@@ -215,6 +215,50 @@ describe('AgentDetailPage', () => {
     expect(screen.getByTestId('agent-connection-registry-tr-2')).toHaveTextContent('Failed');
   });
 
+  it('lists every identity of the agent with a copy button', async () => {
+    mockedGetAgent.mockResolvedValue(
+      details({
+        identities: [
+          { did: 'did:web:agent.example.com', created_at: null, source: 'managed' },
+          { did: 'did:web:surface.example.com', created_at: null, source: 'surface' },
+        ],
+      })
+    );
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Connection/);
+
+    const rows = within(screen.getByTestId('agent-connection-identities')).getAllByTestId(
+      'agent-connection-identity'
+    );
+    expect(rows).toHaveLength(2);
+    expect(within(rows[0]).getByTestId('agents-did')).toHaveAttribute(
+      'title',
+      'did:web:agent.example.com'
+    );
+    expect(within(rows[0]).getByTestId('agents-copy-did-button')).toBeInTheDocument();
+    expect(rows[0]).toHaveTextContent('Managed identity');
+    expect(rows[1]).toHaveTextContent('Surface DID');
+    expect(screen.queryByTestId('agent-connection-identities-empty')).not.toBeInTheDocument();
+  });
+
+  it('says no surface has a DID when the agent has no identity', async () => {
+    mockedGetAgent.mockResolvedValue(details({ identities: [] }));
+    renderPage();
+    await screen.findByTestId('agent-details-name');
+    openTab(/Connection/);
+
+    expect(screen.getByTestId('agent-connection-identities-empty')).toBeInTheDocument();
+    expect(screen.queryByTestId('agent-connection-identity')).not.toBeInTheDocument();
+  });
+
+  it('shows Unnamed agent for an empty name', async () => {
+    mockedGetAgent.mockResolvedValue(details({ name: '' }));
+    renderPage();
+
+    expect(await screen.findByTestId('agent-details-name')).toHaveTextContent(/^Unnamed agent$/);
+  });
+
   it('says no identity was sent to a trust registry when there is no outcome', async () => {
     mockedGetAgent.mockResolvedValue(details({ trust_registry: { recorded: false } }));
     renderPage();
@@ -331,7 +375,9 @@ describe('AgentDetailPage', () => {
   it('shows Unnamed agent for an agent without a name', async () => {
     mockedGetAgent.mockResolvedValue(details({ name: null }));
     renderPage();
-    expect(await screen.findByTestId('agent-details-name')).toHaveTextContent('Unnamed agent');
+    const name = await screen.findByTestId('agent-details-name');
+    expect(name).toHaveTextContent('Unnamed agent');
+    expect(name.innerHTML).toBe('Unnamed agent');
     await waitFor(() =>
       expect(screen.getByTestId('topbar-title')).toHaveTextContent(/^Unnamed agent$/)
     );
@@ -448,9 +494,9 @@ describe('AgentDetailPage', () => {
     openTab(/Agent Card/);
 
     const preview = await screen.findByTestId('agent-card-preview');
-    expect(within(preview).getByTestId('agent-card-preview-name')).toHaveTextContent(
-      'Unnamed agent'
-    );
+    const previewName = within(preview).getByTestId('agent-card-preview-name');
+    expect(previewName).toHaveTextContent('Unnamed agent');
+    expect(previewName.innerHTML).toBe('Unnamed agent');
     expect(within(preview).getAllByText('Not set').length).toBe(7);
     expect(within(preview).getByText('No skills listed')).toBeInTheDocument();
   });
@@ -864,6 +910,11 @@ describe('AgentDetailPage', () => {
     expect(within(changes).getByTestId('agent-card-gateway-did')).toHaveTextContent(
       /^did:web:rick\.example$/
     );
+    for (const testId of ['agent-card-gateway-extension', 'agent-card-gateway-did']) {
+      expect(
+        within(within(changes).getByTestId(testId)).getByText((_, el) => el?.tagName === 'CODE')
+      ).not.toHaveClass('fw-semibold');
+    }
     expect(within(changes).getByTestId('agent-card-gateway-did-change')).toHaveTextContent('Added');
     expect(within(changes).getByText('Verifiable Presentation')).toBeInTheDocument();
     expect(within(changes).getByTestId('agent-card-gateway-extension-change')).toHaveTextContent(

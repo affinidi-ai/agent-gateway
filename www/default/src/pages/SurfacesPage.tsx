@@ -6,6 +6,7 @@ import { AppButton } from '../components/shared/AppButton';
 import { Badge } from '../components/shared/Badge';
 import { EmptyState } from '../components/shared/EmptyState';
 import SearchInput from '../components/shared/SearchInput';
+import { ProtocolBadge, SURFACE_PROTOCOLS } from '../components/shared/ProtocolBadge';
 import { DOCS_URL } from '../config/docs';
 import { usePermissions } from '../context/PermissionsContext';
 import { useApp } from '../context/AppContext';
@@ -167,7 +168,9 @@ const SurfacesPage: React.FC = () => {
                         ? 'primary'
                         : p.badgeClass === 'text-bg-warning'
                           ? 'warning'
-                          : 'info'
+                          : p.badgeClass === 'text-bg-success'
+                            ? 'success'
+                            : 'info'
                     }
                     size="sm"
                     ariaLabel={`${count} ${p.label} surfaces matching search`}
@@ -202,28 +205,6 @@ const SurfacesPage: React.FC = () => {
     </div>
   );
 };
-
-interface ProtocolMeta {
-  key: 'a2a' | 'ap2' | 'mcp';
-  label: string;
-  badgeClass: string;
-}
-
-const SURFACE_PROTOCOLS: ProtocolMeta[] = [
-  { key: 'a2a', label: 'A2A', badgeClass: 'text-bg-primary' },
-  { key: 'ap2', label: 'AP2', badgeClass: 'text-bg-warning' },
-  { key: 'mcp', label: 'MCP', badgeClass: 'text-bg-info' },
-];
-
-function protocolMetaFor(protocol: string): ProtocolMeta {
-  return (
-    SURFACE_PROTOCOLS.find(p => p.key === protocol) ?? {
-      key: protocol as ProtocolMeta['key'],
-      label: protocol.toUpperCase(),
-      badgeClass: 'text-bg-secondary',
-    }
-  );
-}
 
 interface SurfaceListProps {
   allSurfaces: AgentSurface[];
@@ -319,7 +300,6 @@ const SurfaceList: React.FC<SurfaceListProps> = ({
               </thead>
               <tbody>
                 {visibleSurfaces.map(surface => {
-                  const meta = protocolMetaFor(surface.access_point.protocol);
                   const isInactive = surface.status !== 'active';
                   return (
                     <tr
@@ -329,7 +309,7 @@ const SurfaceList: React.FC<SurfaceListProps> = ({
                       onClick={() => onOpen(surface)}
                     >
                       <td>
-                        <span className={`badge ${meta.badgeClass}`}>{meta.label}</span>
+                        <ProtocolBadge protocol={surface.access_point.protocol} />
                       </td>
                       <td>
                         <div>

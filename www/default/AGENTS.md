@@ -2120,9 +2120,13 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
 - The Agents page shows no status anywhere: no list column, filter or dimmed rows, no
   details header badge.
 - Each list row is a link (`role="link"`, named by the agent name and endpoint host) and ends with a
-  chevron cell (`agents-row-chevron`); Enter or Space on the row opens the details.
+  chevron cell (`agents-row-chevron`); Enter or Space on the row opens the details. The chevron is
+  `--muted-text`, and `--accent-blue-text` while the row is hovered or focused, in both themes.
 - The details page has three tabs, **Agent Card** (opened first), **Connection** and **Traffic**.
-  Identities and surfaces are shown only in the list, never repeated on the details page.
+  Surfaces are shown only in the list, never repeated on the details page. The list only counts
+  identities; the **Connection** tab lists each DID with a copy button.
+- An agent without a name, or with an empty one, shows **Unnamed agent** everywhere
+  (`displayName`).
 - The details page sets the top-bar title to the agent name (**Unnamed agent** without one) with
   `usePageTitle`; while loading, or when the agent is missing, the route default stays. The
   back button is `btn-outline-secondary`.
@@ -2137,17 +2141,35 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
   (`DOCS_URL.surfaces`, `docsPlacement="actions"`); without `surfaces.edit` only the docs link
   shows, since the page needs only `surfaces.view` and `/surfaces/new` needs `surfaces.edit`.
 - Columns: Agent, Route, Protocol, Identities, Used by surfaces, Trust registry, Last activity.
-  The protocol badge (`agents-protocol-badge`) uses the Surfaces page's colours (A2A
-  `text-bg-primary`, AP2 `text-bg-warning`, MCP `text-bg-info`, else `text-bg-secondary`).
-  The count badges of **Identities** and **Used by surfaces** match the Surfaces page's Transit
-  Points count: a square `badge text-bg-primary`, not a pill.
+  The protocol badge (`agents-protocol-badge`) is the shared `ProtocolBadge`
+  (`components/shared/ProtocolBadge.tsx`), the one the Surfaces page uses: A2A
+  `text-bg-primary`, AP2 `text-bg-warning`, MCP `text-bg-info`, DIDComm `text-bg-success`, any
+  other protocol upper-cased in `text-bg-secondary`. Never restyle it per page. The template
+  picker's protocol badge (`getTemplateProtocolBadge`) reads the same list.
+  The count badges of **Used by surfaces** and **Identities** match the Surfaces page's Transit
+  Points count: a square `badge text-bg-primary`, not a pill, at the same size, so never inside a
+  `small` element (a badge's size is relative to its parent).
+  Font sizes: every value in a row is the table's 12px body text, never `small`; only the endpoint
+  host under the name is `small`. Every badge in a row is 9px (0.75em of the cell text):
+  `.agents-table .app-badge` in `AgentRegistry.css` sizes the shared `Badge` (rem-based) the same
+  as the Bootstrap badges (em-based) beside it.
   **Used by surfaces** shows a count badge and the surface names joined with commas on one
-  truncated line, with the full list in the tooltip. It has no links. **Identities** shows the same
-  count badge, then the first DID in `identities`, shortened in the middle and muted with a copy
-  button, and `+N` for the rest; every DID is in the tooltip. Without any it shows **No DID**: a
-  warning badge while surfaces use the agent (the API does not say which surface holds which DID),
-  muted text otherwise.
-- The agent name (`agents-name`) is the strongest text in a row; DIDs stay muted. The table's
+  truncated line, with the full list in the tooltip. The surface names and the endpoint host are
+  cut only at their column's edge (the cell has `max-width: 0`), never at a fixed width, so wide
+  screens show them in full. It has no links. **Identities** shows no DID,
+  only the count, in the same square count badge as **Used by surfaces**
+  (`agents-identities-count`), followed by "identity" or "identities" (`identityNoun`), with every
+  DID in `identities` in the tooltip. Without any it shows **No identity** in
+  `text-muted` text, like an empty **Used by surfaces** cell: the badge is only for a count, and
+  never a warning, since a surface without a DID is a valid setup. While surfaces use the agent its tooltip says none of them has a DID (the API does not
+  say which surface holds which DID). The **Trust registry** header stays on one line (`text-nowrap`).
+- The agent name matches the A2A Proxies list on the Proxies page: a plain `<strong>` at the
+  table's font size, with the endpoint host under it in `small text-muted`. An agent without a
+  name shows "Unnamed agent" the same way (`agents-unnamed`), never italic or muted. The name
+  (`agents-name`) is the strongest text in a row: bold, in the table's text colour like a surface
+  name on the Surfaces page. The global `.table td:first-child` rule would grey it, so
+  `AgentRegistry.css` gives the first cell `var(--bs-table-color)`. The host under it stays
+  `small text-muted`. The table's
   column headers (`agents-table`) keep the uppercase `.table-sm` default, like the Surfaces page.
 - **Agent** shows the endpoint host under the name (`endpointHost`: the URL origin with its
   scheme, such as `https://agent.example`, the A2A proxy, or `gateway/channel`), so rows with the
@@ -2156,32 +2178,43 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
   `a2a-proxy://` and `fabric://` schemes are never shown. An endpoint `connectionTarget` cannot
   show gets no line.
 - Raw API values are never shown. `pages/AgentsPage/agentLabels.ts` maps them: runtime `url`,
-  `a2a-proxy`, `gateway` to the route Direct, Proxied, Fabric, and the protocol badge to the
+  `a2a-proxy`, `gateway` to the route Direct, Proxied, Fabric; the protocol badge shows the
   protocol only (`A2A`), never the route. Shared badges are in `pages/AgentsPage/AgentBadges.tsx`.
 - The route is called **Route** everywhere (list column, Connection heading). The list renders it
-  with `AgentRouteBadge`: a neutral bordered badge (`badge text-bg-light border
-  agent-route-badge`) with the route icon and label, its meaning (`routeDescription`) as the
-  tooltip and as visually hidden text (`agents-runtime`). The details page shows no route badge:
+  with `AgentRoute`: plain text at the normal text size and colour, never a badge (the row's
+  badges are for counts, the protocol and the trust registry state), with the route icon and
+  label, its meaning (`routeDescription`) as the tooltip and as visually hidden text
+  (`agents-runtime`). The details page shows no route:
   not in the header, not on the Connection tab, whose description says the route.
-- An agent with a `null` name shows **Unnamed agent** in muted text, in the list and the details
-  header, with the endpoint host beside it in the header (`agent-details-endpoint-host`). The API
+- An agent with a `null` name shows **Unnamed agent** styled like a name, never italic or muted,
+  in the list, the details header and the Agent Card preview, with the endpoint host beside it in
+  the header (`agent-details-endpoint-host`). The API
   names Direct, Proxied and Fabric agents from their Agent Card; a Proxied or Fabric name comes
   from the card the gateway serves and can take a refresh of the list to appear after the
   background lookup. A canvas target name that only names a surface (a surface's own name, or a
   generated `<kind>_surface_<n>`) is never the agent's name.
 - **Trust registry** shows **Recorded** with the Agent Identities page's badge
   (`TrustRecorderStateBadge`, state `recorded`: success tone, no icon), with a tooltip saying
-  recording is not trust, when `trust_registry.recorded` is true, else **Not recorded**
-  (`badge-none`), with no tooltip.
+  recording is not trust, when `trust_registry.recorded` is true, else **Not recorded** in the
+  same shared `Badge` (`size="sm"`) in the `secondary` tone, so both states share one shape and
+  size, with no tooltip.
 - Agent `id` is opaque and never read as a surface id; surface links come from `surfaces[]`.
+- Section headings on every details tab (**Route**, **Trust registry**, **Skills**, **Changes by
+  the gateway**) use `.agent-preview-section-title`. Secondary text in `AgentRegistry.css` uses
+  `--muted-text` at `0.875em`, the size of `.small`, never a fixed pixel size or a `--gray-*`
+  shade, and the Agent Card avatar is white on `--primary-solid`.
 - The **Connection** tab (`AgentDetailPage/ConnectionTab.tsx`) is read-only and has no surfaces
   list. Built from `endpoint` by `connectionTarget`, it shows a **Route** heading with a one-line
   description of the route under it, then a Field / Value table styled like the Agent Card's
   **Changes by the gateway** table (`agent-preview-changes`; the target rows; a URL endpoint has a
-  copy button). It has no route path diagram. Under it, a **Trust registry** section
+  copy button). It has no route path diagram. Under it, an **Identities** section
+  (`agent-connection-identities`) lists every DID in `identities` in the same table style:
+  Identity (the shortened DID with the full one as tooltip and a copy button, local to
+  `ConnectionTab.tsx`) and Source (**Surface DID** or **Managed identity**); without any it says
+  no surface using the agent has a DID. Then a **Trust registry** section
   (`agent-connection-trust-registry`) lists `trust_registry.registries` in the same table style:
   Trust registry (name, else id; links to the registry page only with `trust_registries.edit`),
-  Identity (`AgentDid`) and Status (`TrustRecorderStateBadge`, with the reason text under it).
+  Identity (the same DID cell) and Status (`TrustRecorderStateBadge`, with the reason text under it).
   Without outcomes it says no identity was sent to a trust registry. The Agents API fills
   `registries` on the details only: the best outcome per (registry, DID) across the agent's
   surfaces, for its current identities.
@@ -2211,7 +2244,7 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
   the API's `upstream_card`, with columns **Field**, **Change** and **Value**. **Change** is a
   badge (`<row>-change`): **Rewritten** (`text-bg-warning`) when the field existed before,
   **Added** (`text-bg-primary`) when it did not, **Removed** (`text-bg-secondary`) when the
-  served card dropped it. **Value** (`<row>`) is what callers get, in semibold code, `-` when
+  served card dropped it. **Value** (`<row>`) is what callers get, in regular-weight code, `-` when
   missing; a rewritten or removed one has a muted "Was <value>" line under it, its code muted too
   so the new value stands out (`<row>-was`), an added one none. `code` in `agent-preview-changes`
   cells is `inline-block` so wrapped chips don't overlap. Rows:
@@ -2271,8 +2304,9 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
 | Name, unnamed, endpoint host    | `agents-name`, `agents-unnamed`, `agents-endpoint-host`                                         |
 | Runtime, protocol, activity     | `agents-runtime`, `agents-protocol-badge`, `agents-last-activity`                               |
 | Surfaces, count, names          | `agents-surfaces`, `agents-surfaces-count`, `agents-surface-names`                              |
-| Identities, count, more         | `agents-identities`, `agents-identities-count`, `agents-identities-more`                        |
-| DID, copy, none                 | `agents-did`, `agents-copy-did-button`, `agents-no-did`                                         |
+| Identities, count, none         | `agents-identities`, `agents-identities-count`, `agents-no-identity`                            |
+| Details DID, copy               | `agents-did`, `agents-copy-did-button`                                                          |
+| Details identities, row, none   | `agent-connection-identities`, `agent-connection-identity`, `agent-connection-identities-empty` |
 | Trust registry                  | `agents-trust-recorded`, `agents-trust-not-recorded`                                            |
 | Back, details retry             | `agent-back-button`, `agent-retry-button`                                                       |
 | Details not found, load error   | `agent-not-found`, `agent-load-error`                                                           |
@@ -2281,12 +2315,11 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
 | Agent Card states               | `agent-card-tab`, `-loading`, `-error`, `-retry-button`, `agent-card-<no_agent_card\|not_running\|operator_only>`, `agent-card-surface-unavailable`, `agent-card-surface-retry-button` |
 | Agent Card source               | `agent-card-source`, `-source-text`, `agent-card-surface`, `agent-card-surface-select`, `agent-card-open-surface-button` |
 | Changes by the gateway          | `agent-card-gateway-changes`, `-no-did`; rows `-url`, `-extension`, `-did`, `-vp`, `-removed`, `-other-<field>`, each with `-change` and `-was`; `-vp-toggle-button`, `-vp-view` |
-| Connection tab                  | `agent-connection-tab`, `-description`, `-path`, `-caller-hop`, `-surfaces-hop`, `-target`, `-copy-endpoint` |
-| Connection target rows          | `agent-connection-endpoint`, `-proxy`, `-proxy-link`, `-gateway`, `-gateway-link`, `-remote-surface` |
 | Agent Card JSON, copy           | `agent-card-json`, `agent-card-copy-button`                                                     |
 | Agent Card view toggle, preview | `agent-card-view-preview`, `-view-json`, `agent-card-preview`, `-preview-name`, `-preview-details`, `-preview-skills`, `-preview-empty` |
 | Traffic cards, empty            | `agent-traffic-tab`, `agent-traffic-requests`, `-failed`, `-p95`, `agent-traffic-empty` |
-| Connection                      | `agent-connection-tab`, `-endpoint`, `-proxy`, `-proxy-link`, `-gateway`, `-gateway-link`, `-remote-surface` |
+| Connection                      | `agent-connection-tab`, `-description`, `-endpoint`, `-copy-endpoint`, `-proxy`, `-proxy-link`, `-gateway`, `-gateway-link`, `-remote-surface` |
+| Connection trust registry       | `agent-connection-trust-registry`, `-trust-registry-empty`, `agent-connection-registry-<registry-id>` |
 
 ## Remote gateway Issuer DIDs
 

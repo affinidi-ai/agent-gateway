@@ -732,6 +732,6 @@ describe('SurfaceDetailPage delete', () => {
     expect(await screen.findByTestId('surface-error-alert')).toHaveTextContent('Surface is in use');
     expect(screen.queryByTestId('surface-delete-confirm')).toBeNull();
     expect(screen.queryByTestId('surfaces-list')).toBeNull();
-    expect(screen.getByTestId('surface-delete-button')).toHaveFocus();
+    await waitFor(() => expect(screen.getByTestId('surface-delete-button')).toHaveFocus());
   });
 });

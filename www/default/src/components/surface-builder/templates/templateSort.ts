@@ -6,6 +6,7 @@
 
 import type { SurfaceTemplate } from '../../../api';
 import type { Protocol } from '../elements/types';
+import { knownProtocolMeta, type ProtocolMeta } from '../../shared/ProtocolBadge';
 
 const DEFAULT_SORT_PRIORITY = Number.MAX_SAFE_INTEGER;
 
@@ -24,19 +25,6 @@ export function sortTemplatesForDisplay(list: readonly SurfaceTemplate[]): Surfa
   return [...list].sort(compareTemplatesForDisplay);
 }
 
-export interface TemplateProtocolMeta {
-  key: string;
-  label: string;
-  badgeClass: string;
-}
-
-const KNOWN_PROTOCOL_BADGES: Record<string, TemplateProtocolMeta> = {
-  a2a: { key: 'a2a', label: 'A2A', badgeClass: 'text-bg-primary' },
-  ap2: { key: 'ap2', label: 'AP2', badgeClass: 'text-bg-warning' },
-  mcp: { key: 'mcp', label: 'MCP', badgeClass: 'text-bg-info' },
-  didcomm: { key: 'didcomm', label: 'DIDComm', badgeClass: 'text-bg-success' },
-};
-
 /**
  * Best-effort access-point protocol extraction. Returns `null` when
  * the template carries no protocol hint we recognise.
@@ -48,7 +36,7 @@ export function getTemplateProtocol(t: SurfaceTemplate): string | null {
   }
   for (const tag of t.tags ?? []) {
     const lower = typeof tag === 'string' ? tag.toLowerCase() : '';
-    if (lower in KNOWN_PROTOCOL_BADGES) return lower;
+    if (knownProtocolMeta(lower)) return lower;
   }
   return null;
 }
@@ -58,9 +46,9 @@ export function templateMatchesProtocol(t: SurfaceTemplate, protocol: Protocol):
   return templateProtocol === null || templateProtocol === protocol;
 }
 
-export function getTemplateProtocolBadge(t: SurfaceTemplate): TemplateProtocolMeta | null {
+export function getTemplateProtocolBadge(t: SurfaceTemplate): ProtocolMeta | null {
   const key = getTemplateProtocol(t);
-  return key ? (KNOWN_PROTOCOL_BADGES[key] ?? null) : null;
+  return key ? (knownProtocolMeta(key) ?? null) : null;
 }
 
 /** Whether applying `t` adds a Payment element or a surface payment policy. */
