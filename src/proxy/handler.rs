@@ -4569,6 +4569,7 @@ async fn proxy_charged_request(
                 &headers,
                 &body_bytes,
                 authenticated_identity.as_ref(),
+                caller_inbound_identity.as_ref(),
                 source_auth_context.as_ref(),
                 mcp_context.as_ref(),
                 payment_context.as_ref(),
@@ -4628,6 +4629,7 @@ async fn proxy_charged_request(
                 &headers,
                 &body_bytes,
                 authenticated_identity.as_ref(),
+                caller_inbound_identity.as_ref(),
                 source_auth_context.as_ref(),
                 mcp_context.as_ref(),
                 payment_context.as_ref(),
@@ -4750,6 +4752,7 @@ async fn proxy_charged_request(
                 &headers,
                 &body_bytes,
                 authenticated_identity.as_ref(),
+                caller_inbound_identity.as_ref(),
                 source_auth_context.as_ref(),
                 mcp_context.as_ref(),
                 payment_context.as_ref(),
@@ -4879,6 +4882,7 @@ async fn proxy_charged_request(
                 &headers,
                 &body_bytes,
                 authenticated_identity.as_ref(),
+                caller_inbound_identity.as_ref(),
                 source_auth_context.as_ref(),
                 mcp_context.as_ref(),
                 payment_context.as_ref(),
@@ -15242,6 +15246,8 @@ pub(crate) fn a2a_proxy_connection_status(
 /// Evaluate inbound OPA + surface OPA policies for a `proxy://` MCP request.
 /// Returns the evaluated `PolicyInput` when both policies allow, so MCP tool
 /// gating decides on the same context, or `Err(Response)` with a 403 deny.
+/// `caller_inbound_identity` is the caller's inbound identity: its method's own,
+/// else the surface's (see [`caller_inbound_identity`]).
 async fn evaluate_mcp_proxy_opa_policies(
     state: &ProxyState,
     method: &str,
@@ -15249,6 +15255,7 @@ async fn evaluate_mcp_proxy_opa_policies(
     headers: &HeaderMap,
     body_bytes: &[u8],
     authenticated_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
+    caller_inbound_identity: Option<&crate::source_auth::ManagedIdentityConfig>,
     source_auth_context: Option<&crate::surface_context::SourceAuthContext>,
     mcp_context: Option<&crate::surface_context::McpContext>,
     payment_context: Option<&crate::surface_context::PaymentContext>,
@@ -15312,15 +15319,7 @@ async fn evaluate_mcp_proxy_opa_policies(
             .await,
         );
     }
-    bind_credential_caller_did(
-        state
-            .surface
-            .inbound_identity(),
-        method,
-        uri.path(),
-        policy_input.agent.as_mut(),
-        None,
-    );
+    bind_credential_caller_did(caller_inbound_identity, method, uri.path(), policy_input.agent.as_mut(), None);
     policy_input.normalize_caller_did();
 
     // ── Trust Check stage (caller leg) ─────────────────────────────────────
@@ -23736,8 +23735,15 @@ allow if {
         async fn mcp_proxy_policy_agent(
             inbound: Option<ManagedIdentityConfig>
         ) -> Option<crate::surface_context::AgentContext> {
+            mcp_proxy_policy_agent_of(inbound.clone(), inbound).await
+        }
+
+        async fn mcp_proxy_policy_agent_of(
+            slot: Option<ManagedIdentityConfig>,
+            caller: Option<ManagedIdentityConfig>,
+        ) -> Option<crate::surface_context::AgentContext> {
             let mut surface = mcp_surface("pak-mcp-proxy", "proxy://pak-mcp-proxy", None);
-            surface.identity_slots.inbound = inbound;
+            surface.identity_slots.inbound = slot;
             let state = bare_proxy_state(surface, None);
             let body = serde_json::to_vec(&serde_json::json!({
                 "jsonrpc": "2.0",
@@ -23758,6 +23764,7 @@ allow if {
                 &axum::http::HeaderMap::new(),
                 &body,
                 None,
+                caller.as_ref(),
                 None,
                 None,
                 None,
@@ -23776,6 +23783,24 @@ allow if {
 
             assert_eq!(agent.did, None);
             assert_eq!(agent.provider_did, None);
+        }
+
+        #[tokio::test]
+        async fn mcp_proxy_policy_input_has_no_body_asserted_did_for_a_method_identity() {
+            for method_identity in [
+                ManagedIdentityConfig::FromApiKey { api_key_id: None },
+                ManagedIdentityConfig::FromJwtClaim {
+                    claim: "oid".into(),
+                    namespace_claims: vec!["iss".into()],
+                },
+            ] {
+                let agent = mcp_proxy_policy_agent_of(None, Some(method_identity.clone()))
+                    .await
+                    .unwrap();
+
+                assert_eq!(agent.did, None, "{method_identity:?}");
+                assert_eq!(agent.provider_did, None, "{method_identity:?}");
+            }
         }
 
         #[tokio::test]
