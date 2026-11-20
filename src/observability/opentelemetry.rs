@@ -940,6 +940,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn spans_export_through_the_reloadable_trace_layer() {
+        use opentelemetry::trace::TraceContextExt;
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(crate::observability::http_trace::span_capture::CapturingExporter {
+                spans: captured.clone(),
+            })
+            .build();
+        let (layer, _handle) = tracing_subscriber::reload::Layer::new(build_trace_layer_boxed(&provider, "test"));
+        let layer = layer
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO)
+            .with_filter(crate::observability::span_filter::BusinessLogicFilter::new(vec!["agent_gateway".to_string()]))
+            .boxed();
+
+        let context_is_valid = tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            let span = tracing::info_span!(target: "agent_gateway", "reloadable");
+            let _entered = span.enter();
+            tracing::Span::current()
+                .context()
+                .span()
+                .span_context()
+                .is_valid()
+        });
+
+        provider
+            .force_flush()
+            .unwrap();
+        let exported: Vec<String> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|span| span.name.to_string())
+            .collect();
+        assert_eq!(exported, ["reloadable"]);
+        assert!(!context_is_valid, "the span's OpenTelemetry context is not readable through the reload layer");
+    }
+
+    #[test]
     fn test_otel_config_default() {
         let config = OtelConfig::default();
         assert!(!config.enabled);
