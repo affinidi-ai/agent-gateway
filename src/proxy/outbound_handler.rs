@@ -583,8 +583,9 @@ pub struct OutboundPipelineContext {
     /// Point's `trust_check_list` is empty; otherwise the routed Transit
     /// Point's results under `target`.
     pub trust_check_results: Option<crate::trust_registry_verification::TrustCheckResultsContext>,
-    /// Unique request ID for tracing.
-    pub request_id: String,
+    /// The request's trace id: the transit token's when one was verified, else
+    /// a valid `X-Gateway-Trace-Id`, else a fresh one.
+    pub trace_id: String,
     /// Timestamp recorded at context creation (used for latency metrics).
     pub start_time: Instant,
     /// Pre-compiled rules engine for outbound request extension validation (from live channel state).
@@ -811,7 +812,7 @@ impl OutboundPipelineContext {
         // transit token (see `step_validate_transit_token`, which overrides this
         // from `claims.trace_id`); this only helps when no transit token is used
         // but the agent still echoes the header. UUID-checked to block injection.
-        let request_id = original_headers
+        let trace_id = original_headers
             .get("X-Gateway-Trace-Id")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| {
@@ -847,7 +848,7 @@ impl OutboundPipelineContext {
             target_agent_card_unavailable: false,
             target_identity_failure: None,
             trust_check_results: None,
-            request_id,
+            trace_id,
             start_time: Instant::now(),
             _outbound_rules_engine: outbound_rules_engine,
             outbound_response_rules_engine,
@@ -1260,7 +1261,7 @@ fn step_refuse_variant_changing_enforced_policy(ctx: &OutboundPipelineContext) -
         return Ok(());
     }
     warn!(
-        request_id = %ctx.request_id,
+        request_id = %ctx.trace_id,
         transit_point = %ctx.virtual_channel.alias,
         variant = ?ctx.active_variant_alias,
         "Transit Point request refused: its surface variant changes the Transit Point's policy, response \
@@ -1288,7 +1289,7 @@ async fn step_validate_transit_token(
     let validated = validate_transit_token(state, ctx).await;
     if let Err(OutboundPipelineError::TransitTokenInvalid(reason)) = &validated {
         warn!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             transit_point = %ctx.virtual_channel.alias,
             reason = %reason,
             "Transit token refused"
@@ -1337,7 +1338,7 @@ async fn validate_transit_token(
             Some((issuer, token)) => match verify_transit_token(ctx, issuer, token, modern) {
                 Ok(claims) => ctx.optional_transit_token_claims = Some(claims),
                 Err(OutboundPipelineError::TransitTokenInvalid(reason)) => debug!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     alias = %ctx.virtual_channel.alias,
                     reason = %reason,
                     "Optional transit token did not verify, caller treated as anonymous"
@@ -1345,7 +1346,7 @@ async fn validate_transit_token(
                 Err(_) => {}
             },
             None => debug!(
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 alias = %ctx.virtual_channel.alias,
                 "Transit token enforcement disabled for this transit point, skipping validation"
             ),
@@ -1424,7 +1425,7 @@ fn verify_transit_token(
     }
 
     debug!(
-        request_id = %ctx.request_id,
+        request_id = %ctx.trace_id,
         caller_did = ?claims.sub,
         surface_id = %claims.surface_id,
         transit_point = %transit_point_name,
@@ -1445,7 +1446,7 @@ fn adopt_transit_token(
     // chain all share one id. The managed agent echoes the token reliably, so
     // this is the robust carrier (vs. hoping it forwards `X-Gateway-Trace-Id`).
     if let Some(tid) = claims.trace_id.clone() {
-        ctx.request_id = tid;
+        ctx.trace_id = tid;
     }
 
     ctx.transit_token_claims = Some(claims);
@@ -1485,7 +1486,7 @@ fn step_check_fabric_hops(ctx: &OutboundPipelineContext) -> Result<(), OutboundP
         .map(|_| ())
         .inspect_err(|refusal| {
             warn!(
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 transit_point = %ctx.virtual_channel.alias,
                 "Refusing a Transit Point call that would pass the Fabric hop limit"
             );
@@ -1522,7 +1523,7 @@ async fn step_source_auth(
     };
     if let Some(reason) = unenforceable {
         warn!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             surface_id = %ctx.surface.surface_id,
             transit_point = %ctx.virtual_channel.alias,
             reason = %reason,
@@ -1708,7 +1709,7 @@ async fn authenticate_transit_caller(
         }
         Err(error) if error.is_caller_attributable() => {
             warn!(
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 surface_id = %ctx.surface.surface_id,
                 transit_point = %ctx.virtual_channel.alias,
                 method = config.method_tag(),
@@ -1735,7 +1736,7 @@ fn caller_authentication_unavailable(
     error: &crate::source_auth::errors::SourceAuthError,
 ) -> OutboundPipelineError {
     warn!(
-        request_id = %ctx.request_id,
+        request_id = %ctx.trace_id,
         surface_id = %ctx.surface.surface_id,
         transit_point = %ctx.virtual_channel.alias,
         error = ?error,
@@ -1755,7 +1756,7 @@ async fn step_provider_key_gate(ctx: &mut OutboundPipelineContext) -> Result<(),
         return Ok(());
     };
     warn!(
-        request_id = %ctx.request_id,
+        request_id = %ctx.trace_id,
         surface_id = %ctx.surface.surface_id,
         transit_point = %ctx.virtual_channel.alias,
         rule = crate::identity::provider_key_gate::PROVIDER_KEY_TENANT_RULE,
@@ -1848,7 +1849,7 @@ async fn step_resolve_agent_identity(
             .inject_vp
     {
         debug!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             alias = %ctx.virtual_channel.alias,
             "Outbound: transit point inherits surface identity but inject_vp=false — skipping egress identity management"
         );
@@ -1861,7 +1862,7 @@ async fn step_resolve_agent_identity(
     // still runs.
     if is_transit_discovery_read(ctx) {
         debug!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             "Outbound: public discovery path — skipping identity resolution"
         );
         return Ok(());
@@ -1872,7 +1873,7 @@ async fn step_resolve_agent_identity(
     // here; the inbound path (proxy/backend_identity.rs) owns this mode.
     if matches!(managed_identity, crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. }) {
         debug!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             "Outbound: from_jwt_claim managed identity is inbound-only — skipping"
         );
         return Ok(());
@@ -1904,7 +1905,7 @@ async fn step_resolve_agent_identity(
     {
         Ok(Some(crate::identity::credential_identity::CredentialIdentity::Bound { did, identity_fields })) => {
             debug!(
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 did = %did,
                 mode = mode_label,
                 "Outbound credential identity is pre-bound — skipping VCIssuer"
@@ -1966,7 +1967,7 @@ async fn step_resolve_agent_identity(
                 })?;
             if response.is_new {
                 info!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     did = %response.did,
                     hash = %identity_hash,
                     mode = mode_label,
@@ -1974,7 +1975,7 @@ async fn step_resolve_agent_identity(
                 );
             } else {
                 debug!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     did = %response.did,
                     hash = %identity_hash,
                     mode = mode_label,
@@ -2105,7 +2106,7 @@ async fn step_resolve_agent_identity(
             .validate(&raw_payload, &ctx.surface.name)
             .map_err(|e| {
                 warn!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     error = %e,
                     "Outbound identity validation failed"
                 );
@@ -2114,7 +2115,7 @@ async fn step_resolve_agent_identity(
                     e
                 )))
             })?;
-        debug!(request_id = %ctx.request_id, "Outbound identity validation passed");
+        debug!(request_id = %ctx.trace_id, "Outbound identity validation passed");
     }
 
     // Step 3: Schema validation, field extraction, hash computation, and DID resolution.
@@ -2135,7 +2136,7 @@ async fn step_resolve_agent_identity(
             .validate(&raw_payload)
             .map_err(|e| {
                 warn!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     error = %e,
                     "Outbound identity schema validation failed"
                 );
@@ -2153,7 +2154,7 @@ async fn step_resolve_agent_identity(
             .compute_identity_hash(&raw_payload, &ctx.surface.name)
             .map_err(|e| {
                 warn!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     error = %e,
                     "Outbound identity schema validation failed"
                 );
@@ -2186,14 +2187,14 @@ async fn step_resolve_agent_identity(
 
         if response.is_new {
             info!(
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 did = %response.did,
                 hash = %hash,
                 "Created new DID for outbound protected agent (schema-validated)"
             );
         } else {
             debug!(
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 did = %response.did,
                 hash = %hash,
                 "Resolved existing DID for outbound protected agent (schema-validated)"
@@ -2245,14 +2246,14 @@ async fn step_resolve_agent_identity(
 
     if response.is_new {
         info!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             did = %response.did,
             hash = %hash,
             "Created new DID for outbound protected agent"
         );
     } else {
         debug!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             did = %response.did,
             hash = %hash,
             "Resolved existing DID for outbound protected agent"
@@ -2290,7 +2291,7 @@ async fn step_rate_limit(
         {
             // Rate limit configured but no policy manager — log and allow.
             warn!(
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 "Outbound rate limit configured but SurfacePolicyManager not available"
             );
         }
@@ -2309,7 +2310,7 @@ async fn step_rate_limit(
         None => {}
         Some(crate::policies::CallerLimit::Unenforceable) => {
             warn!(
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 surface_id = %ctx.surface.surface_id,
                 transit_point = %ctx.virtual_channel.alias,
                 "Transit Point request refused: its per-caller rate limit cannot be enforced"
@@ -2323,12 +2324,12 @@ async fn step_rate_limit(
         Some(crate::policies::CallerLimit::Enforced(limiter)) => {
             let caller = rate_limit_caller_hash(ctx);
             if let Err(refusal) = limiter.check(caller.as_deref()) {
-                debug!(request_id = %ctx.request_id, overflow = refusal.overflow, "Outbound rate limit exceeded (per caller)");
+                debug!(request_id = %ctx.trace_id, overflow = refusal.overflow, "Outbound rate limit exceeded (per caller)");
                 crate::audit::request_events::transit_point_caller_rate_limited(
                     &crate::audit::request_events::RequestFacts {
                         surface_id: &ctx.surface.surface_id,
                         channel_name: &ctx.surface.name,
-                        trace_id: Some(&ctx.request_id),
+                        trace_id: Some(&ctx.trace_id),
                         via_fabric: ctx
                             .transit_token_claims
                             .as_ref()
@@ -2350,7 +2351,7 @@ async fn step_rate_limit(
         pm.check_rate_limit(config_id)
             .await
             .map_err(|_| {
-                debug!(request_id = %ctx.request_id, "Outbound rate limit exceeded (channel)");
+                debug!(request_id = %ctx.trace_id, "Outbound rate limit exceeded (channel)");
                 OutboundPipelineError::RateLimitExceeded
             })?;
     }
@@ -2361,7 +2362,7 @@ async fn step_rate_limit(
             .await
             .map_err(|_| {
                 debug!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     vc_alias = %ctx.virtual_channel.alias,
                     "Outbound rate limit exceeded (per-VC)"
                 );
@@ -2418,7 +2419,7 @@ async fn step_extract_protocol_context_with_versions(
             &state.network_config.get_outbound_external_urls(),
             versions,
         ).map_err(|error| {
-            error!(request_id = %ctx.request_id, error = %error, "Invalid MCP Transit Point HTTP configuration");
+            error!(request_id = %ctx.trace_id, error = %error, "Invalid MCP Transit Point HTTP configuration");
             metadata_injection_failed(ctx)
         })?)
         } else {
@@ -2450,7 +2451,7 @@ async fn step_extract_protocol_context_with_versions(
                         &crate::audit::request_events::RequestFacts {
                             surface_id: &ctx.surface.surface_id,
                             channel_name: &ctx.surface.name,
-                            trace_id: Some(&ctx.request_id),
+                            trace_id: Some(&ctx.trace_id),
                             via_fabric: false,
                         },
                         &error,
@@ -2474,7 +2475,7 @@ async fn step_extract_protocol_context_with_versions(
                 .unwrap_or_default(),
         )
     {
-        warn!(request_id = %ctx.request_id, method = %ctx.original_method, "Rejecting MCP request with a body at admission");
+        warn!(request_id = %ctx.trace_id, method = %ctx.original_method, "Rejecting MCP request with a body at admission");
         return Ok(Some(response));
     }
 
@@ -2505,7 +2506,7 @@ async fn step_extract_protocol_context_with_versions(
                 ))
             })?;
         if let Some(refusal) = crate::mcp::tool_analyzer::single_object_refusal(&body) {
-            warn!(request_id = %ctx.request_id, reason = refusal.reason(), "Rejecting MCP request body at admission");
+            warn!(request_id = %ctx.trace_id, reason = refusal.reason(), "Rejecting MCP request body at admission");
             if matches!(classification, crate::mcp::request_validation::McpRequestClassification::Modern(_)) {
                 return Err(OutboundPipelineError::McpValidation(refusal.into_modern_error(&body)));
             }
@@ -2514,7 +2515,7 @@ async fn step_extract_protocol_context_with_versions(
         ctx.surface
             .validate_mcp_metadata_base()
             .map_err(|error| {
-                error!(request_id = %ctx.request_id, error = %error, "Invalid MCP metadata configuration");
+                error!(request_id = %ctx.trace_id, error = %error, "Invalid MCP metadata configuration");
                 metadata_injection_failed(ctx)
             })?;
         ctx.mcp_metadata_context = crate::mcp::meta::McpMetadataContext::from_classification(
@@ -2533,7 +2534,7 @@ async fn step_extract_protocol_context_with_versions(
             normalized,
             &classification,
             &ctx.surface.surface_id,
-            Some(&ctx.request_id),
+            Some(&ctx.trace_id),
         ));
         crate::protocols::extensions::verify_mcp_metadata_identity(
             &body,
@@ -2543,7 +2544,7 @@ async fn step_extract_protocol_context_with_versions(
         )
         .await
         .map_err(|error| {
-            warn!(request_id = %ctx.request_id, error = %error, "Invalid MCP identity presentation");
+            warn!(request_id = %ctx.trace_id, error = %error, "Invalid MCP identity presentation");
             OutboundPipelineError::McpIdentityInvalid
         })?;
         if matches!(classification, crate::mcp::request_validation::McpRequestClassification::Modern(_)) {
@@ -2577,7 +2578,7 @@ async fn step_extract_protocol_context_with_versions(
     if transit_protocol_family(&ctx.virtual_channel.protocol) == Some("a2a")
         && crate::a2a::is_extended_agent_card_batch(body)
     {
-        warn!(request_id = %ctx.request_id, "Rejected JSON-RPC batch containing an extended agent card request");
+        warn!(request_id = %ctx.trace_id, "Rejected JSON-RPC batch containing an extended agent card request");
         return Err(OutboundPipelineError::ExtendedAgentCardBatch);
     }
 
@@ -2598,7 +2599,7 @@ async fn step_extract_protocol_context_with_versions(
         )
     {
         warn!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             transit_point = %ctx.virtual_channel.alias,
             expected_protocol = %ctx.virtual_channel.protocol,
             detected_protocol = detected,
@@ -2614,7 +2615,7 @@ async fn step_extract_protocol_context_with_versions(
     }
 
     debug!(
-        request_id = %ctx.request_id,
+        request_id = %ctx.trace_id,
         protocol = ?ctx.protocol,
         operation = ?ctx.operation,
         "Outbound: protocol context extracted"
@@ -2907,7 +2908,7 @@ async fn transit_target_auth_header(
         }
         Ok(None) => Ok(None),
         Err(error) => {
-            warn!(request_id = %ctx.request_id, error = %error, "Failed to resolve target auth credentials");
+            warn!(request_id = %ctx.trace_id, error = %error, "Failed to resolve target auth credentials");
             crate::proxy::handler::record_target_auth_failure(
                 &transit_audit_facts(ctx),
                 Some(&ctx.virtual_channel.alias),
@@ -2926,7 +2927,7 @@ fn transit_audit_facts(ctx: &OutboundPipelineContext) -> crate::audit::request_e
     crate::audit::request_events::RequestFacts {
         surface_id: &ctx.surface.surface_id,
         channel_name: &ctx.surface.name,
-        trace_id: Some(&ctx.request_id),
+        trace_id: Some(&ctx.trace_id),
         via_fabric: false,
     }
 }
@@ -3033,7 +3034,7 @@ async fn step_inspect_outbound_extensions(
                     ctx.virtual_channel.alias, watched
                 );
                 error!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     transit_point = %ctx.virtual_channel.alias,
                     missing_extension = %watched,
                     "✗ {}", error_msg
@@ -3058,7 +3059,7 @@ async fn step_inspect_outbound_extensions(
                     ctx.virtual_channel.alias, watched
                 );
                 error!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     transit_point = %ctx.virtual_channel.alias,
                     missing_extension = %watched,
                     "✗ {}", error_msg
@@ -3099,7 +3100,7 @@ async fn step_inspect_outbound_extensions(
                     ctx.virtual_channel.alias, watched
                 );
                 error!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     transit_point = %ctx.virtual_channel.alias,
                     missing_extension = %watched,
                     "✗ {}", error_msg
@@ -3107,7 +3108,7 @@ async fn step_inspect_outbound_extensions(
                 return Err(OutboundPipelineError::ExtensionValidationFailed(error_msg));
             } else {
                 debug!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     transit_point = %ctx.virtual_channel.alias,
                     missing_extension = %watched,
                     "Outbound extension absent (inspection disabled — passing through)"
@@ -3115,7 +3116,7 @@ async fn step_inspect_outbound_extensions(
             }
         } else {
             debug!(
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 transit_point = %ctx.virtual_channel.alias,
                 extension = %watched,
                 "✓ Outbound extension present"
@@ -3166,12 +3167,12 @@ async fn step_inject_custom_metadata(
                 metadata_config,
                 channel_name,
                 &state.secrets_store,
-                crate::protocols::MetadataRuntimeContext::for_surface(&ctx.surface, Some(ctx.request_id.as_str())),
+                crate::protocols::MetadataRuntimeContext::for_surface(&ctx.surface, Some(ctx.trace_id.as_str())),
             )
             .await
             .map_err(|e| {
                 error!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     error = %e,
                     "Metadata injection failed"
                 );
@@ -3185,13 +3186,13 @@ async fn step_inject_custom_metadata(
                 metadata_config,
                 channel_name,
                 &state.secrets_store,
-                crate::protocols::MetadataRuntimeContext::for_surface(&ctx.surface, Some(ctx.request_id.as_str())),
+                crate::protocols::MetadataRuntimeContext::for_surface(&ctx.surface, Some(ctx.trace_id.as_str())),
                 ctx.mcp_metadata_context,
                 crate::mcp::meta::McpMetaTarget::TopLevel,
             )
             .await
             .map_err(|e| {
-                error!(request_id = %ctx.request_id, error = %e, "MCP metadata injection failed");
+                error!(request_id = %ctx.trace_id, error = %e, "MCP metadata injection failed");
                 metadata_injection_failed(ctx)
             })?;
 
@@ -3201,7 +3202,7 @@ async fn step_inject_custom_metadata(
                 let header_name = name.to_string();
                 ctx.original_headers
                     .insert(name, value);
-                debug!(request_id = %ctx.request_id, header = %header_name, "Outbound: injected custom metadata as HTTP header");
+                debug!(request_id = %ctx.trace_id, header = %header_name, "Outbound: injected custom metadata as HTTP header");
             }
         }
         _ => {
@@ -3209,7 +3210,7 @@ async fn step_inject_custom_metadata(
         }
     }
 
-    debug!(request_id = %ctx.request_id, "Outbound: custom metadata injected");
+    debug!(request_id = %ctx.trace_id, "Outbound: custom metadata injected");
     Ok(())
 }
 
@@ -3247,7 +3248,7 @@ impl TargetCardRead {
         Self {
             target,
             agent_card_path,
-            request_id: ctx.request_id.clone(),
+            request_id: ctx.trace_id.clone(),
             log_label: ctx.surface.name.clone(),
             timeout: resolve_outbound_timeout(ctx),
             limits: agent_card_limits(state, ctx),
@@ -3507,7 +3508,7 @@ async fn step_collect_trust_context(
     .await;
 
     info!(
-        request_id = %ctx.request_id,
+        request_id = %ctx.trace_id,
         trust_verification = ?agent_ctx.trust_verification,
         "Outbound: target agent context built"
     );
@@ -3541,7 +3542,7 @@ async fn step_collect_trust_context(
                         }
                         Err(e) => {
                             warn!(
-                                request_id = %ctx.request_id,
+                                request_id = %ctx.trace_id,
                                 error = %format!("{e:#}"),
                                 "Outbound: target identity VP verification failed"
                             );
@@ -3555,7 +3556,7 @@ async fn step_collect_trust_context(
                     }
                 } else {
                     warn!(
-                        request_id = %ctx.request_id,
+                        request_id = %ctx.trace_id,
                         "Outbound: target identity VP present but no VCIssuer configured to verify it"
                     );
                     agent_ctx.did = None;
@@ -3568,7 +3569,7 @@ async fn step_collect_trust_context(
             }
             None => {
                 warn!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     "Outbound: target card carries no agent-identity-credential; cannot establish target identity for Trust Check"
                 );
                 agent_ctx.did = None;
@@ -3888,7 +3889,7 @@ async fn step_gateway_opa_policy(
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
     let Some(ref gw_pm) = state.gateway_policy_manager else {
-        info!(request_id = %ctx.request_id, "[OPA] Outbound gateway OPA skipped: no gateway_policy_manager");
+        info!(request_id = %ctx.trace_id, "[OPA] Outbound gateway OPA skipped: no gateway_policy_manager");
         return Ok(());
     };
 
@@ -3902,18 +3903,18 @@ async fn step_gateway_opa_policy(
     // policy is actually found and enforced on egress too. The policy can branch
     // on `input.gateway.direction == "outbound"` to gate egress specifically.
     let Some(gateway_id) = gw_pm.get_self_gateway_id() else {
-        info!(request_id = %ctx.request_id, "[OPA] Outbound gateway OPA skipped: no self gateway id");
+        info!(request_id = %ctx.trace_id, "[OPA] Outbound gateway OPA skipped: no self gateway id");
         return Ok(());
     };
     if !gw_pm.is_enforced(&gateway_id) {
         info!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             gateway_id = %gateway_id,
             "[OPA] Outbound gateway OPA skipped: no gateway policy configured, allowing"
         );
         return Ok(());
     }
-    info!(request_id = %ctx.request_id, "[OPA] Outbound gateway OPA using gateway_id={}", gateway_id);
+    info!(request_id = %ctx.trace_id, "[OPA] Outbound gateway OPA using gateway_id={}", gateway_id);
 
     let policy_input = build_outbound_policy_input(ctx);
     let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
@@ -3939,7 +3940,7 @@ async fn step_gateway_opa_policy(
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
         gateway_did: Some(&gateway_id),
-        trace_id: &ctx.request_id,
+        trace_id: &ctx.trace_id,
         policy_version,
         policy_content_hash: policy_hash.as_deref(),
         caller: caller.as_ref(),
@@ -3947,17 +3948,17 @@ async fn step_gateway_opa_policy(
     match gw_pm.evaluate_policy_decision(&gateway_id, input_value) {
         Ok(decision) if decision.allow => {
             audit.record(true, None);
-            debug!(request_id = %ctx.request_id, "Outbound gateway OPA policy allowed");
+            debug!(request_id = %ctx.trace_id, "Outbound gateway OPA policy allowed");
         }
         Ok(decision) => {
             audit.record(false, decision.reason.as_deref());
-            warn!(request_id = %ctx.request_id, "Outbound gateway OPA policy denied");
+            warn!(request_id = %ctx.trace_id, "Outbound gateway OPA policy denied");
             return Err(OutboundPipelineError::GatewayPolicyDenied);
         }
         Err(e) => {
             let error = crate::observability::PolicyEvaluationError::EvaluationError;
             audit.record_error(error);
-            warn!(request_id = %ctx.request_id, error = %e, "Gateway OPA evaluation error (denying)");
+            warn!(request_id = %ctx.trace_id, error = %e, "Gateway OPA evaluation error (denying)");
             return Err(OutboundPipelineError::GatewayPolicyError(error));
         }
     }
@@ -3984,7 +3985,7 @@ fn record_surface_policy_unavailable(
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
         gateway_did: None,
-        trace_id: &ctx.request_id,
+        trace_id: &ctx.trace_id,
         policy_version: None,
         policy_content_hash: None,
         caller: caller.as_ref(),
@@ -4003,13 +4004,13 @@ async fn step_surface_opa_policy(
         .outbound_shared
         .opa_policy_definition_id
     else {
-        info!(request_id = %ctx.request_id, "[OPA] Outbound channel OPA skipped: no opa_policy_definition_id on outbound config");
+        info!(request_id = %ctx.trace_id, "[OPA] Outbound channel OPA skipped: no opa_policy_definition_id on outbound config");
         return Ok(());
     };
 
     let Some(pm) = &state.policy_manager else {
         warn!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             "[OPA] Outbound channel OPA skipped: SurfacePolicyManager not available; denying"
         );
         return Err(record_surface_policy_unavailable(
@@ -4031,7 +4032,7 @@ async fn step_surface_opa_policy(
     // The compiled engine MUST exist when opa_policy_definition_id is set.
     if !pm.has_policy(&outbound_key) {
         warn!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             config_id = %config_id,
             "Outbound OPA policy is configured but engine not found (compilation may have failed); denying"
         );
@@ -4066,7 +4067,7 @@ async fn step_surface_opa_policy(
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
         gateway_did: None,
-        trace_id: &ctx.request_id,
+        trace_id: &ctx.trace_id,
         policy_version,
         policy_content_hash: policy_hash.as_deref(),
         caller: caller.as_ref(),
@@ -4074,17 +4075,17 @@ async fn step_surface_opa_policy(
     match pm.evaluate_policy_decision(&outbound_key, input_value) {
         Ok(decision) if decision.allow => {
             audit.record(true, None);
-            debug!(request_id = %ctx.request_id, "Outbound channel OPA policy allowed");
+            debug!(request_id = %ctx.trace_id, "Outbound channel OPA policy allowed");
         }
         Ok(decision) => {
             audit.record(false, decision.reason.as_deref());
-            warn!(request_id = %ctx.request_id, "Outbound channel OPA policy denied");
+            warn!(request_id = %ctx.trace_id, "Outbound channel OPA policy denied");
             return Err(OutboundPipelineError::SurfacePolicyDenied);
         }
         Err(e) => {
             let error = crate::observability::PolicyEvaluationError::EvaluationError;
             audit.record_error(error);
-            warn!(request_id = %ctx.request_id, error = %e, "Channel OPA evaluation error (denying)");
+            warn!(request_id = %ctx.trace_id, error = %e, "Channel OPA evaluation error (denying)");
             return Err(OutboundPipelineError::SurfacePolicyError(error));
         }
     }
@@ -4144,7 +4145,7 @@ async fn step_transit_point_opa_policy(
         .await;
 
         debug!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             alias = %ctx.virtual_channel.alias,
             trust_verification = ?agent_ctx.trust_verification,
             "Per-TP policy: agent context built on demand"
@@ -4155,7 +4156,7 @@ async fn step_transit_point_opa_policy(
 
     let Some(pm) = &state.policy_manager else {
         warn!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             alias = %ctx.virtual_channel.alias,
             "Per-transit-point OPA policy configured but SurfacePolicyManager not available; denying"
         );
@@ -4174,7 +4175,7 @@ async fn step_transit_point_opa_policy(
 
     if !pm.has_policy(&tp_key) {
         warn!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             alias = %ctx.virtual_channel.alias,
             "Per-transit-point OPA policy configured but engine not found; denying"
         );
@@ -4203,7 +4204,7 @@ async fn step_transit_point_opa_policy(
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
         gateway_did: None,
-        trace_id: &ctx.request_id,
+        trace_id: &ctx.trace_id,
         policy_version,
         policy_content_hash: policy_hash.as_deref(),
         caller: caller.as_ref(),
@@ -4212,7 +4213,7 @@ async fn step_transit_point_opa_policy(
         Ok(decision) if decision.allow => {
             audit.record(true, None);
             debug!(
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 alias = %ctx.virtual_channel.alias,
                 "Per-transit-point OPA policy allowed"
             );
@@ -4220,7 +4221,7 @@ async fn step_transit_point_opa_policy(
         Ok(decision) => {
             audit.record(false, decision.reason.as_deref());
             warn!(
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 alias = %ctx.virtual_channel.alias,
                 "Per-transit-point OPA policy denied"
             );
@@ -4230,7 +4231,7 @@ async fn step_transit_point_opa_policy(
             let error = crate::observability::PolicyEvaluationError::EvaluationError;
             audit.record_error(error);
             warn!(
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 alias = %ctx.virtual_channel.alias,
                 error = %e,
                 "Per-transit-point OPA evaluation error (denying)"
@@ -4302,7 +4303,7 @@ async fn step_transit_mcp_tool_gating(
     let Some(gating) = compiled_transit_mcp_tool_gating(state, ctx) else {
         if transit_mcp_tool_gating_configured(ctx) {
             warn!(
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 alias = %alias,
                 "Per-transit-point MCP tool gating is configured but not in force; blocking tools/call"
             );
@@ -4326,14 +4327,14 @@ async fn step_transit_mcp_tool_gating(
             policy_id: Some("mcp_tool_gating"),
             surface_id: Some(config_id),
             surface_name: Some(ctx.surface.name.as_str()),
-            trace_id: Some(ctx.request_id.as_str()),
+            trace_id: Some(ctx.trace_id.as_str()),
             http_method: Some(ctx.original_method.as_str()),
             path: Some(ctx.request_path.as_str()),
             caller: outbound_caller(ctx).as_ref(),
             ..Default::default()
         });
         warn!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             alias = %alias,
             "Per-transit-point MCP tool gating blocked tools/call without a readable tool name"
         );
@@ -4376,7 +4377,7 @@ async fn step_transit_mcp_tool_gating(
         policy_id: Some("mcp_tool_gating"),
         surface_id: Some(config_id),
         surface_name: Some(ctx.surface.name.as_str()),
-        trace_id: Some(ctx.request_id.as_str()),
+        trace_id: Some(ctx.trace_id.as_str()),
         http_method: Some(ctx.original_method.as_str()),
         path: Some(ctx.request_path.as_str()),
         caller: outbound_caller(ctx).as_ref(),
@@ -4385,7 +4386,7 @@ async fn step_transit_mcp_tool_gating(
 
     if !allowed {
         warn!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             alias = %alias,
             tool = %tool_name,
             "Per-transit-point MCP tool gating blocked tools/call"
@@ -4446,7 +4447,7 @@ fn step_transit_point_response_policy(
 
     let Some(pm) = state.policy_manager.as_ref() else {
         warn!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             alias = %ctx.virtual_channel.alias,
             "Per-transit-point response OPA policy configured but SurfacePolicyManager not available; denying"
         );
@@ -4461,7 +4462,7 @@ fn step_transit_point_response_policy(
 
     if !pm.has_policy(&policy_key) {
         warn!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             alias = %ctx.virtual_channel.alias,
             "Per-transit-point response OPA policy configured but engine not found; denying"
         );
@@ -4527,7 +4528,7 @@ fn step_transit_point_response_policy(
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
         gateway_did: None,
-        trace_id: &ctx.request_id,
+        trace_id: &ctx.trace_id,
         policy_version: response_policy.version,
         policy_content_hash: response_policy
             .content_hash
@@ -4540,7 +4541,7 @@ fn step_transit_point_response_policy(
             None => audit.record(false, decision.reason.as_deref()),
         }
         warn!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             alias = %ctx.virtual_channel.alias,
             reason = ?decision.reason,
             "Per-transit-point response OPA policy denied — blocking response"
@@ -4549,7 +4550,7 @@ fn step_transit_point_response_policy(
     }
     audit.record(true, None);
     debug!(
-        request_id = %ctx.request_id,
+        request_id = %ctx.trace_id,
         alias = %ctx.virtual_channel.alias,
         "Per-transit-point response OPA policy allowed"
     );
@@ -4776,7 +4777,7 @@ async fn step_inject_trusted_identity(
         ChannelProtocol::A2a | ChannelProtocol::Ap2 | ChannelProtocol::Mcp => {}
         _ => {
             error!(
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 protocol = ?protocol,
                 "Identity injection not implemented for protocol {:?}",
                 protocol
@@ -4790,7 +4791,7 @@ async fn step_inject_trusted_identity(
 
     let Some(ref vc_issuer) = state.vc_issuer else {
         error!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             "Resolved identity present but VCIssuer not configured"
         );
         return Err(OutboundPipelineError::IdentityInjectionFailed("VCIssuer is not configured".to_string()));
@@ -4821,7 +4822,7 @@ async fn step_inject_trusted_identity(
             crate::proxy::workload_binding::WorkloadBindingInputs {
                 agent_identity_fields: Some(identity_fields),
                 caller: captured.as_ref(),
-                trace_id: Some(&ctx.request_id),
+                trace_id: Some(&ctx.trace_id),
                 target: Some(
                     ctx.virtual_channel
                         .target_endpoint
@@ -4873,14 +4874,14 @@ async fn step_inject_trusted_identity(
             .await
             .map_err(|e| {
                 error!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     error = %e,
                     "Failed to inject A2A identity credential"
                 );
                 OutboundPipelineError::IdentityInjectionFailed(e.to_string())
             })?;
             ctx.body_bytes = Some(signed);
-            debug!(request_id = %ctx.request_id, did = %did, "Outbound A2A identity credential injected");
+            debug!(request_id = %ctx.trace_id, did = %did, "Outbound A2A identity credential injected");
             Some(vp_jwt)
         }
         ChannelProtocol::Mcp => {
@@ -4910,14 +4911,14 @@ async fn step_inject_trusted_identity(
             .await
             .map_err(|e| {
                 error!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     error = %e,
                     "Failed to inject MCP identity credential"
                 );
                 OutboundPipelineError::IdentityInjectionFailed(e.to_string())
             })?;
             ctx.body_bytes = Some(signed);
-            debug!(request_id = %ctx.request_id, did = %did, "Outbound MCP identity credential injected");
+            debug!(request_id = %ctx.trace_id, did = %did, "Outbound MCP identity credential injected");
             vp_jwt
         }
         _ => unreachable!("unsupported protocols filtered above"),
@@ -4944,7 +4945,7 @@ async fn step_inject_trusted_identity(
                 protocol: &format!("{:?}", protocol).to_lowercase(),
                 mcp_tool_name: None,
                 vp_jwt: &vp_jwt,
-                trace_id: Some(&ctx.request_id),
+                trace_id: Some(&ctx.trace_id),
                 detail: "transit_point".to_string(),
                 caller: outbound_caller(ctx),
                 via_fabric: true,
@@ -4986,7 +4987,7 @@ async fn step_prepare_modern_credentials(
     if let Some(reason) = modern_fabric_caller_refusal(ctx) {
         warn!(
             target: "credential_delegation",
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
             reason,
             "Delegated credentials are not released for this request that arrived over Fabric - refusing the request"
@@ -5068,7 +5069,7 @@ fn modern_fabric_caller_refusal(ctx: &OutboundPipelineContext) -> Option<&'stati
 fn log_fabric_delegation_withheld(ctx: &OutboundPipelineContext) {
     debug!(
         target: "credential_delegation",
-        request_id = %ctx.request_id,
+        request_id = %ctx.trace_id,
         surface_id = %ctx.surface.surface_id,
         surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
         route = %ctx.virtual_channel.alias,
@@ -5262,7 +5263,7 @@ fn refuse_if_peer_refused_target_credential(
     if !response.refused_credential_in(injected) {
         return Ok(());
     }
-    warn!(request_id = %ctx.request_id, header = injected, "The peer gateway refused the Transit Point's Target credential");
+    warn!(request_id = %ctx.trace_id, header = injected, "The peer gateway refused the Transit Point's Target credential");
     crate::proxy::handler::record_target_credential_refused_by_target(
         &transit_audit_facts(ctx),
         Some(&ctx.virtual_channel.alias),
@@ -5298,7 +5299,7 @@ fn record_partner_consent_refusal(ctx: &OutboundPipelineContext) {
     let refusal = DelegationRefusal::ConsentNotAvailableForPartners;
     warn!(
         target: "credential_delegation",
-        request_id = %ctx.request_id,
+        request_id = %ctx.trace_id,
         surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
         reason = crate::proxy::credential_delegation::PARTNER_CONSENT_UNAVAILABLE_REASON,
         "The caller of a request that arrived over Fabric has no grant, and consent is not started through a \
@@ -5320,7 +5321,7 @@ fn record_body_too_large(
     max_bytes: usize,
 ) {
     warn!(
-        request_id = %ctx.request_id,
+        request_id = %ctx.trace_id,
         transit_point = %ctx.virtual_channel.alias,
         max = max_bytes,
         "Request body too large"
@@ -5329,7 +5330,7 @@ fn record_body_too_large(
         &crate::audit::request_events::RequestFacts {
             surface_id: &ctx.surface.surface_id,
             channel_name: &ctx.surface.name,
-            trace_id: Some(&ctx.request_id),
+            trace_id: Some(&ctx.trace_id),
             via_fabric: false,
         },
         crate::audit::request_events::RejectionStage::Admission,
@@ -5414,7 +5415,7 @@ async fn step_inject_credentials(
         _ => {
             warn!(
                 target: "credential_delegation",
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 surface_variant = surface_variant.as_deref(),
                 "Credential delegation configured but stores not available - refusing the request"
             );
@@ -5434,7 +5435,7 @@ async fn step_inject_credentials(
             {
                 warn!(
                     target: "credential_delegation",
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     surface_variant = surface_variant.as_deref(),
                     reason = "no_fabric_caller_verified",
                     "The receiving surface verified no caller of the request that arrived over Fabric - refusing \
@@ -5443,7 +5444,7 @@ async fn step_inject_credentials(
             } else {
                 warn!(
                     target: "credential_delegation",
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     surface_variant = surface_variant.as_deref(),
                     reason = "delegated_credentials_for_fabric_callers=false",
                     "Delegated credentials are not released for requests that arrived over Fabric - refusing the \
@@ -5453,7 +5454,7 @@ async fn step_inject_credentials(
         } else {
             warn!(
                 target: "credential_delegation",
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 surface_variant = surface_variant.as_deref(),
                 "Neither the transit token nor the Transit Point's source_auth identifies the caller - refusing the request"
             );
@@ -5464,7 +5465,7 @@ async fn step_inject_credentials(
     let Some(agent_did) = delegation_agent_did(ctx).map(str::to_string) else {
         warn!(
             target: "credential_delegation",
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             surface_variant = surface_variant.as_deref(),
             "No managed agent identity for delegated credentials - refusing the request"
         );
@@ -5567,7 +5568,7 @@ async fn step_inject_credentials(
     if !consent_entries.is_empty() {
         info!(
             target: "credential_delegation",
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             surface_variant = surface_variant.as_deref(),
             providers = %consent_entries.len(),
             user_hash = %user_hash,
@@ -5610,7 +5611,7 @@ fn apply_credential_injections(
                 let Some(body_bytes) = ctx.body_bytes.as_ref() else {
                     warn!(
                         target: "credential_delegation",
-                        request_id = %ctx.request_id,
+                        request_id = %ctx.trace_id,
                         surface_variant = surface_variant.as_deref(),
                         meta_field = %field,
                         "Failed to inject delegated credential into outbound MCP metadata because body is unavailable"
@@ -5624,7 +5625,7 @@ fn apply_credential_injections(
                         ctx.body_bytes = Some(modified.into());
                         debug!(
                             target: "credential_delegation",
-                            request_id = %ctx.request_id,
+                            request_id = %ctx.trace_id,
                             surface_variant = surface_variant.as_deref(),
                             meta_field = %field,
                             "Injecting delegated credential into outbound MCP metadata"
@@ -5633,7 +5634,7 @@ fn apply_credential_injections(
                     Err(error) => {
                         warn!(
                             target: "credential_delegation",
-                            request_id = %ctx.request_id,
+                            request_id = %ctx.trace_id,
                             surface_variant = surface_variant.as_deref(),
                             meta_field = %field,
                             error = %error,
@@ -5646,7 +5647,7 @@ fn apply_credential_injections(
             crate::proxy::credential_delegation::ResolvedCredentialInjection::Header { name, value } => {
                 debug!(
                     target: "credential_delegation",
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     surface_variant = surface_variant.as_deref(),
                     header = %name,
                     "Injecting delegated credential header into outbound request"
@@ -5656,7 +5657,7 @@ fn apply_credential_injections(
                 else {
                     warn!(
                         target: "credential_delegation",
-                        request_id = %ctx.request_id,
+                        request_id = %ctx.trace_id,
                         surface_variant = surface_variant.as_deref(),
                         header = %name,
                         "Delegated credential is not a valid header - refusing the request"
@@ -5684,7 +5685,7 @@ fn refuse_grant(
 ) -> OutboundPipelineError {
     warn!(
         target: "credential_delegation",
-        request_id = %ctx.request_id,
+        request_id = %ctx.trace_id,
         surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
         reason,
         refusal = refusal.reason(),
@@ -5735,7 +5736,7 @@ fn refuse_external_grant(
 fn refuse_a_changed_mcp_proxy(ctx: &OutboundPipelineContext) -> OutboundPipelineError {
     warn!(
         target: "credential_delegation",
-        request_id = %ctx.request_id,
+        request_id = %ctx.trace_id,
         surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
         alias = %ctx.virtual_channel.alias,
         transit_point_id = ?ctx.virtual_channel.id,
@@ -5843,7 +5844,7 @@ async fn step_inject_external_grant(
     {
         warn!(
             target: "credential_delegation",
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
             "A 2026-07-28 MCP request was sent to a Transit Point with external consent - refusing the request"
         );
@@ -5853,7 +5854,7 @@ async fn step_inject_external_grant(
     if through_proxy && !calls_an_mcp_proxy_tool(ctx) {
         debug!(
             target: "credential_delegation",
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             alias = %ctx.virtual_channel.alias,
             "The request to the Transit Point's MCP Proxy calls no tool - its grant is not released"
         );
@@ -5884,7 +5885,7 @@ async fn step_inject_external_grant(
     let Some(caller) = delegation_caller_hash(ctx) else {
         warn!(
             target: "credential_delegation",
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             reason = "caller_not_identified",
             "The Transit Point's grant by binding cannot be released - refusing the request"
         );
@@ -6011,7 +6012,7 @@ async fn step_inject_external_grant(
     // Through an MCP Proxy, the grant's use is recorded when the tool call
     // that carries it is sent ([`record_mcp_proxy_grant_sent`]).
     if !through_proxy {
-        crate::delegation_vault::release::record_use_in_background(vault, &grant, Some(ctx.request_id.clone()));
+        crate::delegation_vault::release::record_use_in_background(vault, &grant, Some(ctx.trace_id.clone()));
         log_grant_injected(ctx, &caller, &provider, &grant, subject);
     }
     ctx.released_grant = Some(Box::new(ReleasedGrant {
@@ -6046,7 +6047,7 @@ fn record_mcp_proxy_grant_sent(
         crate::delegation_vault::release::record_use_in_background(
             vault,
             &released.grant,
-            Some(ctx.request_id.clone()),
+            Some(ctx.trace_id.clone()),
         );
     }
     let caller = delegation_caller_hash(ctx).unwrap_or_default();
@@ -6112,7 +6113,7 @@ fn audit_connector_call(
     else {
         warn!(
             target: "credential_delegation",
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             transit_point = %ctx.virtual_channel.id,
             surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
             "A connector call's Transit Point has no connector binding - its connector_call was not recorded"
@@ -6283,7 +6284,7 @@ fn refuse_mcp_proxy_transit(
     reason: &'static str,
 ) -> OutboundPipelineError {
     warn!(
-        request_id = %ctx.request_id,
+        request_id = %ctx.trace_id,
         alias = %ctx.virtual_channel.alias,
         surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
         reason,
@@ -6463,7 +6464,7 @@ async fn step_forward_request_mcp_proxy(
         .unwrap_or("unknown")
         .to_string();
     debug!(
-        request_id = %ctx.request_id,
+        request_id = %ctx.trace_id,
         alias = %ctx.virtual_channel.alias,
         proxy_id = %proxy.id,
         "Outbound: answering through the Transit Point's MCP Proxy"
@@ -6535,7 +6536,7 @@ async fn step_forward_request_mcp_proxy(
         }
         Err(McpProxyCallError::Failed(message)) => {
             warn!(
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 alias = %ctx.virtual_channel.alias,
                 proxy_id = %proxy.id,
                 error = ?message,
@@ -6581,7 +6582,7 @@ async fn grant_forward_client(
     .map_err(|error| {
         warn!(
             target: "credential_delegation",
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
             error = ?error.to_string(),
             "The target of a request carrying a grant by binding was refused by Strict egress"
@@ -6613,7 +6614,7 @@ async fn fabric_forward_headers(
                 .delegated_credential_headers
                 .contains_key(key)
             {
-                warn!(request_id = %ctx.request_id, header = %key, "Delegated credential header is not a string Fabric can carry - refusing the request");
+                warn!(request_id = %ctx.trace_id, header = %key, "Delegated credential header is not a string Fabric can carry - refusing the request");
                 return Err(refuse_delegation(ctx, DelegationRefusal::Unavailable));
             }
             if credential_headers
@@ -6623,7 +6624,7 @@ async fn fabric_forward_headers(
                         .eq_ignore_ascii_case(credential)
                 })
             {
-                warn!(request_id = %ctx.request_id, header = %key, "Target authentication header is not a string Fabric can carry - refusing the request");
+                warn!(request_id = %ctx.trace_id, header = %key, "Target authentication header is not a string Fabric can carry - refusing the request");
                 if let Some(target_auth) = ctx
                     .virtual_channel
                     .target_auth
@@ -6701,7 +6702,7 @@ async fn step_forward_request_fabric(
         .as_ref()
         && !crate::proxy::paths::appended_path_stays_below_base(&path)
     {
-        warn!(request_id = %ctx.request_id, "Refusing a Transit Point request that climbs out of its path: it would carry the Target credential");
+        warn!(request_id = %ctx.trace_id, "Refusing a Transit Point request that climbs out of its path: it would carry the Target credential");
         return Err(refuse_path_outside_target_base(ctx, target_auth));
     }
 
@@ -6715,7 +6716,7 @@ async fn step_forward_request_fabric(
     let timeout = resolve_outbound_timeout(ctx);
 
     debug!(
-        request_id = %ctx.request_id,
+        request_id = %ctx.trace_id,
         target = %fabric_target,
         path = %path,
         method = %ctx.original_method,
@@ -6741,12 +6742,12 @@ async fn step_forward_request_fabric(
                     .mcp_http
                     .clone()
                     .unwrap_or_default(),
-                trace_id: uuid::Uuid::parse_str(&ctx.request_id).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+                trace_id: uuid::Uuid::parse_str(&ctx.trace_id).unwrap_or_else(|_| uuid::Uuid::new_v4()),
             },
         )
         .await
         .map_err(|error| {
-            warn!(request_id = %ctx.request_id, %error, "Modern outbound Fabric forward failed");
+            warn!(request_id = %ctx.trace_id, %error, "Modern outbound Fabric forward failed");
             let request_id = match ctx
                 .mcp_classification
                 .as_ref()
@@ -6779,14 +6780,14 @@ async fn step_forward_request_fabric(
             headers: headers_map,
             body,
             timeout,
-            trace_id: &ctx.request_id,
+            trace_id: &ctx.trace_id,
             log_label: &ctx.surface.name,
             extra_body: None,
         },
     )
     .await
     .map_err(|e| {
-        error!(request_id = %ctx.request_id, error = %e, "Outbound fabric forward failed");
+        error!(request_id = %ctx.trace_id, error = %e, "Outbound fabric forward failed");
         match e {
             FabricForwardError::NoResponse(_) | FabricForwardError::ReplyNotReceived(_) => {
                 OutboundPipelineError::UpstreamTimeout
@@ -6881,7 +6882,7 @@ async fn step_forward_request_http(
                 .as_deref(),
         )
     {
-        warn!(request_id = %ctx.request_id, "Refusing a Transit Point request outside its base path: it would carry the Target credential");
+        warn!(request_id = %ctx.trace_id, "Refusing a Transit Point request outside its base path: it would carry the Target credential");
         return Err(refuse_path_outside_target_base(ctx, target_auth));
     }
 
@@ -6905,7 +6906,7 @@ async fn step_forward_request_http(
             Ok(Ok((client, _target))) => client,
             Ok(Err(e)) => {
                 warn!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     target = %loggable::url(&target_url),
                     "SSRF blocked at forwarding layer: {}",
                     e
@@ -6914,7 +6915,7 @@ async fn step_forward_request_http(
             }
             Err(e) => {
                 warn!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     target = %loggable::url(&target_url),
                     "SSRF egress validation task failed: {}",
                     e
@@ -6925,7 +6926,7 @@ async fn step_forward_request_http(
     };
 
     debug!(
-        request_id = %ctx.request_id,
+        request_id = %ctx.trace_id,
         target = %loggable::url(&target_url),
         method = %ctx.original_method,
         "Outbound: forwarding request"
@@ -7003,10 +7004,10 @@ async fn step_forward_request_http(
         .map_err(|e| {
             let e = e.without_url();
             if e.is_timeout() {
-                warn!(request_id = %ctx.request_id, error = %e, "Outbound request timed out");
+                warn!(request_id = %ctx.trace_id, error = %e, "Outbound request timed out");
                 OutboundPipelineError::UpstreamTimeout
             } else {
-                error!(request_id = %ctx.request_id, error = %e, "Outbound request failed");
+                error!(request_id = %ctx.trace_id, error = %e, "Outbound request failed");
                 OutboundPipelineError::UpstreamConnectionFailed(e.to_string())
             }
         })
@@ -7220,7 +7221,7 @@ fn refuse_a_compressed_answer(
     }
     if crate::proxy::upstream_body::is_compressed(response.headers()) {
         warn!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             alias = %ctx.virtual_channel.alias,
             surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
             "A Transit Point's target compressed its answer although none was accepted - refusing it, since \
@@ -7390,7 +7391,7 @@ fn filter_transit_mcp_tools_list(
     let Some(gating) = compiled_transit_mcp_tool_gating(state, ctx) else {
         if transit_mcp_tool_gating_configured(ctx) {
             warn!(
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 alias = %alias,
                 "Per-transit-point MCP tool gating is configured but not in force; failing closed (empty tool list)"
             );
@@ -7421,7 +7422,7 @@ fn filter_transit_mcp_tools_list(
             // parseable response; it only handles a response we cannot inspect.
             None => {
                 warn!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     alias = %alias,
                     "Per-transit-point MCP tools/list response unparsable under gating; failing closed (empty tool list)"
                 );
@@ -7485,7 +7486,7 @@ fn filter_transit_mcp_tools_list(
     let after = tools.len();
     if after < before {
         info!(
-            request_id = %ctx.request_id,
+            request_id = %ctx.trace_id,
             alias = %alias,
             before,
             after,
@@ -7525,7 +7526,7 @@ async fn step_process_response(
             let body = crate::proxy::upstream_body::read_bounded(resp, limits).await;
             let body_bytes = body.map_err(|e| {
                 error!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     error = %e,
                     "Failed to read upstream response body"
                 );
@@ -7640,7 +7641,7 @@ async fn process_modern_outbound_response(
                     let (state, ctx) = &mut *snapshot;
                     process_outbound_response_body(state, ctx, status, headers, bytes, &response_policy).map_err(
                         |error| {
-                            warn!(request_id = %ctx.request_id, error = %error, "Modern MCP response rejected");
+                            warn!(request_id = %ctx.trace_id, error = %error, "Modern MCP response rejected");
                             SseReadError::ResponseRejected
                         },
                     )?
@@ -7671,7 +7672,7 @@ async fn process_modern_outbound_response(
     .map_err(|error| {
         if let Ok(snapshot) = shared.lock() {
             let (state, ctx) = &*snapshot;
-            warn!(request_id = %ctx.request_id, error = %error, "Invalid modern MCP upstream response");
+            warn!(request_id = %ctx.trace_id, error = %error, "Invalid modern MCP upstream response");
             step_record_metrics(state, ctx, false);
         }
         OutboundPipelineError::UpstreamResponseReadFailed
@@ -7683,7 +7684,7 @@ async fn process_modern_outbound_response(
             if outcome.completed || outcome.failed {
                 step_record_metrics(state, ctx, outcome.completed && status.is_success());
             } else {
-                warn!(request_id = %ctx.request_id, response_bytes = outcome.bytes, "Modern MCP response ended before completion");
+                warn!(request_id = %ctx.trace_id, response_bytes = outcome.bytes, "Modern MCP response ended before completion");
             }
         }
     }))
@@ -7721,13 +7722,13 @@ fn process_outbound_response_body(
     {
         if let Err(e) = rules_engine.validate(&json, &ctx.surface.name) {
             warn!(
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 error = %e,
                 "Outbound response extension validation failed"
             );
             return Err(OutboundPipelineError::ResponseValidationFailed(e.to_string()));
         }
-        debug!(request_id = %ctx.request_id, "Outbound: response extension validation passed");
+        debug!(request_id = %ctx.trace_id, "Outbound: response extension validation passed");
     }
 
     // Per-Transit-Point Response OPA Policy.
@@ -7795,14 +7796,14 @@ fn process_outbound_response_body(
         match rewritten {
             Ok(Some(rewritten)) => {
                 info!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     "Rewrote outbound agent card URLs to outbound virtual channel endpoint"
                 );
                 rewritten
             }
             Ok(None) => body_bytes,
             Err(e) if is_extended_card_response => {
-                warn!(request_id = %ctx.request_id, error = %e, "Failed to rewrite outbound extended agent card URLs");
+                warn!(request_id = %ctx.trace_id, error = %e, "Failed to rewrite outbound extended agent card URLs");
                 return Err(OutboundPipelineError::UnrewritableExtendedAgentCardResponse {
                     rpc_request_id: is_rpc_extended_card_response.then(|| {
                         ctx.body_bytes
@@ -7814,7 +7815,7 @@ fn process_outbound_response_body(
             }
             Err(e) => {
                 warn!(
-                    request_id = %ctx.request_id,
+                    request_id = %ctx.trace_id,
                     error = %e,
                     "Failed to rewrite outbound agent card URLs, returning original"
                 );
@@ -7844,7 +7845,7 @@ fn process_outbound_response_body(
         .body(axum::body::Body::from(body_bytes))
         .map_err(|e| {
             error!(
-                request_id = %ctx.request_id,
+                request_id = %ctx.trace_id,
                 error = %e,
                 "Failed to build outbound response"
             );
@@ -7866,7 +7867,7 @@ fn step_record_metrics(
         .as_millis() as u64;
 
     debug!(
-        request_id = %ctx.request_id,
+        request_id = %ctx.trace_id,
         latency_ms = latency_ms,
         resolved_identity = ?ctx.resolved_identity,
         virtual_channel = %ctx.virtual_channel.alias,
@@ -8298,7 +8299,7 @@ mod tests {
             target_agent_card_unavailable: false,
             target_identity_failure: None,
             trust_check_results: None,
-            request_id: "test-request-id".to_string(),
+            trace_id: "test-request-id".to_string(),
             start_time: Instant::now(),
             _outbound_rules_engine: None,
             outbound_response_rules_engine: None,
@@ -16171,7 +16172,7 @@ mod tests {
             ctx.transit_token_claims
                 .is_none()
         );
-        assert_eq!(ctx.request_id, "test-request-id");
+        assert_eq!(ctx.trace_id, "test-request-id");
         let caller = transit_caller_json(&ctx);
         assert_eq!(caller["verification"], "unverified", "{caller}");
         assert_eq!(caller["did"], "did:example:caller", "{caller}");
@@ -23352,7 +23353,7 @@ mod tests {
                         reason,
                         http_status,
                         rpc_error_code,
-                        event.trace_id == Some(ctx.request_id.clone()),
+                        event.trace_id == Some(ctx.trace_id.clone()),
                         event.surface_id == Some(ctx.surface.surface_id.clone()),
                         event.surface_variant == Some("beta".to_string()),
                     )),
@@ -23677,7 +23678,7 @@ mod tests {
                 }))
                 .unwrap(),
             );
-            let request_id = ctx.request_id.clone();
+            let request_id = ctx.trace_id.clone();
             let (sent, events) = crate::audit::producer::capture(transit_request_headers(&state, &mut ctx)).await;
             assert_eq!(sent.is_err(), refused, "{fallback}");
             let records: Vec<_> = events
