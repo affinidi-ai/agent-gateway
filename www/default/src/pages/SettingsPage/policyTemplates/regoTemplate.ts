@@ -15,6 +15,16 @@ export function defaultParameterValues(template: PolicyTemplate): ParameterValue
   return Object.fromEntries(template.parameters.map(p => [p.key, p.default]));
 }
 
+/** The settings the examples use: each setting's sample, or its default when it has none. */
+export function sampleParameterValues(template: PolicyTemplate): ParameterValues {
+  return Object.fromEntries(template.parameters.map(p => [p.key, sampleOf(p) ?? p.default]));
+}
+
+/** A deployment-specific setting's sample value, or undefined for any other setting. */
+export function sampleOf(param: PolicyTemplateParameter): string | string[] | undefined {
+  return param.kind === 'string' || param.kind === 'string_list' ? param.sample : undefined;
+}
+
 /** Splits a comma- or line-separated text field into trimmed, non-empty values. */
 export function parseListInput(text: string): string[] {
   return text

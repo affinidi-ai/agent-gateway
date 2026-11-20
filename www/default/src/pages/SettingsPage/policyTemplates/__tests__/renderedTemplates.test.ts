@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { BUILTIN_POLICY_TEMPLATES } from '../builtinPolicyTemplates';
-import { defaultParameterValues, renderTemplate } from '../regoTemplate';
+import { renderTemplate, sampleParameterValues } from '../regoTemplate';
 import type { ParameterValues, PolicyTemplate } from '../types';
 
 const FIXTURE = path.join(__dirname, '..', '__fixtures__', 'renderedTemplates.json');
@@ -32,14 +32,14 @@ const BUSINESS_HOURS_VARIANTS: Record<string, ParameterValues> = {
 
 function renderModule(template: PolicyTemplate, values: ParameterValues): string {
   const { rego, errors } = renderTemplate(template, {
-    ...defaultParameterValues(template),
+    ...sampleParameterValues(template),
     ...values,
   });
   if (rego === null) throw new Error(`${template.id} does not render: ${JSON.stringify(errors)}`);
   return rego;
 }
 
-/** Every built-in template with its defaults, keyed `<id>:<type>`, and the business-hours
+/** Every built-in template with its sample settings, keyed `<id>:<type>`, and the business-hours
  * variants, keyed `<id>:<variant>:<type>`, in key order. */
 function templateModules(): Record<string, string> {
   const rendered: Record<string, string> = {};

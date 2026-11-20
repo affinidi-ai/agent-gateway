@@ -15,6 +15,7 @@ function renderList(
   {
     otherTypeGroups = [],
     ruleUse = () => null,
+    groupUse = () => null,
     canEdit = true,
     justAdded = null,
     startedFrom = null,
@@ -22,6 +23,7 @@ function renderList(
   }: {
     otherTypeGroups?: (PolicyType | null)[];
     ruleUse?: (rule: { head: string }) => RuleUse | null;
+    groupUse?: () => RuleUse | null;
     canEdit?: boolean;
     justAdded?: string | null;
     startedFrom?: string | null;
@@ -45,7 +47,7 @@ function renderList(
       onRemoveGroup={noop}
       onRemoveRule={noop}
       ruleUse={ruleUse}
-      groupUse={() => null}
+      groupUse={groupUse}
       startedFrom={startedFrom}
       onSetDefaultDeny={noop}
       onShowRule={noop}
@@ -159,6 +161,29 @@ describe('PolicyRulesList', () => {
       'title',
       'Another rule uses this; remove that rule first.'
     );
+  });
+
+  it('refuses Remove on a rule that sets allow in a way the Rules view cannot read', () => {
+    renderList('package p\n\ndefault allow := true\n\nallow := false if input.x\n', {
+      ruleUse: () => ({ kind: 'sets-allow' }),
+    });
+    const text =
+      "This rule sets allow in a way the Rules view can't read; remove it in the Rego view.";
+    expect(screen.getByTestId('policy-rules-group-0-rule-0-in-use')).toHaveTextContent(text);
+    const remove = screen.getByTestId('policy-rules-group-0-rule-0-remove-button');
+    expect(remove).toBeDisabled();
+    expect(remove).toHaveAttribute('title', text);
+  });
+
+  it('refuses Remove group on a template with a rule that sets allow', () => {
+    renderList(
+      'package p\n\ndefault allow := true\n\n# Inserted from template: Block x\nallow := false if input.x\n# End of template: Block x\n',
+      { groupUse: () => ({ kind: 'sets-allow' }) }
+    );
+    expect(screen.getByTestId('policy-rules-group-0-in-use')).toHaveTextContent(
+      "A rule in this template sets allow in a way the Rules view can't read; remove it in the Rego view."
+    );
+    expect(screen.getByTestId('policy-rules-group-0-remove-button')).toBeDisabled();
   });
 
   it('marks a group written for the other Type and says to remove it', () => {
@@ -432,5 +457,14 @@ describe('PolicyRulesList role badges', () => {
     );
     expect(kind(1)).toHaveTextContent(/^Deny reason$/);
     expect(kind(2)).toHaveTextContent(/^Allows$/);
+  });
+
+  it('marks an allow that sets allow to false as Sets allow, not Allows', () => {
+    renderList('package p\n\ndefault allow := true\n\nallow := false if input.x\n');
+    expect(kind(0)).toHaveTextContent(/^Sets allow$/);
+    expect(kind(0)).toHaveAttribute(
+      'title',
+      "Sets allow in a way the Rules view can't read; read the Rego"
+    );
   });
 });

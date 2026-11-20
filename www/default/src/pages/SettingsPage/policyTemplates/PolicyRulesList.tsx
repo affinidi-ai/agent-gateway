@@ -47,6 +47,7 @@ interface PolicyRulesListProps {
 
 const ROLE_LABEL: Record<RuleRole, string> = {
   allow: 'Allows',
+  'sets-allow': 'Sets allow',
   'deny-reason': 'Deny reason',
   'used-by-allow': 'Used by allow',
   'not-used-by-allow': 'Not used by allow',
@@ -54,6 +55,7 @@ const ROLE_LABEL: Record<RuleRole, string> = {
 
 const ROLE_TITLE: Record<RuleRole, string> = {
   allow: 'Allows the request when its conditions match',
+  'sets-allow': "Sets allow in a way the Rules view can't read; read the Rego",
   'deny-reason': 'Gives the reason a request was denied; does not decide it',
   'used-by-allow': 'allow reads this rule, directly or through other rules',
   'not-used-by-allow':
@@ -100,15 +102,21 @@ const DOCUMENT_READ =
 const readerText = (use: RuleUse) =>
   use.kind === 'reader' ? ` (${use.name}, line ${use.line})` : '';
 
+const SETS_ALLOW = "sets allow in a way the Rules view can't read; remove it in the Rego view.";
+
 const ruleInUseText = (use: RuleUse) =>
   use.kind === 'document'
     ? DOCUMENT_READ
-    : `Another rule uses this${readerText(use)}; remove that rule first.`;
+    : use.kind === 'sets-allow'
+      ? `This rule ${SETS_ALLOW}`
+      : `Another rule uses this${readerText(use)}; remove that rule first.`;
 
 const groupInUseText = (use: RuleUse) =>
   use.kind === 'document'
     ? DOCUMENT_READ
-    : `A rule outside this template uses its rules${readerText(use)}; remove that rule first.`;
+    : use.kind === 'sets-allow'
+      ? `A rule in this template ${SETS_ALLOW}`
+      : `A rule outside this template uses its rules${readerText(use)}; remove that rule first.`;
 
 const otherTypeOf = (type: PolicyType): PolicyType =>
   type === 'gateway' ? 'agent_surface' : 'gateway';

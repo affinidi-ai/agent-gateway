@@ -3,7 +3,7 @@ import { Tab, Tabs } from 'react-bootstrap';
 import { useSearchParams } from 'react-router-dom';
 import SearchInput from '../components/shared/SearchInput';
 import PolicyListTab from './PoliciesPage/PolicyListTab';
-import type { PolicyType } from './SettingsPage/policyTemplates/types';
+import type { PolicyType } from '../types';
 
 const PoliciesPage: React.FC = () => {
   const validTabs: PolicyType[] = ['gateway', 'agent_surface'];

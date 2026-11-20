@@ -55,7 +55,7 @@ Every gateway and surface policy input carries these fields (`PolicyInput` in
 
 | Field | Value |
 | --- | --- |
-| `input.http.method`, `input.http.path` | The request's HTTP method and path. On a Transit Point, the request the managed agent sends. |
+| `input.http.method`, `input.http.path` | The request's HTTP method and its whole path, which starts with the Access Point route (`/my-surface/public/docs` for a route `/my-surface`). On a Transit Point, the request the managed agent sends: its path starts with `/outbound`, the route and the Transit Point's alias (`/outbound/my-surface/partner-a/...`), or with the Transit Point's own `listen_path`. |
 | `input.http.headers` | The request's headers, without credential headers such as `Authorization`, cookies and API keys. |
 | `input.channel.config_id` | The surface id: unique, and unchanged when the surface is renamed. |
 | `input.channel.name` | The surface's display name, which other surfaces may share. |
@@ -725,6 +725,12 @@ caller. It names two principals, each in its own field, because one call can car
 A rule about the end user reads `caller`, and a rule about the client reads `client`;
 neither stands in for the other. A policy that reads `caller` must test `verified` first: a
 caller named only by an unverified DID is reported, and never as verified.
+
+The policy editor's built-in templates that read the caller (`input.source_auth`,
+`input.agent` or `input.extension_identity`) decide on the Access Point and Target request
+policies. On a Transit Point `input.source_auth` is the client the Transit Point
+authenticated, `input.agent` describes the destination and there is no
+`input.extension_identity`; an inbound response policy gets none of the three.
 
 A Transit Point's response policy gets `input.transit`, and `input.source_auth` when the
 Transit Point authenticated a client, beside its `input.response`, `input.caller` and

@@ -1939,11 +1939,27 @@ Create custom policy) in `useTemplateGallery`.
   (`policy-template-role-badge`: "Whole policy" with `fa-file-shield`, "Adds rules" with
   `fa-list-check`); Start from cards and their detail show no role or default decision badge.
   A custom policy is a whole policy. Allow listed
-  paths denies a path that contains `..`, `%2e`, a backslash or `%5c`, with those checks inside
-  its one `allow` rule rather than in a helper rule.
-  `builtinPolicyTemplates.test.ts` checks every entry renders under its package.
+  paths denies a path that contains `..`, `%2e`, `%25`, a backslash or `%5c`, with those checks
+  inside its one `allow` rule rather than in a helper rule.
+- **Settings defaults.** A deployment-specific setting (issuers, audiences, DIDs, outbound
+  destinations, path prefixes, surface IDs, subjects, role and claim values, safe tool names)
+  has an empty `default` and a `sample`. Behaviour switches (business-hours mode), counts (N),
+  universal values (time zone `UTC`, method `GET`, the business-hours days and times) and
+  well-known claim names (`role`) keep a prefilled `default` and no `sample`. A setting with a
+  `sample` starts empty with `e.g. <sample>` as its placeholder and `aria-required`; while it is
+  empty (`missingSettings` in `templateSettings.ts`) it shows "Required before the template
+  can be used." under the field (`<field test id>-required`, `small text-muted`, linked by
+  `aria-describedby`, never `is-invalid`), and Use this template and Add to policy stay
+  disabled, since an empty list renders no Rego. Show Rego and the lines Add to policy adds
+  preview the Rego with each empty setting's sample (`renderPreview`), with "Shown with sample
+  values for the empty settings." above it (`SampleValuesNote`, `<prefix>-sample-note`); Use
+  and Add to policy write only what was typed. How it decides says "Examples use the default
+  settings and the sample values shown in empty fields." on a template with a sample.
+  `builtinPolicyTemplates.test.ts` checks every entry renders under its package with its
+  samples, lists the settings that have one, and checks each of them blocks rendering while empty.
   `__fixtures__/renderedTemplates.json` holds the modules `regoTemplate.ts` renders: every
-  entry under each of its types with its defaults (`<id>:<type>`), and the Business-hours
+  entry under each of its types with its defaults and samples (`sampleParameterValues`,
+  `<id>:<type>`), and the Business-hours
   access window with the settings `renderedTemplates.test.ts` names (`<id>:<variant>:<type>`).
   That test writes it and fails while it differs, has a missing or an extra key; never edit
   it by hand, regenerate it with `UPDATE_RENDERED_TEMPLATES=1 CI=true npm test --prefix
@@ -1980,11 +1996,11 @@ Create custom policy) in `useTemplateGallery`.
   with `fa-plus`, `aria-pressed` while its detail is shown; `.policy-template-gallery__custom`)
   follow the Trust Registry pattern: pick a template, or create a custom one. It calls
   `pickBlank` (Rego `ALLOW_ALL_POLICY`, used template `blank`, its start named "Custom policy";
-  a Name or Description still as the last Use filled it is emptied, a typed one kept) at once,
+  the Name and Description are emptied, typed or filled, and its Undo restores them) at once,
   unless a template was used and the Rego is no longer an untouched start (`replaceText` in
   `policyStart.ts` is not null): then it selects `blank`, and the templates column
   shows the Custom policy detail, whose **Create custom policy** asks in place before it
-  replaces anything. The help text above the grid points to
+  replaces anything, its question ending "and empties the Name and Description." The help text above the grid points to
   **Add rules from a template** by name, not by where the column sits, since the column stacks
   under the editor below `xl`. The page holds the gallery's open state and selected card, and
   while the gallery is open the templates column shows `TemplateGalleryDetail`
@@ -2004,13 +2020,14 @@ Create custom policy) in `useTemplateGallery`.
   (`policy-template-gallery-example-input-<i>`, `-json`, at most `16rem` tall and scrolling,
   `.policy-template-example-input`), the docs link
   (`policy-template-gallery-docs-link`) and **Use this template**
-  (`policy-template-gallery-use-button`), disabled while a setting is invalid. Nothing fills
+  (`policy-template-gallery-use-button`), disabled while a setting is invalid or a required
+  one is empty (_Settings defaults_ above). Nothing fills
   the form until Use, which fills Description and Rego with the settings shown, never the
   Name, and offers Undo, which restores those fields and the used template. The page keeps
   the used template, `usedTemplate: {id, fieldText} | null` in `usePolicyTemplateActions`, which
   only Use and Create custom policy set (`blank` for a custom policy); everything else is derived from it and the
-  Rego. Using the used template again keeps a Description already in the form; using
-  any other card, Deny by default included, fills it. The gallery then collapses to one line
+  Rego. Use fills the Description only while it is empty or still as the last Use filled it
+  (the template's own description); a typed one is kept, for every card. The gallery then collapses to one line
   (`policy-template-gallery-summary`) and the templates column goes back to Add rules. `policyStart` (`policyStart.ts`), computed once by the
   page and passed to the gallery, decides what it says. The Rego still follows its start while
   each template group in it holds exactly the lines Add to policy wrote (`addedRules` in
@@ -2027,9 +2044,11 @@ Create custom policy) in `useTemplateGallery`.
   counts as a change; no default template has either.
   Undo of Use, Create custom policy, Add rules, Remove, Remove rule and Deny by default restores the Rego
   and the used template together. Only the latest action can be undone, and its Undo drops
-  edits made since, so each toast ends "Undo restores the Rego from before this change." (Use,
-  and Create custom policy when it emptied the Description: "the form", since their Undo
-  also restores the Description; neither changes the Name). Use of a template, or Create custom policy, moves focus to **Change**
+  edits made since, so each toast ends "Undo restores the Rego from before this change." (Use
+  and Create custom policy: "the form", since their Undo also restores the Description, and
+  for Create custom policy the Name; Use never changes the Name). A new toast replaces the one
+  on screen and stops it: the replaced toast's timer and `u` key no longer act, and it counts
+  as dismissed without Undo (`toaster.ts`). Use of a template, or Create custom policy, moves focus to **Change**
   (`policy-template-gallery-change-button`), which reopens
   it with the used card selected and its settings as they were used, also after a hand edit,
   and moves focus to the selected card, or to the first card when none is selected. Use
@@ -2053,7 +2072,9 @@ Create custom policy) in `useTemplateGallery`.
   that draft's discard toast if it is still showing (`showUndoToast` returns a dismiss function,
   kept per snapshot key), and starts fresh, with no template selected. Without
   `restoreOnlyOnUndo`, as in the Surface Builder, any visit restores the draft and the toast
-  stays.
+  stays. A second discard of the same editor replaces that toast; the replaced toast expires
+  without clearing the stored draft, which belongs to the newer toast, so its Undo restores the
+  second draft.
   The Type is set by the Define button that opened the page (`?type=`) and can't be changed.
   While `?type=` names a Type, Details has no Type field and the card header says
   "Create <Type> Policy". Opened without it, the page is a Gateway policy titled "Create Policy",
@@ -2091,7 +2112,8 @@ Create custom policy) in `useTemplateGallery`.
   decision, setting fields (`policy-templates-param-<key>`), the lines it adds, How it decides
   with each example's input (`policy-templates-example-input-<i>`), the docs link
   (`policy-templates-docs-link`) and **Add to policy**
-  (`policy-templates-insert-rules-button`). While the policy allows by default the preview
+  (`policy-templates-insert-rules-button`), disabled while a setting is invalid or a required
+  one is empty. While the policy allows by default the preview
   warns "This policy allows every request by default, so these rules change nothing until you
   choose Deny by default." (`policy-templates-allow-default-note`, a warning `InfoBanner`).
 - **Add to policy** shows the lines it adds (`policy-templates-insert-preview`) with a note,
@@ -2117,8 +2139,10 @@ Create custom policy) in `useTemplateGallery`.
   layout so the Rule column truncates instead of scrolling sideways. Each rule
   (`policy-rules-group-<n>-rule-<m>`, the row) has a neutral outline role badge
   (`policy-rules-group-<n>-rule-<m>-kind`, from `ruleRoles` in `regoRules.ts`, shown with or
-  without `policies.edit`): Allows (every rule whose read name is `allow`, a dotted `allow.x`
-  included), Deny reason (only a rule named `deny_reason`), or, for every
+  without `policies.edit`): Allows (a plain allow rule, as `isPlainAllow` reads it), Sets
+  allow (any other rule whose read name is `allow`, such as `allow := false if …` or a dotted
+  `allow.x`; title "Sets allow in a way the Rules view can't read; read the Rego"), Deny
+  reason (only a rule named `deny_reason`), or, for every
   other name, `deny` included, "Used by allow" when `allow` reads it, directly or through other
   rules, or while the Rego reads its package as a whole document (title "allow reads this rule,
   directly or through other rules") and "Not used by
@@ -2159,10 +2183,17 @@ Create custom policy) in `useTemplateGallery`.
   the group. A read from `deny_reason` alone doesn't count, since the gateway decides on `allow`
   and reads `deny_reason` only as text, so `deny` rules that only `deny_reason` reads are free;
   names inside strings are not reads. A rule head and the lines under it that start with `if`,
-  `contains`, `else`, `:=`, `=` or `{` are one rule, so `allow` with `if { count(deny) == 0 }`
-  on the next line reads `deny`; an `import` line never continues onto the next. While the Rego imports a `data` path, or reads `data`, its
+  `contains`, `else`, `:=`, `=` or `{` are one rule, as is a line that ends mid-expression (its
+  last token `if`, `not`, `in`, `with`, `as`, `some`, `every`, `contains`, `else`, `,` or an
+  infix operator, a keyword after a dot excepted), so `allow` with `if { count(deny) == 0 }`
+  on the next line reads `deny` and `allow if not` reads the `blocked` on the next line; an
+  `import` or `package` line never continues onto the next. While the Rego imports a `data` path, or reads `data`, its
   package or a parent as a whole document (`data.<package>["name"]`, `doc := data.<package>`),
-  every rule but `allow` counts as in use. An `allow` rule, a rule with an identical definition
+  every rule but `allow` counts as in use. A rule whose read name is `allow` but that is not a
+  plain allow is in use (`sets-allow`), and so is a group that holds one, unless it has an
+  identical copy elsewhere: the reasons are "This rule sets allow in a way the Rules view can't
+  read; remove it in the Rego view." and "A rule in this template sets allow in a way the Rules
+  view can't read; remove it in the Rego view." A plain `allow` rule, a rule with an identical definition
   left (the same template added twice), and a group whose used rules all have identical copies
   outside it can always be removed; one of several different definitions of a used name stays
   in use. Rules are compared by their
@@ -2229,7 +2260,8 @@ Create custom policy) in `useTemplateGallery`.
   when its `default allow` is true, and otherwise that another allow rule lets the request
   through and allow rules combine with OR; for an expected ALLOW it denies, to load it in Test,
   with the simulate `reason` when there is one. The simulate response doesn't say which rule
-  decided, so the reason never names one. Examples are written for the default settings, so
+  decided, so the reason never names one. Examples are written for the default settings and
+  the samples (`usesDefaultSettings` compares with `sampleParameterValues`), so
   when a setting was changed before inserting, the card says so
   (`policy-template-examples-changed-settings`), shows no Result and highlights no row. Every
   template that adds rules has examples (`builtinPolicyTemplates.test.ts` checks it), so the

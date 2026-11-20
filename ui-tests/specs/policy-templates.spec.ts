@@ -2,8 +2,7 @@
  * Policy template tests
  *
  * Asserts the create policy page's Start from gallery, the templates column's Add rules
- * panel and the Rules view, and on a saved policy the Template examples card and Save as
- * template.
+ * panel and the Rules view, and on a saved policy the Template examples card.
  */
 
 import type {Page} from '@playwright/test';
@@ -91,13 +90,17 @@ test.describe('Policy templates on the create policy page', () => {
 
     test('lists the conditions of an allow rule one per line', async ({page}) => {
         await pickCard(page, 'allow-path-prefixes');
-        await galleryDetail(page).getByTestId('policy-template-gallery-use-button').click();
+        const use = galleryDetail(page).getByTestId('policy-template-gallery-use-button');
+        await expect(use).toBeDisabled();
+        await expect(page.getByTestId('policy-template-gallery-param-prefixes-required')).toBeVisible();
+        await page.getByTestId('policy-template-gallery-param-prefixes').fill('/my-surface/public/');
+        await use.click();
 
         const conditions = page.getByTestId('policy-rules-group-0-rule-0-conditions');
         await expect(conditions).toBeVisible();
-        await expect(conditions.getByRole('listitem')).toHaveCount(6);
+        await expect(conditions.getByRole('listitem')).toHaveCount(7);
         await expect(page.getByTestId('policy-rules-group-0-rule-0-condition-0')).toHaveText(
-            'some prefix in {"/public/"}'
+            'some prefix in {"/my-surface/public/"}'
         );
         await expect(page.getByTestId('policy-rules-group-0-rule-0-condition-1')).toHaveText(
             'and startswith(input.http.path, prefix)'

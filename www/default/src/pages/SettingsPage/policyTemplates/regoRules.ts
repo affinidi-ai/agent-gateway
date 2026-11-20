@@ -103,7 +103,7 @@ function scan(lines: string[]): Item[] | null {
       const continues =
         current !== null &&
         !CLOSED_STATEMENT.test(current.code[0] ?? '') &&
-        (OPEN_ENDING.test(lastCode) || CONTINUING_START.test(trimmed));
+        (endsOpen(lastCode) || CONTINUING_START.test(trimmed));
       if (!continues) {
         current = { type: 'statement', start: i, end: i, code: [] };
         items.push(current);
@@ -140,6 +140,18 @@ function scan(lines: string[]): Item[] | null {
     }
   }
   return depth === 0 && !inRaw ? items : null;
+}
+
+/**
+ * Whether a code line's last token leaves the statement open, such as `if`, `not`, `in` or an
+ * infix operator; a keyword after a dot, as in `input.flags.contains`, is a field name.
+ */
+function endsOpen(code: string): boolean {
+  const tokens = tokenize(code);
+  if (!tokens) return OPEN_ENDING.test(code);
+  const last = tokens[tokens.length - 1]?.text ?? '';
+  const field = /^\w/.test(last) && tokens[tokens.length - 2]?.text === '.';
+  return ENDS_CONTINUATION.has(last) && !field;
 }
 
 /**
@@ -299,11 +311,17 @@ function reachableFromAllow(
   return { reached, readers: Array.from(visited) };
 }
 
-/** Why a rule or group can't be removed: the rule that reads it, or the whole-document read. */
+/**
+ * Why a rule or group can't be removed: the rule that reads it, the whole-document read, or an
+ * allow definition that is not a plain allow.
+ */
 export type RuleUse =
   | { kind: 'reader'; name: string; line: number }
   | { kind: 'document' }
-  | { kind: 'unnamed' };
+  | { kind: 'unnamed' }
+  | { kind: 'sets-allow' };
+
+const setsAllow = (rule: PolicyRule) => readName(rule) === 'allow' && !isPlainAllow(rule);
 
 /**
  * The first rule, by line, among `readers` that reads one of `names` and defines none of them;
@@ -322,16 +340,18 @@ function firstReader(readers: PolicyRule[], names: Set<string>): RuleUse {
 /**
  * Why removing a rule would change what `allow` decides, or null when it wouldn't: `allow` reads
  * its name, directly or through other rules, from outside the rule (the reason names the first
- * rule, by line, that reads it), or the Rego reads its package as a whole document. Removing an
- * `allow` rule, or a rule with an identical definition left from the same template added twice,
- * is always allowed; one of several different definitions is in use.
+ * rule, by line, that reads it), the Rego reads its package as a whole document, or the rule
+ * defines `allow` without being a plain allow. Removing a plain `allow` rule, or a rule with an
+ * identical definition left from the same template added twice, is always allowed; one of
+ * several different definitions is in use.
  */
 export function ruleUse(parsed: ParsedPolicy, rule: PolicyRule): RuleUse | null {
   const name = ruleName(rule);
-  if (!parsed.ok || name === 'allow') return null;
+  if (!parsed.ok || (name === 'allow' && isPlainAllow(rule))) return null;
   const rules = allRules(parsed);
   const self = (r: PolicyRule) => r.startLine === rule.startLine;
   if (rules.some(r => !self(r) && ruleName(r) === name && sameCode(r, rule))) return null;
+  if (setsAllow(rule)) return { kind: 'sets-allow' };
   if (parsed.readsPackageDocument) return { kind: 'document' };
   const { reached, readers } = reachableFromAllow(rules, self);
   return reached.has(readName(rule)) ? firstReader(readers, new Set([readName(rule)])) : null;
@@ -341,19 +361,22 @@ export function ruleUse(parsed: ParsedPolicy, rule: PolicyRule): RuleUse | null 
  * Why removing a template group would change what `allow` decides, or null when it wouldn't:
  * `allow` reads a name the group defines through rules outside the group, or the Rego reads its
  * package as a whole document, and some definition of that name in the group has no identical
- * copy outside it.
+ * copy outside it; or the group defines `allow` without a plain allow and no identical copy.
  */
 export function groupUse(parsed: ParsedPolicy, group: RuleGroup): RuleUse | null {
   if (!parsed.ok) return null;
   const rules = allRules(parsed);
   const inGroup = (r: PolicyRule) => r.startLine >= group.startLine && r.endLine <= group.endLine;
   const outside = rules.filter(r => !inGroup(r));
+  const copied = (rule: PolicyRule) =>
+    outside.some(r => ruleName(r) === ruleName(rule) && sameCode(r, rule));
+  if (group.rules.some(r => setsAllow(r) && !copied(r))) return { kind: 'sets-allow' };
   const { reached, readers } = reachableFromAllow(rules, inGroup);
   const used = group.rules.filter(
     rule =>
       ruleName(rule) !== 'allow' &&
       (parsed.readsPackageDocument || reached.has(readName(rule))) &&
-      !outside.some(r => ruleName(r) === ruleName(rule) && sameCode(r, rule))
+      !copied(rule)
   );
   if (used.length === 0) return null;
   if (parsed.readsPackageDocument) return { kind: 'document' };
@@ -516,10 +539,16 @@ export function summarizeDecision(parsed: ParsedPolicy): DecisionSummary | null 
     : { kind: 'denies-all', hasDefault };
 }
 
-export type RuleRole = 'allow' | 'deny-reason' | 'used-by-allow' | 'not-used-by-allow';
+export type RuleRole =
+  | 'allow'
+  | 'sets-allow'
+  | 'deny-reason'
+  | 'used-by-allow'
+  | 'not-used-by-allow';
 
 /**
- * Each rule's part in the decision: an allow rule, a deny reason, or whether `allow` reads it,
+ * Each rule's part in the decision: a plain allow rule, another definition of `allow`, a deny
+ * reason, or whether `allow` reads it,
  * directly or through other rules. Every rule is used while the Rego reads its package as a
  * whole document or doesn't parse.
  */
@@ -527,7 +556,7 @@ export function ruleRoles(parsed: ParsedPolicy): (rule: PolicyRule) => RuleRole 
   const document = !parsed.ok || parsed.readsPackageDocument;
   const { reached } = reachableFromAllow(allRules(parsed), () => false);
   return rule => {
-    if (readName(rule) === 'allow') return 'allow';
+    if (readName(rule) === 'allow') return isPlainAllow(rule) ? 'allow' : 'sets-allow';
     if (rule.kind === 'deny') return 'deny-reason';
     return document || reached.has(readName(rule)) ? 'used-by-allow' : 'not-used-by-allow';
   };

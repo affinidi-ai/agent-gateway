@@ -104,21 +104,11 @@ export function useDiscardWithUndo({
     }
   }, []); // stable — uses refs
 
-  const clearSnapshot = useCallback(() => {
-    const snap = snapshotRef.current;
-    if (snap) {
-      pendingToasts.delete(snap.storageKey);
-      try {
-        sessionStorage.removeItem(snap.storageKey);
-      } catch (_ignored) {
-        /* ignore */
-      }
-    }
-  }, []); // stable — uses refs
-
+  // A toast replaced by a newer one for the same key expires, but the draft is the newer one's.
   const showDiscardToast = useCallback(
     (onUndo: () => void) => {
       const key = snapshotRef.current?.storageKey;
+      if (key) pendingToasts.delete(key);
       const dismiss = showUndoToast({
         message,
         duration,
@@ -126,11 +116,19 @@ export function useDiscardWithUndo({
           if (key) pendingToasts.delete(key);
           onUndo();
         },
-        onExpire: clearSnapshot,
+        onExpire: () => {
+          if (!key || pendingToasts.get(key) !== dismiss) return;
+          pendingToasts.delete(key);
+          try {
+            sessionStorage.removeItem(key);
+          } catch (_ignored) {
+            /* ignore */
+          }
+        },
       });
-      if (key && dismiss) pendingToasts.set(key, dismiss);
+      if (key) pendingToasts.set(key, dismiss);
     },
-    [message, duration, clearSnapshot]
+    [message, duration]
   );
 
   // Sidebar / header link guard.

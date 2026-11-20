@@ -14,15 +14,22 @@ changes:
         that input needs, such as a verified caller DID for Trust Registry recognition, JWT
         Bearer authentication of the Authorization header for the MCP tool policies, and the
         Transit Point policy slots for the outbound allowlist; a trust check that queries
-        several authorities counts once, and the surface allowlist matches surface IDs. Templates follow the Apply Policies guides and link to their own
+        several authorities counts once, the surface allowlist matches surface IDs, the path
+        allowlist's prefixes start with the Access Point route, and the templates that read the
+        caller say they decide on the Access Point and Target request policies. Templates follow the Apply Policies guides and link to their own
         docs section. Define Gateway Policy lists only templates for gateways and Define Agent
         Surface Policy only templates for surfaces, with a muted note on a template for surfaces
         only; the cards carry no role or default decision badges, six show until Show all, and
         no card is selected until the user picks one. Choosing a card shows its settings, its
         Rego, how it decides on sample inputs and its docs link in the column beside the form,
-        and Use this template fills Description and Rego, never the Name, with settings that are
-        checked first; the Details and Policy sections appear only then. Create custom policy, under the
-        list, starts an allow-all policy instead. Change reopens the gallery and Cancel closes
+        and Use this template fills the Rego and the Description, keeping a typed Description and
+        never changing the Name, with settings that are checked first; the Details and Policy
+        sections appear only then. Settings that depend on the deployment, such as issuers,
+        audiences, DIDs, destinations, paths, surface IDs, subjects and role or claim values,
+        start empty with a sample as the placeholder, and Use this template and Add to policy
+        stay disabled, saying why under the field, until they are filled; the Rego preview uses
+        the samples meanwhile and says so, and only typed values are written. Create custom policy, under the list, starts an allow-all
+        policy instead and empties the Name and Description, which its Undo restores. Change reopens the gallery and Cancel closes
         it; when the policy already has rules or hand edits, Use and Create custom policy ask in
         place before they replace them. The Business-hours access window template allows or
         denies requests inside a daily HH:MM window in a chosen time zone, which may cross
@@ -36,7 +43,9 @@ changes:
         other than allow and deny_reason Used by allow or Not used by allow, shows each
         condition of an allow rule with several on its own line, the later ones after "and",
         or the rule on one line when it can't be split cleanly, removes a template's rules or
-        a single rule unless the allow rule still reads it, saying which rule does, switches an
+        a single rule unless the allow rule still reads it, saying which rule does, or unless
+        the rule sets allow in a way other than a plain allow rule, marked Sets allow, which is
+        removed in the Rego view, switches an
         allow-all policy to deny by default, marks groups that have no effect while the default
         is ALLOW, and on a new policy blocks Create while a group written for the other Type
         remains. Start from names the template the policy started from and counts the
@@ -51,8 +60,8 @@ changes:
       description: >-
         docs/POLICY.md now describes the input of a policy bound to MCP tools (input.mcp,
         input.jwt as the claims of the request's Authorization bearer token, input.channel and
-        input.request), input.http, input.channel and input.gateway with where direction and
-        target_id are set, input.agent.trust_verification beside did_verified, and how to
+        input.request), input.http with a path that starts with the Access Point route,
+        input.channel and input.gateway with where direction and target_id are set, input.agent.trust_verification beside did_verified, and how to
         require every Trust Check when a check queries several authorities.
     - timestamp: '2026-11-19T14:00:00Z'
       title: Set a new policy's Type from the Define button that opened it
@@ -80,10 +89,17 @@ changes:
       description: >-
         The policy create and edit pages group Name, Description, Type and an Enabled switch
         into one Details section (Name, then a two-line Description, then Type and Status side
-        by side), keep the templates in a column beside the editor so opening
-        one never resizes the form, show a saved policy's ID and SHA on one line with copy
-        buttons, and show the Rego with line numbers and a banner when it doesn't compile.
+        by side), show a saved policy's ID and SHA on one line with copy buttons, and show the
+        Rego with line numbers and a banner when it doesn't compile.
   fixed:
+    - timestamp: '2026-11-20T15:00:00Z'
+      title: Stop a replaced dashboard toast from closing the next one or undoing twice
+      description: >-
+        When a new notice replaced an Undo notice on screen, the old one kept its timer and its
+        u key shortcut, so it could close the newer notice early and one press of u ran both
+        undos. A new notice now stops the one it replaces, and each notice closes only itself.
+        Discarding an editor again while its first discard notice still showed also cleared
+        the second draft, so that notice's Undo restored nothing; it now restores it.
     - timestamp: '2026-11-19T20:00:00Z'
       title: Fit the policy editor's dry-run Run button to its label
       description: >-

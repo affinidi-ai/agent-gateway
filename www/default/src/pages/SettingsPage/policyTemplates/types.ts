@@ -1,4 +1,6 @@
-export type PolicyType = 'gateway' | 'agent_surface';
+import type { PolicyType } from '../../../types';
+
+export type { PolicyType };
 
 export type PolicyDecision = 'allow' | 'deny';
 
@@ -28,6 +30,11 @@ export type PolicyTemplateParameter =
       default: string;
       /** `time_zone` accepts IANA time zone names only. */
       format?: 'time_zone';
+      /**
+       * Set on a deployment-specific setting, which starts empty and must be filled before Use:
+       * the field's placeholder, and the value previews, examples and template tests use.
+       */
+      sample?: string;
       help?: string;
     }
   | {
@@ -35,6 +42,8 @@ export type PolicyTemplateParameter =
       label: string;
       kind: 'string_list';
       default: string[];
+      /** As on a `string` setting. */
+      sample?: string[];
       /** The only values accepted, matched without regard to case. */
       allowed?: string[];
       /** An empty list is accepted and written as the empty set, `set()`. */

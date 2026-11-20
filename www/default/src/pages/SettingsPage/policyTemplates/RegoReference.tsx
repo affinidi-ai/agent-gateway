@@ -12,14 +12,27 @@ const INPUT_FIELDS: [string, string][] = [
   ['input.source_auth.subject', 'The JWT subject, for jwt_bearer callers'],
   ['input.source_auth.claims', 'The JWT claims, such as role or iss, for jwt_bearer callers'],
   ['input.http.method', 'HTTP method'],
-  ['input.http.path', 'Request path'],
+  [
+    'input.http.path',
+    "The whole request path, starting with the Access Point route; on a Transit Point, with /outbound<route>/<alias> or the Transit Point's listen_path",
+  ],
   ['input.http.headers', 'HTTP headers'],
   ['input.gateway.direction', '"inbound" or "outbound"'],
   ['input.gateway.target_id', 'The target endpoint, on the outbound path'],
   ['input.mcp.method', 'The MCP method, such as tools/call'],
-  ['input.mcp.tool_name', 'The MCP tool being called'],
-  ['input.trust_check_results.target', 'Trust check results: a list of { id, ok }'],
-  ['input.extension_identity.did', 'The caller DID, when it presented a verified identity'],
+  [
+    'input.mcp.tool_name',
+    'The MCP tool being called; read it with input.mcp.method == "tools/call"',
+  ],
+  [
+    'input.trust_check_results.target',
+    'Trust check results: a list of { id, ok }, with one entry per authority, all with the same id, for a check that queries several',
+  ],
+  [
+    'input.extension_identity.did',
+    'The caller DID the gateway resolved; trust it only when input.extension_identity.verified is true',
+  ],
+  ['input.extension_identity.verified', 'true when the gateway verified the caller DID'],
 ];
 
 const TOOL_INPUT_FIELDS: [string, string][] = [

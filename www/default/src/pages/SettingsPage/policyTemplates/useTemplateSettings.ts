@@ -1,6 +1,11 @@
 import { useState } from 'react';
-import { defaultParameterValues, renderTemplate } from './regoTemplate';
-import { initialFieldText, renderWithText } from './templateSettings';
+import { renderTemplate, sampleParameterValues } from './regoTemplate';
+import {
+  initialFieldText,
+  missingSettings,
+  renderPreview,
+  renderWithText,
+} from './templateSettings';
 import type { FieldText, PolicyTemplate } from './types';
 
 /**
@@ -13,11 +18,14 @@ export function useTemplateSettings(template: PolicyTemplate, initialText?: Fiel
     () => initialText ?? initialFieldText(template)
   );
   const rendered = renderWithText(template, fieldText);
+  const preview = renderPreview(template, fieldText);
+  const missing = missingSettings(template, fieldText);
+  // The examples hold for the settings they were written with: the defaults and the samples.
   const usesDefaultSettings =
-    rendered.rego === renderTemplate(template, defaultParameterValues(template)).rego;
+    rendered.rego === renderTemplate(template, sampleParameterValues(template)).rego;
   const setField = (key: string, value: string) =>
     setFieldText(prev => ({ ...prev, [key]: value }));
-  return { fieldText, setField, rendered, usesDefaultSettings };
+  return { fieldText, setField, rendered, preview, missing, usesDefaultSettings };
 }
 
 export type TemplateSettings = ReturnType<typeof useTemplateSettings>;

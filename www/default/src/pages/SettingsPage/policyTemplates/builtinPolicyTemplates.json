@@ -32,7 +32,7 @@
     "id": "require-authentication",
     "name": "Require authenticated caller",
     "summary": "Allow only callers that authenticated.",
-    "description": "Allows a request only when the caller authenticated with one of the surface's Caller Context methods. Denies callers whose credential was missing or invalid, and requests on a surface without caller authentication.",
+    "description": "Allows a request only when the caller authenticated with one of the surface's Caller Context methods. Denies callers whose credential was missing or invalid, and requests on a surface without caller authentication. It decides on the Access Point and Target request policies: on a Transit Point input.source_auth is the client the Transit Point authenticated, not the caller, and an inbound response policy has no input.source_auth.",
     "category": "authentication",
     "policy_types": ["agent_surface"],
     "rules": "default allow := false\n\nallow if {\n  input.source_auth.method\n  input.source_auth.method != \"failed\"\n}",
@@ -84,7 +84,7 @@
     "id": "allow-by-jwt-claim",
     "name": "Allow by JWT claim or role",
     "summary": "Allow only JWT callers whose claim has one of the listed values.",
-    "description": "Allows a request when the caller authenticated with a JWT and the chosen claim, such as role, holds one of the listed values. A claim that is a list matches when any of its values is listed. Denies every other caller.",
+    "description": "Allows a request when the caller authenticated with a JWT and the chosen claim, such as role, holds one of the listed values. A claim that is a list matches when any of its values is listed. Denies every other caller. It decides on the Access Point and Target request policies: on a Transit Point input.source_auth is the client the Transit Point authenticated, not the caller, and an inbound response policy has no input.source_auth.",
     "category": "authentication",
     "policy_types": ["agent_surface"],
     "rules": "default allow := false\n\njwt_claim_values(v) := [v] if is_string(v)\n\njwt_claim_values(v) := v if is_array(v)\n\nallow if {\n  input.source_auth.method == \"jwt_bearer\"\n  some v in jwt_claim_values(input.source_auth.claims[{{claim}}])\n  v in {{values}}\n}",
@@ -100,7 +100,8 @@
         "key": "values",
         "label": "Allowed values",
         "kind": "string_list",
-        "default": ["admin"],
+        "default": [],
+        "sample": ["admin"],
         "help": "Separate values with commas."
       }
     ],
@@ -159,7 +160,7 @@
     "id": "allow-by-jwt-issuer-audience",
     "name": "Allow by JWT issuer and audience",
     "summary": "Allow only tokens from listed issuers for listed audiences.",
-    "description": "Allows a request only when the caller's JWT was issued by one of the listed issuers and names one of the listed audiences. Denies every other caller. A token without an aud claim, as from an identity provider whose JWT Bearer method checks client_id or azp instead, is denied.",
+    "description": "Allows a request only when the caller's JWT was issued by one of the listed issuers and names one of the listed audiences. Denies every other caller. A token without an aud claim, as from an identity provider whose JWT Bearer method checks client_id or azp instead, is denied. It decides on the Access Point and Target request policies: on a Transit Point input.source_auth is the client the Transit Point authenticated, not the caller, and an inbound response policy has no input.source_auth.",
     "category": "authentication",
     "policy_types": ["agent_surface"],
     "rules": "default allow := false\n\njwt_audiences contains a if {\n  a := input.source_auth.claims.aud\n  is_string(a)\n}\n\njwt_audiences contains a if {\n  is_array(input.source_auth.claims.aud)\n  some a in input.source_auth.claims.aud\n}\n\nallow if {\n  input.source_auth.method == \"jwt_bearer\"\n  input.source_auth.claims.iss in {{issuers}}\n  some a in jwt_audiences\n  a in {{audiences}}\n}",
@@ -168,14 +169,16 @@
         "key": "issuers",
         "label": "Allowed issuers",
         "kind": "string_list",
-        "default": ["https://login.example.com"],
+        "default": [],
+        "sample": ["https://login.example.com"],
         "help": "Exact iss values, separated by commas."
       },
       {
         "key": "audiences",
         "label": "Allowed audiences",
         "kind": "string_list",
-        "default": ["https://gateway.example.com"],
+        "default": [],
+        "sample": ["https://gateway.example.com"],
         "help": "Exact aud values, separated by commas."
       }
     ],
@@ -237,7 +240,7 @@
     "id": "restrict-mcp-tools-by-role",
     "name": "Restrict MCP tools by role",
     "summary": "Admins call any tool; other callers only the safe tools.",
-    "description": "Allows callers whose JWT role claim, a single value or a list, holds an admin role to call any MCP tool, other authenticated callers to call only the listed safe tools, and authenticated callers to use other MCP methods such as tools/list. Denies a request without input.mcp, such as a JSON-RPC message without an id. A caller is authenticated when it passed one of the surface's Caller Context methods, such as JWT Bearer or API Key. Use it as the whole policy: inserted into another policy it would allow requests that policy denies.",
+    "description": "Allows callers whose JWT role claim, a single value or a list, holds an admin role to call any MCP tool, other authenticated callers to call only the listed safe tools, and authenticated callers to use other MCP methods such as tools/list. Denies a request without input.mcp, such as a JSON-RPC message without an id. A caller is authenticated when it passed one of the surface's Caller Context methods, such as JWT Bearer or API Key. It decides on the Access Point and Target request policies: on a Transit Point input.source_auth is the client the Transit Point authenticated, not the caller, and an inbound response policy has no input.source_auth. Use it as the whole policy: inserted into another policy it would allow requests that policy denies.",
     "category": "allow_deny_lists",
     "policy_types": ["agent_surface"],
     "standalone": true,
@@ -247,14 +250,16 @@
         "key": "admin_roles",
         "label": "Admin roles",
         "kind": "string_list",
-        "default": ["admin"],
+        "default": [],
+        "sample": ["admin"],
         "help": "Values of the JWT role claim that may call any tool, separated by commas. A role claim that is a list matches when any of its values is listed."
       },
       {
         "key": "safe_tools",
         "label": "Safe tools",
         "kind": "string_list",
-        "default": ["search", "summarise", "translate"],
+        "default": [],
+        "sample": ["search", "summarise", "translate"],
         "help": "MCP tools every authenticated caller may call, separated by commas."
       }
     ],
@@ -457,7 +462,7 @@
     "id": "require-trust-registry-recognition",
     "name": "Require Trust Registry recognition",
     "summary": "Allow only agents the Trust Registry recognises.",
-    "description": "Allows a request only when the calling agent's DID is verified as the caller's identity and the Trust Registry recognised it. A DID is verified when it is the caller identity the gateway established (input.agent.did_verified), not only a DID the request names. Needs Extract Trust Registry Data on the surface; without it input.agent is absent and every request is denied.",
+    "description": "Allows a request only when the calling agent's DID is verified as the caller's identity and the Trust Registry recognised it. A DID is verified when it is the caller identity the gateway established (input.agent.did_verified), not only a DID the request names. Needs Extract Trust Registry Data on the surface; without it input.agent has no trust_verification and every request is denied. It decides on the Access Point and Target request policies: on a Transit Point input.agent describes the destination, not the caller, and a response policy has no input.agent.",
     "category": "trust_checks",
     "policy_types": ["agent_surface"],
     "rules": "default allow := false\n\nallow if {\n  input.agent.did\n  input.agent.did_verified == true\n  input.agent.trust_verification == true\n}",
@@ -499,7 +504,12 @@
       },
       {
         "name": "No Trust Registry data",
-        "input": {},
+        "input": {
+          "agent": {
+            "did": "did:web:agent.example.com",
+            "did_verified": true
+          }
+        },
         "expected": "deny"
       }
     ],
@@ -513,7 +523,7 @@
     "id": "require-verified-credential-subject",
     "name": "Require verified credential subject",
     "summary": "Allow only listed caller DIDs the gateway verified.",
-    "description": "Allows a request only when the gateway verified the caller's DID, from an identity presentation or a bound source credential, and that DID is on the list. Denies unverified and unlisted callers.",
+    "description": "Allows a request only when the gateway verified the caller's DID, from an identity presentation or a bound source credential, and that DID is on the list. Denies unverified and unlisted callers. It decides on the Access Point and Target request policies: a Transit Point or response policy has no input.extension_identity, so it denies every request there.",
     "category": "trust_checks",
     "policy_types": ["agent_surface"],
     "rules": "default allow := false\n\nallow if {\n  input.extension_identity.verified == true\n  input.extension_identity.did in {{dids}}\n}",
@@ -522,7 +532,8 @@
         "key": "dids",
         "label": "Allowed DIDs",
         "kind": "string_list",
-        "default": ["did:web:agent.example.com"],
+        "default": [],
+        "sample": ["did:web:agent.example.com"],
         "help": "Caller DIDs, separated by commas."
       }
     ],
@@ -582,7 +593,8 @@
         "key": "destinations",
         "label": "Allowed destinations",
         "kind": "string_list",
-        "default": ["https://api.example.com", "fabric://partner-gateway"],
+        "default": [],
+        "sample": ["https://api.example.com", "fabric://partner-gateway"],
         "help": "Separate destinations with commas: an endpoint URL such as https://api.example.com, or fabric://<gateway id> for a Fabric route. A Transit Point matches when its endpoint is a listed destination or a path under it, never a longer host name."
       }
     ],
@@ -1032,37 +1044,48 @@
     "id": "allow-path-prefixes",
     "name": "Allow listed paths",
     "summary": "Allow only requests under the listed path prefixes.",
-    "description": "Allows a request only when its path starts with one of the listed prefixes. Denies a path that contains .., %2e, a backslash or %5c. Assigned appliance-wide, it also decides public discovery reads such as /discovery and /.well-known/ucp.",
+    "description": "Allows a request only when its path starts with one of the listed prefixes. The path is the whole request path, so a prefix starts with the surface's Access Point route, such as /my-surface/public/ for a route /my-surface; on a Transit Point it starts with /outbound, the route and the Transit Point's alias, or the Transit Point's own listen path. Denies a path that contains .., %2e, %25, a backslash or %5c. Assigned appliance-wide, it also decides public discovery reads such as /discovery and /.well-known/ucp.",
     "category": "routing_paths",
     "policy_types": ["gateway", "agent_surface"],
-    "rules": "default allow := false\n\nallow if {\n  some prefix in {{prefixes}}\n  startswith(input.http.path, prefix)\n  not contains(input.http.path, \"..\")\n  not contains(lower(input.http.path), \"%2e\")\n  not contains(input.http.path, \"\\\\\")\n  not contains(lower(input.http.path), \"%5c\")\n}",
+    "rules": "default allow := false\n\nallow if {\n  some prefix in {{prefixes}}\n  startswith(input.http.path, prefix)\n  not contains(input.http.path, \"..\")\n  not contains(lower(input.http.path), \"%2e\")\n  not contains(input.http.path, \"%25\")\n  not contains(input.http.path, \"\\\\\")\n  not contains(lower(input.http.path), \"%5c\")\n}",
     "parameters": [
       {
         "key": "prefixes",
         "label": "Allowed path prefixes",
         "kind": "string_list",
-        "default": ["/public/"],
-        "help": "Separate prefixes with commas."
+        "default": [],
+        "sample": ["/my-surface/public/"],
+        "help": "Whole path prefixes, each starting with the Access Point route, such as /my-surface/public/, separated by commas."
       }
     ],
     "reads": ["http.path"],
     "examples": [
       {
-        "name": "Path /public/docs",
+        "name": "Path /my-surface/public/docs",
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/my-surface/public/docs"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Path /public/docs without the route",
         "input": {
           "http": {
             "method": "GET",
             "path": "/public/docs"
           }
         },
-        "expected": "allow"
+        "expected": "deny"
       },
       {
-        "name": "Path /admin",
+        "name": "Path /my-surface/admin",
         "input": {
           "http": {
             "method": "GET",
-            "path": "/admin"
+            "path": "/my-surface/admin"
           }
         },
         "expected": "deny"
@@ -1072,7 +1095,7 @@
         "input": {
           "http": {
             "method": "GET",
-            "path": "/public/../admin"
+            "path": "/my-surface/public/../admin"
           }
         },
         "expected": "deny"
@@ -1082,7 +1105,17 @@
         "input": {
           "http": {
             "method": "GET",
-            "path": "/public/%2E%2E/admin"
+            "path": "/my-surface/public/%2E%2E/admin"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Path with %252e%252e",
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/my-surface/public/%252e%252e/admin"
           }
         },
         "expected": "deny"
@@ -1107,7 +1140,8 @@
         "key": "surfaces",
         "label": "Surface IDs",
         "kind": "string_list",
-        "default": ["3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40"],
+        "default": [],
+        "sample": ["3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40"],
         "help": "Each surface's ID, shown in the read-only Surface ID field of the Surface Builder's surface panel and at the end of the surface page's address (/surfaces/<id>), separated by commas."
       }
     ],
@@ -1154,7 +1188,7 @@
     "id": "allow-listed-subjects",
     "name": "Allow listed subjects",
     "summary": "Allow only the listed JWT callers, by principal.",
-    "description": "Allows a request only when the caller authenticated with a JWT and its subject is on the list. The subject is the value of the principal claim the JWT verification strategy names, sub unless the strategy names another. Denies every other caller.",
+    "description": "Allows a request only when the caller authenticated with a JWT and its subject is on the list. The subject is the value of the principal claim the JWT verification strategy names, sub unless the strategy names another. Denies every other caller. It decides on the Access Point and Target request policies: on a Transit Point input.source_auth is the client the Transit Point authenticated, not the caller, and an inbound response policy has no input.source_auth.",
     "category": "allow_deny_lists",
     "policy_types": ["agent_surface"],
     "rules": "default allow := false\n\nallow if {\n  input.source_auth.method == \"jwt_bearer\"\n  input.source_auth.subject in {{subjects}}\n}",
@@ -1163,7 +1197,8 @@
         "key": "subjects",
         "label": "Allowed subjects",
         "kind": "string_list",
-        "default": ["user@example.com"],
+        "default": [],
+        "sample": ["user@example.com"],
         "help": "Values of the strategy's principal claim, separated by commas."
       }
     ],
@@ -1326,7 +1361,8 @@
         "key": "values",
         "label": "Allowed values",
         "kind": "string_list",
-        "default": ["admin"],
+        "default": [],
+        "sample": ["admin"],
         "help": "Values of the claim, separated by commas."
       }
     ],
@@ -1462,15 +1498,16 @@
     "id": "tool-role-with-deny-reason",
     "name": "Tool policy: admin role with a deny reason",
     "summary": "For a tool binding: allow one role and record why others were denied.",
-    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows callers whose bearer token has the admin role and sets deny_reason when the token has no role or another role. The reason is written to the audit log only, not the response. It reads the claims of the bearer token in the request's Authorization header (input.jwt), so use it on a surface whose Caller Context authenticates that header with JWT Bearer.",
-    "rules": "default allow := false\n\nallow if input.jwt.role == {{admin_role}}\n\ndeny_reason := \"The caller's token has no role\" if not input.jwt.role\n\ndeny_reason := sprintf(\"Role %v may not call this tool\", [input.jwt.role]) if {\n  input.jwt.role\n  input.jwt.role != {{admin_role}}\n}",
+    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows callers whose bearer token has the admin role, as a single value or in a list, and sets deny_reason when the token has no role or not that one. The reason is written to the audit log only, not the response. It reads the claims of the bearer token in the request's Authorization header (input.jwt), so use it on a surface whose Caller Context authenticates that header with JWT Bearer.",
+    "rules": "default allow := false\n\ntool_claim_values(v) := [v] if is_string(v)\n\ntool_claim_values(v) := v if is_array(v)\n\nallow if {{admin_role}} in tool_claim_values(input.jwt.role)\n\ndeny_reason := \"The caller's token has no role\" if not input.jwt.role\n\ndeny_reason := sprintf(\"Role %v may not call this tool\", [input.jwt.role]) if {\n  input.jwt.role\n  not allow\n}",
     "parameters": [
       {
         "key": "admin_role",
         "label": "Allowed role",
         "kind": "string",
-        "default": "admin",
-        "help": "The role claim value that may call the tool."
+        "default": "",
+        "sample": "admin",
+        "help": "The role claim value that may call the tool. A role claim that is a list matches when it holds this value."
       }
     ],
     "reads": ["jwt.role"],
@@ -1501,6 +1538,36 @@
           "jwt": {
             "sub": "ops@example.com",
             "role": "admin"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Roles list with admin",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "params": {
+              "name": "delete_record",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
+          },
+          "channel": {
+            "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
+            "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
+          },
+          "jwt": {
+            "sub": "lead@example.com",
+            "role": ["viewer", "admin"]
           }
         },
         "expected": "allow"

@@ -1,6 +1,12 @@
 import { BUILTIN_POLICY_TEMPLATES } from '../builtinPolicyTemplates';
 import { EXPECTED_PACKAGE } from '../policyDefaults';
-import { defaultParameterValues, renderTemplate, templateRole } from '../regoTemplate';
+import {
+  defaultParameterValues,
+  renderTemplate,
+  sampleParameterValues,
+  templateRole,
+} from '../regoTemplate';
+import { missingSettings, renderWithText } from '../templateSettings';
 import { CATEGORY_LABELS } from '../types';
 
 describe('built-in policy templates', () => {
@@ -14,10 +20,52 @@ describe('built-in policy templates', () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
+  it('starts every deployment-specific setting empty, with a sample, and only those', () => {
+    const withSample = BUILTIN_POLICY_TEMPLATES.filter(t => t.policy_type === 'agent_surface')
+      .flatMap(t => t.parameters.map(p => [t.id.split(':')[0], p] as const))
+      .filter(([, p]) => 'sample' in p && p.sample !== undefined);
+    expect(withSample.map(([id, p]) => `${id}.${p.key}`)).toEqual([
+      'allow-by-jwt-claim.values',
+      'allow-by-jwt-issuer-audience.issuers',
+      'allow-by-jwt-issuer-audience.audiences',
+      'restrict-mcp-tools-by-role.admin_roles',
+      'restrict-mcp-tools-by-role.safe_tools',
+      'require-verified-credential-subject.dids',
+      'allowlist-outbound-destinations.destinations',
+      'allow-path-prefixes.prefixes',
+      'allow-listed-surfaces.surfaces',
+      'allow-listed-subjects.subjects',
+      'tool-allow-by-jwt-claim.values',
+      'tool-role-with-deny-reason.admin_role',
+    ]);
+    for (const [, p] of withSample) {
+      expect(p.default).toEqual(p.kind === 'string_list' ? [] : '');
+    }
+  });
+
   it.each(BUILTIN_POLICY_TEMPLATES.map(t => [t.id, t] as const))(
-    '%s renders with its defaults under the package of its type',
+    '%s refuses to render with an empty deployment setting, so its Use is blocked',
     (_id, template) => {
+      const required = template.parameters.filter(p => 'sample' in p && p.sample !== undefined);
       const { rego, errors } = renderTemplate(template, defaultParameterValues(template));
+      expect(Object.keys(errors).sort()).toEqual(required.map(p => p.key).sort());
+      expect(rego === null).toBe(required.length > 0);
+    }
+  );
+
+  it('marks a single-value setting missing only while it is blank, as Use renders it', () => {
+    const template = BUILTIN_POLICY_TEMPLATES.find(t =>
+      t.id.startsWith('tool-role-with-deny-reason')
+    )!;
+    expect(missingSettings(template, { admin_role: '  ' })).toEqual(new Set(['admin_role']));
+    expect(missingSettings(template, { admin_role: ',' })).toEqual(new Set());
+    expect(renderWithText(template, { admin_role: ',' }).rego).not.toBeNull();
+  });
+
+  it.each(BUILTIN_POLICY_TEMPLATES.map(t => [t.id, t] as const))(
+    '%s renders with its sample settings under the package of its type',
+    (_id, template) => {
+      const { rego, errors } = renderTemplate(template, sampleParameterValues(template));
       expect(errors).toEqual({});
       expect(rego).not.toBeNull();
       expect(rego).not.toContain('{{');

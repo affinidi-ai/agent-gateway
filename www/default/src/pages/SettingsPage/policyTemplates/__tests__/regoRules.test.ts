@@ -1079,19 +1079,28 @@ describe('ruleRoles', () => {
     ]);
   });
 
-  it('reads a dotted allow.x as an allow rule, and a rule it reads as used by allow', () => {
+  it('reads a dotted allow.x as setting allow, and a rule it reads as used by allow', () => {
     expect(roles('package p\nh if input.a\nallow.x := h')).toEqual([
       ['h', 'used-by-allow'],
-      ['allow.x', 'allow'],
+      ['allow.x', 'sets-allow'],
     ]);
   });
 
-  it('reads a dotted allow.x beside a plain allow as an allow rule', () => {
+  it('reads a dotted allow.x beside a plain allow as setting allow', () => {
     expect(
       roles('package p\ndefault allow := false\nallow if input.a\nallow.x if input.b')
     ).toEqual([
       ['allow', 'allow'],
-      ['allow.x', 'allow'],
+      ['allow.x', 'sets-allow'],
+    ]);
+  });
+
+  it('gives the allow role only to a plain allow, not to one that sets allow to false', () => {
+    expect(
+      roles('package p\ndefault allow := true\nallow := false if input.x\nallow if input.y')
+    ).toEqual([
+      ['allow', 'sets-allow'],
+      ['allow', 'allow'],
     ]);
   });
 
@@ -1213,5 +1222,71 @@ describe('ruleUse through other rules', () => {
     );
     const denyX = parsed.groups[0].rules.find(r => r.head === 'deny_x')!;
     expect(ruleUse(parsed, denyX)).toEqual({ kind: 'reader', name: 'h', line: 7 });
+  });
+});
+
+describe('an allow rule that is not plain', () => {
+  const BLOCK_LIST = 'package p\ndefault allow := true\nallow := false if input.x\n';
+
+  it('refuses Remove on an allow that sets allow to false under default allow', () => {
+    const parsed = groupsOf(BLOCK_LIST);
+    expect(ruleUse(parsed, parsed.groups[0].rules[0])).toEqual({ kind: 'sets-allow' });
+  });
+
+  it('refuses Remove on a dotted allow.x', () => {
+    const parsed = groupsOf('package p\nallow.x if input.b\n');
+    expect(ruleUse(parsed, parsed.groups[0].rules[0])).toEqual({ kind: 'sets-allow' });
+  });
+
+  it('still removes a plain allow beside it', () => {
+    const parsed = groupsOf(`${BLOCK_LIST}allow if input.y\n`);
+    expect(ruleUse(parsed, parsed.groups[0].rules[1])).toBeNull();
+  });
+
+  it('removes one of two identical copies', () => {
+    const parsed = groupsOf(`${BLOCK_LIST}allow := false if input.x\n`);
+    expect(parsed.groups[0].rules.map(r => ruleUse(parsed, r))).toEqual([null, null]);
+  });
+
+  it('refuses Remove group on a template that holds one', () => {
+    const parsed = groupsOf(
+      'package p\ndefault allow := true\n# Inserted from template: Block x\nallow := false if input.x\n# End of template: Block x\n'
+    );
+    expect(groupUse(parsed, parsed.groups[0])).toEqual({ kind: 'sets-allow' });
+  });
+
+  it('still removes a template group whose allow rules are all plain', () => {
+    const parsed = groupsOf(
+      'package p\ndefault allow := false\n# Inserted from template: T\nallow if input.x\n# End of template: T\n'
+    );
+    expect(groupUse(parsed, parsed.groups[0])).toBeNull();
+  });
+});
+
+describe('a rule body on the line after a word that continues it', () => {
+  it.each([
+    ['not', 'allow if not\n  y'],
+    ['in', 'allow if x in\n  y'],
+    ['==', 'allow if x ==\n  y'],
+    ['with', 'allow if x with\n  input as y'],
+  ])('keeps a line ending in %s with the next', (_word, rule) => {
+    const parsed = groupsOf(`package p\n${rule}\n`);
+    expect(parsed.groups[0].rules.map(r => [r.head, r.startLine, r.endLine])).toEqual([
+      ['allow', 2, 3],
+    ]);
+  });
+
+  it('refuses Remove on a rule allow reads after a not at the end of its line', () => {
+    const parsed = groupsOf(
+      'package p\ndefault allow := false\nallow if not\n  blocked\nblocked if input.a\nblocked if input.b\n'
+    );
+    const rules = parsed.groups[0].rules;
+    expect(rules.map(r => r.head)).toEqual(['allow', 'blocked', 'blocked']);
+    expect(ruleUse(parsed, rules[1])).toEqual({ kind: 'reader', name: 'allow', line: 3 });
+  });
+
+  it('never continues an import that ends in a keyword', () => {
+    const parsed = groupsOf('package p\nimport future.keywords.in\nallow if input.x\n');
+    expect(parsed.groups[0].rules.map(r => r.startLine)).toEqual([3]);
   });
 });

@@ -3,8 +3,17 @@ import { AppButton } from '../../../components/shared/AppButton';
 import { Badge } from '../../../components/shared/Badge';
 import FieldHelp from '../../../components/shared/FieldHelp';
 import { Link } from '../../../components/shared/Link';
+import { sampleOf } from './regoTemplate';
+import { samplePlaceholder } from './templateSettings';
 import type { TemplateSettings } from './useTemplateSettings';
 import type { PolicyTemplate } from './types';
+
+/** Muted note under a preview drawn with the sample values of empty settings. */
+export const SampleValuesNote: React.FC<{ testId: string }> = ({ testId }) => (
+  <div className="small text-muted mb-2" data-testid={testId}>
+    Shown with sample values for the empty settings.
+  </div>
+);
 
 interface SettingsFieldsProps {
   template: PolicyTemplate;
@@ -21,7 +30,9 @@ export const TemplateSettingsFields: React.FC<SettingsFieldsProps> = ({
   <>
     {template.parameters.map(p => {
       const id = `${idPrefix}-param-${p.key}`;
-      const err = settings.rendered.errors[p.key];
+      const required = settings.missing.has(p.key);
+      const requiredId = `${id}-required`;
+      const err = required ? undefined : settings.rendered.errors[p.key];
       return (
         <div className="mb-3" key={p.key}>
           <div className="field-label-with-help">
@@ -56,11 +67,19 @@ export const TemplateSettingsFields: React.FC<SettingsFieldsProps> = ({
               max={p.kind === 'integer' ? p.max : undefined}
               className={`form-control${p.kind === 'integer' ? ' policy-template-number' : ''}${p.kind === 'time_of_day' ? ' policy-template-time' : ''}${err ? ' is-invalid' : ''}`}
               value={settings.fieldText[p.key] ?? ''}
+              placeholder={samplePlaceholder(template, p.key)}
+              aria-required={sampleOf(p) !== undefined || undefined}
+              aria-describedby={required ? requiredId : undefined}
               onChange={e => settings.setField(p.key, e.target.value)}
               data-testid={id}
             />
           )}
           {err && <div className="invalid-feedback">{err}</div>}
+          {required && (
+            <div className="small text-muted mt-1" id={requiredId} data-testid={requiredId}>
+              Required before the template can be used.
+            </div>
+          )}
         </div>
       );
     })}
@@ -110,7 +129,11 @@ export const TemplateHowItDecides: React.FC<{ template: PolicyTemplate; idPrefix
         ))}
       </ul>
       {template.parameters.length > 0 && (
-        <div className="small text-muted mb-2">Examples use the default settings.</div>
+        <div className="small text-muted mb-2">
+          {template.parameters.some(p => sampleOf(p) !== undefined)
+            ? 'Examples use the default settings and the sample values shown in empty fields.'
+            : 'Examples use the default settings.'}
+        </div>
       )}
     </>
   );

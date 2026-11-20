@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiClient } from '../../api';
-import type { PolicyType } from '../SettingsPage/policyTemplates/types';
+import type { PolicyType } from '../../types';
 
 interface GatewayOpaPolicyConfig {
   enabled: boolean;

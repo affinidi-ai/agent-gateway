@@ -2,7 +2,12 @@ import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { AppButton } from '../../../components/shared/AppButton';
 import { ALLOW_ALL_POLICY, BLANK_TEMPLATE_ID } from './policyDefaults';
 import { CUSTOM_POLICY_NAME, replaceText, type PolicyStart } from './policyStart';
-import { TemplateDocsLink, TemplateHowItDecides, TemplateSettingsFields } from './TemplatePreview';
+import {
+  SampleValuesNote,
+  TemplateDocsLink,
+  TemplateHowItDecides,
+  TemplateSettingsFields,
+} from './TemplatePreview';
 import { useTemplateSettings } from './useTemplateSettings';
 import type { FieldText, PolicyTemplate, PolicyType, UsedTemplate } from './types';
 import './PolicyTemplates.css';
@@ -23,8 +28,14 @@ const DetailHeading = React.forwardRef<HTMLHeadingElement, { children: React.Rea
 );
 DetailHeading.displayName = 'DetailHeading';
 
-/** The Rego a detail renders to, collapsed until asked for; null while a setting is invalid. */
-const ShowRego: React.FC<{ rego: string | null }> = ({ rego }) => {
+/**
+ * The Rego a detail renders to, collapsed until asked for; null while a setting is invalid.
+ * `usesSamples` marks Rego drawn with the sample values of empty settings.
+ */
+const ShowRego: React.FC<{ rego: string | null; usesSamples?: boolean }> = ({
+  rego,
+  usesSamples = false,
+}) => {
   const [open, setOpen] = useState(false);
   const regoId = useId();
   return (
@@ -39,6 +50,7 @@ const ShowRego: React.FC<{ rego: string | null }> = ({ rego }) => {
       >
         {open ? 'Hide Rego' : 'Show Rego'}
       </AppButton>
+      {open && rego && usesSamples && <SampleValuesNote testId={`${ID_PREFIX}-sample-note`} />}
       {open && (
         <pre
           id={regoId}
@@ -131,7 +143,7 @@ const GalleryDetail: React.FC<{
       <DetailHeading ref={headingRef}>{template.name}</DetailHeading>
       <p className="text-muted small mb-2">{template.description}</p>
       <TemplateSettingsFields template={template} settings={settings} idPrefix={ID_PREFIX} />
-      <ShowRego rego={settings.rendered.rego} />
+      <ShowRego rego={settings.preview.rego} usesSamples={settings.preview.usesSamples} />
       <TemplateHowItDecides template={template} idPrefix={ID_PREFIX} />
       <TemplateDocsLink template={template} testId="policy-template-gallery-docs-link" />
       <UseTemplateButton
@@ -206,7 +218,9 @@ const TemplateGalleryDetail: React.FC<TemplateGalleryDetailProps> = ({
             </p>
             <ShowRego rego={ALLOW_ALL_POLICY[policyType]} />
             <UseTemplateButton
-              replaces={replaces}
+              replaces={
+                replaces && `${replaces.replace(/\.$/, '')} and empties the Name and Description.`
+              }
               label="Create custom policy"
               onUse={onPickBlank}
             />

@@ -4,7 +4,12 @@ import InfoBanner from '../../../components/shared/InfoBanner';
 import { defaultDecision, insertTemplateRules, templateRole } from './regoTemplate';
 import { DecisionBadge, TemplateRoleBadge } from './TemplateBadges';
 import TemplateFilterBar from './TemplateFilterBar';
-import { TemplateDocsLink, TemplateHowItDecides, TemplateSettingsFields } from './TemplatePreview';
+import {
+  SampleValuesNote,
+  TemplateDocsLink,
+  TemplateHowItDecides,
+  TemplateSettingsFields,
+} from './TemplatePreview';
 import { useTemplateSettings } from './useTemplateSettings';
 import { galleryTemplates, type PolicyTemplateLibrary } from './policyTemplateLibrary';
 import { useTemplateFilter } from './useTemplateFilter';
@@ -19,7 +24,10 @@ interface PolicyTemplatesPanelProps {
   existingPolicy?: string;
   /** On the create form whole policies are offered under Start from. */
   isCreateMode: boolean;
-  /** `usesDefaultSettings` is false when a setting differs from its default. */
+  /**
+   * `usesDefaultSettings` is false when a setting differs from the settings the examples use:
+   * its default, or its sample for a deployment-specific setting.
+   */
   onInsert: (template: PolicyTemplate, rego: string, usesDefaultSettings: boolean) => void;
 }
 
@@ -36,16 +44,17 @@ const InsertPreview: React.FC<{
   onInsert: PolicyTemplatesPanelProps['onInsert'];
 }> = ({ template, existingPolicy, onInsert }) => {
   const settings = useTemplateSettings(template);
-  const { rendered, usesDefaultSettings } = settings;
+  const { rendered, preview, usesDefaultSettings } = settings;
   // The preview sits under the list, so picking a row scrolls only as far as needed to show it.
   const headingRef = useRef<HTMLHeadingElement>(null);
   useEffect(() => {
     headingRef.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
   }, []);
-  const insert = rendered.rego
-    ? insertTemplateRules(existingPolicy, template.name, rendered.rego)
+  const insert = preview.rego
+    ? insertTemplateRules(existingPolicy, template.name, preview.rego)
     : null;
-  const canInsert = !!insert?.added;
+  const addsLines = !!insert?.added;
+  const canInsert = addsLines && !!rendered.rego;
 
   return (
     <div className="policy-template-preview" data-testid="policy-templates-preview">
@@ -61,13 +70,14 @@ const InsertPreview: React.FC<{
       <TemplateSettingsFields template={template} settings={settings} idPrefix={ID_PREFIX} />
 
       <div className="font-weight-bold mb-1">Added to the end of the policy</div>
+      {insert && preview.usesSamples && <SampleValuesNote testId={`${ID_PREFIX}-sample-note`} />}
       <pre
         className="policy-preview-block rounded p-2 mb-2 small"
         data-testid="policy-templates-insert-preview"
       >
         <code>{insert ? insert.added : 'Fix the settings above to see the rules.'}</code>
       </pre>
-      {canInsert && defaultDecision(existingPolicy) === 'allow' && (
+      {addsLines && defaultDecision(existingPolicy) === 'allow' && (
         <div data-testid="policy-templates-allow-default-note">
           <InfoBanner
             variant="warning"
@@ -78,7 +88,7 @@ const InsertPreview: React.FC<{
           />
         </div>
       )}
-      {canInsert && (
+      {addsLines && (
         <div data-testid="policy-templates-or-note">
           <InfoBanner
             collapsible={false}

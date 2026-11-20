@@ -434,12 +434,15 @@ Policy section, on the Rules view, appear after that. The gallery lists only the
 templates of the policy's Type, so **Define Gateway Policy** and **Define Agent
 Surface Policy** each start from their own templates, the Type set by that button and never
 changeable, with a **Create custom policy** button
-under the list that starts a custom policy (allow-all Rego) at once, or shows it in the
-templates column first when it would replace rules or edits. It has no search or category
+under the list that starts a custom policy (allow-all Rego, Name and Description emptied) at
+once, or shows it in the templates column first when it would replace rules or edits. It has no search or category
 filters, its cards carry no role or default decision badges, and on an Agent Surface policy a
-template that serves surfaces only has a muted "Agent surface only" note. A gallery card shows its
-settings, How it decides, its Rego and docs link in the templates column, and **Use this template** fills the
-form, asking in place first (focus on Cancel) unless the Rego is an untouched
+template that serves surfaces only has a muted "Agent surface only" note. A setting that
+depends on the deployment (issuers, audiences, DIDs, destinations, paths, surface IDs,
+subjects, role and claim values) starts empty with a sample as its placeholder, and Use this
+template and Add to policy stay disabled until it is filled; previews use the sample, labelled
+as one. A gallery card shows its settings, How it decides, its Rego and docs link in the templates column, and **Use this template** fills the
+Rego and an empty or template-filled Description, never the Name, asking in place first (focus on Cancel) unless the Rego is an untouched
 start. Templates still have a role, **Whole policy** or **Adds rules**, shown under **Add rules
 from a template**. The Policy section's
 **Rules | Rego** toggle lists the rules grouped by
@@ -448,7 +451,8 @@ marks each rule other than `allow` and `deny_reason` "Used by allow" or "Not use
 shows a plain allow rule's conditions one per line, joined by a muted "and", when it has
 several and splits cleanly (otherwise the rule stays on one line), with Remove per group and
 per rule, disabled while `allow` reads the rule, with a reason that names the rule reading
-it; under Default ALLOW each group with allow rules is marked as having no effect, and on a
+it, and on an `allow` definition that is not a plain allow (badged "Sets allow"), with a
+reason that points to the Rego view; under Default ALLOW each group with allow rules is marked as having no effect, and on a
 new policy a group written for the other Type is marked and blocks Create until it is
 removed. Once rules are added the gallery still names the template the policy started from
 and counts the templates added. **Add rules from a template** lists only templates that add

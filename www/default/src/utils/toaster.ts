@@ -20,20 +20,30 @@ export interface ToastOptions {
   action?: ToastAction;
 }
 
+// Removes the toast on screen with its timer and key handler; a new toast replaces it through this.
+let dismissActive: (() => void) | null = null;
+
+const replaceActiveToast = () => {
+  dismissActive?.();
+  document.getElementById('app-toast')?.remove();
+};
+
 export const showToast = (
   type: ToastType,
   text: string,
   options: ToastOptions = { autoRemove: true, duration: 3000 }
 ) => {
-  // Remove any existing toast
-  const existingToast = document.getElementById('app-toast');
-  if (existingToast) {
-    existingToast.remove();
-  }
+  replaceActiveToast();
 
   // Create new toast element
   const toast = document.createElement('div');
   toast.id = 'app-toast';
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const close = () => {
+    clearTimeout(timer);
+    toast.remove();
+    if (dismissActive === close) dismissActive = null;
+  };
 
   // Set class based on type
   let alertClass = 'alert-info'; // Default for loading
@@ -130,7 +140,7 @@ export const showToast = (
         try {
           action.onClick();
         } finally {
-          document.getElementById('app-toast')?.remove();
+          close();
         }
       };
       link.addEventListener('click', fire);
@@ -141,26 +151,21 @@ export const showToast = (
     }
   }
 
-  toast
-    .querySelector('button.close')
-    ?.addEventListener('click', () => document.getElementById('app-toast')?.remove());
+  toast.querySelector('button.close')?.addEventListener('click', close);
 
   // Add to page
   document.body.appendChild(toast);
+  dismissActive = close;
 
   // Auto-remove with different timers based on type and options
   if (options.autoRemove && type !== 'loading') {
     const duration =
       type === 'error' || type === 'warning' ? options.duration || 5000 : options.duration || 3000;
-    setTimeout(() => {
-      document.getElementById('app-toast')?.remove();
-    }, duration);
+    timer = setTimeout(close, duration);
   }
 };
 
-export const removeToast = () => {
-  document.getElementById('app-toast')?.remove();
-};
+export const removeToast = replaceActiveToast;
 
 export interface UndoToastOptions {
   message?: string;
@@ -181,7 +186,7 @@ export const showUndoToast = ({
   onUndo,
   onExpire,
 }: UndoToastOptions): (() => void) => {
-  document.getElementById('app-toast')?.remove();
+  replaceActiveToast();
 
   const isDark = document.body.classList.contains('dark-theme');
   const bgColor = isDark ? 'rgba(15, 23, 42, 0.85)' : 'rgba(255, 255, 255, 0.95)';
@@ -228,19 +233,19 @@ export const showUndoToast = ({
 
   let undoRoot: Root | null = null;
 
-  let expired = false;
+  let removed = false;
   const remove = (undone: boolean) => {
+    if (removed) return;
+    removed = true;
+    if (dismissActive === dismiss) dismissActive = null;
     document.removeEventListener('keydown', keyHandler);
-    clearInterval(ticker);
     clearTimeout(timer);
     undoRoot?.unmount();
     undoRoot = null;
-    document.getElementById('app-toast')?.remove();
-    if (!undone && !expired) {
-      expired = true;
-      onExpire?.();
-    }
+    toast.remove();
+    if (!undone) onExpire?.();
   };
+  const dismiss = () => remove(false);
 
   const fireUndo = () => {
     remove(true);
@@ -259,7 +264,7 @@ export const showUndoToast = ({
     );
   }
 
-  toast.querySelector('#app-toast-close')?.addEventListener('click', () => remove(false));
+  toast.querySelector('#app-toast-close')?.addEventListener('click', dismiss);
 
   // 'u' key triggers undo while the toast is visible (ignored inside inputs).
   const keyHandler = (e: KeyboardEvent) => {
@@ -278,8 +283,7 @@ export const showUndoToast = ({
     fill.style.width = '0%';
   }
 
-  const ticker = 0; // no visible countdown — kept for remove() signature compatibility
-
-  const timer = setTimeout(() => remove(false), duration);
-  return () => remove(false);
+  const timer = setTimeout(dismiss, duration);
+  dismissActive = dismiss;
+  return dismiss;
 };

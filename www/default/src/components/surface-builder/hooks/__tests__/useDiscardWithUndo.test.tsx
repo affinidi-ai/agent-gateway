@@ -3,14 +3,15 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { useDiscardWithUndo } from '../useDiscardWithUndo';
 
-const Editor: React.FC<{ restoreOnlyOnUndo: boolean; restore: (saved: string) => void }> = ({
-  restoreOnlyOnUndo,
-  restore,
-}) => {
+const Editor: React.FC<{
+  restoreOnlyOnUndo: boolean;
+  restore: (saved: string) => void;
+  save: () => string;
+}> = ({ restoreOnlyOnUndo, restore, save }) => {
   const { discard, popPendingRestore } = useDiscardWithUndo({
     dirty: true,
     navigateTo: '/list',
-    snapshot: { storageKey: 'draft:test', save: () => 'draft', restore, restoreOnlyOnUndo },
+    snapshot: { storageKey: 'draft:test', save, restore, restoreOnlyOnUndo },
   });
   useEffect(() => {
     popPendingRestore();
@@ -32,14 +33,14 @@ const List: React.FC = () => {
 };
 
 /** Opens the editor and returns its `restore` mock. */
-function openEditor(restoreOnlyOnUndo: boolean) {
+function openEditor(restoreOnlyOnUndo: boolean, save: () => string = () => 'draft') {
   const restore = jest.fn();
   render(
     <MemoryRouter initialEntries={['/edit']}>
       <Routes>
         <Route
           path="/edit"
-          element={<Editor restoreOnlyOnUndo={restoreOnlyOnUndo} restore={restore} />}
+          element={<Editor restoreOnlyOnUndo={restoreOnlyOnUndo} restore={restore} save={save} />}
         />
         <Route path="/list" element={<List />} />
       </Routes>
@@ -95,5 +96,19 @@ describe('useDiscardWithUndo', () => {
 
     expect(restore).toHaveBeenCalledWith('draft');
     expect(screen.getByText('Changes discarded.')).toBeInTheDocument();
+  });
+
+  it('restores the second draft when the editor is discarded again while the first toast shows', () => {
+    let saves = 0;
+    const restore = openEditor(false, () => `draft ${++saves}`);
+    fireEvent.click(screen.getByText('Back'));
+    fireEvent.click(screen.getByText('Open'));
+    expect(restore).toHaveBeenLastCalledWith('draft 1');
+
+    fireEvent.click(screen.getByText('Back'));
+    expect(window.sessionStorage.getItem('draft:test')).toBe('draft 2');
+    fireEvent.keyDown(document, { key: 'u' });
+
+    expect(restore).toHaveBeenLastCalledWith('draft 2');
   });
 });

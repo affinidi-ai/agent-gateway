@@ -9,7 +9,7 @@ import { DOCS_URL } from '../../config/docs';
 import { apiClient } from '../../api';
 import ConfirmPopover from '../../components/shared/ConfirmPopover';
 import { useGlobalPolicyAssignments } from './useGlobalPolicyAssignments';
-import type { PolicyType } from '../SettingsPage/policyTemplates/types';
+import type { PolicyType } from '../../types';
 
 export interface PolicyDefinition {
   id: string;

@@ -99,6 +99,11 @@ async function card(id: string) {
   return screen.getByTestId(`policy-template-card-${id}`);
 }
 const openAdd = () => fireEvent.click(screen.getByTestId('policy-templates-insert-button'));
+/** Fills Allowed values of Allow by JWT claim or role with its sample, which its examples use. */
+const fillClaimValues = () =>
+  fireEvent.change(screen.getByTestId('policy-templates-param-values'), {
+    target: { value: 'admin' },
+  });
 const panelRow = (id: string) => screen.findByTestId(`policy-templates-row-${id}:agent_surface`);
 
 const customButton = () => screen.getByTestId('policy-template-gallery-create-custom-button');
@@ -732,6 +737,61 @@ describe('template settings in the gallery', () => {
     expect(screen.getByText('Must differ from From.')).toBeInTheDocument();
     expect(screen.getByTestId('policy-template-gallery-use-button')).toBeDisabled();
   });
+
+  it('starts a deployment setting empty and blocks Use, saying why, until it is filled', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    fireEvent.click(await card('allow-listed-subjects'));
+    const field = screen.getByTestId('policy-template-gallery-param-subjects');
+    expect(field).toHaveValue('');
+    expect(field).toHaveAttribute('placeholder', 'e.g. user@example.com');
+    const reason = screen.getByTestId('policy-template-gallery-param-subjects-required');
+    expect(reason).toHaveTextContent(/^Required before the template can be used\.$/);
+    expect(field).toHaveAttribute('aria-describedby', reason.id);
+    expect(field).not.toHaveClass('is-invalid');
+    const use = screen.getByTestId('policy-template-gallery-use-button');
+    expect(use).toBeDisabled();
+
+    fireEvent.change(field, { target: { value: 'ops@example.com' } });
+    expect(screen.queryByTestId('policy-template-gallery-param-subjects-required')).toBeNull();
+    fireEvent.click(use);
+    expect(rego().value).toContain('input.source_auth.subject in {"ops@example.com"}');
+    expect(rego().value).not.toContain('user@example.com');
+  });
+
+  it('blocks Use again when a filled deployment setting is emptied', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    fireEvent.click(await card('allow-listed-subjects'));
+    const field = screen.getByTestId('policy-template-gallery-param-subjects');
+    fireEvent.change(field, { target: { value: 'ops@example.com' } });
+    fireEvent.change(field, { target: { value: ' , ' } });
+    expect(screen.getByTestId('policy-template-gallery-use-button')).toBeDisabled();
+    expect(screen.getByTestId('policy-template-gallery-param-subjects-required')).toBeVisible();
+  });
+
+  it('shows the Rego with the sample values, labelled as samples, while a setting is empty', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    fireEvent.click(await card('allow-listed-subjects'));
+    fireEvent.click(screen.getByTestId('policy-template-gallery-show-rego'));
+    expect(screen.getByTestId('policy-template-gallery-rego')).toHaveTextContent(
+      'input.source_auth.subject in {"user@example.com"}'
+    );
+    expect(screen.getByTestId('policy-template-gallery-sample-note')).toHaveTextContent(
+      'Shown with sample values for the empty settings.'
+    );
+    expect(screen.getByText(/the sample values shown in empty fields/)).toBeInTheDocument();
+
+    fireEvent.change(screen.getByTestId('policy-template-gallery-param-subjects'), {
+      target: { value: 'ops@example.com' },
+    });
+    expect(screen.queryByTestId('policy-template-gallery-sample-note')).toBeNull();
+  });
+
+  it('keeps a well-known claim name prefilled and its values empty', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    fireEvent.click(await card('allow-by-jwt-claim'));
+    expect(screen.getByTestId('policy-template-gallery-param-claim')).toHaveValue('role');
+    expect(screen.getByTestId('policy-template-gallery-param-values')).toHaveValue('');
+  });
 });
 
 describe('templates panel', () => {
@@ -751,6 +811,31 @@ describe('templates panel', () => {
     fireEvent.click(screen.getByTestId('policy-templates-insert-rules-button'));
     expect(rego().value).toContain('allow if input.http.method in {"GET"}');
     expect(screen.queryByTestId('policy-rules-allow-default-warning')).toBeNull();
+  });
+
+  it('blocks Add to policy until a deployment setting is filled, previewing sample values', async () => {
+    await renderNew();
+    fireEvent.click(await panelRow('allow-listed-subjects'));
+    const field = screen.getByTestId('policy-templates-param-subjects');
+    expect(field).toHaveValue('');
+    expect(field).toHaveAttribute('placeholder', 'e.g. user@example.com');
+    expect(screen.getByTestId('policy-templates-param-subjects-required')).toHaveTextContent(
+      'Required before the template can be used.'
+    );
+    const add = screen.getByTestId('policy-templates-insert-rules-button');
+    expect(add).toBeDisabled();
+    expect(screen.getByTestId('policy-templates-insert-preview')).toHaveTextContent(
+      'input.source_auth.subject in {"user@example.com"}'
+    );
+    expect(screen.getByTestId('policy-templates-sample-note')).toHaveTextContent(
+      'Shown with sample values for the empty settings.'
+    );
+
+    fireEvent.change(field, { target: { value: 'ops@example.com' } });
+    expect(add).toBeEnabled();
+    fireEvent.click(add);
+    expect(rego().value).toContain('input.source_auth.subject in {"ops@example.com"}');
+    expect(rego().value).not.toContain('user@example.com');
   });
 
   it('scrolls the preview into view and keeps focus on the picked row', async () => {
@@ -923,6 +1008,7 @@ describe('add rules while creating a policy', () => {
     await renderNew();
     openAdd();
     fireEvent.click(await row('allow-by-jwt-claim'));
+    fillClaimValues();
     fireEvent.click(screen.getByTestId('policy-templates-insert-rules-button'));
     expect(screen.getByTestId('policy-templates-panel')).toBeInTheDocument();
     fireEvent.click(await row('allow-http-methods'));
@@ -982,6 +1068,7 @@ describe('insert a template into a saved policy', () => {
       'some v in jwt_claim_values(input.source_auth.claims["role"])'
     );
 
+    fillClaimValues();
     fireEvent.click(screen.getByTestId('policy-templates-insert-rules-button'));
 
     expect(rego().value).toContain(
@@ -1045,6 +1132,7 @@ describe('insert a template into a saved policy', () => {
     fireEvent.click(
       await screen.findByTestId('policy-templates-row-allow-by-jwt-claim:agent_surface')
     );
+    fillClaimValues();
     fireEvent.click(screen.getByTestId('policy-templates-insert-rules-button'));
     expect(screen.getByTestId('policy-rules-allow-default-warning')).toBeInTheDocument();
   });
@@ -1181,6 +1269,7 @@ describe('rules in this policy', () => {
     fireEvent.click(
       await screen.findByTestId('policy-templates-row-allow-by-jwt-claim:agent_surface')
     );
+    fillClaimValues();
     fireEvent.click(screen.getByTestId('policy-templates-insert-rules-button'));
     fireEvent.change(rego(), {
       target: { value: `${rego().value}\nallow if input.http.method == "GET"\n` },
@@ -1202,6 +1291,7 @@ describe('rules in this policy', () => {
     fireEvent.click(
       await screen.findByTestId('policy-templates-row-allow-by-jwt-claim:agent_surface')
     );
+    fillClaimValues();
     fireEvent.click(screen.getByTestId('policy-templates-insert-rules-button'));
     expect(await screen.findByTestId('policy-template-examples-card')).toBeInTheDocument();
 
@@ -1220,6 +1310,7 @@ describe('rules in this policy', () => {
     fireEvent.click(screen.getByTestId('policy-templates-insert-rules-button'));
     await screen.findByTestId('policy-template-examples-card');
     fireEvent.click(screen.getByTestId('policy-templates-row-allow-by-jwt-claim:agent_surface'));
+    fillClaimValues();
     fireEvent.click(screen.getByTestId('policy-templates-insert-rules-button'));
 
     const card = screen.getByTestId('policy-template-examples-card');
@@ -1493,7 +1584,9 @@ describe('Use over rules already in the policy', () => {
     fireEvent.click(customButton());
     expect(rego().value).toContain('Allow listed HTTP methods');
     fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
-    expect(confirm()).toBeInTheDocument();
+    expect(confirm()).toHaveTextContent(
+      'This replaces the 1 rule in the Policy section and empties the Name and Description.'
+    );
     expect(rego().value).toContain('Allow listed HTTP methods');
 
     fireEvent.click(screen.getByTestId('policy-template-gallery-replace-button'));
@@ -1675,7 +1768,7 @@ describe('undo', () => {
     );
   });
 
-  it('clears the used template description on Create custom policy, keeps the Name, and restores both on Undo', async () => {
+  it('empties the Name and the filled Description on Create custom policy, and restores both on Undo', async () => {
     renderAt('/policy-definitions/new?type=agent_surface');
     await applyCard('allow-http-methods');
     const description = () => screen.getByPlaceholderText('What does this policy do?');
@@ -1685,7 +1778,7 @@ describe('undo', () => {
     fireEvent.click(customButton());
 
     expect(rego().value).toContain('default allow = true');
-    expect(nameField()).toHaveValue('methods');
+    expect(nameField()).toHaveValue('');
     expect(description()).toHaveValue('');
     expect(mockUndo.message).toContain('Undo restores the form from before this change.');
 
@@ -1696,15 +1789,47 @@ describe('undo', () => {
     expect(rego().value).toContain('allow if input.http.method in {"GET"}');
   });
 
-  it('keeps a typed name on Create custom policy', async () => {
+  it('empties a typed Name and Description on Create custom policy, and restores both on Undo', async () => {
     renderAt('/policy-definitions/new?type=agent_surface');
     await applyCard('allow-http-methods');
+    const description = () => screen.getByPlaceholderText('What does this policy do?');
     fireEvent.change(nameField()!, { target: { value: 'Read-only partners' } });
+    fireEvent.change(description(), { target: { value: 'Partners only read.' } });
     changeGallery();
     fireEvent.click(customButton());
 
     expect(rego().value).toContain('default allow = true');
+    expect(nameField()).toHaveValue('');
+    expect(description()).toHaveValue('');
+    expect(mockUndo.message).toContain('Undo restores the form from before this change.');
+
+    act(() => mockUndo.last?.());
+
     expect(nameField()).toHaveValue('Read-only partners');
+    expect(description()).toHaveValue('Partners only read.');
+  });
+
+  it('keeps a typed Description when another template is used', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    await applyCard('allow-http-methods');
+    const description = () => screen.getByPlaceholderText('What does this policy do?');
+    fireEvent.change(description(), { target: { value: 'Partners only read.' } });
+    changeGallery();
+    await applyCard('deny-by-default');
+
+    expect(rego().value).toContain('default allow := false');
+    expect(description()).toHaveValue('Partners only read.');
+  });
+
+  it('fills the Description of another template over one the last Use filled', async () => {
+    renderAt('/policy-definitions/new?type=agent_surface');
+    await applyCard('allow-http-methods');
+    changeGallery();
+    await applyCard('deny-by-default');
+
+    expect(
+      (screen.getByPlaceholderText('What does this policy do?') as HTMLTextAreaElement).value
+    ).toMatch(/^Denies every request/);
   });
 
   it('keeps the mark of a same-named group that is still in the policy', async () => {
@@ -1844,6 +1969,7 @@ describe('template examples that differ', () => {
     });
     renderAt('/policy-definitions/partner-only');
     fireEvent.click(await panelRow('allow-by-jwt-claim'));
+    fillClaimValues();
     fireEvent.click(screen.getByTestId('policy-templates-insert-rules-button'));
     const card = await screen.findByTestId('policy-template-examples-card');
     await waitFor(() =>
