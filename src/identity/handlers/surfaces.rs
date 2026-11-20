@@ -1312,10 +1312,26 @@ async fn save_warnings(
 }
 
 /// A `Warning` header (code 299) carrying `warning`.
+///
+/// A warning quotes what the operator stored, such as a Transit Point
+/// `listen_path`, so the text can carry anything a save was given. Each
+/// control character becomes a space: one would otherwise end the header
+/// value, and a header value is where a line break would be read as the end of
+/// the field. `HeaderValue::from_str` refuses them, so the whole warning would
+/// be dropped and the operator told nothing.
 pub(crate) fn warning_header(warning: &str) -> Option<axum::http::HeaderValue> {
-    let quoted = warning
+    let quoted: String = warning
         .replace('\\', "\\\\")
-        .replace('"', "\\\"");
+        .replace('"', "\\\"")
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
     axum::http::HeaderValue::from_str(&format!("299 - \"{quoted}\"")).ok()
 }
 
@@ -9397,7 +9413,17 @@ mod validation_tests {
     fn nothing_a_listen_path_does_is_refused_while_the_appliance_is_not_strict() {
         let lenient = network_with_strict_listen_paths(false);
 
-        for path in ["/partner-a-webhook", "/outbound", "/outbound/", "/", "//", "partner-a", "/partner/{id}"] {
+        for path in [
+            "/partner-a-webhook",
+            "/outbound",
+            "/outbound/",
+            "/",
+            "//",
+            "partner-a",
+            "/partner/{id}",
+            "/outbound/:partner",
+            "/outbound/*partner",
+        ] {
             let saved = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", path);
             check_listen_paths(&saved, None, &lenient)
                 .unwrap_or_else(|error| panic!("{path} saved before this release and must still save: {error:?}"));
@@ -9431,6 +9457,8 @@ mod validation_tests {
             ("partner-a", "must start with '/'"),
             ("/partner/../secret", "must not contain '..' segments"),
             ("/partner/{id}", "must not contain '{' or '}'"),
+            ("/outbound/:partner", "must not contain a segment starting with ':' or '*' (':partner')"),
+            ("/outbound/*partner", "must not contain a segment starting with ':' or '*' ('*partner')"),
         ] {
             let (code, msg) =
                 listen_path_refusal(&surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", path), None, &strict);
@@ -9441,6 +9469,45 @@ mod validation_tests {
 
         let under = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "/outbound/partner-a");
         check_listen_paths(&under, None, &strict).expect("a path under the prefix is served");
+    }
+
+    /// A surface whose base Transit Point claims no `listen_path` and whose
+    /// one variant defines a Transit Point that claims `listen_path`.
+    fn surface_with_a_variant_only_listen_path(listen_path: &str) -> AgentSurface {
+        let mut surface = with_transit(
+            base_surface(),
+            serde_json::json!({
+                "outbound_listen_address": "0.0.0.0:9443",
+                "points": [{ "alias": "pa", "target_endpoint": "https://a.example.com", "protocol": "a2a" }],
+            }),
+        );
+        surface.variants = serde_json::from_value(serde_json::json!([{
+            "id": "candidate",
+            "alias": "candidate",
+            "name": "Candidate",
+            "overrides": { "transit": { "points": [{
+                "alias": "pb",
+                "target_endpoint": "https://b.example.com",
+                "protocol": "a2a",
+                "listen_path": listen_path,
+            }] } },
+        }]))
+        .expect("variant fixture");
+        surface
+    }
+
+    #[test]
+    fn the_strict_gate_refuses_a_listen_path_only_a_variant_claims() {
+        let strict = network_with_strict_listen_paths(true);
+
+        let introduced = surface_with_a_variant_only_listen_path("/partner-a-webhook");
+        let (code, msg) = listen_path_refusal(&introduced, None, &strict);
+        assert_eq!(code, "listen_path_not_served");
+        assert!(msg.starts_with("Transit Point 'pb' in variant 'candidate' "), "{msg}");
+        assert!(msg.contains("'/outbound/api$candidate/pb'"), "the route the variant serves must be named: {msg}");
+
+        let served = surface_with_a_variant_only_listen_path("/outbound/api/partner-b");
+        check_listen_paths(&served, None, &strict).expect("a variant path under the prefix is served");
     }
 
     #[test]
@@ -9499,6 +9566,26 @@ mod validation_tests {
         assert!(msg.contains("'pb'"), "the Transit Point that introduces it must be named: {msg}");
         assert!(msg.contains("'/partner-b-webhook'"), "{msg}");
         assert!(!msg.contains("'/partner-a-webhook'"), "the kept path must not be refused: {msg}");
+    }
+
+    #[test]
+    fn a_warning_header_carries_what_an_operator_stored_without_its_control_characters() {
+        let value = warning_header("Transit Point 'pa' has listen_path '/hook\r\nX-Injected: 1'")
+            .expect("a warning naming a stored path must still be told");
+
+        let told = value
+            .to_str()
+            .expect("the header value is text");
+        assert_eq!(told, "299 - \"Transit Point 'pa' has listen_path '/hook  X-Injected: 1'\"");
+        assert!(!told.contains('\r') && !told.contains('\n'), "{told}");
+
+        let quoted = warning_header(r#"listen_path "/a\b""#).expect("quotes and backslashes are escaped, not dropped");
+        assert_eq!(
+            quoted
+                .to_str()
+                .expect("the header value is text"),
+            r#"299 - "listen_path \"/a\\b\"""#
+        );
     }
 
     // ── access_point route collision checks ────────────────────────────

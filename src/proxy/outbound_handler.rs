@@ -31,9 +31,23 @@ pub fn transit_point_outbound_path(
     }
 }
 
+/// The path a Transit Point a variant defines answers on: the surface's
+/// `route` with the variant alias behind `$`, then the point's own `alias`.
+/// The outbound listener registers this form for every variant of the surface,
+/// so it, not the base [`transit_point_outbound_path`], is what a caller of
+/// that variant can rely on.
+pub fn transit_point_variant_outbound_path(
+    route: &str,
+    variant: &str,
+    alias: &str,
+) -> String {
+    let route = route.trim_end_matches('/');
+    format!("{TP_OUTBOUND_PATH_PREFIX}{route}${variant}/{alias}")
+}
+
 #[cfg(test)]
 mod transit_point_outbound_path_tests {
-    use super::transit_point_outbound_path;
+    use super::{transit_point_outbound_path, transit_point_variant_outbound_path};
 
     #[test]
     fn a_route_is_kept_between_the_prefix_and_the_alias() {
@@ -45,6 +59,25 @@ mod transit_point_outbound_path_tests {
     fn a_root_route_leaves_the_prefix_beside_the_alias() {
         for route in ["", "/"] {
             assert_eq!(transit_point_outbound_path(route, "pricing"), "/outbound/pricing", "{route:?}");
+        }
+    }
+
+    #[test]
+    fn a_variant_names_itself_behind_a_dollar_after_the_route() {
+        assert_eq!(
+            transit_point_variant_outbound_path("/agents", "candidate", "pricing"),
+            "/outbound/agents$candidate/pricing"
+        );
+        assert_eq!(
+            transit_point_variant_outbound_path("/agents/", "candidate", "pricing"),
+            "/outbound/agents$candidate/pricing"
+        );
+        for route in ["", "/"] {
+            assert_eq!(
+                transit_point_variant_outbound_path(route, "candidate", "pricing"),
+                "/outbound$candidate/pricing",
+                "{route:?}"
+            );
         }
     }
 }

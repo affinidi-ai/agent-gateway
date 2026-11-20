@@ -745,6 +745,22 @@ pub(crate) struct ListenPathProblem<'a> {
     pub message: String,
 }
 
+/// The route the gateway derives for one Transit Point, which every address
+/// serves: the surface's own under [`TP_OUTBOUND_PATH_PREFIX`], or, for a point
+/// a variant defines, that variant's `$` route.
+fn derived_outbound_path(
+    surface: &crate::config::agent_surface::AgentSurface,
+    variant: Option<&str>,
+    alias: &str,
+) -> String {
+    match variant {
+        Some(variant) => {
+            crate::proxy::outbound_handler::transit_point_variant_outbound_path(surface.route(), variant, alias)
+        }
+        None => crate::proxy::outbound_handler::transit_point_outbound_path(surface.route(), alias),
+    }
+}
+
 /// A Transit Point as every refusal and warning names it.
 fn named_transit_point(
     variant: Option<&str>,
@@ -795,7 +811,7 @@ pub(crate) fn listen_path_problems(surface: &crate::config::agent_surface::Agent
                      alone, so an inbound listener sharing that listener's hostname does not reach it; the route \
                      every address serves is '{}'. Set a listen_path under '{prefix}', or leave it unset to take \
                      the route the gateway derives.",
-                    crate::proxy::outbound_handler::transit_point_outbound_path(surface.route(), &point.alias)
+                    derived_outbound_path(surface, variant, &point.alias)
                 ),
             })
         })
@@ -3874,8 +3890,8 @@ mod tests {
                     "Transit Point 'variant-outside' in variant 'candidate' has listen_path '/variant-hook', \
                      outside '/outbound'. It answers on the outbound listener alone, so an inbound listener sharing \
                      that listener's hostname does not reach it; the route every address serves is \
-                     '/outbound/example/variant-outside'. Set a listen_path under '/outbound', or leave it unset to \
-                     take the route the gateway derives."
+                     '/outbound/example$candidate/variant-outside'. Set a listen_path under '/outbound', or leave it \
+                     unset to take the route the gateway derives."
                 ),
             ]
         );

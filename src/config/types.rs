@@ -892,6 +892,9 @@ pub fn validate_outbound_listen_path(path: &str) -> Result<(), String> {
 /// - Contain no `{` or `}`: axum reads a balanced pair as a path parameter, so
 ///   the transit point quietly answers every value in that position, and an
 ///   unbalanced one panics the listener build
+/// - Contain no segment starting with `:` or `*`: axum rejects the pre-0.8
+///   parameter syntax unless the router opts out of that check, which the
+///   outbound router does not, so it panics the listener build
 /// - Have at least one non-empty segment after the leading `/`, so the point
 ///   claims a path of its own rather than the listener's root
 pub fn validate_outbound_listen_path_format(path: &str) -> Result<(), String> {
@@ -906,6 +909,15 @@ pub fn validate_outbound_listen_path_format(path: &str) -> Result<(), String> {
     }
     if path.contains(['{', '}']) {
         return Err(format!("listen_path '{}' must not contain '{{' or '}}'", path));
+    }
+    if let Some(segment) = path
+        .split('/')
+        .find(|segment| segment.starts_with(':') || segment.starts_with('*'))
+    {
+        return Err(format!(
+            "listen_path '{}' must not contain a segment starting with ':' or '*' ('{}')",
+            path, segment
+        ));
     }
     if path
         .trim_start_matches('/')

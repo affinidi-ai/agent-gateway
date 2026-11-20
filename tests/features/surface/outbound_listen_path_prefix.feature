@@ -47,6 +47,18 @@ Feature: A Transit Point's listen_path is held to the prefixes the gateway serve
     Then the admin API response status is 400
     And the admin API error response mentions "must start with '/'"
 
+  Scenario: A listen_path with a legacy parameter segment is refused while the appliance is strict
+    Given the appliance serves Transit Points only under its outbound prefixes
+    When the operator sets Transit Point "alpha" listen_path to "/outbound/:partner"
+    Then the admin API response status is 400
+    And the admin API error response mentions "must not contain a segment starting with ':' or '*'"
+
+  Scenario: A listen_path with a legacy wildcard segment is refused while the appliance is strict
+    Given the appliance serves Transit Points only under its outbound prefixes
+    When the operator sets Transit Point "alpha" listen_path to "/outbound/*partner"
+    Then the admin API response status is 400
+    And the admin API error response mentions "must not contain a segment starting with ':' or '*'"
+
   Scenario: A listen_path on the outbound prefix itself is saved with a warning while the appliance is not strict
     When the operator sets Transit Point "alpha" listen_path to "/outbound"
     Then the admin API response status is 200
