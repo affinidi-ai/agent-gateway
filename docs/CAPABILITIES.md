@@ -358,7 +358,7 @@ See [Surface payment policy](CONFIGURATION_REFERENCE.md#surface-payment-policy).
 | --- | --- |
 | Metrics to several backends | Local JSON files feed the dashboard, while Prometheus, AWS CloudWatch, and OpenTelemetry collectors receive the same metrics for long-term analysis. All can be active at once. |
 | Connection tracking | Every request is recorded with its timestamp, surface, source, destination, status, latency, trace ID, direction, and the agent's identity hash, and kept for the metrics retention window, six hours by default. For lasting evidence, use the audit log. |
-| Request correlation | Every request gets a trace ID, carried as an `X-Gateway-Trace-Id` header and attached to the request's log entries. |
+| Request correlation | Every request gets a trace ID, carried as an `X-Gateway-Trace-Id` header and attached to the request's log entries. A trace ID an Access Point starts is 32 lowercase hexadecimal digits, the W3C Trace Context form. |
 | Policy decision audit | Every policy evaluation records which policy version decided and why. |
 | Live dashboard | A WebSocket stream updates the dashboard as traffic flows. |
 | Payload capture | Start a capture session on a surface to see four stages side by side: the request as the client sent it, as the gateway forwarded it, the response as the target returned it, and as the gateway returned it. |

@@ -330,7 +330,13 @@ points recorded before the upgrade keep their old values, so a per-variant serie
 upgrade for one metrics retention window (6 hours by default).
 
 The gateway propagates `X-Gateway-Trace-Id` to a Target where the request path creates that trace
-identifier, allowing gateway and managed-agent logs to be correlated.
+identifier, allowing gateway and managed-agent logs to be correlated. A trace id an Access Point
+starts, and the fresh one a surface with `terminate_trace_id` sends downstream, is 32 lowercase
+hexadecimal digits with no hyphens, the W3C Trace Context form. An Access Point continues a
+caller's `X-Gateway-Trace-Id` that reads as a UUID and records it as sent. A Transit Point request
+that carries neither a transit token nor such a header starts a hyphenated UUID. A request sent
+over a Fabric stream carries its trace id as a hyphenated UUID, and the receiving gateway records
+that form.
 
 ## Access log
 

@@ -1,0 +1,20 @@
+branch: feat/w3c-trace-context
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-11-20T14:02:20Z'
+      title: Start trace ids as 32 lowercase hexadecimal digits
+      description: >-
+        A trace id an Access Point starts, and the fresh one a surface with terminate_trace_id
+        sends downstream, is now 32 lowercase hexadecimal digits with no hyphens, the W3C Trace
+        Context form. It was a hyphenated UUID. The new form appears in X-Gateway-Trace-Id, in the
+        transit token, in audit records and in logs. A Managed Agent or a log pipeline that reads
+        the value as a hyphenated UUID must accept the new form; a parser that accepts a UUID
+        without hyphens, as earlier gateways do, needs no change. A trace id continued from a
+        caller's X-Gateway-Trace-Id is still recorded as sent, a Transit Point request with
+        neither a transit token nor that header still starts a hyphenated UUID, and a gateway that
+        receives a request over a Fabric stream still records its trace id hyphenated.

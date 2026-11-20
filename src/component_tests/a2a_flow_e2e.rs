@@ -887,12 +887,16 @@ async fn inbound_a2a_observability_headers() {
         .clone()
         .expect("mock did not receive a request");
 
-    // 1. Correlation ID: X-Gateway-Trace-Id is present and is a valid UUID
+    // 1. Correlation ID: X-Gateway-Trace-Id is present and is 32 lowercase hex digits
     let trace_id = received
         .headers
         .get("x-gateway-trace-id")
         .expect("upstream request must have X-Gateway-Trace-Id header");
-    assert!(uuid::Uuid::parse_str(trace_id).is_ok(), "X-Gateway-Trace-Id should be a valid UUID, got: {}", trace_id);
+    assert!(
+        crate::proxy::trace::TraceId::from_written(trace_id).is_ok(),
+        "X-Gateway-Trace-Id should be 32 lowercase hex digits, got: {}",
+        trace_id
+    );
 
     // 2. Request metadata: content-type is forwarded
     let upstream_ct = received

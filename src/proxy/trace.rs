@@ -14,6 +14,9 @@
 //!   fresh id crosses the boundary while this gateway keeps the incoming trace for
 //!   its own VP + audit.
 //!
+//! Both mint with [`TraceId::mint`]: 32 lowercase hexadecimal digits, the W3C
+//! Trace Context form.
+//!
 //! [`TraceId`], [`SpanId`] and [`Traceparent`] read a received trace id, span
 //! id and `traceparent` header as the trace context requirements shared with
 //! Agent Stream and Agent Watch define them. Their test vectors are
@@ -73,6 +76,23 @@ impl TraceId {
             return Err(TraceHeaderError::TraceId);
         }
         Ok(Self(written))
+    }
+
+    /// Reads a trace id that must already be in its written form.
+    pub fn from_written(input: &str) -> Result<Self, TraceHeaderError> {
+        written_id(input.as_bytes(), Self::DIGITS)
+            .map(Self)
+            .ok_or(TraceHeaderError::TraceId)
+    }
+
+    /// A new trace id: a random version 4 UUID written without hyphens, so it
+    /// is never all zero and still reads as a UUID.
+    pub fn mint() -> Self {
+        Self(
+            uuid::Uuid::new_v4()
+                .simple()
+                .to_string(),
+        )
     }
 
     pub fn as_str(&self) -> &str {
@@ -216,7 +236,7 @@ pub fn continue_or_mint_trace_id(incoming: Option<&str>) -> String {
                 .ok()
                 .map(|_| s.to_string())
         })
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+        .unwrap_or_else(|| TraceId::mint().0)
 }
 
 /// Egress-firewall trace id for the onward hop.
@@ -230,7 +250,7 @@ pub fn egress_trace_id(
     own: &str,
 ) -> String {
     if terminate {
-        uuid::Uuid::new_v4().to_string()
+        TraceId::mint().0
     } else {
         own.to_string()
     }
@@ -382,15 +402,15 @@ mod tests {
         // UUID is minted instead of being echoed back.
         let out = continue_or_mint_trace_id(Some("not-a-uuid; DROP TABLE"));
         assert_ne!(out, "not-a-uuid; DROP TABLE");
-        assert!(uuid::Uuid::parse_str(&out).is_ok());
+        assert!(TraceId::from_written(&out).is_ok(), "{out}");
     }
 
     #[test]
     fn continue_mints_for_missing_or_empty() {
         let a = continue_or_mint_trace_id(None);
         let b = continue_or_mint_trace_id(Some(""));
-        assert!(uuid::Uuid::parse_str(&a).is_ok());
-        assert!(uuid::Uuid::parse_str(&b).is_ok());
+        assert!(TraceId::from_written(&a).is_ok(), "{a}");
+        assert!(TraceId::from_written(&b).is_ok(), "{b}");
         // Two independent mints must differ.
         assert_ne!(a, b);
     }
@@ -406,6 +426,36 @@ mod tests {
         let own = uuid::Uuid::new_v4().to_string();
         let out = egress_trace_id(true, &own);
         assert_ne!(out, own, "termination must not forward the incoming trace");
-        assert!(uuid::Uuid::parse_str(&out).is_ok());
+        assert!(TraceId::from_written(&out).is_ok(), "{out}");
+    }
+
+    #[test]
+    fn a_minted_trace_id_is_32_lowercase_hex_and_never_zero() {
+        let minted: Vec<TraceId> = (0..1000)
+            .map(|_| TraceId::mint())
+            .collect();
+        for id in &minted {
+            assert_eq!(TraceId::from_written(id.as_str()).as_ref(), Ok(id));
+            assert_eq!(TraceId::parse(id.as_str()).as_ref(), Ok(id));
+        }
+        let distinct: std::collections::HashSet<&str> = minted
+            .iter()
+            .map(TraceId::as_str)
+            .collect();
+        assert_eq!(distinct.len(), minted.len());
+    }
+
+    #[test]
+    fn only_the_written_form_is_a_written_trace_id() {
+        assert!(TraceId::from_written("4bf92f3577b34da6a3ce929d0e0e4736").is_ok());
+        for other in [
+            "4BF92F3577B34DA6A3CE929D0E0E4736",
+            "4bf92f35-77b3-4da6-a3ce-929d0e0e4736",
+            "00000000000000000000000000000000",
+            "4bf92f3577b34da6a3ce929d0e0e473",
+            "",
+        ] {
+            assert_eq!(TraceId::from_written(other), Err(TraceHeaderError::TraceId), "{other}");
+        }
     }
 }
