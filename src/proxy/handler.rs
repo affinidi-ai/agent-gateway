@@ -24704,6 +24704,125 @@ mod fabric_send_tests {
             Some("ada@example.com")
         );
     }
+
+    /// The `trace_id` of the one message a Fabric send for a request in trace `own` reaches
+    /// `peer` with, and the downstream trace id of each `trace_terminated` record it wrote.
+    async fn fabric_send_trace_ids(
+        peer: &FabricPeer,
+        own: &str,
+    ) -> (String, Vec<String>) {
+        let sent_before = peer
+            .forwards
+            .lock()
+            .unwrap()
+            .len();
+        let (result, events) = crate::audit::producer::capture(Box::pin(super::handle_fabric_request(
+            peer.state.clone(),
+            super::FabricSend {
+                channel_name: "Fabric A2A",
+                method: axum::http::Method::POST,
+                uri: "https://gateway.example/a2a"
+                    .parse()
+                    .unwrap(),
+                headers: axum::http::HeaderMap::new(),
+                source_addr: "127.0.0.1:12345".to_string(),
+                start_time: std::time::Instant::now(),
+                connection_guard: super::ConnectionGuard::new(None, None),
+                body_bytes: axum::body::Bytes::from(
+                    json!({"jsonrpc": "2.0", "id": "m-1", "method": "message/send"}).to_string(),
+                ),
+                trace_id: own.to_string(),
+                ucp_operation: None,
+                authenticated_identity: None,
+                source_auth_context: None,
+                payment_context: None,
+                mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
+                mcp_verified_binding: None,
+                mcp_classification: None,
+                subscription_lifetime: None,
+                mcp_continuations: None,
+                payment: None,
+            },
+        )))
+        .await;
+        let status = match result {
+            Ok(response) | Err(response) => response.status(),
+        };
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let sent: Vec<String> = peer
+            .forwards
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(sent_before)
+            .map(|body| {
+                body["trace_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(sent.len(), 1, "one message per request: {sent:?}");
+        let terminated = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::TraceTerminated {
+                    own_trace_id,
+                    downstream_trace_id,
+                    ..
+                } => {
+                    assert_eq!(own_trace_id, own);
+                    assert_eq!(event.trace_id.as_deref(), Some(own));
+                    Some(downstream_trace_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        (sent[0].clone(), terminated)
+    }
+
+    #[tokio::test]
+    async fn an_access_points_fabric_send_carries_its_trace_id() {
+        let own = "0af76519-16cd-43dd-8448-eb211c80319c";
+        let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+
+        let (sent, terminated) = fabric_send_trace_ids(&peer, own).await;
+        assert_eq!(sent, own);
+        assert!(terminated.is_empty(), "{terminated:?}");
+
+        let mut surface = (*peer.state.surface).clone();
+        surface
+            .access_point
+            .terminate_trace_id = true;
+        peer.state.surface = Arc::new(surface);
+        let (sent, terminated) = fabric_send_trace_ids(&peer, own).await;
+        assert_ne!(sent, own, "a terminating surface sends a fresh trace id");
+        assert_eq!(terminated, [sent.clone()]);
+
+        let sent_as_uuid = uuid::Uuid::parse_str(&sent).unwrap();
+        let open = crate::proxy::fabric_stream::wire::StreamFrame {
+            stream_id: uuid::Uuid::new_v4(),
+            payload: crate::proxy::fabric_stream::wire::FramePayload::Open {
+                request: crate::proxy::fabric_stream::wire::OpenRequest {
+                    capability_nonce: uuid::Uuid::new_v4(),
+                    channel_id: "remote-surface".to_string(),
+                    variant_alias: None,
+                    path: "/a2a".to_string(),
+                    headers: Default::default(),
+                    body_bytes: 0,
+                    response_window_bytes: 64 * 1024,
+                    deadline_ms: 1,
+                    trace_id: sent_as_uuid,
+                },
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&open).unwrap()["payload"]["request"]["trace_id"],
+            json!(sent_as_uuid.hyphenated().to_string()),
+            "a stream Open writes the trace id hyphenated"
+        );
+    }
+
     /// The status a Fabric send answers for `path` on a surface whose Target authentication
     /// uses a secret that does not exist, with fallback `passthrough`.
     async fn fabric_send_status_with_passthrough_target_auth(path: &str) -> axum::http::StatusCode {
