@@ -683,6 +683,11 @@ pub async fn get_connection_point<S: ConnectionPointStore>(
 ) -> Result<Json<GatewayConnectionPoint>, (StatusCode, String)> {
     let (connection_point, _) =
         load_accessible_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, false).await?;
+    // System points are the gateway's own, as in the lists: a paused acceptance's point holds
+    // the inviter's invitation secret, which a viewer must not read and redeem first.
+    if connection_point.cp_type != super::types::ConnectionPointType::User {
+        return Err((StatusCode::NOT_FOUND, "Connection point not found".to_string()));
+    }
 
     Ok(Json(connection_point))
 }
@@ -2693,6 +2698,81 @@ mod tests {
             crate::gateways::connection_points::ConnectionPointType::User,
             "secret".to_string(),
         )
+    }
+
+    #[tokio::test]
+    async fn a_system_connection_point_is_not_found_by_id_as_in_the_lists() {
+        use crate::gateways::connection_points::ConnectionPointStore;
+        use crate::gateways::connection_points::types::{ConnectionPointType, GatewayConnectionPoint};
+        use crate::gateways::store::GatewayStore;
+        use crate::gateways::types::{Gateway, GatewayType};
+        use axum::Extension;
+        use axum::extract::Path;
+
+        let dir = tempfile::tempdir().unwrap();
+        let gateways = Arc::new(
+            crate::gateways::FileSystemGatewayStore::new(dir.path().join("gateways"), None)
+                .await
+                .unwrap(),
+        );
+        let gateway = Gateway::new("Partner".into(), String::new(), "did:peer:2.partner".into(), GatewayType::Remote);
+        gateways
+            .create(&gateway)
+            .await
+            .unwrap();
+        let points = Arc::new(
+            crate::gateways::connection_points::FileSystemConnectionPointStore::new(dir.path().join("points"))
+                .await
+                .unwrap(),
+        );
+        let point = |cp_type| {
+            GatewayConnectionPoint::new(
+                gateway.id.clone(),
+                "mediator-1".into(),
+                "did:peer:2.point".into(),
+                "Point".into(),
+                String::new(),
+                "oob-1".into(),
+                "https://mediator.example/oob?_oobid=oob-1".into(),
+                serde_json::json!({}),
+                None,
+                cp_type,
+                "inviter-secret".into(),
+            )
+        };
+        // A paused acceptance's temporary point holds the inviter's invitation secret.
+        let system = point(ConnectionPointType::System);
+        let user = point(ConnectionPointType::User);
+        points
+            .create(&system)
+            .await
+            .unwrap();
+        points
+            .create(&user)
+            .await
+            .unwrap();
+        let get = |id: &str| {
+            super::get_connection_point(
+                Extension(points.clone()),
+                Extension(gateways.clone()),
+                Path(id.to_string()),
+                None,
+                None,
+            )
+        };
+
+        let err = get(&system.id)
+            .await
+            .expect_err("a viewer must not read a System point");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            get(&user.id)
+                .await
+                .expect("a User point is still served")
+                .0
+                .id,
+            user.id
+        );
     }
 
     #[tokio::test]

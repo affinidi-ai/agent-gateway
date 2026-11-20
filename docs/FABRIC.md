@@ -393,7 +393,9 @@ mediator that admits them, pairing looks as it did before.
 
 A paused Connection Point is stored with `awaiting_mediator_access: true`, no invitation and no
 listener. A paused acceptance is a gateway with status `awaiting-mediator-access` and a temporary
-Connection Point that keeps the invitation, its secret and the reserved permanent DID. Both keep
+Connection Point that keeps the invitation, its secret and the reserved permanent DID; like every
+System Connection Point, `GET /v1/connection-points/{id}` answers `404` for it, so a viewer cannot
+read the secret and redeem the invitation first. Both keep
 their keys and state on disk, survive a restart, and last until the invitation expires: the
 Connection Point's own expiry, and for an acceptance the invitation's `expires_time`, capped at
 seven days, or seven days without one. The startup cleanup of orphaned key directories keeps the
@@ -416,11 +418,12 @@ Continue authenticates every DID and reads its own mediator account first. While
 refuses one (`403`, which a live `explicit_allow` mediator returns from `/authenticate/challenge`,
 or an ACL denial) it answers `409` with `code: mediator_access_refused` and the refused DID's `role`
 and `did`, and the pause stays. Any other failure, a socket timeout included, answers `502`: it says
-nothing about admission. Continuing twice is serialised, a delete of the same record waits for it,
-and a pairing that already went on is returned as it is. An acceptance whose connection-setup was
+nothing about admission. Continuing twice is serialised, a delete of the same record waits for it
+(also for the writes after the connection-setup when the request is cancelled), and a pairing that already went on is returned as it is. An acceptance whose connection-setup was
 sent but whose result was not fully stored (`pending` with its point still flagged) is finished by
-the next Continue without sending again. Only the pairing flow sets `awaiting-mediator-access`: a
-gateway edit that sets it is refused with `400`. The inviter's connection-setup and approval use the
+the next Continue without sending again. Only the pairing flow sets or clears
+`awaiting-mediator-access`: a gateway edit that sets it, or changes it on a paused gateway, is
+refused with `400`, and the dashboard keeps **Gateway Enabled** locked while a gateway is paused. The inviter's connection-setup and approval use the
 reserved permanent DID and mint none, so once both gateways continued, every DID of the pairing is
 already admitted when approval completes it. A Connection Point created without the pause reserves
 nothing and mints its permanent DID at approval as before.

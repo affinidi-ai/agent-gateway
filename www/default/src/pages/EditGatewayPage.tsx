@@ -67,7 +67,10 @@ const EditGatewayPage: React.FC = () => {
   const [gatewayMetadata, setGatewayMetadata] = useState<GatewayMetadata | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<ConnectionRuntimeStatus | null>(null);
   const [issuerDids, setIssuerDids] = useState<GatewayIssuerDids>(issuerDidsFromGateway({}));
-  const isPending = gatewayMetadata?.status === 'pending';
+  // Not accepted yet: pending, or paused until the mediator admits its DIDs. Only the
+  // pairing flow changes either status, so Gateway Enabled stays locked.
+  const isPending =
+    gatewayMetadata?.status === 'pending' || gatewayMetadata?.status === 'awaiting-mediator-access';
 
   // Handle /gateways/self - look up the actual self gateway ID and redirect
   useEffect(() => {
