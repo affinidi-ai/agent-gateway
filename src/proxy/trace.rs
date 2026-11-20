@@ -13,6 +13,71 @@
 //!   trace downstream unless the surface opts into termination, in which case a
 //!   fresh id crosses the boundary while this gateway keeps the incoming trace for
 //!   its own VP + audit.
+//!
+//! [`TraceId`] reads a received trace id as the trace context requirements
+//! shared with Agent Stream and Agent Watch define it. Their test vectors are
+//! `tests/fixtures/trace_context/trace-context-vectors.json`.
+
+#![cfg_attr(not(test), expect(dead_code))]
+
+/// Why a received trace header is treated as absent. It names the header only,
+/// never any part of its value, so it is safe to log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TraceHeaderError {
+    #[error("the trace id is not valid")]
+    TraceId,
+}
+
+/// A trace id in its written form: 32 lowercase hexadecimal digits, not all
+/// zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceId(String);
+
+impl TraceId {
+    const DIGITS: usize = 32;
+    const HYPHENATED_LEN: usize = 36;
+
+    /// Reads a received trace id: 32 hexadecimal digits in any case, or the
+    /// hyphenated 8-4-4-4-12 form in any case, normalised to the written
+    /// form. Any other shape, and an id of all zeros, is refused.
+    pub fn parse(input: &str) -> Result<Self, TraceHeaderError> {
+        let bytes = input.as_bytes();
+        let hyphenated = match bytes.len() {
+            Self::DIGITS => false,
+            Self::HYPHENATED_LEN => true,
+            _ => return Err(TraceHeaderError::TraceId),
+        };
+        let mut written = String::with_capacity(Self::DIGITS);
+        for (position, byte) in bytes
+            .iter()
+            .enumerate()
+        {
+            if hyphenated && matches!(position, 8 | 13 | 18 | 23) {
+                if *byte != b'-' {
+                    return Err(TraceHeaderError::TraceId);
+                }
+            } else if byte.is_ascii_hexdigit() {
+                written.push(char::from(byte.to_ascii_lowercase()));
+            } else {
+                return Err(TraceHeaderError::TraceId);
+            }
+        }
+        if is_all_zero(written.as_bytes()) {
+            return Err(TraceHeaderError::TraceId);
+        }
+        Ok(Self(written))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn is_all_zero(digits: &[u8]) -> bool {
+    digits
+        .iter()
+        .all(|digit| *digit == b'0')
+}
 
 /// Continue a trusted upstream trace or mint a fresh one.
 ///
@@ -51,7 +116,54 @@ pub fn egress_trace_id(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     use super::*;
+
+    /// The cases of `group` in the trace context vectors shared with the
+    /// other appliances.
+    fn vector_cases(group: &str) -> Vec<Value> {
+        let vectors: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/trace_context/trace-context-vectors.json"))
+                .unwrap();
+        let cases = vectors["groups"][group]["cases"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no vector group {group}"))
+            .clone();
+        assert!(
+            cases
+                .iter()
+                .any(|case| case["accepted"] == json!(true))
+                && cases
+                    .iter()
+                    .any(|case| case["accepted"] == json!(false)),
+            "{group} has accepting and refusing cases"
+        );
+        cases
+    }
+
+    #[test]
+    fn trace_ids_parse_as_the_vectors_say() {
+        for case in vector_cases("trace_id") {
+            let name = &case["name"];
+            let parsed = TraceId::parse(
+                case["input"]
+                    .as_str()
+                    .unwrap(),
+            );
+            assert_eq!(json!(parsed.is_ok()), case["accepted"], "{name}");
+            assert_eq!(
+                json!(
+                    parsed
+                        .as_ref()
+                        .ok()
+                        .map(TraceId::as_str)
+                ),
+                case["expected"]["trace_id"],
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn continue_reuses_a_valid_uuid() {
