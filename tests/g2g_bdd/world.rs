@@ -15,6 +15,7 @@ use serde_json::Value;
 use crate::bdd_support::actors::ActorRegistry;
 use crate::bdd_support::admin_client::{AdminApiClient, GatewayRecord};
 use crate::bdd_support::config::fabric_surface_fixture::{SourceAuthSpec, SurfaceSpec};
+use crate::bdd_support::dashboard_socket::DashboardSocket;
 use crate::bdd_support::gateway_process::G2G_TEST_AUTH_TOKEN;
 use crate::bdd_support::json_rpc::{
     IdentityBindingProof, McpVersion, build_a2a_request_body, build_mcp_list_tools_body, build_mcp_tool_call_body,
@@ -386,6 +387,8 @@ pub struct G2gWorld {
     pub relayed_transit_point_calls: Option<usize>,
     /// The traffic of a surface's agent the operator read before the caller's action, by surface name.
     pub agent_traffic_baseline: HashMap<String, AgentTraffic>,
+    /// The operator's open dashboard WebSocket on one gateway, by gateway index.
+    pub dashboard_sockets: HashMap<usize, DashboardSocket>,
 }
 
 /// The Access Point request counts `GET /v1/agents/{id}` reports for an agent.
@@ -437,6 +440,7 @@ impl G2gWorld {
             consent_request: None,
             relayed_transit_point_calls: None,
             agent_traffic_baseline: HashMap::new(),
+            dashboard_sockets: HashMap::new(),
         }
     }
 

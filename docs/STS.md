@@ -71,7 +71,11 @@ VP (`urn:affinidi:params:oauth:token-type:vp`).
   below). A VP is
   verified via `VCIssuer::verify_agent_presentation_full` (`VcIssuerVpVerifier`)
   and the exchanged token's subject becomes the cryptographically-proven
-  credential-subject DID.
+  credential-subject DID. Each proof in the VP must be signed with a key its
+  signer's DID document lists under the proof's purpose (`assertionMethod` for a
+  credential, `assertionMethod` or `authentication` for the presentation); a VP
+  that breaks this is refused like one with a bad signature (see
+  [Peer issuer DIDs](FABRIC.md#peer-issuer-dids)).
 - **Issued tokens** are EdDSA-signed via `VCIssuer::sign_jwt_with_gateway_key`,
   verifiable by resolving the gateway DID document or the JWKS endpoint. An
   issued **ID-JAG additionally carries the explicit JOSE `typ:

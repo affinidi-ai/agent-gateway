@@ -1,0 +1,87 @@
+branch: feat/policy-input-logging
+changes:
+  added:
+    - timestamp: '2026-11-12T00:00:00Z'
+      title: ⭐ Capture a surface's OPA policy input live while a dashboard user listens
+      description: >-
+        Policy authors can see the input their policies run against again, without the gateway
+        logging it. Policy input capture is off until an administrator turns on the
+        policy_input_capture system feature flag under Settings, Admin, Feature Flags; a user's own
+        settings never turn it on. A dashboard user with surfaces.edit and policies.edit can then
+        listen to one surface's policy input over the dashboard WebSocket. While they listen, each
+        request and response policy evaluation on that surface (gateway, surface, Transit Point and
+        appliance-wide planes, on the direct, Fabric and MCP proxy paths; not MCP tool policies or
+        tools/list filtering) is sent to the listening connections only, with its slot, the policies
+        it ran, its decision and reason, and its input. Credentials in the input are masked by shape
+        and the operator's log redaction rules are applied, but message bodies and tool arguments
+        are otherwise sent as they are. Nothing is stored: listening ends when the user stops, the
+        connection closes, or a keep-alive check finds the session ended, a permission gone or the
+        flag off, and turning the flag off stops new captures at once. Each start and stop of a
+        listen is recorded as policy_input_capture_started and policy_input_capture_stopped, with
+        the user, the surface and the reason, in the VP Audit Log and Governance Audit integrations
+        that select them. See docs/POLICY.md.
+    - timestamp: '2026-11-12T00:00:00Z'
+      title: Show captured policy input and decisions live in a surface's Capture view
+      description: >-
+        The Surface Builder's Capture view has a Policy Input card with a Listen to policy input
+        button for users with both surfaces.edit and policies.edit, shown while the
+        policy_input_capture flag is on; otherwise the card says capture is turned off, or, when
+        the gateway settings could not be read, says so with a Retry. While
+        listening, the card lists each captured policy evaluation with its slot, the name and version
+        of the policy it ran, its decision and reason, and shows or copies its input to try in the
+        policy Test panel. Stopping, leaving the view or reloading the page ends listening; the
+        payload Pause does not, and the card says so. It keeps the last 50 evaluations with a filter
+        by policy slot, says when it is waiting for the dashboard connection or the gateway refused,
+        and warns how many evaluations were not shown when the surface sent them faster than the
+        dashboard could receive them. The Audit Log can filter by the two capture events. It is for
+        developing and testing policies only.
+  changed:
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Make the Capture view's toolbar, route copy and card titles consistent
+      description: >-
+        The Capture view's Clear Payloads button is now Clear, outlined in red and titled to say it
+        clears captured payloads and policy inputs, so it no longer looks like the yellow Pause
+        button beside it, whose tooltip now says it pauses payload capture only. The Surface Route
+        copies with the dashboard's shared copy button, and every card title uses the same colour.
+    - timestamp: '2026-11-17T00:00:00Z'
+      title: Close a dashboard connection whose client stops reading for 10 seconds
+      description: >-
+        A dashboard WebSocket message the client has not read within 10 seconds now closes the
+        connection, and the page reconnects. A client that stopped reading used to keep its
+        connection open indefinitely and hold back the keep-alive checks of its session and
+        permissions.
+  fixed:
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Name every Audit Log event in title case
+      description: >-
+        An Audit Log event the dashboard has no label for, such as auth_failed, rate_limited or
+        policy_input_capture_started, showed as its raw lowercase name ("auth failed"). It is now
+        named in title case ("Auth Failed"), with acronyms such as MCP and VP in capitals, like the
+        events that have a label.
+    - timestamp: '2026-11-13T00:00:00Z'
+      title: Keep surface ids whole in redacted logs so their Monitoring log shows them
+      description: >-
+        Log redaction no longer masks part of a UUID. A broad rule such as the example phone
+        number pattern turned ids like bf983d36-0281-4579-... into bf983d[REDACTED-PHONE], so the
+        [CHANNEL:<id>] prefix no longer matched and that surface's Monitoring log stayed empty. A
+        rule that matches a whole UUID still masks it.
+    - timestamp: '2026-11-16T00:00:00Z'
+      title: Keep a dashboard connected when it falls behind the live update stream
+      description: >-
+        A dashboard WebSocket connection that fell more than websocket_broadcast_buffer updates
+        behind was closed, and the page showed its reconnect dialog. It now skips the updates it
+        missed and keeps reading; only a closed update channel ends it. At its next keep-alive it
+        is sent one refresh_dashboard, however often it fell behind, so the page reloads its
+        dashboard stats; the Edit Trust Registry page keeps any field edited since it loaded. A
+        burst of dashboard updates no longer forces a slow connection to reconnect.
+    - timestamp: '2026-11-17T00:00:00Z'
+      title: Mask camelCase and spaced credential names in exported OTLP attributes
+      description: >-
+        A credential name written in camelCase or with spaces, such as accessToken, clientSecret,
+        apiKey or "API Key", is now recognised like its snake_case form, and key, auth and pat are
+        credential names when they are the whole name. Its value becomes <redacted> in exported
+        OTLP span and log attributes. Names such as maxTokens, apiKeyId and primary_key are still
+        kept.
+  removed: []
+  security: []
+  breaking: []

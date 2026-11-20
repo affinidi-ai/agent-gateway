@@ -365,6 +365,11 @@ also copy any built-in rules you still want from
 | No `rules` | The built-in rules below apply. |
 | `rules` | Your rules replace the built-in rules and run in order. An empty list applies no pattern. |
 
+A rule's match that lies inside a UUID without covering all of it is left as it is, so a
+broad pattern such as the example phone number rule does not mangle surface ids and the
+`[CHANNEL:<id>]` prefix a surface's Monitoring log filters on. A rule that matches a whole
+UUID still masks it.
+
 A rule whose pattern does not compile is skipped with a warning on stderr. At startup
 stderr reports the number of rules in use, or a warning when redaction is off, and the
 `Startup configuration` log line shows `log_redaction=on` or `off`.
@@ -396,9 +401,13 @@ In OTLP exports, an attribute whose name is a credential name is replaced with
 attribute by its name. The names, ignoring case, are `authorization`, `cookie`, `token`,
 `session_id`, `sessionid`, `jsessionid`, `password`, `passwd`, `secret`, `secret_key`,
 `api_key`, `apikey`, `caller_key`, `private_key`, `credential` and `credentials`, alone or after
-a `.`, `_` or `-`: `http.request.header.authorization`, `x-api-key`, `x-caller-key` and
-`mcp_session_id` match,
-`token_count` and `secret_id` do not. Fields named like a credential lose the
+a `.`, `_`, `-` or space, or after a camelCase word break (a lowercase letter or digit followed
+by an uppercase letter), and `key`, `auth` and `pat` as the whole name only:
+`http.request.header.authorization`, `x-api-key`, `x-caller-key`, `mcp_session_id`,
+`accessToken`, `clientSecret`, `API Key` and `key` match,
+`token_count`, `secret_id`, `maxTokens`, `apiKeyId`, `primary_key` and `oauth` do not. The same
+names mark credential-named keys in captured [policy input](POLICY.md#policy-input-capture), and
+these rules apply to captures too. Fields named like a credential lose the
 8-character prefix the gateway logs for correlation, in local logs as well as in OTLP
 exports.
 
@@ -657,7 +666,7 @@ neither lists them nor acts on them.
   `403`; payment gateways already connected keep taking payments and every read route still
   works. The dashboard hides its agent-pay UI while it is off, except the Payments page, which
   needs only `payments.view`. A user's own settings cannot
-  override this flag or `mediator_federation`
+  override this flag, `mediator_federation` or `policy_input_capture`
   ([`SYSTEM_ONLY_FLAGS`](../src/storage/settings_store.rs)). At startup the gateway turns it on
   when a payment gateway already exists and the flag has not been set either way, so an upgrade
   never hides a payment gateway that is taking payments.

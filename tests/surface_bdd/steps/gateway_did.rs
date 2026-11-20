@@ -24,7 +24,7 @@ pub(crate) fn seed_gateway_did_without_assertion_multikey(vc_keys: &Path) {
     std::fs::create_dir_all(vc_keys).expect("create the vc_keys directory");
     let signing_key = ssi::jwk::JWK::generate_ed25519().expect("generate the gateway signing key");
     let signing_key_json = serde_json::to_value(&signing_key).expect("serialize the gateway signing key");
-    let multikey = didwebvh_rs::prelude::Secret::from_str("did:key:seed#seed", &signing_key_json)
+    let multikey = didwebvh_rs::prelude::Secret::from_jwk_value("did:key:seed#seed", &signing_key_json)
         .expect("read the gateway signing key")
         .get_public_keymultibase()
         .expect("encode the gateway signing key as a Multikey");

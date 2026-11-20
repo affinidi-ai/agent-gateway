@@ -2,6 +2,7 @@ pub mod agent_context;
 pub mod circuit_breaker;
 pub mod gateway_manager;
 pub mod global_policy;
+pub mod input_capture;
 pub mod mcp_tool_gating;
 pub mod opa;
 pub mod policy_definitions;

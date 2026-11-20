@@ -46,7 +46,7 @@ const CaptureHistoryTable: React.FC<CaptureHistoryTableProps> = ({ captured, onS
   return (
     <div className="card shadow mb-4">
       <div className="card-header py-3">
-        <h6 className="m-0 font-weight-bold text-info">
+        <h6 className="m-0 font-weight-bold text-primary">
           <i className="fas fa-history"></i> Payload History
           <span className="badge text-bg-primary ms-2" style={{ verticalAlign: 'middle' }}>
             {captured.length}/{MAX_HISTORY}

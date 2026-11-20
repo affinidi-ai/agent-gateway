@@ -423,6 +423,26 @@ const SystemTab: React.FC<SystemTabProps> = ({
                   updateSettings={updateSettings}
                 />
                 <FeatureFlagRow
+                  flag="policy_input_capture"
+                  // Default off when unset — must be explicit `true` to reveal.
+                  checked={featureFlags.policy_input_capture === true}
+                  disabled={isSubmitting}
+                  description={
+                    <>
+                      Lets users with <code>surfaces.edit</code> and <code>policies.edit</code>{' '}
+                      listen to the live policy input of a surface, credentials masked, on its
+                      Capture view. For developing and testing policies. While off, the gateway
+                      refuses to listen and stops any listen at its next check.
+                    </>
+                  }
+                  onChangeMessages={{
+                    on: 'Policy input capture turned on.',
+                    off: 'Policy input capture turned off.',
+                  }}
+                  featureFlags={featureFlags}
+                  updateSettings={updateSettings}
+                />
+                <FeatureFlagRow
                   flag="mediator_federation"
                   // Default off when unset — must be explicit `true` to reveal.
                   checked={featureFlags.mediator_federation === true}

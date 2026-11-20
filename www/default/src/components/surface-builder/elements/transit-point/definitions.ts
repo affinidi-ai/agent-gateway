@@ -7,6 +7,7 @@ export const transitPointA2aDefinition = makeTransitPointDefinition({
   color: '#f6c23e',
   paletteOrder: 3,
   isPayloadCoordinator: true,
+  protocols: ['a2a', 'ap2'],
 });
 
 export const transitPointMcpDefinition = makeTransitPointDefinition({
@@ -15,6 +16,7 @@ export const transitPointMcpDefinition = makeTransitPointDefinition({
   label: 'MCP',
   color: '#36b9cc',
   paletteOrder: 4,
+  protocols: ['mcp'],
 });
 
 export const transitPointAp2Definition = makeTransitPointDefinition({

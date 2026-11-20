@@ -1,0 +1,15 @@
+branch: fix/transit-point-palette-protocol
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-17T09:00:00Z'
+      title: Offer only the Transit Point that matches the surface protocol
+      description: >-
+        The Surface Builder palette now offers the A2A Transit Point only on A2A and AP2 surfaces
+        and the MCP Transit Point only on MCP surfaces, so a surface is not built with a Transit
+        Point that speaks the other protocol. Transit Points already on a surface still render
+        and can be edited.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

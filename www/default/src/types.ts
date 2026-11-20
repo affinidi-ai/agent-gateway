@@ -796,6 +796,10 @@ export interface FeatureFlags {
    *  that already has a Payment element keeps it, editable, either way; the
    *  gateway also refuses to add a payment gateway while it is off. */
   agent_pay_delegation?: boolean;
+  /** Lets users with `surfaces.edit` and `policies.edit` listen to a surface's live,
+   *  masked policy input on its Capture view. Default off (treated as `false` when
+   *  undefined); the gateway refuses to listen while it is off. */
+  policy_input_capture?: boolean;
   /** Experimental per-gateway mediator choice. Default off (treated as `false`
    *  when undefined); set explicitly to `true` to enable. When on, the Connect
    *  via OOB wizard shows the mediator picker and the API accepts

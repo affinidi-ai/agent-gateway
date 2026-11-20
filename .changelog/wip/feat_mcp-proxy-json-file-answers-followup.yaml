@@ -1,0 +1,43 @@
+branch: feat/mcp-proxy-json-file-answers-followup
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-19T14:00:00Z'
+      title: Log which x-gateway-file declaration decoded a REST answer
+      description: >-
+        A tool call that answers a file now logs, at debug level, the status and the media type of
+        the declaration it decoded the answer with, so an operator can see which of an operation's
+        declarations a backend's Content-Type selected.
+  fixed:
+    - timestamp: '2026-11-19T09:00:00Z'
+      title: Read an x-gateway-file declaration on any JSON media type of a REST answer
+      description: >-
+        A success answer that lists several JSON media types, such as application/json beside
+        application/vnd.example+json, had only the first of them read, so a file declared on the
+        other was answered as JSON text and a malformed declaration there left the tool listed and
+        callable. Every JSON media type of every success answer is read now, each content key by
+        the media type it names rather than by its spelling, so parameters such as charset decide
+        nothing. One success answer governs each answered status, its exact status before 2XX and
+        2XX before default, and the Content-Type the REST API answered picks which of that
+        answer's declarations the answer carries: the file declared on that media type, or no file
+        when the answer declares that media type without one, so such an answer stays its JSON. An
+        answer whose media type that answer does not declare, or that names none, carries the
+        first file that answer declares. Each media type may name its own pointer and encoding,
+        but all of them must describe the same file of one response, since the Content-Type that
+        picks between them is the backend's own.
+    - timestamp: '2026-11-19T16:00:00Z'
+      title: Refuse a legacy tool call whose answer declares a file the gateway cannot read
+      description: >-
+        A tool whose success answer carries a malformed x-gateway-file declaration is left out of
+        tools/list, and a call to it by name is refused on every path, a legacy call that carries
+        no Target credential and is sent by the OpenAPI client included. Its backend is never
+        called.
+  removed: []
+  security:
+    - timestamp: '2026-11-19T14:05:00Z'
+      title: Release the buffered REST answer before decoding the file it carries
+      description: >-
+        A REST answer that carries a file is released once it is parsed, so decoding holds the
+        parsed JSON and the decoded file only, and a backend answering near the configured
+        response limit costs the gateway about two copies of that limit per call in flight.
+  breaking: []

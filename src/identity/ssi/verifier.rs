@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
@@ -7,13 +7,13 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use did_peer::resolve_did_peer;
 use serde_json::Value;
-use ssi::claims::data_integrity::{AnyDataIntegrity, AnySuite, Proofs};
+use ssi::claims::data_integrity::{AnyDataIntegrity, AnySuite, Proof, Proofs};
 use ssi::claims::vc::v2::syntax::{JsonCredential, JsonPresentation};
 use ssi::claims::{ProofValidationError, Verification, VerificationParameters};
 use ssi::dids::document::{self, representation::MediaType};
 use ssi::dids::resolution::{self, Options};
 use ssi::dids::{AnyDidMethod, DID, DIDResolver, DIDURL, VerificationMethodDIDResolver};
-use ssi::verification_methods::AnyMethod;
+use ssi::verification_methods::{AnyMethod, ControllerProvider, ProofPurpose};
 
 use super::context::create_signature_environment;
 use super::vp_issuer::VP_LIFETIME_MINUTES;
@@ -55,17 +55,50 @@ impl LocalVerifier {
     }
 }
 
-pub struct CompositeResolver {
+#[derive(Default)]
+struct ResolvedDocuments {
+    documents: HashMap<String, resolution::Output<Vec<u8>>>,
+    from_cache: HashSet<String>,
+}
+
+/// Resolves DIDs for one verification. A DID resolved through the DID cache is resolved once and
+/// its document reused, so the signature and proof purpose checks of a presentation read the same
+/// document.
+struct CompositeResolver {
     ssi_resolver: AnyDidMethod,
     did_cache: Arc<DIDCacheClient>,
+    resolved: Arc<std::sync::Mutex<ResolvedDocuments>>,
+}
+
+/// The DIDs a [`CompositeResolver`] answered from the DID cache rather than a fresh resolution.
+struct CachedDocuments(Arc<std::sync::Mutex<ResolvedDocuments>>);
+
+impl CachedDocuments {
+    fn contains(
+        &self,
+        did: &str,
+    ) -> bool {
+        self.0
+            .lock()
+            .is_ok_and(|resolved| {
+                resolved
+                    .from_cache
+                    .contains(did)
+            })
+    }
 }
 
 impl CompositeResolver {
-    pub fn new(did_cache: Arc<DIDCacheClient>) -> Self {
+    fn new(did_cache: Arc<DIDCacheClient>) -> Self {
         Self {
             ssi_resolver: AnyDidMethod::default(),
             did_cache,
+            resolved: Arc::default(),
         }
+    }
+
+    fn cached_documents(&self) -> CachedDocuments {
+        CachedDocuments(self.resolved.clone())
     }
 
     async fn resolve_peer_did(
@@ -83,6 +116,48 @@ impl CompositeResolver {
 
         serde_json::to_vec(&doc).map_err(|e| resolution::Error::Internal(e.to_string()))
     }
+
+    async fn resolve_through_did_cache(
+        &self,
+        did: &DID,
+    ) -> Result<resolution::Output<Vec<u8>>, resolution::Error> {
+        if let Some(output) = self
+            .resolved
+            .lock()
+            .ok()
+            .and_then(|resolved| {
+                resolved
+                    .documents
+                    .get(did.as_str())
+                    .cloned()
+            })
+        {
+            return Ok(output);
+        }
+        let resolve_result = self
+            .did_cache
+            .resolve(did.as_str())
+            .await
+            .map_err(|e| resolution::Error::Internal(e.to_string()))?;
+        let doc_bytes =
+            serde_json::to_vec(&resolve_result.doc).map_err(|e| resolution::Error::Internal(e.to_string()))?;
+        let output = resolution::Output::new(
+            doc_bytes,
+            document::Metadata::default(),
+            resolution::Metadata::from_content_type(Some(MediaType::JsonLd.to_string())),
+        );
+        if let Ok(mut resolved) = self.resolved.lock() {
+            resolved
+                .documents
+                .insert(did.as_str().to_string(), output.clone());
+            if resolve_result.cache_hit {
+                resolved
+                    .from_cache
+                    .insert(did.as_str().to_string());
+            }
+        }
+        Ok(output)
+    }
 }
 
 impl DIDResolver for CompositeResolver {
@@ -91,9 +166,7 @@ impl DIDResolver for CompositeResolver {
         did: &'a DID,
         options: Options,
     ) -> Result<resolution::Output<Vec<u8>>, resolution::Error> {
-        let method = did.method_name();
-
-        match method {
+        match did.method_name() {
             "peer" => {
                 let doc_bytes = self
                     .resolve_peer_did(did.as_str())
@@ -110,20 +183,8 @@ impl DIDResolver for CompositeResolver {
                     .await
             }
             _ => {
-                let resolve_result = self
-                    .did_cache
-                    .resolve(did.as_str())
+                self.resolve_through_did_cache(did)
                     .await
-                    .map_err(|e| resolution::Error::Internal(e.to_string()))?;
-
-                let doc_bytes =
-                    serde_json::to_vec(&resolve_result.doc).map_err(|e| resolution::Error::Internal(e.to_string()))?;
-
-                Ok(resolution::Output::new(
-                    doc_bytes,
-                    document::Metadata::default(),
-                    resolution::Metadata::from_content_type(Some(MediaType::JsonLd.to_string())),
-                ))
             }
         }
     }
@@ -258,6 +319,165 @@ fn ensure_proofs_controlled_by(
     Ok(())
 }
 
+fn purpose_term(purpose: ProofPurpose) -> String {
+    match serde_json::to_value(purpose) {
+        Ok(Value::String(term)) => term,
+        _ => purpose.to_string(),
+    }
+}
+
+const VC_PROOF_PURPOSES: &[ProofPurpose] = &[ProofPurpose::Assertion];
+const VP_PROOF_PURPOSES: &[ProofPurpose] = &[ProofPurpose::Assertion, ProofPurpose::Authentication];
+
+/// How long a signer DID whose cached document did not list a key waits before its document may be
+/// fetched again for that reason.
+const SIGNER_DOCUMENT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PurposeReason {
+    PurposeNotAllowed,
+    NotListed,
+    Unresolvable,
+}
+
+impl PurposeReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PurposeNotAllowed => "purpose_not_allowed",
+            Self::NotListed => "not_listed",
+            Self::Unresolvable => "unresolvable",
+        }
+    }
+}
+
+struct PurposeProblem {
+    reason: PurposeReason,
+    message: String,
+}
+
+/// A refused proof's key was missing from a cached DID document; the signer may have listed it
+/// since, so the presentation is verified again against the document as now published.
+#[derive(Debug)]
+struct StaleSignerDocument {
+    did: String,
+    role: &'static str,
+}
+
+impl std::fmt::Display for StaleSignerDocument {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(f, "the cached DID document of {} does not list the proof key", self.did)
+    }
+}
+
+impl std::error::Error for StaleSignerDocument {}
+
+/// Whether `did`'s document may be fetched again now, at most once per
+/// [`SIGNER_DOCUMENT_REFRESH_INTERVAL`], so a signer that keeps failing does not cost a fetch on
+/// every presentation.
+fn may_refresh_signer_document(did: &str) -> bool {
+    static REFRESHED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+        std::sync::LazyLock::new(Default::default);
+    let Ok(mut refreshed) = REFRESHED.lock() else {
+        return false;
+    };
+    let now = std::time::Instant::now();
+    refreshed.retain(|_, at| now.duration_since(*at) < SIGNER_DOCUMENT_REFRESH_INTERVAL);
+    if refreshed.contains_key(did) {
+        return false;
+    }
+    refreshed.insert(did.to_string(), now);
+    true
+}
+
+/// Why `proof` may not be used, if it may not: it declares a purpose outside `allowed`, the
+/// signer's DID document does not list its key under the purpose it declares, or the document
+/// could not be read to check.
+async fn proof_purpose_problem(
+    proof: &Proof<AnySuite>,
+    allowed: &[ProofPurpose],
+    controllers: &impl ControllerProvider,
+) -> Option<PurposeProblem> {
+    let vm = proof.verification_method.id();
+    let declared = proof.proof_purpose;
+    if !allowed.contains(&declared) {
+        let allowed = allowed
+            .iter()
+            .map(|purpose| purpose_term(*purpose))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        return Some(PurposeProblem {
+            reason: PurposeReason::PurposeNotAllowed,
+            message: format!("proof by {vm} declares purpose {} instead of {allowed}", purpose_term(declared)),
+        });
+    }
+    let unresolvable = |detail: String| {
+        tracing::warn!("Could not check the proof purpose of {vm}: {detail}");
+        Some(PurposeProblem {
+            reason: PurposeReason::Unresolvable,
+            message: format!("proof key {vm} could not be checked against its DID document"),
+        })
+    };
+    let did = match DIDURL::new(vm.as_str()) {
+        Ok(url) => url.did(),
+        Err(e) => return unresolvable(format!("not a DID URL: {e}")),
+    };
+    match controllers
+        .ensure_allows_verification_method(did.as_iri(), vm, declared)
+        .await
+    {
+        Ok(()) => None,
+        Err(ProofValidationError::InvalidKeyUse) => Some(PurposeProblem {
+            reason: PurposeReason::NotListed,
+            message: format!("proof key {vm} is not listed under {} in {did}", purpose_term(declared)),
+        }),
+        Err(e) => unresolvable(e.to_string()),
+    }
+}
+
+/// Refuses, and counts, a proof in `proofs` that breaks `allowed`. A key missing from a document
+/// read from the DID cache fails with [`StaleSignerDocument`] instead, unless its signer is in
+/// `refreshed`, so the caller verifies the whole presentation again against the document as now
+/// published.
+async fn ensure_proof_purpose(
+    proofs: &Proofs<AnySuite>,
+    allowed: &[ProofPurpose],
+    controllers: &impl ControllerProvider,
+    cached: &CachedDocuments,
+    refreshed: &HashSet<String>,
+    what: &str,
+    role: &'static str,
+) -> Result<()> {
+    for proof in proofs.iter() {
+        let Some(problem) = proof_purpose_problem(proof, allowed, controllers).await else {
+            continue;
+        };
+        if problem.reason == PurposeReason::NotListed
+            && let Ok(url) = DIDURL::new(
+                proof
+                    .verification_method
+                    .id()
+                    .as_str(),
+            )
+            && !refreshed.contains(url.did().as_str())
+            && cached.contains(url.did().as_str())
+            && may_refresh_signer_document(url.did().as_str())
+        {
+            return Err(StaleSignerDocument {
+                did: url.did().as_str().to_string(),
+                role,
+            }
+            .into());
+        }
+        tracing::warn!(reason = problem.reason.as_str(), "Refused a presentation: {what} {}", problem.message);
+        crate::metrics::backends::prometheus::track_proof_purpose_mismatch(role, problem.reason.as_str());
+        anyhow::bail!("{what} {}", problem.message);
+    }
+    Ok(())
+}
+
 fn ensure_verified(
     outcome: Result<Verification, ProofValidationError>,
     what: &str,
@@ -330,6 +550,62 @@ impl Verifier for LocalVerifier {
         &self,
         presentation: &Value,
     ) -> Result<VpVerificationResult> {
+        let mut refreshed = HashSet::new();
+        loop {
+            let result = self
+                .verify_vp_with(presentation, &refreshed)
+                .await;
+            match result
+                .as_ref()
+                .err()
+                .and_then(|e| e.downcast_ref::<StaleSignerDocument>())
+            {
+                Some(stale) if refreshed.insert(stale.did.clone()) => {
+                    self.fetch_again(stale)
+                        .await?;
+                }
+                _ => return result,
+            }
+        }
+    }
+}
+
+impl LocalVerifier {
+    /// Replaces `stale`'s cached document with the one now published. A document that cannot be
+    /// fetched again refuses the presentation, counted as `unresolvable`, and is not cached again.
+    async fn fetch_again(
+        &self,
+        stale: &StaleSignerDocument,
+    ) -> Result<()> {
+        self.did_cache
+            .remove(&stale.did)
+            .await;
+        if let Err(e) = self
+            .did_cache
+            .resolve(&stale.did)
+            .await
+        {
+            let reason = PurposeReason::Unresolvable.as_str();
+            tracing::warn!(
+                reason,
+                "Refused a presentation: the DID document of {} could not be fetched again: {e}",
+                stale.did
+            );
+            crate::metrics::backends::prometheus::track_proof_purpose_mismatch(stale.role, reason);
+            anyhow::bail!(
+                "{} proof key could not be checked against the DID document of {}",
+                stale.role.to_uppercase(),
+                stale.did
+            );
+        }
+        Ok(())
+    }
+
+    async fn verify_vp_with(
+        &self,
+        presentation: &Value,
+        refreshed: &HashSet<String>,
+    ) -> Result<VpVerificationResult> {
         let holder_did = presentation
             .get("holder")
             .and_then(|h| h.as_str())
@@ -359,6 +635,7 @@ impl Verifier for LocalVerifier {
         verify_vp_proof_lifetime(proof)?;
 
         let resolver = CompositeResolver::new(self.did_cache.clone());
+        let cached = resolver.cached_documents();
         let vm_resolver = VerificationMethodDIDResolver::<_, AnyMethod>::new(resolver);
 
         let env = create_signature_environment(None).await?;
@@ -380,6 +657,7 @@ impl Verifier for LocalVerifier {
 
         ensure_proofs_controlled_by(&vp.proofs, &holder_did, "holder").context("VP proof binding failed")?;
         ensure_verified(vp.verify(&params).await, "VP")?;
+        ensure_proof_purpose(&vp.proofs, VP_PROOF_PURPOSES, &params.resolver, &cached, refreshed, "VP", "vp").await?;
 
         let mut credentials = Vec::with_capacity(vcs.len());
         for (i, (vc_json, vc)) in vcs
@@ -392,6 +670,16 @@ impl Verifier for LocalVerifier {
             ensure_proofs_controlled_by(&vc.proofs, &vc_result.issuer_did, "issuer")
                 .with_context(|| format!("VC[{}] proof binding failed", i))?;
             ensure_verified(vc.verify(&params).await, &format!("VC[{}]", i))?;
+            ensure_proof_purpose(
+                &vc.proofs,
+                VC_PROOF_PURPOSES,
+                &params.resolver,
+                &cached,
+                refreshed,
+                &format!("VC[{}]", i),
+                "vc",
+            )
+            .await?;
             credentials.push(vc_result);
         }
 
@@ -856,12 +1144,7 @@ mod tests {
     #[tokio::test]
     async fn verify_vp_rejects_tampered_issuer() {
         let (mut vp, _) = mint_vp().await;
-        let vc = if vp["verifiableCredential"].is_array() {
-            &mut vp["verifiableCredential"][0]
-        } else {
-            &mut vp["verifiableCredential"]
-        };
-        vc["issuer"] = json!("did:web:did.dev.example.io:fake-issuer");
+        first_vc_mut(&mut vp)["issuer"] = json!("did:web:did.dev.example.io:fake-issuer");
 
         assert!(
             local_verifier()
@@ -870,5 +1153,519 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    fn did_web_signer(
+        key: &JWK,
+        relationships: &[&str],
+    ) -> (String, affinidi_did_common::Document) {
+        let did = format!("did:web:localhost%3A1:{}", uuid::Uuid::new_v4());
+        let vm = format!("{did}#key-2");
+        let mut document = json!({
+            "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
+            "id": did,
+            "verificationMethod": [{
+                "id": vm,
+                "type": "Multikey",
+                "controller": did,
+                "publicKeyMultibase": jwk_to_multibase_ed25519(key).unwrap(),
+            }],
+        });
+        for relationship in relationships {
+            document[*relationship] = json!([vm]);
+        }
+        (did, serde_json::from_value(document).unwrap())
+    }
+
+    /// A DID cache holding `documents`, each also published unchanged, so fetching one again
+    /// returns the same document.
+    async fn verifier_with(documents: &[(String, affinidi_did_common::Document)]) -> Arc<DIDCacheClient> {
+        let mut client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .expect("Failed to create DID cache client");
+        if !documents.is_empty() {
+            client.set_resolver(
+                affinidi_did_resolver_cache_sdk::MethodName::Web,
+                Box::new(PublishedDocuments(
+                    documents
+                        .iter()
+                        .cloned()
+                        .collect(),
+                )),
+            );
+        }
+        cache(&client, documents).await;
+        Arc::new(client)
+    }
+
+    /// A DID cache holding `documents`, none of which can be fetched again.
+    async fn cached_only(documents: &[(String, affinidi_did_common::Document)]) -> Arc<DIDCacheClient> {
+        let client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .expect("Failed to create DID cache client");
+        cache(&client, documents).await;
+        Arc::new(client)
+    }
+
+    async fn cache(
+        client: &DIDCacheClient,
+        documents: &[(String, affinidi_did_common::Document)],
+    ) {
+        for (did, document) in documents {
+            client
+                .get_cache()
+                .insert(DIDCacheClient::hash_did(did), document.clone())
+                .await;
+        }
+    }
+
+    async fn verify_under(
+        client: &Arc<DIDCacheClient>,
+        vp: &Value,
+    ) -> Result<VpVerificationResult, String> {
+        LocalVerifier::new(client.clone())
+            .verify_vp(vp)
+            .await
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    struct PurposeCase {
+        client: Arc<DIDCacheClient>,
+        vp: Value,
+        vc: Value,
+    }
+
+    async fn did_web_issuer_case(relationships: &[&str]) -> PurposeCase {
+        let issuer_key = JWK::generate_ed25519().unwrap();
+        let issuer = did_web_signer(&issuer_key, relationships);
+        let holder_key = JWK::generate_ed25519().unwrap();
+        let holder_did = two_key_peer_did(&holder_key);
+        let f = Fixture {
+            issuer_config: signer_config(&issuer.0, &issuer_key),
+            issuer_did: issuer.0.clone(),
+            holder_key,
+            holder_did,
+            verifier: LocalVerifier::new(verifier_with(&[]).await),
+        };
+        let vc = issue_vc(&f, &f.holder_did).await;
+        let vp = present(&f.holder_key, &f.holder_did, vec![vc.clone()]).await;
+        PurposeCase {
+            client: verifier_with(&[issuer]).await,
+            vp,
+            vc,
+        }
+    }
+
+    fn mismatch_count(role: &str) -> u64 {
+        mismatches(role, PurposeReason::NotListed)
+    }
+
+    fn mismatches(
+        role: &str,
+        reason: PurposeReason,
+    ) -> u64 {
+        crate::metrics::backends::prometheus::PROOF_PURPOSE_MISMATCH
+            .with_label_values(&[role, reason.as_str()])
+            .get()
+    }
+
+    #[tokio::test]
+    async fn vc_key_missing_from_assertion_method_is_refused() {
+        let case = did_web_issuer_case(&[]).await;
+        let before = mismatch_count("vc");
+
+        let err = verify_under(&case.client, &case.vp)
+            .await
+            .err()
+            .expect("a VC key listed under no relationship must be refused");
+
+        assert!(err.contains("VC[0] proof key") && err.contains("is not listed under assertionMethod"), "{err}");
+        assert!(mismatch_count("vc") > before);
+    }
+
+    #[tokio::test]
+    async fn signer_document_that_cannot_be_fetched_again_is_not_cached_again() {
+        let case = did_web_issuer_case(&[]).await;
+        let (issuer, cached) = cached_issuer_document(&case).await;
+        let client = cached_only(&[(issuer.clone(), cached)]).await;
+        let before = mismatches("vc", PurposeReason::Unresolvable);
+
+        verify_under(&client, &case.vp)
+            .await
+            .err()
+            .expect("a VC key the cached document does not list must be refused");
+
+        assert!(mismatches("vc", PurposeReason::Unresolvable) > before);
+
+        assert!(
+            client
+                .get_cache()
+                .get(&DIDCacheClient::hash_did(&issuer))
+                .await
+                .is_none(),
+            "the out-of-date document must not be cached again"
+        );
+    }
+
+    #[test]
+    fn a_signer_document_is_refreshed_at_most_once_per_interval() {
+        let did = format!("did:web:example.com:{}", uuid::Uuid::new_v4());
+        let other = format!("did:web:example.com:{}", uuid::Uuid::new_v4());
+
+        assert!(may_refresh_signer_document(&did));
+        assert!(!may_refresh_signer_document(&did));
+        assert!(may_refresh_signer_document(&other));
+    }
+
+    fn first_vc_mut(vp: &mut Value) -> &mut Value {
+        if vp["verifiableCredential"].is_array() {
+            &mut vp["verifiableCredential"][0]
+        } else {
+            &mut vp["verifiableCredential"]
+        }
+    }
+
+    fn embedded_method(
+        issuer: &str,
+        key: &JWK,
+    ) -> Value {
+        json!({
+            "id": format!("{issuer}#key-2"),
+            "type": "Multikey",
+            "controller": issuer,
+            "publicKeyMultibase": jwk_to_multibase_ed25519(key).unwrap(),
+        })
+    }
+
+    #[tokio::test]
+    async fn relative_verification_method_is_refused() {
+        let mut case = did_web_issuer_case(&["assertionMethod"]).await;
+        first_vc_mut(&mut case.vp)["proof"]["verificationMethod"] = json!("#key-2");
+
+        verify_under(&case.client, &case.vp)
+            .await
+            .err()
+            .expect("a relative verification method must be refused");
+    }
+
+    #[tokio::test]
+    async fn embedded_verification_method_is_checked_by_its_id() {
+        for (relationships, listed) in [(&["assertionMethod"][..], true), (&[][..], false)] {
+            let case = did_web_issuer_case(relationships).await;
+            let (issuer, cached) = cached_issuer_document(&case).await;
+            let mut vc = case.vc.clone();
+            vc["proof"]["verificationMethod"] = embedded_method(&issuer, &JWK::generate_ed25519().unwrap());
+            let vc: AnyDataIntegrity<JsonCredential> = serde_json::from_value(vc).unwrap();
+            let resolver = VerificationMethodDIDResolver::<_, AnyMethod>::new(CompositeResolver::new(
+                verifier_with(&[(issuer, cached)]).await,
+            ));
+
+            let problem = proof_purpose_problem(vc.proofs.first().unwrap(), VC_PROOF_PURPOSES, &resolver).await;
+
+            assert_eq!(problem.map(|p| p.reason), (!listed).then_some(PurposeReason::NotListed));
+        }
+    }
+
+    #[tokio::test]
+    async fn vc_key_under_assertion_method_verifies() {
+        let case = did_web_issuer_case(&["assertionMethod"]).await;
+
+        let result = verify_under(&case.client, &case.vp)
+            .await
+            .expect("a VC key listed under assertionMethod verifies");
+
+        assert_eq!(result.credentials.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn did_peer_presentation_verifies() {
+        let (vp, holder_did) = mint_vp().await;
+
+        let result = verify_under(&verifier_with(&[]).await, &vp)
+            .await
+            .expect("did:peer keys are listed under assertionMethod");
+
+        assert_eq!(result.holder_did, holder_did);
+    }
+
+    #[tokio::test]
+    async fn vp_key_missing_from_assertion_method_is_refused() {
+        let issuer_key = JWK::generate_ed25519().unwrap();
+        let issuer_did = two_key_peer_did(&issuer_key);
+        let holder_key = JWK::generate_ed25519().unwrap();
+        let holder = did_web_signer(&holder_key, &[]);
+        let f = Fixture {
+            issuer_config: signer_config(&issuer_did, &issuer_key),
+            issuer_did,
+            holder_key,
+            holder_did: holder.0.clone(),
+            verifier: LocalVerifier::new(verifier_with(&[]).await),
+        };
+        let vc = issue_vc(&f, &f.holder_did).await;
+        let vp = present(&f.holder_key, &f.holder_did, vec![vc]).await;
+
+        let err = verify_under(&verifier_with(&[holder]).await, &vp)
+            .await
+            .err()
+            .expect("a VP key listed under no relationship must be refused");
+
+        assert!(err.contains("VP proof key") && err.contains("is not listed under assertionMethod"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn tampered_vc_fails_its_signature_before_its_purpose() {
+        let mut case = did_web_issuer_case(&["authentication"]).await;
+        first_vc_mut(&mut case.vp)["credentialSubject"]["identityFields"]["region"] = json!("evil");
+
+        let err = verify_under(&case.client, &case.vp)
+            .await
+            .err()
+            .expect("a tampered VC must be refused");
+
+        assert!(err.contains("proof verification failed") && !err.contains("is not listed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn proof_purpose_must_be_allowed_and_list_the_key() {
+        let case = did_web_issuer_case(&["authentication"]).await;
+        let vc: AnyDataIntegrity<JsonCredential> = serde_json::from_value(case.vc.clone()).unwrap();
+        let mut declares_authentication = case.vc.clone();
+        declares_authentication["proof"]["proofPurpose"] = json!("authentication");
+        let declares_authentication: AnyDataIntegrity<JsonCredential> =
+            serde_json::from_value(declares_authentication).unwrap();
+        let resolver = VerificationMethodDIDResolver::<_, AnyMethod>::new(CompositeResolver::new(case.client));
+        let declares_authentication = declares_authentication
+            .proofs
+            .first()
+            .unwrap();
+        let declares_assertion = vc.proofs.first().unwrap();
+
+        let outside = proof_purpose_problem(declares_authentication, VC_PROOF_PURPOSES, &resolver)
+            .await
+            .expect("a credential proof may not declare authentication");
+        assert_eq!(outside.reason, PurposeReason::PurposeNotAllowed);
+        let outside = outside.message;
+        assert!(outside.contains("declares purpose authentication instead of assertionMethod"), "{outside}");
+
+        assert!(
+            proof_purpose_problem(declares_authentication, VP_PROOF_PURPOSES, &resolver)
+                .await
+                .is_none(),
+            "a presentation proof may declare authentication with a key listed under it"
+        );
+
+        let unlisted = proof_purpose_problem(declares_assertion, VP_PROOF_PURPOSES, &resolver)
+            .await
+            .expect("an assertionMethod proof needs its key under assertionMethod");
+        assert_eq!(unlisted.reason, PurposeReason::NotListed);
+        let unlisted = unlisted.message;
+        assert!(unlisted.contains("is not listed under assertionMethod"), "{unlisted}");
+    }
+
+    #[tokio::test]
+    async fn a_verification_resolves_each_did_once() {
+        let key = JWK::generate_ed25519().unwrap();
+        let (did, document) = did_web_signer(&key, &["assertionMethod"]);
+        let client = verifier_with(&[(did.clone(), document)]).await;
+        let resolver = CompositeResolver::new(client.clone());
+        let did = DID::new(did.as_str()).unwrap();
+        let first = resolver
+            .resolve_representation(did, Options::default())
+            .await
+            .expect("the cached document resolves");
+        client
+            .remove(did.as_str())
+            .await;
+
+        let again = resolver
+            .resolve_representation(did, Options::default())
+            .await
+            .expect("the second resolution reuses the first document");
+
+        assert_eq!(again.document, first.document);
+    }
+
+    #[tokio::test]
+    async fn presentation_declaring_authentication_needs_its_key_under_authentication() {
+        let case = did_web_issuer_case(&["assertionMethod"]).await;
+        let mut declares_authentication = case.vc.clone();
+        declares_authentication["proof"]["proofPurpose"] = json!("authentication");
+        let declares_authentication: AnyDataIntegrity<JsonCredential> =
+            serde_json::from_value(declares_authentication).unwrap();
+        let resolver = VerificationMethodDIDResolver::<_, AnyMethod>::new(CompositeResolver::new(case.client));
+
+        let problem = proof_purpose_problem(
+            declares_authentication
+                .proofs
+                .first()
+                .unwrap(),
+            VP_PROOF_PURPOSES,
+            &resolver,
+        )
+        .await
+        .expect("a key listed only under assertionMethod may not sign for authentication");
+
+        assert_eq!(problem.reason, PurposeReason::NotListed);
+        assert!(
+            problem
+                .message
+                .contains("is not listed under authentication"),
+            "{}",
+            problem.message
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_signer_is_reported_without_the_resolver_error() {
+        let case = did_web_issuer_case(&["assertionMethod"]).await;
+        let vc: AnyDataIntegrity<JsonCredential> = serde_json::from_value(case.vc.clone()).unwrap();
+        let resolver =
+            VerificationMethodDIDResolver::<_, AnyMethod>::new(CompositeResolver::new(verifier_with(&[]).await));
+
+        let problem = proof_purpose_problem(vc.proofs.first().unwrap(), VC_PROOF_PURPOSES, &resolver)
+            .await
+            .expect("a document that cannot be read cannot list the key");
+
+        assert_eq!(problem.reason, PurposeReason::Unresolvable);
+        assert!(
+            problem
+                .message
+                .ends_with("could not be checked against its DID document"),
+            "{}",
+            problem.message
+        );
+        assert!(
+            !problem
+                .message
+                .contains("SSRF"),
+            "{}",
+            problem.message
+        );
+    }
+
+    struct PublishedDocuments(HashMap<String, affinidi_did_common::Document>);
+
+    impl affinidi_did_resolver_cache_sdk::Resolver for PublishedDocuments {
+        fn name(&self) -> &str {
+            "PublishedDocuments"
+        }
+
+        fn resolve(
+            &self,
+            did: &affinidi_did_common::DID,
+        ) -> affinidi_did_resolver_cache_sdk::Resolution {
+            self.0
+                .get(&did.to_string())
+                .cloned()
+                .map(Ok)
+        }
+    }
+
+    async fn cached_issuer_document(case: &PurposeCase) -> (String, affinidi_did_common::Document) {
+        let issuer = case.vc["issuer"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let cached = case
+            .client
+            .get_cache()
+            .get(&DIDCacheClient::hash_did(&issuer))
+            .await
+            .unwrap();
+        (issuer, cached)
+    }
+
+    /// A DID cache holding each signer's `cached` document while its DID publishes `published`.
+    async fn client_with_published(
+        signers: Vec<(String, affinidi_did_common::Document, affinidi_did_common::Document)>
+    ) -> Arc<DIDCacheClient> {
+        let mut client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .unwrap();
+        let (cached, published): (Vec<_>, HashMap<_, _>) = signers
+            .into_iter()
+            .map(|(did, cached, published)| ((did.clone(), cached), (did, published)))
+            .unzip();
+        client.set_resolver(affinidi_did_resolver_cache_sdk::MethodName::Web, Box::new(PublishedDocuments(published)));
+        cache(&client, &cached).await;
+        Arc::new(client)
+    }
+
+    #[tokio::test]
+    async fn issuer_that_has_since_listed_its_key_is_accepted() {
+        let case = did_web_issuer_case(&[]).await;
+        let (issuer, cached) = cached_issuer_document(&case).await;
+        let published = listing_key_under_assertion_method(&issuer, &cached);
+        let client = client_with_published(vec![(issuer, cached, published)]).await;
+
+        let result = verify_under(&client, &case.vp)
+            .await
+            .expect("the document as now published lists the key");
+
+        assert_eq!(result.credentials.len(), 1);
+    }
+
+    fn listing_key_under_assertion_method(
+        did: &str,
+        cached: &affinidi_did_common::Document,
+    ) -> affinidi_did_common::Document {
+        let mut published = serde_json::to_value(cached).unwrap();
+        published["assertionMethod"] = json!([format!("{did}#key-2")]);
+        serde_json::from_value(published).unwrap()
+    }
+
+    #[tokio::test]
+    async fn holder_and_issuer_that_have_both_since_listed_their_keys_are_accepted() {
+        let issuer_key = JWK::generate_ed25519().unwrap();
+        let (issuer_did, issuer_cached) = did_web_signer(&issuer_key, &[]);
+        let holder_key = JWK::generate_ed25519().unwrap();
+        let (holder_did, holder_cached) = did_web_signer(&holder_key, &[]);
+        let f = Fixture {
+            issuer_config: signer_config(&issuer_did, &issuer_key),
+            issuer_did: issuer_did.clone(),
+            holder_key,
+            holder_did: holder_did.clone(),
+            verifier: LocalVerifier::new(verifier_with(&[]).await),
+        };
+        let vc = issue_vc(&f, &holder_did).await;
+        let vp = present(&f.holder_key, &holder_did, vec![vc]).await;
+        let client = client_with_published(
+            [(&issuer_did, issuer_cached), (&holder_did, holder_cached)]
+                .into_iter()
+                .map(|(did, cached)| {
+                    let published = listing_key_under_assertion_method(did, &cached);
+                    (did.clone(), cached, published)
+                })
+                .collect(),
+        )
+        .await;
+
+        let result = verify_under(&client, &vp)
+            .await
+            .expect("both documents as now published list their keys");
+
+        assert_eq!(result.holder_did, holder_did);
+        assert_eq!(result.credentials[0].issuer_did, issuer_did);
+    }
+
+    #[tokio::test]
+    async fn key_replaced_since_it_was_cached_is_refused() {
+        let case = did_web_issuer_case(&[]).await;
+        let (issuer, cached) = cached_issuer_document(&case).await;
+        let (_, published) = did_web_signer(&JWK::generate_ed25519().unwrap(), &["assertionMethod"]);
+        let mut published = serde_json::to_value(&published).unwrap();
+        let vm = format!("{issuer}#key-2");
+        published["id"] = json!(issuer);
+        published["verificationMethod"][0]["id"] = json!(vm);
+        published["verificationMethod"][0]["controller"] = json!(issuer);
+        published["assertionMethod"] = json!([vm]);
+        let client = client_with_published(vec![(issuer, cached, serde_json::from_value(published).unwrap())]).await;
+
+        let err = verify_under(&client, &case.vp)
+            .await
+            .err()
+            .expect("a signature by a key the published document no longer holds must be refused");
+
+        assert!(err.contains("VC[0]") && !err.contains("is not listed"), "{err}");
     }
 }

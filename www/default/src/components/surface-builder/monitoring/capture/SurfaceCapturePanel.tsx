@@ -4,12 +4,15 @@ import { generateSchemaFromPayload } from '../../../../utils/schemaUtils';
 import { formatTime } from '../../../../utils/stringUtils';
 import { useFabricResolver } from '../../../../utils/useFabricResolver';
 import type { AgentSurface } from '../../../../api';
+import { CopyButton } from '../../../shared/CopyButton';
 import CaptureDetailsModal from './CaptureDetailsModal';
 import CaptureHistoryTable from './CaptureHistoryTable';
 import CapturePipelineView from './CapturePipelineView';
 import CaptureSchemaModal from './CaptureSchemaModal';
+import PolicyInputCaptureCard, { surfaceHasPolicy } from './PolicyInputCaptureCard';
 import { CapturedPayload } from './types';
 import { useSurfaceCaptureStream } from './useSurfaceCaptureStream';
+import { usePolicyInputCaptureStream } from './usePolicyInputCaptureStream';
 
 export interface SurfaceCapturePanelProps {
   surfaceId: string;
@@ -31,6 +34,7 @@ const SurfaceCapturePanel: React.FC<SurfaceCapturePanelProps> = ({
 }) => {
   const { state, actions } = useApp();
   const stream = useSurfaceCaptureStream(surfaceId);
+  const policyInputs = usePolicyInputCaptureStream(surfaceId);
 
   const [selectedCapture, setSelectedCapture] = useState<CapturedPayload | null>(null);
   const [schemaModal, setSchemaModal] = useState<{
@@ -78,16 +82,6 @@ const SurfaceCapturePanel: React.FC<SurfaceCapturePanelProps> = ({
     document.body.classList.remove('modal-open');
   };
 
-  const copyRoute = async (e: React.MouseEvent<HTMLButtonElement>) => {
-    navigator.clipboard.writeText(fullRoute);
-    const btn = e.currentTarget;
-    const original = btn.innerHTML;
-    btn.innerHTML = '<i class="fas fa-check"></i>';
-    setTimeout(() => {
-      btn.innerHTML = original;
-    }, 2000);
-  };
-
   const copyAllStages = async () => {
     if (!stream.latestInboundRequest) return;
     try {
@@ -123,17 +117,21 @@ const SurfaceCapturePanel: React.FC<SurfaceCapturePanelProps> = ({
           <button
             className={`btn btn-sm ${stream.isPaused ? 'btn-success' : 'btn-warning'}`}
             onClick={() => stream.setPaused(!stream.isPaused)}
-            title={stream.isPaused ? 'Resume live capture' : 'Pause live capture'}
+            title={stream.isPaused ? 'Resume payload capture' : 'Pause payload capture'}
           >
             <i className={`fas ${stream.isPaused ? 'fa-play' : 'fa-pause'}`}></i>{' '}
             {stream.isPaused ? 'Resume' : 'Pause'}
           </button>
           <button
-            className="btn btn-sm btn-warning"
-            onClick={stream.clear}
-            disabled={stream.count === 0}
+            className="btn btn-sm btn-outline-danger"
+            onClick={() => {
+              stream.clear();
+              policyInputs.clear();
+            }}
+            disabled={stream.count === 0 && policyInputs.captures.length === 0}
+            title="Clear captured payloads and policy inputs"
           >
-            <i className="fas fa-trash"></i> Clear Payloads
+            <i className="fas fa-trash"></i> Clear
           </button>
           <button
             className="btn btn-sm btn-outline-secondary"
@@ -157,15 +155,7 @@ const SurfaceCapturePanel: React.FC<SurfaceCapturePanelProps> = ({
             <div className="alert alert-success mb-3" style={{ fontSize: '14px' }}>
               <i className="fas fa-info-circle me-2"></i>
               <strong>Surface Route:</strong> {fullRoute}
-              <button
-                type="button"
-                className="btn btn-xs ms-2"
-                style={{ padding: '2px 6px', fontSize: '11px', outline: 'none' }}
-                onClick={copyRoute}
-                title="Copy to clipboard"
-              >
-                <i className="fas fa-copy"></i>
-              </button>
+              <CopyButton text={fullRoute} size="xs" className="ms-2" title="Copy route" />
             </div>
           )}
           {targetEndpoint && (
@@ -216,7 +206,7 @@ const SurfaceCapturePanel: React.FC<SurfaceCapturePanelProps> = ({
         <div className="card-header py-3">
           <div className="d-flex justify-content-between align-items-center">
             <div className="d-flex align-items-center">
-              <h6 className="m-0 font-weight-bold text-success me-3">
+              <h6 className="m-0 font-weight-bold text-primary me-3">
                 <i className="fas fa-file-code"></i>{' '}
                 {stream.displayedCapture
                   ? `${stream.displayedCapture.channel} - ${formatTime(stream.displayedCapture.timestamp)}`
@@ -276,6 +266,13 @@ const SurfaceCapturePanel: React.FC<SurfaceCapturePanelProps> = ({
           />
         </div>
       </div>
+
+      <PolicyInputCaptureCard
+        captures={policyInputs.captures}
+        skipped={policyInputs.skipped}
+        payloadPaused={stream.isPaused}
+        hasPolicy={!surface || surfaceHasPolicy(surface)}
+      />
 
       <CaptureHistoryTable captured={stream.captured} onSelectRow={stream.loadCapture} />
 

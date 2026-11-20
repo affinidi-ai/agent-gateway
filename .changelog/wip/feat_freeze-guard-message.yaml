@@ -1,0 +1,17 @@
+branch: feat/freeze-guard-message
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-12T12:00:00Z'
+      title: Point the component test freeze guard at where new tests belong
+      description: >-
+        The freeze guard's failure message now tells a contributor to put new tests outside
+        src/component_tests, and that a pin is raised only with a reason stated in the pull
+        request, usually to match main's count after a FROZEN_FILES merge conflict or when
+        main itself fails the guard. AGENTS.md, TESTING.md and the guard state this one pin
+        rule, so the folder does not only shrink. The Unit label in DEVELOPMENT.md matches
+        TESTING.md.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

@@ -189,6 +189,25 @@ verifies every embedded VC's Data Integrity proof and requires the proof key's D
 `issuer` (and the VP proof key's DID to equal `holder`). ssi alone verifies only the outer VP proof
 and never binds a proof key to the document it signs.
 
+ssi does not check the proof purpose either, so after each signature verifies `verify_vp` checks
+the purpose the proof declares: `assertionMethod` for every VC, `assertionMethod` or
+`authentication` for the VP, and the signer's DID document must list the proof key under that
+purpose. A presentation with a proof that fails this, or that cannot be checked, is rejected
+like one whose signature does not verify, and counted in
+`agent_gateway_proof_purpose_mismatch_total`; there is no setting to turn the check off. The
+request then carries no caller identity, so it is refused only where caller authentication or a
+policy needs one (a policy that requires `input.identity_binding`, for example). Before rejecting
+a key that a cached DID
+document does not list, the gateway drops that document from its DID cache and verifies the whole
+presentation again, signatures included, against the document as now published, so a signer that
+has since fixed its document is accepted at once. It does this for each signer of the
+presentation whose cached document is out of date, such as both the holder and a credential's
+issuer, at most once a minute per signer DID. When the document cannot be fetched again, the
+presentation is refused and the out-of-date document is not cached again. A peer
+on a release whose gateway DID document lists its signing key (`#key-2`) under no relationship has
+its presentations rejected until it upgrades, which repairs its document on its next start (see
+[Proof purpose metric](OBSERVABILITY.md#proof-purpose-metric)).
+
 ![Presentation issuance: a verifiable credential is issued, wrapped in a verifiable presentation, signed with the agent key, and forwarded to the receiving gateway](assets/diagrams/vp-issuance.png)
 
 ![Presentation verification: receive the presentation, verify its signature, verify the credential signature, and check that the presentation holder equals the credential subject](assets/diagrams/vp-verification.png)
@@ -336,12 +355,25 @@ or fails over. It recreates an account only when that account sends, and refuses
 missing account with `e.p.delivery.refused`. Without the periodic check, a gateway that only
 receives would stay unreachable.
 
+A mediator says the account is gone in one of two ways, and both are recognised: the
+`account.not_found` problem report of a mediator before v0.52, and the `trust-task-error` document
+every later one answers with, under the code `messaging/account/get` declares for it. Another
+task's `unknownAccount` is left alone, since it may be about a peer's account rather than this
+one's.
+
 Four Connection Points are checked at a time, so one slow mediator does not hold up the others.
 Each probe waits up to 5 seconds, a restart up to 20 seconds, and re-applying an ACL up to
-10 seconds; a repair that fails is tried again at the next check and logged at `warn`. An account
-that cannot be read changes nothing. When that happens on consecutive checks it is logged at
-`warn` on the second, then at doubling intervals, so a check that cannot reach its mediator is
-visible. A Connection Point stopped or removed while it is being checked is not started again.
+10 seconds; a repair that fails is tried again at the next check and logged at `warn`. A probe the
+mediator answered, even with a refusal, changes nothing: the socket still carries traffic. A probe
+it did not answer at all is the case a lost account produces, because a mediator that no longer
+holds the account has nowhere to deliver its own answer either, so the second unanswered probe in
+a row restarts the Connection Point, and then the fourth, eighth and so on, backing off while the
+mediator stays silent. Only the Connection Points whose probe went unanswered are re-probed after
+5 seconds, and every Connection Point is still visited at least every 30 seconds, so a mediator
+that never answers for one of them cannot keep the others from being checked. A listener that is
+not connected — one still re-authenticating after a restart, say — is not probed at all, and that
+pass neither counts against it nor clears what it has counted. A Connection Point stopped or
+removed while it is being checked is not started again.
 
 When the appliance is Standby, fabric and trust listeners are inactive and the node reports not
 ready. Periodic cache refresh keeps supported cached stores current on a Standby node.

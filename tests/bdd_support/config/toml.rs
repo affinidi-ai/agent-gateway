@@ -15,7 +15,7 @@ pub fn write_config_toml(
 secrets_backend = "filesystem"
 auth_mode = "passkey"
 session_timeout_minutes = 20
-websocket_require_auth = false
+websocket_require_auth = true
 metrics_retention_minutes = 360
 metrics_cache_ttl_seconds = 1
 backup_encryption_key = "{backup_key}"

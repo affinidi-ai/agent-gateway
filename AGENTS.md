@@ -62,13 +62,13 @@ changes:
 
 ## Tests
 
-- **Unit**: `#[cfg(test)] mod tests` inline in each module.
+- **Unit**: `#[cfg(test)] mod tests` inline in each module; one function or type, or an in-process seam where real collaborators meet.
 - **Behaviour**: the acceptance layer. Gherkin scenarios under `tests/features/surface/` (`surface_bdd`, one gateway) and `tests/features/g2g/` (`g2g_bdd`, two gateways over the fabric). Every new behaviour an operator or caller can observe gets a scenario here; behaviour seen in the dashboard goes to Playwright in `ui-tests/`. After adding or changing a `.feature` file or a step binding, run `python3 scripts/bdd-gherkin.py --lint`; errors block, and CI runs the same check.
   - One behaviour per scenario, in the vocabulary of [`CONTEXT.md`](CONTEXT.md).
   - Exercise the real gateway through its public interfaces.
   - Assert what the caller or operator observes, not internal state.
   - Fixtures store an Access Point as the admin API creates it: closed when it authenticates callers, public when it does not. Test a caller whose credential fails on that protected flow (refused with `401`, the Target never called). Only a scenario about what a public Access Point still guarantees (the failed caller reaches policy, gets no Target credential and no caller identity, and a policy can deny it) says `the surface is stored with a public Access Point`, and only one about a legacy surface says `the surface is stored as a legacy surface`.
-- **Legacy component**: `src/component_tests/` is frozen. No new files, test functions or helpers; existing tests may be fixed or deleted. The `freeze` tests in `src/component_tests/mod.rs` pin each file's test count in `FROZEN_FILES` and fail on a new file or a count that moves without its pin. Pins only go down. New helpers are a review rule; the tests do not catch them.
+- **Legacy component**: `src/component_tests/` is frozen. No new files, test functions or helpers; existing tests may be fixed or deleted. The `freeze` tests in `src/component_tests/mod.rs` pin each file's test count in `FROZEN_FILES` and fail on a new file or a count that moves without its pin. Pins only go down; a raise needs a reason stated in the pull request, usually matching main's count after a `FROZEN_FILES` merge conflict or when main itself fails the guard (see [`docs/development/TESTING.md`](docs/development/TESTING.md#legacy-component-tests)). New helpers are a review rule; the tests do not catch them.
 - **MCP conformance**: `make mcp-conformance` (`scripts/mcp-conformance/`) runs the published MCP suite and the legacy compatibility checks against the ordinary gateway binary; `ARGS=--unit-tests` adds the full binary test suite.
 
 ## Frontend conventions
@@ -140,6 +140,10 @@ destination only, not on a `fabric://` one; see _Surface Builder_ in
 A Transit Point's Rate Limit panel has a **Per caller** section that writes
 `transit.points[].per_caller_rate_limit` beside the point's shared `rate_limit`; see _Surface
 Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+The Surface Builder palette offers the A2A Transit Point only on A2A and AP2 surfaces and the MCP
+Transit Point only on MCP surfaces; existing Transit Points stay editable; see _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Surface Builder labels an Access Point's URL **Entry point URL**, with a copy button in the
 Access Point panel and on the canvas, and names a new surface `<protocol>_surface_<n>`; see
@@ -401,6 +405,20 @@ or has an `a2a-proxy://` Target, while `credential_policy.target_source_auth` is
 which refuses the save), shown as "Not ready for external access" under the Access Point URL
 with a **Configure Authentication** action; see
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+A surface's Capture view has a **Policy Input** card listing, live, the input and decision of each
+request and response policy evaluation (not MCP tool policies) while the user listens with its **Listen to policy input** button (users with
+both `surfaces.edit` and `policies.edit`; leaving the view or reloading stops it), and says a
+request policy must be added first while the surface has none. It offers listening only while the
+`policy_input_capture` feature flag is on (default off), and otherwise says capture is turned off,
+or that the gateway settings could not be read, with a Retry, when loading them failed;
+see _Policy input capture_ and _Feature flags_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#policy-input-capture).
+
+The Capture view's **Clear** button clears captured payloads and policy inputs, its **Pause**
+holds the payload stream only (the Policy Input card says so while a listen is on), and its card
+titles share one style; see _Policy input capture_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#policy-input-capture).
 
 The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see
 _Maintenance actions_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#maintenance-actions).

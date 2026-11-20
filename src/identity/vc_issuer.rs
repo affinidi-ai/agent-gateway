@@ -742,6 +742,20 @@ impl VCIssuer {
         Ok(true)
     }
 
+    /// The gateway DID, followed by the parallel `did:web` DID of a `did:webvh` gateway when it can
+    /// be derived.
+    #[cfg(feature = "didwebvh")]
+    pub async fn gateway_did_ids(&self) -> Vec<String> {
+        let config = self.config.read().await;
+        let mut ids = vec![config.proxy_did.clone()];
+        match Self::did_document_id(&config) {
+            Ok(document_id) if document_id != config.proxy_did => ids.push(document_id),
+            Ok(_) => {}
+            Err(e) => warn!("Could not derive the did:web DID of gateway DID {}: {e:#}", config.proxy_did),
+        }
+        ids
+    }
+
     /// The DID the stored `did.json` describes: the gateway DID, or for a `did:webvh` DID its
     /// parallel `did:web` DID.
     #[cfg(feature = "didwebvh")]

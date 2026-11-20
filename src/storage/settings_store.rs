@@ -30,8 +30,11 @@ pub fn global_settings_store() -> Option<&'static SettingsStore> {
 /// Feature flags only the system settings decide. The gateway enforces them, so
 /// a user's own overrides never change them, and the dashboard shows what the
 /// gateway does.
-pub const SYSTEM_ONLY_FLAGS: &[&str] =
-    &[crate::gateways::agent_pay_flag::FLAG_AGENT_PAY, crate::mediators::federation::FLAG_MEDIATOR_FEDERATION];
+pub const SYSTEM_ONLY_FLAGS: &[&str] = &[
+    crate::gateways::agent_pay_flag::FLAG_AGENT_PAY,
+    crate::mediators::federation::FLAG_MEDIATOR_FEDERATION,
+    crate::policies::input_capture::FLAG_POLICY_INPUT_CAPTURE,
+];
 
 /// Whether `flag` is explicitly on in the system settings; false when unset or
 /// before the settings store is registered.
@@ -820,6 +823,7 @@ mod tests {
             feature_flags: Some(HashMap::from([
                 ("agent_pay_delegation".to_string(), false),
                 ("mediator_federation".to_string(), true),
+                ("policy_input_capture".to_string(), true),
                 ("metrics".to_string(), false),
             ])),
             ..UserSettings::default()
@@ -829,6 +833,7 @@ mod tests {
             .feature_flags;
         assert_eq!(flags.get("agent_pay_delegation"), Some(&true));
         assert_eq!(flags.get("mediator_federation"), Some(&false));
+        assert_eq!(flags.get("policy_input_capture"), None, "a user can't turn policy input capture on");
         assert_eq!(flags.get("metrics"), Some(&false), "other flags stay per user");
     }
 

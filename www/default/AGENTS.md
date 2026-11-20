@@ -115,6 +115,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
 
 ## Surface Builder
 
+- The palette offers the A2A Transit Point only on A2A and AP2 surfaces and the MCP Transit
+  Point only on MCP surfaces (`protocols` on the node definition); a DIDComm surface, or one
+  with no protocol yet, is offered neither. Transit Points already on a surface keep
+  rendering and editing.
 - Sidebars may include small, legible configuration controls. Move dense editors,
   repeated rows, long lists, JSON and schema editors, and advanced controls into an
   element `FullscreenPanel`. When fullscreen is used, keep the sidebar focused on counts
@@ -713,6 +717,112 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
 | Add method button, menu, menu entry | `<area>-add-method-button`, `<area>-add-method-menu`, `<area>-add-method-<method type>` |
 | Selected method's settings (editor) | `caller-auth-editor-method-settings`                                                    |
 | JWT audience claim and its warnings | `caller-auth-jwt-audience-claim`, `-audience-claim-warning`, `caller-auth-audiences-missing-warning` |
+
+### Policy input capture
+
+- The surface's Capture view (`monitoring/capture/SurfaceCapturePanel.tsx`) has a **Policy Input**
+  card (`monitoring/capture/PolicyInputCaptureCard.tsx`) between the latest payload and the
+  payload history. Its header holds the **Listen to policy input** button
+  (`monitoring/PolicyInputCaptureControl.tsx`), shown only on a saved surface (never while
+  creating). The Monitoring view itself has only the Capture button.
+- The Capture view's toolbar holds **Pause**/**Resume** (payload capture only), **Clear**
+  (`btn-outline-danger`; it clears captured payloads and policy inputs) and **Copy All Stages**.
+  Every card title in the view is a `font-weight-bold text-primary` `h6`, and the Surface Route
+  line copies with the shared `CopyButton`.
+- The button is shown only while the `policy_input_capture` feature flag is on (see _Feature
+  flags_). While it is off, the card shows no button, no empty-state hint and no no-policy note;
+  an `alert alert-info` (`policy-input-capture-off`) says "Policy input capture is turned off on
+  this gateway. An administrator can turn it on under Settings › Admin › Feature Flags
+  (`policy_input_capture`)." Evaluations already in the list stay. Until the settings have loaded
+  the card shows neither the button nor that notice. When the settings could not be read
+  (`state.settingsLoadFailed` in `AppContext`, set while `settings` holds `FALLBACK_SETTINGS`;
+  `usePolicyInputCaptureFlag` returns it as `loadFailed` and is its only reader), the card shows
+  an `alert alert-danger` (`policy-input-capture-settings-error`) saying "Could not read the
+  gateway settings" with an `outline-danger` **Retry** (`policy-input-capture-settings-retry`)
+  that calls `actions.loadSettings`, in place of the turned-off notice. When the gateway's flag is turned off while
+  the page still reads it on, the gateway's refusal (`policy input capture is turned off`) ends
+  listening and shows as the inline error, like any other refusal.
+- Capture is live and lasts only while the view is open: the button turns into **Stop
+  listening**, and an effect keyed on the surface and the listening state sends
+  `capture_policy_input` (and its cleanup `stop_capturing_policy_input`) on the dashboard
+  WebSocket through `actions.listenToPolicyInput` in `AppContext`. Clicking again, leaving the
+  Capture view (unmount) or reloading the page stops it; a new surface id moves listening to that
+  surface. Nothing is stored, so a reload starts with listening off. `AppContext` keeps the open
+  listens in a `PolicyInputListens` (`context/policyInputListens.ts`) and sends them again after a
+  socket reconnect. There is no duration and no admin API call.
+- While listening, a green "Listening" indicator shows when the dashboard socket is connected
+  (`state.wsStatus === 'CONNECTED'`), and a warning "Waiting for the dashboard connection" in its
+  place otherwise. While the Capture view's Pause holds the payload stream during a listen, a
+  muted line (`policy-input-capture-paused-note`) says "Pause holds payload capture only; policy
+  input keeps arriving. Use Stop listening to stop it." (`SurfaceCapturePanel` passes
+  `stream.isPaused` to the card as `payloadPaused`, and the card to the control.)
+- The button needs both `surfaces.edit` and `policies.edit`; without either it is disabled with
+  "Needs permission to edit surfaces and policies" beside it. When the gateway ends listening
+  (`listening: false` with an `error`, such as a refusal, an ended session or a permission lost at
+  a keep-alive ping), the button
+  goes back to **Listen to policy input** without sending a stop of its own
+  (`listenToPolicyInput(id, false, false)`), and an `error` shows inline beside it until the user
+  clicks again or a later answer starts listening. A `listening: false` answer without an `error`
+  answers this page's own stop and changes nothing, so a stop answered after the user listened
+  again doesn't turn the button off.
+- The card follows the Capture view's existing cards, Payload History in particular: a
+  `card shadow mb-4` whose `text-primary` `h6` header holds the icon, the title and a `count/max`
+  `text-bg-primary` badge, with the warning and muted hint lines beneath it (see below) and the
+  listen control on the right; a
+  `table table-hover table-sm` with a **Timestamp** column rendered by `formatDateTime(…, true)`
+  (`timestamp-cell`) and the policy slot as a `text-bg-secondary` badge, like a payload's Channel;
+  the no-policy note as an `alert alert-info` with an icon, like the route and Target lines. The
+  input's copy button is the shared `CopyButton`, which shows a check when it copied; a failed
+  copy shows an error toast. The rest of the Capture view keeps its own markup.
+- The card lists the last 50 `policy_input_captured` WebSocket updates of the surface (see
+  `monitoring/capture/usePolicyInputCaptureStream.ts`), newest first: time, policy slot with a
+  variant badge and, under it, the name and version of each policy the slot ran (`policies`; the
+  name, else the id, else "inline policy"; the member that denied a gateway or appliance-wide set
+  in red with "(denied)"), a decision badge (Allow green, Deny red, Error yellow) with the reason, a
+  **Show input** toggle that opens the input JSON, and a copy button for the input. Above the
+  list an "All policy slots" select shows one slot's rows (the header's hint says the last 50
+  evaluations are kept and that one request can add several rows); a chosen slot that has
+  left the list (cleared or rolled off) falls back to all slots. With none it says to
+  listen and send a request, and that on an appliance with several nodes only requests served by
+  this dashboard's node show. Clear applies to it too; Pause holds only the payload
+  stream, so the card keeps every evaluation of a listen while payloads are paused, and says so
+  while a listen is on. Each row's input is formatted as JSON only when its row is opened or
+  its copy button is clicked (`CopyButton` takes `text` as a string or a function that builds
+  it). When the gateway reports
+  captures it dropped for this dashboard (`policy_input_skipped`), a warning alert
+  (`policy-input-capture-skipped`) above the list says how many evaluations were not shown;
+  Clear resets it. The header stacks
+  the title and count badge, then a warning line (`text-warning` with a triangle icon,
+  `policy-input-capture-warning`): "For developing and testing policies only", then the muted
+  hint line; the Listen control sits on the right.
+- While the surface has no policy the gateway captures (`surfaceHasPolicy`: an Access Point,
+  Target or Target response policy, the shared Transit Point policy
+  `transit.opa_policy_definition_id`, a Transit Point policy or response policy, or a variant's
+  Access Point, Target or Target response policy), the card shows an info note above the list: the surface has nothing of
+  its own to capture, only a gateway or appliance-wide policy shows, and a request policy (an
+  allow-all one is enough) should be added first. The button's `FieldHelp` says the same.
+- The note that captures show each request and response policy evaluation (not MCP tool
+  policies), only those of this dashboard's node on a multi-node appliance, hold request data with
+  credentials masked, reach only the listening user, are neither logged nor stored, are for
+  developing and testing policies only, and stop when listening stops sits behind the button's
+  `FieldHelp`.
+- The Audit Log's Category filter offers `policy_input_capture_started` and
+  `policy_input_capture_stopped` ("Policy Input Capture Started" / "Stopped", in the overflow
+  menu like the other low-frequency categories).
+
+| Policy input capture element                    | Test id                                                                |
+| ----------------------------------------------- | ---------------------------------------------------------------------- |
+| Control, button, listening, missing permission  | `policy-input-capture`, `policy-input-capture-listen`, `policy-input-capture-listening`, `policy-input-capture-not-allowed` |
+| Waiting for the connection                      | `policy-input-capture-waiting`                                         |
+| Pause note while listening                      | `policy-input-capture-paused-note`                                     |
+| Hint line (kept count), slot filter             | `policy-input-capture-kept`, `policy-input-capture-slot-filter`        |
+| Warning line, skipped notice                    | `policy-input-capture-warning`, `policy-input-capture-skipped`         |
+| Help and error                                  | `field-help-policy-input-capture`, `policy-input-capture-error`        |
+| Card, empty state, no-policy note, row          | `policy-input-capture-card`, `policy-input-capture-empty`, `policy-input-capture-no-policy`, `policy-input-capture-row` |
+| Turned-off notice                               | `policy-input-capture-off`                                             |
+| Settings read error, its Retry                  | `policy-input-capture-settings-error`, `policy-input-capture-settings-retry` |
+| Reason, input toggle, input, copy               | `policy-input-capture-reason`, `policy-input-capture-toggle`, `policy-input-capture-input`, `policy-input-capture-copy` |
+| Policy the slot ran                             | `policy-input-capture-policy`                                          |
 
 ## Trust Check
 
@@ -1356,7 +1466,9 @@ The delegation categories are the ones the gateway audits: `consent_granted`, `c
 (`token_injected`, `token_refreshed`, `refresh_failed`, `consent_required`, `token_not_found`
 and the elicitation events) is written to its log, or nowhere while `[logging] delegation_events`
 is `false`, and is no audit event, so the Audit Log offers no category for it and no link selects it. A record of one that an older gateway
-audited is still shown, with its label (`categoryLabel`).
+audited is still shown, with its label (`categoryLabel`). A category `categoryLabel` has no label
+for is named in title case from its event name (`auth_failed` as "Auth Failed"), with `API`, `DID`,
+`JWT`, `MCP` and `VP` in capitals, never as the raw lowercase name.
 
 - The Audit Log offers each delegation category in its Category filter, labels and narrates
   `consent_expired` ("Consent expired", a warning, apart from a revocation) and
@@ -2332,6 +2444,12 @@ Settings → **Admin** → **Feature Flags** is a table of the shared `FeatureFl
   payment gateway already exists and no operator has set it either way. The Connections permission
   list (`connectionsPermissions`) is shared by the route and the sidebar. When the settings cannot
   be loaded, `FALLBACK_SETTINGS` (every flag off) is used so the pages waiting for them render.
+- `policy_input_capture` (`settings-flag-policy_input_capture`) is default off and lets users
+  with `surfaces.edit` and `policies.edit` listen to a surface's policy input on its Capture
+  view (see _Policy input capture_). Read it through `utils/featureFlags.ts`
+  (`policyInputCaptureEnabled`, `usePolicyInputCaptureFlag`), never inline. The gateway checks the
+  same system flag: it refuses a listen while the flag is off and stops every listen at the next
+  keep-alive check after it is turned off.
 - `mediator_federation` is default off and experimental. On, the Connect via OOB wizard's
   details step (`gateway-add-via-oob/EnterDetailsStep.tsx`) shows a mediator picker
   (`wizard-oob-acceptor-mediator`) that lists only mediators with `status === 'active'` and

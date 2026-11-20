@@ -128,6 +128,127 @@ their tenant and within their resource pattern. `PUT /v1/policy-assignments`
 rejects any tenant-scoped PAT with 403. See
 [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#tenant-ownership).
 
+## Policy input capture
+
+The gateway does not log the policy input. To write a policy against real requests, an operator
+listens to the policy input of one surface from its Capture view in the dashboard. It is meant for
+developing and testing policies, not for monitoring, so it is off until an administrator turns on
+the `policy_input_capture` system feature flag (Settings › Admin › Feature Flags, or
+`feature_flags.policy_input_capture` in `POST /api/v1/settings`). It is a system-only flag: a
+user's own settings never turn it on. Listening is a
+request on the dashboard WebSocket, with no admin API route and nothing stored on the surface:
+
+- `{"type": "capture_policy_input", "surface_id": "<id>"}` starts listening, and
+  `{"type": "stop_capturing_policy_input", "surface_id": "<id>"}` stops it.
+- The gateway answers each with `{"type": "policy_input_capture", "surface_id", "listening"}`, and
+  an `error` when it refuses or ends a listen: `policy input capture needs dashboard sign-in` (the
+  connection carries no signed-in dashboard user, as when the gateway serves the dashboard without
+  authentication or without role checks), `your dashboard session has ended; sign
+  in again` (the connection's session is no longer live), `policy input capture is turned off` (the
+  flag is off), `needs surfaces.edit and policies.edit`, `invalid surface
+  id` (empty, over 256 bytes, or holding a control character or a bidirectional or zero-width
+  format character) or `listening to too many surfaces on this connection` (more than
+  10). The answer to a stop has no `error`, even when its surface id is not valid.
+- Starting needs the flag on and a dashboard session whose user holds `surfaces.edit` and
+  `policies.edit` ([`RBAC.md`](RBAC.md#policy-input-capture)). The session, the flag and the
+  permissions are checked again on each keep-alive ping; once the session ends, the flag is turned
+  off or either permission is gone, the connection stops listening to every surface and is told
+  why. The flag is also read on every policy evaluation, so turning it off stops new captures at
+  once. A due check runs before any queued capture is
+  sent, and the captures still queued when access is lost are discarded. A client that has not
+  read a message within 10 seconds is disconnected, so it cannot delay the check.
+- Each listen that starts records `policy_input_capture_started`, and each that ends records
+  `policy_input_capture_stopped` with its reason, in the VP Audit Log when auditing selects either
+  event and in any Governance Audit integration that selects either one
+  ([`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)). Each start and stop is also
+  written to the log at info, whatever auditing selects. A refused listen records nothing.
+- Listening ends when the connection closes, so reloading or leaving the page ends it. Captures
+  still queued when the connection closes are not sent. The dashboard sends its listens again
+  after a reconnect.
+- Captures and `policy_input_skipped` notices queued before a stop, or by an earlier listen to
+  the same surface, are not sent; those of the connection's other surfaces still are.
+
+A surface's policy input is captured while at least one connection listens to it, and only the
+listening connections receive the captures, each through its own queue of at most 64; a capture
+that finds a connection's queue full is dropped for that connection, and the connection is told how
+many it missed with `{"type": "policy_input_skipped", "config_id", "skipped"}` before its next
+capture. While every listening connection's queue is full, an evaluation is counted as missed for
+each of them and its input is not masked or serialized. The Capture view shows that count.
+Capture runs on the node the dashboard is connected to: requests another node of the appliance
+serves are not captured there.
+
+While a connection listens, each evaluation of a request or response policy on the surface sends
+it one `policy_input_captured` update, once the policy has decided:
+
+| Field | Value |
+| --- | --- |
+| `config_id` | The surface id |
+| `timestamp` | When the policy decided, RFC 3339 |
+| `slot` | The policy, in words: `inbound` (the Access Point policy), `target` (the Target's request policy), `inbound variant <alias>`, `target variant <alias>`, `outbound`, `transit <alias>`, `response` (the Target's response policy), `transit <alias> response`, `gateway` (the gateway-level policy on an inbound request), `gateway outbound` (the gateway-level policy on an outbound request, `input.gateway.direction` `outbound`) or `appliance <plane>` (an appliance-wide plane) |
+| `transit_point` | The Transit Point alias, for a Transit Point request or response policy |
+| `policies` | The policy definitions the slot evaluated, each `{"id", "name", "version"}`: one for a surface slot, every member of the set for the gateway and appliance-wide planes; a legacy inline gateway policy has neither `id` nor `name`. A monitor-only appliance-wide member is listed without its outcome: a deny it would have made does not change `decision` or `decided_by` |
+| `decided_by` | The `id` of the member that denied, when a gateway or appliance-wide set denies, or that failed to evaluate, on an appliance-wide plane |
+| `plane` | `surface`, `gateway` or `appliance` |
+| `engine` | The compiled policy key: the surface id, `inbound:`, `outbound:`, `variant:` or `transit:<surface>:<alias>` for a surface request policy, `response:<policy definition id>` or `response:transit:<surface>:<alias>` for a response policy, the gateway id, or the appliance-wide plane |
+| `input` | The policy input, credentials masked: the request input of a request policy, `response`, `caller` and `surface` (with `transit` and `source_auth` on a Transit Point leg) for a response policy |
+| `decision` | `allow`, `deny` or `error` (an evaluation error, which denies) |
+| `reason` | The deny reason, or the evaluation error; an appliance-wide error carries its generic reason (`Appliance-wide policy evaluation error`, `Appliance-wide policy input error` or `Failed to serialize policy input`), not the engine's error text |
+| `surface_variant` | The surface variant of the request, when there is one |
+
+Policies run appliance-wide, gateway, Access Point, Target, and a deny ends the chain, so a slot
+after it sends nothing. Captures are sent on the direct, Fabric and MCP proxy paths alike. MCP tool
+policies, the `tools/list` filtering of a surface policy, and a fail-closed deny of a slot whose
+policy did not compile (the request is denied before any policy runs) are not captured. A
+surface with no
+policy of its own has no surface evaluation to capture, so only a gateway or appliance-wide policy
+that applies to it is shown; to see the input of each request, add a request policy first (one that
+allows everything is enough). The Capture view says so while the surface has none.
+
+Only a dashboard WebSocket opened with a session (`websocket_require_auth`, on by default) can
+listen; a socket that carries no signed-in dashboard user is refused with `policy input capture
+needs dashboard sign-in` and never receives captures. Nothing is written to the log or
+stored, so a capture is gone once it has been sent. A listen is checked against the user's
+permissions, not against the surface: dashboard sessions are appliance-wide, so a user with both
+permissions can listen to any surface, and a listen naming a surface that does not exist receives
+nothing. Scoping dashboard sessions to tenants or surfaces would need the listen check to apply the
+same scope.
+
+Before a capture is sent, every credential in the input becomes `<redacted>`: the value of a key
+named like a credential (the [credential names](CONFIGURATION_REFERENCE.md#log-redaction) of log
+redaction, such as `token` or `api_key`), any JWT (three dot-separated base64url segments whose
+first decodes to a JSON object), and the token of any `Bearer` or `Basic`
+authorization value, also inside longer text (`Authorization: Bearer <redacted> please`). A
+JWT joined to the word before it, as in `CSRF=<redacted>` or `session_<redacted>`, is masked
+too, and a JWT followed by `.` and more text, as in `<JWT>.example.com` or `<JWT>.<JWT>`, is
+masked together with the dotted text after it. A `Bearer` token is one of letters, digits or `-._~+/=` that is at least 12 characters long, or at
+least 6 with a digit or one of those symbols; a `Basic` token is one that decodes as base64 to
+`user:password`. Message text such as `Basic authentication` or `Bearer arms` is kept. In every
+absolute URL in the input, query parameter names are kept and every query value becomes
+`<redacted>`, and the userinfo (user name and password) becomes `<redacted>`
+(`https://<redacted>@host/path`), up to the last `@` before the path, query or fragment. A
+fragment that holds `name=value` parameters, as an OAuth redirect's does
+(`#access_token=<redacted>&state=<redacted>`), is masked like a query; a plain anchor such as
+`#top` is kept. A deny
+reason and an evaluation error get the same masking, since a policy can build its reason from
+input text and an engine error can quote it. `http.path`
+is shown as the request log line shows it: query parameter names are kept and every query value
+becomes `<redacted>`, since a request received over Fabric carries the caller's full path and query,
+and capability ids in the path are shortened. Masking matches these shapes only, so a credential in
+another shape, such as an opaque key under a field name that is not a credential name, is sent as
+it is. Object keys are never masked: only values are, so a credential used as a key is sent as it
+is. Policies still see the full path. Headers that
+carry credentials never reach the policy input. After this masking, the operator's
+[log redaction rules](CONFIGURATION_REFERENCE.md#log-redaction) (`logging.redaction.rules`) are
+applied to every string value in the input, to each string field as a log line writes it
+(`"name":"value"`, so a rule that matches a field name with its value, such as the built-in quoted
+credential fields rule for `"clientsecret":"..."`, masks the whole value as `<redacted>`), and to
+the deny reason and error, so a capture masks at least what the log masks. The built-in rules also catch credential assignments in free text
+(`password=[REDACTED]`, `api_key: [REDACTED]`), `agpat_` tokens, PEM private keys and email
+addresses, each shown with the rule's replacement. With `logging.redaction.enabled` set to `false`
+only the masking above applies. The rules are read at startup. Message bodies, tool arguments and
+claims are sent with only this masking applied. Policy input capture is meant for writing and
+testing policies: the captures hold caller data.
+
 ## Appliance-wide (global) enforcement
 
 In `src/policies/global_policy.rs`: a policy can be assigned to a whole plane via

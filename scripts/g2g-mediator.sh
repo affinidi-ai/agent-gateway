@@ -73,6 +73,33 @@ if [[ "${needs_regen}" -eq 1 ]]; then
   echo "🔧 Generating mediator config in ${ABS_TARGET} via mediator-setup"
   pushd "${ABS_TARGET}" >/dev/null
 
+  # Newer wizards refuse an unencrypted file:// secret store for a container
+  # deployment unless it is accepted explicitly. This stack is a throwaway test
+  # mediator whose keys are generated per scenario and deleted with the temp
+  # dir, so the acceptance is made here rather than asked of the caller; a
+  # mediator meant to outlive a test is provisioned by
+  # scripts/mediator/user-data-v2.sh, which asks. Older wizards reject the flag
+  # as unknown, so pass it only when this image advertises it. Read the help into a
+  # variable rather than piping it: a probe the daemon refused — which happens
+  # under a parallel run — would otherwise be indistinguishable from an image
+  # without the flag, and the setup that follows would fail on the refusal.
+  setup_help=""
+  for _ in 1 2 3; do
+    if setup_help="$(docker run --rm --entrypoint mediator-setup "${MEDIATOR_IMAGE}" --help 2>/dev/null)" \
+      && [[ -n "${setup_help}" ]]; then
+      break
+    fi
+    sleep 2
+  done
+  if [[ -z "${setup_help}" ]]; then
+    echo "❌ could not read mediator-setup --help from ${MEDIATOR_IMAGE}" >&2
+    exit 1
+  fi
+  SETUP_FLAGS=()
+  case "${setup_help}" in
+    *--allow-plaintext-file*) SETUP_FLAGS+=(--allow-plaintext-file) ;;
+  esac
+
   # Use the mediator image's own setup wizard to provision keys + config.
   # Do NOT pass --database-url: redis isn't running yet during setup.
   # The database URL is provided via env var at container runtime.
@@ -84,6 +111,7 @@ if [[ "${needs_regen}" -eq 1 ]]; then
     --volume "$(pwd):/app" \
     --workdir /app \
     "${MEDIATOR_IMAGE}" \
+    ${SETUP_FLAGS[@]+"${SETUP_FLAGS[@]}"} \
     --non-interactive \
     --deployment container \
     --protocol didcomm \
@@ -125,6 +153,10 @@ if [[ "${needs_regen}" -eq 1 ]]; then
     echo "  Mediator DID from setup: ${SETUP_DID}"
   fi
 
+  # The conf dir is mounted at both paths: the entrypoint reads
+  # conf/mediator.toml relative to /app, while a config a newer wizard wrote
+  # for a container deployment points its secret store and DID log at
+  # /etc/mediator/conf.
   cat > docker-compose.yml <<EOF
 name: ${MEDIATOR_NAME}
 networks:
@@ -147,6 +179,7 @@ services:
 $(for p in ${EXTRA_PORTS}; do echo "      - \"${p}:${p}\""; done)
     volumes:
       - ./conf:/app/conf
+      - ./conf:/etc/mediator/conf
     working_dir: /app
     environment:
       RUST_LOG: info
