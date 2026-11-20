@@ -90,23 +90,29 @@ test.describe('Transit Point — self recognition check', () => {
 
         await expect(page.getByTestId('transit-point-self-recognition-check-switch')).toBeDisabled();
         await expect(page.getByTestId('transit-point-self-recognition-check-note')).toContainText(
-            'Needs a Trust Recorder that records the owned agent',
+            'Requires a Trust Recorder that records the owned agent',
         );
         await captureFullPage(page, 'self-recognition-check-needs-recorder');
     });
 
-    test('saves the switch once the surface records the owned agent', async ({page}) => {
+    test('saves the trust registry picked once the surface records the owned agent', async ({page}) => {
         await openTransitPointPanel(page, {withRecorder: true});
 
         const toggle = page.getByTestId('transit-point-self-recognition-check-switch');
         await expect(toggle).toBeEnabled();
         await expect(page.getByTestId('transit-point-self-recognition-check-note')).toBeHidden();
         await toggle.check();
+
+        const registry = page.getByTestId('transit-point-self-recognition-check-registry-tr-fixture');
+        await expect(registry).not.toBeChecked();
+        await expect(page.getByTestId('transit-point-self-recognition-check-registry-required')).toBeVisible();
+        await registry.check();
+        await expect(page.getByTestId('transit-point-self-recognition-check-registry-required')).toBeHidden();
         await captureFullPage(page, 'self-recognition-check-on');
 
         const saved = page.waitForRequest(isSurfaceSave);
         await page.getByTestId('surface-save-button').click();
         const [point] = (await saved).postDataJSON().transit.points;
-        expect(point.self_recognition_check).toBe(true);
+        expect(point.self_recognition_check).toEqual({trust_registry_ids: ['tr-fixture']});
     });
 });

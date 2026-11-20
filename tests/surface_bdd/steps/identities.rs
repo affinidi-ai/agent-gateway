@@ -192,13 +192,28 @@ async fn transit_point_presents_managed_agent_identity(
     .await;
 }
 
+/// A self recognition check naming every trust registry the surface's Trust
+/// Recorder records the owned agent in.
+fn self_recognition_check_of(surface: &Value) -> Value {
+    let trust_registry_ids: Vec<Value> = surface["access_point"]["trust_recorder"]["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["include_owned_agent"] != Value::Bool(false))
+        .map(|entry| entry["trust_registry_id"].clone())
+        .collect();
+    serde_json::json!({ "trust_registry_ids": trust_registry_ids })
+}
+
 #[given(expr = "Transit Point {string} checks the self recognition of its managed agent")]
 async fn transit_point_checks_self_recognition(
     world: &mut SurfaceWorld,
     transit_point: String,
 ) {
-    edit_transit_point(world, &transit_point, "turning on the self recognition check", |point| {
-        point["self_recognition_check"] = Value::Bool(true);
+    let surface_name = surface_under_test_name(world);
+    edit_named_surface(world, &surface_name, "turning on the self recognition check", |surface| {
+        let check = self_recognition_check_of(surface);
+        transit_point_mut(surface, &transit_point)["self_recognition_check"] = check;
     })
     .await;
 }
@@ -233,7 +248,8 @@ async fn operator_saves_transit_point_with_self_recognition_check(
 ) {
     let action = "saving the self recognition check";
     let (surface_id, mut surface) = stored_surface_under_test(world, action).await;
-    transit_point_mut(&mut surface, &transit_point)["self_recognition_check"] = Value::Bool(true);
+    transit_point_mut(&mut surface, &transit_point)["self_recognition_check"] =
+        serde_json::json!({ "trust_registry_ids": ["alpha-registry"] });
     let response = world
         .admin_client
         .as_ref()
@@ -254,7 +270,7 @@ async fn transit_point_does_not_check_self_recognition(
     assert!(
         point
             .get("self_recognition_check")
-            .is_none_or(|value| value == &Value::Bool(false)),
+            .is_none_or(Value::is_null),
         "expected Transit Point {transit_point:?} not to check the self recognition of its managed agent, got {point}"
     );
 }

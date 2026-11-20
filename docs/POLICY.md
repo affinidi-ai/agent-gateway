@@ -458,22 +458,25 @@ triggered it. On the outbound path the record also names the Transit Point.
 
 ### Self recognition check
 
-A Transit Point with `self_recognition_check: true` checks the managed agent calling out
-through it before the request leaves the gateway. Unlike a Trust Check it refuses the request
-itself: its results are never in `input.trust_check_results`, and no policy can allow a
-request it refused.
+A Transit Point with `self_recognition_check: { "trust_registry_ids": [...] }` checks the
+managed agent calling out through it before the request leaves the gateway. The operator picks
+the trust registries, at least one, from those the surface's Trust Recorder records the owned
+agent in. Unlike a Trust Check it refuses the request itself: its results are never in
+`input.trust_check_results`, and no policy can allow a request it refused.
 
-For each Trust Recorder entry with `include_owned_agent`, the gateway sends one recognition
-query to that entry's trust registry: the entry's authority (with `{{ surface.issuer_did }}`
-resolved to the surface's Issuer), the agent's DID as the entity, action `is` and resource
-`ownedAgent`. The agent's DID is the one the Transit Point calls out under: its own managed
-identity's when it has one, otherwise the surface Managed Agent's. The request goes on only when every query answers recognised. Any other
-answer refuses it with `403` "Calling agent is not recognised" (JSON-RPC `-32001` on an MCP
-Transit Point), before the destination is contacted: not recognised, a timeout, a trust
-registry that is unknown, not connected or unreachable, an Authority that no longer exists,
-an Issuer template that does not resolve, no resolved managed agent, or no such entry. The
-reason is logged, not sent. Nothing is cached, so turning recognition off in the trust
-registry takes effect on the next call.
+For each Trust Recorder entry with `include_owned_agent` whose trust registry is picked, the
+gateway sends one recognition query to that registry: the entry's authority (with
+`{{ surface.issuer_did }}` resolved to the surface's Issuer), the agent's DID as the entity,
+action `is` and resource `ownedAgent`. Registries the Transit Point does not pick are not
+asked. The agent's DID is the one the Transit Point calls out under: its own managed
+identity's when it has one, otherwise the surface Managed Agent's. The request goes on only
+when every query answers recognised. Any other answer refuses it with `403` "Calling agent is
+not recognised" (JSON-RPC `-32001` on an MCP Transit Point), before the destination is
+contacted: not recognised, a timeout, a trust registry that is unknown, not connected or
+unreachable, an Authority that no longer exists, an Issuer template that does not resolve, no
+resolved managed agent, or a picked registry the Trust Recorder no longer records the owned
+agent in. The reason is logged, not sent. Nothing is cached, so turning recognition off in the
+trust registry takes effect on the next call.
 
 Before the queries, the Trust Recorder writes the agent's records, and the request waits for
 it for at most 10 seconds, unless the agent's stored
@@ -486,12 +489,13 @@ discovery reads. Each query is a `trust_check` record with `leg` `managed_agent`
 refusal a `request_rejected` record with reason `agent_not_recognized`.
 
 A write is refused with `400` when a Transit Point, on the surface or in an enabled variant,
-sets the switch and the surface has no Trust Recorder entry that records the owned agent, or
-the Transit Point resolves no managed agent identity: its own managed identity is
-`from_jwt_claim`, or it has none and does not inject a VP with the surface's, or the surface's
-is `from_jwt_claim` or absent. A `PUT` of the surface or of a
-variant that leaves the field out keeps the stored value, so a Surface Builder save keeps it;
-`false` turns it off, as does a merge `PATCH` whose Transit Points leave it out.
+sets `self_recognition_check` and its `trust_registry_ids` is empty, names a trust registry
+the surface's Trust Recorder does not record the owned agent in, or the Transit Point resolves
+no managed agent identity: its own managed identity is `from_jwt_claim`, or it has none and
+does not inject a VP with the surface's, or the surface's is `from_jwt_claim` or absent. A
+`PUT` of the surface or of a variant that leaves the field out keeps the stored value, so a
+Surface Builder save keeps it; `null` turns it off, as does a merge `PATCH` whose Transit
+Points leave it out.
 
 ### Several authorities in one query
 

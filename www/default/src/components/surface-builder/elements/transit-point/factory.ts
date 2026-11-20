@@ -24,6 +24,7 @@ import {
 } from '../trust-check/definition';
 import { DOCS_URL } from '../../../../config/docs';
 import { callerAuthProblems, callerAuthToWire } from './callerAuth';
+import { selfRecognitionRegistryProblem } from './SelfRecognitionCheckSection';
 
 /**
  * Pattern that a transit point alias MUST match. Mirrors the backend
@@ -236,6 +237,8 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
       }
       const secretMessage = targetAuthSecretProblem(c);
       if (secretMessage) errs.push({ field: 'auth_secret', message: secretMessage });
+      const registryMessage = selfRecognitionRegistryProblem(c);
+      if (registryMessage) errs.push({ field: 'self_recognition_check', message: registryMessage });
       return errs;
     },
     // A transit point's listen address must be an actual outbound listener
@@ -446,9 +449,19 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                   c.fabric_delegated_credentials === true
                     ? { fabric_delegated_credentials: true }
                     : {}),
-                  ...(typeof c.self_recognition_check === 'boolean'
-                    ? { self_recognition_check: c.self_recognition_check }
-                    : {}),
+                  ...(c.self_recognition_check === null
+                    ? { self_recognition_check: null }
+                    : c.self_recognition_check && typeof c.self_recognition_check === 'object'
+                      ? {
+                          self_recognition_check: {
+                            trust_registry_ids: Array.isArray(
+                              c.self_recognition_check.trust_registry_ids
+                            )
+                              ? c.self_recognition_check.trust_registry_ids
+                              : [],
+                          },
+                        }
+                      : {}),
                   ...(c.identity_injection?.inject_vp === true
                     ? { identity_injection: c.identity_injection }
                     : {}),

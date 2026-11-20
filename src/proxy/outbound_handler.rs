@@ -3804,16 +3804,17 @@ async fn step_trust_check(
 /// [4b] Self recognition check. On a Transit Point that sets
 /// `self_recognition_check`, records the managed agent calling out through it
 /// in the Trust Recorder's registries unless its stored outcome there is
-/// `recorded`, then refuses the request unless each of those registries still
-/// recognises it as an owned agent. Runs before anything reaches the
-/// destination, skips discovery reads, and is never part of policy input.
+/// `recorded`, then refuses the request unless each registry the Transit Point
+/// names still recognises it as an owned agent. Runs before anything reaches
+/// the destination, skips discovery reads, and is never part of policy input.
 async fn step_self_recognition_check(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
-    if !ctx
+    if ctx
         .virtual_channel
         .self_recognition_check
+        .is_none()
         || is_transit_discovery_read(ctx)
     {
         return Ok(());
@@ -3831,9 +3832,10 @@ async fn step_self_recognition_check(
     check_self_recognition(ctx, &crate::trust_registry_verification::TrqpListenerClient::new(manager)).await
 }
 
-/// Asks, through `client`, each registry the Trust Recorder records the owned
-/// agent in whether it still recognises the managed agent of `ctx`, and refuses
-/// the request unless every one does.
+/// Asks, through `client`, each registry the Transit Point names whether it
+/// still recognises the managed agent of `ctx`, and refuses the request unless
+/// every one does. A named registry the Trust Recorder no longer records the
+/// owned agent in refuses it too.
 async fn check_self_recognition<
     C: crate::trust_registry_verification::trust_check_executor::TrqpClient + Sync + ?Sized,
 >(
@@ -3849,9 +3851,29 @@ async fn check_self_recognition<
         .virtual_channel
         .alias
         .clone();
-    let checks = crate::trust_registry_verification::self_recognition_checks(&surface, &did).await;
-    if checks.is_empty() {
-        return Err(refuse_unrecognized_agent(ctx, "the Trust Recorder records the owned agent in no trust registry"));
+    let trust_registry_ids = ctx
+        .virtual_channel
+        .self_recognition_check
+        .as_ref()
+        .map(|check| {
+            check
+                .trust_registry_ids
+                .clone()
+        })
+        .unwrap_or_default();
+    let checks = crate::trust_registry_verification::self_recognition_checks(&surface, &trust_registry_ids, &did).await;
+    let unasked = trust_registry_ids
+        .iter()
+        .any(|id| {
+            !checks
+                .iter()
+                .any(|check| &check.trust_registry_id == id)
+        });
+    if trust_registry_ids.is_empty() || unasked {
+        return Err(refuse_unrecognized_agent(
+            ctx,
+            "a named trust registry is not one the Trust Recorder records the owned agent in",
+        ));
     }
     let origin = crate::observability::trust_check_audit::TrustCheckOrigin {
         surface_id: &surface.surface_id,
@@ -14279,13 +14301,20 @@ mod tests {
         }
     }
 
-    /// A call through a Transit Point with the self recognition check on, from
-    /// managed agent `did:web:agent.example`, on a surface whose Trust Recorder
-    /// has one entry per `(trust registry, records the owned agent)`.
+    /// A call through a Transit Point whose self recognition check names every
+    /// registry its entries record the owned agent in, from managed agent
+    /// `did:web:agent.example`, on a surface whose Trust Recorder has one entry
+    /// per `(trust registry, records the owned agent)`.
     fn self_checked_call(entries: &[(&str, bool)]) -> OutboundPipelineContext {
         let mut ctx = test_pipeline_context();
         ctx.virtual_channel
-            .self_recognition_check = true;
+            .self_recognition_check = Some(crate::config::agent_surface::SelfRecognitionCheck {
+            trust_registry_ids: entries
+                .iter()
+                .filter(|(_, owned_agent)| *owned_agent)
+                .map(|(registry, _)| registry.to_string())
+                .collect(),
+        });
         ctx.resolved_identity = ProtectedAgentIdentity::Managed {
             did: "did:web:agent.example".to_string(),
             identity_fields: std::collections::HashMap::new(),
@@ -14437,6 +14466,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_the_registries_the_transit_point_names_are_asked() {
+        let mut ctx = self_checked_call(&[("alpha", true), ("beta", true)]);
+        ctx.virtual_channel
+            .self_recognition_check = Some(crate::config::agent_surface::SelfRecognitionCheck {
+            trust_registry_ids: vec!["alpha".to_string()],
+        });
+        let (result, events) =
+            crate::audit::producer::capture(check_self_recognition(&mut ctx, &RecognisedIn(&["alpha"]))).await;
+        assert!(result.is_ok(), "beta, which would refuse, is not asked: {result:?}");
+        assert_eq!(
+            self_check_records(&events)
+                .1
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_named_registry_the_recorder_no_longer_records_in_refuses_the_call() {
+        let mut ctx = self_checked_call(&[("alpha", true)]);
+        Arc::make_mut(&mut ctx.surface)
+            .access_point
+            .trust_recorder
+            .as_mut()
+            .unwrap()
+            .entries[0]
+            .include_owned_agent = false;
+        let result = check_self_recognition(&mut ctx, &RecognisedIn(&["alpha"])).await;
+        assert!(matches!(result, Err(OutboundPipelineError::ManagedAgentNotRecognized { .. })), "{result:?}");
+    }
+
+    #[tokio::test]
     async fn a_registry_that_cannot_answer_refuses_the_call() {
         let mut ctx = self_checked_call(&[("alpha", true)]);
         let result = check_self_recognition(&mut ctx, &UnreachableRegistries).await;
@@ -14470,7 +14531,7 @@ mod tests {
         let state = test_outbound_state();
         let mut off = self_checked_call(&[("alpha", true)]);
         off.virtual_channel
-            .self_recognition_check = false;
+            .self_recognition_check = None;
         let mut discovery = self_checked_call(&[("alpha", true)]);
         discovery.original_method = Method::GET;
         discovery.request_path = "/outbound/surfaces/order/partner-a/.well-known/agent-card.json".to_string();

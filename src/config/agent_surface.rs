@@ -2040,11 +2040,18 @@ pub struct TransitPoint {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trust_check_migrated: bool,
 
-    /// Refuses a request through this Transit Point unless every trust
-    /// registry the surface's Trust Recorder records the owned agent in still
-    /// recognises the managed agent sending it. Off by default.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub self_recognition_check: bool,
+    /// Refuses a request through this Transit Point unless each trust registry
+    /// it names still recognises the managed agent sending it. Off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_recognition_check: Option<SelfRecognitionCheck>,
+}
+
+/// The trust registries a Transit Point's self recognition check asks, each
+/// one the surface's Trust Recorder records the owned agent in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelfRecognitionCheck {
+    pub trust_registry_ids: Vec<String>,
 }
 
 impl TransitPoint {
@@ -6946,7 +6953,7 @@ mod tests {
                         delegated_credentials_for_fabric_callers: false,
                         trust_check_list: Vec::new(),
                         trust_check_migrated: false,
-                        self_recognition_check: false,
+                        self_recognition_check: None,
                     },
                     TransitPoint {
                         id: uuid::Uuid::new_v4().to_string(),
@@ -6980,7 +6987,7 @@ mod tests {
                         delegated_credentials_for_fabric_callers: false,
                         trust_check_list: Vec::new(),
                         trust_check_migrated: false,
-                        self_recognition_check: false,
+                        self_recognition_check: None,
                     },
                 ],
                 outbound_listen_address: None,

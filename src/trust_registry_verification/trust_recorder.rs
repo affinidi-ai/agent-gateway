@@ -579,23 +579,26 @@ async fn record_agent(
 }
 
 /// The recognition queries of a Transit Point's self recognition check: one
-/// per Trust Recorder entry that records the owned agent, asking the entry's
-/// authority whether it still recognises `agent_did` as an owned agent. An
-/// entry whose `{{ surface.issuer_did }}` does not resolve keeps the template,
-/// which then fails its query.
+/// per Trust Recorder entry that records the owned agent in one of
+/// `trust_registry_ids`, asking the entry's authority whether it still
+/// recognises `agent_did` as an owned agent. An entry whose
+/// `{{ surface.issuer_did }}` does not resolve keeps the template, which then
+/// fails its query.
 pub async fn self_recognition_checks(
     surface: &AgentSurface,
+    trust_registry_ids: &[String],
     agent_did: &str,
 ) -> Vec<crate::trust_registry_verification::TrustCheckElement> {
     let Some(cfg) = surface.trust_recorder() else {
         return Vec::new();
     };
     let issuer_did = resolve_surface_issuer_did(surface.issuer_id.as_deref()).await;
-    owned_agent_checks(cfg, issuer_did.as_deref(), agent_did)
+    owned_agent_checks(cfg, trust_registry_ids, issuer_did.as_deref(), agent_did)
 }
 
 fn owned_agent_checks(
     cfg: &TrustRecorderConfig,
+    trust_registry_ids: &[String],
     resolved_issuer_did: Option<&str>,
     agent_did: &str,
 ) -> Vec<crate::trust_registry_verification::TrustCheckElement> {
@@ -603,7 +606,7 @@ fn owned_agent_checks(
     cfg.entries
         .iter()
         .enumerate()
-        .filter(|(_, entry)| entry.include_owned_agent)
+        .filter(|(_, entry)| entry.include_owned_agent && trust_registry_ids.contains(&entry.trust_registry_id))
         .map(|(index, entry)| {
             let authority_id =
                 entry_authority_did(entry, resolved_issuer_did).unwrap_or_else(|| entry.authority_did.clone());
@@ -761,7 +764,8 @@ mod tests {
             entries: vec![owned, base_entry(), from_issuer],
         };
 
-        let checks = owned_agent_checks(&cfg, Some("did:example:surface-issuer"), "did:example:agent");
+        let both = ["tr-1".to_string(), "tr-2".to_string()];
+        let checks = owned_agent_checks(&cfg, &both, Some("did:example:surface-issuer"), "did:example:agent");
         let asked: Vec<String> = checks
             .iter()
             .map(|check| {
@@ -789,7 +793,19 @@ mod tests {
                     == crate::trust_registry_verification::trust_check_element::TrqpQueryType::Recognition)
         );
 
-        let unresolved = owned_agent_checks(&cfg, None, "did:example:agent");
+        let picked = owned_agent_checks(&cfg, &["tr-2".to_string()], None, "did:example:agent");
+        assert_eq!(
+            picked
+                .iter()
+                .map(|check| check
+                    .trust_registry_id
+                    .as_str())
+                .collect::<Vec<_>>(),
+            ["tr-2"],
+            "only the registries the Transit Point names are asked"
+        );
+
+        let unresolved = owned_agent_checks(&cfg, &both, None, "did:example:agent");
         assert_eq!(
             unresolved[1]
                 .query

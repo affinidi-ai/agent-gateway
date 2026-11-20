@@ -22,6 +22,7 @@ import {
 } from '../_shared/providerTargetAuth';
 import TransitCallerSection from './TransitCallerSection';
 import SelfRecognitionCheckSection, {
+  ownedAgentRegistryIds,
   selfRecognitionCheckBlocker,
 } from './SelfRecognitionCheckSection';
 import TargetAuthSecretField from './TargetAuthSecretField';
@@ -552,7 +553,8 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
 
       <SelfRecognitionCheckSection
         instanceKey={config.id}
-        checked={config.self_recognition_check === true}
+        value={config.self_recognition_check}
+        registryIds={ownedAgentRegistryIds(allNodes)}
         blocker={selfRecognitionCheckBlocker(node?.id, config, allNodes)}
         onChange={next => updateField('self_recognition_check', next)}
       />
