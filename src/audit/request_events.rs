@@ -122,6 +122,60 @@ pub fn transit_point_caller_rate_limited(
     })
 }
 
+/// What an Access Point knows about a request at the moment it hands it to its
+/// target.
+pub struct Forwarding<'a> {
+    pub surface: &'a crate::config::agent_surface::AgentSurface,
+    pub trace_id: &'a str,
+    /// The managed agent's own DID, when the surface has one.
+    pub agent_identity_did: Option<&'a str>,
+    /// The caller source authentication verified; `None` for a caller it did
+    /// not authenticate.
+    pub identity: Option<&'a crate::source_auth::AuthenticatedIdentity>,
+    /// The agent DID derived for the request, as a policy decision records it.
+    pub actor_did: Option<&'a str>,
+}
+
+/// The Access Point is handing a request to its target. The record names the
+/// caller, as a policy decision does, only when source authentication
+/// verified one. The target URL is written without its credentials.
+pub fn request_forwarded(forwarding: Forwarding<'_>) {
+    emit("request_forwarded", || {
+        let surface = forwarding.surface;
+        let caller = forwarding
+            .identity
+            .map(|identity| crate::observability::policy_audit::recorded_caller(Some(identity), None, forwarding.actor_did))
+            .unwrap_or_default();
+        let facts = RequestFacts {
+            surface_id: &surface.surface_id,
+            channel_name: &surface.name,
+            trace_id: Some(forwarding.trace_id),
+            via_fabric: surface
+                .target
+                .endpoint
+                .starts_with("fabric://"),
+        };
+        let mut record = facts.record(DelegationAuditAction::RequestForwarded {
+            flow: crate::observability::PolicyFlow::AccessPoint
+                .as_str()
+                .to_string(),
+            caller_did: caller.caller_did,
+        });
+        record.caller = caller.caller;
+        record.tenant_id = surface.tenant_id.clone();
+        record.protocol = Some(
+            surface
+                .channel_protocol()
+                .to_string(),
+        );
+        record.target_endpoint = Some(crate::observability::loggable::url(&surface.target.endpoint));
+        record.agent_identity_did = forwarding
+            .agent_identity_did
+            .map(str::to_string);
+        record
+    })
+}
+
 /// The gateway refused the request. `http_status` and `rpc_error_code` are
 /// what the caller received; a Fabric refusal records no HTTP status, as no
 /// HTTP response is involved.
@@ -463,6 +517,169 @@ mod tests {
             trace_id: Some("trace-1"),
             via_fabric: false,
         }
+    }
+
+    /// An MCP surface of tenant `tenant-a` whose Target URL holds a user name,
+    /// a password, a query value and a fragment.
+    fn forwarding_surface() -> crate::config::agent_surface::AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": "orders", "name": "Orders", "tenant_id": "tenant-a",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "https://agent:planted-password@agent.example/mcp?key=planted-query#planted-fragment"}
+        }))
+        .unwrap()
+    }
+
+    /// The caller of a `request_forwarded` vector's `auth_method`. The JWT
+    /// carries a claim no record may hold.
+    fn vector_caller(auth_method: &serde_json::Value) -> Option<crate::source_auth::AuthenticatedIdentity> {
+        use crate::source_auth::AuthenticatedIdentity;
+        match auth_method.as_str() {
+            Some("jwt_bearer") => Some(AuthenticatedIdentity::JwtBearer {
+                strategy_id: None,
+                principal_claim: "oid".to_string(),
+                subject: "agent-oid".to_string(),
+                claims: serde_json::json!({"sub": "user-123", "iss": "https://issuer.example", "aud": "gateway",
+                    "oid": "agent-oid", "email": "ada@example.com", "name": "Ada",
+                    "planted": "planted-claim-secret"}),
+                verification: Default::default(),
+            }),
+            Some("did_auth") => Some(AuthenticatedIdentity::DidAuth {
+                did: "did:web:caller.example".to_string(),
+            }),
+            None => None,
+            Some(other) => panic!("no vector caller for {other}"),
+        }
+    }
+
+    /// Every record written while `forwarding` is recorded inside a request
+    /// that continued the caller's `traceparent` under span `53995c3f42cd8ad8`.
+    async fn recorded_forwarding(identity: Option<&crate::source_auth::AuthenticatedIdentity>) -> Vec<serde_json::Value> {
+        use crate::observability::policy_audit::{RequestScope, in_request};
+        use crate::proxy::trace::{RequestTrace, SpanId};
+        let surface = forwarding_surface();
+        let (trace, _) = RequestTrace::from_headers(
+            &["00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"],
+            &[],
+            SpanId::parse("53995c3f42cd8ad8").unwrap(),
+        );
+        let trace_id = trace
+            .trace_id
+            .as_str()
+            .to_string();
+        let ((), records) = crate::audit::producer::capture(in_request(RequestScope::traced(trace), async {
+            request_forwarded(Forwarding {
+                surface: &surface,
+                trace_id: &trace_id,
+                agent_identity_did: Some("did:web:agent.example"),
+                identity,
+                actor_did: Some("did:web:derived.example"),
+            });
+        }))
+        .await;
+        records
+            .iter()
+            .map(|record| serde_json::to_value(record).unwrap())
+            .collect()
+    }
+
+    /// The one `request_forwarded` record among `records`.
+    fn forwarded(
+        records: &[serde_json::Value],
+        name: &serde_json::Value,
+    ) -> serde_json::Value {
+        let forwarded: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|record| record["event"]["request_forwarded"].is_object())
+            .collect();
+        assert_eq!(forwarded.len(), 1, "{name}: one request_forwarded record, got {records:?}");
+        forwarded[0].clone()
+    }
+
+    /// The field at a vector's dotted `path`, when the record has it.
+    fn field<'a>(
+        record: &'a serde_json::Value,
+        path: &str,
+    ) -> Option<&'a serde_json::Value> {
+        path.split('.')
+            .try_fold(record, |value, key| value.get(key))
+            .filter(|value| !value.is_null())
+    }
+
+    #[tokio::test]
+    async fn request_forwarded_writes_the_vectors_fields() {
+        let cases = crate::proxy::trace::vector_cases("request_forwarded");
+        for case in cases
+            .iter()
+            .filter(|case| case["accepted"] == true)
+        {
+            let (name, expected) = (&case["name"], &case["expected"]);
+            let identity = vector_caller(&case["input"]["auth_method"]);
+            let record = forwarded(&recorded_forwarding(identity.as_ref()).await, name);
+            for path in expected["required"]
+                .as_array()
+                .unwrap()
+            {
+                let path = path.as_str().unwrap();
+                assert!(field(&record, path).is_some(), "{name}: {path} is missing from {record}");
+            }
+            for path in expected["absent"]
+                .as_array()
+                .unwrap()
+            {
+                let path = path.as_str().unwrap();
+                assert!(field(&record, path).is_none(), "{name}: {path} is present in {record}");
+            }
+            assert_eq!(record["event"]["request_forwarded"]["flow"], expected["flow"], "{name}");
+            assert_eq!(record["span_id"], record["request_id"], "{name}");
+            assert_eq!(record["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736", "{name}");
+        }
+        let refused: Vec<&str> = cases
+            .iter()
+            .filter(|case| case["accepted"] == false)
+            .map(|case| case["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            refused,
+            ["refused_before_forwarding", "transit_point_request", "fabric_receive"],
+            "each refusing case has its own test where the request is served"
+        );
+    }
+
+    /// A forwarded request names its caller exactly as a policy decision for
+    /// the same caller does, and holds no claim, hash, credential or URL part
+    /// beyond that.
+    #[tokio::test]
+    async fn a_forwarded_request_carries_no_more_of_its_caller_than_a_policy_decision() {
+        let identity = vector_caller(&serde_json::json!("jwt_bearer")).unwrap();
+        let record = forwarded(&recorded_forwarding(Some(&identity)).await, &serde_json::json!("jwt"));
+        let ((), decisions) = crate::audit::producer::capture(async {
+            crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                scope: crate::observability::PolicyScope::Surface,
+                allow: true,
+                identity: Some(&identity),
+                actor_did: Some("did:web:derived.example"),
+                ..Default::default()
+            });
+        })
+        .await;
+        let decision = serde_json::to_value(&decisions[0]).unwrap();
+
+        assert_eq!(record["caller"], decision["caller"]);
+        assert_eq!(
+            record["event"]["request_forwarded"]["caller_did"],
+            decision["event"]["policy_decision"]["caller_did"]
+        );
+        assert_eq!(
+            record["target_endpoint"],
+            "https://agent.example/mcp?key=<redacted>",
+            "the target URL loses its user name, password, query value and fragment"
+        );
+        let stored = record.to_string();
+        for planted in ["planted-claim-secret", "planted-password", "planted-query", "planted-fragment"] {
+            assert!(!stored.contains(planted), "the record holds {planted}: {stored}");
+        }
+        assert!(field(&record, "user_identity_hash").is_none() && field(&record, "caller.user_identity_hash").is_none());
     }
 
     #[tokio::test]

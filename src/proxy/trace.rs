@@ -476,33 +476,34 @@ pub fn egress_trace_id(
     }
 }
 
+/// The cases of `group` in the trace context vectors shared with the other
+/// appliances. Every group has accepting and refusing cases.
+#[cfg(test)]
+pub(crate) fn vector_cases(group: &str) -> Vec<serde_json::Value> {
+    use serde_json::{Value, json};
+    let vectors: Value =
+        serde_json::from_str(include_str!("../../tests/fixtures/trace_context/trace-context-vectors.json")).unwrap();
+    let cases = vectors["groups"][group]["cases"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no vector group {group}"))
+        .clone();
+    assert!(
+        cases
+            .iter()
+            .any(|case| case["accepted"] == json!(true))
+            && cases
+                .iter()
+                .any(|case| case["accepted"] == json!(false)),
+        "{group} has accepting and refusing cases"
+    );
+    cases
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-
-    /// The cases of `group` in the trace context vectors shared with the
-    /// other appliances.
-    fn vector_cases(group: &str) -> Vec<Value> {
-        let vectors: Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/trace_context/trace-context-vectors.json"))
-                .unwrap();
-        let cases = vectors["groups"][group]["cases"]
-            .as_array()
-            .unwrap_or_else(|| panic!("no vector group {group}"))
-            .clone();
-        assert!(
-            cases
-                .iter()
-                .any(|case| case["accepted"] == json!(true))
-                && cases
-                    .iter()
-                    .any(|case| case["accepted"] == json!(false)),
-            "{group} has accepting and refusing cases"
-        );
-        cases
-    }
 
     #[test]
     fn trace_ids_parse_as_the_vectors_say() {
@@ -882,8 +883,8 @@ mod tests {
             "trace_termination",
             "trace_source",
         ];
-        let not_this_modules_rule =
-            ["mcp_meta", "transit_point", "link", "caller_identity_verified", "caller_key", "request_forwarded"];
+        let not_this_modules_rule = ["mcp_meta", "transit_point", "link", "caller_identity_verified", "caller_key"];
+        let run_by_the_audit_record = ["request_forwarded"];
         let vectors: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/trace_context/trace-context-vectors.json"))
                 .unwrap();
@@ -897,6 +898,7 @@ mod tests {
         let mut known: Vec<&str> = run_here
             .into_iter()
             .chain(not_this_modules_rule)
+            .chain(run_by_the_audit_record)
             .collect();
         known.sort_unstable();
         assert_eq!(groups, known);
