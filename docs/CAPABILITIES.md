@@ -106,7 +106,11 @@ signature. The gateway's DID and managed agent DIDs list the Multikey that signs
 credentials and presentations (`#key-2`) under `assertionMethod` and `authentication`, so strict
 Data Integrity verifiers accept them. An agent's presentations claim `authentication`, the proof
 purpose presentations conventionally claim, once its `did:webvh` DID log lists the key there, and
-`assertionMethod` before; a legacy `did:web` agent keeps claiming `assertionMethod`. A gateway whose published DID document leaves the Multikey out of
+`assertionMethod` before; a legacy `did:web` agent keeps claiming `assertionMethod`. An agent DID
+that got the key listed by a repair claims `authentication` only 65 minutes after that version: the
+hour a peer's DID resolver may keep the earlier document, which accepts `assertionMethod` only,
+plus a margin for clock differences; a
+DID that listed it from its first version claims it at once. A gateway whose published DID document leaves the Multikey out of
 either adds it when it starts Active, or when a Standby node is promoted (see
 [Server mode](CONFIGURATION_RELOAD.md#server-mode)): a `did:webvh` DID gets a new log
 version signed with the gateway key, so the DID and its earlier versions stay as they are, and a

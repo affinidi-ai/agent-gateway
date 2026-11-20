@@ -104,7 +104,10 @@ pub(crate) async fn seed_agent_did(
 #[when("the caller fetches the agent DID log")]
 async fn agent_did_log_fetched(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
+    world.agent_did_log = Some(fetch_agent_did_log(world).await);
+}
 
+async fn fetch_agent_did_log(world: &SurfaceWorld) -> String {
     let did = world
         .seeded_agent_did
         .clone()
@@ -123,12 +126,28 @@ async fn agent_did_log_fetched(world: &mut SurfaceWorld) {
         .await
         .expect("fetch the agent DID log");
     assert_eq!(response.status(), 200, "the agent DID log must be served");
-    world.agent_did_log = Some(
-        response
-            .text()
-            .await
-            .expect("read the agent DID log"),
-    );
+    response
+        .text()
+        .await
+        .expect("read the agent DID log")
+}
+
+/// The gateway repairs agent DIDs in the background after it starts, so the log is fetched again
+/// until it has `count` versions or ten seconds pass.
+#[then(expr = "within ten seconds the agent DID log has {int} version(s)")]
+async fn agent_did_log_has_versions_within(
+    world: &mut SurfaceWorld,
+    count: usize,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if agent_did_log_versions(world).len() == count || std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        world.agent_did_log = Some(fetch_agent_did_log(world).await);
+    }
+    assert_eq!(agent_did_log_versions(world).len(), count);
 }
 
 fn agent_did_log_versions(world: &SurfaceWorld) -> Vec<Value> {
@@ -170,14 +189,6 @@ fn lists_signing_key_under(
         .into_iter()
         .flatten()
         .any(|id| *id == signing_key.as_str())
-}
-
-#[then(expr = "the agent DID log has {int} version(s)")]
-fn agent_did_log_has_versions(
-    world: &mut SurfaceWorld,
-    count: usize,
-) {
-    assert_eq!(agent_did_log_versions(world).len(), count);
 }
 
 #[then("every version of the agent DID log describes the same agent DID")]

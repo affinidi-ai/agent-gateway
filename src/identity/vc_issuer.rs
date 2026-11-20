@@ -250,6 +250,12 @@ pub struct VCIssuer {
     authentication_holders: dashmap::DashMap<String, Option<std::time::Instant>>,
 }
 
+/// Added to the DID resolver cache lifetime before a repaired holder claims `authentication`, for
+/// the time between a version's `versionTime` and its write, and for clocks that differ between
+/// nodes.
+#[cfg(feature = "didwebvh")]
+const AUTHENTICATION_GRACE_MARGIN: chrono::Duration = chrono::Duration::minutes(5);
+
 /// How long a holder whose DID document does not list its signing key under `authentication` is
 /// taken as not listing it before its DID log is read again.
 #[cfg(feature = "didwebvh")]
@@ -261,24 +267,12 @@ const HOLDER_MISS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 pub struct AgentDidSweep {
     /// The DIDs that got a new log version.
     pub repaired: Vec<String>,
-    /// The DIDs whose latest log version lists the signing key, repaired or not.
-    pub listed: Vec<String>,
+    /// How many DIDs' latest log version lists the signing key, repaired or not.
+    pub listed: usize,
     /// How many DIDs still do not list it: not repaired, or refused.
     pub unlisted: usize,
     /// How many local agent DIDs have no DID log to repair or to serve.
     pub without_log: usize,
-}
-
-#[cfg(feature = "didwebvh")]
-impl AgentDidSweep {
-    fn mark_listed(
-        &mut self,
-        holders: &dashmap::DashMap<String, Option<std::time::Instant>>,
-        did: String,
-    ) {
-        holders.insert(did.clone(), None);
-        self.listed.push(did);
-    }
 }
 
 impl VCIssuer {
@@ -683,8 +677,9 @@ impl VCIssuer {
     }
 
     /// Whether `did`'s latest published DID document publishes `key` as its signing Multikey and
-    /// lists it under `assertionMethod` and `authentication`, so the presentations it holds may
-    /// claim authentication. A DID without a
+    /// lists it under `assertionMethod` and `authentication`, since its first version or for at
+    /// least a DID resolver cache lifetime, so the presentations it holds may claim
+    /// authentication. A DID without a
     /// local `did:webvh` log, such as an external, `did:web` or `did:peer` holder, does not. A listed key stays
     /// listed, so a yes is remembered; a no is remembered for [`HOLDER_MISS_TTL`], since another
     /// node may repair the DID meanwhile.
@@ -706,10 +701,14 @@ impl VCIssuer {
             Some(Some(missed_at)) if missed_at.elapsed() < HOLDER_MISS_TTL => return false,
             _ => {}
         }
+        let grace = chrono::Duration::seconds(crate::gateways::did_cache::SHARED_RESOLVER_TTL_SECS.into())
+            + AUTHENTICATION_GRACE_MARGIN;
         let listed = match self.agent_did_log_dir(did) {
             Some(dir) => matches!(
                 crate::storage::did_artifacts::read_did_log_raw(&dir).await,
-                Ok(Some(log)) if crate::identity::didwebvh::signing_key_repair::lists_signing_key(&log, did, key)
+                Ok(Some(log)) if crate::identity::didwebvh::signing_key_repair::signs_for_authentication(
+                    &log, did, key, grace, chrono::Utc::now()
+                )
             ),
             None => false,
         };
@@ -750,7 +749,7 @@ impl VCIssuer {
             .await;
         info!(
             repaired = sweep.repaired.len(),
-            listed = sweep.listed.len(),
+            listed = sweep.listed,
             unlisted = sweep.unlisted,
             without_log = sweep.without_log,
             "Agent DIDs list their signing key under assertionMethod and authentication"
@@ -778,6 +777,9 @@ impl VCIssuer {
                 return sweep;
             }
         };
+        let mut listed_dids = std::collections::HashSet::new();
+        let mut unlisted_dids = std::collections::HashSet::new();
+        let mut without_log = std::collections::HashSet::new();
         for record in records {
             if !still_active() {
                 break;
@@ -794,15 +796,20 @@ impl VCIssuer {
             let Some(dir) = self.agent_did_log_dir(&record.did) else {
                 continue;
             };
+            if listed_dids.contains(&record.did) {
+                continue;
+            }
             let log = match crate::storage::did_artifacts::read_did_log_raw(&dir).await {
                 Ok(Some(log)) => log,
                 Ok(None) => {
-                    sweep.without_log += 1;
+                    if !without_log.insert(record.did.clone()) {
+                        continue;
+                    }
                     warn!("Agent DID {} has no DID log, so peers cannot resolve it", record.did);
                     continue;
                 }
                 Err(e) => {
-                    sweep.unlisted += 1;
+                    unlisted_dids.insert(record.did.clone());
                     warn!("Could not read the DID log of agent DID {}: {e:#}", record.did);
                     continue;
                 }
@@ -810,17 +817,18 @@ impl VCIssuer {
             let key: JWK = match serde_json::from_value(private_key.clone()) {
                 Ok(key) => key,
                 Err(_) => {
-                    sweep.unlisted += 1;
+                    unlisted_dids.insert(record.did.clone());
                     warn!("The key of agent DID {} is not a JWK; its DID is left as it is", record.did);
                     continue;
                 }
             };
             if lists_signing_key(&log, &record.did, &key) {
-                sweep.mark_listed(&self.authentication_holders, record.did);
+                sweep.listed += 1;
+                listed_dids.insert(record.did);
                 continue;
             }
             if !repair {
-                sweep.unlisted += 1;
+                unlisted_dids.insert(record.did.clone());
                 continue;
             }
             match append_version(&dir, &log, &record.did, &key, true, still_active).await {
@@ -828,12 +836,16 @@ impl VCIssuer {
                     sweep
                         .repaired
                         .push(record.did.clone());
-                    sweep.mark_listed(&self.authentication_holders, record.did);
+                    sweep.listed += 1;
+                    listed_dids.insert(record.did);
                 }
-                Ok(Repair::Unchanged { .. }) => sweep.mark_listed(&self.authentication_holders, record.did),
+                Ok(Repair::Unchanged { .. }) => {
+                    sweep.listed += 1;
+                    listed_dids.insert(record.did);
+                }
                 Ok(Repair::SteppedDown) => break,
                 Err(e) => {
-                    sweep.unlisted += 1;
+                    unlisted_dids.insert(record.did.clone());
                     warn!(
                         "Could not list the signing key of agent DID {} under assertionMethod and authentication: {e:#}",
                         record.did
@@ -841,6 +853,10 @@ impl VCIssuer {
                 }
             }
         }
+        sweep.unlisted = unlisted_dids
+            .difference(&listed_dids)
+            .count();
+        sweep.without_log = without_log.len();
         sweep
     }
 
@@ -5658,7 +5674,7 @@ mod tests {
                 .repair_agent_dids_while(|| true)
                 .await;
             assert!(again.repaired.is_empty(), "a second sweep finds nothing left to do");
-            assert_eq!(again.listed.len(), 2);
+            assert_eq!(again.listed, 2);
             assert_eq!(log_entries(&log_of(&f, &listed_for_assertion).await).len(), 2);
         }
 
@@ -5697,6 +5713,27 @@ mod tests {
                 1,
                 "no identity is created"
             );
+        }
+
+        #[tokio::test]
+        async fn a_did_several_records_share_is_repaired_and_counted_once() {
+            let f = fixture().await;
+            let (did, key) = seed_agent_identity(f.store.as_ref(), true).await;
+            store_record(&f, &did, None).await;
+            store_record(&f, &did, Some(&key)).await;
+
+            let checked = f
+                .issuer
+                .check_agent_dids()
+                .await;
+            let sweep = f
+                .issuer
+                .repair_agent_dids_while(|| true)
+                .await;
+
+            assert_eq!(checked.unlisted, 1);
+            assert_eq!((sweep.repaired, sweep.listed), (vec![did.clone()], 1));
+            assert_eq!(log_entries(&log_of(&f, &did).await).len(), 2);
         }
 
         #[tokio::test]
@@ -5739,7 +5776,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn presentations_claim_authentication_once_the_agent_did_lists_the_key_there() {
+        async fn a_repaired_agent_keeps_claiming_assertion_method_while_peers_may_cache_its_old_document() {
             let f = fixture().await;
             let (did, _) = seed_agent_identity(f.store.as_ref(), true).await;
             assert_eq!(proof_purpose_of_presentation(&f, &did).await, "assertionMethod");
@@ -5747,8 +5784,11 @@ mod tests {
             f.issuer
                 .repair_agent_dids_while(|| true)
                 .await;
+            f.issuer
+                .authentication_holders
+                .clear();
 
-            assert_eq!(proof_purpose_of_presentation(&f, &did).await, "authentication");
+            assert_eq!(proof_purpose_of_presentation(&f, &did).await, "assertionMethod");
         }
 
         #[tokio::test]
@@ -5791,23 +5831,44 @@ mod tests {
                 .check_agent_dids()
                 .await;
 
-            assert_eq!((checked.listed.len(), checked.unlisted), (0, 1));
+            assert_eq!((checked.listed, checked.unlisted), (0, 1));
             assert_eq!(log_entries(&log_of(&f, &did).await).len(), 1);
         }
 
         #[tokio::test]
-        async fn a_holder_repaired_by_another_node_signs_for_authentication_once_its_miss_expires() {
+        async fn a_holder_whose_log_was_missing_is_read_again_once_its_miss_expires() {
             let f = fixture().await;
-            let (did, key) = seed_agent_identity(f.store.as_ref(), true).await;
+            let mut fields = HashMap::new();
+            fields.insert("agentIdentity".to_string(), json!({ "softwareInfo": { "name": "late-log" } }));
+            let did = f
+                .issuer
+                .issue_or_get_credential(fields, None, None, None)
+                .await
+                .unwrap()
+                .did;
+            let key: JWK = serde_json::from_value(
+                f.store
+                    .find_by_did(&did)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .private_key
+                    .unwrap(),
+            )
+            .unwrap();
+            let log = f
+                .issuer
+                .agent_did_log_dir(&did)
+                .unwrap()
+                .join("did.jsonl");
+            let moved = log.with_extension("moved");
+            std::fs::rename(&log, &moved).unwrap();
             assert!(
                 !f.issuer
                     .holder_signs_for_authentication(&did, &key)
                     .await
             );
-            let (other, _) = crate::identity::test_helpers::test_vc_issuer_with(f.store.clone()).await;
-            other
-                .repair_agent_dids_while(|| true)
-                .await;
+            std::fs::rename(&moved, &log).unwrap();
 
             assert!(
                 !f.issuer
@@ -5815,13 +5876,17 @@ mod tests {
                     .await,
                 "a recent miss is reused"
             );
+            let expired = std::time::Instant::now()
+                .checked_sub(HOLDER_MISS_TTL + std::time::Duration::from_secs(1))
+                .unwrap();
             f.issuer
                 .authentication_holders
-                .clear();
+                .insert(did.clone(), Some(expired));
             assert!(
                 f.issuer
                     .holder_signs_for_authentication(&did, &key)
-                    .await
+                    .await,
+                "an expired miss is read again"
             );
         }
     }

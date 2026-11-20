@@ -84,8 +84,20 @@ pub(crate) fn add_signing_key_to_relationships(
 /// Like [`add_signing_key_to_relationships`], but first publishes `signing_key` as the Multikey
 /// `multikey_id`, controlled by `did`, when the document has no method by that id, absolute or
 /// relative, and creates a missing relationship. A method by that id holding another key, or
-/// published only by its relative id, is still refused.
+/// published only by its relative id, is still refused, changing nothing.
 pub(crate) fn publish_signing_key(
+    document: &mut Value,
+    did: &str,
+    multikey_id: &str,
+    signing_key: &JWK,
+) -> Result<bool> {
+    let mut published = document.clone();
+    let changed = publish_signing_key_into(&mut published, did, multikey_id, signing_key)?;
+    *document = published;
+    Ok(changed)
+}
+
+fn publish_signing_key_into(
     document: &mut Value,
     did: &str,
     multikey_id: &str,
@@ -144,7 +156,6 @@ fn add_multikey_context(document: &mut serde_json::Map<String, Value>) -> Result
     Ok(())
 }
 
-/// The non-empty lines of a DID log, one entry each.
 pub(crate) fn log_entries(log: &str) -> Vec<String> {
     log.lines()
         .map(str::trim)
@@ -153,7 +164,6 @@ pub(crate) fn log_entries(log: &str) -> Vec<String> {
         .collect()
 }
 
-/// The latest entry of a DID log.
 pub(crate) fn latest_entry(log: &str) -> Result<Value> {
     let entries = log_entries(log);
     Ok(serde_json::from_str(
@@ -180,7 +190,51 @@ pub(crate) fn lists_signing_key(
         == Some(false)
 }
 
-/// The id of a DID's signing Multikey.
+/// Whether presentations held by `did` may claim `authentication` at `now`: the latest version of
+/// `log` publishes `signing_key` as the DID's signing Multikey and lists it under every one of
+/// [`SIGNING_KEY_RELATIONSHIPS`], and it has been listed under `authentication` either since the
+/// first version or for at least `grace`. A peer may hold a copy of the document cached before the
+/// key was listed for as long as its resolver keeps documents; within `grace` the holder keeps
+/// claiming `assertionMethod`, which that copy also accepts. A log with an entry that does not
+/// parse never qualifies. Only reads; the log is not verified.
+pub(crate) fn signs_for_authentication(
+    log: &str,
+    did: &str,
+    signing_key: &JWK,
+    grace: chrono::Duration,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if !lists_signing_key(log, did, signing_key) {
+        return false;
+    }
+    let multikey_id = signing_key_id(did);
+    let Ok(entries) = log_entries(log)
+        .iter()
+        .map(|entry| serde_json::from_str::<Value>(entry))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return false;
+    };
+    let listed_from = entries
+        .iter()
+        .rposition(|entry| {
+            !entry["state"]["authentication"]
+                .as_array()
+                .is_some_and(|ids| {
+                    ids.iter()
+                        .any(|id| *id == multikey_id.as_str())
+                })
+        })
+        .map_or(0, |unlisted| unlisted + 1);
+    if listed_from == 0 {
+        return true;
+    }
+    entries[listed_from]["versionTime"]
+        .as_str()
+        .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+        .is_some_and(|listed_at| now.signed_duration_since(listed_at.to_utc()) >= grace)
+}
+
 pub(crate) fn signing_key_id(did: &str) -> String {
     format!("{did}#{}", crate::identity::ssi::vp_issuer::DEFAULT_SIGNING_KEY_ID)
 }
@@ -509,6 +563,78 @@ mod tests {
         serde_json::to_value(key.to_public()).unwrap()["x"].clone()
     }
 
+    fn version_time_of_latest(log: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(
+            latest_entry(log).unwrap()["versionTime"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+        .to_utc()
+    }
+
+    #[tokio::test]
+    async fn a_repaired_holder_claims_authentication_only_after_the_grace_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let (did, key) = agent_log(dir.path(), true).await;
+        let grace = chrono::Duration::hours(1);
+        repair(dir.path(), &did, &key)
+            .await
+            .unwrap();
+        let log = read_log(dir.path()).await;
+        let repaired_at = version_time_of_latest(&log);
+
+        assert!(!signs_for_authentication(&log, &did, &key, grace, repaired_at + chrono::Duration::minutes(59)));
+        assert!(signs_for_authentication(&log, &did, &key, grace, repaired_at + grace));
+    }
+
+    #[tokio::test]
+    async fn a_holder_listed_from_its_first_version_claims_authentication_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (did, key) = agent_log(dir.path(), true).await;
+        let mut first = latest_entry(&read_log(dir.path()).await).unwrap();
+        first["state"]["authentication"] = json!([format!("{did}#key-1"), signing_key_id(&did)]);
+
+        assert!(signs_for_authentication(
+            &first.to_string(),
+            &did,
+            &key,
+            chrono::Duration::hours(1),
+            version_time_of_latest(&first.to_string())
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_log_with_an_unparseable_entry_never_claims_authentication() {
+        let dir = tempfile::tempdir().unwrap();
+        let (did, key) = agent_log(dir.path(), true).await;
+        repair(dir.path(), &did, &key)
+            .await
+            .unwrap();
+        let log = read_log(dir.path()).await;
+        let at = version_time_of_latest(&log) + chrono::Duration::days(1);
+        let lines: Vec<&str> = log.lines().collect();
+        let broken = format!("{}\nnot json\n{}", lines[0], lines[1]);
+
+        assert!(signs_for_authentication(&log, &did, &key, chrono::Duration::hours(1), at));
+        assert!(!signs_for_authentication(&broken, &did, &key, chrono::Duration::hours(1), at));
+    }
+
+    #[tokio::test]
+    async fn a_holder_that_does_not_list_the_key_never_claims_authentication() {
+        let dir = tempfile::tempdir().unwrap();
+        let (did, key) = agent_log(dir.path(), true).await;
+        let log = read_log(dir.path()).await;
+
+        assert!(!signs_for_authentication(
+            &log,
+            &did,
+            &key,
+            chrono::Duration::zero(),
+            version_time_of_latest(&log) + chrono::Duration::days(1)
+        ));
+    }
+
     #[tokio::test]
     async fn repair_runs_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -559,15 +685,11 @@ mod tests {
             "verificationMethod": [{ "id": "#key-2", "type": "Multikey", "controller": did }],
         });
 
+        let before = document.clone();
+
         publish_signing_key(&mut document, did, &signing_key_id(did), &key).expect_err("the relative #key-2 is kept");
 
-        assert_eq!(
-            document["verificationMethod"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(document, before, "a refused document is left unchanged");
     }
 
     #[test]
