@@ -240,3 +240,38 @@ describe('migrated Trust Check — fullscreen panel', () => {
     expect(screen.queryByTestId('trust-check-fullscreen-migrated-warning')).toBeNull();
   });
 });
+
+describe('Trust Check on an MCP Transit Point', () => {
+  const onMcpTransitPoint = (config: Record<string, unknown>) => ({
+    ...panelProps(config),
+    allNodes: [{ id: 'tp', type: 'transit-point-mcp' }] as CanvasNode[],
+  });
+  const managedAgentQuery = { ...queries[0], subject: 'managed_agent' };
+
+  it('starts every new query as a managed-agent query', async () => {
+    render(<TrustCheckFullscreenPanel {...(onMcpTransitPoint({}) as any)} />);
+    await screen.findByTestId('trust-check-save');
+    expect(screen.getByTestId('trust-check-query-0-subject')).toHaveTextContent(
+      "This surface's managed agent"
+    );
+    fireEvent.click(screen.getByTestId('trust-check-add-query'));
+    expect(screen.getByTestId('trust-check-query-1-subject')).toHaveTextContent(
+      "This surface's managed agent"
+    );
+  });
+
+  it('keeps a migrated copy holding a destination query read-only', async () => {
+    render(<TrustCheckFullscreenPanel {...(onMcpTransitPoint({ queries }) as any)} />);
+    expect(await screen.findByTestId('trust-check-fullscreen-read-only')).toBeInTheDocument();
+    expect(screen.queryByTestId('trust-check-save')).toBeNull();
+  });
+
+  it('labels a managed-agent query in the sidebar and names its results', () => {
+    render(<TrustCheckPanel {...(onMcpTransitPoint({ queries: [managedAgentQuery] }) as any)} />);
+    expect(screen.getByTestId('trust-check-panel-query-0')).toHaveTextContent('Managed agent ·');
+    expect(screen.getByTestId('trust-check-panel-results-ref')).toHaveTextContent(
+      'input.trust_check_results.managed_agent[]'
+    );
+    expect(screen.queryByTestId('trust-check-panel-read-only')).toBeNull();
+  });
+});

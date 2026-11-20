@@ -16,7 +16,11 @@ import {
   TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
 } from './edges/archetypes';
 import { isInboundIdentity } from './identity/placement';
-import { queriesFromWire, STORED_TRUST_CHECK_LIST_KEY } from './trust-check/definition';
+import {
+  queriesFromWire,
+  STORED_TRUST_CHECK_LIST_KEY,
+  transitPointChecksDestination,
+} from './trust-check/definition';
 import { TRANSIT_POINT_FIELDS } from './agentSurfaceSchema';
 import { STORED_TARGET_AUTH_KEY, storedTargetAuth } from './_shared/providerTargetAuth';
 import { MANAGED_AGENT_TARGET_AUTH_FORM_KEYS } from './managed-agent/targetAuth';
@@ -885,9 +889,9 @@ class ElementRegistry {
           slotId: 'request:metadata-extraction',
         });
       }
-      // Per-TP target-leg Trust Check (`transit.points[i].trust_check_list`).
-      // New ones are offered only on A2A/AP2 Transit Points, but a stored
-      // list (a migrated copy on any protocol) is always shown.
+      // Per-TP Trust Check (`transit.points[i].trust_check_list`). On a Transit
+      // Point that cannot check its destination the stored list is kept, so a
+      // migrated destination copy saves back exactly as loaded.
       hydrateTrustCheck(
         tp?.trust_check_list,
         `trust-check-${tpId}`,
@@ -895,7 +899,7 @@ class ElementRegistry {
         tpId,
         TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
         tp?.trust_check_migrated === true,
-        tpType !== 'transit-point-a2a' && tpType !== 'transit-point-ap2'
+        !transitPointChecksDestination(tpType)
       );
       // Per-TP managed identity (`transit.points[i].managed_identity`).
       // Mirrors the request-slot id produced by the identity element

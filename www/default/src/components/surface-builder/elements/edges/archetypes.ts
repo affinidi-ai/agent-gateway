@@ -575,14 +575,12 @@ export function getSlot(archetypeId: string, slotId: SlotId): RuntimeSlotDef | u
  * arg). Otherwise returns a predicate that returns `false` for the
  * hidden slot.
  *
- * A second class of hidden slot is protocol-scoped `ma-tp` request slots
- * whose target-leg pipeline stage is only implemented for A2A/AP2 Transit
- * Points: Header Metadata Mapping (`request:metadata-extraction`) and the
- * Transit Point's target-leg Trust Check (`TRUST_CHECK_TRANSIT_POINT_SLOT_ID`).
- * The MCP outbound pipeline has no target-leg counterpart for these yet,
- * so they are offered only on `transit-point-a2a` / `transit-point-ap2`
- * edges — an MCP Transit Point never exposes them, and the caller-leg
- * (AP→MA) Trust Check remains available for MCP.
+ * A second class of hidden slot is the protocol-scoped `ma-tp` request slot
+ * whose pipeline stage is only implemented for A2A/AP2 Transit Points:
+ * Header Metadata Mapping (`request:metadata-extraction`), offered only on
+ * `transit-point-a2a` / `transit-point-ap2` edges. The Transit Point's Trust
+ * Check (`TRUST_CHECK_TRANSIT_POINT_SLOT_ID`) is offered on every Transit
+ * Point; on MCP ones it can only check the managed agent.
  *
  * The Managed Agent's own target-leg Trust Check
  * (`TRUST_CHECK_MANAGED_AGENT_SLOT_ID`) is offered only when the Managed
@@ -613,12 +611,10 @@ export function makeSurfaceSlotFilter(
     if (shouldHideManagedAgentTrustCheck && slot.id === TRUST_CHECK_MANAGED_AGENT_SLOT_ID) {
       return false;
     }
-    // Header Metadata Mapping and the target-leg Trust Check have no MCP
-    // target-leg implementation, so only offer them on A2A/AP2 TPs.
-    if (
-      edge.archetype === 'ma-tp' &&
-      (slot.id === 'request:metadata-extraction' || slot.id === TRUST_CHECK_TRANSIT_POINT_SLOT_ID)
-    ) {
+    // Header Metadata Mapping has no MCP target-leg implementation, so only
+    // offer it on A2A/AP2 TPs. A Trust Check is offered on every TP: on
+    // MCP ones it can only check the managed agent.
+    if (edge.archetype === 'ma-tp' && slot.id === 'request:metadata-extraction') {
       return isA2aFamilyTp(edge);
     }
     // MCP Tool Gating firewalls a TP's MCP tool surface, so it applies only

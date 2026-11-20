@@ -680,19 +680,52 @@ export function trustCheckReviewBadge(
 }
 
 /**
- * The protocol label of the Transit Point a Trust Check hangs off when
- * that Transit Point takes no new Trust Checks (anything but A2A and AP2),
- * or null. Such a Trust Check is a migrated copy that can only be kept or
- * removed.
+ * Whether a Transit Point of `type` can check its destination: only A2A and AP2
+ * destinations serve the agent card a destination check needs. Any Transit Point
+ * can check its managed agent.
+ */
+export function transitPointChecksDestination(type: string | undefined): boolean {
+  return type === 'transit-point-a2a' || type === 'transit-point-ap2';
+}
+
+/**
+ * The protocol label of the Transit Point a Trust Check hangs off when that
+ * Transit Point cannot check its destination (anything but A2A and AP2) and the
+ * Trust Check holds a destination query, or null. Such a Trust Check is a
+ * migrated copy that can only be kept or removed; one that holds only
+ * managed-agent queries stays editable.
  */
 export function readOnlyTrustCheckProtocol(
-  node: { parentId?: string },
+  node: { parentId?: string; config?: any },
   allNodes: ReadonlyArray<{ id: string; type: string }> | undefined
 ): string | null {
+  const parent = parentTransitPoint(node, allNodes);
+  if (!parent || transitPointChecksDestination(parent.type)) return null;
+  const checksDestination = readQueries(node.config).some(q => q.subject !== 'managed_agent');
+  return checksDestination ? parent.type.slice('transit-point-'.length).toUpperCase() : null;
+}
+
+/** Whom the queries of a Transit Point's Trust Check may ask about. */
+export type TrustCheckSubjectChoice = 'destination-or-managed-agent' | 'managed-agent-only';
+
+/** The subjects a Trust Check may ask about when it hangs off a Transit Point, or undefined. */
+export function transitPointSubjectChoice(
+  node: { parentId?: string },
+  allNodes: ReadonlyArray<{ id: string; type: string }> | undefined
+): TrustCheckSubjectChoice | undefined {
+  const parent = parentTransitPoint(node, allNodes);
+  if (!parent) return undefined;
+  return transitPointChecksDestination(parent.type)
+    ? 'destination-or-managed-agent'
+    : 'managed-agent-only';
+}
+
+function parentTransitPoint(
+  node: { parentId?: string },
+  allNodes: ReadonlyArray<{ id: string; type: string }> | undefined
+): { id: string; type: string } | undefined {
   const parent = node.parentId ? allNodes?.find(n => n.id === node.parentId) : undefined;
-  if (!parent || !isTransitPointType(parent.type)) return null;
-  const protocol = parent.type.slice('transit-point-'.length);
-  return protocol === 'a2a' || protocol === 'ap2' ? null : protocol.toUpperCase();
+  return parent && isTransitPointType(parent.type) ? parent : undefined;
 }
 
 export function readOnlyTrustCheckMessage(protocol: string): string {
@@ -921,9 +954,9 @@ export const trustCheckDefinition: NodeDefinition = {
           the caller leg. Available for all protocols.</li>
         <li><strong>On a Managed Agent \u2192 Transit Point edge</strong>:
           the target leg of that Transit Point only. Each Transit Point has
-          its own list. A2A / AP2 Transit Points only (the MCP target-leg
-          check is not available yet, so the slot is not offered on MCP
-          Transit Points).</li>
+          its own list. Each query checks the destination agent or this
+          surface's managed agent calling out; on an MCP Transit Point only
+          the managed agent.</li>
         <li><strong>On the Managed Agent \u2192 External Target edge</strong>:
           the Managed Agent's own target leg. Offered only when the Managed
           Agent targets an A2A Proxy or another gateway.</li>

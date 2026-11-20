@@ -305,12 +305,13 @@ with a refresh button beside it, and Save is blocked while no secret is picked; 
 Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 A Trust Check on a Managed Agent → Transit Point arrow belongs to that Transit Point and saves
-to `transit.points[i].trust_check_list` (new ones on A2A and AP2 Transit Points only); the
+to `transit.points[i].trust_check_list`, and each query's **Checks** select picks the destination
+agent or this surface's managed agent (on MCP Transit Points only the managed agent); the
 Managed Agent's own Trust Check is offered only for `a2a-proxy://` and `fabric://` targets (on
 any other target it blocks Save), Transit Points whose list was migrated from the old
-surface-wide list are flagged for review (migrated copies can exist on MCP and HTTP Transit
-Points, but new Trust Checks can't be added there), and every surface write and template create
-or update sends `trust_check_split: true`; see
+surface-wide list are flagged for review (a migrated destination copy on an MCP Transit Point is
+read-only), and every surface write and template create or update sends
+`trust_check_split: true`; see
 _Trust Check_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-check).
 
 The Gateways list shows, under a remote gateway's status, when its peer was last heard from
