@@ -10,7 +10,11 @@ changes:
         require a verified credential subject, allowlist outbound destinations, a business-hours
         access window, a monitor-only baseline, all or at least N trust checks pass, and HTTP
         method, path, surface and subject allowlists, plus MCP tool policies for tool bindings
-        on the MCP Proxy hop. Templates follow the Apply Policies guides and link to their own
+        on MCP Targets. Each template's description says which policy input it reads and what
+        that input needs, such as a verified caller DID for Trust Registry recognition, JWT
+        Bearer authentication of the Authorization header for the MCP tool policies, and the
+        Transit Point policy slots for the outbound allowlist; a trust check that queries
+        several authorities counts once, and the surface allowlist matches surface IDs. Templates follow the Apply Policies guides and link to their own
         docs section. Define Gateway Policy lists only templates for gateways and Define Agent
         Surface Policy only templates for surfaces, with a muted note on a template for surfaces
         only; the cards carry no role or default decision badges, six show until Show all, and
@@ -42,6 +46,14 @@ changes:
         that ships with the dashboard; templates are not saved, stored or shared, and no
         gateway API changes.
   changed:
+    - timestamp: '2026-11-20T12:00:00Z'
+      title: Document the MCP tool policy input and request fields in the policy docs
+      description: >-
+        docs/POLICY.md now describes the input of a policy bound to MCP tools (input.mcp,
+        input.jwt as the claims of the request's Authorization bearer token, input.channel and
+        input.request), input.http, input.channel and input.gateway with where direction and
+        target_id are set, input.agent.trust_verification beside did_verified, and how to
+        require every Trust Check when a check queries several authorities.
     - timestamp: '2026-11-19T14:00:00Z'
       title: Set a new policy's Type from the Define button that opened it
       description: >-

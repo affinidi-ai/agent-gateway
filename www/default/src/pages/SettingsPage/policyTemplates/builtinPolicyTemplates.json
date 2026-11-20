@@ -3,7 +3,7 @@
     "id": "deny-by-default",
     "name": "Deny by default",
     "summary": "Nothing is allowed until a rule allows it.",
-    "description": "Denies every request. Start here and insert or write the rules that allow what you need.",
+    "description": "Denies every request. Start here and insert or write the rules that allow what you need. Assigned appliance-wide, it also decides public discovery reads such as /discovery and /.well-known/ucp.",
     "category": "baseline",
     "policy_types": ["gateway", "agent_surface"],
     "standalone": true,
@@ -159,7 +159,7 @@
     "id": "allow-by-jwt-issuer-audience",
     "name": "Allow by JWT issuer and audience",
     "summary": "Allow only tokens from listed issuers for listed audiences.",
-    "description": "Allows a request only when the caller's JWT was issued by one of the listed issuers and names one of the listed audiences. Denies every other caller.",
+    "description": "Allows a request only when the caller's JWT was issued by one of the listed issuers and names one of the listed audiences. Denies every other caller. A token without an aud claim, as from an identity provider whose JWT Bearer method checks client_id or azp instead, is denied.",
     "category": "authentication",
     "policy_types": ["agent_surface"],
     "rules": "default allow := false\n\njwt_audiences contains a if {\n  a := input.source_auth.claims.aud\n  is_string(a)\n}\n\njwt_audiences contains a if {\n  is_array(input.source_auth.claims.aud)\n  some a in input.source_auth.claims.aud\n}\n\nallow if {\n  input.source_auth.method == \"jwt_bearer\"\n  input.source_auth.claims.iss in {{issuers}}\n  some a in jwt_audiences\n  a in {{audiences}}\n}",
@@ -237,18 +237,18 @@
     "id": "restrict-mcp-tools-by-role",
     "name": "Restrict MCP tools by role",
     "summary": "Admins call any tool; other callers only the safe tools.",
-    "description": "Allows callers with an admin role to call any MCP tool, other authenticated callers to call only the listed safe tools, and authenticated callers to use other MCP methods such as tools/list. Use it as the whole policy: inserted into another policy it would allow requests that policy denies.",
+    "description": "Allows callers whose JWT role claim, a single value or a list, holds an admin role to call any MCP tool, other authenticated callers to call only the listed safe tools, and authenticated callers to use other MCP methods such as tools/list. Denies a request without input.mcp, such as a JSON-RPC message without an id. A caller is authenticated when it passed one of the surface's Caller Context methods, such as JWT Bearer or API Key. Use it as the whole policy: inserted into another policy it would allow requests that policy denies.",
     "category": "allow_deny_lists",
     "policy_types": ["agent_surface"],
     "standalone": true,
-    "rules": "default allow := false\n\nallow if {\n  input.source_auth.claims.role in {{admin_roles}}\n  input.mcp.method == \"tools/call\"\n}\n\nallow if {\n  input.source_auth.subject\n  input.mcp.method == \"tools/call\"\n  input.mcp.tool_name in {{safe_tools}}\n}\n\nallow if {\n  input.source_auth.subject\n  input.mcp.method != \"tools/call\"\n}",
+    "rules": "default allow := false\n\nrole_claim_values(v) := [v] if is_string(v)\n\nrole_claim_values(v) := v if is_array(v)\n\nauthenticated_caller if {\n  input.source_auth.method\n  input.source_auth.method != \"failed\"\n}\n\nallow if {\n  input.source_auth.method == \"jwt_bearer\"\n  some role in role_claim_values(input.source_auth.claims.role)\n  role in {{admin_roles}}\n  input.mcp.method == \"tools/call\"\n}\n\nallow if {\n  authenticated_caller\n  input.mcp.method == \"tools/call\"\n  input.mcp.tool_name in {{safe_tools}}\n}\n\nallow if {\n  authenticated_caller\n  input.mcp.method != \"tools/call\"\n}",
     "parameters": [
       {
         "key": "admin_roles",
         "label": "Admin roles",
         "kind": "string_list",
         "default": ["admin"],
-        "help": "Values of the JWT role claim that may call any tool, separated by commas."
+        "help": "Values of the JWT role claim that may call any tool, separated by commas. A role claim that is a list matches when any of its values is listed."
       },
       {
         "key": "safe_tools",
@@ -258,7 +258,7 @@
         "help": "MCP tools every authenticated caller may call, separated by commas."
       }
     ],
-    "reads": ["source_auth.claims.role", "source_auth.subject", "mcp.method", "mcp.tool_name"],
+    "reads": ["source_auth.method", "source_auth.claims.role", "mcp.method", "mcp.tool_name"],
     "examples": [
       {
         "name": "Admin calls any tool",
@@ -273,6 +273,24 @@
             "claims": {
               "sub": "ops@example.com",
               "role": "admin"
+            }
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Roles list with admin calls any tool",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "tool_name": "delete_record"
+          },
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "lead@example.com",
+            "claims": {
+              "sub": "lead@example.com",
+              "role": ["viewer", "admin"]
             }
           }
         },
@@ -339,6 +357,94 @@
           }
         },
         "expected": "deny"
+      },
+      {
+        "name": "API key caller lists the tools",
+        "input": {
+          "mcp": {
+            "method": "tools/list"
+          },
+          "source_auth": {
+            "method": "api_key",
+            "key_name": "partner-key"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "API key caller calls another tool",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "tool_name": "delete_record"
+          },
+          "source_auth": {
+            "method": "api_key",
+            "key_name": "partner-key"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Notification without input.mcp",
+        "input": {
+          "http": {
+            "method": "POST",
+            "path": "/mcp"
+          },
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "guest@example.com",
+            "claims": {
+              "sub": "guest@example.com",
+              "role": "viewer"
+            }
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Id-less tools/call from an API key caller",
+        "input": {
+          "http": {
+            "method": "POST",
+            "path": "/mcp"
+          },
+          "source_auth": {
+            "method": "api_key",
+            "key_name": "partner-key"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Failed caller lists the tools",
+        "input": {
+          "mcp": {
+            "method": "tools/list"
+          },
+          "source_auth": {
+            "method": "failed",
+            "attempted_method": "jwt_bearer",
+            "reason": "expired token"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Failed caller sends a notification",
+        "input": {
+          "http": {
+            "method": "POST",
+            "path": "/mcp"
+          },
+          "source_auth": {
+            "method": "failed",
+            "attempted_method": "jwt_bearer",
+            "reason": "expired token"
+          }
+        },
+        "expected": "deny"
       }
     ],
     "docs": {
@@ -351,28 +457,41 @@
     "id": "require-trust-registry-recognition",
     "name": "Require Trust Registry recognition",
     "summary": "Allow only agents the Trust Registry recognises.",
-    "description": "Allows a request only when the calling agent has a DID and the Trust Registry recognised it. Needs Extract Trust Registry Data on the surface; without it input.agent is absent and every request is denied.",
+    "description": "Allows a request only when the calling agent's DID is verified as the caller's identity and the Trust Registry recognised it. A DID is verified when it is the caller identity the gateway established (input.agent.did_verified), not only a DID the request names. Needs Extract Trust Registry Data on the surface; without it input.agent is absent and every request is denied.",
     "category": "trust_checks",
     "policy_types": ["agent_surface"],
-    "rules": "default allow := false\n\nallow if {\n  input.agent.did\n  input.agent.trust_verification == true\n}",
+    "rules": "default allow := false\n\nallow if {\n  input.agent.did\n  input.agent.did_verified == true\n  input.agent.trust_verification == true\n}",
     "parameters": [],
-    "reads": ["agent.did", "agent.trust_verification"],
+    "reads": ["agent.did", "agent.did_verified", "agent.trust_verification"],
     "examples": [
       {
-        "name": "Recognised agent",
+        "name": "Recognised agent, DID verified",
         "input": {
           "agent": {
             "did": "did:web:agent.example.com",
+            "did_verified": true,
             "trust_verification": true
           }
         },
         "expected": "allow"
       },
       {
+        "name": "Recognised agent, DID not verified",
+        "input": {
+          "agent": {
+            "did": "did:web:agent.example.com",
+            "did_verified": false,
+            "trust_verification": true
+          }
+        },
+        "expected": "deny"
+      },
+      {
         "name": "Agent not recognised",
         "input": {
           "agent": {
             "did": "did:web:agent.example.com",
+            "did_verified": true,
             "trust_verification": false
           }
         },
@@ -452,45 +571,95 @@
   {
     "id": "allowlist-outbound-destinations",
     "name": "Allowlist outbound destinations",
-    "summary": "Allow outbound calls only to the listed destinations.",
-    "description": "Allows a Transit Point call only when its destination starts with one of the listed prefixes. Inbound requests are allowed. Use it as the whole policy: inserted into another policy it would allow requests that policy denies.",
+    "summary": "Allow Transit Point calls only to the listed destinations.",
+    "description": "Allows a request through a Transit Point only when the Transit Point's configured endpoint (input.gateway.target_id) is one of the listed destinations or a path under one. It decides as a Transit Point policy or the shared Transit Point policy, where input.gateway.direction is outbound; as the surface's Access Point or Target policy it allows every request. Use it as the whole policy: inserted into another policy it would allow requests that policy denies.",
     "category": "routing_paths",
     "policy_types": ["agent_surface"],
     "standalone": true,
-    "rules": "default allow := false\n\nallow if input.gateway.direction != \"outbound\"\n\nallow if {\n  input.gateway.direction == \"outbound\"\n  some prefix in {{destinations}}\n  startswith(input.gateway.target_id, prefix)\n}",
+    "rules": "default allow := false\n\nallow if input.gateway.direction != \"outbound\"\n\nallow if {\n  input.gateway.direction == \"outbound\"\n  some destination in {{destinations}}\n  startswith(concat(\"\", [input.gateway.target_id, \"/\"]), concat(\"\", [trim_suffix(destination, \"/\"), \"/\"]))\n}",
     "parameters": [
       {
         "key": "destinations",
-        "label": "Allowed destination prefixes",
+        "label": "Allowed destinations",
         "kind": "string_list",
-        "default": ["https://api.example.com/"],
-        "help": "Start of each allowed destination URL, separated by commas."
+        "default": ["https://api.example.com", "fabric://partner-gateway"],
+        "help": "Separate destinations with commas: an endpoint URL such as https://api.example.com, or fabric://<gateway id> for a Fabric route. A Transit Point matches when its endpoint is a listed destination or a path under it, never a longer host name."
       }
     ],
     "reads": ["gateway.direction", "gateway.target_id"],
     "examples": [
       {
-        "name": "Outbound to a listed destination",
+        "name": "Transit Point to a listed endpoint",
         "input": {
           "gateway": {
             "direction": "outbound",
-            "target_id": "https://api.example.com/v1/orders"
+            "target_id": "https://api.example.com"
           }
         },
         "expected": "allow"
       },
       {
-        "name": "Outbound elsewhere",
+        "name": "Transit Point to a path under a listed endpoint",
         "input": {
           "gateway": {
             "direction": "outbound",
-            "target_id": "https://unknown.example.net/"
+            "target_id": "https://api.example.com/mcp"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Transit Point to a host that starts with a listed one",
+        "input": {
+          "gateway": {
+            "direction": "outbound",
+            "target_id": "https://api.example.com.example.net/mcp"
           }
         },
         "expected": "deny"
       },
       {
-        "name": "Inbound request",
+        "name": "Transit Point to a longer host name",
+        "input": {
+          "gateway": {
+            "direction": "outbound",
+            "target_id": "https://api.example.com.example.net/x"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Transit Point to another endpoint",
+        "input": {
+          "gateway": {
+            "direction": "outbound",
+            "target_id": "https://unknown.example.net"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Fabric route to a listed gateway",
+        "input": {
+          "gateway": {
+            "direction": "outbound",
+            "target_id": "fabric://partner-gateway/orders"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Fabric route to another gateway",
+        "input": {
+          "gateway": {
+            "direction": "outbound",
+            "target_id": "fabric://other-gateway/orders"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Request on the Access Point",
         "input": {
           "gateway": {
             "direction": "inbound"
@@ -578,11 +747,11 @@
   {
     "id": "all-trust-checks-pass",
     "name": "All trust checks pass",
-    "summary": "Allow only if every trust check succeeded.",
-    "description": "Allows a request only if at least one trust check ran on the target and every one succeeded. Denies when any check failed or none ran.",
+    "summary": "Allow only if every target trust check passed.",
+    "description": "Allows a request only if at least one Trust Check ran on the target leg (input.trust_check_results.target: the Managed Agent's Target, or the Transit Point the request goes through) and every one passed. A check that queries several authorities passes when any of them recognises the entity. Denies when any check failed or none ran. Trust Checks on the Access Point are not read.",
     "category": "trust_checks",
     "policy_types": ["agent_surface"],
-    "rules": "default allow := false\n\nallow if {\n  count(input.trust_check_results.target) > 0\n  every r in input.trust_check_results.target { r.ok }\n}",
+    "rules": "default allow := false\n\ntarget_check_ids contains r.id if {\n  some r in input.trust_check_results.target\n}\n\ntarget_checks_passed contains r.id if {\n  some r in input.trust_check_results.target\n  r.ok == true\n}\n\nallow if {\n  count(target_check_ids) > 0\n  count(target_check_ids - target_checks_passed) == 0\n}",
     "parameters": [],
     "reads": ["trust_check_results.target"],
     "examples": [
@@ -623,6 +792,50 @@
         "expected": "deny"
       },
       {
+        "name": "1 check with 2 authorities, 1 recognises",
+        "input": {
+          "trust_check_results": {
+            "target": [
+              {
+                "id": "registry",
+                "authority_id": "did:web:authority-a.example.com",
+                "ok": true
+              },
+              {
+                "id": "registry",
+                "authority_id": "did:web:authority-b.example.com",
+                "ok": false
+              }
+            ]
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "2 checks, 1 with no authority recognising",
+        "input": {
+          "trust_check_results": {
+            "target": [
+              {
+                "id": "registry",
+                "ok": true
+              },
+              {
+                "id": "credential",
+                "authority_id": "did:web:authority-a.example.com",
+                "ok": false
+              },
+              {
+                "id": "credential",
+                "authority_id": "did:web:authority-b.example.com",
+                "ok": false
+              }
+            ]
+          }
+        },
+        "expected": "deny"
+      },
+      {
         "name": "No checks ran",
         "input": {
           "trust_check_results": {
@@ -642,10 +855,10 @@
     "id": "at-least-n-trust-checks-pass",
     "name": "At least N trust checks pass",
     "summary": "Threshold instead of all-or-nothing. Has a setting.",
-    "description": "Allows a request when the number of passing trust checks on the target reaches your threshold. Denies when fewer pass, or when no checks ran.",
+    "description": "Allows a request when the number of Trust Checks that passed on the target leg (input.trust_check_results.target: the Managed Agent's Target, or the Transit Point the request goes through) reaches your threshold. A check that queries several authorities counts once, and passes when any of them recognises the entity. Denies when fewer pass, or when no checks ran. Trust Checks on the Access Point are not counted.",
     "category": "trust_checks",
     "policy_types": ["agent_surface"],
-    "rules": "default allow := false\n\nallow if {\n  passing := [r | some r in input.trust_check_results.target; r.ok]\n  count(passing) >= {{min_passing}}\n}",
+    "rules": "default allow := false\n\ntarget_checks_passing contains r.id if {\n  some r in input.trust_check_results.target\n  r.ok == true\n}\n\nallow if count(target_checks_passing) >= {{min_passing}}",
     "parameters": [
       {
         "key": "min_passing",
@@ -704,6 +917,56 @@
         "expected": "deny"
       },
       {
+        "name": "1 check with 2 authorities, both recognise",
+        "input": {
+          "trust_check_results": {
+            "target": [
+              {
+                "id": "a",
+                "authority_id": "did:web:authority-a.example.com",
+                "ok": true
+              },
+              {
+                "id": "a",
+                "authority_id": "did:web:authority-b.example.com",
+                "ok": true
+              }
+            ]
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "2 checks, each with 1 of 2 authorities recognising",
+        "input": {
+          "trust_check_results": {
+            "target": [
+              {
+                "id": "a",
+                "authority_id": "did:web:authority-a.example.com",
+                "ok": true
+              },
+              {
+                "id": "a",
+                "authority_id": "did:web:authority-b.example.com",
+                "ok": false
+              },
+              {
+                "id": "b",
+                "authority_id": "did:web:authority-a.example.com",
+                "ok": false
+              },
+              {
+                "id": "b",
+                "authority_id": "did:web:authority-b.example.com",
+                "ok": true
+              }
+            ]
+          }
+        },
+        "expected": "allow"
+      },
+      {
         "name": "No checks ran",
         "input": {
           "trust_check_results": {
@@ -723,7 +986,7 @@
     "id": "allow-http-methods",
     "name": "Allow listed HTTP methods",
     "summary": "Allow only the listed HTTP methods.",
-    "description": "Allows a request only when its HTTP method is on the list, for example to keep a surface read-only.",
+    "description": "Allows a request only when its HTTP method is on the list, for example to keep a surface read-only. Assigned appliance-wide, it also decides public discovery reads such as /discovery and /.well-known/ucp.",
     "category": "routing_paths",
     "policy_types": ["gateway", "agent_surface"],
     "rules": "default allow := false\n\nallow if input.http.method in {{methods}}",
@@ -769,7 +1032,7 @@
     "id": "allow-path-prefixes",
     "name": "Allow listed paths",
     "summary": "Allow only requests under the listed path prefixes.",
-    "description": "Allows a request only when its path starts with one of the listed prefixes. Denies a path that contains .., %2e, a backslash or %5c.",
+    "description": "Allows a request only when its path starts with one of the listed prefixes. Denies a path that contains .., %2e, a backslash or %5c. Assigned appliance-wide, it also decides public discovery reads such as /discovery and /.well-known/ucp.",
     "category": "routing_paths",
     "policy_types": ["gateway", "agent_surface"],
     "rules": "default allow := false\n\nallow if {\n  some prefix in {{prefixes}}\n  startswith(input.http.path, prefix)\n  not contains(input.http.path, \"..\")\n  not contains(lower(input.http.path), \"%2e\")\n  not contains(input.http.path, \"\\\\\")\n  not contains(lower(input.http.path), \"%5c\")\n}",
@@ -835,35 +1098,47 @@
     "id": "allow-listed-surfaces",
     "name": "Allow listed surfaces",
     "summary": "Allow only requests to the listed surfaces.",
-    "description": "Allows a request only when it is for one of the listed surfaces, by name. Useful for a policy enforced across every surface.",
+    "description": "Allows a request only when it is for one of the listed surfaces, by surface ID. Useful for a policy enforced across every surface. Assigned appliance-wide, it also decides public discovery reads such as /discovery and /.well-known/ucp.",
     "category": "routing_paths",
     "policy_types": ["gateway", "agent_surface"],
-    "rules": "default allow := false\n\nallow if input.channel.name in {{surfaces}}",
+    "rules": "default allow := false\n\nallow if input.channel.config_id in {{surfaces}}",
     "parameters": [
       {
         "key": "surfaces",
-        "label": "Surface names",
+        "label": "Surface IDs",
         "kind": "string_list",
-        "default": ["public-mcp"],
-        "help": "Surface names, separated by commas."
+        "default": ["3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40"],
+        "help": "Each surface's ID, shown in the read-only Surface ID field of the Surface Builder's surface panel and at the end of the surface page's address (/surfaces/<id>), separated by commas."
       }
     ],
-    "reads": ["channel.name"],
+    "reads": ["channel.config_id"],
     "examples": [
       {
         "name": "Listed surface",
         "input": {
           "channel": {
+            "config_id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
             "name": "public-mcp"
           }
         },
         "expected": "allow"
       },
       {
-        "name": "Other surface",
+        "name": "Listed surface, renamed",
         "input": {
           "channel": {
-            "name": "private-mcp"
+            "config_id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
+            "name": "partner-mcp"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Other surface with the same name",
+        "input": {
+          "channel": {
+            "config_id": "9a7d5e31-0c4b-4f8e-b2a6-7e1d3c5f9b82",
+            "name": "public-mcp"
           }
         },
         "expected": "deny"
@@ -878,8 +1153,8 @@
   {
     "id": "allow-listed-subjects",
     "name": "Allow listed subjects",
-    "summary": "Allow only the listed JWT subjects.",
-    "description": "Allows a request only when the caller authenticated with a JWT whose subject is on the list. Denies every other caller.",
+    "summary": "Allow only the listed JWT callers, by principal.",
+    "description": "Allows a request only when the caller authenticated with a JWT and its subject is on the list. The subject is the value of the principal claim the JWT verification strategy names, sub unless the strategy names another. Denies every other caller.",
     "category": "allow_deny_lists",
     "policy_types": ["agent_surface"],
     "rules": "default allow := false\n\nallow if {\n  input.source_auth.method == \"jwt_bearer\"\n  input.source_auth.subject in {{subjects}}\n}",
@@ -889,7 +1164,7 @@
         "label": "Allowed subjects",
         "kind": "string_list",
         "default": ["user@example.com"],
-        "help": "Separate subjects with commas."
+        "help": "Values of the strategy's principal claim, separated by commas."
       }
     ],
     "reads": ["source_auth.subject"],
@@ -963,20 +1238,33 @@
     "id": "tool-allow-authenticated",
     "name": "Tool policy: allow authenticated callers",
     "summary": "For a tool binding: allow any caller with a token.",
-    "description": "For a policy bound to MCP tools on the MCP Proxy hop: allows a call when the caller's token has a subject.",
+    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows a call when the request's bearer token has a sub claim. It reads the claims of the bearer token in the request's Authorization header (input.jwt), so use it on a surface whose Caller Context authenticates that header with JWT Bearer.",
     "rules": "default allow := false\n\nallow if input.jwt.sub",
     "parameters": [],
     "reads": ["jwt.sub"],
     "examples": [
       {
-        "name": "Caller with a token",
+        "name": "Bearer token with a subject",
         "input": {
           "mcp": {
-            "method": "search"
+            "method": "tools/call",
+            "params": {
+              "name": "search",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
           },
           "channel": {
             "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
             "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
           },
           "jwt": {
             "sub": "user@example.com"
@@ -985,14 +1273,27 @@
         "expected": "allow"
       },
       {
-        "name": "Caller without a token",
+        "name": "No bearer token",
         "input": {
           "mcp": {
-            "method": "search"
+            "method": "tools/call",
+            "params": {
+              "name": "search",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
           },
           "channel": {
             "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
             "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
           }
         },
         "expected": "deny"
@@ -1011,7 +1312,7 @@
     "id": "tool-allow-by-jwt-claim",
     "name": "Tool policy: allow by JWT claim",
     "summary": "For a tool binding: allow callers whose claim has a listed value.",
-    "description": "For a policy bound to MCP tools on the MCP Proxy hop: allows a call when a claim in the caller's token, a single value or a list, has one of the listed values. Covers admin-only and subscription-based access.",
+    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows a call when a claim of the request's bearer token, a single value or a list, has one of the listed values. Covers admin-only and subscription-based access. It reads the claims of the bearer token in the request's Authorization header (input.jwt), so use it on a surface whose Caller Context authenticates that header with JWT Bearer.",
     "rules": "default allow := false\n\ntool_claim_values(v) := [v] if is_string(v)\n\ntool_claim_values(v) := v if is_array(v)\n\nallow if {\n  some v in tool_claim_values(input.jwt[{{claim}}])\n  v in {{values}}\n}",
     "parameters": [
       {
@@ -1035,11 +1336,24 @@
         "name": "Role admin",
         "input": {
           "mcp": {
-            "method": "search"
+            "method": "tools/call",
+            "params": {
+              "name": "search",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
           },
           "channel": {
             "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
             "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
           },
           "jwt": {
             "sub": "ops@example.com",
@@ -1052,11 +1366,24 @@
         "name": "Role viewer",
         "input": {
           "mcp": {
-            "method": "search"
+            "method": "tools/call",
+            "params": {
+              "name": "search",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
           },
           "channel": {
             "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
             "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
           },
           "jwt": {
             "sub": "guest@example.com",
@@ -1066,14 +1393,57 @@
         "expected": "deny"
       },
       {
-        "name": "No token",
+        "name": "Roles list with admin",
         "input": {
           "mcp": {
-            "method": "search"
+            "method": "tools/call",
+            "params": {
+              "name": "search",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
           },
           "channel": {
             "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
             "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
+          },
+          "jwt": {
+            "sub": "lead@example.com",
+            "role": ["viewer", "admin"]
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "No bearer token",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "params": {
+              "name": "search",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
+          },
+          "channel": {
+            "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
+            "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
           }
         },
         "expected": "deny"
@@ -1092,7 +1462,7 @@
     "id": "tool-role-with-deny-reason",
     "name": "Tool policy: admin role with a deny reason",
     "summary": "For a tool binding: allow one role and record why others were denied.",
-    "description": "For a policy bound to MCP tools on the MCP Proxy hop: allows callers with the admin role and sets deny_reason when the token has no role or another role. The reason is written to the audit log only, not the response.",
+    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows callers whose bearer token has the admin role and sets deny_reason when the token has no role or another role. The reason is written to the audit log only, not the response. It reads the claims of the bearer token in the request's Authorization header (input.jwt), so use it on a surface whose Caller Context authenticates that header with JWT Bearer.",
     "rules": "default allow := false\n\nallow if input.jwt.role == {{admin_role}}\n\ndeny_reason := \"The caller's token has no role\" if not input.jwt.role\n\ndeny_reason := sprintf(\"Role %v may not call this tool\", [input.jwt.role]) if {\n  input.jwt.role\n  input.jwt.role != {{admin_role}}\n}",
     "parameters": [
       {
@@ -1109,11 +1479,24 @@
         "name": "Role admin",
         "input": {
           "mcp": {
-            "method": "search"
+            "method": "tools/call",
+            "params": {
+              "name": "delete_record",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
           },
           "channel": {
             "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
             "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
           },
           "jwt": {
             "sub": "ops@example.com",
@@ -1126,11 +1509,24 @@
         "name": "Role viewer",
         "input": {
           "mcp": {
-            "method": "search"
+            "method": "tools/call",
+            "params": {
+              "name": "delete_record",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
           },
           "channel": {
             "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
             "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
           },
           "jwt": {
             "sub": "guest@example.com",
@@ -1143,11 +1539,24 @@
         "name": "No role",
         "input": {
           "mcp": {
-            "method": "search"
+            "method": "tools/call",
+            "params": {
+              "name": "delete_record",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
           },
           "channel": {
             "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
             "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
           },
           "jwt": {
             "sub": "guest@example.com"
@@ -1169,20 +1578,33 @@
     "id": "tool-allow-every-caller",
     "name": "Tool policy: allow every caller",
     "summary": "For a tool binding: the tool entry list is the only control.",
-    "description": "For a policy bound to MCP tools on the MCP Proxy hop: allows every call, so only the tools listed on the binding decide what can be called.",
+    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows every call, so only the tools listed on the binding decide what can be called.",
     "rules": "default allow := true",
     "parameters": [],
     "reads": [],
     "examples": [
       {
-        "name": "Caller without a token",
+        "name": "No bearer token",
         "input": {
           "mcp": {
-            "method": "search"
+            "method": "tools/call",
+            "params": {
+              "name": "search",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
           },
           "channel": {
             "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
             "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
           }
         },
         "expected": "allow"

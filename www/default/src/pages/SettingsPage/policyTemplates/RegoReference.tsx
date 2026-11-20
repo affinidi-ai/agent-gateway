@@ -23,8 +23,12 @@ const INPUT_FIELDS: [string, string][] = [
 ];
 
 const TOOL_INPUT_FIELDS: [string, string][] = [
-  ['input.jwt.<claim>', "Claims of the caller's token, such as sub or role"],
-  ['input.mcp.method', 'The tool being called'],
+  [
+    'input.jwt.<claim>',
+    "Claims of the bearer token in the request's Authorization header, such as sub or role",
+  ],
+  ['input.mcp.method', 'Always tools/call'],
+  ['input.mcp.params.name', 'The tool being called'],
   ['input.channel.name', 'The surface name'],
   ['input.request.path', 'The request path'],
 ];
@@ -119,8 +123,8 @@ allow if {
             ))}
           </ul>
           <p className="small text-gray-800 mb-1">
-            A policy bound to MCP tools on the MCP Proxy hop reads the tool call instead, with the
-            caller&apos;s token claims in <code>input.jwt</code> and no{' '}
+            A policy bound to MCP tools reads the tool call instead, with the claims of the
+            request&apos;s bearer token in <code>input.jwt</code> and no{' '}
             <code>input.source_auth</code>.{' '}
             <Link
               href={`${DOCS_URL.opaPoliciesReferencePage}#mcp-tool-policy-input`}

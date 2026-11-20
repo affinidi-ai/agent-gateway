@@ -303,9 +303,9 @@ describe('start a policy from the gallery', () => {
 
     expect(screen.getByPlaceholderText('e.g. Require Authentication')).toHaveValue('');
     expect(screen.getByPlaceholderText('What does this policy do?')).toHaveValue(
-      'Allows a request only if at least one trust check ran on the target and every one succeeded. Denies when any check failed or none ran.'
+      "Allows a request only if at least one Trust Check ran on the target leg (input.trust_check_results.target: the Managed Agent's Target, or the Transit Point the request goes through) and every one passed. A check that queries several authorities passes when any of them recognises the entity. Denies when any check failed or none ran. Trust Checks on the Access Point are not read."
     );
-    expect(rego().value).toContain('every r in input.trust_check_results.target { r.ok }');
+    expect(rego().value).toContain('count(target_check_ids - target_checks_passed) == 0');
     expect(screen.getByTestId('policy-template-gallery-summary')).toHaveTextContent(
       'Started from All trust checks pass'
     );
@@ -462,7 +462,7 @@ describe('the used template', () => {
 
     expect(screen.getByTestId('policy-template-gallery-param-min_passing')).toHaveValue(3);
     fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
-    expect(rego().value).toContain('count(passing) >= 3');
+    expect(rego().value).toContain('count(target_checks_passing) >= 3');
   });
 
   it('selects no card over Rego restored by Undo after a discard', async () => {
@@ -670,7 +670,7 @@ describe('template settings in the gallery', () => {
     });
     fireEvent.click(screen.getByTestId('policy-template-gallery-use-button'));
 
-    expect(rego().value).toContain('count(passing) >= 3');
+    expect(rego().value).toContain('count(target_checks_passing) >= 3');
   });
 
   it('refuses a setting outside its range', async () => {
@@ -1475,7 +1475,7 @@ describe('Use over rules already in the policy', () => {
     fireEvent.click(screen.getByTestId('policy-template-gallery-replace-button'));
 
     expect(rego().value).not.toContain('Allow listed HTTP methods');
-    expect(rego().value).toContain('every r in input.trust_check_results.target { r.ok }');
+    expect(rego().value).toContain('count(target_check_ids - target_checks_passed) == 0');
     expect(name()).toHaveValue('');
     act(() => mockUndo.last?.());
     expect(rego().value).toContain('Allow listed HTTP methods');

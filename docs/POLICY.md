@@ -46,6 +46,56 @@ version and client declarations (see
 `input.mcp` only for modern requests, so a rule keyed on `input.mcp` never
 matched legacy Fabric traffic; it now does, and a decision can change on upgrade.
 
+A legacy JSON-RPC message without an `id`, whatever its `method`, carries no `input.mcp`; a rule that allows requests without `input.mcp` allows them whatever they call.
+
+### Request, surface and direction (`input.http`, `input.channel`, `input.gateway`)
+
+Every gateway and surface policy input carries these fields (`PolicyInput` in
+[`src/surface_context/mod.rs`](../src/surface_context/mod.rs)):
+
+| Field | Value |
+| --- | --- |
+| `input.http.method`, `input.http.path` | The request's HTTP method and path. On a Transit Point, the request the managed agent sends. |
+| `input.http.headers` | The request's headers, without credential headers such as `Authorization`, cookies and API keys. |
+| `input.channel.config_id` | The surface id: unique, and unchanged when the surface is renamed. |
+| `input.channel.name` | The surface's display name, which other surfaces may share. |
+| `input.channel.variant_alias` | The surface variant the request selects: set on Fabric receive and on a Transit Point; absent on a direct request and for the default variant. |
+| `input.gateway.direction` | `inbound` for a request arriving at the Access Point, directly or over Fabric receive: the gateway policy, the Access Point policy and the Target's request policy see it. `outbound` for a request the managed agent sends through a Transit Point: the gateway policy, the shared Transit Point policy and the Transit Point's own policy see it. |
+| `input.gateway.target_id` | On `outbound`, the Transit Point's configured `target_endpoint`, such as `https://api.example.com/mcp`, or `fabric://{gateway_id}/{surface_id}` on a Fabric route; never the URL of one request. Absent on `inbound`. |
+| `input.gateway.source_id` | On `outbound`, the managed agent's DID when it has one. On Fabric receive, the DID that sent the forward request. |
+
+### MCP tool policy input
+
+A policy bound to MCP tools (`target.mcp_tool_policies`) decides each `tools/call` to an MCP
+Target: a direct HTTP Target, a `proxy://` MCP Proxy, the sending gateway of a `fabric://`
+Target, and Fabric receive. Other MCP methods pass this gate. Its input is
+the tool call (`McpPolicyContext` in [`src/mcp/policy.rs`](../src/mcp/policy.rs)), not the
+caller context the gateway and surface policies get:
+
+```json
+{
+  "mcp": {
+    "method": "tools/call",
+    "params": {"name": "search", "arguments": {"query": "open invoices"}},
+    "protocol": "json-rpc-2.0"
+  },
+  "jwt": {"sub": "user@example.com", "role": "admin"},
+  "channel": {"name": "tools", "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40", "protocol": "mcp"},
+  "request": {"source_ip": "203.0.113.10", "method": "POST", "path": "/mcp"}
+}
+```
+
+| Field | Value |
+| --- | --- |
+| `input.mcp.method` | Always `tools/call`. |
+| `input.mcp.params` | The call's `params`; the tool name is `input.mcp.params.name`. |
+| `input.mcp.protocol_version`, `client_capabilities`, `client_info` | Set for a modern (`2026-07-28`) request only. |
+| `input.jwt` | The claims of the bearer token in the request's `Authorization` header, absent without one; on Fabric receive, of the header the sending gateway forwarded. The surface's caller authentication verifies that token, not this input, so a tool policy that reads `input.jwt` belongs on a surface whose Caller Context authenticates that header with JWT Bearer. |
+| `input.channel` | The surface's `name`, `id` (the surface id) and `protocol` (`mcp`). |
+| `input.request` | `source_ip` (`fabric` on Fabric receive), `method` and `path`. |
+
+The input has no `source_auth`, `agent`, `extension_identity` or `trust_check_results`.
+
 ### Payment context (`input.payment`)
 
 On a surface with an `agent_pay` payment policy, every policy that runs for it gets
@@ -458,6 +508,27 @@ Builder's fullscreen editor picks that list in one multi-select of the Issuers a
 registers; see _Authority lists_ in
 [`www/default/AGENTS.md`](../www/default/AGENTS.md).
 
+A rule over every result, such as `every r in input.trust_check_results.target { r.ok }`,
+requires every authority of every element. To require every element, each passing when any
+of its authorities recognises the entity, group the results by `id`, as the dashboard's
+_All trust checks pass_ and _At least N trust checks pass_ templates do:
+
+```rego
+check_ids contains r.id if {
+    some r in input.trust_check_results.target
+}
+
+passed_ids contains r.id if {
+    some r in input.trust_check_results.target
+    r.ok == true
+}
+
+allow if {
+    count(check_ids) > 0
+    count(check_ids - passed_ids) == 0
+}
+```
+
 Accepted risk: nothing bounds how many authorities a leg queries. Every request sends one TRQP
 message per listed authority, all at once, through the trust registry's connection and its
 mediator, and writes one audit record and one `agent_gateway_trust_check_total` sample per
@@ -590,6 +661,13 @@ Check flagged an identity mismatch). Both carry how the DID was established:
 | | `source_auth` | The DID is bound to the source credential this gateway authenticated on this request: `from_jwt_claim`, or an API Key Provider key on an inbound `from_api_key` slot. |
 | | `unverified` | Nothing in the request proves the DID: `x-identity` payload pseudonyms, surface-configured identities (`static`, `from_mtls`, a stored-key `from_api_key`), and a plain API Key on an inbound `from_api_key` slot, whose DID every holder of the secret shares. |
 | `input.extension_identity.verified`, `input.agent.did_verified` | `true` / `false` | Boolean projection: everything but `unverified` is verified. |
+
+`input.agent.trust_verification` is `true` when every Trust Registry recognition query for
+`input.agent.did` passed, `false` when one did not, and absent without Trust Registry data. On
+the caller leg, `input.agent.did` and the Trust Registry fields beside it come from the request
+body's trust-registry extension, so a policy that requires the caller to be recognised also
+requires `input.agent.did_verified == true`: the recognised DID is then the caller identity the
+gateway established.
 
 On a direct request to a surface whose inbound identity is `from_api_key`, the
 caller is the API key it presents (see

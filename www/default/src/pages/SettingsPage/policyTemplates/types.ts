@@ -91,8 +91,8 @@ export interface PolicyTemplate {
    */
   standalone?: boolean;
   /**
-   * `mcp_tool`: the template is for a policy bound to MCP tools on the MCP Proxy hop, whose
-   * input is the tool call (`input.jwt`, `input.mcp.method`), not the request's caller context.
+   * `mcp_tool`: the template is for a policy bound to MCP tools, whose input is the tool call
+   * (`input.jwt`, `input.mcp.params.name`), not the request's caller context.
    */
   policy_input?: 'mcp_tool';
   docs_href?: string;

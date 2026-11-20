@@ -154,8 +154,9 @@ describe('EditPolicyDefinitionPage — instructions panel', () => {
     const callerFields = screen.getByTestId('policy-instructions-input-fields');
     expect(callerFields).toHaveTextContent('input.source_auth.claims');
     expect(callerFields).not.toHaveTextContent('input.jwt');
-    expect(screen.getByTestId('policy-instructions-tool-input-fields')).toHaveTextContent(
-      'input.jwt.<claim>'
-    );
+    const toolFields = screen.getByTestId('policy-instructions-tool-input-fields');
+    expect(toolFields).toHaveTextContent('input.jwt.<claim>');
+    expect(toolFields).toHaveTextContent('input.mcp.params.name – The tool being called');
+    expect(toolFields).toHaveTextContent('input.mcp.method – Always tools/call');
   });
 });

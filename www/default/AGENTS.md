@@ -1849,8 +1849,9 @@ request's caller context that gateway and surface policies read (`PolicyInput` i
 `src/surface_context/mod.rs`: `input.source_auth`, `input.http`, `input.gateway`, `input.mcp`,
 `input.trust_check_results`, `input.extension_identity`; `policy-instructions-input-fields`),
 which the Test (dry-run) default sample input follows, and the tool call that a policy bound to
-MCP tools on the MCP Proxy hop reads (`McpPolicyContext` in `src/mcp/policy.rs`: `input.jwt`
-claims, `input.mcp.method` as the tool name, `input.channel`, `input.request`;
+MCP tools reads (`McpPolicyContext` in `src/mcp/policy.rs`: `input.jwt`, the claims of the
+request's `Authorization` bearer token, `input.mcp.method`, always `tools/call`,
+`input.mcp.params.name` as the tool name, `input.channel`, `input.request`;
 `policy-instructions-tool-input-fields`). Its title is a heading holding one full-width button (`policy-instructions-toggle`,
 with `aria-expanded` and `aria-controls="policyDefInstructions"`), so the whole header row
 toggles, Enter and Space work natively, and screen readers still announce the heading. The
@@ -1905,9 +1906,14 @@ Create custom policy) in `useTemplateGallery`.
   (`page`, a `DOCS_URL` key of a direct doc-site URL, since the catalog redirect may drop a
   `#section`; `anchor`; `label`), which becomes the template's `docs_href` and link text. Entries
   with `"input": "mcp_tool"` (category **MCP tool policies**, `agent_surface` only) are for
-  policies bound to MCP tools on the MCP Proxy hop: they read `McpPolicyContext`
-  (`src/mcp/policy.rs`: `input.jwt` claims, `input.mcp.method` as the tool name), carry an "MCP
-  tool policy" badge in the gallery, and are whole policies (below). A setting is a `{{key}}` placeholder with `kind` `integer` (`min`, `max`),
+  policies bound to MCP tools, which decide each `tools/call` to an MCP Target: they read
+  `McpPolicyContext` (`src/mcp/policy.rs`: `input.jwt`, the claims of the request's
+  `Authorization` bearer token, which their descriptions say needs JWT Bearer caller
+  authentication on that header; `input.mcp.method`, always `tools/call`; the tool name in
+  `input.mcp.params.name`), carry an "MCP tool policy" badge in the gallery, and are whole
+  policies (below). Trust check templates group `input.trust_check_results.target` by `id`, so
+  a check that queries several authorities counts once and passes when any of its results is
+  `ok`. Allow listed surfaces matches `input.channel.config_id`, the surface id, not its name. A setting is a `{{key}}` placeholder with `kind` `integer` (`min`, `max`),
   `string`, `string_list`, `choice` or `time_of_day`. A string's `format: "time_zone"` accepts
   IANA names only (written in their canonical spelling); a list's `allowed` names the only values
   accepted, matched without regard to case and written in the listed spelling, and an `optional`
