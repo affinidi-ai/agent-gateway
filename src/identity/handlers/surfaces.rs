@@ -2240,14 +2240,15 @@ fn claiming_stored_surface(stored: Option<&AgentSurface>) -> Option<&AgentSurfac
 /// stored.
 ///
 /// A path under a configured prefix but outside the outbound one
-/// ([`crate::proxy::server::LISTEN_PATH_NOT_SERVED`]) is refused only where an
-/// inbound listener shares a hostname with the outbound listener, which is
-/// where it stops being reachable and where the Surface Builder offers the
-/// `/outbound` prefixes alone. On a deployment whose outbound listener has a
-/// hostname of its own the Transit Point answers it, the picker offers it, and
-/// the save stores it; the same predicate decides the `Warning`
-/// ([`crate::proxy::server::listen_path_warnings`]), so what is warned about
-/// on a stored path is what is refused on a new one.
+/// ([`crate::proxy::server::LISTEN_PATH_NOT_SERVED`]) is one of them only where
+/// the Transit Point's own outbound listener shares a hostname with an inbound
+/// listener, which is where it stops being reachable and where the Surface
+/// Builder offers the `/outbound` prefixes alone. Where that listener has a
+/// hostname of its own the point answers the path, the picker offers it, and
+/// the save stores it. [`crate::proxy::server::listen_path_problems`] decides
+/// that per point, and the `Warning`
+/// ([`crate::proxy::server::listen_path_warnings`]) comes from the same list,
+/// so what is warned about on a stored path is what is refused on a new one.
 ///
 /// Only a path this save introduces or changes is refused: the same Transit
 /// Point, in the same variant, keeping the same path is exempt, so a surface
@@ -2265,10 +2266,8 @@ fn check_listen_paths(
         return Ok(());
     }
     let kept = crate::proxy::server::kept_listen_path_claims(claiming_stored_surface(stored));
-    let shared_hostname = crate::proxy::server::shares_an_outbound_hostname(network_config);
     match crate::proxy::server::listen_path_problems(surface, network_config)
         .into_iter()
-        .filter(|problem| shared_hostname || problem.code != crate::proxy::server::LISTEN_PATH_NOT_SERVED)
         .find(|problem| !kept.contains(&problem.claim))
     {
         Some(problem) => Err(SurfaceApiError::BadRequestCode(problem.code, problem.message)),

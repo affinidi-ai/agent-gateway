@@ -126,7 +126,7 @@ alike:
 | One the outbound router cannot register as written: no leading `/`, `/` or `//` alone, a `..` segment, `{` or `}` (axum reads a balanced pair as a path parameter, so the Transit Point silently answers every value in that position, and the listener build panics on a conflict there), or a segment starting with `:` or `*` (axum's pre-0.8 parameter syntax, which it refuses outright) | The outbound listener build panics, taking the gateway down, once the surface is stored | Refused, `400` with the code `listen_path_invalid` |
 | `/outbound` itself, bare or with a trailing slash | The point answers every `/outbound` request no more specific route matches, the derived routes of other Transit Points still winning | Refused, `400` with the code `listen_path_is_outbound_prefix` |
 | Under no configured surface prefix, or a bare prefix with no segment of its own: `/partner-a-webhook`, `/outbound/not-a-channel/x`, `/<channel>` | The dashboard cannot compose it, and it claims a route outside the space the gateway serves Transit Points on | Refused, `400` with the code `listen_path_not_a_channel_prefix`, naming the prefixes this gateway does offer |
-| A path outside `/outbound`, under a configured prefix: `/<channel>/<name>` | The point answers it on the outbound listener's own address. An inbound listener that shares a hostname with the outbound one forwards `/outbound` and nothing else, so on such a deployment this path is not reachable through the inbound address | Refused where an inbound listener shares the outbound hostname, `400` with the code `listen_path_not_served`, which is also where the Surface Builder offers the `/outbound` prefixes alone. Where the outbound listener has a hostname of its own the path is reachable, the picker offers it, and the save stores it; a path already stored gets a `Warning` header naming the point, its variant and the route every address serves |
+| A path outside `/outbound`, under a configured prefix: `/<channel>/<name>` | The point answers it on its outbound listener's own address. An inbound listener that shares a hostname with that listener forwards `/outbound` and nothing else, so the path is not reachable through the inbound address | Refused where **the point's own outbound listener** shares a hostname with an inbound listener, `400` with the code `listen_path_not_served`, which is also where the Surface Builder offers the `/outbound` prefixes alone. The listener is the point's `listen_address`, or the surface's `outbound_listen_address`, so one point may be held to the outbound prefix while another on a listener of its own is not. Where that listener has a hostname of its own the path is reachable, the picker offers it, and the save stores it; a path already stored gets a `Warning` header naming the point, its variant and the route it would otherwise answer on |
 
 Both refusals name the Transit Point, its variant and what to do instead, and apply only to a
 path the save introduces or changes. The same Transit Point, in the same variant, keeping the
@@ -139,7 +139,17 @@ cannot be enabled until the path changes.
 
 `outbound_channel_path_prefix` of `GET /v1/config/surface-routing` names each surface prefix
 under `/outbound`: prefixes to build a `listen_path` under, never values to set, since a surface
-prefix of `/` leaves the bare `/outbound` there.
+prefix of `/` leaves the bare `/outbound` there. A path built under any of them is accepted,
+that root prefix included, so `/outbound/<name>` saves on a gateway whose only channel is `/`;
+the bare `/outbound` itself is still refused. A root channel has no usable plain form, since
+that would be the whole listener, so only its `/outbound` form is a prefix anything may be set
+under.
+
+A Transit Point that sets no `listen_path` is unaffected, except for one case: the outbound
+listener registers routes for the base surface's Transit Points, and builds each variant's `$`
+route from a base point's alias, so **an alias only a variant defines has no route of its own**.
+Such a point is reachable at its `listen_path` or not at all, and a refusal or warning about it
+says so rather than naming a route that does not exist.
 
 Known limitation: a `listen_path` already on disk is served as stored. One the router cannot
 register still panics the outbound listener build, and a stored `/outbound` still answers every

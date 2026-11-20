@@ -648,24 +648,74 @@ pub(crate) fn shares_an_outbound_hostname(network_config: &crate::config::Networ
         .any(|listener| find_shared_outbound_listener(network_config, listener.port).is_some())
 }
 
+/// Whether the outbound listener `point` answers on shares a hostname with an
+/// inbound listener, so that the inbound listener forwards
+/// [`TP_OUTBOUND_PATH_PREFIX`] to it and a path outside that prefix is reached
+/// on the outbound listener's own address alone.
+///
+/// Resolved per Transit Point, from its own `listen_address` or the surface's
+/// `outbound_listen_address`: an appliance can serve one point on a listener
+/// that shares the inbound hostname and another on a listener of its own, and
+/// only the first is held to the outbound prefix. An address that resolves to
+/// no configured outbound listener falls back to the appliance-wide answer
+/// ([`shares_an_outbound_hostname`]), which is all the gateway can say about a
+/// listener it cannot identify.
+fn point_listener_shares_an_inbound_hostname(
+    network_config: &crate::config::NetworkConfig,
+    surface: &crate::config::agent_surface::AgentSurface,
+    point: &crate::config::agent_surface::TransitPoint,
+) -> bool {
+    let address = point
+        .listen_address
+        .as_deref()
+        .or_else(|| {
+            surface
+                .transit
+                .as_ref()
+                .and_then(|transit| {
+                    transit
+                        .outbound_listen_address
+                        .as_deref()
+                })
+        });
+    let Some(port) = address.and_then(|address| network_config.map_url_to_port_for_type(address, Some("outbound")))
+    else {
+        return shares_an_outbound_hostname(network_config);
+    };
+    let listener_hostnames: std::collections::HashSet<String> = network_config
+        .listeners
+        .iter()
+        .filter(|listener| listener.listener_type == "outbound" && listener.port == port)
+        .flat_map(|listener| listener.external_urls.iter())
+        .filter_map(|url| extract_hostname(url))
+        .collect();
+    if listener_hostnames.is_empty() {
+        return shares_an_outbound_hostname(network_config);
+    }
+    network_config
+        .listeners
+        .iter()
+        .filter(|listener| listener.listener_type == "inbound")
+        .flat_map(|listener| listener.external_urls.iter())
+        .filter_map(|url| extract_hostname(url))
+        .any(|hostname| listener_hostnames.contains(&hostname))
+}
+
 /// What an operator is told on a save about each `listen_path` the gateway
 /// cannot serve as the Transit Point means it ([`listen_path_problems`]).
 ///
-/// For a path outside [`TP_OUTBOUND_PATH_PREFIX`] the warning is the whole
-/// answer, and it is named only where an inbound listener shares the outbound
-/// one's hostname, since that is when it stops being reachable: the Transit
-/// Point still answers it on the outbound listener's own address, so the save
-/// is stored. The other two are wrong on any deployment and the save that
-/// introduces one is refused (`check_listen_paths`), so they reach a warning
-/// only for a path a surface already holds.
+/// Every problem is told: a path outside [`TP_OUTBOUND_PATH_PREFIX`] is one
+/// only where the point's own listener shares an inbound hostname, which
+/// [`listen_path_problems`] decides per point, and the other three are wrong on
+/// any deployment. The save that introduces any of them is refused
+/// (`check_listen_paths`), so a warning is what a path a surface already holds
+/// gets.
 pub(crate) fn listen_path_warnings(
     network_config: &crate::config::NetworkConfig,
     surface: &crate::config::agent_surface::AgentSurface,
 ) -> Vec<String> {
-    let shared_hostname = shares_an_outbound_hostname(network_config);
     listen_path_problems(surface, network_config)
         .into_iter()
-        .filter(|problem| shared_hostname || problem.code != LISTEN_PATH_NOT_SERVED)
         .map(|problem| problem.message)
         .collect()
 }
@@ -720,18 +770,29 @@ fn is_under_outbound_prefix(path: &str) -> bool {
 /// address shared with an inbound listener, where only those are forwarded.
 /// The admin API takes the same list, so a `listen_path` it stores is one the
 /// dashboard could have composed.
+///
+/// A channel prefix of `/` leaves the bare outbound prefix, which is what
+/// `outbound_channel_path_prefix` of `GET /v1/config/surface-routing`
+/// advertises for it, so a path built under it is accepted here. Its plain
+/// form is the whole listener and is not a prefix anything may be set under,
+/// and the bare prefix itself is still refused as
+/// [`LISTEN_PATH_IS_OUTBOUND_PREFIX`], before this list is consulted.
 pub(crate) fn listen_path_prefixes(network_config: &crate::config::NetworkConfig) -> Vec<String> {
     let outbound = crate::proxy::outbound_handler::TP_OUTBOUND_PATH_PREFIX;
     network_config
         .channels
         .iter()
-        .filter_map(|channel| {
+        .flat_map(|channel| {
             let prefix = channel
                 .prefix
                 .trim_end_matches('/');
-            (!prefix.is_empty()).then(|| [format!("{outbound}{prefix}"), prefix.to_string()])
+            let under_outbound = format!("{outbound}{prefix}");
+            if prefix.is_empty() {
+                vec![under_outbound]
+            } else {
+                vec![under_outbound, prefix.to_string()]
+            }
         })
-        .flatten()
         .collect()
 }
 
@@ -779,25 +840,54 @@ pub(crate) const LISTEN_PATH_NOT_SERVED: &str = "listen_path_not_served";
 /// What is wrong with one Transit Point's `listen_path`: what claims it, the
 /// code that tells it apart, and what the operator is told, as the refusal of
 /// a save that introduces it or as the `Warning` header of one that is stored.
+#[derive(Debug)]
 pub(crate) struct ListenPathProblem<'a> {
     pub claim: ListenPathClaim<'a>,
     pub code: &'static str,
     pub message: String,
 }
 
-/// The route the gateway derives for one Transit Point, which every address
-/// serves: the surface's own under [`TP_OUTBOUND_PATH_PREFIX`], or, for a point
-/// a variant defines, that variant's `$` route.
-fn derived_outbound_path(
+/// The route the outbound listener registers for one Transit Point beside any
+/// `listen_path`: the surface's own under [`TP_OUTBOUND_PATH_PREFIX`], or, for
+/// a point a variant defines, that variant's `$` route.
+///
+/// `None` for an alias only a variant defines. The router registers routes from
+/// the base surface's Transit Points alone (`group_outbound_vcs_by_port` reads
+/// `surface.transit.points`) and builds each variant route from a base point's
+/// alias, so a variant-only alias has no route of its own and is reachable at
+/// its `listen_path` or not at all. Nothing may recommend a route for it:
+/// following that advice would reach another point's Target, or nothing.
+fn derived_outbound_route(
+    surface: &crate::config::agent_surface::AgentSurface,
+    variant: Option<&str>,
+    alias: &str,
+) -> Option<String> {
+    let Some(variant) = variant else {
+        return Some(crate::proxy::outbound_handler::transit_point_outbound_path(surface.route(), alias));
+    };
+    let registered_in_base = surface
+        .transit
+        .iter()
+        .flat_map(|transit| transit.points.iter())
+        .any(|point| point.alias == alias);
+    registered_in_base
+        .then(|| crate::proxy::outbound_handler::transit_point_variant_outbound_path(surface.route(), variant, alias))
+}
+
+/// How a refusal or a warning tells the operator to reach this Transit Point
+/// without a `listen_path` of its own: the route the gateway derives, or, for
+/// an alias only a variant defines, that there is none
+/// ([`derived_outbound_route`]).
+fn derived_route_advice(
     surface: &crate::config::agent_surface::AgentSurface,
     variant: Option<&str>,
     alias: &str,
 ) -> String {
-    match variant {
-        Some(variant) => {
-            crate::proxy::outbound_handler::transit_point_variant_outbound_path(surface.route(), variant, alias)
-        }
-        None => crate::proxy::outbound_handler::transit_point_outbound_path(surface.route(), alias),
+    match derived_outbound_route(surface, variant, alias) {
+        Some(route) => format!("or leave it unset to take '{route}'"),
+        None => "and keep it: the outbound listener registers no route of its own for a Transit Point only a \
+                 variant defines, so a listen_path is the only way to reach this one"
+            .to_string(),
     }
 }
 
@@ -860,13 +950,20 @@ pub(crate) fn listen_path_problems<'a>(
                     code: LISTEN_PATH_NOT_A_CHANNEL_PREFIX,
                     message: format!(
                         "{named} has listen_path '{path}', under no surface prefix this gateway serves Transit \
-                         Points on. Set a listen_path with a segment of its own under one of {offered}, or leave \
-                         it unset to take '{}'.",
-                        derived_outbound_path(surface, variant, &point.alias)
+                         Points on. Set a listen_path with a segment of its own under one of {offered}, {}.",
+                        derived_route_advice(surface, variant, &point.alias)
                     ),
                 });
             }
             if is_under_outbound_prefix(path) {
+                return None;
+            }
+            // Reachable where the point's own outbound listener has a hostname
+            // of its own: only an inbound listener answering on that listener's
+            // hostname hides a path outside the prefix, and an appliance can
+            // serve one point on such a listener and another on a listener of
+            // its own.
+            if !point_listener_shares_an_inbound_hostname(network_config, surface, point) {
                 return None;
             }
             Some(ListenPathProblem {
@@ -874,10 +971,9 @@ pub(crate) fn listen_path_problems<'a>(
                 code: LISTEN_PATH_NOT_SERVED,
                 message: format!(
                     "{named} has listen_path '{path}', outside '{prefix}'. It answers on the outbound listener \
-                     alone, so an inbound listener sharing that listener's hostname does not reach it; the route \
-                     every address serves is '{}'. Set a listen_path under '{prefix}', or leave it unset to take \
-                     the route the gateway derives.",
-                    derived_outbound_path(surface, variant, &point.alias)
+                     alone, and an inbound listener shares that listener's hostname, so it is not reached there. \
+                     Set a listen_path under '{prefix}', {}.",
+                    derived_route_advice(surface, variant, &point.alias)
                 ),
             })
         })
@@ -3934,9 +4030,9 @@ mod tests {
                 (
                     LISTEN_PATH_NOT_SERVED,
                     "Transit Point 'outside' has listen_path '/transit/outside', outside '/outbound'. It answers \
-                     on the outbound listener alone, so an inbound listener sharing that listener's hostname does \
-                     not reach it; the route every address serves is '/outbound/example/outside'. Set a listen_path \
-                     under '/outbound', or leave it unset to take the route the gateway derives."
+                     on the outbound listener alone, and an inbound listener shares that listener's hostname, so \
+                     it is not reached there. Set a listen_path under '/outbound', or leave it unset to take \
+                     '/outbound/example/outside'."
                 ),
                 (
                     LISTEN_PATH_NOT_A_CHANNEL_PREFIX,
@@ -3967,10 +4063,10 @@ mod tests {
                 (
                     LISTEN_PATH_NOT_SERVED,
                     "Transit Point 'variant-outside' in variant 'candidate' has listen_path '/transit/variant-hook', \
-                     outside '/outbound'. It answers on the outbound listener alone, so an inbound listener sharing \
-                     that listener's hostname does not reach it; the route every address serves is \
-                     '/outbound/example$candidate/variant-outside'. Set a listen_path under '/outbound', or leave it \
-                     unset to take the route the gateway derives."
+                     outside '/outbound'. It answers on the outbound listener alone, and an inbound listener \
+                     shares that listener's hostname, so it is not reached there. Set a listen_path under \
+                     '/outbound', and keep it: the outbound listener registers no route of its own for a Transit \
+                     Point only a variant defines, so a listen_path is the only way to reach this one."
                 ),
             ]
         );
@@ -3995,9 +4091,14 @@ mod tests {
     }
 
     /// A gateway configuring the surface prefixes `/example` and `/transit`,
-    /// the two a Transit Point's `listen_path` may be set under.
+    /// the two a Transit Point's `listen_path` may be set under, whose inbound
+    /// listener answers on its outbound listener's hostname, so a path outside
+    /// the outbound prefix is not reached there.
     fn channel_config() -> crate::config::NetworkConfig {
-        make_network_config_with_listeners(vec!["https://inbound.example.com"], vec!["https://outbound.example.com"])
+        make_network_config_with_listeners(
+            vec!["https://gateway.example.com"],
+            vec!["https://gateway.example.com:9000"],
+        )
     }
 
     #[test]
@@ -4019,6 +4120,119 @@ mod tests {
         assert!(told[1].starts_with("Transit Point 'prefix': "), "{told:?}");
         assert!(told[2].starts_with("Transit Point 'malformed': "), "{told:?}");
         assert!(told[3].starts_with("Transit Point 'lookalike' "), "{told:?}");
+    }
+
+    /// A gateway whose inbound listener shares a hostname with one outbound
+    /// listener, on port 9000, while a second outbound listener on 9100 has a
+    /// hostname of its own.
+    fn config_with_one_shared_and_one_separate_outbound_listener() -> crate::config::NetworkConfig {
+        serde_json::from_value(serde_json::json!({
+            "did": { "domain": "gateway.example.com" },
+            "webauthn": { "rp_id": "gateway.example.com", "external_origin": "https://gateway.example.com" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [
+                { "id": "in", "name": "In", "bind_address": "0.0.0.0", "port": 8080, "protocol": "https",
+                    "external_urls": ["https://gateway.example.com"], "listener_type": "inbound" },
+                { "id": "out-shared", "name": "Shared", "bind_address": "0.0.0.0", "port": 9000,
+                    "protocol": "https", "external_urls": ["https://gateway.example.com:9000"],
+                    "listener_type": "outbound" },
+                { "id": "out-own", "name": "Own", "bind_address": "0.0.0.0", "port": 9100, "protocol": "https",
+                    "external_urls": ["https://partner.example.com:9100"], "listener_type": "outbound" }
+            ],
+            "channels": [{ "id": "transit", "name": "Transit", "prefix": "/transit" }],
+            "routes": {}
+        }))
+        .expect("two outbound listeners")
+    }
+
+    #[test]
+    fn a_path_outside_the_prefix_is_judged_by_the_listener_its_own_point_answers_on() {
+        let network = config_with_one_shared_and_one_separate_outbound_listener();
+        let surface = surface_with_points(
+            serde_json::json!([
+                { "alias": "on-shared", "target_endpoint": "https://a.example", "listen_path": "/transit/a" },
+                { "alias": "on-own", "target_endpoint": "https://b.example", "listen_path": "/transit/b",
+                    "listen_address": "https://partner.example.com:9100" }
+            ]),
+            serde_json::json!([]),
+        );
+
+        let problems = listen_path_problems(&surface, &network);
+
+        assert_eq!(problems.len(), 1, "only the point on the shared listener is unreachable: {problems:?}");
+        assert_eq!(problems[0].claim, (None, "on-shared", "/transit/a"));
+        assert_eq!(problems[0].code, LISTEN_PATH_NOT_SERVED);
+    }
+
+    #[test]
+    fn a_root_surface_prefix_is_offered_and_taken_as_the_bare_outbound_prefix() {
+        let network: crate::config::NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "gateway.example.com" },
+            "webauthn": { "rp_id": "gateway.example.com", "external_origin": "https://gateway.example.com" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "channels": [{ "id": "root", "name": "Root", "prefix": "/" }],
+            "routes": {}
+        }))
+        .expect("root channel");
+
+        // The plain form of a root prefix is the whole listener, so only its
+        // `/outbound` form is a prefix anything may be set under.
+        assert_eq!(listen_path_prefixes(&network), vec!["/outbound".to_string()]);
+
+        let surface = surface_with_points(
+            serde_json::json!([{ "alias": "pa", "target_endpoint": "https://a.example",
+                "listen_path": "/outbound/partner-alpha" }]),
+            serde_json::json!([]),
+        );
+        assert!(
+            listen_path_problems(&surface, &network).is_empty(),
+            "a path built under the advertised root prefix must be served"
+        );
+
+        let bare = surface_with_points(
+            serde_json::json!([{ "alias": "pa", "target_endpoint": "https://a.example", "listen_path": "/outbound" }]),
+            serde_json::json!([]),
+        );
+        assert_eq!(
+            listen_path_problems(&bare, &network)[0].code,
+            LISTEN_PATH_IS_OUTBOUND_PREFIX,
+            "the bare prefix is still refused"
+        );
+    }
+
+    #[test]
+    fn the_outbound_router_groups_only_the_base_surface_s_transit_points() {
+        // What makes a variant-only alias unreachable, and so what no refusal
+        // may recommend a route for: the router registers routes from these
+        // points alone, and builds each variant route from a base point's alias.
+        let surface = surface_with_points(
+            serde_json::json!([{ "alias": "pa", "target_endpoint": "https://a.example" }]),
+            serde_json::json!([{ "alias": "pb", "target_endpoint": "https://b.example" }]),
+        );
+
+        let grouped =
+            crate::config::types::group_outbound_vcs_by_port(std::slice::from_ref(&surface), &[9000], |_address| {
+                Some(9000)
+            });
+
+        let aliases: Vec<&str> = grouped[&9000]
+            .iter()
+            .flat_map(|(_surface, points)| points.iter())
+            .map(|point| point.alias.as_str())
+            .collect();
+        assert_eq!(aliases, vec!["pa"], "the variant-only alias 'pb' gets no route of its own");
+        assert_eq!(derived_outbound_route(&surface, None, "pa"), Some("/outbound/example/pa".to_string()));
+        assert_eq!(
+            derived_outbound_route(&surface, Some("candidate"), "pa"),
+            Some("/outbound/example$candidate/pa".to_string()),
+            "a base alias is registered under each variant too"
+        );
+        assert_eq!(
+            derived_outbound_route(&surface, Some("candidate"), "pb"),
+            None,
+            "nothing may be recommended for an alias only the variant defines"
+        );
     }
 
     #[test]

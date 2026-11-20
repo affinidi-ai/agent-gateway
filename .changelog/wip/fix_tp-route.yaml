@@ -46,19 +46,6 @@ changes:
         hostname of its own the path is reachable, the picker offers it and the save stores it; a
         path a surface is already stored with is answered with a Warning header rather than
         refused, so such a surface stays editable.
-    - timestamp: '2026-11-20T13:30:00Z'
-      title: ⭐ Hold a Transit Point listen_path to the prefixes the Surface Builder offers
-      description: >-
-        The Surface Builder composes a Transit Point's listen_path from a picker: one of the
-        surface prefixes gateway.json configures in channels, with /outbound in front on an
-        outbound address shared with an inbound listener, then a path of your own. The admin API
-        took any path at all, so it stored Transit Points the dashboard could not have made and
-        could not edit, among them paths claiming a route under another surface's prefix, which
-        the outbound listener either shadowed or dropped as a duplicate. A listen_path must now be
-        under one of those same prefixes, with or without /outbound, with a segment of its own
-        after it, and a save that introduces anything else is refused with 400 and the code
-        listen_path_not_a_channel_prefix, naming the Transit Point, its variant and the prefixes
-        the gateway does offer.
     - timestamp: '2026-11-20T12:10:00Z'
       title: Refuse a Transit Point listen_path with a legacy parameter segment
       description: >-
@@ -86,4 +73,21 @@ changes:
         surface holds can end the header value or introduce a line break, and a warning about such a
         value is still delivered instead of being dropped whole, which is what the header library's
         own refusal did before.
-  breaking: []
+  breaking:
+    - timestamp: '2026-11-20T13:30:00Z'
+      title: ⭐ Hold a Transit Point listen_path to the prefixes the Surface Builder offers
+      description: >-
+        The Surface Builder composes a Transit Point's listen_path from a picker: one of the
+        surface prefixes gateway.json configures in channels, with /outbound in front on an
+        outbound address shared with an inbound listener, then a path of your own. The admin API
+        took any path at all, so it stored Transit Points the dashboard could not have made and
+        could not edit, among them paths claiming a route under another surface's prefix, which
+        the outbound listener either shadowed or dropped as a duplicate. A listen_path must now be
+        under one of those same prefixes, with or without /outbound, with a segment of its own
+        after it, and a save that introduces anything else is refused with 400 and the code
+        listen_path_not_a_channel_prefix, naming the Transit Point, its variant and the prefixes
+        the gateway does offer. This refuses saves every deployment accepted until now, with no
+        setting to turn it off: an API client or integration that creates a Transit Point on a
+        path outside those prefixes, such as /partner-a-webhook, is refused on upgrade and must
+        move the path under a configured prefix. A listen_path already stored keeps working and
+        keeps saving, so no running surface stops serving.

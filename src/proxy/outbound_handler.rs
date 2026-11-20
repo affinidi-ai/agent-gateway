@@ -23,12 +23,9 @@ pub fn transit_point_outbound_path(
     route: &str,
     alias: &str,
 ) -> String {
+    // A route of `/` trims to empty, so one branch covers both.
     let route = route.trim_end_matches('/');
-    if route.is_empty() || route == "/" {
-        format!("{TP_OUTBOUND_PATH_PREFIX}/{alias}")
-    } else {
-        format!("{TP_OUTBOUND_PATH_PREFIX}{route}/{alias}")
-    }
+    format!("{TP_OUTBOUND_PATH_PREFIX}{route}/{alias}")
 }
 
 /// The path a Transit Point a variant defines answers on: the surface's
