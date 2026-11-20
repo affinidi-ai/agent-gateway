@@ -1354,3 +1354,34 @@ async fn the_policy_card_read_logs_the_card_location_and_the_cards_url_redacted(
         assert!(!logs.contains(value), "{what} was logged");
     }
 }
+
+/// A variant that keeps the base surface's id but adds Response authentication is not served
+/// the base's cached policy card: its own read refuses the Target's answer without the key.
+#[tokio::test]
+async fn the_policy_card_cache_keeps_a_variants_response_authentication_apart() {
+    use axum::response::IntoResponse;
+    let app = axum::Router::new()
+        .fallback(|| async { ([("content-type", "application/json")], r#"{"name":"unkeyed"}"#).into_response() });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let target = format!("http://{}", listener.local_addr().unwrap());
+    let _server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .ok();
+    });
+    let (_dir, secrets) = crate::proxy::response_auth::bravo_key_store().await;
+    let base = surface("a2a", &target, &[]);
+    let mut variant = serde_json::to_value(&base).unwrap();
+    variant["target"]["response_auth"] = crate::proxy::response_auth::api_key_bravo();
+    let variant: AgentSurface = serde_json::from_value(variant).unwrap();
+    let read = |surface: AgentSurface| {
+        super::TEST_SECRETS_STORE
+            .scope(secrets.clone(), async move { super::policy_agent_card(&surface, SURFACE_ID).await })
+    };
+
+    assert_eq!(read(base).await, Some(json!({ "name": "unkeyed" })), "the base surface's card");
+    assert_eq!(variant.surface_id, SURFACE_ID);
+    assert_eq!(read(variant).await, None, "the variant was served the base's card");
+}

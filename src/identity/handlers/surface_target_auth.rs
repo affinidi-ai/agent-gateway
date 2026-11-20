@@ -248,19 +248,6 @@ fn legs<'a>(
         });
     let mut legs = Vec::new();
     if let Some(authentication) = view.target.auth.as_ref() {
-        let mut other_headers: Vec<(String, &'static str)> = bindings
-            .clone()
-            .map(|name| (name, "a credential binding"))
-            .collect();
-        other_headers.extend(
-            forwarded_source_auth_headers(view)
-                .into_iter()
-                .map(|name| (name, "source authentication")),
-        );
-        other_headers.extend(mapped_headers(
-            view.access_point
-                .header_metadata_mapping_if_supported(),
-        ));
         legs.push(Leg {
             variant_id: variant.map(|(id, _)| id),
             transit_point_id: None,
@@ -269,7 +256,7 @@ fn legs<'a>(
             authentication,
             checks_callers: view.authenticates_callers(),
             caller_check: "source authentication on the Access Point",
-            other_headers,
+            other_headers: target_leg_headers(view),
         });
     }
     for point in view
@@ -308,6 +295,31 @@ fn legs<'a>(
         });
     }
     legs
+}
+
+/// The headers other than `target.auth`'s that a request to `view`'s Target can carry, each
+/// with what sends it.
+pub(super) fn target_leg_headers(view: &AgentSurface) -> Vec<(String, &'static str)> {
+    let mut headers: Vec<(String, &'static str)> = view
+        .outbound_credentials
+        .iter()
+        .filter_map(|binding| {
+            binding
+                .inject_as
+                .header_name()
+        })
+        .map(|name| (name.to_string(), "a credential binding"))
+        .collect();
+    headers.extend(
+        forwarded_source_auth_headers(view)
+            .into_iter()
+            .map(|name| (name, "source authentication")),
+    );
+    headers.extend(mapped_headers(
+        view.access_point
+            .header_metadata_mapping_if_supported(),
+    ));
+    headers
 }
 
 /// Each rule `leg` breaks, worded to follow the leg's field name, with the credential policy

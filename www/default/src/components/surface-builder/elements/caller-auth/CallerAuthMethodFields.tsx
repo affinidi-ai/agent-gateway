@@ -1,7 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { flushSync } from 'react-dom';
 import { useParams } from 'react-router-dom';
-import { apiClient } from '../../../../api';
 import AddResourceLink from '../../../shared/AddResourceLink';
 import { deepLinks } from '../../../../utils/deepLinks';
 import type { ConfigPanelProps } from '../types';
@@ -13,14 +12,7 @@ import {
   readsAuthorizationHeader,
   usesBearerScheme,
 } from './protectedResource';
-import { useApiKeySecrets, useJwtStrategies } from './useCallerAuthOptions';
-
-interface Certificate {
-  id: string;
-  name: string;
-  active: boolean;
-  expires_at?: string;
-}
+import { useApiKeySecrets, useCertificates, useJwtStrategies } from './useCallerAuthOptions';
 
 type CallerAuthMethodFieldsProps = Pick<
   ConfigPanelProps,
@@ -53,25 +45,11 @@ const CallerAuthMethodFields: React.FC<CallerAuthMethodFieldsProps> = ({
   const method: CallerAuthMethodType = (config.method_type as CallerAuthMethodType) || 'jwt_bearer';
   const { surfaceId } = useParams<{ surfaceId: string }>();
   const jwtStrategies = useJwtStrategies();
-  const [certificates, setCertificates] = useState<Certificate[]>([]);
   const { secrets: apiKeySecrets, loading: loadingApiKeySecrets } = useApiKeySecrets(
     method === 'api_key'
   );
-  const [loadingCertificates, setLoadingCertificates] = useState(false);
+  const { certificates, loading: loadingCertificates } = useCertificates(method === 'mtls');
   const [audienceInput, setAudienceInput] = useState('');
-
-  useEffect(() => {
-    if (method !== 'mtls') return;
-    setLoadingCertificates(true);
-    apiClient
-      .get('/certificates')
-      .then(res => {
-        const list: Certificate[] = Array.isArray(res.data) ? res.data : [];
-        setCertificates(list.filter(c => c.active));
-      })
-      .catch(() => setCertificates([]))
-      .finally(() => setLoadingCertificates(false));
-  }, [method]);
 
   const audiences: string[] = Array.isArray(config.audiences) ? config.audiences : [];
   const audienceClaim: JwtAudienceClaim = config.jwt_audience_claim ?? 'aud';

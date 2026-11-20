@@ -36,6 +36,10 @@ import {
   savedAccessPointStatus,
 } from '../components/surface-builder/elements/access-point/readiness';
 import {
+  variantsWithoutResponseAuth,
+  withResponseAuth,
+} from '../components/surface-builder/elements/managed-agent/responseAuth';
+import {
   DEFAULT_DIDWEBVH_CONFIG,
   type DidwebvhConfig,
 } from '../components/surface-builder/SurfaceMetaContext';
@@ -1704,6 +1708,16 @@ const SurfaceDetailPage: React.FC = () => {
   // Stored without `public`: turning Public access off keeps `public` unset.
   const legacyAccessPoint = !!surface && typeof surface.access_point?.public !== 'boolean';
   const refusingRequests = surface?.serving_status === 'not_serving';
+  const variantsMissingResponseAuth =
+    activeSnapshotId === BASE_VARIANT_ID
+      ? variantsWithoutResponseAuth(variantSnapshots.variants, getVariantSnapshot)
+      : [];
+  const copyResponseAuthToVariants = (value: unknown) => {
+    for (const v of variantsMissingResponseAuth) {
+      setVariantSnapshot(v.id, withResponseAuth(getVariantSnapshot(v.id), value));
+    }
+    scheduleSnap('commit');
+  };
 
   const policyDefinitionsSaveBlocker = surfacePolicyBlockingReason(
     builder.state.nodes,
@@ -1798,6 +1812,8 @@ const SurfaceDetailPage: React.FC = () => {
         legacyAccessPoint={legacyAccessPoint}
         apiKeyStatuses={apiKeyStatuses}
         authorityDids={authorityDids}
+        variantsWithoutResponseAuth={variantsMissingResponseAuth.map(v => v.alias)}
+        onCopyResponseAuthToVariants={canEdit ? copyResponseAuthToVariants : undefined}
         surfaceId={surface?.surface_id}
         tenantId={surface ? (surface.tenant_id ?? null) : undefined}
         lastActivity={

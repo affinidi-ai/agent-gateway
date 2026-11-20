@@ -1,6 +1,6 @@
 use crate::bdd_support::config::mcp_proxy::McpProxyFixture;
 use crate::bdd_support::config::single_surface_fixture::{
-    McpToolPolicyFixture, SurfaceTargetAuthConfig, SurfaceTargetAuthProviderConfig,
+    McpToolPolicyFixture, ResponseAuthFixture, SurfaceTargetAuthConfig, SurfaceTargetAuthProviderConfig,
 };
 
 #[derive(Debug, Clone)]
@@ -27,6 +27,8 @@ pub struct SurfaceSpec {
     /// provider's token endpoint and sets `token_endpoint` before the gateway starts; one
     /// surface per gateway may use it.
     pub target_auth_provider: Option<SurfaceTargetAuthProviderConfig>,
+    /// The surface's `target.response_auth` by API key, and the secret it names.
+    pub response_auth: Option<ResponseAuthFixture>,
     pub source_auth: Option<SourceAuthSpec>,
     pub inbound_policy_rego: Option<String>,
     /// Surface-level request policy (`target.policy`) written into the config at boot.
@@ -121,6 +123,7 @@ impl SurfaceSpec {
             target_endpoint: target_endpoint.to_string(),
             target_auth: None,
             target_auth_provider: None,
+            response_auth: None,
             source_auth: None,
             inbound_policy_rego: None,
             target_policy_rego: None,
