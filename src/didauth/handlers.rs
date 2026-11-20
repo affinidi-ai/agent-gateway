@@ -387,7 +387,6 @@ mod tests {
         let state = DidAuthHandlerState {
             session_store: Arc::new(DidAuthSessionStore::new()),
             config: Arc::new(DidAuthAuthConfig {
-                id: None,
                 extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
                     field: "X-DID-Auth-Session".to_string(),
                 },

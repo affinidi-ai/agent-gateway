@@ -15,7 +15,6 @@ const SURFACE_ID = 'ui-test-identity-per-method';
 
 const JWT_METHOD = {
     type: 'jwt_bearer',
-    id: 'users-jwt',
     jwt_verification_strategy_id: 'idp',
     audiences: ['api://agent'],
     token_header: 'Authorization',
@@ -25,7 +24,6 @@ const JWT_METHOD = {
 
 const API_KEY_METHOD = {
     type: 'api_key',
-    id: 'partner-key',
     extraction: {source: 'http_header', field: 'X-API-Key'},
     secret_id: 'partner-keys',
 };

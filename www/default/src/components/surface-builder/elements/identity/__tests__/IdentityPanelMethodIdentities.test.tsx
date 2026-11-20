@@ -9,13 +9,11 @@ import type { CanvasNode } from '../../types';
 jest.mock('../../../../../api', () => ({ apiClient: { fetch: jest.fn(), get: jest.fn() } }));
 
 const JWT = {
-  id: 'users-jwt',
   method_type: 'jwt_bearer',
   jwt_strategy_id: 'idp',
   jwt_token_header: 'Authorization',
 };
 const API_KEY = {
-  id: 'partner-key',
   method_type: 'api_key',
   extraction_source: 'http_header',
   extraction_field: 'X-API-Key',
@@ -83,6 +81,19 @@ describe('Identity caller identity per method', () => {
     });
     expect(updateNodeFields).toHaveBeenCalledWith('caller-auth', {
       methods: [JWT, { ...API_KEY, identity: { type: 'from_api_key' } }],
+    });
+  });
+
+  it('namespaces the claim of a new JWT method identity by the token issuer', () => {
+    const { updateNodeFields } = renderPanel([JWT, API_KEY], { type: 'from_api_key' });
+    fireEvent.change(screen.getByTestId(`${row(0)}-select`), {
+      target: { value: 'from_jwt_claim' },
+    });
+    expect(updateNodeFields).toHaveBeenCalledWith('caller-auth', {
+      methods: [
+        { ...JWT, identity: { type: 'from_jwt_claim', claim: 'oid', namespace_claims: ['iss'] } },
+        API_KEY,
+      ],
     });
   });
 

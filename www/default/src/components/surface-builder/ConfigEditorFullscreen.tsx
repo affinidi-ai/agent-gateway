@@ -43,7 +43,7 @@ const ConfigEditorFullscreen: React.FC<ConfigEditorFullscreenProps> = ({
   const updateFields = (fields: Record<string, any>) => {
     onUpdate(node.id, { ...node.config, ...fields });
   };
-  const updateNodeFields = (nodeId: string, fields: Record<string, any>) => {
+  const updateNodeFields = (nodeId: string, fields: Record<string, unknown>) => {
     const target = allNodes?.find(candidate => candidate.id === nodeId);
     if (target) onUpdate(nodeId, { ...target.config, ...fields });
   };

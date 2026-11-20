@@ -1538,7 +1538,6 @@ async fn access_point_tool_scoped_credentials_flow() {
             on_failure: crate::config::agent_surface::OnFailure::Continue,
             methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
                 identity: None,
-                id: None,
                 extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
                     field: "x-api-key".to_string(),
                 },

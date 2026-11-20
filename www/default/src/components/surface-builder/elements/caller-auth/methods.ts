@@ -11,10 +11,6 @@ export const LATER_JWT_BEARER_BESIDE_DISCOVERY =
  * shape (`method_type`, `jwt_strategy_id`, `extraction_field`, …).
  */
 export interface CallerAuthMethodConfig {
-  /** Stable id of the method within its list. Never shown. */
-  id?: string;
-  /** The id was made here, not stored, and is never saved. */
-  id_generated?: boolean;
   /**
    * How this method's callers' identity is derived from the credential they
    * present; unset, the surface's inbound Identity applies. Edited in the
@@ -89,47 +85,9 @@ export const CALLER_AUTH_METHOD_SHORT_LABEL: Record<CallerAuthMethodType, string
   mtls: 'mTLS',
 };
 
-const METHOD_ID_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789';
-
-/** A new method id: lowercase letters, digits and dashes, at most 32 characters. */
-export function newMethodId(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(8));
-  const random = Array.from(
-    bytes,
-    byte => METHOD_ID_ALPHABET[byte % METHOD_ID_ALPHABET.length]
-  ).join('');
-  return `method-${random}`;
-}
-
-/**
- * Gives every method without an id one, named by its position: a surface
- * stored before ids existed gets the same ids on every load, so nothing looks
- * edited, and an id already taken is never reused.
- */
-export function withMethodIds(methods: CallerAuthMethodConfig[]): CallerAuthMethodConfig[] {
-  const taken = new Set(methods.map(method => method.id).filter(Boolean));
-  return methods.map((method, position) => {
-    if (method.id) return method;
-    let n = position + 1;
-    while (taken.has(`method-${n}`)) n += 1;
-    taken.add(`method-${n}`);
-    return { ...method, id: `method-${n}`, id_generated: true };
-  });
-}
-
 export function defaultMethodConfig(
   type: CallerAuthMethodType,
   current: CallerAuthMethodConfig = {}
-): CallerAuthMethodConfig {
-  const id = current.id
-    ? { id: current.id, ...(current.id_generated ? { id_generated: true } : {}) }
-    : { id: newMethodId(), id_generated: true };
-  return { ...methodConfigFor(type, current), ...id };
-}
-
-function methodConfigFor(
-  type: CallerAuthMethodType,
-  current: CallerAuthMethodConfig
 ): CallerAuthMethodConfig {
   switch (type) {
     case 'jwt_bearer':
@@ -254,15 +212,11 @@ export function buildMethod(c: CallerAuthMethodConfig, surfaceId: string | undef
   const method = buildMethodBody(c, surfaceId);
   if (!method) return method;
   const identity = methodIdentityWire(c);
-  return {
-    ...method,
-    ...(c.id && !c.id_generated ? { id: c.id } : {}),
-    ...(identity ? { identity } : {}),
-  };
+  return identity ? { ...method, identity } : method;
 }
 
 /** The method's own identity on the wire, when it is one its credential supplies. */
-function methodIdentityWire(c: CallerAuthMethodConfig): any {
+function methodIdentityWire(c: CallerAuthMethodConfig): MethodIdentity | undefined {
   const identity = c.identity;
   if (identity?.type === 'from_jwt_claim' && c.method_type === 'jwt_bearer') {
     return {
@@ -326,7 +280,6 @@ function buildMethodBody(c: CallerAuthMethodConfig, surfaceId: string | undefine
 /** The flat panel fields for one runtime `SourceAuthConfig`. */
 export function methodConfigFromPayload(m: any): CallerAuthMethodConfig {
   const out: CallerAuthMethodConfig = { method_type: m.type };
-  if (typeof m.id === 'string' && m.id) out.id = m.id;
   if (m.identity?.type === 'from_jwt_claim') {
     out.identity = {
       type: 'from_jwt_claim',

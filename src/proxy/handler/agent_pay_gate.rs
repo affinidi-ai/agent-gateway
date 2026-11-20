@@ -6532,7 +6532,6 @@ pub(crate) mod tests {
             .caller_authentication = Some(crate::config::agent_surface::CallerAuthentication {
             methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
                 identity: None,
-                id: None,
                 extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
                     field: "x-api-key".to_string(),
                 },

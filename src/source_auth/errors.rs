@@ -186,6 +186,39 @@ pub fn mismatched_caller_refusal(
     refuse_caller(protocol, false, mcp_request_id)
 }
 
+/// Record the refusal [`mismatched_caller_refusal`] answers, on the direct and
+/// Fabric paths alike: the log line, the `source_method_mismatch` metric and a
+/// blocking `auth_failed` audit record. `method` is the caller's method as
+/// configured, `resolved_method` as verified.
+pub fn record_mismatched_caller(
+    surface: &crate::config::agent_surface::AgentSurface,
+    method: &SourceAuthConfig,
+    resolved_method: &SourceAuthConfig,
+    reason: &str,
+    audit_facts: &crate::audit::request_events::RequestFacts<'_>,
+    client_ip: Option<std::net::IpAddr>,
+) {
+    tracing::warn!(
+        "[CHANNEL:{}] Caller refused: {reason}",
+        surface
+            .config_id()
+            .unwrap_or("unknown")
+    );
+    crate::metrics::backends::prometheus::track_managed_identity_resolve(
+        &surface.name,
+        surface.inbound_identity_mode_label(method),
+        "source_method_mismatch",
+        0.0,
+    );
+    crate::audit::request_events::auth_failed(
+        audit_facts,
+        crate::audit::request_events::source_auth_scheme(resolved_method),
+        "source_method_mismatch",
+        true,
+        client_ip,
+    );
+}
+
 fn refuse_caller(
     protocol: &SurfaceProtocol,
     bearer_challenge: bool,
@@ -479,7 +512,6 @@ mod tests {
     fn api_key_config() -> SourceAuthConfig {
         SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
             identity: None,
-            id: None,
             extraction: crate::source_auth::models::CredentialExtraction::HttpHeader { field: "x-api-key".to_string() },
             secret_id: "key".to_string(),
         })

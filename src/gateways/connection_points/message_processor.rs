@@ -962,7 +962,6 @@ pub(crate) fn sign_channel_did_proof(
 
 fn channel_did_proof_config() -> crate::source_auth::models::DidAuthAuthConfig {
     crate::source_auth::models::DidAuthAuthConfig {
-        id: None,
         extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
             field: "Authorization".to_string(),
         },
@@ -5146,25 +5145,22 @@ async fn process_charged_forward_request(
                 match verified {
                     Ok(identity) => {
                         if let Err(reason) = surface.inbound_identity_for(Some(auth_config)) {
-                            channel_warn!(config_id, "GW2: Caller refused: {}", reason);
-                            crate::metrics::backends::prometheus::track_managed_identity_resolve(
-                                &surface.name,
-                                surface.inbound_identity_mode_label(auth_config),
-                                "source_method_mismatch",
-                                0.0,
-                            );
-                            crate::audit::request_events::auth_failed(
+                            crate::source_auth::errors::record_mismatched_caller(
+                                &surface,
+                                auth_config,
+                                &resolved_auth_config,
+                                &reason,
                                 &audit_facts,
-                                crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
-                                "source_method_mismatch",
-                                true,
                                 None,
                             );
                             let refusal = crate::source_auth::errors::mismatched_caller_refusal(
                                 &surface.access_point.protocol,
                                 refused_mcp_request_id(&surface, &body_bytes),
                             );
-                            return axum_response_to_forward_result(refusal).await;
+                            return with_caller_refusal(
+                                axum_response_to_forward_result(refusal).await,
+                                refused_credential_header(auth_config, selection.ambiguous, &axum_headers),
+                            );
                         }
                         Some(identity)
                     }

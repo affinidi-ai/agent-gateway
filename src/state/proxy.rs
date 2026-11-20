@@ -116,6 +116,17 @@ pub struct ProxyState {
     pub served_surface: Arc<crate::config::agent_surface::AgentSurface>,
 }
 
+impl ProxyState {
+    /// The VC issuer of the channel-wide identity selector, else the gateway's
+    /// own: a caller identity a Caller Context method derives builds no selector.
+    pub fn caller_vc_issuer(&self) -> Option<Arc<crate::identity::VCIssuer>> {
+        self.identity_selector
+            .as_ref()
+            .map(|selector| selector.get_vc_issuer())
+            .or_else(|| self.vc_issuer.clone())
+    }
+}
+
 /// Surface info with routing support (includes rules engines and identity selector)
 #[derive(Clone)]
 pub struct SurfaceInfo {
