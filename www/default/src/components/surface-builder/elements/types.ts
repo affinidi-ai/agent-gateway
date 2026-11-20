@@ -208,6 +208,12 @@ export interface ConfigPanelProps {
   updateField: (field: string, value: any) => void;
   /** Update multiple config fields atomically (single onUpdate call). */
   updateFields: (fields: Record<string, any>) => void;
+  /**
+   * Update fields of another node's config, for a panel that edits settings
+   * stored on another element (the inbound Identity edits the Caller Context
+   * methods' own identities).
+   */
+  updateNodeFields?: (nodeId: string, fields: Record<string, unknown>) => void;
   /** Surface protocol (used for protocol-aware fields). Optional only for elements that don't depend on it. */
   protocol?: Protocol;
   /** All canvas nodes (used by NPC/identity panels for dropdowns). */

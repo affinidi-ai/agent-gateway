@@ -5143,7 +5143,27 @@ async fn process_charged_forward_request(
                         .await
                 };
                 match verified {
-                    Ok(identity) => Some(identity),
+                    Ok(identity) => {
+                        if let Err(reason) = surface.inbound_identity_for(Some(auth_config)) {
+                            crate::source_auth::errors::record_mismatched_caller(
+                                &surface,
+                                auth_config,
+                                &resolved_auth_config,
+                                &reason,
+                                &audit_facts,
+                                None,
+                            );
+                            let refusal = crate::source_auth::errors::mismatched_caller_refusal(
+                                &surface.access_point.protocol,
+                                refused_mcp_request_id(&surface, &body_bytes),
+                            );
+                            return with_caller_refusal(
+                                axum_response_to_forward_result(refusal).await,
+                                refused_credential_header(auth_config, selection.ambiguous, &axum_headers),
+                            );
+                        }
+                        Some(identity)
+                    }
                     // Caller-attributable failure. An Access Point that is not
                     // public, or that publishes protected resource metadata,
                     // refuses it; a public one records the outcome for the

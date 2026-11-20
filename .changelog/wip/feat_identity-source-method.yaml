@@ -1,0 +1,35 @@
+branch: feat/identity-source-method
+changes:
+  added:
+    - timestamp: '2026-11-11T17:10:00Z'
+      title: Give each Caller Context method its own caller identity
+      description: >-
+        A surface that mixes JWT Bearer and API key callers can now serve both, each caller with
+        its own identity: a JWT Bearer method can derive its callers' identity from a JWT claim and
+        an API key method from the key the caller presents, saved as the method's identity and
+        edited under Caller identity per method in the inbound Identity panel. A method without
+        its own identity uses the surface's inbound identity; when that identity cannot read the
+        method's credential, its callers are refused with 401 before policy, on a public Access
+        Point too. An inbound From JWT Claims or From API Key identity now needs only one method it
+        can read instead of every method being of its kind.
+  changed:
+    - timestamp: '2026-11-19T15:00:00Z'
+      title: Refuse callers whose method the inbound identity cannot read with 401
+      description: >-
+        A stored surface whose inbound From JWT Claims or From API Key identity sits beside a
+        Caller Context method of the other kind, which earlier releases warned about at startup,
+        now refuses the callers of that method with 401 before policy, with the generic body and
+        the source_method_mismatch audit reason, instead of answering 500. On a public Access Point
+        such a surface also refuses callers whose credential is missing or invalid. The gateway
+        logs a warning at startup naming each method whose callers a surface or variant refuses.
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-20T12:00:00Z'
+      title: Keep a caller's identity from its credential over one its request asserts
+      description: >-
+        An inbound From JWT Claims identity, set on the surface or on the caller's method, now
+        replaces any identity the request body asserts, and policy sees its DID as
+        input.agent.did, as From API Key already did. Before, a caller with a valid token could
+        send an identity in the body and be forwarded under that identity instead of its own.
+  breaking: []

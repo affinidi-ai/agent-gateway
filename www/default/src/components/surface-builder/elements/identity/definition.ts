@@ -1,17 +1,41 @@
 import * as Cap from '../capabilities';
-import type { DependencyNode, NodeDefinition, PayloadSlice } from '../types';
+import type { DependencyNode, NodeDefinition, PayloadSlice, SurfaceContext } from '../types';
 import { findSlotById } from '../edges/archetypes';
 import { registry } from '../registry';
 import IdentityPanel from './IdentityPanel';
 import IdentityPayloadFullscreenPanel from './IdentityPayloadFullscreenPanel';
-import { isInboundIdentity } from './placement';
+import { callerAuthMethods, isInboundIdentity } from './placement';
+import { methodGetsIdentity } from './sourceMethods';
 import { DOCS_URL } from '../../../../config/docs';
-import { readMethods } from '../caller-auth/methods';
 
 export const INBOUND_API_KEY_NEEDS_API_KEY_CALLER =
-  "Identity 'From API Key' needs every Caller Context method to be API Key or API Key Provider";
+  "Identity 'From API Key' needs an API Key or API Key Provider Caller Context method";
 
-const INBOUND_API_KEY_CALLER_METHODS = new Set<unknown>(['api_key', 'api_key_provider']);
+export const INBOUND_JWT_CLAIM_NEEDS_JWT_CALLER =
+  'From JWT Claims needs a JWT Bearer Caller Context method';
+
+export const METHOD_IDENTITY_BESIDE_PAYLOAD =
+  "A Caller Context method can't identify its own callers beside From Payload, which callers assert in the request body. Set those methods to This Identity, or choose another extraction type.";
+
+/** Whether some Caller Context method gets an inbound identity: its own, or this one. */
+const someMethodGetsIdentity = (c: Record<string, any>, ctx: SurfaceContext) =>
+  callerAuthMethods(ctx.allNodes).some(method => methodGetsIdentity(c.type, method));
+
+function identityConfigFromSlice(slice: any) {
+  if (!slice || typeof slice !== 'object') return slice;
+  if (slice.type === 'payload_extraction') {
+    const mapped: Record<string, any> = { ...slice, type: 'from_payload' };
+    if (slice.strip_raw_meta) mapped.strip_raw_meta = true;
+    return mapped;
+  }
+  if (slice.type === 'static') {
+    // The backend `ManagedIdentityConfig::Static` serialises the DID
+    // under `did`; the panel edits it as `static_did`.
+    const { did, ...rest } = slice;
+    return { ...rest, static_did: rest.static_did ?? did };
+  }
+  return slice;
+}
 
 export const identityDefinition: NodeDefinition = {
   type: 'identity',
@@ -112,31 +136,27 @@ export const identityDefinition: NodeDefinition = {
     },
     {
       description:
-        'from_jwt_claim derives the DID from a validated JWT, so the surface must authenticate every caller with JWT Bearer',
-      condition: c => c.type === 'from_jwt_claim',
-      check: (_c, ctx) =>
-        ctx.allNodes.some(n => {
-          const methods = n.type === 'caller-auth' ? readMethods(n.config) : [];
-          return methods.length > 0 && methods.every(m => m.method_type === 'jwt_bearer');
-        }),
+        'An inbound from_jwt_claim identity derives the DID from a validated JWT, so the surface needs a JWT Bearer method to read',
+      condition: (c, _ctx, node) => c.type === 'from_jwt_claim' && isInboundIdentity(node),
+      check: someMethodGetsIdentity,
       severity: 'error',
-      message:
-        'From JWT Claims requires a Caller Context whose methods are all JWT Bearer. Remove the other methods, or change this extraction type.',
+      message: INBOUND_JWT_CLAIM_NEEDS_JWT_CALLER,
     },
     {
       description:
-        'Inbound from_api_key identifies each caller by the key it presents, so every Caller Context method must be API Key or API Key Provider',
+        'Inbound from_api_key identifies each caller by the key it presents, so the surface needs an API Key or API Key Provider method to read',
       condition: (c, _ctx, node) => c.type === 'from_api_key' && isInboundIdentity(node),
-      check: (_c, ctx) => {
-        const callerAuth = ctx.allNodes.find(n => n.type === 'caller-auth');
-        const methods = callerAuth ? readMethods(callerAuth.config) : [];
-        return (
-          methods.length > 0 &&
-          methods.every(method => INBOUND_API_KEY_CALLER_METHODS.has(method.method_type))
-        );
-      },
+      check: someMethodGetsIdentity,
       severity: 'error',
       message: INBOUND_API_KEY_NEEDS_API_KEY_CALLER,
+    },
+    {
+      description:
+        'A method that identifies its own callers cannot sit beside an inbound identity read from the request body',
+      condition: (c, _ctx, node) => c.type === 'from_payload' && isInboundIdentity(node),
+      check: (_c, ctx) => !callerAuthMethods(ctx.allNodes).some(method => method.identity),
+      severity: 'error',
+      message: METHOD_IDENTITY_BESIDE_PAYLOAD,
     },
   ],
   ConfigPanel: IdentityPanel,
@@ -154,21 +174,7 @@ export const identityDefinition: NodeDefinition = {
   // slice round-trips as a `type` the dropdown can't render, so the
   // panel reports "Pick an identity extraction type" even though the
   // identity is fully configured.
-  configFromPayload: (slice: any) => {
-    if (!slice || typeof slice !== 'object') return slice;
-    if (slice.type === 'payload_extraction') {
-      const mapped: Record<string, any> = { ...slice, type: 'from_payload' };
-      if (slice.strip_raw_meta) mapped.strip_raw_meta = true;
-      return mapped;
-    }
-    if (slice.type === 'static') {
-      // The backend `ManagedIdentityConfig::Static` serialises the DID
-      // under `did`; the panel edits it as `static_did`.
-      const { did, ...rest } = slice;
-      return { ...rest, static_did: rest.static_did ?? did };
-    }
-    return slice;
-  },
+  configFromPayload: (slice: any) => identityConfigFromSlice(slice),
   buildPayload: ctx => {
     const nodes = ctx.nodesOfType('identity');
     if (nodes.length === 0) return undefined;

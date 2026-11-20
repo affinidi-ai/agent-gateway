@@ -302,7 +302,10 @@ fn write_single_surface_config_inner(
         .iter()
         .chain(&surface_config.additional_source_auth)
     {
-        let method = crate::bdd_support::config::source_auth::caller_authentication_method_json(auth);
+        let method = crate::bdd_support::config::source_auth::with_method_identity(
+            crate::bdd_support::config::source_auth::caller_authentication_method_json(auth),
+            &surface_config.method_identities,
+        );
         surface_fixture = surface_fixture.with_caller_auth_method(method);
     }
     if let Some(protected) = &surface_config.protected_resource {
@@ -499,6 +502,9 @@ fn write_single_surface_config_inner(
         }
     }
 
+    if surface_config.api_key_inbound_identity {
+        surface_fixture = surface_fixture.with_identity_slot("inbound", serde_json::json!({"type": "from_api_key"}));
+    }
     if surface_config.jwt_claim_inbound_identity {
         surface_fixture = surface_fixture.with_identity_slot(
             "inbound",

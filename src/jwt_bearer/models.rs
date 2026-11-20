@@ -191,6 +191,10 @@ impl AudienceClaim {
 /// JWT Bearer-specific authentication configuration attached to a channel or pipe.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JwtBearerAuthConfig {
+    /// How the inbound identity of this method's callers is derived, read from
+    /// the credential they presented. Unset: the surface's inbound identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<crate::source_auth::ManagedIdentityConfig>,
     /// UUID of the `JwtVerificationStrategy` to use for validation.
     pub jwt_verification_strategy_id: String,
 
@@ -232,6 +236,7 @@ fn default_token_scheme() -> String {
 impl Default for JwtBearerAuthConfig {
     fn default() -> Self {
         Self {
+            identity: None,
             jwt_verification_strategy_id: String::new(),
             audiences: Vec::new(),
             audience_claim: AudienceClaim::Aud,
@@ -242,9 +247,46 @@ impl Default for JwtBearerAuthConfig {
     }
 }
 
+impl JwtBearerAuthConfig {
+    /// Whether `other` accepts the same tokens as this method: every field but
+    /// the caller identity derived from them.
+    pub fn accepts_the_tokens_of(
+        &self,
+        other: &Self,
+    ) -> bool {
+        Self { identity: None, ..self.clone() }
+            == Self {
+                identity: None,
+                ..other.clone()
+            }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_method_identity_does_not_change_which_tokens_a_method_accepts() {
+        let stored = JwtBearerAuthConfig {
+            jwt_verification_strategy_id: "idp".into(),
+            ..JwtBearerAuthConfig::default()
+        };
+        let with_identity = JwtBearerAuthConfig {
+            identity: Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim {
+                claim: "oid".into(),
+                namespace_claims: vec!["iss".into()],
+            }),
+            ..stored.clone()
+        };
+        let other_audience = JwtBearerAuthConfig {
+            audiences: vec!["api://other".into()],
+            ..stored.clone()
+        };
+
+        assert!(with_identity.accepts_the_tokens_of(&stored));
+        assert!(!other_audience.accepts_the_tokens_of(&stored));
+    }
 
     fn make_strategy() -> JwtVerificationStrategy {
         JwtVerificationStrategy {

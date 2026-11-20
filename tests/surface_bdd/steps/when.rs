@@ -694,10 +694,38 @@ pub(crate) async fn build_new_surface_payload(
         .surface_config
         .source_auth
     {
-        access_point.insert(
-            "caller_authentication".to_string(),
-            serde_json::json!({ "methods": [config::source_auth::caller_authentication_method_json(auth)] }),
-        );
+        let methods: Vec<serde_json::Value> = std::iter::once(auth)
+            .chain(
+                &world
+                    .surface_config
+                    .additional_source_auth,
+            )
+            .map(|auth| {
+                config::source_auth::with_method_identity(
+                    config::source_auth::caller_authentication_method_json(auth),
+                    &world
+                        .surface_config
+                        .method_identities,
+                )
+            })
+            .collect();
+        access_point.insert("caller_authentication".to_string(), serde_json::json!({ "methods": methods }));
+    }
+    let inbound = if world
+        .surface_config
+        .jwt_claim_inbound_identity
+    {
+        Some(serde_json::json!({ "type": "from_jwt_claim", "claim": "sub", "namespace_claims": ["iss"] }))
+    } else if world
+        .surface_config
+        .api_key_inbound_identity
+    {
+        Some(serde_json::json!({ "type": "from_api_key" }))
+    } else {
+        None
+    };
+    if let Some(inbound) = inbound {
+        payload["identity_slots"] = serde_json::json!({ "inbound": inbound });
     }
     payload
 }
@@ -5133,4 +5161,13 @@ fn caller_closes_mcp_response_stream(world: &mut SurfaceWorld) {
         .take()
         .expect("setup failed: the caller has no open MCP response stream to close");
     drop(stream);
+}
+
+#[when(expr = "the operator tries to create the surface for route {string}")]
+async fn operator_tries_to_create_the_surface(
+    world: &mut SurfaceWorld,
+    route: String,
+) {
+    let payload = build_new_surface_payload(world, &route, false).await;
+    create_surface(world, payload).await;
 }
