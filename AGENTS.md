@@ -443,8 +443,8 @@ subjects, role and claim values) starts empty with a sample as its placeholder, 
 template and Add to policy stay disabled until it is filled; previews use the sample, labelled
 as one. A gallery card shows its settings, How it decides, its Rego and docs link in the templates column, and **Use this template** fills the
 Rego and an empty or template-filled Description, never the Name, asking in place first (focus on Cancel) unless the Rego is an untouched
-start. Templates still have a role, **Whole policy** or **Adds rules**, shown under **Add rules
-from a template**. The Policy section's
+start. **Add rules from a template** lists only templates that add rules, each marked **Adds
+rules**; a whole-policy template is used from Start from. The Policy section's
 **Rules | Rego** toggle lists the rules grouped by
 template, states above them what the policy decides (or that it can't, pointing to the Rego),
 marks each rule other than `allow` and `deny_reason` "Used by allow" or "Not used by allow",

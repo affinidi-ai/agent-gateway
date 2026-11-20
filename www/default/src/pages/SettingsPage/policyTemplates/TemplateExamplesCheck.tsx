@@ -160,6 +160,7 @@ const TemplateExamplesCheck: React.FC<TemplateExamplesCheckProps> = ({
                         <span
                           className="spinner-border spinner-border-sm text-primary"
                           role="status"
+                          aria-label="Running"
                         />
                       ) : 'error' in o ? (
                         <span className="text-danger small">{o.error}</span>

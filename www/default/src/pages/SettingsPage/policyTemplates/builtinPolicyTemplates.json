@@ -462,7 +462,7 @@
     "id": "require-trust-registry-recognition",
     "name": "Require Trust Registry recognition",
     "summary": "Allow only agents the Trust Registry recognises.",
-    "description": "Allows a request only when the calling agent's DID is verified as the caller's identity and the Trust Registry recognised it. A DID is verified when it is the caller identity the gateway established (input.agent.did_verified), not only a DID the request names. Needs Extract Trust Registry Data on the surface; without it input.agent has no trust_verification and every request is denied. It decides on the Access Point and Target request policies: on a Transit Point input.agent describes the destination, not the caller, and a response policy has no input.agent.",
+    "description": "Allows a request only when the calling agent's DID is verified as the caller's identity and the Trust Registry recognised it. A DID is verified when it is the caller identity the gateway established (input.agent.did_verified), not only a DID the request names. Needs Extract Trust Registry Data on the surface; without it input.agent has no trust_verification and every request is denied. It decides on the Access Point and Target request policies: on a Transit Point input.agent describes the destination, not the caller, and a response policy has no input.agent. As the Target request policy of a fabric:// Target, input.agent describes this Access Point's own card, so it denies every request there.",
     "category": "trust_checks",
     "policy_types": ["agent_surface"],
     "rules": "default allow := false\n\nallow if {\n  input.agent.did\n  input.agent.did_verified == true\n  input.agent.trust_verification == true\n}",
@@ -523,7 +523,7 @@
     "id": "require-verified-credential-subject",
     "name": "Require verified credential subject",
     "summary": "Allow only listed caller DIDs the gateway verified.",
-    "description": "Allows a request only when the gateway verified the caller's DID, from an identity presentation or a bound source credential, and that DID is on the list. Denies unverified and unlisted callers. It decides on the Access Point and Target request policies: a Transit Point or response policy has no input.extension_identity, so it denies every request there.",
+    "description": "Allows a request only when the gateway verified the caller's DID, from an identity presentation or a bound source credential, and that DID is on the list. Denies unverified and unlisted callers. It decides on the Access Point and Target request policies: a Transit Point or response policy, and the Target request policy of a fabric:// Target, have no input.extension_identity, so it denies every request there.",
     "category": "trust_checks",
     "policy_types": ["agent_surface"],
     "rules": "default allow := false\n\nallow if {\n  input.extension_identity.verified == true\n  input.extension_identity.did in {{dids}}\n}",
@@ -1335,7 +1335,7 @@
     "id": "tool-allow-authenticated",
     "name": "Tool policy: allow authenticated callers",
     "summary": "For a tool binding: allow any caller with a token.",
-    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows a call when the request's bearer token has a sub claim. It reads the claims of the bearer token in the request's Authorization header (input.jwt), which the gateway does not verify, so use it only on a closed Access Point whose Caller Context methods are all JWT Bearer.",
+    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows a call when the request's bearer token has a sub claim. It reads the claims of the bearer token in the request's Authorization header (input.jwt), which the gateway does not verify, so use it only on a closed Access Point whose Caller Context methods are all JWT Bearer reading the Authorization header with the Bearer scheme.",
     "rules": "default allow := false\n\nallow if input.jwt.sub",
     "parameters": [],
     "reads": ["jwt.sub"],
@@ -1409,7 +1409,7 @@
     "id": "tool-allow-by-jwt-claim",
     "name": "Tool policy: allow by JWT claim",
     "summary": "For a tool binding: allow callers whose claim has a listed value.",
-    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows a call when a claim of the request's bearer token, a single value or a list, has one of the listed values. Covers admin-only and subscription-based access. It reads the claims of the bearer token in the request's Authorization header (input.jwt), which the gateway does not verify, so use it only on a closed Access Point whose Caller Context methods are all JWT Bearer.",
+    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows a call when a claim of the request's bearer token, a single value or a list, has one of the listed values. Covers admin-only and subscription-based access. It reads the claims of the bearer token in the request's Authorization header (input.jwt), which the gateway does not verify, so use it only on a closed Access Point whose Caller Context methods are all JWT Bearer reading the Authorization header with the Bearer scheme.",
     "rules": "default allow := false\n\ntool_claim_values(v) := [v] if is_string(v)\n\ntool_claim_values(v) := v if is_array(v)\n\nallow if {\n  some v in tool_claim_values(input.jwt[{{claim}}])\n  v in {{values}}\n}",
     "parameters": [
       {
@@ -1560,7 +1560,7 @@
     "id": "tool-role-with-deny-reason",
     "name": "Tool policy: admin role with a deny reason",
     "summary": "For a tool binding: allow one role and record why others were denied.",
-    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows callers whose bearer token has the admin role, as a single value or in a list, and sets deny_reason when the token has no role or not that one. The reason is written to the audit log only, not the response. It reads the claims of the bearer token in the request's Authorization header (input.jwt), which the gateway does not verify, so use it only on a closed Access Point whose Caller Context methods are all JWT Bearer.",
+    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows callers whose bearer token has the admin role, as a single value or in a list, and sets deny_reason when the token has no role or not that one. The reason is written to the audit log only, not the response. It reads the claims of the bearer token in the request's Authorization header (input.jwt), which the gateway does not verify, so use it only on a closed Access Point whose Caller Context methods are all JWT Bearer reading the Authorization header with the Bearer scheme.",
     "rules": "default allow := false\n\ntool_claim_values(v) := [v] if is_string(v)\n\ntool_claim_values(v) := v if is_array(v)\n\nallow if {{admin_role}} in tool_claim_values(input.jwt.role)\n\ndeny_reason := \"The caller's token has no role\" if not input.jwt.role\n\ndeny_reason := sprintf(\"Role %v may not call this tool\", [input.jwt.role]) if {\n  input.jwt.role\n  not allow\n}",
     "parameters": [
       {

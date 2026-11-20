@@ -12,13 +12,16 @@ changes:
         method, path, surface and subject allowlists, plus MCP tool policies for tool bindings
         on MCP Targets. Each template's description says which policy input it reads and what
         that input needs, such as a verified caller DID for Trust Registry recognition, a
-        closed Access Point whose Caller Context methods are all JWT Bearer for the MCP tool
-        policies, which read the unverified bearer token, and the Transit Point policy slots for
+        closed Access Point whose Caller Context methods are all JWT Bearer reading the
+        Authorization header with the Bearer scheme for the MCP tool policies, which read the
+        unverified bearer token, and the Transit Point policy slots for
         the outbound allowlist, which decides only where input.transit is set and allows the
         request a fabric:// Target sends; a trust check that queries several authorities counts
         once, the surface allowlist matches surface IDs, the path allowlist's prefixes start
         with the Access Point route and match whole path segments, and the templates that read the
-        caller say they decide on the Access Point and Target request policies. Templates follow the Apply Policies guides and link to their own
+        caller say they decide on the Access Point and Target request policies, and the
+        verified credential subject and Trust Registry templates that they deny every request
+        as a fabric:// Target's request policy. Templates follow the Apply Policies guides and link to their own
         docs section. Define Gateway Policy lists only templates for gateways and Define Agent
         Surface Policy only templates for surfaces, with a muted note on a template for surfaces
         only; the cards carry no role or default decision badges, six show until Show all, and
@@ -40,7 +43,8 @@ changes:
         from only. Add rules from a template lists only templates that add rules, labelled
         Adds rules, says how many whole policies and templates for the other Type it leaves
         out, and appends a template's rules to a new or saved policy, so several can be
-        combined. A Rules | Rego toggle shows the policy, opening on Rules. The Rules view says
+        combined; on an empty policy it warns that the rules make it deny every request they
+        don't allow. A Rules | Rego toggle shows the policy, opening on Rules. The Rules view says
         in one line above the rules what the policy decides, or that it can't and to read the
         Rego, lists the policy's rules grouped by the template they came from, marks each rule
         other than allow and deny_reason Used by allow or Not used by allow, shows each
@@ -66,7 +70,8 @@ changes:
         input.request), input.http with a path that starts with the Access Point route,
         input.channel and input.gateway with where direction and target_id are set, including
         the outbound evaluation of a fabric:// Target's send, which carries the peer gateway's
-        DID and no input.transit, input.agent.trust_verification beside did_verified, and how to
+        DID and no input.transit, input.gateway.source_id or input.extension_identity,
+        input.agent.trust_verification beside did_verified, and how to
         require every Trust Check when a check queries several authorities.
     - timestamp: '2026-11-19T14:00:00Z'
       title: Set a new policy's Type from the Define button that opened it
@@ -74,7 +79,9 @@ changes:
         Define Gateway Policy and Define Agent Surface Policy set the new policy's Type, so the
         create page no longer shows a Type field and its header names the Type instead
         ("Create Gateway Policy"). A policy can't drift to a Type its templates were not
-        written for. A saved policy still shows its Type, read-only.
+        written for. Opened without a Define button, from a typed or bookmarked link, the page
+        creates a Gateway policy and shows its Type locked. A saved policy still shows its Type,
+        read-only.
     - timestamp: '2026-11-18T22:00:00Z'
       title: Show the policy editor read-only to users who can't edit policies
       description: >-
@@ -97,8 +104,10 @@ changes:
         into one Details section (Name, then a two-line Description, then Type and Status side
         by side), show a saved policy's ID and SHA on one line with copy buttons, the SHA of the
         revision Save just wrote, and show the Rego with line numbers and a banner when it
-        doesn't compile. Save closes an Undo notice still on screen, so an Undo can't be lost
-        to the save.
+        doesn't compile. An Undo or an edit made while Save runs stays unsaved instead of being
+        overwritten, a failed save keeps the change and its Undo, the SHA is hidden when the
+        saved revision can't be read back, and a policy that fails to load shows the error
+        instead of an empty form.
   fixed:
     - timestamp: '2026-11-20T15:00:00Z'
       title: Stop a replaced dashboard toast from closing the next one or undoing twice

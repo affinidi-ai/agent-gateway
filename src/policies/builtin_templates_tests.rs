@@ -257,7 +257,21 @@ fn business_hours_deny_mode_inverts_the_decision() {
 }
 
 #[test]
-fn business_hours_denies_in_both_modes_when_the_time_zone_cannot_be_read() {
+fn business_hours_never_allows_when_the_time_zone_cannot_be_read() {
+    for policy_type in ["gateway", "agent_surface"] {
+        for key in [
+            format!("business-hours-access-window:{policy_type}"),
+            format!("business-hours-access-window:deny:{policy_type}"),
+        ] {
+            let rego = rendered(&key).replace("\"UTC\"", "\"Mars/Olympus_Mons\"");
+            let decision = decide(policy_type, &rego, &json!({}));
+            assert!(decision != Ok(true), "{key} allowed a request whose time zone is unknown: {decision:?}");
+        }
+    }
+}
+
+#[test]
+fn business_hours_access_minute_guard_denies_on_an_engine_that_reads_a_failed_builtin_as_undefined() {
     for variant in ["business-hours-access-window:gateway", "business-hours-access-window:deny:gateway"] {
         let rego = rendered(variant).replace("\"UTC\"", "\"Mars/Olympus_Mons\"");
         let mut engine = regorus::Engine::new();

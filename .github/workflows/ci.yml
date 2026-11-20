@@ -42,6 +42,8 @@ jobs:
               - 'Cargo.lock'
               - 'Makefile'
               - '.github/workflows/ci.yml'
+              - 'www/default/src/pages/SettingsPage/policyTemplates/builtinPolicyTemplates.json'
+              - 'www/default/src/pages/SettingsPage/policyTemplates/__fixtures__/**'
             frontend:
               - 'www/default/**'
             mcp:

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { apiClient } from '../../api';
-import { removeToast, showToast, showUndoToast } from '../../utils/toaster';
+import { showToast, showUndoToast } from '../../utils/toaster';
 import { useSafeNavigate } from '../../hooks/useSafeNavigate';
 import { usePageTitle } from '../../context/PageTitleContext';
 import { usePermissions } from '../../context/PermissionsContext';
@@ -70,6 +70,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
   const [loading, setLoading] = useState(!isCreateMode);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const baselineRef = useRef<string>(JSON.stringify(form));
   const [isDirty, setIsDirty] = useState(false);
   const [isValidating, setIsValidating] = useState(false);
@@ -178,7 +179,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
           setLoading(false);
         })
         .catch(e => {
-          setError(e.message);
+          setLoadError(e.message || 'Failed to load the policy');
           setLoading(false);
         });
     }
@@ -235,8 +236,6 @@ const EditPolicyDefinitionPage: React.FC = () => {
       );
       return;
     }
-    // An Undo pressed while the save runs would be overwritten by the saved form.
-    removeToast();
     setSaving(true);
     setError(null);
     try {
@@ -263,17 +262,17 @@ const EditPolicyDefinitionPage: React.FC = () => {
         navigate(`/policy-definitions/${encodeURIComponent(payload.id)}`);
       } else {
         // Stay in the editor and surface the newly appended version, with its content hash.
+        // Only the stored fields are merged, so an edit or Undo made during the save stays dirty.
         const stored: Partial<PolicyDefinition> | null = await apiClient
           .fetch(`/api/v1/policy-definitions/${encodeURIComponent(payload.id)}`)
           .then(r => (r.ok ? r.json() : null))
           .catch(() => null);
-        const saved: PolicyDefinition = {
-          ...payload,
-          content_hash: stored?.content_hash ?? payload.content_hash,
+        const storedFields = {
+          content_hash: stored?.content_hash,
           updated_at: stored?.updated_at ?? payload.updated_at,
         };
-        baselineRef.current = JSON.stringify(saved);
-        setForm(saved);
+        baselineRef.current = JSON.stringify({ ...payload, ...storedFields });
+        setForm(f => ({ ...f, ...storedFields }));
         setVersionRefreshKey(k => k + 1);
         showToast('success', 'Policy updated!');
       }
@@ -372,6 +371,26 @@ const EditPolicyDefinitionPage: React.FC = () => {
       <div className="container-fluid">
         <div className="text-center py-5">
           <div className="spinner-border text-primary" role="status" />
+        </div>
+      </div>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <div className="container-fluid" data-testid="page-policy-definition-editor">
+        <div className="mb-3">
+          <button
+            className="btn btn-sm btn-secondary"
+            onClick={discard}
+            data-testid="policy-definition-editor-back-button"
+          >
+            <i className="fas fa-arrow-left"></i>
+          </button>
+        </div>
+        <div className="alert alert-danger" data-testid="policy-definition-load-error">
+          <i className="fas fa-exclamation-triangle me-2"></i>
+          <span className="policy-error-text">{loadError}</span>
         </div>
       </div>
     );

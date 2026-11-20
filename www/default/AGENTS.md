@@ -73,7 +73,9 @@ Applies to:
 text (`textContent`), never as HTML, so a name or a server error message in a toast cannot run
 script. Pass plain text only: markup such as `<b>` shows literally, and callers must not
 escape the text themselves. `showUndoToast` returns a function that dismisses that toast
-without Undo, as its close button does.
+without Undo, as its close button does. A new toast replaces the one on screen and stops it:
+the replaced toast's timer and `u` key no longer act, and an Undo toast counts as dismissed
+without Undo (its `onExpire` runs). `removeToast` does the same. This holds on every page.
 
 ## Test identifiers
 
@@ -1829,11 +1831,13 @@ header. The exceptions are the selectable `.policy-template-row` cards and rows 
 the Rego reference heading toggle, the examples card's `btn-close`, Back, the Rego view's package-mismatch
 alert with **Fix it** (Bootstrap `alert-danger`), the Rules view's
 rule-kind badges (`.policy-rules__kind`, a neutral `--muted-text` outline for every kind, so a
-rule's kind never reads as an allow or deny decision), the template role badge
-(`RoleBadge`/`TemplateRoleBadge`, the same outline), and the Rules view's amber group lines
+rule's kind never reads as an allow or deny decision), the Add rules template badge
+(`AddsRulesBadge` in `TemplateBadges.tsx`, the same outline), and the Rules view's amber group lines
 (`.policy-rules__misfit`, `--warning-text` on a light amber tint, with a `body.dark-theme`
 border).
 
+A definition that fails to
+load shows only Back and the error (`policy-definition-load-error`), never an editable form.
 Without `policies.edit` the page is read-only, since the gateway refuses a create or save
 without it: a muted line with a lock icon under the intro says "You can view this policy but not
 change it." (`policy-definition-read-only-note`), the Rego textarea is `readOnly`, Name and
@@ -1846,8 +1850,9 @@ and no gallery, templates column, Add rules or Remove (below).
 The **Rego reference** panel in the Rego view is collapsed by default. It lists the two inputs a
 policy can get, each with a link to its section of the OPA policies reference page: the
 request's caller context that gateway and surface policies read (`PolicyInput` in
-`src/surface_context/mod.rs`: `input.source_auth`, `input.http`, `input.gateway`, `input.mcp`,
-`input.trust_check_results`, `input.extension_identity`; `policy-instructions-input-fields`),
+`src/surface_context/mod.rs`: `input.source_auth`, `input.http`, `input.gateway`,
+`input.transit`, `input.mcp`, `input.trust_check_results`, `input.extension_identity`;
+`policy-instructions-input-fields`),
 which the Test (dry-run) default sample input follows, and the tool call that a policy bound to
 MCP tools reads (`McpPolicyContext` in `src/mcp/policy.rs`: `input.jwt`, the claims of the
 request's `Authorization` bearer token, `input.mcp.method`, always `tools/call`,
@@ -1883,17 +1888,17 @@ Create custom policy) in `useTemplateGallery`.
   - *Components* (`.tsx`), which export components only, so no logic lives in a component
     file.
 - **App seams.** The feature calls the dashboard's `showUndoToast` (the undo toast) and
-  `simulatePolicy` (the dry-run endpoint) directly. Save dismisses the toast on screen
-  (`removeToast`) before it writes, so an Undo can't land while the save runs, and then reads
-  the definition back, so the SHA shown is the saved revision's. The page takes the
+  `simulatePolicy` (the dry-run endpoint) directly. After a save the page reads the definition
+  back and merges only its `content_hash` and `updated_at` into the form, so the SHA shown is
+  the saved revision's; when that read fails the SHA is hidden. The page takes the
   templates from `POLICY_TEMPLATE_LIBRARY` (`builtinPolicyTemplates.ts`, `{entries, templates}`,
   built once from the catalogue by `buildTemplateLibrary`, Agent Surface variants first;
   `templates` feeds `groupsForOtherType`), and hands them to
   `useTemplateGallery` (`entries`, which returns the gallery's `cards` and `surfaceOnly`) and to
   `PolicyTemplatesPanel` (`library`), so `TemplateGallery` and the panel never list templates
   themselves. The catalogue (`builtinPolicyTemplates.*`, with its `DOCS_URL` links and
-  `POLICY_TEMPLATE_LIBRARY`), `RegoReference` and `policyTemplateServices.ts` are dashboard
-  content, not part of the reusable layers.
+  `POLICY_TEMPLATE_LIBRARY`) and `RegoReference` are dashboard content, not part of the
+  reusable layers.
 
 - **Catalogue.** A JSON entry holds its rules without a `package` line and lists the
   `policy_types` it serves; `builtinPolicyTemplates.ts` adds the package per type. Every entry
@@ -2048,8 +2053,10 @@ Create custom policy) in `useTemplateGallery`.
   edits made since, so each toast ends "Undo restores the Rego from before this change." (Use
   and Create custom policy: "the form", since their Undo also restores the Description, and
   for Create custom policy the Name; Use never changes the Name). A new toast replaces the one
-  on screen and stops it: the replaced toast's timer and `u` key no longer act, and it counts
-  as dismissed without Undo (`toaster.ts`). Use of a template, or Create custom policy, moves focus to **Change**
+  on screen (see _Toasts_). Save leaves the Undo toast on screen: a successful save merges only
+  the stored `content_hash` and `updated_at` into the form, so an Undo or edit made while the
+  save runs stays unsaved and the form stays dirty, and a failed save keeps the change and its
+  Undo. Use of a template, or Create custom policy, moves focus to **Change**
   (`policy-template-gallery-change-button`), which reopens
   it with the used card selected and its settings as they were used, also after a hand edit,
   and moves focus to the selected card, or to the first card when none is selected. Use
@@ -2117,7 +2124,9 @@ Create custom policy) in `useTemplateGallery`.
   (`policy-templates-insert-rules-button`), disabled while a setting is invalid or a required
   one is empty. While the policy allows by default the preview
   warns "This policy allows every request by default, so these rules change nothing until you
-  choose Deny by default." (`policy-templates-allow-default-note`, a warning `InfoBanner`).
+  choose Deny by default." (`policy-templates-allow-default-note`, a warning `InfoBanner`). On an
+  empty policy it warns instead "This policy is empty, so it allows every request. These rules
+  make it deny every request they don't allow." (`policy-templates-empty-policy-note`).
 - **Add to policy** shows the lines it adds (`policy-templates-insert-preview`) with a note,
   "Allow rules combine with OR: a request passes when any allow rule matches. Its `default
   allow` line is not copied." (`policy-templates-or-note`), and appends

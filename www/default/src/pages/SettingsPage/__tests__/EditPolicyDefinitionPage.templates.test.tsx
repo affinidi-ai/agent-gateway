@@ -24,9 +24,6 @@ jest.mock('../../../utils/toaster', () => ({
     mockUndo.last = options.onUndo;
     mockUndo.message = options.message;
   },
-  removeToast: () => {
-    mockUndo.last = undefined;
-  },
 }));
 
 const fetchMock = apiClient.fetch as jest.Mock;
@@ -1058,6 +1055,17 @@ describe('add rules while creating a policy', () => {
     fireEvent.click(await row('allow-http-methods'));
     expect(screen.getByTestId('policy-templates-insert-preview')).toBeInTheDocument();
     expect(screen.queryByTestId('policy-templates-allow-default-note')).toBeNull();
+    expect(screen.queryByTestId('policy-templates-empty-policy-note')).toBeNull();
+  });
+
+  it('says adding rules to an empty policy makes it deny what they do not allow', async () => {
+    await renderNew();
+    fireEvent.change(rego(), { target: { value: '' } });
+    fireEvent.click(await row('allow-http-methods'));
+    expect(screen.getByTestId('policy-templates-empty-policy-note')).toHaveTextContent(
+      "This policy is empty, so it allows every request. These rules make it deny every request they don't allow."
+    );
+    expect(screen.queryByTestId('policy-templates-allow-default-note')).toBeNull();
   });
 });
 
@@ -1438,6 +1446,38 @@ describe('policy section', () => {
     expect(screen.getByTestId('policy-definition-id-copy-button')).toBeInTheDocument();
   });
 
+  it('shows a failed load as an error, without a form to save', async () => {
+    fetchMock.mockResolvedValue({ ok: false, status: 404, statusText: 'Not Found' });
+    renderAt('/policy-definitions/partner-only');
+
+    expect(await screen.findByTestId('policy-definition-load-error')).toHaveTextContent(
+      'Failed to load: Not Found'
+    );
+    expect(screen.queryByTestId('policy-definition-editor-save-button')).toBeNull();
+    expect(screen.queryByPlaceholderText('e.g. Require Authentication')).toBeNull();
+  });
+
+  it('hides the SHA when the saved revision cannot be read back', async () => {
+    let put = false;
+    fetchMock.mockImplementation(async (url: string, init?: { method?: string }) => {
+      if (init?.method === 'PUT') {
+        put = true;
+        return jsonResponse({ ...SAVED, content_hash: 'sha256:old' });
+      }
+      if (url.includes('/versions')) return jsonResponse([]);
+      if (put) return { ok: false, status: 503, statusText: 'Service Unavailable' };
+      return jsonResponse({ ...SAVED, content_hash: 'sha256:old' });
+    });
+    renderAt('/policy-definitions/partner-only');
+    expect(await screen.findByTestId('policy-definition-sha')).toHaveTextContent('sha256:old');
+
+    fireEvent.click(screen.getByTestId('policy-view-rego'));
+    fireEvent.change(rego(), { target: { value: `${SAVED.policy}\n` } });
+    fireEvent.click(screen.getByTestId('policy-definition-editor-save-button'));
+
+    await waitFor(() => expect(screen.queryByTestId('policy-definition-sha')).toBeNull());
+  });
+
   it('shows the SHA of the revision Save wrote, not the one loaded', async () => {
     let put = false;
     fetchMock.mockImplementation(async (url: string, init?: { method?: string }) => {
@@ -1656,18 +1696,55 @@ describe('remove one rule', () => {
     expect(rego().value).toContain('"HEAD"');
   });
 
-  it('dismisses the Undo toast when Save starts, so the save cannot overwrite an Undo', async () => {
+  it('keeps an Undo pressed while Save runs, unsaved', async () => {
+    const withHead = {
+      ...SAVED,
+      policy: `${SAVED.policy}\n\nallow if input.http.method == "HEAD"\n`,
+    };
+    let finishPut: (value: unknown) => void = () => {};
+    fetchMock.mockImplementation((url: string, init?: { method?: string }) => {
+      if (init?.method === 'PUT') return new Promise(resolve => (finishPut = resolve));
+      if (url.includes('/versions')) return Promise.resolve(jsonResponse([]));
+      return Promise.resolve(jsonResponse(withHead));
+    });
+    renderAt('/policy-definitions/partner-only');
+    fireEvent.click(await screen.findByTestId('policy-rules-group-0-rule-1-remove-button'));
+    fireEvent.click(screen.getByTestId('policy-definition-editor-save-button'));
+
+    act(() => mockUndo.last?.());
+    await act(async () => finishPut(jsonResponse(withHead)));
+
+    await waitFor(() =>
+      expect(screen.getByTestId('policy-definition-editor-save-button')).toHaveTextContent('Save')
+    );
+    expect(rego().value).toContain('"HEAD"');
+  });
+
+  it('keeps the change and its Undo when Save fails', async () => {
     mockGateway({
       ...SAVED,
       policy: `${SAVED.policy}\n\nallow if input.http.method == "HEAD"\n`,
     });
+    const answer = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url: string, init?: { method?: string; body?: string }) =>
+      init?.method === 'PUT'
+        ? {
+            ok: false,
+            status: 500,
+            statusText: 'Internal Server Error',
+            json: async () => ({ error: 'Policy store unavailable' }),
+          }
+        : answer(url, init)
+    );
     renderAt('/policy-definitions/partner-only');
     fireEvent.click(await screen.findByTestId('policy-rules-group-0-rule-1-remove-button'));
-    expect(mockUndo.last).toBeDefined();
 
     fireEvent.click(screen.getByTestId('policy-definition-editor-save-button'));
 
-    expect(mockUndo.last).toBeUndefined();
+    expect(await screen.findByText('Policy store unavailable')).toBeInTheDocument();
+    expect(rego().value).not.toContain('"HEAD"');
+    act(() => mockUndo.last?.());
+    expect(rego().value).toContain('"HEAD"');
   });
 
   it("removes a template's group with its last rule, and Undo brings both back", async () => {

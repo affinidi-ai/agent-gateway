@@ -82,6 +82,17 @@ const InsertPreview: React.FC<{
       >
         <code>{insert ? insert.added : 'Fix the settings above to see the rules.'}</code>
       </pre>
+      {addsLines && !existingPolicy.trim() && (
+        <div data-testid="policy-templates-empty-policy-note">
+          <InfoBanner
+            variant="warning"
+            icon="fa-exclamation-triangle"
+            collapsible={false}
+            className="mb-2"
+            summary="This policy is empty, so it allows every request. These rules make it deny every request they don't allow."
+          />
+        </div>
+      )}
       {addsLines && policyDefaultDecision(existingPolicy) === 'allow' && (
         <div data-testid="policy-templates-allow-default-note">
           <InfoBanner
