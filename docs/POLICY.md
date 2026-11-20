@@ -493,6 +493,10 @@ allow if {
 deny_reason := "Calling agent is not recognised" if not allow
 ```
 
+A Transit Point's own policy that denies answers `403` with the `detail` "Request blocked by
+surface policy", followed by `: <deny_reason>` when the policy sets one, so the managed agent
+learns why it was refused.
+
 A Transit Point with its own `trust_recorder` writes its managed agent's records in the
 background on every request, without waiting, so the agent is recognised once those records
 exist, which may be after its first call; see

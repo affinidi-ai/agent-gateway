@@ -1699,6 +1699,12 @@ fn response_body_is_error(
             "status": 403,
             "detail": "Request blocked by surface policy"
         }),
+        "transit_point_request_policy_denied_not_recognised" => serde_json::json!({
+            "type": "https://a2a-protocol.org/errors/proxy-error",
+            "title": "Forbidden",
+            "status": 403,
+            "detail": "Request blocked by surface policy: Calling agent is not recognised"
+        }),
         "agent_card_target_auth_misconfigured" => serde_json::json!({
             "type": "https://a2a-protocol.org/errors/proxy-error",
             "title": "Internal Server Error",

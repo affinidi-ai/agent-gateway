@@ -137,6 +137,11 @@ pub(crate) enum OutboundPipelineError {
     #[error("Request blocked by surface policy")]
     SurfacePolicyDenied,
 
+    /// The Transit Point's own policy denied the request; the caller is told
+    /// the policy's `deny_reason` when it set one.
+    #[error("Request blocked by surface policy")]
+    TransitPointPolicyDenied { reason: Option<String> },
+
     /// The surface or transit-point policy could not decide. Why is logged
     /// and audited, never shown to the caller.
     #[error("Request blocked by surface policy")]
@@ -332,6 +337,7 @@ impl OutboundPipelineError {
             Self::GatewayPolicyDenied
             | Self::GatewayPolicyError(_)
             | Self::SurfacePolicyDenied
+            | Self::TransitPointPolicyDenied { .. }
             | Self::SurfacePolicyError(_)
             | Self::TransitPointResponsePolicyDenied
             | Self::TransitMcpToolGated => StatusCode::FORBIDDEN,
@@ -481,6 +487,11 @@ impl IntoResponse for OutboundPipelineError {
             Self::OutboundDisabled | Self::MissingVirtualChannelAlias | Self::UnknownVirtualChannelAlias(_)
         ) {
             return crate::protocols::no_transit_point_response();
+        }
+        if let Self::TransitPointPolicyDenied { reason: Some(reason) } = &self
+            && !reason.is_empty()
+        {
+            return create_error_response(self.status_code(), &format!("{self}: {reason}"));
         }
         // ConsentRequired carries a pre-formed JSON body for the caller
         if let Self::ConsentRequired(body) = self {
@@ -4403,7 +4414,7 @@ async fn step_transit_point_opa_policy(
                 alias = %ctx.virtual_channel.alias,
                 "Per-transit-point OPA policy denied"
             );
-            return Err(OutboundPipelineError::SurfacePolicyDenied);
+            return Err(OutboundPipelineError::TransitPointPolicyDenied { reason: decision.reason });
         }
         Err(e) => {
             let error = crate::observability::PolicyEvaluationError::EvaluationError;
@@ -23814,6 +23825,31 @@ mod tests {
 
         assert!(call("fabric://peer-gateway/peer-surface", 7, false).is_ok());
         assert!(call("https://partner.example/a2a", 8, false).is_ok(), "only Fabric crossings are counted");
+    }
+
+    #[tokio::test]
+    async fn a_transit_point_policy_deny_tells_the_caller_its_reason() {
+        async fn detail(reason: Option<&str>) -> serde_json::Value {
+            let response = OutboundPipelineError::TransitPointPolicyDenied {
+                reason: reason.map(str::to_string),
+            }
+            .into_response();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            body["detail"].clone()
+        }
+
+        assert_eq!(
+            detail(Some("Calling agent is not recognised")).await,
+            "Request blocked by surface policy: Calling agent is not recognised"
+        );
+        assert_eq!(detail(None).await, "Request blocked by surface policy");
+        assert_eq!(detail(Some("")).await, "Request blocked by surface policy");
     }
 
     /// A Transit Point records the call it refuses at the hop limit as a
