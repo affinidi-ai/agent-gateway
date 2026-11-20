@@ -137,7 +137,6 @@ fn transit_point_json(
         "alias": transit_point.alias,
         "target_endpoint": target_endpoint,
         "protocol": transit_point.protocol,
-        "listen_path": format!("/transit/{}", transit_point.alias),
         "require_transit_token": transit_point.require_transit_token
     });
     if let Some(source_auth) = &transit_point.source_auth {
@@ -695,9 +694,6 @@ fn write_single_surface_config_inner(
     if let Some(max_secs) = surface_config.transit_token_max_lifetime_secs {
         set_transit_token_max_lifetime(base_dir, max_secs);
     }
-    if surface_config.strict_outbound_listen_paths {
-        set_strict_outbound_listen_paths(base_dir);
-    }
     write_credential_policy(
         base_dir,
         &surface_config.enforced_credential_rules,
@@ -989,15 +985,6 @@ fn set_transit_token_max_lifetime(
     let path = base_dir.join("gateway.json");
     let mut gateway: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     gateway["transit_token_max_lifetime_secs"] = serde_json::json!(max_secs);
-    std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
-}
-
-/// Turns on the appliance's `strict_outbound_listen_paths`, which refuses a
-/// Transit Point whose `listen_path` is outside the outbound prefixes.
-fn set_strict_outbound_listen_paths(base_dir: &Path) {
-    let path = base_dir.join("gateway.json");
-    let mut gateway: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    gateway["strict_outbound_listen_paths"] = serde_json::json!(true);
     std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
 }
 

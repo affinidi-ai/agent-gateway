@@ -258,7 +258,6 @@ fn build_surface_fixture(
                     "alias": tp.alias,
                     "target_endpoint": tp.target_endpoint,
                     "protocol": tp.protocol,
-                    "listen_path": format!("/transit/{}", tp.alias),
                     "require_transit_token": tp.require_transit_token,
                 });
                 if let Some(SourceAuthSpec::ApiKey { header_name, secret_id, .. }) = &tp.source_auth {

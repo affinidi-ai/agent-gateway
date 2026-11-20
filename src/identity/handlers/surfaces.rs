@@ -2196,7 +2196,7 @@ fn outbound_listen_path_claims(
 /// surface under validation and clashes with any other persisted surface
 /// (the surface being updated is excluded by `surface_id`).
 ///
-/// The two prefix checks run on every surface, including one whose transit
+/// [`check_listen_paths`] runs on every surface, including one whose transit
 /// points claim no custom path, so a path a variant override alone sets is
 /// still seen. `stored` is the surface as the gateway holds it, `None` on
 /// create.
@@ -2228,38 +2228,47 @@ fn claiming_stored_surface(stored: Option<&AgentSurface>) -> Option<&AgentSurfac
     stored.filter(|stored| stored.status != crate::config::agent_surface::SurfaceStatus::Disabled)
 }
 
-/// Refuse a `listen_path` the gateway cannot serve as the Transit Point means
-/// it (one the outbound router cannot register as written, the outbound
-/// prefix itself, or a path outside that prefix: see
-/// [`crate::proxy::server::listen_path_problems`]), while
-/// `strict_outbound_listen_paths` is on.
+/// Refuse a `listen_path` no deployment serves as the Transit Point means it:
+/// one the outbound router cannot register as written
+/// ([`crate::proxy::server::LISTEN_PATH_INVALID`]), which panics the listener
+/// build once the surface is stored; the outbound prefix itself
+/// ([`crate::proxy::server::LISTEN_PATH_IS_OUTBOUND_PREFIX`]), which answers
+/// every outbound request no more specific route matches; and one under no
+/// surface prefix this gateway serves Transit Points on
+/// ([`crate::proxy::server::LISTEN_PATH_NOT_A_CHANNEL_PREFIX`]), which the
+/// Surface Builder's Listen Path picker cannot compose either. None is ever
+/// stored.
 ///
-/// Off, which is the default, this refuses nothing: every `listen_path` that
-/// saved before this release still saves, and the operator is told about it in
-/// a `Warning` header instead
-/// ([`crate::proxy::server::listen_path_warnings`]). The setting is what turns
-/// those warnings into refusals.
+/// A path under a configured prefix but outside the outbound one
+/// ([`crate::proxy::server::LISTEN_PATH_NOT_SERVED`]) is refused only where an
+/// inbound listener shares a hostname with the outbound listener, which is
+/// where it stops being reachable and where the Surface Builder offers the
+/// `/outbound` prefixes alone. On a deployment whose outbound listener has a
+/// hostname of its own the Transit Point answers it, the picker offers it, and
+/// the save stores it; the same predicate decides the `Warning`
+/// ([`crate::proxy::server::listen_path_warnings`]), so what is warned about
+/// on a stored path is what is refused on a new one.
 ///
-/// On, only a path this save introduces or changes is refused, for all three
-/// alike: the same Transit Point, in the same variant, keeping the same path
-/// is exempt, so turning the setting on never locks an operator out of editing
-/// a surface, while moving a path, copying it into a variant, or renaming the
-/// point or the variant is a new claim. A disabled surface registers no route,
-/// and is skipped as `check_listen_path_collisions` skips it; it claims
-/// nothing either ([`claiming_stored_surface`]).
+/// Only a path this save introduces or changes is refused: the same Transit
+/// Point, in the same variant, keeping the same path is exempt, so a surface
+/// stored with such a path before this release stays editable, while moving a
+/// path, copying it into a variant, or renaming the point or the variant is a
+/// new claim. A disabled surface registers no route, and is skipped as
+/// `check_listen_path_collisions` skips it; it claims nothing either
+/// ([`claiming_stored_surface`]).
 fn check_listen_paths(
     surface: &AgentSurface,
     stored: Option<&AgentSurface>,
     network_config: &crate::config::NetworkConfig,
 ) -> Result<(), SurfaceApiError> {
-    if !network_config.strict_outbound_listen_paths
-        || surface.status == crate::config::agent_surface::SurfaceStatus::Disabled
-    {
+    if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
         return Ok(());
     }
     let kept = crate::proxy::server::kept_listen_path_claims(claiming_stored_surface(stored));
-    match crate::proxy::server::listen_path_problems(surface)
+    let shared_hostname = crate::proxy::server::shares_an_outbound_hostname(network_config);
+    match crate::proxy::server::listen_path_problems(surface, network_config)
         .into_iter()
+        .filter(|problem| shared_hostname || problem.code != crate::proxy::server::LISTEN_PATH_NOT_SERVED)
         .find(|problem| !kept.contains(&problem.claim))
     {
         Some(problem) => Err(SurfaceApiError::BadRequestCode(problem.code, problem.message)),
@@ -9382,70 +9391,113 @@ mod validation_tests {
         }
     }
 
-    /// A network config with no listeners, whose appliance either refuses a
-    /// Transit Point `listen_path` outside the outbound prefix on save or
-    /// accepts it.
-    fn network_with_strict_listen_paths(strict: bool) -> crate::config::NetworkConfig {
+    /// A gateway whose configured surface prefixes are `/api`, the route of
+    /// [`base_surface`], and `/transit`, with `listeners`. A Transit Point's
+    /// `listen_path` may be set under either prefix, or under either beneath
+    /// the outbound prefix, unless an inbound listener shares the outbound
+    /// hostname.
+    fn network_with_channels_and_listeners(listeners: serde_json::Value) -> crate::config::NetworkConfig {
         serde_json::from_value(serde_json::json!({
             "did": { "domain": "test.local" },
             "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
             "integration": { "types": [], "categories": [] },
-            "listeners": [],
-            "strict_outbound_listen_paths": strict,
+            "listeners": listeners,
+            "channels": [
+                { "id": "api", "name": "API", "prefix": "/api" },
+                { "id": "transit", "name": "Transit", "prefix": "/transit" },
+            ],
             "routes": {},
         }))
         .expect("network config fixture")
+    }
+
+    /// A gateway whose outbound listener has a hostname of its own, so every
+    /// configured prefix is reachable and the `/outbound` form is not required.
+    fn network_with_channels() -> crate::config::NetworkConfig {
+        network_with_channels_and_listeners(serde_json::json!([]))
+    }
+
+    /// A gateway whose inbound listener answers on the outbound listener's
+    /// hostname, where the inbound side forwards the outbound prefix and
+    /// nothing else.
+    fn network_sharing_the_outbound_hostname() -> crate::config::NetworkConfig {
+        network_with_channels_and_listeners(serde_json::json!([
+            { "id": "in", "name": "In", "bind_address": "0.0.0.0", "port": 8080, "protocol": "https",
+                "external_urls": ["https://gateway.example.com"], "listener_type": "inbound" },
+            { "id": "out", "name": "Out", "bind_address": "0.0.0.0", "port": 9443, "protocol": "https",
+                "external_urls": ["https://gateway.example.com:9443"], "listener_type": "outbound" },
+        ]))
     }
 
     /// A refusal's code and message, for a save the gate must turn away.
     fn listen_path_refusal(
         surface: &AgentSurface,
         stored: Option<&AgentSurface>,
-        strict: &crate::config::NetworkConfig,
     ) -> (String, String) {
-        match check_listen_paths(surface, stored, strict) {
+        match check_listen_paths(surface, stored, &network_with_channels()) {
             Err(SurfaceApiError::BadRequestCode(code, msg)) => (code.to_string(), msg),
             other => panic!("expected a refusal, got {other:?}"),
         }
     }
 
-    #[test]
-    fn nothing_a_listen_path_does_is_refused_while_the_appliance_is_not_strict() {
-        let lenient = network_with_strict_listen_paths(false);
+    /// The gate's answer for a save of `surface` the appliance holds as
+    /// `stored`, against [`network_with_channels`].
+    fn listen_path_check(
+        surface: &AgentSurface,
+        stored: Option<&AgentSurface>,
+    ) -> Result<(), SurfaceApiError> {
+        check_listen_paths(surface, stored, &network_with_channels())
+    }
 
-        for path in [
-            "/partner-a-webhook",
-            "/outbound",
-            "/outbound/",
-            "/",
-            "//",
-            "partner-a",
-            "/partner/{id}",
-            "/outbound/:partner",
-            "/outbound/*partner",
-        ] {
+    #[test]
+    fn a_listen_path_under_a_configured_surface_prefix_is_saved() {
+        for path in ["/transit/pa", "/outbound/transit/pa", "/api/pa", "/outbound/api/pa/v2"] {
             let saved = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", path);
-            check_listen_paths(&saved, None, &lenient)
-                .unwrap_or_else(|error| panic!("{path} saved before this release and must still save: {error:?}"));
+            listen_path_check(&saved, None).unwrap_or_else(|error| {
+                panic!("{path} is a path the Surface Builder composes, so it must save: {error:?}")
+            });
+        }
+
+        let variant_only = surface_with_a_variant_only_listen_path("/transit/pb");
+        listen_path_check(&variant_only, None).expect("a variant's path under a surface prefix saves too");
+    }
+
+    #[test]
+    fn a_listen_path_outside_the_outbound_prefix_is_refused_where_the_hostname_is_shared() {
+        let shared = network_sharing_the_outbound_hostname();
+
+        let refused = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "/transit/pa");
+        let (code, msg) = match check_listen_paths(&refused, None, &shared) {
+            Err(SurfaceApiError::BadRequestCode(code, msg)) => (code.to_string(), msg),
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert_eq!(code, "listen_path_not_served");
+        assert!(msg.contains("'/outbound/api/pa'"), "the route every address serves must be named: {msg}");
+
+        let under_the_outbound_prefix = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "/outbound/transit/pa");
+        check_listen_paths(&under_the_outbound_prefix, None, &shared)
+            .expect("the /outbound form of the same prefix is what a shared hostname forwards");
+
+        let stored = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "/transit/pa");
+        check_listen_paths(&stored, Some(&stored), &shared)
+            .expect("a path the surface is already stored with stays editable");
+    }
+
+    #[test]
+    fn a_listen_path_the_surface_builder_cannot_compose_is_refused() {
+        for path in ["/partner-a-webhook", "/outbound/other/pa", "/transit", "/outbound/transit"] {
+            let (code, msg) = listen_path_refusal(&surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", path), None);
+            assert_eq!(code, "listen_path_not_a_channel_prefix", "{path}");
+            assert!(msg.starts_with("Transit Point 'pa' "), "{path}: {msg}");
+            assert!(msg.contains("'/outbound/api/', '/api/', '/outbound/transit/', '/transit/'"), "{path}: {msg}");
+            assert!(msg.contains("'/outbound/api/pa'"), "the derived route must be named: {path}: {msg}");
         }
     }
 
     #[test]
-    fn the_strict_gate_refuses_each_listen_path_the_save_introduces() {
-        let strict = network_with_strict_listen_paths(true);
-
-        let (code, msg) = listen_path_refusal(
-            &surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "/partner-a-webhook"),
-            None,
-            &strict,
-        );
-        assert_eq!(code, "listen_path_not_served");
-        assert!(msg.contains("listen_path '/partner-a-webhook', outside '/outbound'"), "{msg}");
-        assert!(msg.contains("'/outbound/api/pa'"), "the derived route must be named: {msg}");
-
+    fn a_listen_path_no_deployment_serves_is_refused_on_the_save_that_introduces_it() {
         for path in ["/outbound", "/outbound/"] {
-            let (code, msg) =
-                listen_path_refusal(&surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", path), None, &strict);
+            let (code, msg) = listen_path_refusal(&surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", path), None);
             assert_eq!(code, "listen_path_is_outbound_prefix", "{path}");
             assert!(msg.starts_with("Transit Point 'pa': "), "{path}: {msg}");
             assert!(msg.contains("every '/outbound' request"), "{path}: {msg}");
@@ -9460,15 +9512,14 @@ mod validation_tests {
             ("/outbound/:partner", "must not contain a segment starting with ':' or '*' (':partner')"),
             ("/outbound/*partner", "must not contain a segment starting with ':' or '*' ('*partner')"),
         ] {
-            let (code, msg) =
-                listen_path_refusal(&surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", path), None, &strict);
+            let (code, msg) = listen_path_refusal(&surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", path), None);
             assert_eq!(code, "listen_path_invalid", "{path}");
             assert!(msg.starts_with("Transit Point 'pa': "), "{path}: {msg}");
             assert!(msg.contains(reason), "{path}: {msg}");
         }
 
-        let under = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "/outbound/partner-a");
-        check_listen_paths(&under, None, &strict).expect("a path under the prefix is served");
+        let under = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "/outbound/api/partner-a");
+        listen_path_check(&under, None).expect("a path under a configured surface prefix is served");
     }
 
     /// A surface whose base Transit Point claims no `listen_path` and whose
@@ -9497,55 +9548,46 @@ mod validation_tests {
     }
 
     #[test]
-    fn the_strict_gate_refuses_a_listen_path_only_a_variant_claims() {
-        let strict = network_with_strict_listen_paths(true);
-
-        let introduced = surface_with_a_variant_only_listen_path("/partner-a-webhook");
-        let (code, msg) = listen_path_refusal(&introduced, None, &strict);
-        assert_eq!(code, "listen_path_not_served");
-        assert!(msg.starts_with("Transit Point 'pb' in variant 'candidate' "), "{msg}");
-        assert!(msg.contains("'/outbound/api$candidate/pb'"), "the route the variant serves must be named: {msg}");
+    fn the_gate_refuses_a_listen_path_only_a_variant_claims() {
+        let introduced = surface_with_a_variant_only_listen_path("/outbound");
+        let (code, msg) = listen_path_refusal(&introduced, None);
+        assert_eq!(code, "listen_path_is_outbound_prefix");
+        assert!(msg.starts_with("Transit Point 'pb' in variant 'candidate': "), "{msg}");
 
         let served = surface_with_a_variant_only_listen_path("/outbound/api/partner-b");
-        check_listen_paths(&served, None, &strict).expect("a variant path under the prefix is served");
+        listen_path_check(&served, None).expect("a variant path under the prefix is served");
     }
 
     #[test]
-    fn the_strict_gate_keeps_a_listen_path_the_same_point_already_held() {
-        let strict = network_with_strict_listen_paths(true);
-
-        for path in ["/partner-a-webhook", "/outbound", "partner-a"] {
+    fn the_gate_keeps_a_listen_path_the_same_point_already_held() {
+        for path in ["/outbound", "partner-a"] {
             let stored = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", path);
-            check_listen_paths(&stored, Some(&stored), &strict)
+            listen_path_check(&stored, Some(&stored))
                 .unwrap_or_else(|error| panic!("{path} is stored and unchanged, so it must save: {error:?}"));
 
             let moved = surface_with_tp("s1", "one", "0.0.0.0:9443", "pb", path);
             assert!(
-                check_listen_paths(&moved, Some(&stored), &strict).is_err(),
+                listen_path_check(&moved, Some(&stored)).is_err(),
                 "{path} on another Transit Point registers routes of its own"
             );
 
             let mut disabled = stored.clone();
             disabled.status = SurfaceStatus::Disabled;
-            check_listen_paths(&disabled, None, &strict).expect("a disabled surface reserves no route");
+            listen_path_check(&disabled, None).expect("a disabled surface reserves no route");
             assert!(
-                check_listen_paths(&stored, Some(&disabled), &strict).is_err(),
+                listen_path_check(&stored, Some(&disabled)).is_err(),
                 "{path} was claimed by a disabled surface, which claims nothing, so enabling it introduces it"
             );
         }
 
-        let stored = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "/partner-a-webhook");
-        let moved_under_the_prefix = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "/outbound/partner-a");
-        check_listen_paths(&moved_under_the_prefix, Some(&stored), &strict)
-            .expect("the edit that fixes a stored path must save");
+        let stored = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "/outbound");
+        let moved_under_the_prefix = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "/outbound/api/partner-a");
+        listen_path_check(&moved_under_the_prefix, Some(&stored)).expect("the edit that fixes a stored path must save");
 
-        let (code, msg) = listen_path_refusal(
-            &surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "/partner-b-webhook"),
-            Some(&stored),
-            &strict,
-        );
-        assert_eq!(code, "listen_path_not_served");
-        assert!(msg.contains("'/partner-b-webhook'"), "a changed path is introduced: {msg}");
+        let (code, msg) =
+            listen_path_refusal(&surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "partner-b"), Some(&stored));
+        assert_eq!(code, "listen_path_invalid");
+        assert!(msg.contains("'partner-b'"), "a changed path is introduced: {msg}");
 
         // The stored path is kept and a second one added beside it: the save is
         // refused, and only for the path it introduces.
@@ -9555,17 +9597,17 @@ mod validation_tests {
                 "outbound_listen_address": "0.0.0.0:9443",
                 "points": [
                     { "alias": "pa", "target_endpoint": "https://a.example.com", "protocol": "a2a",
-                        "listen_path": "/partner-a-webhook" },
+                        "listen_path": "/outbound" },
                     { "alias": "pb", "target_endpoint": "https://b.example.com", "protocol": "a2a",
-                        "listen_path": "/partner-b-webhook" },
+                        "listen_path": "partner-b" },
                 ],
             }),
         );
-        let (code, msg) = listen_path_refusal(&kept_and_added, Some(&stored), &strict);
-        assert_eq!(code, "listen_path_not_served");
+        let (code, msg) = listen_path_refusal(&kept_and_added, Some(&stored));
+        assert_eq!(code, "listen_path_invalid");
         assert!(msg.contains("'pb'"), "the Transit Point that introduces it must be named: {msg}");
-        assert!(msg.contains("'/partner-b-webhook'"), "{msg}");
-        assert!(!msg.contains("'/partner-a-webhook'"), "the kept path must not be refused: {msg}");
+        assert!(msg.contains("'partner-b'"), "{msg}");
+        assert!(!msg.contains("'pa'"), "the kept path must not be refused: {msg}");
     }
 
     #[test]

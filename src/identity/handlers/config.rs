@@ -558,8 +558,7 @@ pub struct ChannelRoutingConfigResponse {
     /// Each entry is a prefix to build a `listen_path` under, never a value to
     /// set: a surface prefix of `/` leaves the bare outbound prefix here, and
     /// a `listen_path` equal to it answers every outbound request no more
-    /// specific route matches, which the save warns about and
-    /// `strict_outbound_listen_paths` refuses.
+    /// specific route matches, which the admin API refuses.
     pub outbound_channel_path_prefix: Vec<ChannelPrefixInfo>,
     /// Channel path prefixes with names (for UI dropdown)
     pub channel_path_prefix: Vec<ChannelPrefixInfo>,

@@ -1,73 +1,66 @@
-Feature: A Transit Point's listen_path is held to the prefixes the gateway serves
-  A Transit Point answers at the route the gateway derives, under its outbound
-  prefix, and at its own listen_path as well. A listen_path outside that prefix
-  answers on the outbound listener alone, so an inbound listener sharing the
-  outbound hostname never reaches it. So does a listen_path on the outbound
-  prefix itself, which answers every outbound request no more specific route
-  matches, and one the outbound listener cannot register at all. The appliance
-  says so on the save in a Warning header, and refuses the paths the save
-  introduces only while strict_outbound_listen_paths is on: with it off, every
-  listen_path saves as it always did.
+Feature: A Transit Point's listen_path is held to the routes the gateway serves
+  A Transit Point answers at the route the gateway derives, under its surface's
+  outbound prefix, and at its own listen_path as well. A listen_path is set
+  under one of the gateway's configured surface prefixes, with or without the
+  outbound prefix in front, which is what the Surface Builder's Listen Path
+  picker offers; the admin API refuses the save that introduces anything else,
+  so it stores no Transit Point the dashboard could not have made. It also
+  refuses one the outbound listener cannot register, which would panic the
+  listener build once the surface is stored, and one on the outbound prefix
+  itself, which answers every outbound request no more specific route matches.
+  A listen_path outside the outbound prefix is served on the outbound
+  listener's own address alone, so where an inbound listener shares that
+  hostname, as it does here, the save that introduces one is refused as well;
+  a deployment whose outbound listener has a hostname of its own keeps it,
+  with a Warning on a path already stored.
 
   Background:
     Given A2A surface "example-surface" is defined for route "/example" with managed agent "example-agent" as its target
     And Transit Point "alpha" routes to MCP server "bravo"
 
-  Scenario: A listen_path under the outbound prefix is saved while the appliance is strict
-    Given the appliance serves Transit Points only under its outbound prefixes
-    When the operator sets Transit Point "alpha" listen_path to "/outbound/partner/alpha"
+  Scenario: A listen_path under the surface prefix is saved
+    When the operator sets Transit Point "alpha" listen_path to "/outbound/example/partner-alpha"
     Then the admin API response status is 200
 
-  Scenario: A listen_path outside the outbound prefix is refused while the appliance is strict
-    Given the appliance serves Transit Points only under its outbound prefixes
-    When the operator sets Transit Point "alpha" listen_path to "/partner-a-webhook"
+  Scenario: A listen_path outside the outbound prefix is refused while an inbound listener shares the outbound hostname
+    When the operator sets Transit Point "alpha" listen_path to "/transit/partner-alpha"
     Then the admin API response status is 400
-    And the admin API error response mentions "outside '/outbound'"
+    And the admin API error response mentions "listen_path '/transit/partner-alpha', outside '/outbound'"
 
   Scenario: The refusal names the route the gateway derives instead
-    Given the appliance serves Transit Points only under its outbound prefixes
-    When the operator sets Transit Point "alpha" listen_path to "/partner-a-webhook"
+    When the operator sets Transit Point "alpha" listen_path to "/transit/partner-alpha"
     Then the admin API response status is 400
     And the admin API error response mentions "/outbound/example/alpha"
 
-  Scenario: The listen_path a surface was stored with is saved again while the appliance is strict
-    Given the appliance serves Transit Points only under its outbound prefixes
-    When the operator sets Transit Point "alpha" listen_path to "/transit/alpha"
-    Then the admin API response status is 200
+  Scenario: A listen_path under no configured surface prefix is refused
+    When the operator sets Transit Point "alpha" listen_path to "/partner-a-webhook"
+    Then the admin API response status is 400
+    And the admin API error response mentions "under no surface prefix this gateway serves Transit Points on"
 
-  Scenario: A listen_path on the outbound prefix itself is refused while the appliance is strict
-    Given the appliance serves Transit Points only under its outbound prefixes
+  Scenario: A listen_path under an unconfigured prefix beneath the outbound prefix is refused
+    When the operator sets Transit Point "alpha" listen_path to "/outbound/other/alpha"
+    Then the admin API response status is 400
+    And the admin API error response mentions "under no surface prefix this gateway serves Transit Points on"
+
+  Scenario: A listen_path on the outbound prefix itself is refused
     When the operator sets Transit Point "alpha" listen_path to "/outbound"
     Then the admin API response status is 400
     And the admin API error response mentions "is the gateway's own outbound prefix"
 
-  Scenario: A listen_path the outbound listener cannot register is refused while the appliance is strict
-    Given the appliance serves Transit Points only under its outbound prefixes
+  Scenario: A listen_path the outbound listener cannot register is refused
     When the operator sets Transit Point "alpha" listen_path to "partner-a"
     Then the admin API response status is 400
     And the admin API error response mentions "must start with '/'"
 
-  Scenario: A listen_path with a legacy parameter segment is refused while the appliance is strict
-    Given the appliance serves Transit Points only under its outbound prefixes
-    When the operator sets Transit Point "alpha" listen_path to "/outbound/:partner"
+  Scenario: A listen_path with a legacy parameter segment is refused
+    When the operator sets Transit Point "alpha" listen_path to "/outbound/example/:partner"
     Then the admin API response status is 400
     And the admin API error response mentions "must not contain a segment starting with ':' or '*'"
 
-  Scenario: A listen_path with a legacy wildcard segment is refused while the appliance is strict
-    Given the appliance serves Transit Points only under its outbound prefixes
-    When the operator sets Transit Point "alpha" listen_path to "/outbound/*partner"
+  Scenario: A listen_path with a legacy wildcard segment is refused
+    When the operator sets Transit Point "alpha" listen_path to "/outbound/example/*partner"
     Then the admin API response status is 400
     And the admin API error response mentions "must not contain a segment starting with ':' or '*'"
-
-  Scenario: A listen_path on the outbound prefix itself is saved with a warning while the appliance is not strict
-    When the operator sets Transit Point "alpha" listen_path to "/outbound"
-    Then the admin API response status is 200
-    And the admin API response carries a Warning header containing "is the gateway's own outbound prefix"
-
-  Scenario: A listen_path outside the outbound prefix is saved with a warning while the appliance is not strict
-    When the operator sets Transit Point "alpha" listen_path to "/partner-a-webhook"
-    Then the admin API response status is 200
-    And the admin API response carries a Warning header containing "listen_path '/partner-a-webhook', outside '/outbound'"
 
   Scenario: The surface routing settings name the prefixes a Transit Point may listen under
     When the operator reads the surface routing settings

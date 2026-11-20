@@ -48,7 +48,14 @@ pub(crate) async fn send_a2a_request_through_transit_point(
     let outbound_port = gateway
         .outbound_port
         .unwrap_or_else(|| panic!("gateway {gw_index} has no outbound listener for Transit Point '{transit_point}'"));
-    let url = format!("http://127.0.0.1:{outbound_port}/transit/{transit_point}");
+    // The route the gateway derives for the point, registered whatever its
+    // listen_path: `/outbound<surface route>/<alias>`.
+    let route = world
+        .surface_spec(gw_index, &link.from_surface)
+        .route
+        .trim_end_matches('/')
+        .to_string();
+    let url = format!("http://127.0.0.1:{outbound_port}/outbound{route}/{transit_point}");
     let mut body = build_a2a_request_body();
     if world
         .surface_spec(gw_index, &link.from_surface)

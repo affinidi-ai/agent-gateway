@@ -104,6 +104,48 @@ bucket for the point, and `per_caller_rate_limit` gives each caller the point id
 of their own. Both are counted on each gateway node. See
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point).
 
+## Transit Point listen paths
+
+A Transit Point answers at the route the gateway derives,
+`/outbound/<surface route>/<alias>`, or `/outbound/<surface route>$<variant>/<alias>` for one a
+variant defines. That route is registered whatever the point's `listen_path` and is served at
+every address in `available_outbound_listen_addresses`, so a point that sets no `listen_path`
+needs nothing from this section.
+
+A `listen_path` adds a second route beside the derived one. It is set under one of the surface
+prefixes `gateway.json` configures in `channels`, with or without `/outbound` in front, and needs
+a segment of its own after that prefix: `/<channel>/<name>` or `/outbound/<channel>/<name>`.
+Those are the prefixes the Surface Builder's **Listen Path** picker offers, the plain ones on an
+outbound address of its own and the `/outbound` ones on an address shared with an inbound
+listener, so the admin API stores no Transit Point the dashboard could not have composed. Four
+paths it cannot serve as the Transit Point means it, on the base surface and in every variant
+alike:
+
+| Path | What happens | On save |
+| --- | --- | --- |
+| One the outbound router cannot register as written: no leading `/`, `/` or `//` alone, a `..` segment, `{` or `}` (axum reads a balanced pair as a path parameter, so the Transit Point silently answers every value in that position, and the listener build panics on a conflict there), or a segment starting with `:` or `*` (axum's pre-0.8 parameter syntax, which it refuses outright) | The outbound listener build panics, taking the gateway down, once the surface is stored | Refused, `400` with the code `listen_path_invalid` |
+| `/outbound` itself, bare or with a trailing slash | The point answers every `/outbound` request no more specific route matches, the derived routes of other Transit Points still winning | Refused, `400` with the code `listen_path_is_outbound_prefix` |
+| Under no configured surface prefix, or a bare prefix with no segment of its own: `/partner-a-webhook`, `/outbound/not-a-channel/x`, `/<channel>` | The dashboard cannot compose it, and it claims a route outside the space the gateway serves Transit Points on | Refused, `400` with the code `listen_path_not_a_channel_prefix`, naming the prefixes this gateway does offer |
+| A path outside `/outbound`, under a configured prefix: `/<channel>/<name>` | The point answers it on the outbound listener's own address. An inbound listener that shares a hostname with the outbound one forwards `/outbound` and nothing else, so on such a deployment this path is not reachable through the inbound address | Refused where an inbound listener shares the outbound hostname, `400` with the code `listen_path_not_served`, which is also where the Surface Builder offers the `/outbound` prefixes alone. Where the outbound listener has a hostname of its own the path is reachable, the picker offers it, and the save stores it; a path already stored gets a `Warning` header naming the point, its variant and the route every address serves |
+
+Both refusals name the Transit Point, its variant and what to do instead, and apply only to a
+path the save introduces or changes. The same Transit Point, in the same variant, keeping the
+same path is exempt, so a surface stored with such a path before this release stays editable,
+while moving the path to another Transit Point, copying it into a variant, renaming the point, or
+renaming the variant (which re-introduces every path that variant holds) is a new claim. A
+disabled surface reserves no route, so saving one is never refused and, claiming nothing while
+disabled, enabling it introduces every path it names: a surface disabled with a refused path
+cannot be enabled until the path changes.
+
+`outbound_channel_path_prefix` of `GET /v1/config/surface-routing` names each surface prefix
+under `/outbound`: prefixes to build a `listen_path` under, never values to set, since a surface
+prefix of `/` leaves the bare `/outbound` there.
+
+Known limitation: a `listen_path` already on disk is served as stored. One the router cannot
+register still panics the outbound listener build, and a stored `/outbound` still answers every
+outbound request no more specific route matches. Both are logged when the listener is built.
+Move any stored path the admin API would now refuse.
+
 ## Browser origins of a surface
 
 A browser page can call a surface only from an allowed origin. `network.cors` in `gateway.json` lists
@@ -254,7 +296,6 @@ Network topology and the surfaces served. The largest configuration file; the ex
 | `payment_ledger` | `retention_days` (default `7`, 1 to 400): how long the payments ledger keeps its hourly segments. `max_size_mb` (default `2048`, 16 to 1,048,576): the oldest segments are deleted early while the ledger is larger. Neither deletes a segment holding a payment still awaiting capture or void. Read at startup; a value out of range is clamped and logged as a warning. See [Taking the payment](#taking-the-payment). |
 | `client_ip` | `trusted_proxies`: proxy CIDRs whose `X-Forwarded-For` gives the client IP for the SAML and CLI login limits and the STS token endpoint throttle, and whose `X-Forwarded-Host` and `X-Forwarded-Proto` (or `Forwarded` `host` and `proto`) STS discovery may use when no inbound `external_urls` is set (default empty, so the TCP peer is the client and forwarded headers are ignored). Behind a load balancer, list it here: until then every caller it forwards counts as one client for these limits. A listed proxy that passes a caller's own `X-Forwarded-Host`, `X-Forwarded-Proto` or `Forwarded` through unchanged lets that caller choose the URLs STS discovery advertises, so have it set or strip them, or set inbound `external_urls`. Each listed proxy must append the address it saw to `X-Forwarded-For` or overwrite it; `Forwarded` is read only when `X-Forwarded-For` is absent. Separate from `tls.client_auth.trusted_proxies`. |
 | `facilitator_mode` | x402 facilitator behaviour. `facilitator_via_fabric`, `facilitator_via_http` and `enable_test_endpoints` are ignored, and a warning is logged when any is set: a peer's fabric x402 verify and settle requests are refused with `facilitator_disabled`, and `/api/x402/*` and the x402 test endpoints are not served. x402 payments already in the transaction store still settle. |
-| `strict_outbound_listen_paths` | Whether a Transit Point `listen_path` the gateway cannot serve as the Transit Point means it is refused on save. Default `false`, and **with it off nothing that saved before this release is refused**: every `listen_path` is accepted exactly as it was, and the save answers with a `Warning` header naming each problem instead. This setting is what turns those warnings into refusals. Three paths are named, for the base surface and every variant alike: one the outbound router cannot register as written (no leading `/`, `/` or `//` alone, a `..` segment, `{` or `}`, which axum reads as a path parameter, so the Transit Point silently answers every value in that position and the build panics on a conflict there, or a segment starting with `:` or `*`, axum's pre-0.8 parameter syntax, which it refuses outright so the build panics); `/outbound` itself, bare or with a trailing slash, which answers every `/outbound` request no more specific route matches, the derived routes of other Transit Points still winning; and a path outside `/outbound`, which answers on the outbound listener alone, so an inbound listener sharing that listener's hostname never reaches it. Only the third waits for a shared hostname before it is warned about, since that is when it stops being reachable; the other two are wrong on any deployment. With this `true`, such a save is refused with `400` and the code `listen_path_invalid`, `listen_path_is_outbound_prefix` or `listen_path_not_served`, naming the Transit Point, its variant and what to do instead, but only for a path the save introduces or changes: the same Transit Point, in the same variant, keeping the same path is exempt, so turning this on never locks an operator out of editing a surface, while moving a path to another Transit Point, copying it into a variant, renaming the point, or renaming the variant (which re-introduces every path that variant holds), is a new claim. A disabled surface reserves no route, so saving one is never refused and, claiming nothing while disabled, enabling it introduces every path it names: a surface disabled with one of these paths cannot be enabled while this is `true` until the path changes. A Transit Point that sets no `listen_path` answers at the derived `/outbound/<surface route>/<alias>`, or `/outbound/<surface route>$<variant>/<alias>` for one a variant defines, and is never affected, and `outbound_channel_path_prefix` of `GET /v1/config/surface-routing` names each surface prefix under `/outbound`: prefixes to build a `listen_path` under, never values to set, since a surface prefix of `/` leaves the bare `/outbound` there. Known limitation, and the pre-existing behaviour this setting exists to close: while it is `false` a stored `listen_path` the router cannot register still panics the outbound listener build, and a stored `/outbound` still answers every outbound request no more specific route matches. Both were only ever logged as a warning when the listener was built, by which time the surface was stored. Turn this on, having first moved any stored path it would now refuse. |
 | `cors` | Exact origins whose pages may call the gateway from a browser: the dashboard, and any surface. Read once, at startup. A surface can allow more origins for itself alone with `browser_origins` (see [Browser origins of a surface](#browser-origins-of-a-surface)). |
 | `terms`, `affinidi_terms_url` | Whether Terms acceptance is enforced, and where metadata is fetched |
 | `logging` | Log redaction, for every configuration source. Only `redaction` is read here; level, JSON output, and directory come from `config.toml`. See [Log redaction](#log-redaction). |
