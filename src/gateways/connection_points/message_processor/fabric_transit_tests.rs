@@ -386,6 +386,38 @@ async fn a_fabric_request_reaches_the_agent_with_one_transit_token_issued_for_it
     );
 }
 
+/// A Fabric receive continues the trace id the peer sent, whatever its form:
+/// the agent receives it, and every record of the request carries it, for a
+/// request the surface serves and for one it refuses.
+#[tokio::test]
+async fn a_fabric_receive_continues_any_trace_id_it_is_sent() {
+    if ran_in_child("ATG_FABRIC_RECEIVE_TRACE_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &surface("a2a", &target.url, &["crm"])).await;
+
+    let mut recorded = 0;
+    for (key, status) in [(CALLER_KEY, 200), ("a-key-the-surface-refuses", 401)] {
+        let (response, events) = crate::audit::producer::capture(forward_response(&forward_request(
+            root.path(),
+            json!({ "content-type": "application/json", "x-api-key": key }),
+            a2a_body(),
+        )))
+        .await;
+        assert_eq!(response["status"], status, "{response}");
+        for event in &events {
+            assert_eq!(event.trace_id.as_deref(), Some("trace-from-the-peer"), "{event:?}");
+        }
+        recorded += events.len();
+    }
+    assert!(recorded > 0, "the receive wrote no record");
+    let received = target.received();
+    assert_eq!(received.len(), 1, "only the served request reaches the agent");
+    assert_eq!(header_values(&received[0], "x-gateway-trace-id"), ["trace-from-the-peer"]);
+}
+
 /// A request past the hop limit is refused with `508`, and one whose hop
 /// count is not an integer from 1 to 255 with `400`, before the Target is
 /// called; each refusal is audited.
