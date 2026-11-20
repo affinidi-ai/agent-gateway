@@ -449,6 +449,9 @@ pub enum TrustCheckLeg {
     /// `trust_check_list` on the outbound path, or `Target.trust_check_list`
     /// for an `a2a-proxy://` target and fabric send.
     Target,
+    /// A Transit Point's self recognition check of the managed agent calling
+    /// out through it. Never part of policy input.
+    ManagedAgent,
 }
 
 #[cfg(test)]

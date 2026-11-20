@@ -339,10 +339,11 @@ export function describeEntry(entry: AuditEntry, userName?: UserNameResolver): E
     // "unavailable" paths (`AGENT_CARD_UNAVAILABLE`,
     // `TRUST_REGISTRY_METADATA_UNAVAILABLE`), so the summary falls
     // back to a plain phrasing that doesn't invent noise strings.
+    const leg = tc.leg.replace(/_/g, ' ');
     const summary =
       tc.authority_id && tc.entity_id
-        ? `The ${tc.leg} leg verified ${tc.entity_id} against ${tc.authority_id}.`
-        : `The ${tc.leg} leg trust check could not be evaluated.`;
+        ? `The ${leg} leg verified ${tc.entity_id} against ${tc.authority_id}.`
+        : `The ${leg} leg trust check could not be evaluated.`;
     return {
       title: tc.ok ? 'Trust check passed' : 'Trust check failed',
       tone,

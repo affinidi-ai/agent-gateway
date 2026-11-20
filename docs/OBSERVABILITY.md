@@ -837,6 +837,10 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     call's trace id, for a call whose Fabric-issued transit token names a caller with no grant,
     and answers the agent `403` with that reason (see
     [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
+    `agent_not_recognized`: a Transit Point's self recognition check refused the managed agent
+    calling out (`403`, JSON-RPC `-32001` on an MCP Transit Point), recorded against its surface
+    with the call's trace id; each of its queries is a `trust_check` record with `leg`
+    `managed_agent` (see [`POLICY.md`](POLICY.md#self-recognition-check)).
   - `forward`: `ssrf_blocked` (egress policy refuses the target address),
     `fabric_chain_too_long` (`508`) from a Transit Point to a `fabric://` target whose call would
     pass 8 Fabric crossings, recorded against its surface with the call's trace id, and on Fabric

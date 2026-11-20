@@ -965,6 +965,7 @@ fn audited_refusal_reason(refusal: &str) -> &'static str {
         "a malformed request" => "invalid_envelope",
         "a rejected request extension" => "extension_rejected",
         "a Target response that is not authenticated" => "target_response_auth_failed",
+        "an unrecognised managed agent" => "agent_not_recognized",
         other => panic!("no audited reason for the request refusal '{other}'"),
     }
 }

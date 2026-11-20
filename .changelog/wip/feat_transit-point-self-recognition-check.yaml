@@ -1,0 +1,19 @@
+branch: feat/transit-point-self-recognition-check
+changes:
+  added:
+    - timestamp: '2026-11-19T12:00:00Z'
+      title: ⭐ Refuse Transit Point calls from a managed agent no longer recognised
+      description: >-
+        A Transit Point's new self_recognition_check asks each trust registry the surface's
+        Trust Recorder records the owned agent in whether it still recognises the managed agent
+        calling out, and refuses the request with 403 before it leaves the gateway unless every
+        one does, so an agent whose recognition was turned off can no longer act for the
+        gateway. The Trust Recorder writes the agent's records first until they are recorded.
+        Refusals are audited as request_rejected with reason agent_not_recognized, and each
+        query as a trust_check on the managed_agent leg, which the Audit Log names and places
+        before policy in the request journey.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

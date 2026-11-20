@@ -2086,7 +2086,10 @@ restart mints new credential-derived DIDs, which show as versions with no field 
 
 The only writer of agent-in-trust-registry records
 ([`trust_recorder.rs`](../src/trust_registry_verification/trust_recorder.rs)). It fires
-on the response leg and on discovery, and is idempotent.
+on the response leg and on discovery, and is idempotent. A Transit Point's
+[self recognition check](POLICY.md#self-recognition-check) also has it write the calling
+agent's records, and waits for them, unless that agent's recorder status on the surface is
+Recorded.
 
 After writing its records, the Trust Recorder publishes a name for each authority it
 wrote. The name comes from the Authority register entry with that DID, or, failing that,

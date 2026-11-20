@@ -11,11 +11,11 @@ pub mod trust_check_element;
 pub mod trust_check_executor;
 pub mod trust_recorder;
 
-pub use stage::{run_caller_trust_check, run_trust_check_stage};
+pub use stage::{run_caller_trust_check, run_managed_agent_check, run_trust_check_stage};
 pub use trqp_adapter::TrqpListenerClient;
 pub use trust_check_element::{TrustCheckElement, TrustCheckLeg, TrustCheckResultsContext};
 pub use trust_check_executor::{
     AGENT_CARD_UNAVAILABLE, IDENTITY_VP_VERIFICATION_FAILED, TARGET_AGENT_IDENTITY_UNAVAILABLE,
     TrustCheckIdentityVerificationFailure, synthesize_failure, synthesize_unavailable_target,
 };
-pub use trust_recorder::spawn_trust_recorder;
+pub use trust_recorder::{record_before_self_recognition_check, self_recognition_checks, spawn_trust_recorder};

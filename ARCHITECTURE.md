@@ -192,7 +192,7 @@ flowchart TB
     end
     subgraph I["Identity and context"]
         direction LR
-        B1[Identity resolution] --> B2[Trusted identity] --> B3[Custom metadata]
+        B1[Identity resolution] --> B1a["Self recognition check,<br/>refuses outside policy"] --> B2[Trusted identity] --> B3[Custom metadata]
     end
     subgraph P["Trust and policy"]
         direction LR
@@ -252,13 +252,17 @@ transit token validation → rate limit → protocol context → variant check (
 Transit Point sets other gating or policies than the base surface's is refused with `403`) →
 Fabric hop check (a `fabric://` Transit Point refuses a call past the hop limit with `508`) →
 Transit Point header mapping
-(A2A and AP2) → outbound extension inspection (A2A) → identity resolution → trusted
+(A2A and AP2) → outbound extension inspection (A2A) → identity resolution → self
+recognition check (with `self_recognition_check`, refuses with `403` before policy unless the
+Trust Recorder's registries recognise the managed agent; see
+[`docs/POLICY.md`](docs/POLICY.md#self-recognition-check)) → trusted
 identity → custom metadata → trust context → Trust Check (the Transit Point's own list) → gateway OPA →
 surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection →
 forward (a `proxy://` Transit Point is answered by its MCP Proxy, whose backend gets only a
 `consent_mode: external` grant) → response and agent-card rewrite → metrics. A discovery read (a `GET` or `HEAD` of a discovery document on the Transit Point) runs
-the same stages, transit token validation included, except identity resolution: it has no body
-to resolve an identity from, so it reaches Trust Check and policy without a resolved identity.
+the same stages, transit token validation included, except identity resolution and the self
+recognition check: it has no body to resolve an identity from, so it reaches Trust Check and
+policy without a resolved identity.
 
 This page is the authority on pipeline ordering. When it disagrees with a summary
 elsewhere, the source is the arbiter and this page is corrected.
