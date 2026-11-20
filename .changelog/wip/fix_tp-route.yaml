@@ -62,6 +62,21 @@ changes:
         which is the base point's route: an operator who followed it reached the base Target, or a
         404 for an alias only the variant has. Such a Transit Point is now named at the route its
         variant serves, /outbound/<surface route>$<variant>/<alias>.
+    - timestamp: '2026-11-20T16:40:00Z'
+      title: The Surface Builder reads a Transit Point's prefix from the list it offers
+      description: >-
+        On an outbound address that shares the inbound hostname a Transit Point listens under
+        /outbound plus a channel's prefix, and the prefix picker offers exactly those forms. Two
+        places matched a stored route against the plain inbound list instead, which such a route
+        can never match, and then fell back to the first channel: a Transit Point whose path began
+        /outbound/ was recorded as /agents. The picker had no option equal to that, so it stayed on
+        its placeholder with Custom Path empty, and both required fields looked unset on a surface
+        whose route was correct; saving from there would have composed a new route out of the two
+        empty fields. Both now match against the offered list, a route under none of the offered
+        prefixes leaves the field unset rather than claiming one its path does not start with, and
+        a stored prefix the picker no longer offers is re-derived from the route instead of shown
+        as selected, so a surface stored before this reads correctly without being rewritten. A
+        new Transit Point seeds an offered prefix as well.
   removed: []
   security:
     - timestamp: '2026-11-20T12:40:00Z'

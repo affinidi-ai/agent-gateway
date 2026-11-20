@@ -218,7 +218,15 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
   const composedRoute: string = config[routeFieldName] || '';
 
   const { selectedPrefix, customPath } = useMemo(() => {
-    if (config.route_prefix || config.route_suffix !== undefined) {
+    // A persisted prefix is only trusted while the selector still offers it. One that
+    // is not among the options cannot be shown as selected, so taking it here left the
+    // dropdown on its placeholder and Custom Path empty on a surface whose route was
+    // perfectly good - which is what a stale or wrongly seeded route_prefix looks like
+    // (an inbound /agents on a Transit Point whose path starts /outbound/). Falling
+    // through re-derives both from the route itself.
+    const offersPersistedPrefix =
+      !config.route_prefix || channelPrefixes.some(p => p.prefix === config.route_prefix);
+    if (offersPersistedPrefix && (config.route_prefix || config.route_suffix !== undefined)) {
       return {
         selectedPrefix: config.route_prefix || '',
         customPath: config.route_suffix || '',
@@ -254,19 +262,28 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
       if (!config.listen_address && availableAddresses[0]) {
         patch.listen_address = meaningfulAddresses[0] ?? availableAddresses[0];
       }
-      if (!config.route_prefix && routingConfig.channel_path_prefix[0]) {
-        const matched = routingConfig.channel_path_prefix.find(
+      // Against the prefixes the selector OFFERS, not the plain inbound list: on an
+      // outbound address that shares the inbound hostname those are the /outbound/…
+      // forms, and a Transit Point's route starts there. Matching the raw list could
+      // never match such a route, and the old fallback to the first channel then wrote
+      // /agents onto every Transit Point Boris creates.
+      if (!config.route_prefix && channelPrefixes[0]) {
+        const matched = channelPrefixes.find(
           p => composedRoute === p.prefix || composedRoute.startsWith(p.prefix + '/')
         );
-        const prefix = matched?.prefix ?? routingConfig.channel_path_prefix[0].prefix;
-        const derivedSuffix = matched ? composedRoute.substring(matched.prefix.length) : '';
-        const suffix = config.route_suffix || derivedSuffix || '';
-        const path = suffix ? (suffix.startsWith('/') ? suffix : `/${suffix}`) : '';
-        patch.route_prefix = prefix;
-        if (suffix) {
-          patch.route_suffix = suffix.startsWith('/') ? suffix.substring(1) : suffix;
+        // Only a prefix the route actually starts with is persisted. A route under none
+        // of them leaves the field unset, so the selector shows it unresolved rather
+        // than claiming a prefix that does not belong to it.
+        if (matched) {
+          const derivedSuffix = composedRoute.substring(matched.prefix.length);
+          const suffix = config.route_suffix || derivedSuffix || '';
+          const path = suffix ? (suffix.startsWith('/') ? suffix : `/${suffix}`) : '';
+          patch.route_prefix = matched.prefix;
+          if (suffix) {
+            patch.route_suffix = suffix.startsWith('/') ? suffix.substring(1) : suffix;
+          }
+          if (path) patch[routeFieldName] = `${matched.prefix}${path}`;
         }
-        if (path) patch[routeFieldName] = `${prefix}${path}`;
       }
       if (Object.keys(patch).length > 0) updateFields(patch);
       return;
@@ -275,7 +292,9 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
     seededRef.current = true;
     const suffix = generateRandomPath();
     const path = suffix.startsWith('/') ? suffix : `/${suffix}`;
-    const prefix = routingConfig.channel_path_prefix[0]?.prefix ?? '';
+    // The offered list again, so a brand-new Transit Point on a shared-hostname
+    // outbound address seeds /outbound/<channel> rather than the inbound /<channel>.
+    const prefix = channelPrefixes[0]?.prefix ?? '';
     const listen = meaningfulAddresses[0] ?? availableAddresses[0] ?? '';
     updateFields({
       listen_address: listen,
