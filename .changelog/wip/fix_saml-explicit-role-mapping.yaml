@@ -1,0 +1,28 @@
+branch: fix/saml-explicit-role-mapping
+changes:
+  added:
+    - timestamp: '2026-11-20T12:00:00Z'
+      title: Add default_role to saml.json for sign-ins with no role mapping
+      description: >-
+        saml.json accepts an optional default_role (administrator, poweruser or user) that a SAML sign-in gets
+        when its identity-provider role has no role_mapping entry. Without it such a sign-in is refused.
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-20T12:00:00Z'
+      title: ⭐ Grant SAML roles only through an explicit role_mapping entry
+      description: >-
+        Previously a SAML role value with no role_mapping entry was matched by name, so an identity-provider
+        group or role called admin or administrator signed users in as Gateway administrator, and a power-user
+        spelling as power user, without anyone mapping it. A role now comes only from role_mapping; an unmapped
+        or missing role gets default_role or is refused with a 403 page. A role_mapping value or default_role
+        that names an unknown role stops the gateway at startup instead of becoming user.
+  breaking:
+    - timestamp: '2026-11-20T12:00:00Z'
+      title: Refuse SAML sign-ins whose role is not in role_mapping
+      description: >-
+        SAML sign-ins that relied on the name match, or on having no role at all, are now refused unless
+        saml.json maps the role in role_mapping or sets default_role. Add a role_mapping entry for every
+        identity-provider role that should sign in, or set default_role to user to keep admitting the rest.
+        The first user on an empty appliance and the primary administrator are unaffected.
