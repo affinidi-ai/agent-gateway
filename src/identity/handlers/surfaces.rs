@@ -10829,7 +10829,6 @@ mod validation_tests {
     fn valid_didauth_config() -> crate::source_auth::models::DidAuthAuthConfig {
         use crate::source_auth::models::{CredentialExtraction, DidAuthAuthConfig};
         DidAuthAuthConfig {
-            id: None,
             extraction: CredentialExtraction::HttpHeader {
                 field: "X-Session-Token".into(),
             },
@@ -11012,7 +11011,6 @@ mod validation_tests {
             0,
             SourceAuthConfig::ApiKey(ApiKeyAuthConfig {
                 identity: None,
-                id: None,
                 extraction: CredentialExtraction::HttpHeader { field: "X-API-Key".into() },
                 secret_id: "keys".into(),
             }),

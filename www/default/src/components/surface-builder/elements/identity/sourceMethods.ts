@@ -30,9 +30,13 @@ export function ownIdentityType(
   return undefined;
 }
 
-/** A new identity of `type` for a method's own callers. */
+/**
+ * A new identity of `type` for a method's own callers. A JWT claim is
+ * namespaced by the token's issuer, so two JWT Bearer methods trusting
+ * different identity providers never give their users the same DID.
+ */
 export function newMethodIdentity(type: MethodIdentity['type']): MethodIdentity {
-  return type === 'from_jwt_claim' ? { type, claim: 'oid' } : { type };
+  return type === 'from_jwt_claim' ? { type, claim: 'oid', namespace_claims: ['iss'] } : { type };
 }
 
 /**

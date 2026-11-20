@@ -2556,20 +2556,12 @@ async fn proxy_charged_request(
                     .surface
                     .inbound_identity_for(Some(auth_config))
                 {
-                    channel_warn!(config_id, "Caller refused: {}", reason);
-                    crate::metrics::backends::prometheus::track_managed_identity_resolve(
-                        &channel_name,
-                        state
-                            .surface
-                            .inbound_identity_mode_label(auth_config),
-                        "source_method_mismatch",
-                        0.0,
-                    );
-                    crate::audit::request_events::auth_failed(
+                    crate::source_auth::errors::record_mismatched_caller(
+                        &state.surface,
+                        auth_config,
+                        &resolved_auth_config,
+                        &reason,
                         &audit_facts,
-                        crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
-                        "source_method_mismatch",
-                        true,
                         client_ip,
                     );
                     connection_guard
@@ -3425,7 +3417,7 @@ async fn proxy_charged_request(
             None
         };
     let mut pre_identity_agent_context = agent_context.clone();
-    bind_api_key_caller_did(
+    bind_credential_caller_did(
         caller_inbound_identity.as_ref(),
         method.as_str(),
         uri.path(),
@@ -5305,18 +5297,19 @@ async fn proxy_charged_request(
 
     // ── Request-bound identity resolution (FromJwtClaim) ──────────────────
     //
-    // `from_jwt_claim` on the inbound slot derives the *caller* agent's DID
-    // from a validated JWT claim (e.g. the Entra Agent ID `oid`) produced by
-    // `jwt_bearer` source auth, then feeds the same `identity_result` /
-    // VP-inject path so the caller's identity VP is forwarded upstream to the
-    // target. This is the request leg — distinct from the protected slot,
-    // which stamps the managed agent's DID on the response back to the caller.
+    // `from_jwt_claim`, on the inbound slot or the caller's method, derives the
+    // *caller* agent's DID from a validated JWT claim (e.g. the Entra Agent ID
+    // `oid`) produced by `jwt_bearer` source auth, then feeds the same
+    // `identity_result` / VP-inject path so the caller's identity VP is
+    // forwarded upstream to the target. It replaces any identity the body
+    // asserts, as `from_api_key` does. This is the request leg — distinct from
+    // the protected slot, which stamps the managed agent's DID on the response
+    // back to the caller.
     //
     // Skipped on public/discovery paths (`is_public_path`): source auth is
     // bypassed there, so no JWT claims exist and there is no caller identity to
     // resolve — mirrors the Trust Check and surface OPA discovery bypasses.
     if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
-        && identity_result.is_none()
         && let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) =
             caller_inbound_identity.as_ref()
     {
@@ -5345,11 +5338,7 @@ async fn proxy_charged_request(
                 identity_hash,
                 ..
             }) => {
-                let vc_issuer_opt = state
-                    .identity_selector
-                    .as_ref()
-                    .map(|s| s.get_vc_issuer())
-                    .or_else(|| state.vc_issuer.clone());
+                let vc_issuer_opt = state.caller_vc_issuer();
                 let Some(issuer) = vc_issuer_opt else {
                     crate::metrics::backends::prometheus::track_managed_identity_resolve(
                         &channel_name,
@@ -5482,7 +5471,7 @@ async fn proxy_charged_request(
             did: Some(result.did.clone()),
             identity_hash: Some(result.hash.clone()),
         });
-    bind_api_key_caller_did(
+    bind_credential_caller_did(
         caller_inbound_identity.as_ref(),
         method.as_str(),
         uri.path(),
@@ -7212,14 +7201,8 @@ async fn proxy_charged_request(
                 // `workloadBinding.delegationAction`; otherwise it uses the
                 // legacy `identityFields` shape. The VP itself is NEVER returned
                 // to the caller — it lives only in the audit trail.
-                if let (Some(selector), Some(result)) = (
-                    state
-                        .identity_selector
-                        .as_ref(),
-                    identity_result.as_ref(),
-                ) {
+                if let (Some(vc_issuer), Some(result)) = (state.caller_vc_issuer(), identity_result.as_ref()) {
                     let wb: Option<serde_json::Value> = None;
-                    let vc_issuer = selector.get_vc_issuer();
                     match vc_issuer
                         .create_agent_identity_presentation_with_binding(
                             &result.did,
@@ -7462,11 +7445,7 @@ async fn proxy_charged_request(
             "inject_vp is enabled but no identity binding VP was produced on the protected path — no inbound agent identity was resolved (configure managed_identity / protected_identity, or have the caller send an identity VP); toggle has no effect for this request"
         );
     }
-    let vc_issuer_for_vp = state
-        .identity_selector
-        .as_ref()
-        .map(|s| s.get_vc_issuer())
-        .or_else(|| state.vc_issuer.clone());
+    let vc_issuer_for_vp = state.caller_vc_issuer();
     if let (Some(vc_issuer), Some(result)) = (vc_issuer_for_vp, identity_result.as_ref()) {
         let wb = build_target_request_workload_binding(
             &state.surface,
@@ -10754,12 +10733,7 @@ async fn resolve_configured_caller_identity(
             identity_hash,
             credential_updated_at,
         })) => {
-            let Some(issuer) = state
-                .identity_selector
-                .as_ref()
-                .map(|s| s.get_vc_issuer())
-                .or_else(|| state.vc_issuer.clone())
-            else {
+            let Some(issuer) = state.caller_vc_issuer() else {
                 debug!(
                     channel = channel_name,
                     leg, "Inbound credential identity: VCIssuer not configured — DID issuance skipped"
@@ -10841,7 +10815,7 @@ async fn resolve_configured_caller_identity(
 const CALLER_IDENTITY_UNRESOLVED: &str = "Caller identity could not be resolved";
 
 /// Whether the configured caller identity runs on this request. It fills in
-/// when the body carried no identity; on an inbound `from_api_key` slot it
+/// when the body carried no identity; an inbound `from_api_key` identity
 /// replaces any body identity, so a presented key cannot be traded for a VP's
 /// DID.
 fn configured_caller_identity_applies(
@@ -10851,12 +10825,21 @@ fn configured_caller_identity_applies(
     path: &str,
 ) -> bool {
     !body_identity_resolved
-        || (identifies_by_presented_api_key(inbound_identity) && !crate::proxy::paths::is_public_request(method, path))
+        || (matches!(inbound_identity, Some(crate::source_auth::ManagedIdentityConfig::FromApiKey { .. }))
+            && !crate::proxy::paths::is_public_request(method, path))
 }
 
-/// Whether the caller's inbound identity is the API key it presented.
-fn identifies_by_presented_api_key(inbound_identity: Option<&crate::source_auth::ManagedIdentityConfig>) -> bool {
-    matches!(inbound_identity, Some(crate::source_auth::ManagedIdentityConfig::FromApiKey { .. }))
+/// Whether the caller's inbound identity is read from the credential it
+/// presented: the API key (`from_api_key`) or a claim of its JWT
+/// (`from_jwt_claim`).
+fn identifies_by_presented_credential(inbound_identity: Option<&crate::source_auth::ManagedIdentityConfig>) -> bool {
+    matches!(
+        inbound_identity,
+        Some(
+            crate::source_auth::ManagedIdentityConfig::FromApiKey { .. }
+                | crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. }
+        )
+    )
 }
 
 /// The inbound identity of this request's caller: the identity of the method that
@@ -10878,17 +10861,18 @@ fn caller_inbound_identity(
         .cloned()
 }
 
-/// On an inbound `from_api_key` surface the caller is the presented key, so
-/// `input.agent.did` is the key's DID (or absent when none was resolved), never
-/// a DID the request body asserts. Other surfaces keep the body DID.
-fn bind_api_key_caller_did(
+/// When the caller's inbound identity is read from its credential
+/// (`from_api_key`, `from_jwt_claim`), `input.agent.did` is that identity's DID
+/// (or absent when none was resolved), never a DID the request body asserts.
+/// Other callers keep the body DID.
+fn bind_credential_caller_did(
     inbound_identity: Option<&crate::source_auth::ManagedIdentityConfig>,
     method: &str,
     path: &str,
     agent: Option<&mut crate::surface_context::AgentContext>,
     extension_identity: Option<&crate::surface_context::ExtensionIdentityContext>,
 ) {
-    if identifies_by_presented_api_key(inbound_identity)
+    if identifies_by_presented_credential(inbound_identity)
         && !crate::proxy::paths::is_public_request(method, path)
         && let Some(agent) = agent
     {
@@ -10963,12 +10947,7 @@ async fn resolve_presented_api_key_identity(
         }
     };
 
-    let Some(issuer) = state
-        .identity_selector
-        .as_ref()
-        .map(|s| s.get_vc_issuer())
-        .or_else(|| state.vc_issuer.clone())
-    else {
+    let Some(issuer) = state.caller_vc_issuer() else {
         warn!(channel = channel_name, leg, "Inbound from_api_key identity without a VC issuer — DID issuance skipped");
         track("vc_issuer_missing");
         return Ok(None);
@@ -11443,17 +11422,17 @@ async fn handle_fabric_request_inner(
 
     // ── Request-bound identity resolution (FromJwtClaim) — fabric path ────
     //
-    // `from_jwt_claim` on the inbound slot derives the *caller* agent's DID
-    // from a validated JWT claim (e.g. the Entra Agent ID `oid`) produced by
-    // `jwt_bearer` source auth, then feeds the same `identity_result` so the
-    // caller's identity VP is forwarded across the fabric hop to the remote
-    // gateway (mirrors the direct path).
+    // `from_jwt_claim`, on the inbound slot or the caller's method, derives the
+    // *caller* agent's DID from a validated JWT claim (e.g. the Entra Agent ID
+    // `oid`) produced by `jwt_bearer` source auth, replacing any identity the
+    // body asserts, then feeds the same `identity_result` so the caller's
+    // identity VP is forwarded across the fabric hop to the remote gateway
+    // (mirrors the direct path).
     //
     // Skipped on public/discovery paths (`is_public_path`): source auth is
     // bypassed there, so no JWT claims exist and there is no caller identity to
     // resolve — mirrors the Trust Check and surface OPA discovery bypasses.
     if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
-        && identity_result.is_none()
         && let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) =
             caller_inbound_identity.as_ref()
     {
@@ -11482,11 +11461,7 @@ async fn handle_fabric_request_inner(
                 identity_hash,
                 ..
             }) => {
-                let vc_issuer_opt = state
-                    .identity_selector
-                    .as_ref()
-                    .map(|s| s.get_vc_issuer())
-                    .or_else(|| state.vc_issuer.clone());
+                let vc_issuer_opt = state.caller_vc_issuer();
                 let Some(issuer) = vc_issuer_opt else {
                     crate::metrics::backends::prometheus::track_managed_identity_resolve(
                         channel_name,
@@ -11678,7 +11653,7 @@ async fn handle_fabric_request_inner(
         } else {
             None
         };
-        bind_api_key_caller_did(
+        bind_credential_caller_did(
             caller_inbound_identity.as_ref(),
             method.as_str(),
             uri.path(),
@@ -12544,11 +12519,7 @@ async fn handle_fabric_request_inner(
 
     // ── Create identity binding VP for fabric forwarding (audit + optional injection) ─────
     let fabric_binding_vp_jwt = if let Some(ref result) = identity_result {
-        let selector = state
-            .identity_selector
-            .as_ref();
-        if let Some(selector) = selector {
-            let vc_issuer = selector.get_vc_issuer();
+        if let Some(vc_issuer) = state.caller_vc_issuer() {
             let chained_credentials = identity_binding
                 .as_ref()
                 .map(|b| b.inbound_credentials.clone())
@@ -15341,7 +15312,7 @@ async fn evaluate_mcp_proxy_opa_policies(
             .await,
         );
     }
-    bind_api_key_caller_did(
+    bind_credential_caller_did(
         state
             .surface
             .inbound_identity(),
@@ -23699,7 +23670,7 @@ allow if {
             };
 
             let mut agent = asserted_agent();
-            super::super::bind_api_key_caller_did(
+            super::super::bind_credential_caller_did(
                 api_key.inbound_identity(),
                 "POST",
                 "/mcp",
@@ -23710,18 +23681,30 @@ allow if {
             assert_eq!(agent.did_verification, Some(IdentityVerification::SourceAuth));
 
             let mut agent = asserted_agent();
-            super::super::bind_api_key_caller_did(api_key.inbound_identity(), "POST", "/mcp", Some(&mut agent), None);
+            super::super::bind_credential_caller_did(
+                api_key.inbound_identity(),
+                "POST",
+                "/mcp",
+                Some(&mut agent),
+                None,
+            );
             assert_eq!(agent.did, None);
 
             let mut agent = asserted_agent();
             agent.did = None;
             agent.provider_did = Some("did:web:provider.example".into());
-            super::super::bind_api_key_caller_did(api_key.inbound_identity(), "POST", "/mcp", Some(&mut agent), None);
+            super::super::bind_credential_caller_did(
+                api_key.inbound_identity(),
+                "POST",
+                "/mcp",
+                Some(&mut agent),
+                None,
+            );
             assert_eq!(agent.did, None);
             assert_eq!(agent.provider_did, None);
 
             let mut agent = asserted_agent();
-            super::super::bind_api_key_caller_did(
+            super::super::bind_credential_caller_did(
                 api_key.inbound_identity(),
                 "GET",
                 "/.well-known/agent-card.json",
@@ -23729,6 +23712,25 @@ allow if {
                 Some(&key),
             );
             assert_eq!(agent.did.as_deref(), Some("did:web:asserted.example"));
+        }
+
+        #[test]
+        fn a_jwt_claim_did_replaces_a_body_asserted_agent_did() {
+            let claim = ManagedIdentityConfig::FromJwtClaim {
+                claim: "oid".into(),
+                namespace_claims: vec!["iss".into()],
+            };
+            let derived = crate::surface_context::ExtensionIdentityContext {
+                did: Some("did:webvh:claim".into()),
+                identity_hash: Some("hash-claim".into()),
+                verification: IdentityVerification::SourceAuth,
+            };
+
+            let mut agent = asserted_agent();
+            super::super::bind_credential_caller_did(Some(&claim), "POST", "/mcp", Some(&mut agent), Some(&derived));
+
+            assert_eq!(agent.did.as_deref(), Some("did:webvh:claim"));
+            assert_eq!(agent.did_verification, Some(IdentityVerification::SourceAuth));
         }
 
         async fn mcp_proxy_policy_agent(
@@ -23805,7 +23807,7 @@ allow if {
             ];
             for surface in &surfaces {
                 let mut agent = asserted_agent();
-                super::super::bind_api_key_caller_did(
+                super::super::bind_credential_caller_did(
                     surface.inbound_identity(),
                     "POST",
                     "/mcp",

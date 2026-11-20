@@ -17,7 +17,6 @@ import {
   methodIncompleteReason,
   methodSelectionProblems,
   readMethods,
-  withMethodIds,
 } from './methods';
 
 const usesDiscovery = (c: Record<string, unknown>): boolean =>
@@ -194,7 +193,7 @@ export const callerAuthDefinition: NodeDefinition = {
     const stored = Array.isArray(slice?.methods) ? slice.methods : [];
     if (stored.length === 0) return slice ?? {};
     return {
-      methods: withMethodIds(stored.map(methodConfigFromPayload)),
+      methods: stored.map(methodConfigFromPayload),
       protected_resource:
         stored[0].type === 'jwt_bearer' ? readProtectedResource(slice.protected_resource) : null,
       on_failure: isOnFailure(slice.on_failure) ? slice.on_failure : undefined,

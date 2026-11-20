@@ -36,16 +36,6 @@ pub enum SourceAuthConfig {
 }
 
 impl SourceAuthConfig {
-    pub fn id(&self) -> Option<&str> {
-        match self {
-            SourceAuthConfig::JwtBearer(config) => config.id.as_deref(),
-            SourceAuthConfig::ApiKey(config) => config.id.as_deref(),
-            SourceAuthConfig::ApiKeyProvider(config) => config.id.as_deref(),
-            SourceAuthConfig::DidAuth(config) => config.id.as_deref(),
-            SourceAuthConfig::Mtls(config) => config.id.as_deref(),
-        }
-    }
-
     /// The inbound identity this method's callers are given, when the method sets its own.
     pub fn identity(&self) -> Option<&ManagedIdentityConfig> {
         match self {
@@ -84,17 +74,6 @@ impl SourceAuthConfig {
         format!("{article} {tag}")
     }
 
-    /// Drop the method's id; the method itself is unchanged.
-    pub fn clear_id(&mut self) {
-        match self {
-            SourceAuthConfig::JwtBearer(config) => config.id = None,
-            SourceAuthConfig::ApiKey(config) => config.id = None,
-            SourceAuthConfig::ApiKeyProvider(config) => config.id = None,
-            SourceAuthConfig::DidAuth(config) => config.id = None,
-            SourceAuthConfig::Mtls(config) => config.id = None,
-        }
-    }
-
     /// Snake_case identifier for the configured authentication method, matching
     /// the serde `type` discriminant. Used to label a failed source-auth
     /// attempt when handing the outcome to the policy layer.
@@ -112,10 +91,6 @@ impl SourceAuthConfig {
 /// API Key authentication configuration (backed by SecretsStore).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApiKeyAuthConfig {
-    /// Stable identifier of this method within its `methods` list, assigned by
-    /// the dashboard and kept across edits and reordering.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
     /// How the inbound identity of this method's callers is derived, read from
     /// the credential they presented. Unset: the surface's inbound identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -129,10 +104,6 @@ pub struct ApiKeyAuthConfig {
 /// API Key Provider authentication configuration (backed by ApiKeyValidator).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApiKeyProviderAuthConfig {
-    /// Stable identifier of this method within its `methods` list, assigned by
-    /// the dashboard and kept across edits and reordering.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
     /// How the inbound identity of this method's callers is derived, read from
     /// the credential they presented. Unset: the surface's inbound identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,10 +123,6 @@ pub struct ApiKeyProviderAuthConfig {
 /// configured `extraction` slot on subsequent requests.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DidAuthAuthConfig {
-    /// Stable identifier of this method within its `methods` list, assigned by
-    /// the dashboard and kept across edits and reordering.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
     /// Where to extract the DID Auth session token from the inbound request.
     pub extraction: CredentialExtraction,
 
@@ -250,10 +217,6 @@ impl DidAuthAuthConfig {
 ///   stable principal string for downstream OPA / audit / metrics use.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MtlsAuthConfig {
-    /// Stable identifier of this method within its `methods` list, assigned by
-    /// the dashboard and kept across edits and reordering.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
     /// How to establish trust in the presented client certificate.
     pub trust: MtlsTrust,
 
@@ -1038,7 +1001,6 @@ mod tests {
     fn source_auth_config_apikey_roundtrip() {
         let config = SourceAuthConfig::ApiKey(ApiKeyAuthConfig {
             identity: None,
-            id: None,
             extraction: CredentialExtraction::HttpHeader { field: "X-API-Key".to_string() },
             secret_id: "my-secret".to_string(),
         });
@@ -1375,7 +1337,6 @@ mod tests {
     fn source_auth_config_apikey_provider_roundtrip() {
         let config = SourceAuthConfig::ApiKeyProvider(ApiKeyProviderAuthConfig {
             identity: None,
-            id: None,
             extraction: CredentialExtraction::HttpHeader { field: "X-API-Key".to_string() },
             agent_id: "agent-1".to_string(),
         });
@@ -1387,7 +1348,6 @@ mod tests {
     #[test]
     fn source_auth_config_didauth_roundtrip() {
         let config = SourceAuthConfig::DidAuth(DidAuthAuthConfig {
-            id: None,
             extraction: CredentialExtraction::HttpHeader {
                 field: "Authorization".to_string(),
             },
@@ -1405,7 +1365,6 @@ mod tests {
     #[test]
     fn source_auth_config_didauth_optional_fields_round_trip() {
         let config = SourceAuthConfig::DidAuth(DidAuthAuthConfig {
-            id: None,
             extraction: CredentialExtraction::HttpHeader { field: "X-Session".to_string() },
             allowed_dids: vec!["did:example:alice".to_string()],
             challenge_ttl_seconds: Some(600),
@@ -1421,7 +1380,6 @@ mod tests {
     #[test]
     fn didauth_default_ttl_and_alg_helpers() {
         let cfg = DidAuthAuthConfig {
-            id: None,
             extraction: CredentialExtraction::HttpHeader { field: "X-Session".to_string() },
             allowed_dids: vec![],
             challenge_ttl_seconds: None,
@@ -1434,7 +1392,6 @@ mod tests {
         assert_eq!(cfg.effective_allowed_algorithms(), vec!["EdDSA".to_string()]);
 
         let custom = DidAuthAuthConfig {
-            id: None,
             extraction: CredentialExtraction::HttpHeader { field: "X-Session".to_string() },
             allowed_dids: vec![],
             challenge_ttl_seconds: Some(60),
@@ -1460,7 +1417,6 @@ mod tests {
     #[test]
     fn source_auth_config_mtls_roundtrip() {
         let config = SourceAuthConfig::Mtls(MtlsAuthConfig {
-            id: None,
             trust: crate::source_auth::models::MtlsTrust::Pinned {
                 certificate_ids: vec!["cert-1".to_string()],
             },
@@ -1810,39 +1766,5 @@ mod tests {
         assert!(CredentialSource::McpMeta.same_as(&CredentialSource::McpMeta));
         assert!(!CredentialSource::McpMeta.same_as(&CredentialSource::A2aExtension));
         assert!(!CredentialSource::ClientCertificate.same_as(&CredentialSource::Header("Authorization")));
-    }
-
-    #[test]
-    fn every_method_type_keeps_its_id_through_a_round_trip() {
-        let wire = [
-            serde_json::json!({"type": "api_key", "id": "m-key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "s1"}),
-            serde_json::json!({"type": "api_key_provider", "id": "m-prov", "extraction": {"source": "http_header", "field": "X-Provider-Key"}, "agent_id": "a1"}),
-            serde_json::json!({"type": "jwt_bearer", "id": "m-jwt", "jwt_verification_strategy_id": "st1", "audiences": ["aud"]}),
-            serde_json::json!({"type": "mtls", "id": "m-mtls", "trust": {"type": "pinned", "certificate_ids": ["c1"]}, "identity_binding": {"type": "fingerprint"}}),
-        ];
-        for value in wire {
-            let expected = value["id"]
-                .as_str()
-                .unwrap()
-                .to_string();
-            let parsed: SourceAuthConfig = serde_json::from_value(value.clone()).unwrap();
-            assert_eq!(parsed.id(), Some(expected.as_str()), "{value}");
-            assert_eq!(serde_json::to_value(&parsed).unwrap()["id"], value["id"], "{value}");
-        }
-    }
-
-    #[test]
-    fn a_method_without_an_id_serializes_without_one() {
-        let parsed: SourceAuthConfig = serde_json::from_value(serde_json::json!({
-            "type": "jwt_bearer", "jwt_verification_strategy_id": "st1", "audiences": ["aud"]
-        }))
-        .unwrap();
-        assert_eq!(parsed.id(), None);
-        assert!(
-            serde_json::to_value(&parsed)
-                .unwrap()
-                .get("id")
-                .is_none()
-        );
     }
 }

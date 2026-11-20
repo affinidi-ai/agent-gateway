@@ -594,11 +594,11 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   is on, JWT Bearer only as the first method), shown on each row and on the canvas. Removing the
   primary method also turns discovery off, since discovery belongs to it. With several methods an incomplete one marks the element
   unconfigured as `Method <n>: <reason>`.
-- **Caller identity per method**: every method has an `id` (`methods.ts`: `newMethodId` for an
-  added method, `withMethodIds` naming a stored one `method-<position>` on load), kept when a
-  method is edited, reordered or made primary; an id the dashboard made is flagged
-  `id_generated` and never saved, a stored one always is. Each method may carry `identity`
-  (`MethodIdentity`): From JWT Claims (`claim`, default `oid`, optional `namespace_claims`) on a
+- **Caller identity per method**: methods have no id; rows are keyed by position and the
+  dashboard never sends an `id` on a method. Each method may carry `identity`
+  (`MethodIdentity`): From JWT Claims (`claim`, default `oid`; `namespace_claims` is `["iss"]` on
+  one the panel creates (`newMethodIdentity`), so two JWT Bearer methods trusting different
+  identity providers never share a DID, and a stored list is saved unchanged) on a
   JWT Bearer method, From API Key on an API Key or API Key Provider method, saved as the method's
   `identity` (`buildMethod`); one its credential cannot supply is not saved, and changing a
   method's type drops it. With more than one Caller Context method (and an extraction type other
@@ -612,7 +612,7 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `updateNodeFields`, since the identity lives on the method. The inbound From JWT Claims and
   From API Key rules need only one method that gets an identity (`methodGetsIdentity` in
   `sourceMethods.ts`). Loading a surface replaces `methods`, so a stale canvas copy never brings
-  a removed method identity back, and a template keeps the methods' ids and identities. A method
+  a removed method identity back, and a template keeps the methods' identities. A method
   identity beside an inbound From Payload Identity is a Save error (`METHOD_IDENTITY_BESIDE_PAYLOAD`),
   since callers assert that identity in the body. Each Caller Context row with its own identity says
   so under its location (`<area>-method-<index>-identity`, "Identifies its callers From JWT Claims" or

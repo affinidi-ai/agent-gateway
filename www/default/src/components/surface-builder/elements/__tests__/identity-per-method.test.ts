@@ -11,7 +11,6 @@ import {
 
 const JWT = {
   type: 'jwt_bearer',
-  id: 'users-jwt',
   jwt_verification_strategy_id: 'idp',
   audiences: ['api://agent'],
   token_header: 'Authorization',
@@ -20,7 +19,6 @@ const JWT = {
 };
 const API_KEY = {
   type: 'api_key',
-  id: 'partner-key',
   extraction: { source: 'http_header', field: 'X-API-Key' },
   secret_id: 'partner-keys',
 };
@@ -72,33 +70,12 @@ const KEY_IDENTITY = { type: 'from_api_key' };
 const callerMethods = (nodes: CanvasNode[]) =>
   nodes.find(n => n.type === 'caller-auth')!.config.methods;
 
-describe('caller authentication method ids', () => {
-  it('keeps each stored method id through a load and a save', () => {
-    const { payload } = rebuild(stored([JWT, API_KEY]));
-    expect(payload.access_point.caller_authentication.methods.map((m: any) => m.id)).toEqual([
-      'users-jwt',
-      'partner-key',
-    ]);
-  });
-
-  it('gives a stored method without an id one in memory, unique and stable across loads', () => {
-    const legacy = stored([
-      { ...JWT, id: undefined },
-      { ...API_KEY, id: undefined },
-    ]);
-    const ids = (nodes: CanvasNode[]) => callerMethods(nodes).map((m: any) => m.id);
-    const first = ids(registry.nodesFromPayload(legacy));
-    expect(first).toHaveLength(2);
-    expect(first.every((id: unknown) => /^[a-z0-9-]{1,32}$/.test(String(id)))).toBe(true);
-    expect(new Set(first).size).toBe(2);
-    expect(ids(registry.nodesFromPayload(legacy))).toEqual(first);
-  });
-
-  it('saves a surface stored without ids without adding any, identities included', () => {
+describe('caller authentication methods', () => {
+  it('sends no id on any method, even one a stored method carries', () => {
     const { payload } = rebuild(
       stored([
-        { ...JWT, id: undefined, identity: JWT_IDENTITY },
-        { ...API_KEY, id: undefined, identity: KEY_IDENTITY },
+        { ...JWT, id: 'users-jwt', identity: JWT_IDENTITY },
+        { ...API_KEY, id: 'partner-key' },
       ])
     );
     expect(payload.access_point.caller_authentication.methods.some((m: any) => 'id' in m)).toBe(
@@ -150,6 +127,17 @@ describe('caller identity per method — payload', () => {
     ).toBe(false);
   });
 
+  it('keeps the namespace claims a stored method identity names', () => {
+    const { payload } = rebuild(
+      stored([{ ...JWT, identity: { ...JWT_IDENTITY, namespace_claims: ['iss', 'tid'] } }])
+    );
+    expect(payload.access_point.caller_authentication.methods[0].identity).toEqual({
+      type: 'from_jwt_claim',
+      claim: 'oid',
+      namespace_claims: ['iss', 'tid'],
+    });
+  });
+
   it('drops a method identity when the method changes type', () => {
     const method = callerMethods(registry.nodesFromPayload(mixed))[1];
     expect(defaultMethodConfig('jwt_bearer', method).identity).toBeUndefined();
@@ -166,8 +154,8 @@ describe('caller identity per method — payload', () => {
             type: 'caller-auth',
             config: {
               methods: [
-                { method_type: 'jwt_bearer', id: 'users-jwt', identity: JWT_IDENTITY },
-                { method_type: 'api_key', id: 'partner-key', identity: KEY_IDENTITY },
+                { method_type: 'jwt_bearer', identity: JWT_IDENTITY },
+                { method_type: 'api_key', identity: KEY_IDENTITY },
               ],
             },
           },
@@ -178,10 +166,9 @@ describe('caller identity per method — payload', () => {
     expect(methods.some((m: any) => m.identity)).toBe(false);
   });
 
-  it('keeps method ids and identities in a template', () => {
+  it('keeps method identities in a template', () => {
     const scrubbed: any = scrubVolatileTemplateFields(mixed);
     const methods = scrubbed.access_point.caller_authentication.methods;
-    expect(methods.map((m: any) => m.id)).toEqual(['users-jwt', 'partner-key']);
     expect(methods.map((m: any) => m.identity.type)).toEqual(['from_jwt_claim', 'from_api_key']);
   });
 });
@@ -193,7 +180,7 @@ describe('caller identity per method — rules', () => {
   });
 
   it('refuses From JWT Claims with no JWT Bearer method to read', () => {
-    const second = { ...API_KEY, id: 'other-key' };
+    const second = { ...API_KEY, extraction: { source: 'http_header', field: 'X-Other-Key' } };
     const { nodes } = rebuild(stored([API_KEY, second], { inbound: { type: 'from_jwt_claim' } }));
     expect(errors(nodes)).toEqual([INBOUND_JWT_CLAIM_NEEDS_JWT_CALLER]);
   });

@@ -200,7 +200,6 @@ Creating or saving a surface, and each of its enabled variants as resolved, refu
   `from_api_key` identity with no `api_key` or `api_key_provider` method to read, unless a
   method [sets its own identity](#caller-identity-per-method);
 - a method's own `identity` that its credential cannot supply;
-- two methods with the same `id`;
 - on an Access Point that publishes protected resource metadata, a JWT bearer method other
   than the primary: the discovery audience and challenge belong to the primary method.
 
@@ -208,12 +207,6 @@ Both identity rules follow from the caller: `from_jwt_claim` needs a verified JW
 `from_api_key` a verified key. So a surface mixing JWT and API key callers gives each method its
 own identity, or takes a stored or static inbound identity, and policy tells its callers apart
 by `input.source_auth.method` and `key_name`.
-
-Each method may carry an `id`: 1 to 32 lowercase letters, digits and dashes, which stays with the
-method when it is edited or reordered. A save refuses any other id, and refuses two methods of one
-`methods` list that share one. A variant that overrides `caller_authentication` has its own list.
-A stored surface whose methods share an id is not cut down to its first method: the gateway logs a
-warning and clears the ids that clash, so the surface keeps serving every method.
 
 #### Caller identity per method
 
@@ -244,7 +237,17 @@ both, each caller with its own DID:
 
 A caller's inbound identity is the identity of the method that verified it, and it reaches the
 Target in the identity binding VP as an inbound slot's does (a method's own identity turns VP
-injection on, as an inbound slot does). A method that sets none uses `identity_slots.inbound`, as
+injection on, as an inbound slot does). An identity read from the caller's credential, the
+method's or the surface's `from_jwt_claim` or `from_api_key`, replaces any identity the request
+body asserts, and `input.agent.did` is its DID; a method's own identity never lets a body
+identity resolve.
+
+The DID of a `from_jwt_claim` identity is derived from the claim's value and the values of
+`namespace_claims` only. When two `jwt_bearer` methods trust different identity providers, set
+`namespace_claims` to `["iss"]`, so a user of one provider can't get the DID of a user of the
+other whose claim has the same value; the dashboard does this for every method identity it
+creates. Adding an `identity` to a stored `jwt_bearer` method that names no audiences keeps the
+method's exemption from the audience rule, since it changes no token the method accepts. A method that sets none uses `identity_slots.inbound`, as
 before; when that identity reads a credential the method
 does not carry (`from_jwt_claim` beside an API key method, `from_api_key` beside a JWT method),
 the caller is refused with `401` before policy and before the Target, directly and over Fabric,
@@ -253,7 +256,9 @@ used; the audit reason and the identity-resolution metric outcome are `source_me
 the credential was valid, so the record is a refusal of a caller who authenticated, not of one
 who failed to. The refusal carries no `WWW-Authenticate` challenge, because fetching another
 token would not help. A stored method identity its credential cannot supply refuses its
-callers the same way, is logged as a warning at startup, and is refused on the next save. The
+callers the same way, is logged as a warning at startup, and is refused on the next save. A
+surface, or an enabled variant, that refuses the callers of a method is logged as a warning at
+startup naming those methods. The
 DID of a caller depends on the claim value or the key, not on the method, so a caller keeps its
 DID when its identity moves from the surface to its method.
 
@@ -293,8 +298,8 @@ node, a storage event and a DynamoDB-sourced surface are corrected in memory onl
 inbound `from_jwt_claim` or `from_api_key` identity with no method to read, are logged as a
 warning at startup and refused on the next save.
 
-A method's `id` and `identity` are safe to roll back over, because the method structures accept
-unknown fields: an earlier release loads the surface and ignores them. It then derives every
+A method's `identity` is safe to roll back over, because the method structures accept
+unknown fields: an earlier release loads the surface and ignores it. It then derives every
 caller's identity from `identity_slots.inbound`, so before rolling back, remove the method
 identities, or the methods whose callers they identify.
 

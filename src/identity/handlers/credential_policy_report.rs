@@ -807,7 +807,6 @@ mod tests {
                 methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(
                     crate::source_auth::models::ApiKeyAuthConfig {
                         identity: None,
-                        id: None,
                         extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
                             field: "X-Caller".to_string(),
                         },

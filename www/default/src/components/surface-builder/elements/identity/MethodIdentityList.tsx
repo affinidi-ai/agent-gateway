@@ -57,7 +57,7 @@ const MethodIdentityList: React.FC<Props> = ({ surfaceType, methods, onChange })
             ? USES_SURFACE_IDENTITY
             : REFUSED_WITHOUT_OWN_IDENTITY;
         return (
-          <div key={method.id ?? position} className="mb-2" data-testid={testId}>
+          <div key={position} className="mb-2" data-testid={testId}>
             <Form.Label className="small mb-1" htmlFor={`${testId}-select`}>
               {methodLabel(method, position)}
             </Form.Label>

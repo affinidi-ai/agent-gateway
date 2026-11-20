@@ -213,7 +213,7 @@ export interface ConfigPanelProps {
    * stored on another element (the inbound Identity edits the Caller Context
    * methods' own identities).
    */
-  updateNodeFields?: (nodeId: string, fields: Record<string, any>) => void;
+  updateNodeFields?: (nodeId: string, fields: Record<string, unknown>) => void;
   /** Surface protocol (used for protocol-aware fields). Optional only for elements that don't depend on it. */
   protocol?: Protocol;
   /** All canvas nodes (used by NPC/identity panels for dropdowns). */

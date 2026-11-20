@@ -482,7 +482,6 @@ mod tests {
 
     fn happy_path_config() -> DidAuthAuthConfig {
         DidAuthAuthConfig {
-            id: None,
             extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
                 field: "X-DID-Auth-Session".to_string(),
             },

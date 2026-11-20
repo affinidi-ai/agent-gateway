@@ -1227,7 +1227,6 @@ async fn start_a2a_proxy_harness_with_caller_auth(
             on_failure,
             methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
                 identity: None,
-                id: None,
                 extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
                     field: "x-api-key".to_string(),
                 },
