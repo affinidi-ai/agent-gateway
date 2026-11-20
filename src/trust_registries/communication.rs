@@ -411,10 +411,24 @@ fn problem_report_error(body: serde_json::Value) -> TrustRegistryError {
     }
 }
 
-/// How much of a refusal's code reaches an error string. The SDK caps a
-/// refusal's `code` and `message` but keeps `details`, which is where
-/// `mediator_code` reads from, exactly as the peer sent it.
+/// How much of a refusal's code and message reach an error string. The SDK
+/// caps a refusal's `code` and `message` but keeps `details`, which is where
+/// `mediator_code` reads from, exactly as the peer sent it, so this path caps
+/// what it takes rather than resting on the SDK's own limits.
 const MAX_REFUSAL_CODE_CHARS: usize = 256;
+const MAX_REFUSAL_MESSAGE_CHARS: usize = 2048;
+
+/// Peer-chosen text cut to `max_chars`, so no field of a refusal can fill an
+/// error string that is logged and recorded.
+fn capped(
+    value: &str,
+    max_chars: usize,
+) -> String {
+    value
+        .chars()
+        .take(max_chars)
+        .collect()
+}
 
 /// The error a refusal produces when it arrives as the `trust-task-error`
 /// document a mediator from v0.52 sends, rather than as a problem report. The
@@ -426,16 +440,31 @@ const MAX_REFUSAL_CODE_CHARS: usize = 256;
 /// code and would not be read as a conflict; none sends that form today.
 fn refusal_error(refusal: &TrustTaskRefusal) -> TrustRegistryError {
     TrustRegistryError::ProblemReport(
-        refusal
-            .mediator_code()
-            .chars()
-            .take(MAX_REFUSAL_CODE_CHARS)
-            .collect(),
+        capped(refusal.mediator_code(), MAX_REFUSAL_CODE_CHARS),
         refusal
             .message
-            .clone()
+            .as_deref()
+            .map(|message| capped(message, MAX_REFUSAL_MESSAGE_CHARS))
             .unwrap_or_default(),
     )
+}
+
+/// A query to a trust registry and the thread it opens. The query's id is
+/// that thread, so a refusal naming the refused request by its id
+/// (`inResponseTo`) names a thread the reader recognises as the gateway's.
+pub(crate) fn query_message(
+    from: &str,
+    to: &str,
+    message_type: &str,
+    body: serde_json::Value,
+) -> (DIDCommMessage, String) {
+    let thread_id = format!("{REQUEST_THREAD_PREFIX}{}", uuid::Uuid::new_v4());
+    let message = DIDCommMessage::build(thread_id.clone(), message_type.to_string(), body)
+        .from(from.to_string())
+        .to(to.to_string())
+        .thid(thread_id.clone())
+        .finalize();
+    (message, thread_id)
 }
 
 /// Deserialise a registry response into the expected typed shape, returning
@@ -2441,16 +2470,7 @@ impl TrustRegistryListenerManager {
         if remaining.is_zero() {
             return Err(TrustRegistryError::Timeout("no time left to send to the trust registry".to_string()));
         }
-        let message_id = uuid::Uuid::new_v4().to_string();
-        let thread_id = format!("{REQUEST_THREAD_PREFIX}{}", uuid::Uuid::new_v4());
-
-        let message = DIDCommMessage::build(message_id.clone(), message_type.to_string(), body)
-            .from(connection.our_did.clone())
-            .to(connection
-                .registry_did
-                .clone())
-            .thid(thread_id.clone())
-            .finalize();
+        let (message, thread_id) = query_message(&connection.our_did, &connection.registry_did, message_type, body);
 
         debug!("Sending {} to trust registry {} (thid: {})", message_type, connection.registry_did, thread_id);
 
@@ -4362,6 +4382,41 @@ mod tests {
             }
             other => panic!("Expected ProblemReport, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_refusals_message_is_capped_before_it_reaches_an_error_string() {
+        let refusal = TrustTaskRefusal::from_document(&json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000005",
+            "type": "https://trusttasks.org/spec/trust-task-error/0.6",
+            "payload": {
+                "code": "messaging/account/get:unknownAccount",
+                "message": "m".repeat(10_000),
+                "retryable": false,
+            },
+        }))
+        .expect("a trust-task-error");
+
+        match refusal_error(&refusal) {
+            TrustRegistryError::ProblemReport(_, message) => {
+                assert!(
+                    message.chars().count() <= MAX_REFUSAL_MESSAGE_CHARS,
+                    "the message reaches a Trust Check detail, so this path caps it: {} chars",
+                    message.chars().count()
+                );
+            }
+            other => panic!("Expected ProblemReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_query_is_identified_by_the_thread_it_opens() {
+        let (message, thread_id) =
+            query_message("did:example:gateway", "did:example:registry", "https://example.org/query", json!({}));
+
+        assert!(is_request_thread(&thread_id), "a query's thread marks it as the gateway's");
+        assert_eq!(message.thid.as_deref(), Some(thread_id.as_str()));
+        assert_eq!(message.id, thread_id, "a refusal naming the query by its id names the thread the reader knows");
     }
 
     #[test]

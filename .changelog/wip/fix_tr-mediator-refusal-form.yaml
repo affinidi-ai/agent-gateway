@@ -15,8 +15,11 @@ changes:
         registry Failed — and a refusal that answers a query reports its code instead of
         failing to parse. What triggers a rebuild is unchanged, and a registry the mediator
         rejects is marked Failed as it was before v0.52, which a manual reconnect clears, and
-        only a refusal that names no request reaches it. The refusal log line now carries the
-        code and message as fields and no longer says "problem-report".
+        only a refusal that answers none of the gateway's queries reaches it. The refusal log line now carries the
+        code and message as fields and no longer says "problem-report". A refused query is
+        read in either form too, which nothing is known to send today and which guards the
+        gateway against a mediator that starts to. A query's DIDComm id is now the thread it
+        opens, so a refusal that names the query by its id is recognised as well.
   removed: []
   security: []
   breaking: []

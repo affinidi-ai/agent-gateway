@@ -109,9 +109,10 @@ async fn handle_message(
         .unwrap_or_else(|| message.id.clone());
 
     // A mediator from v0.52 refuses with a `trust-task-error` document where an
-    // earlier one sent a problem report. Both are routed the same way, so the
-    // form a refusal arrives in changes nothing. No other message carries such a
-    // document, so reading it first takes nothing from the arms below.
+    // earlier one sent a problem report. Both are routed by the query they
+    // answer; the newer form can also name that query in its own correlators.
+    // No other message carries such a document, so reading it first takes
+    // nothing from the arms below.
     let refusal = TrustTaskRefusal::from_document(&message.body);
     if refusal.is_some() || message.typ == MSG_TYPE_PROBLEM_REPORT {
         handle_refusal(&message, refusal.as_ref(), &thid, connection, store, ws_state).await;
@@ -146,9 +147,11 @@ async fn handle_message(
 }
 
 /// Route a refusal the way a problem report has always been routed: to the
-/// waiter it answers, ignored when that request is no longer awaited, and
-/// otherwise taken as the gateway being rejected. `refusal` is the
-/// `trust-task-error` document when the refusal came in that form.
+/// waiter of the query it answers, ignored when that query is no longer
+/// awaited, and otherwise taken as the gateway being rejected. A
+/// `trust-task-error` can name its query in its own correlators as well as in
+/// its envelope. `refusal` is that document when the refusal came in that
+/// form.
 async fn handle_refusal(
     message: &DIDCommMessage,
     refusal: Option<&TrustTaskRefusal>,
@@ -161,22 +164,27 @@ async fn handle_refusal(
         msg_type: message.typ.clone(),
         body: message.body.clone(),
     };
-    if connection
-        .deliver_response(thid, result)
-        .await
-    {
-        debug!("TR reader: delivered refusal to waiter (thid {})", thid);
-        return;
+    for query_thread in std::iter::once(thid).chain(named_threads(refusal)) {
+        if connection
+            .deliver_response(query_thread, result.clone())
+            .await
+        {
+            debug!("TR reader: delivered refusal to waiter (thid {})", query_thread);
+            return;
+        }
     }
-    if is_request_thread(thid) || answers_a_request(refusal) {
+    // A refusal answering a query of the gateway's own never fails the
+    // registry, however late it arrives. A correlator naming anything else
+    // says nothing about the gateway's queries, so it changes nothing.
+    if is_request_thread(thid) || named_threads(refusal).any(is_request_thread) {
         warn!(
             thid = ?for_log(thid, 64),
-            "TR reader: refusal for '{}' answers a request no longer awaited, ignoring",
+            "TR reader: refusal for '{}' answers a query the gateway no longer awaits, ignoring",
             connection.trust_registry_id
         );
         return;
     }
-    // Not a reply to a request → the registry rejected the gateway.
+    // Not a reply to a query → the registry rejected the gateway.
     let (code, comment) = refusal_reason(message, refusal);
     error!(
         code = ?for_log(&code, 128),
@@ -187,17 +195,25 @@ async fn handle_refusal(
     update_status(connection, TrustRegistryConnectionStatus::Failed, store, ws_state).await;
 }
 
-/// Whether a `trust-task-error` names the request it answers, in the
-/// correlators only that form carries. Such a refusal is about that request
-/// and not about this connection, whatever thread it arrived on; only an
-/// unsolicited one says the registry rejected the gateway.
-fn answers_a_request(refusal: Option<&TrustTaskRefusal>) -> bool {
-    refusal.is_some_and(|refusal| {
-        refusal
-            .in_response_to
-            .is_some()
-            || refusal.thread_id.is_some()
-    })
+/// The threads a `trust-task-error` names in its own correlators: its
+/// `threadId`, and the id `inResponseTo` gives the refused request. These are
+/// what `TrustTaskRefusal::answers` matches a request on, and either can name
+/// a query of the gateway's own when the envelope's thread does not.
+fn named_threads(refusal: Option<&TrustTaskRefusal>) -> impl Iterator<Item = &str> {
+    refusal
+        .into_iter()
+        .flat_map(|refusal| {
+            refusal
+                .thread_id
+                .as_deref()
+                .into_iter()
+                .chain(
+                    refusal
+                        .in_response_to
+                        .as_ref()
+                        .and_then(|refused| refused.id.as_deref()),
+                )
+        })
 }
 
 /// Peer-chosen text, capped so one field cannot fill the log; the caller
@@ -357,19 +373,41 @@ mod tests {
         .finalize()
     }
 
-    /// The same refusal naming the request it answers, the way only the
-    /// `trust-task-error` form can.
-    fn correlated_trust_task_error(
+    /// A query built as `send_and_await` builds one: the thread its waiter is
+    /// registered under, and what a refusal of it names by `correlator` — the
+    /// thread as `threadId`, or the query's own id as `inResponseTo`.
+    fn named_query(
+        connection: &TrustRegistryConnection,
+        correlator: &str,
+    ) -> (String, String) {
+        let (query, thread) = super::super::communication::query_message(
+            &connection.our_did,
+            &connection.registry_did,
+            "https://example.org/query",
+            serde_json::json!({}),
+        );
+        let named = if correlator == "threadId" {
+            thread.clone()
+        } else {
+            query.id
+        };
+        (thread, named)
+    }
+
+    /// A refusal arriving on `thid` that names `named` in its own
+    /// `correlator`, the way only the `trust-task-error` form can.
+    fn trust_task_error_naming(
         thid: &str,
         correlator: &str,
+        named: &str,
     ) -> DIDCommMessage {
         let mut message = trust_task_error(thid);
         if correlator == "threadId" {
-            message.body["threadId"] = serde_json::json!("registry-thread-1");
+            message.body["threadId"] = serde_json::json!(named);
         } else {
             message.body["payload"]["inResponseTo"] = serde_json::json!({
                 "typeUri": "https://trusttasks.org/spec/trust-task/0.6",
-                "id": "urn:uuid:00000000-0000-4000-8000-00000000000a",
+                "id": named,
             });
         }
         message
@@ -453,18 +491,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_trust_task_error_naming_the_request_it_answers_keeps_the_status() {
+    async fn a_trust_task_error_naming_a_query_no_longer_awaited_keeps_the_status() {
         for correlator in ["threadId", "inResponseTo"] {
             let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connected).await;
+            let named = named_query(&connection, correlator).1;
 
-            handle_message(correlated_trust_task_error("registry-thread-1", correlator), &connection, &store, &None)
-                .await;
+            handle_message(
+                trust_task_error_naming("mediator-thread-1", correlator, &named),
+                &connection,
+                &store,
+                &None,
+            )
+            .await;
 
             assert_eq!(
                 status_of(&store, &connection).await,
                 TrustRegistryConnectionStatus::Connected,
-                "a refusal naming the request it answers by {correlator} is not a rejection of the gateway"
+                "a refusal naming a query of the gateway's by {correlator} answers that query"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_trust_task_error_naming_a_request_the_gateway_never_sent_marks_the_registry_failed() {
+        for status in [
+            TrustRegistryConnectionStatus::Connecting,
+            TrustRegistryConnectionStatus::AwaitingApproval,
+            TrustRegistryConnectionStatus::Connected,
+        ] {
+            for correlator in ["threadId", "inResponseTo"] {
+                let before = format!("{status:?}");
+                let (connection, store, _dir) = registry_with(status.clone()).await;
+
+                handle_message(
+                    trust_task_error_naming("mediator-thread-1", correlator, "registry-thread-1"),
+                    &connection,
+                    &store,
+                    &None,
+                )
+                .await;
+
+                assert_eq!(
+                    status_of(&store, &connection).await,
+                    TrustRegistryConnectionStatus::Failed,
+                    "from {before}, a {correlator} naming no query of the gateway's is a rejection"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_trust_task_error_naming_a_waiting_query_is_delivered_to_it() {
+        for correlator in ["threadId", "inResponseTo"] {
+            let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connected).await;
+            let (thread, named) = named_query(&connection, correlator);
+            let (waiter, mut answer) = tokio::sync::oneshot::channel();
+            connection
+                .response_waiters
+                .lock()
+                .await
+                .insert(thread, waiter);
+
+            handle_message(
+                trust_task_error_naming("mediator-thread-1", correlator, &named),
+                &connection,
+                &store,
+                &None,
+            )
+            .await;
+
+            let delivered = answer
+                .try_recv()
+                .unwrap_or_else(|_| panic!("a refusal naming the query by {correlator} reaches its waiter"));
+            assert_eq!(delivered.body["payload"]["code"], "messaging/account/get:unknownAccount");
+            assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connected);
         }
     }
 
