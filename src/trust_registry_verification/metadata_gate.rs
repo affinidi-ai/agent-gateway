@@ -286,6 +286,7 @@ mod tests {
             },
             timeout_secs: None,
             name: None,
+            subject: Default::default(),
         }
     }
 

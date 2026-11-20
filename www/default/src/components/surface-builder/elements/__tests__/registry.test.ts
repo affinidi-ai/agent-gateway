@@ -605,6 +605,30 @@ describe('ElementRegistry', () => {
       expect(out.target.networking).toBeUndefined();
       expect(out.transit).toBeUndefined();
     });
+
+    it("keeps a Transit Point's stored VP injection, so a save keeps the managed agent identity", () => {
+      const savedPoint = (identityInjection: Record<string, unknown>) =>
+        registry.buildPayload(
+          makeCtx(
+            registry.nodesFromPayload({
+              access_point: { route: '/a2a', protocol: 'a2a' },
+              target: { endpoint: 'https://upstream.example.com' },
+              transit: {
+                points: [
+                  {
+                    alias: 'partner',
+                    protocol: 'a2a',
+                    target_endpoint: 'https://p.example',
+                    identity_injection: identityInjection,
+                  },
+                ],
+              },
+            })
+          )
+        ).transit.points[0];
+      expect(savedPoint({ inject_vp: true }).identity_injection).toEqual({ inject_vp: true });
+      expect(savedPoint({ inject_vp: false })).not.toHaveProperty('identity_injection');
+    });
   });
 
   describe('deletable', () => {

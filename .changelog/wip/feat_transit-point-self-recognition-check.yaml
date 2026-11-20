@@ -2,30 +2,21 @@ branch: feat/transit-point-self-recognition-check
 changes:
   added:
     - timestamp: '2026-11-19T12:00:00Z'
-      title: ⭐ Refuse Transit Point calls from a managed agent no longer recognised
+      title: ⭐ Let Transit Point policy refuse a managed agent no longer recognised
       description: >-
-        A Transit Point's new self_recognition_check asks the trust registries it names, picked
-        from those the surface's Trust Recorder records the owned agent in, whether they still
-        recognise the managed agent calling out, and refuses the request with 403 before it
-        leaves the gateway unless every one does, so an agent whose recognition was turned off
-        can no longer act for the gateway. The Trust Recorder writes the agent's records first until they are recorded.
-        Refusals are audited as request_rejected with reason agent_not_recognized, and each
-        query as a trust_check on the managed_agent leg, which the Audit Log names and places
-        before policy in the request journey.
-    - timestamp: '2026-11-20T09:00:00Z'
-      title: Check and record a Transit Point's own managed identity
-      description: >-
-        The self recognition check now works on a Transit Point that calls out under its own
-        managed identity: the Trust Recorder records that DID with the surface's entries before
-        the check asks about it, and the Identities page shows its recorder status on its
-        version in Version History.
+        A Transit Point Trust Check element with subject managed_agent asks a trust registry
+        whether it still recognises the managed agent calling out through the Transit Point,
+        by the DID it calls out under, instead of the destination. Results reach policy at
+        input.trust_check_results.managed_agent, so policy can refuse an agent whose
+        recognition was turned off; MANAGED_AGENT_IDENTITY_UNAVAILABLE reports a request with
+        no managed agent DID. Each query is audited as a trust_check on the managed_agent leg,
+        which the Audit Log names and places before policy in the request journey.
     - timestamp: '2026-11-20T10:00:00Z'
-      title: Add a Self Recognition Check switch to the Transit Point panel
+      title: Keep managed-agent Trust Checks and VP injection across dashboard saves
       description: >-
-        Operators can turn on the self recognition check from the Surface Builder and pick, at
-        least one, the trust registries it asks. The switch is disabled, with a note, until the
-        surface has a Trust Recorder that records the owned agent and the Transit Point resolves
-        a managed agent identity, and a save sends an explicit null when it is turned off.
+        A Surface Builder save keeps a Transit Point Trust Check element's managed_agent
+        subject and blank entity, and a Transit Point's stored identity_injection while
+        inject_vp is on, so saving does not change what the check asks about.
   changed: []
   fixed: []
   removed: []

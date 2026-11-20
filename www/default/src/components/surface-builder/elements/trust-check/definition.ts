@@ -458,6 +458,11 @@ export interface TrustCheckQueryConfig {
   authority_source?: AuthoritySource;
   /** Where each literal DID of `query.authority_ids` came from, keyed by DID. */
   authority_sources?: Record<string, AuthoritySource>;
+  /**
+   * `managed_agent` when a Transit Point's element asks about the managed
+   * agent calling out instead of the destination; absent for the destination.
+   */
+  subject?: 'managed_agent';
   query?: {
     authority_id?: string;
     authority_ids?: string[];
@@ -503,6 +508,7 @@ function queryFromElement(e: any): TrustCheckQueryConfig {
     ...(e.authority_sources && typeof e.authority_sources === 'object'
       ? { authority_sources: e.authority_sources }
       : {}),
+    ...(e.subject === 'managed_agent' ? { subject: 'managed_agent' as const } : {}),
     query,
   };
 }
@@ -786,12 +792,14 @@ function buildEntry(
   const explicitAuthority =
     typeof stored.authority_id === 'string' ? stored.authority_id.trim() : '';
   const explicitEntity = typeof stored.entity_id === 'string' ? stored.entity_id.trim() : '';
+  const managedAgent = q.subject === 'managed_agent';
   const authorities = explicitAuthority ? [] : listedAuthorities(stored);
   const query: Record<string, string | string[]> = {
     ...(authorities.length > 0
       ? { authority_ids: authorities }
       : { authority_id: explicitAuthority || defaultAuthorityIdTemplate(edge) }),
-    entity_id: explicitEntity || defaultEntityIdTemplate(edge),
+    // A blank managed-agent entity is the agent calling out; the gateway fills it in.
+    entity_id: explicitEntity || (managedAgent ? '' : defaultEntityIdTemplate(edge)),
   };
   if (typeof stored.action === 'string' && stored.action) query.action = stored.action;
   if (typeof stored.resource === 'string' && stored.resource) query.resource = stored.resource;
@@ -802,6 +810,7 @@ function buildEntry(
     query,
   };
   if (typeof q.name === 'string' && q.name.length > 0) entry.name = q.name;
+  if (managedAgent) entry.subject = 'managed_agent';
   if (authorities.length > 0) {
     if (q.authority_sources && Object.keys(q.authority_sources).length > 0) {
       entry.authority_sources = q.authority_sources;

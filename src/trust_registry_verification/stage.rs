@@ -88,29 +88,13 @@ async fn run_trust_check_stage_with<C: TrqpClient + ?Sized>(
     authorities: Option<&dyn AuthorityStore>,
 ) -> Option<TrustCheckResultsContext> {
     let results = leg_results(origin, leg, elements, input, client, authorities).await;
-    Some(match leg {
-        TrustCheckLeg::Caller => TrustCheckResultsContext {
-            caller: results,
-            target: Vec::new(),
-        },
-        TrustCheckLeg::Target => TrustCheckResultsContext {
-            caller: Vec::new(),
-            target: results,
-        },
-        TrustCheckLeg::ManagedAgent => TrustCheckResultsContext::default(),
-    })
-}
-
-/// Run a Transit Point's self recognition check: one result per element, in
-/// order, each audited on the `managed_agent` leg. The elements carry literal
-/// DIDs, so no request context is offered to their templates.
-pub async fn run_managed_agent_check<'o, C: TrqpClient + ?Sized>(
-    origin: impl Into<TrustCheckOrigin<'o>>,
-    elements: &[TrustCheckElement],
-    client: &C,
-) -> Vec<TrustCheckResult> {
-    let authorities = crate::gateways::connection_points::get_authority_store();
-    leg_results(origin.into(), TrustCheckLeg::ManagedAgent, elements, &json!({}), client, authorities.as_deref()).await
+    let mut context = TrustCheckResultsContext::default();
+    match leg {
+        TrustCheckLeg::Caller => context.caller = results,
+        TrustCheckLeg::Target => context.target = results,
+        TrustCheckLeg::ManagedAgent => context.managed_agent = results,
+    }
+    Some(context)
 }
 
 async fn leg_results<C: TrqpClient + ?Sized>(
@@ -312,6 +296,7 @@ mod tests {
             },
             timeout_secs: None,
             name: None,
+            subject: Default::default(),
         }
     }
 
@@ -1028,18 +1013,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_managed_agent_check_answers_per_element_and_fails_an_unresolved_template() {
+    async fn managed_agent_results_land_on_their_own_leg_and_are_audited_there() {
         let mut literal = elem("self-recognition-0");
         literal.query.entity_id = "did:web:agent.example".to_string();
         let mut template = literal.clone();
         template.id = "self-recognition-1".to_string();
         template.query.authority_id = "{{ surface.issuer_did }}".to_string();
 
-        let (results, records) =
-            crate::audit::producer::capture(run_managed_agent_check("surf", &[literal, template], &AllowClient)).await;
+        let (context, records) = crate::audit::producer::capture(run_trust_check_stage(
+            "surf",
+            TrustCheckLeg::ManagedAgent,
+            &[literal, template],
+            &json!({}),
+            &AllowClient,
+        ))
+        .await;
+        let context = context.expect("elements were configured");
 
+        assert!(context.caller.is_empty() && context.target.is_empty(), "{context:?}");
         assert_eq!(
-            outcomes(&results),
+            outcomes(&context.managed_agent),
             [("did:a", None), ("{{ surface.issuer_did }}", Some("TEMPLATE_RESOLUTION_FAILED"))]
         );
         let legs: Vec<String> = records

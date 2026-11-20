@@ -320,7 +320,7 @@ every plane's global assignments (`global_policies/global.json`). `GET
 ## Trust Check
 
 `src/trust_registry_verification/` runs TRQP queries per-leg, with results at
-`input.trust_check_results.{caller|target}`. The stage never denies — OPA decides.
+`input.trust_check_results.{caller|target|managed_agent}`. The stage never denies — OPA decides.
 Discovery paths bypass the caller-leg check. See the source for error codes and
 template syntax.
 
@@ -336,8 +336,9 @@ Each leg carries a `trust_check_list`:
 
 A Transit Point with an empty list runs no Trust Check on its traffic: no agent-card fetch
 for trust, no identity verification, no TRQP query. A request through a Transit Point sees
-only that Transit Point's results, at `input.trust_check_results.target`, in all three
-outbound OPA scopes (gateway, surface, Transit Point).
+only that Transit Point's results, at `input.trust_check_results.target`, and those of its
+[managed-agent elements](#self-recognition-check) at `input.trust_check_results.managed_agent`,
+in all three outbound OPA scopes (gateway, surface, Transit Point).
 
 A list has no limit on its elements or on the authorities they query
 ([`src/config/agent_surface.rs`](../src/config/agent_surface.rs)). The gateway queries every
@@ -458,44 +459,46 @@ triggered it. On the outbound path the record also names the Transit Point.
 
 ### Self recognition check
 
-A Transit Point with `self_recognition_check: { "trust_registry_ids": [...] }` checks the
-managed agent calling out through it before the request leaves the gateway. The operator picks
-the trust registries, at least one, from those the surface's Trust Recorder records the owned
-agent in. Unlike a Trust Check it refuses the request itself: its results are never in
-`input.trust_check_results`, and no policy can allow a request it refused.
+An element of a Transit Point's `trust_check_list` with `"subject": "managed_agent"` asks
+about the managed agent calling out through the Transit Point instead of its destination.
+Elements without `subject` ask about the destination, as before. Only a Transit Point's list
+may hold managed-agent elements; any other list refuses them with `400`.
 
-For each Trust Recorder entry with `include_owned_agent` whose trust registry is picked, the
-gateway sends one recognition query to that registry: the entry's authority (with
-`{{ surface.issuer_did }}` resolved to the surface's Issuer), the agent's DID as the entity,
-action `is` and resource `ownedAgent`. Registries the Transit Point does not pick are not
-asked. The agent's DID is the one the Transit Point calls out under: its own managed
-identity's when it has one, otherwise the surface Managed Agent's. The request goes on only
-when every query answers recognised. Any other answer refuses it with `403` "Calling agent is
-not recognised" (JSON-RPC `-32001` on an MCP Transit Point), before the destination is
-contacted: not recognised, a timeout, a trust registry that is unknown, not connected or
-unreachable, an Authority that no longer exists, an Issuer template that does not resolve, no
-resolved managed agent, or a picked registry the Trust Recorder no longer records the owned
-agent in. The reason is logged, not sent. Nothing is cached, so turning recognition off in the
-trust registry takes effect on the next call.
+A managed-agent element whose `query.entity_id` is blank asks about the DID the Transit Point
+calls out under: its own managed identity's when it has one, otherwise the surface Managed
+Agent's identity it injects. Templates, authority lists, `authority_source`, query types and
+timeouts work as on any element. When no managed agent DID is resolved for the request, each
+managed-agent element reports `MANAGED_AGENT_IDENTITY_UNAVAILABLE` without asking its trust
+registry; such a Transit Point can still be saved. Managed-agent elements need no destination
+agent card, so a list holding only them fetches none for trust.
 
-Before the queries, the Trust Recorder writes the agent's records, and the request waits for
-it for at most 10 seconds, unless the agent's stored
-[recorder status](SOURCE_AUTH.md#recorder-status) on the surface is Recorded. While it is not,
-each request through the Transit Point writes again. A record that already exists, including
-one the trust registry marks inactive, is left as it is.
+Their results are at `input.trust_check_results.managed_agent`, in the gateway, surface and
+Transit Point outbound scopes, beside `target`. The key is absent when the Transit Point has
+no managed-agent elements or the request is a discovery read. Without a trust registry
+connection each element fails with `TRUST_REGISTRY_UNREACHABLE`. Like every Trust Check the
+stage never denies: policy decides. Nothing is cached, so turning recognition off in the trust
+registry takes effect on the next call. To refuse a managed agent the trust registry no longer
+recognises, require that the check ran and that every result is `ok`:
 
-The check runs on A2A, AP2, MCP and HTTP Transit Points, including `fabric://` ones, and not on
-discovery reads. Each query is a `trust_check` record with `leg` `managed_agent`, and a
-refusal a `request_rejected` record with reason `agent_not_recognized`.
+```rego
+package surface.policy
 
-A write is refused with `400` when a Transit Point, on the surface or in an enabled variant,
-sets `self_recognition_check` and its `trust_registry_ids` is empty, names a trust registry
-the surface's Trust Recorder does not record the owned agent in, or the Transit Point resolves
-no managed agent identity: its own managed identity is `from_jwt_claim`, or it has none and
-does not inject a VP with the surface's, or the surface's is `from_jwt_claim` or absent. A
-`PUT` of the surface or of a variant that leaves the field out keeps the stored value, so a
-Surface Builder save keeps it; `null` turns it off, as does a merge `PATCH` whose Transit
-Points leave it out.
+default allow := false
+
+allow if {
+    count(input.trust_check_results.managed_agent) > 0
+    every r in input.trust_check_results.managed_agent { r.ok }
+}
+
+deny_reason := "Calling agent is not recognised" if not allow
+```
+
+The gateway does not record a Transit Point's managed agent before asking about it: the agent
+is recognised only once its records exist in the trust registry.
+
+Managed-agent elements run on A2A, AP2, MCP and HTTP Transit Points, including `fabric://`
+ones, and not on discovery reads. Each query is a `trust_check` record with `leg`
+`managed_agent` that names the Transit Point.
 
 ### Several authorities in one query
 
@@ -521,7 +524,8 @@ combines the answers. Such an element cannot set `timeout_secs`. Each
 authority gets its own result, in list order, all carrying the element's `id` and each its own
 `authority_id`, and its own audit record and `agent_gateway_trust_check_total` sample. A result
 failed with `AGENT_CARD_UNAVAILABLE`, `TRUST_REGISTRY_METADATA_UNAVAILABLE`,
-`IDENTITY_VP_VERIFICATION_FAILED` or `TARGET_AGENT_IDENTITY_UNAVAILABLE` omits `authority_id`
+`IDENTITY_VP_VERIFICATION_FAILED`, `TARGET_AGENT_IDENTITY_UNAVAILABLE` or
+`MANAGED_AGENT_IDENTITY_UNAVAILABLE` omits `authority_id`
 and `entity_id`, so the authorities of one element tell such results apart only by order. A
 template that fails to resolve, a missing metadata field or an unreachable registry fails only
 that authority's result. An authority that resolves to a blank value, in a list or in

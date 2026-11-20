@@ -242,7 +242,7 @@ async fn write_entries<W: RecordWriter + ?Sized>(
 ///
 /// `resolved_issuer_did` is the pre-computed value for the
 /// `{{ surface.issuer_did }}` template — usually the surface's `Issuer.did`
-/// resolved before each recorder run. Pass
+/// resolved by [`spawn_trust_recorder`] before firing the task. Pass
 /// `None` when no surface Issuer is configured; entries whose
 /// `authority_did` uses the template are then skipped with a WARN.
 pub async fn apply_trust_recorder(
@@ -416,29 +416,21 @@ fn resolve_authority_did(
     entry: &TrustRecorderEntry,
     resolved_issuer_did: Option<&str>,
 ) -> Option<String> {
-    let authority_did = entry_authority_did(entry, resolved_issuer_did);
-    if authority_did.is_none() {
-        warn!(
-            trust_registry_id = %entry.trust_registry_id,
-            template = SURFACE_ISSUER_DID_TEMPLATE,
-            "Trust Recorder: `surface.issuer_did` template unresolved (surface has no issuer configured), skipping entry"
-        );
+    if entry.authority_did.trim() == SURFACE_ISSUER_DID_TEMPLATE {
+        match resolved_issuer_did {
+            Some(did) if !did.is_empty() => Some(did.to_string()),
+            _ => {
+                warn!(
+                    trust_registry_id = %entry.trust_registry_id,
+                    template = SURFACE_ISSUER_DID_TEMPLATE,
+                    "Trust Recorder: `surface.issuer_did` template unresolved (surface has no issuer configured), skipping entry"
+                );
+                None
+            }
+        }
+    } else {
+        Some(entry.authority_did.clone())
     }
-    authority_did
-}
-
-/// `entry.authority_did`, with `{{ surface.issuer_did }}` resolved to
-/// `resolved_issuer_did`; `None` when the template cannot be resolved.
-fn entry_authority_did(
-    entry: &TrustRecorderEntry,
-    resolved_issuer_did: Option<&str>,
-) -> Option<String> {
-    if entry.authority_did.trim() != SURFACE_ISSUER_DID_TEMPLATE {
-        return Some(entry.authority_did.clone());
-    }
-    resolved_issuer_did
-        .filter(|did| !did.is_empty())
-        .map(str::to_string)
 }
 
 /// Fire-and-forget wrapper that spawns a `tokio` task to run
@@ -476,160 +468,36 @@ pub fn spawn_trust_recorder(
     let Some(tr_manager) = tr_manager else {
         return;
     };
-    let target = RecordTarget::of(surface, recorder_cfg);
+    let cfg = recorder_cfg.clone();
     let did = agent_did.to_string();
+    let issuer_id = surface.issuer_id.clone();
+    let surface_id = surface.surface_id.clone();
+    let tenant_id = surface.tenant_id.clone();
     let started_at = chrono::Utc::now();
-    tokio::spawn(async move { record_agent(&target, &did, tr_manager, started_at).await });
-}
-
-/// What a Trust Recorder run needs from its surface.
-struct RecordTarget {
-    cfg: TrustRecorderConfig,
-    surface_id: String,
-    issuer_id: Option<String>,
-    tenant_id: Option<String>,
-}
-
-impl RecordTarget {
-    fn of(
-        surface: &AgentSurface,
-        cfg: &TrustRecorderConfig,
-    ) -> Self {
-        Self {
-            cfg: cfg.clone(),
-            surface_id: surface.surface_id.clone(),
-            issuer_id: surface.issuer_id.clone(),
-            tenant_id: surface.tenant_id.clone(),
-        }
-    }
-}
-
-/// The longest a request waits for the Trust Recorder before its self
-/// recognition check; the check then asks about whatever was recorded.
-pub const SELF_RECOGNITION_RECORD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Writes the Trust Recorder's records for `agent_did` before a Transit
-/// Point's self recognition check asks about them, unless the last stored
-/// outcome for that DID on `surface` is `recorded`. Waits for the writes, for
-/// at most [`SELF_RECOGNITION_RECORD_TIMEOUT`].
-pub async fn record_before_self_recognition_check(
-    surface: &AgentSurface,
-    agent_did: &str,
-    tr_manager: Arc<TrustRegistryListenerManager>,
-) {
-    let stored = match global_store() {
-        Some(store) => {
-            store
-                .status_for(&surface.surface_id, agent_did)
+    tokio::spawn(async move {
+        let Some(store) = tr_manager.store().await else {
+            return;
+        };
+        let resolved_issuer_did = resolve_surface_issuer_did(issuer_id.as_deref()).await;
+        let display_name = resolve_recorder_display_name(&did, &surface_id).await;
+        let entries = apply_trust_recorder(
+            &cfg,
+            &did,
+            resolved_issuer_did.as_deref(),
+            tenant_id.as_deref(),
+            display_name.as_ref(),
+            tr_manager,
+            store,
+        )
+        .await;
+        if let Some(status_store) = global_store()
+            && let Err(e) = status_store
+                .record(&surface_id, &did, entries, started_at, chrono::Utc::now())
                 .await
+        {
+            warn!(surface_id = %surface_id, error = %e, "Trust Recorder: failed to store status");
         }
-        None => None,
-    };
-    if !needs_recording(stored.as_ref()) {
-        return;
-    }
-    let Some(cfg) = surface.trust_recorder() else {
-        return;
-    };
-    let target = RecordTarget::of(surface, cfg);
-    let record = record_agent(&target, agent_did, tr_manager, chrono::Utc::now());
-    if tokio::time::timeout(SELF_RECOGNITION_RECORD_TIMEOUT, record)
-        .await
-        .is_err()
-    {
-        warn!(
-            surface_id = %surface.surface_id,
-            "Trust Recorder: recording before the self recognition check timed out"
-        );
-    }
-}
-
-fn needs_recording(stored: Option<&super::recorder_status::RecorderStatus>) -> bool {
-    stored.is_none_or(|status| status.state != super::recorder_status::RecorderState::Recorded)
-}
-
-async fn record_agent(
-    target: &RecordTarget,
-    agent_did: &str,
-    tr_manager: Arc<TrustRegistryListenerManager>,
-    started_at: chrono::DateTime<chrono::Utc>,
-) {
-    let Some(store) = tr_manager.store().await else {
-        return;
-    };
-    let resolved_issuer_did = resolve_surface_issuer_did(target.issuer_id.as_deref()).await;
-    let display_name = resolve_recorder_display_name(agent_did, &target.surface_id).await;
-    let entries = apply_trust_recorder(
-        &target.cfg,
-        agent_did,
-        resolved_issuer_did.as_deref(),
-        target.tenant_id.as_deref(),
-        display_name.as_ref(),
-        tr_manager,
-        store,
-    )
-    .await;
-    if let Some(status_store) = global_store()
-        && let Err(e) = status_store
-            .record(&target.surface_id, agent_did, entries, started_at, chrono::Utc::now())
-            .await
-    {
-        warn!(surface_id = %target.surface_id, error = %e, "Trust Recorder: failed to store status");
-    }
-}
-
-/// The recognition queries of a Transit Point's self recognition check: one
-/// per Trust Recorder entry that records the owned agent in one of
-/// `trust_registry_ids`, asking the entry's authority whether it still
-/// recognises `agent_did` as an owned agent. An entry whose
-/// `{{ surface.issuer_did }}` does not resolve keeps the template, which then
-/// fails its query.
-pub async fn self_recognition_checks(
-    surface: &AgentSurface,
-    trust_registry_ids: &[String],
-    agent_did: &str,
-) -> Vec<crate::trust_registry_verification::TrustCheckElement> {
-    let Some(cfg) = surface.trust_recorder() else {
-        return Vec::new();
-    };
-    let issuer_did = resolve_surface_issuer_did(surface.issuer_id.as_deref()).await;
-    owned_agent_checks(cfg, trust_registry_ids, issuer_did.as_deref(), agent_did)
-}
-
-fn owned_agent_checks(
-    cfg: &TrustRecorderConfig,
-    trust_registry_ids: &[String],
-    resolved_issuer_did: Option<&str>,
-    agent_did: &str,
-) -> Vec<crate::trust_registry_verification::TrustCheckElement> {
-    use crate::trust_registry_verification::trust_check_element::{TrqpQueryParams, TrqpQueryType};
-    cfg.entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| entry.include_owned_agent && trust_registry_ids.contains(&entry.trust_registry_id))
-        .map(|(index, entry)| {
-            let authority_id =
-                entry_authority_did(entry, resolved_issuer_did).unwrap_or_else(|| entry.authority_did.clone());
-            crate::trust_registry_verification::TrustCheckElement {
-                id: format!("self-recognition-{index}"),
-                trust_registry_id: entry
-                    .trust_registry_id
-                    .clone(),
-                authority_source: entry.authority_source,
-                authority_sources: Default::default(),
-                query_type: TrqpQueryType::Recognition,
-                query: TrqpQueryParams {
-                    authority_id,
-                    authority_ids: None,
-                    entity_id: agent_did.to_string(),
-                    action: Some("is".to_string()),
-                    resource: Some("ownedAgent".to_string()),
-                },
-                timeout_secs: None,
-                name: None,
-            }
-        })
-        .collect()
+    });
 }
 
 /// Look up `surface.issuer_id → Issuer.did` via the process-global
@@ -730,89 +598,6 @@ mod tests {
             include_owned_agent: false,
             custom_resources: vec![],
         }
-    }
-
-    #[test]
-    fn records_before_the_self_recognition_check_until_an_outcome_is_recorded() {
-        use crate::trust_registry_verification::recorder_status::RecorderStatus;
-        let status = |state: RecorderState| RecorderStatus {
-            state,
-            reason: None,
-            last_attempt_at: None,
-            entries: Vec::new(),
-        };
-        assert!(needs_recording(None), "no stored outcome");
-        for state in [RecorderState::Failed, RecorderState::Skipped, RecorderState::Partial] {
-            assert!(needs_recording(Some(&status(state))), "{state:?}");
-        }
-        assert!(!needs_recording(Some(&status(RecorderState::Recorded))));
-    }
-
-    #[test]
-    fn the_self_recognition_check_asks_each_entry_that_records_the_owned_agent() {
-        let owned = TrustRecorderEntry {
-            include_owned_agent: true,
-            ..base_entry()
-        };
-        let from_issuer = TrustRecorderEntry {
-            trust_registry_id: "tr-2".into(),
-            authority_did: SURFACE_ISSUER_DID_TEMPLATE.into(),
-            include_owned_agent: true,
-            ..base_entry()
-        };
-        let cfg = TrustRecorderConfig {
-            entries: vec![owned, base_entry(), from_issuer],
-        };
-
-        let both = ["tr-1".to_string(), "tr-2".to_string()];
-        let checks = owned_agent_checks(&cfg, &both, Some("did:example:surface-issuer"), "did:example:agent");
-        let asked: Vec<String> = checks
-            .iter()
-            .map(|check| {
-                format!(
-                    "{} {} {} {:?} {:?}",
-                    check.trust_registry_id,
-                    check.query.authority_id,
-                    check.query.entity_id,
-                    check.query.action,
-                    check.query.resource
-                )
-            })
-            .collect();
-        assert_eq!(
-            asked,
-            [
-                "tr-1 did:example:authority did:example:agent Some(\"is\") Some(\"ownedAgent\")",
-                "tr-2 did:example:surface-issuer did:example:agent Some(\"is\") Some(\"ownedAgent\")",
-            ]
-        );
-        assert!(
-            checks
-                .iter()
-                .all(|check| check.query_type
-                    == crate::trust_registry_verification::trust_check_element::TrqpQueryType::Recognition)
-        );
-
-        let picked = owned_agent_checks(&cfg, &["tr-2".to_string()], None, "did:example:agent");
-        assert_eq!(
-            picked
-                .iter()
-                .map(|check| check
-                    .trust_registry_id
-                    .as_str())
-                .collect::<Vec<_>>(),
-            ["tr-2"],
-            "only the registries the Transit Point names are asked"
-        );
-
-        let unresolved = owned_agent_checks(&cfg, &both, None, "did:example:agent");
-        assert_eq!(
-            unresolved[1]
-                .query
-                .authority_id,
-            SURFACE_ISSUER_DID_TEMPLATE,
-            "an unresolved issuer template is kept, so its query fails"
-        );
     }
 
     async fn issuer_store_with(

@@ -818,6 +818,51 @@ describe('trustCheckDefinition — hydrate → buildPayload round-trip', () => {
     const slices = trustCheckDefinition.buildPayload!(ctx)!;
     expect((slices[0].value as any[])[0]).not.toHaveProperty('timeout_secs');
   });
+
+  it("keeps a Transit Point element's managed-agent subject and its blank entity", () => {
+    const nodes = registry.nodesFromPayload({
+      name: 'roundtrip',
+      status: 'active' as const,
+      tags: [],
+      access_point: { route: '/a2a', protocol: 'a2a' },
+      target: { endpoint: 'https://upstream/y' },
+      transit: {
+        points: [
+          {
+            alias: 'partner',
+            protocol: 'a2a',
+            target_endpoint: 'https://p.example',
+            trust_check_list: [
+              {
+                id: 'self',
+                trust_registry_id: 'tr-1',
+                query_type: 'recognition',
+                query: { authority_id: 'did:web:authority.example', entity_id: '' },
+                subject: 'managed_agent',
+              },
+              {
+                id: 'destination',
+                trust_registry_id: 'tr-1',
+                query_type: 'recognition',
+                query: { authority_id: 'did:web:authority.example' },
+              },
+            ],
+          },
+        ],
+      },
+    });
+    const ctx = {
+      protocol: 'a2a',
+      surfaceMeta: { name: 'roundtrip', tags: [], status: 'active' },
+      allNodes: nodes,
+      nodesOfType: (type: string) => nodes.filter(n => n.type === type),
+      firstNodeOfType: (type: string) => nodes.find(n => n.type === type),
+    } as any;
+    const [self, destination] = registry.buildPayload(ctx).transit.points[0].trust_check_list;
+    expect(self).toMatchObject({ id: 'self', subject: 'managed_agent', query: { entity_id: '' } });
+    expect(destination).not.toHaveProperty('subject');
+    expect(destination.query.entity_id).not.toBe('');
+  });
 });
 
 describe('trust_check_list — canvas removal clears the config', () => {
