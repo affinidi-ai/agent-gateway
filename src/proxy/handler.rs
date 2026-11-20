@@ -16808,6 +16808,8 @@ mod response_auth_tests;
 #[cfg(test)]
 mod target_auth_audit_tests;
 #[cfg(test)]
+mod trace_tests;
+#[cfg(test)]
 pub(crate) mod variant_routing_tests;
 
 #[cfg(test)]
