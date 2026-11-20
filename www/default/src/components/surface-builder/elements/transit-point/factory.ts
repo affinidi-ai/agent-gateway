@@ -384,10 +384,9 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                   n => n.type === 'mcp-tool-gating' && n.parentId === tp.id
                 );
                 const mcpToolGating = mcpToolGatingConfigToWire(mcpToolGatingNode?.config);
-                // Per-TP target-leg Trust Check (MA→TP request slot). New ones
-                // are dropped only on A2A/AP2 Transit Points; on other
-                // protocols the node is a read-only stored copy, saved back
-                // exactly as loaded.
+                // Per-TP Trust Check (MA→TP request slot). A read-only migrated
+                // destination copy on an MCP Transit Point is saved back exactly
+                // as loaded; every other list is rebuilt from its queries.
                 // The trust-check element's own buildPayload skips
                 // TP-parented nodes so this is the only writer.
                 const trustCheckNode = ctx.allNodes.find(

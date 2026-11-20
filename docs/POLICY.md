@@ -331,7 +331,7 @@ Each leg carries a `trust_check_list`:
 | List | Runs on |
 | --- | --- |
 | `access_point.trust_check_list` | The caller leg, for requests arriving at the Access Point. |
-| `transit.points[].trust_check_list` | Requests the managed agent sends through that Transit Point, and no other. The Surface Builder adds Trust Checks to A2A and AP2 Transit Points only; on an MCP or HTTP Transit Point it shows a migrated copy read-only, to keep or remove. |
+| `transit.points[].trust_check_list` | Requests the managed agent sends through that Transit Point, and no other. In the Surface Builder each query checks the destination or the [managed agent](#self-recognition-check); on an MCP Transit Point only the managed agent, and a migrated copy holding a destination query is shown read-only, to keep or remove. |
 | `target.trust_check_list` | The managed agent's own target leg: `a2a-proxy://` Targets and Fabric send. |
 
 A Transit Point with an empty list runs no Trust Check on its traffic: no agent-card fetch
@@ -394,8 +394,8 @@ saved.
 
 MCP and HTTP Transit Points receive a copy too, because the old list ran on them. There it
 usually reports `AGENT_CARD_UNAVAILABLE`, but an HTTP Transit Point whose destination serves an
-A2A agent card runs real identity and TRQP checks. The Surface Builder does not add Trust Checks
-to MCP or HTTP Transit Points and shows such a copy read-only, to keep or remove; the
+A2A agent card runs real identity and TRQP checks. On an MCP Transit Point the Surface Builder
+adds only managed-agent queries and shows such a copy read-only, to keep or remove; the
 management API accepts a list on any Transit Point. Removing a copy during review means that
 Transit Point's traffic is no longer checked, so a policy that denied on its results allows
 it.

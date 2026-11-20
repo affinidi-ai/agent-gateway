@@ -863,6 +863,50 @@ describe('trustCheckDefinition — hydrate → buildPayload round-trip', () => {
     expect(destination).not.toHaveProperty('subject');
     expect(destination.query.entity_id).not.toBe('');
   });
+
+  it('saves a managed-agent list on an MCP Transit Point from its queries, not as a read-only copy', () => {
+    const managedAgentElement = {
+      id: 'self',
+      trust_registry_id: 'tr-1',
+      query_type: 'recognition',
+      query: { authority_id: 'did:web:authority.example', entity_id: '' },
+      subject: 'managed_agent',
+    };
+    const nodes = registry.nodesFromPayload({
+      name: 'roundtrip',
+      status: 'active' as const,
+      tags: [],
+      access_point: { route: '/mcp', protocol: 'mcp' },
+      target: { endpoint: 'https://upstream/y' },
+      transit: {
+        points: [
+          {
+            alias: 'tools',
+            protocol: 'mcp',
+            target_endpoint: 'https://tools.example/mcp',
+            trust_check_list: [managedAgentElement],
+          },
+        ],
+      },
+    });
+    const tc = nodes.find(n => n.type === 'trust-check')!;
+    tc.config = {
+      ...tc.config,
+      queries: [...tc.config.queries, { ...tc.config.queries[0], id: 'self-2' }],
+    };
+    const ctx = {
+      protocol: 'mcp',
+      surfaceMeta: { name: 'roundtrip', tags: [], status: 'active' },
+      allNodes: nodes,
+      nodesOfType: (type: string) => nodes.filter(n => n.type === type),
+      firstNodeOfType: (type: string) => nodes.find(n => n.type === type),
+    } as any;
+    const list = registry.buildPayload(ctx).transit.points[0].trust_check_list;
+    expect(list.map((element: any) => [element.id, element.subject])).toEqual([
+      ['self', 'managed_agent'],
+      ['self-2', 'managed_agent'],
+    ]);
+  });
 });
 
 describe('trust_check_list — canvas removal clears the config', () => {

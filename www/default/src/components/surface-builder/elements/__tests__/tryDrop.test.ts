@@ -196,7 +196,7 @@ describe('tryDrop', () => {
     expect(onTp2).toEqual({ ok: true, slotId: TRUST_CHECK_TRANSIT_POINT_SLOT_ID });
   });
 
-  it('rejects target-leg Trust Check on an MCP Transit Point (no MCP target-leg impl)', () => {
+  it('accepts a Trust Check on an MCP Transit Point, which can check its managed agent', () => {
     const nodes: CanvasNode[] = [
       node({ id: 'ap', type: 'access-point' }),
       node({ id: 'ma', type: 'target', parentId: 'ap' }),
@@ -210,8 +210,7 @@ describe('tryDrop', () => {
       undefined,
       makeSurfaceSlotFilter('https://upstream.example/api', true, nodes)
     );
-    expect(r.ok).toBe(false);
-    expect(r.ok ? '' : r.reason).toMatch(/transit-wide/i);
+    expect(r).toEqual({ ok: true, slotId: TRUST_CHECK_TRANSIT_POINT_SLOT_ID });
   });
 
   it('rejects a direction the archetype does not support', () => {

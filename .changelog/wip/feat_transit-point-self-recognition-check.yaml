@@ -19,6 +19,13 @@ changes:
         the records of the DID the Transit Point calls out under, so a managed-agent Trust Check
         can recognise that agent. The status shows in the Identities page's Version History and
         in trust-recorder-status, and an Authority delete refusal names the Transit Point.
+    - timestamp: '2026-11-20T11:00:00Z'
+      title: Pick in the Trust Check editor whether a query checks the managed agent
+      description: >-
+        Each query of a Transit Point's Trust Check has a Checks select: the destination agent
+        or this surface's managed agent, the self recognition check. MCP Transit Points now take
+        Trust Checks for their managed agent, while a migrated destination copy there stays
+        read-only.
     - timestamp: '2026-11-20T10:00:00Z'
       title: Keep managed-agent Trust Checks and VP injection across dashboard saves
       description: >-
