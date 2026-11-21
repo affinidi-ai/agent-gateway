@@ -153,6 +153,21 @@ const VARIABLES: &[VariableSpec] = &[
         "Trace ID",
         "Request trace ID that correlates every audit record written for the same request",
     ),
+    var(
+        "AUDIT_SPAN_ID",
+        "Span ID",
+        "This gateway's span for the request in W3C Trace Context, the same value as the request id. Empty outside a request",
+    ),
+    var(
+        "AUDIT_PARENT_SPAN_ID",
+        "Parent Span ID",
+        "The span the request named as its parent in a traceparent of the same trace. Empty when it named none",
+    ),
+    var(
+        "AUDIT_TRACE_SOURCE",
+        "Trace Source",
+        "Where the request's trace id came from: transit_token, header or minted. Empty outside a traced request",
+    ),
     var("AUDIT_SURFACE_ID", "Surface ID", "ID of the Agent Surface the record belongs to"),
     var("AUDIT_SURFACE_NAME", "Surface Name", "Name of the Agent Surface the record belongs to"),
     var(
@@ -275,6 +290,9 @@ const AUDIT_VARIABLES: &[&str] = &[
     "AUDIT_RECORD",
     "AUDIT_CATEGORY",
     "AUDIT_TRACE_ID",
+    "AUDIT_SPAN_ID",
+    "AUDIT_PARENT_SPAN_ID",
+    "AUDIT_TRACE_SOURCE",
     "AUDIT_SURFACE_ID",
     "AUDIT_SURFACE_NAME",
     "AUDIT_SURFACE_VARIANT",

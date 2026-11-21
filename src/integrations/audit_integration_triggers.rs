@@ -77,6 +77,9 @@ pub fn audit_variables(event: &DelegationAuditEvent) -> HashMap<String, String> 
         ("AUDIT_RECORD".to_string(), serde_json::to_string(event).unwrap_or_default()),
         ("AUDIT_CATEGORY".to_string(), action_category(&event.event).to_string()),
         ("AUDIT_TRACE_ID".to_string(), text(&event.trace_id)),
+        ("AUDIT_SPAN_ID".to_string(), text(&event.span_id)),
+        ("AUDIT_PARENT_SPAN_ID".to_string(), text(&event.parent_span_id)),
+        ("AUDIT_TRACE_SOURCE".to_string(), text(&event.trace_source)),
         ("AUDIT_SURFACE_ID".to_string(), text(&event.surface_id)),
         ("AUDIT_SURFACE_NAME".to_string(), text(&event.channel_name)),
         ("AUDIT_SURFACE_VARIANT".to_string(), text(&event.surface_variant)),
@@ -503,6 +506,27 @@ mod tests {
         assert_eq!(variables["AUDIT_POLICY_NAME"], "surface.policy");
         assert_eq!(variables["AUDIT_POLICY_VERSION"], "", "an unversioned policy has no version");
         assert_eq!(variables["AUDIT_POLICY_CONTENT_HASH"], "");
+    }
+
+    #[test]
+    fn audit_variables_carry_span_parent_and_trace_source() {
+        let mut event = policy_decision("allow");
+        event.span_id = Some("53995c3f42cd8ad8".to_string());
+        event.parent_span_id = Some("00f067aa0ba902b7".to_string());
+        event.trace_source = Some("header".to_string());
+        let variables = audit_variables(&event);
+        let variable = |name: &str| {
+            variables
+                .get(name)
+                .map(String::as_str)
+        };
+
+        assert_eq!(
+            (variable("AUDIT_SPAN_ID"), variable("AUDIT_PARENT_SPAN_ID"), variable("AUDIT_TRACE_SOURCE")),
+            (Some("53995c3f42cd8ad8"), Some("00f067aa0ba902b7"), Some("header"))
+        );
+        let untraced = audit_variables(&policy_decision("allow"));
+        assert_eq!(untraced["AUDIT_PARENT_SPAN_ID"], "", "a record without a parent span sets it empty");
     }
 
     #[test]

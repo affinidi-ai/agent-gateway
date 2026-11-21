@@ -253,7 +253,10 @@ Audit events carry the `AUDIT_*` variables listed in
 variant's alias, `_base_` when the base surface served it, `_unknown_` on an unknown-variant
 refusal, or the disabled alias on a disabled-variant refusal. It is empty outside surface requests
 and when the surface's default variant is misconfigured. A template can send it as, for example,
-`"audit_surface_variant": "${AUDIT_SURFACE_VARIANT}"`.
+`"audit_surface_variant": "${AUDIT_SURFACE_VARIANT}"`. `AUDIT_SPAN_ID`, `AUDIT_PARENT_SPAN_ID` and
+`AUDIT_TRACE_SOURCE` carry the record's span, parent span and trace source, so a receiver can
+follow a request across appliances by W3C Trace Context; each is empty when the record has none.
+`audit.request_forwarded` is one record per request an Access Point forwards.
 
 A user's `OLD_STATE` and `NEW_STATE` carry only `user_id`, `role`, `status`, `is_primary`,
 `created_at`, and `updated_at`

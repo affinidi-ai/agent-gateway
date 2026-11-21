@@ -1294,7 +1294,10 @@ release the lock.
 **Payload.** Audit templates may use `EVENT_TYPE` (`audit.<event>`), `EVENT_NAME`,
 `EVENT_SUMMARY` (the event's name, then whichever of the surface, decision, policy, reason and
 caller the record holds), `EVENT_DATA` (the same as `AUDIT_RECORD`), `APPLIANCE_ID`,
-`TIMESTAMP` (the record's own timestamp), `AUDIT_RECORD`, `AUDIT_CATEGORY`, `AUDIT_TRACE_ID`, `AUDIT_SURFACE_ID`, `AUDIT_SURFACE_NAME`,
+`TIMESTAMP` (the record's own timestamp), `AUDIT_RECORD`, `AUDIT_CATEGORY`, `AUDIT_TRACE_ID`,
+`AUDIT_SPAN_ID` (the record's `span_id`), `AUDIT_PARENT_SPAN_ID` (its `parent_span_id`, empty
+when the request named none), `AUDIT_TRACE_SOURCE` (its `trace_source`, empty outside a traced
+request), `AUDIT_SURFACE_ID`, `AUDIT_SURFACE_NAME`,
 `AUDIT_SURFACE_VARIANT` (the record's `surface_variant`: the variant's alias, `_base_`,
 `_unknown_` or a refused disabled alias; empty outside surface requests and on a misconfigured
 default), `AUDIT_PROTOCOL`, `AUDIT_AGENT_DID`, `AUDIT_VIA_FABRIC`, `AUDIT_PRINCIPAL`,

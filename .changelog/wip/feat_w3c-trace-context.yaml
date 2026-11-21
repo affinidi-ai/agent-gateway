@@ -25,6 +25,12 @@ changes:
         credentials and, for an authenticated caller, the same caller fields a policy decision
         records. It lets Agent Watch name the original caller of a request whether or not a
         policy ran. No body, header value, token or identity hash is recorded.
+    - timestamp: '2026-11-21T06:30:00Z'
+      title: Offer span, parent span and trace source to audit integrations
+      description: >-
+        Audit integration templates can now use AUDIT_SPAN_ID, AUDIT_PARENT_SPAN_ID and
+        AUDIT_TRACE_SOURCE for every audit record, so a receiver such as Agent Watch can follow a
+        request across appliances without parsing the whole record.
   changed: []
   fixed: []
   removed: []
