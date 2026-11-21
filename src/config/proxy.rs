@@ -143,7 +143,16 @@ impl BootstrapConfig {
 
         // Read and parse x402.json
         let contents = std::fs::read_to_string(x402_path)?;
-        let config: X402Config = serde_json::from_str(&contents)?;
+        let mut config: X402Config = serde_json::from_str(&contents)?;
+        if config
+            .facilitator_private_keys
+            .take()
+            .is_some()
+        {
+            warn!(
+                "{x402_path}: facilitator_private_keys is ignored and not kept: the gateway signs no x402 settlement. Remove the keys from the file."
+            );
+        }
 
         info!("Loaded x402 config: enabled={}, verification_mode={:?}", config.enabled, config.verification_mode);
         Ok(config)
@@ -2114,5 +2123,47 @@ mod tests {
                 "{on_disk}"
             );
         }
+    }
+
+    #[test]
+    fn facilitator_private_keys_are_dropped_when_x402_json_loads() {
+        let directory = tempfile::tempdir().unwrap();
+        let x402_json = directory
+            .path()
+            .join("x402.json");
+        let mut bootstrap: BootstrapConfig =
+            toml::from_str(&crate::render_default_bootstrap_toml("", "").unwrap()).unwrap();
+        bootstrap.config_files.x402 = x402_json
+            .to_string_lossy()
+            .into_owned();
+
+        std::fs::write(
+            &x402_json,
+            serde_json::json!({
+                "rpc_endpoints": {"eip155:84532": "https://sepolia.base.org"},
+                "facilitator_private_keys": {"eip155:84532": {"private_key": "0xkey", "address": "0xaddress"}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let loaded = bootstrap
+            .load_x402_config()
+            .unwrap();
+        assert!(
+            loaded
+                .facilitator_private_keys
+                .is_none(),
+            "the keys are not kept in memory"
+        );
+        assert_eq!(loaded.rpc_endpoints["eip155:84532"], "https://sepolia.base.org");
+
+        std::fs::write(&x402_json, "{}").unwrap();
+        assert!(
+            bootstrap
+                .load_x402_config()
+                .unwrap()
+                .facilitator_private_keys
+                .is_none()
+        );
     }
 }

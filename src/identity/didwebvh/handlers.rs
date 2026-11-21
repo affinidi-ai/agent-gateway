@@ -101,18 +101,35 @@ type HandlerError = (StatusCode, Json<ErrorResponse>);
 static IDENTITY_CHANGE_LOCKS: std::sync::LazyLock<dashmap::DashMap<Uuid, Arc<tokio::sync::Mutex<()>>>> =
     std::sync::LazyLock::new(dashmap::DashMap::new);
 
+/// Holds an identity's change lock, and removes the lock once no change holds
+/// or waits for it.
+struct IdentityChange {
+    id: Uuid,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for IdentityChange {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        IDENTITY_CHANGE_LOCKS.remove_if(&self.id, |_, lock| Arc::strong_count(lock) == 1);
+    }
+}
+
 /// Takes identity `id`'s change lock and loads it, finishing a key rotation
 /// that stopped after saving its new key. Hold the guard until the change is
 /// saved.
 async fn identity_for_change(
     state: &DidWebVhApiState,
     id: &Uuid,
-) -> Result<(DidWebVhIdentity, tokio::sync::OwnedMutexGuard<()>), HandlerError> {
+) -> Result<(DidWebVhIdentity, IdentityChange), HandlerError> {
     let lock = IDENTITY_CHANGE_LOCKS
         .entry(*id)
         .or_default()
         .clone();
-    let guard = lock.lock_owned().await;
+    let guard = IdentityChange {
+        id: *id,
+        guard: Some(lock.lock_owned().await),
+    };
     let mut identity = state
         .identity_store
         .get(id)
@@ -3416,6 +3433,29 @@ mod tests {
                 .is_none()
         );
         assert_eq!(identity.version, interrupted.version + 2);
+    }
+
+    #[tokio::test]
+    async fn an_identity_change_lock_is_removed_once_nothing_holds_or_awaits_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, id, _) = api_state_with_identity(tmp.path()).await;
+
+        let (_, change) = identity_for_change(&state, &id)
+            .await
+            .unwrap();
+        let waiter = IDENTITY_CHANGE_LOCKS
+            .get(&id)
+            .map(|lock| Arc::clone(&lock))
+            .expect("held while the change runs");
+        drop(change);
+        assert!(IDENTITY_CHANGE_LOCKS.contains_key(&id), "kept while another change awaits it");
+
+        let (_, next) = identity_for_change(&state, &id)
+            .await
+            .unwrap();
+        drop(waiter);
+        drop(next);
+        assert!(!IDENTITY_CHANGE_LOCKS.contains_key(&id));
     }
 
     #[tokio::test]

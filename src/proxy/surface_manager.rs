@@ -1226,8 +1226,35 @@ impl SurfaceTaskManager {
             );
         }
 
-        // Step 1: Update the channel in the configuration first
-        let port: u16;
+        // Resolve the port and its listener before anything is published, so a
+        // surface that cannot be served leaves the running configuration as it was.
+        let network_config = self
+            .bootstrap_config
+            .load_network_config()
+            .map_err(|e| anyhow::anyhow!("Failed to load network configuration: {}", e))?;
+        if let Some(adjustment) =
+            new_surface.transit_token_lifetime_adjustment(network_config.transit_token_max_lifetime_secs)
+        {
+            warn!("{adjustment}");
+        }
+        let port = network_config
+            .map_url_to_port(&surface_listen_address)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Could not map channel listen_address to internal port: {}", surface_listen_address)
+            })?;
+        if !self
+            .port_listener_states
+            .read()
+            .await
+            .contains_key(&port)
+        {
+            anyhow::bail!(
+                "No port listener found for port {}. This should not happen - port listeners should be permanent.",
+                port
+            );
+        }
+
+        // Step 1: Update the channel in the configuration
         let previous_surface: Option<crate::config::agent_surface::AgentSurface>;
         {
             let mut config_lock = self.config.write().await;
@@ -1257,24 +1284,6 @@ impl SurfaceTaskManager {
                 error!("Channel '{}' has no config_id - this should never happen!", surface_name);
                 return Err(anyhow::anyhow!("Channel '{}' has no config_id", surface_name));
             }
-
-            // Load network configuration to map addresses to ports
-            let network_config = self
-                .bootstrap_config
-                .load_network_config()
-                .map_err(|e| anyhow::anyhow!("Failed to load network configuration: {}", e))?;
-            if let Some(adjustment) =
-                new_surface.transit_token_lifetime_adjustment(network_config.transit_token_max_lifetime_secs)
-            {
-                warn!("{adjustment}");
-            }
-
-            // Get the port for this channel
-            port = network_config
-                .map_url_to_port(&surface_listen_address)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Could not map channel listen_address to internal port: {}", surface_listen_address)
-                })?;
 
             *config_lock = Arc::new(new_config.clone());
 
@@ -1883,7 +1892,8 @@ impl SurfaceTaskManager {
             .map(|r| r.name.clone())
     }
 
-    /// Reload a single channel with fallback to cached configuration
+    /// Reload a single channel. A surface that could not be loaded is an
+    /// error and leaves the channel serving as it was.
     pub async fn reload_single_channel_with_fallback(
         &self,
         channel_name: &str,
@@ -1901,37 +1911,12 @@ impl SurfaceTaskManager {
                     .await
             }
             Err(load_error) => {
-                // Failed to load new channel, try to use cached config
-                warn!(
-                    "Failed to load channel '{}': {}. Attempting to use cached configuration.",
-                    channel_name, load_error
+                error!(
+                    error = %load_error,
+                    channel = channel_name,
+                    "Failed to load channel; it keeps serving as it was"
                 );
-
-                match self.config_cache.load().await {
-                    Ok(_cached) => {
-                        // This function should not be called without a config_id in the error case
-                        // Log error and return the load_error
-                        error!(
-                            "Cannot use fallback for channel '{}' - original error did not provide config_id",
-                            channel_name
-                        );
-                        Err(load_error)
-                    }
-                    Err(cache_error) => {
-                        error!(
-                            load_error = %load_error,
-                            cache_error = %cache_error,
-                            channel = channel_name,
-                            "Failed to load channel and no cached configuration available"
-                        );
-                        anyhow::bail!(
-                            "Failed to load channel '{}': {}. Also failed to load cached configuration: {}",
-                            channel_name,
-                            load_error,
-                            cache_error
-                        )
-                    }
-                }
+                Err(load_error)
             }
         }
     }
@@ -2030,6 +2015,19 @@ mod tests {
     }
 
     fn manager(directory: &std::path::Path) -> super::SurfaceTaskManager {
+        manager_with_bootstrap(
+            directory,
+            serde_json::json!({
+                "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
+                "backup_encryption_key": "env://UNUSED_BACKUP_KEY"
+            }),
+        )
+    }
+
+    fn manager_with_bootstrap(
+        directory: &std::path::Path,
+        bootstrap: serde_json::Value,
+    ) -> super::SurfaceTaskManager {
         let config: crate::config::GatewayConfig = serde_json::from_value(serde_json::json!({
             "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
             "integration": {"variable_pattern": "\\$\\{([^}]+)\\}", "custom_variable_prefix": "_", "types": [],
@@ -2037,11 +2035,7 @@ mod tests {
             "extension_inspection": {"enabled": false}
         }))
         .unwrap();
-        let bootstrap: crate::config::BootstrapConfig = serde_json::from_value(serde_json::json!({
-            "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
-            "backup_encryption_key": "env://UNUSED_BACKUP_KEY"
-        }))
-        .unwrap();
+        let bootstrap: crate::config::BootstrapConfig = serde_json::from_value(bootstrap).unwrap();
         super::SurfaceTaskManager::new(
             std::sync::Arc::new(config),
             std::sync::Arc::new(bootstrap),
@@ -2126,6 +2120,54 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("default_variant_id='missing'")
+        );
+        let running = manager.config.read().await;
+        assert_eq!(running.surfaces.len(), 1);
+        assert_eq!(
+            running.surfaces[0]
+                .target
+                .endpoint,
+            running_surface
+                .target
+                .endpoint
+        );
+    }
+
+    #[tokio::test]
+    async fn a_surface_reload_with_no_listener_for_its_port_leaves_the_running_configuration_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = manager_with_bootstrap(
+            directory.path(),
+            serde_json::json!({
+                "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
+                "backup_encryption_key": "env://UNUSED_BACKUP_KEY",
+                "config_files": {
+                    "gateway": concat!(env!("CARGO_MANIFEST_DIR"), "/config/examples/gateway.example.json")
+                }
+            }),
+        );
+        let mut running_surface = surface_with_variant();
+        running_surface
+            .access_point
+            .listen_address = "https://localhost:8443".to_string();
+        {
+            let mut running = manager.config.write().await;
+            let mut config = (**running).clone();
+            config.surfaces = vec![running_surface.clone()];
+            *running = std::sync::Arc::new(config);
+        }
+        let mut changed = running_surface.clone();
+        changed.target.endpoint = "https://changed.example.com/mcp".to_string();
+
+        let result = manager
+            .reload_single_channel(&changed.name.clone(), changed, test_tls_acceptor(directory.path()), None, None)
+            .await;
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No port listener found for port 8443"),
         );
         let running = manager.config.read().await;
         assert_eq!(running.surfaces.len(), 1);

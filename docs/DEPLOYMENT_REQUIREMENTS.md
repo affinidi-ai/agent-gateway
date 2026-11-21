@@ -119,9 +119,14 @@ host; the gateway warns about it and starts.
 
 Instances that share one `_storage` volume, such as an Active node and its Standby nodes, take
 turns through advisory file locks on that volume: the gateway DID lock (`.gateway_did.lock` in
-`vc_keys`) and the delegation vault's mutation lock (see
-[Credential delegation](CREDENTIAL_DELEGATION.md)). The file server must grant each lock to one
-host at a time:
+`vc_keys`), the delegation vault's mutation lock (see
+[Credential delegation](CREDENTIAL_DELEGATION.md)), and, with the default `single_use_store`
+disk backend, the single-use journal lock (`single_use/single-use.lock`), which the Active node
+holds and a node stepping down to Standby releases (see
+[Single-use store](CONFIGURATION_REFERENCE.md#single-use-store)). Instances that each have their
+own `_storage` and serve at the same time need `single_use_store` set to the `dynamodb` backend,
+or a replayed ID-JAG, Fabric envelope or voided payment receipt is accepted by the node that has
+not seen it. The file server must grant each lock to one host at a time:
 
 | Volume | Locks hold across hosts |
 | --- | --- |

@@ -55,7 +55,6 @@ struct ErrorResponse {
 pub struct ReloadConfigResponse {
     pub channels_count: usize,
     pub surfaces_count: usize,
-    pub is_fallback: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
@@ -73,11 +72,15 @@ pub async fn reload_configuration(
             .await
             .map_err(|e| AppError::InternalError(format!("Failed to reload channels: {}", e)))?
     };
+    if is_fallback {
+        return Err(AppError::InternalError(
+            warning.unwrap_or_else(|| "The configuration could not be loaded and was not reloaded".to_string()),
+        ));
+    }
 
     Ok(Json(ReloadConfigResponse {
         channels_count,
         surfaces_count,
-        is_fallback,
         warning,
     }))
 }
@@ -704,7 +707,6 @@ pub struct X402DefaultsConfig {
     pub verification_mode: String,
     pub settlement_mode: String,
     pub min_confirmations: u32,
-    pub facilitator_timeout_secs: u64,
 }
 
 /// x402 configuration response

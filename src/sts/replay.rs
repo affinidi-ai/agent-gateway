@@ -92,6 +92,7 @@ impl McpReplay {
         jti: &str,
         expiry: u64,
         now: u64,
+        max_lifetime_secs: u64,
     ) -> Result<bool, StsError> {
         if profile_issuer.is_empty()
             || profile_issuer.len() > 4096
@@ -101,7 +102,7 @@ impl McpReplay {
             || jti.len() > 1024
             || expiry
                 .checked_sub(now)
-                .is_none_or(|ttl| ttl == 0 || ttl > 900)
+                .is_none_or(|ttl| ttl == 0 || ttl > max_lifetime_secs)
         {
             return Err(StsError::InvalidGrant("MCP ID-JAG identity or lifetime is invalid".into()));
         }
@@ -187,28 +188,35 @@ mod tests {
     async fn mcp_replay_is_issuer_scoped_atomic_and_lifetime_capped() {
         let replay = Arc::new(McpReplay::Embedded(Arc::new(SingleUseStore::in_memory())));
         let (first, second) = tokio::join!(
-            replay.record_unique(PROFILE, "https://idp.example", "grant", 100, 10),
-            replay.record_unique(PROFILE, "https://idp.example", "grant", 100, 10),
+            replay.record_unique(PROFILE, "https://idp.example", "grant", 100, 10, 900),
+            replay.record_unique(PROFILE, "https://idp.example", "grant", 100, 10, 900),
         );
         assert_eq!(usize::from(first.unwrap()) + usize::from(second.unwrap()), 1);
         assert!(
             replay
-                .record_unique(PROFILE, "https://other.example", "grant", 100, 10)
+                .record_unique(PROFILE, "https://other.example", "grant", 100, 10, 900)
                 .await
                 .unwrap()
         );
         assert!(
             replay
-                .record_unique(PROFILE, "https://idp.example", "grant", 200, 100)
+                .record_unique(PROFILE, "https://idp.example", "grant", 200, 100, 900)
                 .await
                 .unwrap(),
             "an expired redemption no longer blocks"
         );
         assert!(
             replay
-                .record_unique(PROFILE, "https://idp.example", "long", 2000, 100)
+                .record_unique(PROFILE, "https://idp.example", "long", 2000, 100, 900)
                 .await
                 .is_err()
+        );
+        assert!(
+            replay
+                .record_unique(PROFILE, "https://idp.example", "long", 2000, 100, 3600)
+                .await
+                .unwrap(),
+            "the configured cap, not a fixed one, bounds the lifetime"
         );
         assert!(McpReplay::new(&McpReplayConfig::Dynamodb { table: "replays".into() }, None).is_err());
     }
@@ -226,14 +234,14 @@ mod tests {
         assert!(
             open()
                 .await
-                .record_unique(PROFILE, "https://idp.example", "grant", 100, 10)
+                .record_unique(PROFILE, "https://idp.example", "grant", 100, 10, 900)
                 .await
                 .unwrap()
         );
         assert!(
             !open()
                 .await
-                .record_unique(PROFILE, "https://idp.example", "grant", 100, 20)
+                .record_unique(PROFILE, "https://idp.example", "grant", 100, 20, 900)
                 .await
                 .unwrap()
         );

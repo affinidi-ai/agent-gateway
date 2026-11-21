@@ -372,25 +372,32 @@ impl X402Transaction {
         }
     }
 
-    /// Update settlement tx_hash (set when remote gateway responds)
-    pub fn set_settlement_tx_hash(
+    /// Marks an in-progress settlement completed with the reported `tx_hash`,
+    /// returning whether it was in progress. A settlement already completed,
+    /// failed or refunded, or a transaction with none, is left as it is.
+    pub fn complete_settlement(
         &mut self,
-        tx_hash: String,
-    ) {
-        if let Some(settlement) = &mut self.settlement {
+        tx_hash: Option<String>,
+    ) -> bool {
+        let Some(settlement) = self
+            .settlement
+            .as_mut()
+            .filter(|settlement| {
+                settlement
+                    .status
+                    .is_in_progress()
+            })
+        else {
+            return false;
+        };
+        if let Some(tx_hash) = tx_hash {
             settlement.tx_hash = tx_hash;
-            self.last_updated = Utc::now();
         }
-    }
-
-    /// Mark settlement as completed
-    pub fn complete_settlement(&mut self) {
-        if let Some(settlement) = &mut self.settlement {
-            settlement.status = SettlementStatus::Completed;
-            settlement.settlement_completed_at = Some(Utc::now());
-            settlement.error = None;
-            self.last_updated = Utc::now();
-        }
+        settlement.status = SettlementStatus::Completed;
+        settlement.settlement_completed_at = Some(Utc::now());
+        settlement.error = None;
+        self.last_updated = Utc::now();
+        true
     }
 }
 
@@ -483,15 +490,20 @@ impl TransactionStore {
             .cloned()
     }
 
-    /// Complete settlement
+    /// Completes the transaction's in-progress settlement and issues its
+    /// receipt. A settlement that is not in progress is refused, so a repeated
+    /// completion issues no second receipt and reopens nothing.
     pub async fn complete_settlement(
         &self,
         correlation_id: &str,
+        tx_hash: Option<String>,
     ) -> Result<(), String> {
         let mut cache = self.cache.write().await;
 
         if let Some(transaction) = cache.get_mut(correlation_id) {
-            transaction.complete_settlement();
+            if !transaction.complete_settlement(tx_hash) {
+                return Err(format!("Settlement of {correlation_id} is not in progress"));
+            }
 
             let settlement_evidence = transaction
                 .settlement
@@ -530,32 +542,6 @@ impl TransactionStore {
                     .map(|c| c.jwt.as_str()),
             );
             info!("[transaction-store] Settlement completed: {}", correlation_id);
-            Ok(())
-        } else {
-            Err(format!("Transaction not found: {}", correlation_id))
-        }
-    }
-
-    /// Update settlement tx_hash (from remote gateway response)
-    pub async fn set_settlement_tx_hash(
-        &self,
-        correlation_id: &str,
-        tx_hash: String,
-    ) -> Result<(), String> {
-        let mut cache = self.cache.write().await;
-
-        if let Some(transaction) = cache.get_mut(correlation_id) {
-            transaction.set_settlement_tx_hash(tx_hash);
-
-            // Save to disk
-            if let Err(e) = self
-                .save_to_disk(transaction)
-                .await
-            {
-                error!("Failed to save transaction to disk: {}", e);
-                return Err(format!("Failed to persist transaction: {}", e));
-            }
-
             Ok(())
         } else {
             Err(format!("Transaction not found: {}", correlation_id))
@@ -711,7 +697,7 @@ mod tests {
         store.insert(pending).await;
 
         store
-            .complete_settlement(&id)
+            .complete_settlement(&id, Some("0xsettled".to_string()))
             .await
             .unwrap();
 
@@ -722,6 +708,7 @@ mod tests {
             .settlement
             .unwrap();
         assert_eq!(settlement.status, SettlementStatus::Completed);
+        assert_eq!(settlement.tx_hash, "0xsettled");
         assert!(
             settlement
                 .settlement_completed_at
@@ -730,11 +717,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_settlement_that_is_not_in_progress_is_not_completed() {
+        let (store, _root) = store().await;
+        for (status, settlement) in [
+            ("completed", Some(SettlementStatus::Completed)),
+            ("failed", Some(SettlementStatus::Failed)),
+            ("absent", None),
+        ] {
+            let record = transaction(VerificationStatus::Verified, settlement.clone(), Utc::now());
+            let id = record.id.clone();
+            store.insert(record).await;
+
+            let error = store
+                .complete_settlement(&id, Some("0xreplayed".to_string()))
+                .await
+                .unwrap_err();
+
+            assert_eq!(error, format!("Settlement of {id} is not in progress"), "{status}");
+            let kept = store.get(&id).await.unwrap();
+            assert_eq!(
+                kept.settlement
+                    .as_ref()
+                    .map(|s| s.status.clone()),
+                settlement,
+                "{status}"
+            );
+            assert_eq!(kept.receipt_vc_jwt, None, "{status}");
+        }
+    }
+
+    #[tokio::test]
     async fn completing_an_unknown_transaction_fails() {
         let (store, _root) = store().await;
 
         let error = store
-            .complete_settlement("missing")
+            .complete_settlement("missing", None)
             .await
             .unwrap_err();
 

@@ -946,14 +946,7 @@ pub async fn run_axum_proxy(
             ),
             crate::storage::single_use::SingleUseStoreConfig::Disk {} => None,
         };
-        let dir = std::path::Path::new(
-            &bootstrap_config
-                .storage_paths
-                .mpp_transactions,
-        )
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("_storage"))
-        .join("single_use");
+        let dir = crate::storage::single_use::journal_dir(&bootstrap_config.storage_paths);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();

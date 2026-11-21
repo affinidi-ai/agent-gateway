@@ -1556,6 +1556,9 @@ impl Authorization {
         let evidence = self.evidence.clone();
         let settled = Arc::clone(&self.settled);
         let in_flight = Arc::clone(&self.in_flight);
+        if action == crate::payments_ledger::SettleAction::Void {
+            mark_voiding(&evidence);
+        }
         runtime.spawn(async move {
             let _in_flight = in_flight;
             if action == crate::payments_ledger::SettleAction::Void {
@@ -1593,6 +1596,16 @@ impl Authorization {
     }
 }
 
+/// Receipts whose void is decided but not yet durably recorded. A receipt is
+/// added the moment the void is decided, so continuation evidence of it is
+/// refused on this node before the record is written, and stays when the
+/// record cannot be written.
+static VOIDING: LazyLock<dashmap::DashSet<[u8; 32]>> = LazyLock::new(dashmap::DashSet::new);
+
+fn mark_voiding(receipt: &str) {
+    VOIDING.insert(evidence_digest(receipt));
+}
+
 /// Records the receipt of a voided authorization in the single-use store until
 /// the longest an MCP continuation can carry it, so continuation evidence
 /// recorded from it before the void pays for no later round.
@@ -1601,8 +1614,14 @@ async fn void_evidence(receipt: &str) {
         Ok(store) => record_voided(&store, receipt, now_ms() / 1000).await,
         Err(error) => Err(error),
     };
-    if let Err(error) = recorded {
-        tracing::error!(%error, "Failed to record voided payment evidence; continuation evidence of it is refused only on this node");
+    match recorded {
+        Ok(()) => {
+            VOIDING.remove(&evidence_digest(receipt));
+        }
+        Err(error) => {
+            mark_voiding(receipt);
+            tracing::error!(%error, "Failed to record voided payment evidence; continuation evidence of it is refused only on this node until it restarts");
+        }
     }
 }
 
@@ -1625,6 +1644,9 @@ async fn record_voided(
 /// Whether the receipt's authorization was voided. A store that cannot answer
 /// counts it as voided.
 async fn evidence_voided(receipt: &str) -> bool {
+    if VOIDING.contains(&evidence_digest(receipt)) {
+        return true;
+    }
     match crate::storage::single_use::global() {
         Ok(store) => voided_in(&store, receipt, now_ms() / 1000).await,
         Err(_) => true,
@@ -1661,10 +1683,13 @@ impl Drop for Authorization {
             Ok(runtime) => {
                 self.spawn_settle(&runtime, action);
             }
-            Err(_) => tracing::warn!(
-                row_id = %self.held.row_id,
-                "A held payment was dropped outside a runtime; the reconciler voids it"
-            ),
+            Err(_) => {
+                mark_voiding(&self.evidence);
+                tracing::warn!(
+                    row_id = %self.held.row_id,
+                    "A held payment was dropped outside a runtime; the reconciler voids it, and its continuation evidence is refused only on this node until it restarts"
+                );
+            }
         }
     }
 }
@@ -6618,6 +6643,21 @@ pub(crate) mod tests {
                 .is_none(),
             "a request without a credential pays nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn evidence_is_refused_from_the_void_decision_until_and_after_it_is_recorded() {
+        let receipt = unique("voiding-receipt");
+        let untouched = unique("untouched-receipt");
+        assert!(!evidence_voided(&receipt).await);
+
+        mark_voiding(&receipt);
+        assert!(evidence_voided(&receipt).await, "refused before the void is recorded");
+        assert!(!evidence_voided(&untouched).await);
+
+        void_evidence(&receipt).await;
+        assert!(!VOIDING.contains(&evidence_digest(&receipt)), "the local entry goes once the record is durable");
+        assert!(evidence_voided(&receipt).await, "the durable record refuses it from then on");
     }
 
     #[tokio::test]

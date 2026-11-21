@@ -87,6 +87,14 @@ Each of these behaves differently from the obvious reading of the field.
 | `encryption.enabled` | `--generate-bootstrap` writes `[encryption]` with `enabled = false`, and a `config.toml` without the table runs unencrypted. Deployment tooling that builds `config.toml` from `--generate-bootstrap` replaces that table, so its output keeps encryption off and the table's shape stable. The development setup turns encryption on for an environment it creates: a local one reads the master key from `envs/master_encryption_key` (`key_source = "file"`), a Docker one from `AG_MASTER_KEY`. When it regenerates an existing `config.toml`, it keeps that file's `[encryption]` table. An existing environment that runs unencrypted stays unencrypted. To opt in, set `[encryption]` by hand (`enabled = true`, `key_source = "file"`, `key_file` = the absolute path of `envs/master_encryption_key` or of another file holding a 64-hex or base64 32-byte key) and restart; plaintext records are rewritten as `.json.enc` when they are loaded. |
 | `encryption.field_encryption_enabled` | Reserved and not wired to any field. Leave it false. |
 
+## Surface status
+
+A surface's `status` is `active` (the default), `disabled` or `deleted`. Only an `active`
+surface serves traffic or claims its listener route; a `disabled` or `deleted` one does
+neither, at startup and after a reload, so it never blocks an active surface on the same
+route. The admin API refuses to save a surface with `status: "deleted"` with a `400`: delete the
+surface instead.
+
 ## Surface transit settings that do nothing
 
 Two settings in a surface's `transit` block ship in generated configs but the gateway acts
@@ -359,13 +367,20 @@ lives). The gateway records each in the single-use store, which `single_use_stor
 
 | Backend | Behaviour |
 | --- | --- |
-| `disk` (default) | One append-only journal per kind of record, `<kind>.jsonl` in `single_use/` beside the payments ledger (`_storage/single_use/` by default), readable by the owner only. Every record is synced to the disk before it is accepted. At startup the journals are read back and rewritten with only the records still live; a journal that grows to twice its live records is rewritten the same way while the gateway runs. A journal that cannot be read stops the gateway from starting. |
+| `disk` (default) | One append-only journal per kind of record, `<kind>.jsonl` in `single_use/` inside the `_storage` folder that holds `[storage_paths].agent_surfaces` (`_storage/single_use/` by default; beside the `agent_surfaces` folder when no `_storage` folder contains it), readable by the owner only. Every record is synced to the disk before it is accepted. When the gateway takes the journals over, they are read back and rewritten with only the records still live; a journal that grows past twice its live records plus 4096 lines is rewritten the same way while the gateway runs. A journal that cannot be read at startup stops the gateway from starting. |
 | `dynamodb` | A conditional put to `table`, keyed by `PK`/`SK` with the expiry in `expires_at` (enable the table's TTL on `expires_at` to remove expired records). Uses `aws_region` and `aws_profile` from `config.toml`. Each call times out after 10 seconds. |
 
-The disk backend is per node: records survive a restart, but another node never sees them.
-Several nodes behind one mediator or load balancer need the `dynamodb` backend, and the
-gateway refuses to start when `[mcp.continuations]` keeps continuations in DynamoDB while this
-store is on disk, since a payment voided on one node would still pay on another. A `table`
+The disk backend is per node: records survive a restart, but a node with its own `_storage`
+never sees another node's. Instances that share one `_storage` volume, such as an Active node
+and its Standby nodes, take turns: the instance holding the journals keeps an exclusive lock on
+`single_use/single-use.lock`, an Active node takes the journals over once the lock is free
+(trying again every 5 seconds) and reads back what the previous holder recorded, and a node
+stepping down to Standby releases them. Until a node holds the journals every single-use check
+on it fails closed, as below. The lock must hold across hosts (see
+[Shared storage for several instances](DEPLOYMENT_REQUIREMENTS.md#shared-storage-for-several-instances)).
+Several nodes serving at once, each with its own `_storage`, need the `dynamodb` backend, and
+the gateway refuses to start when `[mcp.continuations]` keeps continuations in DynamoDB while
+this store is on disk, since a payment voided on one node would still pay on another. A `table`
 that is not 3 to 255 letters, digits, `_`, `-` or `.` stops the gateway from starting.
 
 Every node also keeps the records it has seen in memory, so a duplicate is refused without a
@@ -531,9 +546,12 @@ failed. A record whose settlement is pending, processing or awaiting a remote or
 facilitator is never deleted. If `x402.json` fails to parse, the gateway logs a warning and loads
 no transactions. Other `transaction_storage` keys, and `settlement_storage`, are ignored.
 
-Recorded x402 transactions are kept as they are and stay readable through the admin API: nothing
-settles, retries or recovers them, and only a settlement-complete from a transaction's own
-facilitator gateway changes one (see [FABRIC.md](FABRIC.md)). A surface cannot charge through
+x402 transactions recorded before the upgrade are kept as they are and stay readable through the
+admin API. Nothing writes a new one or settles, retries or recovers them, and only a
+settlement-complete from a transaction's own facilitator gateway completes one whose settlement is
+still in progress (see [FABRIC.md](FABRIC.md)). The daily cleanup deletes only final records, so an
+unsettled record stays on disk until an operator deletes it. `facilitator_private_keys` is ignored
+and dropped when `x402.json` loads, with a warning: remove it from the file. A surface cannot charge through
 local x402; see [Surface payment policy](#surface-payment-policy).
 
 `test-endpoints.json` (`[config_files].test_endpoints`) fed the unauthenticated x402 test
@@ -542,8 +560,7 @@ says, so the file is not read. Nor is `x402-proxy.json` (`[config_files].x402_pr
 held the networks and wallets of the removed MPP auto-pay; a wallet's `private_key` in an old
 copy of the file is never loaded, and the file can be deleted.
 
-A network entry pointing at mainnet moves real value. The demo scripts and a worked walkthrough are in
-[`scripts/x402/README.md`](../scripts/x402/README.md); protocol behaviour is in
+A network entry pointing at mainnet moves real value. Protocol behaviour is in
 [`PROTOCOLS.md`](PROTOCOLS.md).
 
 ## `metrics.json`

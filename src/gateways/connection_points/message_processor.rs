@@ -9485,8 +9485,8 @@ async fn process_x402_settlement_complete(message: &ReceivedMessage) -> Processi
 }
 
 /// Complete the named transaction's settlement, but only when the message comes
-/// from the active peer gateway recorded as that transaction's facilitator and
-/// explicitly reports `completed`.
+/// from the active peer gateway recorded as that transaction's facilitator,
+/// explicitly reports `completed`, and the settlement is still in progress.
 async fn apply_settlement_complete(
     message: &ReceivedMessage,
     txn_store: &crate::x402::TransactionStore,
@@ -9528,14 +9528,10 @@ async fn apply_settlement_complete(
     let tx_hash = body
         .get("tx_hash")
         .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    if !tx_hash.is_empty() {
-        txn_store
-            .set_settlement_tx_hash(correlation_id, tx_hash.to_string())
-            .await?;
-    }
+        .filter(|tx_hash| !tx_hash.is_empty())
+        .map(str::to_string);
     txn_store
-        .complete_settlement(correlation_id)
+        .complete_settlement(correlation_id, tx_hash)
         .await?;
     info!("✅ Marked settlement as complete for: {}", correlation_id);
     Ok(())

@@ -120,6 +120,9 @@ async fn handle_message(
             info!("TR reader: setup/approved for '{}'", connection.trust_registry_id);
             update_status(connection, TrustRegistryConnectionStatus::Connected, store, ws_state).await;
         }
+        MSG_TYPE_PROBLEM_REPORT if !may_reject(connection, sender) => {
+            ignore_unverified_signal(connection, &message.typ, sender);
+        }
         MSG_TYPE_PROBLEM_REPORT => {
             let result = PollResult {
                 msg_type: message.typ.clone(),
@@ -133,27 +136,31 @@ async fn handle_message(
             } else if is_request_thread(&thid) {
                 warn!(
                     // Peer-chosen: capped at 64 chars and Debug-escaped.
-                    thid = ?thid.chars().take(64).collect::<String>(),
+                    thid = ?capped(&thid),
                     "TR reader: problem-report for '{}' answers a request no longer awaited, ignoring",
                     connection.trust_registry_id
                 );
-            } else if !may_reject(connection, sender) {
-                ignore_unverified_signal(connection, &message.typ, sender);
             } else {
                 // Not a reply to a request → the registry rejected the gateway.
-                let code = message
-                    .body
-                    .get("code")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let comment = message
-                    .body
-                    .get("comment")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                error!("TR reader: problem-report for '{}': {}: {}", connection.trust_registry_id, code, comment);
+                let field = |name| {
+                    message
+                        .body
+                        .get(name)
+                        .and_then(|v| v.as_str())
+                        .map(capped)
+                };
+                error!(
+                    // Peer-chosen: capped at 64 chars and Debug-escaped.
+                    code = ?field("code"),
+                    comment = ?field("comment"),
+                    "TR reader: problem-report for '{}'",
+                    connection.trust_registry_id
+                );
                 update_status(connection, TrustRegistryConnectionStatus::Failed, store, ws_state).await;
             }
+        }
+        _ if !sent_by_registry(connection, sender) => {
+            ignore_unverified_signal(connection, &message.typ, sender);
         }
         other => {
             let result = PollResult {
@@ -171,6 +178,13 @@ async fn handle_message(
             }
         }
     }
+}
+
+fn capped(peer_chosen: &str) -> String {
+    peer_chosen
+        .chars()
+        .take(64)
+        .collect()
 }
 
 fn sent_by_registry(
@@ -194,9 +208,9 @@ fn ignore_unverified_signal(
 ) {
     warn!(
         // Peer-chosen: capped at 64 chars and Debug-escaped.
-        sender = ?sender.map(|did| did.chars().take(64).collect::<String>()),
+        sender = ?sender.map(capped),
         "TR reader: ignoring '{}' for '{}' from a sender that is not the registry",
-        message_type,
+        capped(message_type),
         connection.trust_registry_id
     );
 }
@@ -388,6 +402,75 @@ mod tests {
 
         handle_message(problem_report("thid-rejection", STRANGER), &connection, &store, &None).await;
 
+        assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connected);
+    }
+
+    async fn awaiting(
+        connection: &TrustRegistryConnection,
+        thid: &str,
+    ) -> tokio::sync::oneshot::Receiver<PollResult> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        connection
+            .response_waiters
+            .lock()
+            .await
+            .insert(thid.to_string(), tx);
+        rx
+    }
+
+    fn reply(
+        thid: &str,
+        from: &str,
+    ) -> DIDCommMessage {
+        DIDCommMessage::build(
+            uuid::Uuid::new_v4().to_string(),
+            "https://example.org/registry/query-response".to_string(),
+            serde_json::json!({ "recognized": true }),
+        )
+        .thid(thid.to_string())
+        .from(from.to_string())
+        .finalize()
+    }
+
+    #[tokio::test]
+    async fn only_the_registry_answers_a_pending_query() {
+        let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connected).await;
+        let mediator = connection
+            .mediator_did
+            .clone();
+        let mut pending = awaiting(&connection, "thid-query").await;
+
+        for forger in [STRANGER, mediator.as_str()] {
+            handle_message(reply("thid-query", forger), &connection, &store, &None).await;
+            assert!(pending.try_recv().is_err(), "{forger} answers nothing");
+        }
+
+        handle_message(reply("thid-query", REGISTRY), &connection, &store, &None).await;
+        assert_eq!(
+            pending
+                .try_recv()
+                .unwrap()
+                .body,
+            serde_json::json!({ "recognized": true })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_problem_report_from_another_sender_answers_no_pending_query() {
+        let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connected).await;
+        let mut pending = awaiting(&connection, "thid-query").await;
+
+        handle_message(problem_report("thid-query", STRANGER), &connection, &store, &None).await;
+        assert!(pending.try_recv().is_err());
+
+        handle_message(problem_report("thid-query", REGISTRY), &connection, &store, &None).await;
+        assert_eq!(
+            pending
+                .try_recv()
+                .unwrap()
+                .msg_type,
+            MSG_TYPE_PROBLEM_REPORT
+        );
         assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connected);
     }
 

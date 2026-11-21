@@ -156,8 +156,11 @@ answered `{"valid": false, "error": "facilitator_disabled"}` and an `x402/settle
 whatever `facilitator_mode.facilitator_via_fabric` says. This gateway sends no verify or settle
 request, so an `x402/verify-response` or `x402/settle-response` is dropped without touching the
 transaction store. The x402 transactions already in that store are kept as they are: nothing
-settles, retries or recovers them. Only an `x402/settlement-complete` reporting `completed` from a
-transaction's own active facilitator gateway changes one, marking its settlement completed.
+writes a new one or settles, retries or recovers them. Only an `x402/settlement-complete`
+reporting `completed` from a transaction's own active facilitator gateway changes one, and only
+while its settlement is in progress: it marks the settlement completed and issues the receipt
+once, so a repeated message, or one for a settlement already completed, failed or refunded,
+changes nothing.
 
 ## Peer issuer DIDs
 

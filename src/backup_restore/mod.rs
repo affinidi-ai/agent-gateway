@@ -401,7 +401,7 @@ fn check_and_restore_backup_with_keys(
         }
         data
     };
-    let staged_digest = hex::encode(sha2::Sha256::digest(&data));
+    let staged_digests = staged_digests(backup_restore_dir);
     if !encryption::is_encrypted_backup(&data) {
         audit::record_startup_storage_audit(audit::StorageAuditEvent {
             operation: audit::StorageOperation::Restore,
@@ -618,7 +618,7 @@ fn check_and_restore_backup_with_keys(
     }
     let _ = std::fs::remove_dir_all(&staging_path);
 
-    if let Err(e) = std::fs::write(backup_restore_dir.join(RESTORE_DONE_MARKER), &staged_digest) {
+    if let Err(e) = std::fs::write(backup_restore_dir.join(RESTORE_DONE_MARKER), staged_digests.join("\n")) {
         eprintln!("WARNING: Failed to record the restored backup: {e}");
     }
     remove_staged_backups(backup_restore_dir);
@@ -665,7 +665,8 @@ fn check_and_restore_backup_with_keys(
     true
 }
 
-/// Whether `staged` is the backup the restore marker names as installed.
+/// Whether `staged` is one of the backups the restore marker names as staged
+/// when a restore was installed.
 fn already_restored(
     backup_restore_dir: &std::path::Path,
     staged: &std::path::Path,
@@ -673,7 +674,27 @@ fn already_restored(
     let Ok(marker) = std::fs::read_to_string(backup_restore_dir.join(RESTORE_DONE_MARKER)) else {
         return false;
     };
-    std::fs::read(staged).is_ok_and(|bytes| hex::encode(sha2::Sha256::digest(&bytes)) == marker.trim())
+    file_digest(staged).is_some_and(|digest| {
+        marker
+            .lines()
+            .any(|line| line.trim() == digest)
+    })
+}
+
+/// The digest of every staged backup, current and legacy, taken before a
+/// restore installs one of them.
+fn staged_digests(backup_restore_dir: &std::path::Path) -> Vec<String> {
+    [BACKUP_STAGING_FILENAME, LEGACY_BACKUP_STAGING_FILENAME]
+        .into_iter()
+        .filter_map(|name| file_digest(&backup_restore_dir.join(name)))
+        .collect()
+}
+
+fn file_digest(path: &std::path::Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = sha2::Sha256::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    Some(hex::encode(hasher.finalize()))
 }
 
 /// Removes every staged backup, current and legacy, so an older file left
@@ -1248,6 +1269,36 @@ mod tests {
                 .join(RESTORE_DONE_MARKER)
                 .exists()
         );
+    }
+
+    #[test]
+    fn a_legacy_backup_left_beside_the_restored_one_is_not_restored_over_it() {
+        let dir = create_test_storage();
+        let storage_root = dir.path().join("_storage");
+        let backup_restore_dir = dir
+            .path()
+            .join("_backup_restore");
+        fs::create_dir_all(&backup_restore_dir).unwrap();
+        let key = [0x31; 32];
+        let legacy = backup_restore_dir.join(LEGACY_BACKUP_STAGING_FILENAME);
+        fs::write(&legacy, staged_backup(&storage_root, &key)).unwrap();
+        fs::write(backup_restore_dir.join(BACKUP_STAGING_FILENAME), b"the newer backup").unwrap();
+        let digests = staged_digests(&backup_restore_dir);
+        assert_eq!(digests.len(), 2, "both staged backups are hashed before the install");
+        fs::write(backup_restore_dir.join(RESTORE_DONE_MARKER), digests.join("\n")).unwrap();
+        fs::remove_file(backup_restore_dir.join(BACKUP_STAGING_FILENAME)).unwrap();
+        fs::write(storage_root.join("channels/written-after-restore.json"), b"{}").unwrap();
+
+        let restored =
+            check_and_restore_backup_with_keys(&storage_root, &backup_restore_dir, &key, &[], "gateway.example.com");
+
+        assert!(!restored, "the legacy archive is recognised as staged alongside the restored one");
+        assert!(
+            storage_root
+                .join("channels/written-after-restore.json")
+                .exists()
+        );
+        assert!(!legacy.exists());
     }
 
     #[test]

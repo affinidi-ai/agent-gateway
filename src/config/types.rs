@@ -2229,6 +2229,36 @@ fn any_pattern_matches(
 }
 
 #[cfg(test)]
+mod sts_runtime_config_tests {
+    use super::StsRuntimeConfig;
+
+    fn with_lifetime(secs: u64) -> StsRuntimeConfig {
+        StsRuntimeConfig {
+            id_jag_max_lifetime_secs: secs,
+            ..StsRuntimeConfig::default()
+        }
+    }
+
+    #[test]
+    fn an_id_jag_lifetime_cap_from_1_to_3600_is_accepted() {
+        for secs in [1, 900, 3600] {
+            assert_eq!(with_lifetime(secs).validate(), Ok(()), "{secs}");
+        }
+        assert_eq!(StsRuntimeConfig::default().id_jag_max_lifetime_secs, 900);
+    }
+
+    #[test]
+    fn an_id_jag_lifetime_cap_outside_1_to_3600_is_refused() {
+        for secs in [0, 3601] {
+            assert_eq!(
+                with_lifetime(secs).validate(),
+                Err(format!("sts.id_jag_max_lifetime_secs must be from 1 to 3600, not {secs}"))
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod integration_config_tests {
     use super::IntegrationConfig;
 
@@ -4628,12 +4658,22 @@ mod x402_storage_config_tests {
     }
 
     #[test]
-    fn example_x402_config_parses_settlement_worker_settings() {
+    fn example_x402_config_parses_without_the_facilitator_blocks() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/examples/x402.example.json");
         let contents = std::fs::read_to_string(path).expect("read x402 example");
         let config: X402Config = serde_json::from_str(&contents).expect("parse x402 example");
 
-        assert_eq!(settlement_worker_settings(&config), (100, 60, 3));
+        assert!(
+            config
+                .settlement_storage
+                .is_none()
+        );
+        assert!(
+            config
+                .facilitator_private_keys
+                .is_none()
+        );
+        assert!(config.facilitator.is_none());
         assert!(
             config
                 .transaction_storage

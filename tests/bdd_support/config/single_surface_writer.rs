@@ -689,6 +689,11 @@ fn write_single_surface_config_inner(
     if let Some(max_secs) = surface_config.transit_token_max_lifetime_secs {
         set_transit_token_max_lifetime(base_dir, max_secs);
     }
+    if let Some(max_secs) = surface_config.sts_id_jag_max_lifetime_secs {
+        edit_gateway_json(base_dir, |gateway| {
+            gateway["sts"]["id_jag_max_lifetime_secs"] = serde_json::json!(max_secs);
+        });
+    }
     write_credential_policy(
         base_dir,
         &surface_config.enforced_credential_rules,

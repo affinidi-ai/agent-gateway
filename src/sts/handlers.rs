@@ -1463,7 +1463,16 @@ async fn handle_jwt_bearer(
             .mcp_replay
             .as_ref()
             .ok_or_else(|| StsError::ServerError("MCP replay storage is not configured".into()))?
-            .record_unique(&profile.issuer, &id_jag.issuer, &id_jag.jti, id_jag.expires_at, now)
+            .record_unique(
+                &profile.issuer,
+                &id_jag.issuer,
+                &id_jag.jti,
+                id_jag.expires_at,
+                now,
+                state
+                    .config
+                    .id_jag_max_lifetime_secs,
+            )
             .await?
     } else {
         let store = state

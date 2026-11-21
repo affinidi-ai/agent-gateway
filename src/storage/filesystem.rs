@@ -1033,6 +1033,7 @@ async fn load_storage_dir<T: StorableEntity>(
     fs::create_dir_all(storage_dir)
         .await
         .context("Failed to create storage directory")?;
+    remove_stale_temporaries(storage_dir).await;
 
     // Load existing entities from disk
     let entities = load_all_entities_from_disk(storage_dir, entity_name, config, cache, strict).await?;
@@ -1314,6 +1315,45 @@ async fn save_entity_to_disk_atomic<T: StorableEntity>(
     }
 
     Ok(())
+}
+
+/// A temporary file older than this was left by a write that never renamed it.
+const STALE_TEMPORARY_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Removes the `.<name>.<uuid>.tmp` files a crash between writing and renaming
+/// left in `dir`. A temporary file younger than [`STALE_TEMPORARY_AGE`] may
+/// belong to a write still running on another instance sharing the directory,
+/// so it is kept.
+async fn remove_stale_temporaries(dir: &Path) {
+    let Ok(mut entries) = fs::read_dir(dir).await else {
+        return;
+    };
+    let mut removed = 0usize;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with('.') && name.ends_with(".tmp")) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .await
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= STALE_TEMPORARY_AGE);
+        if stale
+            && fs::remove_file(entry.path())
+                .await
+                .is_ok()
+        {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        info!("Removed {} temporary file(s) left by interrupted writes in {}", removed, dir.display());
+    }
 }
 
 /// Writes `content` beside `target_path` and renames it over the target, so a
@@ -2292,6 +2332,7 @@ impl<T: StorableEntity> UncachedFilesystemStorage<T> {
         fs::create_dir_all(&storage_dir)
             .await
             .context("Failed to create storage directory")?;
+        remove_stale_temporaries(&storage_dir).await;
 
         Ok(Self {
             storage_dir,
@@ -5204,6 +5245,40 @@ mod tests {
             })
             .any(|name| name.ends_with(".tmp"));
         assert!(!has_tmp);
+    }
+
+    #[tokio::test]
+    async fn opening_a_storage_directory_removes_only_stale_temporary_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let stale = temp_dir
+            .path()
+            .join(".stale-1.json.0b6c3a52-7f0e-4e43-9d3c-1d2f6d1f5c11.tmp");
+        let fresh = temp_dir
+            .path()
+            .join(".fresh-1.json.5a1e9c8d-2b7f-4f0a-8c3d-6e4b2a9f1d07.tmp");
+        let unrelated = temp_dir
+            .path()
+            .join("notes.tmp");
+        for path in [&stale, &fresh, &unrelated] {
+            std::fs::write(path, b"partial").unwrap();
+        }
+        let old = std::time::SystemTime::now() - STALE_TEMPORARY_AGE - std::time::Duration::from_secs(1);
+        for path in [&stale, &unrelated] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+
+        let _storage = cached_storage::<TestEntity>(temp_dir.path().to_path_buf(), "test_entity")
+            .await
+            .unwrap();
+
+        assert!(!stale.exists(), "a temporary file older than any running write is removed");
+        assert!(fresh.exists(), "a recent one may belong to a write still running");
+        assert!(unrelated.exists(), "only hidden temporary files are touched");
     }
 
     #[tokio::test]

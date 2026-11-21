@@ -127,7 +127,7 @@ Transit Point refuses it with `404`.
 
 If the requested configuration source or the Agent Surface records cannot be loaded, the reload
 changes nothing: every surface keeps serving from the configuration already running, and
-`POST /v1/config/reload` answers with `is_fallback: true` and a warning naming the failure. A
+`POST /v1/config/reload` answers `500` with the failure in `details`. A
 surface whose identity engines or variants fail to build is refused before any change, so a
 single-surface reload that fails leaves the surface as it was served. A port whose router cannot be rebuilt keeps serving the router
 it had and its task-monitor entries, and the error is logged and returned as the reload's

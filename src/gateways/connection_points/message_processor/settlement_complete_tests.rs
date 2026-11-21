@@ -246,3 +246,74 @@ async fn an_unknown_transaction_is_refused() {
             .contains("no transaction")
     );
 }
+
+#[tokio::test]
+async fn a_repeated_settlement_complete_changes_nothing() {
+    let fixture = fixture(GatewayStatus::Active).await;
+    let complete = |tx_hash: &str| {
+        settlement_complete(
+            Some(FACILITATOR_DID),
+            json!({ "correlation_id": CORRELATION_ID, "tx_hash": tx_hash, "status": "completed" }),
+        )
+    };
+    apply_settlement_complete(&complete("0xsettled"), &fixture.transactions, &fixture.gateways)
+        .await
+        .unwrap();
+    let first = fixture
+        .transactions
+        .get(CORRELATION_ID)
+        .await
+        .unwrap();
+
+    let result = apply_settlement_complete(&complete("0xreplayed"), &fixture.transactions, &fixture.gateways).await;
+
+    assert!(
+        result
+            .unwrap_err()
+            .contains("not in progress")
+    );
+    let after = fixture
+        .transactions
+        .get(CORRELATION_ID)
+        .await
+        .unwrap();
+    assert_eq!(settlement_of(&fixture).await, (SettlementStatus::Completed, "0xsettled".to_string()));
+    assert_eq!(after.receipt_vc_jwt, first.receipt_vc_jwt);
+    assert_eq!(after.last_updated, first.last_updated);
+}
+
+#[tokio::test]
+async fn a_transaction_without_a_settlement_is_not_completed() {
+    let fixture = fixture(GatewayStatus::Active).await;
+    let mut unsettled = fixture
+        .transactions
+        .get(CORRELATION_ID)
+        .await
+        .unwrap();
+    unsettled.id = "unsettled".to_string();
+    unsettled.settlement = None;
+    fixture
+        .transactions
+        .insert(unsettled)
+        .await;
+
+    let result = apply_settlement_complete(
+        &settlement_complete(Some(FACILITATOR_DID), json!({ "correlation_id": "unsettled", "status": "completed" })),
+        &fixture.transactions,
+        &fixture.gateways,
+    )
+    .await;
+
+    assert!(
+        result
+            .unwrap_err()
+            .contains("not in progress")
+    );
+    let kept = fixture
+        .transactions
+        .get("unsettled")
+        .await
+        .unwrap();
+    assert!(kept.settlement.is_none());
+    assert_eq!(kept.receipt_vc_jwt, None);
+}
