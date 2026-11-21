@@ -51,6 +51,65 @@ async fn send_with_planted_values(
     (response.status(), events)
 }
 
+/// [`super::variant_routing_tests::router`] with a request policy that denies
+/// every request. Returns the directory holding the policy, which the caller
+/// keeps alive.
+async fn router_denying_requests(
+    mut surface: crate::config::agent_surface::AgentSurface
+) -> (crate::state::MultiSurfaceProxyState, tempfile::TempDir) {
+    let directory = tempfile::tempdir().unwrap();
+    let policies = std::sync::Arc::new(
+        crate::policies::policy_definitions::FileSystemPolicyDefinitionStore::new(
+            directory
+                .path()
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .unwrap(),
+    );
+    policies
+        .save(
+            serde_json::from_value(json!({
+                "id": "deny-requests", "name": "Deny requests", "policy_type": "agent_surface",
+                "policy": "package surface.policy\ndefault allow = false", "created_at": "2026-11-21T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    surface.target.policy = serde_json::from_value(json!({"policy_definition_id": "deny-requests"})).unwrap();
+    let manager = std::sync::Arc::new(crate::policies::SurfacePolicyManager::new());
+    manager.set_policy_definition_store(policies);
+    manager
+        .update_channel_policy(&surface)
+        .await
+        .unwrap();
+    let mut router = super::variant_routing_tests::router(surface);
+    router.policy_manager = Some(manager);
+    (router, directory)
+}
+
+#[tokio::test]
+async fn a_refused_request_is_not_recorded_as_forwarded() {
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}).to_string())
+            .await;
+    let (router, _policies) =
+        router_denying_requests(super::variant_routing_tests::surface(&target.url(), json!([]), None)).await;
+
+    let (status, events) = send_with_planted_values(router).await;
+
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    assert_eq!(
+        target
+            .request_count
+            .load(Ordering::SeqCst),
+        0
+    );
+    assert!(forwarded(&events).is_empty(), "no request_forwarded record for a refused request, got {events:?}");
+}
+
 #[tokio::test]
 async fn an_access_point_records_the_request_it_forwards() {
     let target =

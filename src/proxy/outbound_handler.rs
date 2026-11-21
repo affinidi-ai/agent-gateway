@@ -10398,6 +10398,65 @@ mod tests {
         }
     }
 
+    /// A request a Transit Point forwards writes no `request_forwarded`
+    /// record: that record names the Access Point request alone.
+    #[tokio::test]
+    async fn a_transit_point_request_is_not_recorded_as_forwarded() {
+        let target = crate::component_tests::helpers::MockServer::start_with_response(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}).to_string(),
+        )
+        .await;
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "forwarding-surface", "name": "Forwarding surface",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
+            "target": {"endpoint": "http://127.0.0.1:1"},
+            "transit": {"points": [{"alias": "partner-a", "protocol": "mcp",
+                "require_transit_token": false, "allow_unauthenticated_callers": true,
+                "target_endpoint": format!("http://{}", target.addr)}]}
+        }))
+        .unwrap();
+        let state = test_outbound_state();
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(surface);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/outbound/mcp/partner-a")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(axum::body::Body::from(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string()))
+            .unwrap();
+
+        let (_, events) = crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
+            "127.0.0.1:12345"
+                .parse()
+                .unwrap(),
+            state,
+            request,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+        )))
+        .await;
+
+        assert_eq!(
+            target
+                .request_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the Transit Point forwarded the request"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(
+                    event.event,
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestForwarded { .. }
+                )),
+            "no request_forwarded record for a Transit Point request, got {events:?}"
+        );
+    }
+
     #[tokio::test]
     async fn transit_requests_each_carry_their_own_request_id() {
         let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({

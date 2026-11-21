@@ -258,6 +258,34 @@ fn a2a_body() -> Value {
         "params": { "message": { "role": "user", "messageId": "m-1", "parts": [{ "kind": "text", "text": "hi" }] } } })
 }
 
+/// A request a peer sends over Fabric writes no `request_forwarded` record:
+/// that record belongs to the Access Point that took the caller's request.
+#[tokio::test]
+async fn a_fabric_receive_is_not_recorded_as_forwarded() {
+    if ran_in_child("ATG_FABRIC_RECEIVE_NOT_FORWARDED_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let (_peer, _issuer_dir) = receiver(root.path(), &surface("a2a", &target.url, &[])).await;
+
+    let (response, events) = crate::audit::producer::capture(forward_response(&forward_request(
+        root.path(),
+        json!({ "content-type": "application/json", "x-api-key": CALLER_KEY }),
+        a2a_body(),
+    )))
+    .await;
+
+    assert_eq!(response["status"], 200, "{response}");
+    assert_eq!(target.received().len(), 1, "the request reached the agent");
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event.event, DelegationAuditAction::RequestForwarded { .. })),
+        "no request_forwarded record for a Fabric receive, got {events:?}"
+    );
+}
+
 /// The agent behind a surface with Transit Points gets one transit token per
 /// request a peer sends, whatever tokens the peer sent: valid for each of the
 /// surface's Transit Points and no other, naming the peer's record and issuer
