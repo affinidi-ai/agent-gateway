@@ -774,8 +774,8 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   (`transit_point`) and the caller's identity hash (`user_identity_hash`), and omits the hash for
   a request with no identified caller. A `transit_point_overflow` record names the Transit Point
   and no caller.
-- `request_forwarded`: an Access Point handed a request to an `http`, `https` or gateway-owned
-  MCP Proxy Target, after every check and any payment, just before the send. One per request,
+- `request_forwarded`: an Access Point handed a request to an `http`, `https`, gateway-owned
+  MCP Proxy or `fabric://` Target, after every check and any payment, just before the send. One per request,
   written whether or not a policy ran. `event.request_forwarded.flow` is `access_point`. The
   record carries the request's `trace_id`, `request_id` and `span_id`, `parent_span_id` when the
   caller named one, `trace_source`, the surface (`surface_id`, `channel_name`,

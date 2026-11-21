@@ -12312,7 +12312,7 @@ async fn handle_fabric_request_inner(
     let identity_hash = identity_result
         .as_ref()
         .map(|r| r.hash.clone());
-    let _request_agent_did = identity_result
+    let request_agent_did = identity_result
         .as_ref()
         .map(|r| r.did.clone());
     let request_user_hash = source_auth_user_hash(authenticated_identity.as_ref(), &state.surface);
@@ -12320,7 +12320,7 @@ async fn handle_fabric_request_inner(
     // Mirror the direct path: stamp the derived agent DID onto the root span
     // as `caller.did` so credential-derived identity (e.g. `from_jwt_claim`)
     // is visible on fabric:// G2G hops too.
-    if let Some(did) = _request_agent_did.as_deref() {
+    if let Some(did) = request_agent_did.as_deref() {
         crate::observability::record_caller_did_on_current_span(did);
     }
 
@@ -12925,6 +12925,16 @@ async fn handle_fabric_request_inner(
             None
         }
     };
+
+    // Every check has passed and any payment is taken: the request goes over
+    // Fabric now.
+    crate::audit::request_events::request_forwarded(crate::audit::request_events::Forwarding {
+        surface: &state.surface,
+        trace_id: &trace_id,
+        agent_identity_did: request_agent_did.as_deref(),
+        identity: authenticated_identity.as_ref(),
+        actor_did: request_agent_did.as_deref(),
+    });
 
     let (modern_upstream, forward_result) = if modern_request.is_some() {
         crate::mcp::modern_http::strip_protocol_session_headers(&mut stream_headers);
@@ -24712,6 +24722,63 @@ mod fabric_send_tests {
                 .as_ref()
                 .and_then(|caller| caller.email.as_deref()),
             Some("ada@example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fabric_send_records_the_request_it_forwards() {
+        let peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+        let caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
+            principal_claim: "sub".to_string(),
+            subject: "user-123".to_string(),
+            claims: json!({"sub": "user-123", "iss": "https://idp.example.com", "email": "ada@example.com"}),
+            verification: Default::default(),
+        };
+
+        let (result, events) = crate::audit::producer::capture(Box::pin(super::handle_fabric_request(
+            peer.state.clone(),
+            super::FabricSend {
+                channel_name: "Fabric A2A",
+                method: axum::http::Method::POST,
+                uri: "https://gateway.example/a2a"
+                    .parse()
+                    .unwrap(),
+                headers: axum::http::HeaderMap::new(),
+                source_addr: "127.0.0.1:12345".to_string(),
+                start_time: std::time::Instant::now(),
+                connection_guard: super::ConnectionGuard::new(None, None),
+                body_bytes: axum::body::Bytes::from(
+                    json!({"jsonrpc": "2.0", "id": "m-1", "method": "message/send"}).to_string(),
+                ),
+                trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
+                ucp_operation: None,
+                authenticated_identity: Some(caller),
+                source_auth_context: None,
+                payment_context: None,
+                mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
+                mcp_verified_binding: None,
+                mcp_classification: None,
+                subscription_lifetime: None,
+                mcp_continuations: None,
+                payment: None,
+            },
+        )))
+        .await;
+
+        assert!(result.is_ok(), "the Fabric send is served");
+        let records = super::request_forwarded_tests::forwarded(&events);
+        assert_eq!(records.len(), 1, "one request_forwarded record, got {events:?}");
+        let record = &records[0];
+        assert_eq!(record["event"]["request_forwarded"]["flow"], "access_point");
+        assert_eq!(record["via_fabric"], true);
+        assert_eq!(record["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(record["caller"]["email"], "ada@example.com");
+        assert!(
+            record["target_endpoint"]
+                .as_str()
+                .is_some_and(|target| target.starts_with("fabric://")),
+            "{record}"
         );
     }
 
