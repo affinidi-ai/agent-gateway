@@ -7773,6 +7773,15 @@ async fn proxy_charged_request(
         None
     };
 
+    // Every check has passed: the request is handed to the target now.
+    crate::audit::request_events::request_forwarded(crate::audit::request_events::Forwarding {
+        surface: &state.surface,
+        trace_id: &trace_id,
+        agent_identity_did: request_agent_did.as_deref(),
+        identity: authenticated_identity.as_ref(),
+        actor_did: request_agent_did.as_deref(),
+    });
+
     // Send request and measure request latency (time to get response from upstream)
     let request_latency_start = std::time::Instant::now();
 
@@ -16804,6 +16813,8 @@ mod fabric_send_policy_tests;
 mod response_auth_tests;
 #[cfg(test)]
 mod target_auth_audit_tests;
+#[cfg(test)]
+mod request_forwarded_tests;
 #[cfg(test)]
 mod trace_tests;
 #[cfg(test)]

@@ -16,6 +16,15 @@ changes:
         and name different traces, X-Gateway-Trace-Id is continued and a warning names both
         trace ids. A header that is not valid, or that arrived more than once, is ignored and a
         new trace is started.
+    - timestamp: '2026-11-21T00:20:00Z'
+      title: Record each request an Access Point forwards as request_forwarded
+      description: >-
+        A new audit event, request_forwarded in the Requests group (audit.request_forwarded for
+        integrations), records each Access Point request at the moment it is handed to its
+        target, with its trace, span and parent span, the surface, the target without
+        credentials and, for an authenticated caller, the same caller fields a policy decision
+        records. It lets Agent Watch name the original caller of a request whether or not a
+        policy ran. No body, header value, token or identity hash is recorded.
   changed: []
   fixed: []
   removed: []
