@@ -172,6 +172,10 @@ Gateway OPA runs before surface-level or transit-level OPA, and a gateway deny i
 | **Policy input capture**                 | Live listening, from a surface's Capture view, to the input and decision of each request and response policy evaluation on that surface; MCP tool policies are not captured. Off until an administrator turns on the `policy_input_capture` system feature flag. Per dashboard connection: only the listening connection receives it, it ends when the connection closes, and the captures are neither logged nor stored; each start and stop of a listen is an audit event. Credentials in the input are masked. See [`docs/POLICY.md`](docs/POLICY.md#policy-input-capture). _Avoid: policy input logging._ |
 | **Capture view**                         | The surface page's live view of its traffic: the payloads of each request and the Policy Input card of policy input capture. |
 | **Governance Audit integration**         | An appliance-wide integration in the `audit` category. It receives every record the VP Audit Log writes, as it is written. A tenant PAT is refused on every integration route, so it reads no record through an integration. |
+| **Trace id**                             | The id one end-to-end request carries through every hop and on every record of it. Its written form is 32 lowercase hexadecimal digits, as W3C Trace Context writes it; an id that arrives hyphenated or in capitals is recorded in its written form. An Access Point continues the trace a caller names, else starts one. _Avoid: correlation id, request id._ |
+| **Span**                                 | One appliance's handling of one request within a trace. The gateway's span id is its request id. _Avoid: hop._ |
+| **Parent span**                          | The span a request names as the one that sent it, in a `traceparent` of the same trace. A request that names none has no parent span. |
+| **Trace source**                         | Where a request's trace id came from: `transit_token` (a verified transit token), `header` (`traceparent` or `X-Gateway-Trace-Id`) or `minted` (the gateway started the trace). |
 
 ## Payment and outbound mechanics
 

@@ -2202,7 +2202,7 @@ fn both_responses_same_did(world: &mut SurfaceWorld) {
     );
 }
 
-fn get_mcp_request_for_actor<'a>(
+pub(crate) fn get_mcp_request_for_actor<'a>(
     world: &'a SurfaceWorld,
     server_name: &str,
 ) -> &'a crate::bdd_support::mock_server::ReceivedRequest {

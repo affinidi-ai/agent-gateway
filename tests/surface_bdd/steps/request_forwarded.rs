@@ -8,7 +8,7 @@ use crate::steps::when::{build_valid_api_key_source_auth_header, ensure_admin_se
 use crate::world::{SurfaceSourceAuthConfig, SurfaceWorld};
 
 /// A valid `traceparent` with a fresh trace id and span id, sampled.
-fn generated_traceparent() -> (String, String) {
+pub(crate) fn generated_traceparent() -> (String, String) {
     let span_id = uuid::Uuid::new_v4()
         .simple()
         .to_string()[..16]
@@ -58,7 +58,7 @@ async fn forwarded_records(world: &mut SurfaceWorld) -> (bool, Vec<Value>) {
 }
 
 /// The one `request_forwarded` record of the scenario's request.
-async fn the_forwarded_record(world: &mut SurfaceWorld) -> Value {
+pub(crate) async fn the_forwarded_record(world: &mut SurfaceWorld) -> Value {
     let (found, records) = forwarded_records(world).await;
     assert!(found, "expected a request_forwarded record, the VP Audit Log holds none");
     assert_eq!(records.len(), 1, "expected one request_forwarded record, got {records:?}");
@@ -77,7 +77,7 @@ async fn vp_audit_log_records_no_forwarded_request(world: &mut SurfaceWorld) {
 }
 
 /// The value of header `name` the scenario's request sent.
-fn sent_header<'a>(
+pub(crate) fn sent_header<'a>(
     world: &'a SurfaceWorld,
     name: &str,
 ) -> Option<&'a str> {
