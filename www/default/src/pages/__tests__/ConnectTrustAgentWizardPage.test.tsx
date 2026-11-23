@@ -199,6 +199,49 @@ describe('ConnectTrustAgentWizardPage', () => {
     expect(screen.queryByTestId('wizard-step-details')).not.toBeInTheDocument();
   });
 
+  it.each(['revoked', 'degraded'])(
+    'opens a %s connection as it is and pairs it only when asked',
+    async state => {
+      handlers['GET /api/v1/vta/connections'] = () =>
+        json([{ ...pending, pairing: { state, last_error: 'revoked by an operator' } }]);
+      mountWizard('/connections/trust-agents/connect?id=agent-1');
+
+      expect(await screen.findByTestId('wizard-out-of-use')).toHaveTextContent(
+        `This connection is ${state} and signs nothing: revoked by an operator`
+      );
+      expect(calls.some(call => call.url.endsWith('/pair'))).toBe(false);
+      expect(screen.getByTestId('wizard-next')).toBeDisabled();
+
+      await userEvent.click(screen.getByTestId('wizard-pair-again'));
+
+      expect(await screen.findByText(grantCommand)).toBeInTheDocument();
+      expect(calls.filter(call => call.url.endsWith('/pair'))).toHaveLength(1);
+    }
+  );
+
+  it('shows the agent reason when Verify is answered 502 with the connection', async () => {
+    handlers['POST /api/v1/vta/connections/agent-1/verify'] = () =>
+      json(
+        {
+          ...pending,
+          pairing: {
+            state: 'degraded',
+            last_error: 'the trust agent answered as did:key:zImpostor',
+          },
+        },
+        502
+      );
+    mountWizard();
+    await fillDetails();
+    await userEvent.click(screen.getByTestId('wizard-next'));
+    await screen.findByTestId('wizard-step-grant');
+
+    await userEvent.click(screen.getByTestId('wizard-next'));
+
+    expect(await screen.findByText(/answered as did:key:zImpostor/)).toBeInTheDocument();
+    expect(screen.queryByText(/Bad Gateway/)).not.toBeInTheDocument();
+  });
+
   it('resumes a connected one at the last step', async () => {
     handlers['GET /api/v1/vta/connections'] = () => json([connected]);
     mountWizard('/connections/trust-agents/connect?id=agent-1');

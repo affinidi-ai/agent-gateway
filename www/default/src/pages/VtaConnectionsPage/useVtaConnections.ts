@@ -125,15 +125,22 @@ export function useVtaConnections(): VtaConnectionsState {
         `${BASE}/${encodeURIComponent(connection.id)}/verify`,
         { method: 'POST' }
       );
-      // `409` means the VTA answered but the grant or identity is wrong: the
-      // body is still the updated connection, so record it before surfacing
-      // the problem — the operator needs to see *what* was granted.
-      if (response.status === 409) {
-        const updated = (await response.json()) as VtaConnection;
-        replace(updated);
-        throw new Error(
-          explainFailure(updated.pairing.last_error ?? 'Verification failed.', connection.endpoint)
-        );
+      // `409` means the VTA answered but the grant or identity is wrong, and a
+      // `502` carrying a connection that it refused: either way the body is the
+      // updated connection, so record it before surfacing the problem — the
+      // operator needs to see *what* was granted and the agent's reason. A
+      // `502` without one is an agent that could not be reached.
+      if (response.status === 409 || response.status === 502) {
+        const body = (await response.json().catch(() => null)) as
+          | (VtaConnection & { error?: string })
+          | null;
+        if (body?.pairing) {
+          replace(body);
+          throw new Error(
+            explainFailure(body.pairing.last_error ?? 'Verification failed.', connection.endpoint)
+          );
+        }
+        throw new Error(explainFailure(body?.error ?? response.statusText, connection.endpoint));
       }
       if (!response.ok) throw new Error(await readError(response, connection.endpoint));
       const updated = (await response.json()) as VtaConnection;

@@ -50,6 +50,9 @@ const ConnectTrustAgentWizardPage: React.FC = () => {
   const [verified, setVerified] = useState<VtaConnection | null>(null);
   const [makeDefault, setMakeDefault] = useState(false);
   const [finishing, setFinishing] = useState(false);
+  // A revoked or degraded connection opened from its row: shown as it is until the operator
+  // asks to pair it again, because pairing replaces its state and the agent DID it pinned.
+  const [outOfUse, setOutOfUse] = useState<VtaConnection | null>(null);
   const resumed = useRef(false);
 
   const leave = useCallback(() => navigate(ROUTES.TRUST_AGENTS_TAB), [navigate]);
@@ -98,6 +101,10 @@ const ConnectTrustAgentWizardPage: React.FC = () => {
       return;
     }
     setStep('grant');
+    if (found.pairing.state === 'revoked' || found.pairing.state === 'degraded') {
+      setOutOfUse(found);
+      return;
+    }
     void issuePayload(found);
   }, [resumeId, loading, connections, issuePayload]);
 
@@ -213,11 +220,35 @@ const ConnectTrustAgentWizardPage: React.FC = () => {
               </h6>
             </div>
             <div className="card-body">
-              <PairStep
-                payload={payload}
-                error={pairError}
-                onReissue={() => (connection ? issuePayload(connection) : Promise.resolve())}
-              />
+              {outOfUse ? (
+                <div className="alert alert-warning" role="alert" data-testid="wizard-out-of-use">
+                  <p className="mb-2">
+                    This connection is {outOfUse.pairing.state} and signs nothing
+                    {outOfUse.pairing.last_error ? `: ${outOfUse.pairing.last_error}` : '.'}
+                  </p>
+                  <p className="mb-2">
+                    Pairing it again asks the agent for a new grant and replaces the agent DID it
+                    pinned.
+                  </p>
+                  <AppButton
+                    variant="primary"
+                    size="sm"
+                    onClick={() => {
+                      setOutOfUse(null);
+                      void issuePayload(outOfUse);
+                    }}
+                    data-testid="wizard-pair-again"
+                  >
+                    Pair again
+                  </AppButton>
+                </div>
+              ) : (
+                <PairStep
+                  payload={payload}
+                  error={pairError}
+                  onReissue={() => (connection ? issuePayload(connection) : Promise.resolve())}
+                />
+              )}
             </div>
             <div className="card-footer d-flex justify-content-between">
               <AppButton variant="outline-secondary" onClick={leave} data-testid="wizard-cancel">

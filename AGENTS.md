@@ -171,8 +171,9 @@ Verifiable Trust Agents are connections: they live on the Connections page's **V
 Agent** tab, laid out like Registries: no text above its card, **Add VTA** in the card header as
 its only call to action (no Refresh, nothing in the tab banner, none in the empty state, which says
 "Add your first Verifiable Trust Agent" with View Docs), no filter box, and a full-page wizard
-(`/connections/trust-agents/connect`), never a pop-up. There is no Trust Agent page and no signing
-tier banner. The tab's Control key card, shown while `GET /v1/vta/status`
+(`/connections/trust-agents/connect`), never a pop-up; a revoked or degraded connection opens in it
+showing its state and reason, and pairs only after **Pair again**. There is no Trust Agent page and
+no signing tier banner. The tab's Control key card, shown while `GET /v1/vta/status`
 reports a `control_key`, shows the key the gateway signs in to its trust agent with, when it was
 last rotated and when it is next due, and a Rotate control key button for key management editors.
 A connection added by hand with a `did:webvh` identity has a Rotate control key action on its

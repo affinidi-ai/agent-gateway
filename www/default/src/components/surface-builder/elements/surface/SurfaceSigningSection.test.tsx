@@ -91,11 +91,31 @@ describe('SurfaceSigningSection', () => {
     await mountSection([connection()]);
 
     expect(typeSelect()).toHaveValue('local');
-    expect(screen.getByTestId('surface-signing-inherited')).toHaveTextContent(
-      'Following the gateway-wide default (Gateway secret)'
+    await waitFor(() =>
+      expect(screen.getByTestId('surface-signing-inherited')).toHaveTextContent(
+        'Following the gateway-wide default (Gateway secret)'
+      )
     );
     expect(screen.queryByTestId('surface-signing-reset')).not.toBeInTheDocument();
     expect(screen.queryByTestId('surface-signing-agent-select')).not.toBeInTheDocument();
+  });
+
+  it('says the gateway-wide default could not be read rather than naming one', async () => {
+    mockFetch.mockImplementation((url: string) =>
+      Promise.resolve(
+        url.includes('/vta/status')
+          ? { ok: false, status: 403, json: () => Promise.resolve({}) }
+          : { ok: true, json: () => Promise.resolve([connection()]) }
+      )
+    );
+    render(<SurfaceSigningSection signing={undefined} setSigning={jest.fn()} />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId('surface-signing-inherited')).toHaveTextContent(
+        'Following the gateway-wide default, which could not be read.'
+      )
+    );
+    expect(screen.getByTestId('surface-signing-inherited')).not.toHaveTextContent('Gateway secret');
   });
 
   it('shows Remote and the agent picker when the appliance default signs through an agent', async () => {

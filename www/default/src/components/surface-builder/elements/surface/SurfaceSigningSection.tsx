@@ -45,6 +45,17 @@ interface Props {
  * backend's `assert_usable`. A connection that is paired but has no key is listed and disabled
  * with the reason, so a half-finished setup reads as what it is instead of looking like a failure.
  */
+/** What an editor that sets no source of its own says it follows. */
+const followingDefault = (backend: string | null): string => {
+  if (backend === 'local' || backend === 'vta') {
+    return `Following the gateway-wide default (${SIGNING_TYPE_LABELS[backend === 'local' ? 'local' : 'remote']}).`;
+  }
+  if (backend === 'unreadable') {
+    return 'Following the gateway-wide default, which could not be read.';
+  }
+  return 'Following the gateway-wide default.';
+};
+
 export const SurfaceSigningSection: React.FC<Props> = ({
   signing,
   setSigning,
@@ -57,7 +68,9 @@ export const SurfaceSigningSection: React.FC<Props> = ({
   const [connections, setConnections] = useState<VtaConnection[]>([]);
   const [loadError, setLoadError] = useState(false);
   const [connectionsLoaded, setConnectionsLoaded] = useState(false);
-  const [defaultBackend, setDefaultBackend] = useState<string>('local');
+  // What the gateway-wide default signs with: `null` while it is read, `unreadable` when it could
+  // not be (the status needs `vta_connections.view`).
+  const [defaultBackend, setDefaultBackend] = useState<string | null>(null);
   /** Remote was picked and no agent has been chosen yet, so nothing is stored for it. */
   const [remotePending, setRemotePending] = useState(false);
 
@@ -82,11 +95,11 @@ export const SurfaceSigningSection: React.FC<Props> = ({
       .fetch('/api/v1/vta/status')
       .then(response => (response.ok ? response.json() : null))
       .then(status => {
-        if (alive && status?.default_resolution?.backend) {
-          setDefaultBackend(status.default_resolution.backend);
-        }
+        if (alive) setDefaultBackend(status?.default_resolution?.backend ?? 'unreadable');
       })
-      .catch(() => undefined);
+      .catch(() => {
+        if (alive) setDefaultBackend('unreadable');
+      });
     return () => {
       alive = false;
     };
@@ -106,9 +119,9 @@ export const SurfaceSigningSection: React.FC<Props> = ({
       ? 'local'
       : shown?.backend
         ? 'remote'
-        : defaultBackend === 'local'
-          ? 'local'
-          : 'remote';
+        : defaultBackend === 'vta'
+          ? 'remote'
+          : 'local';
   const selectedAgent = shown?.backend === 'vta' ? (shown.connection_id ?? '') : '';
 
   const ready = (connection: VtaConnection) =>
@@ -210,7 +223,7 @@ export const SurfaceSigningSection: React.FC<Props> = ({
         <Form.Text className="d-block text-muted" data-testid="surface-signing-inherited">
           {followed
             ? `Following its issuer, ${owner?.name} (${followed}).`
-            : `Following the gateway-wide default (${SIGNING_TYPE_LABELS[defaultBackend === 'local' ? 'local' : 'remote']}).`}{' '}
+            : followingDefault(defaultBackend)}{' '}
           Choose a source to set {subject === 'issuer' ? "this issuer's" : "this surface's"} own.
         </Form.Text>
       )}

@@ -2725,13 +2725,18 @@ with the shared navigation test ids (`wizard-next`, `wizard-back`, `wizard-cance
    agent. It grants the `initiator` role in that one context with four capabilities, never
    administration, and the copy says so. An expired command offers a new one; **Finish later**
    leaves with the connection saved.
-3. **Verify** (`wizard-step-verify`) checks the grant; a refusal shows its reason and a retry.
+3. **Verify** (`wizard-step-verify`) checks the grant; a refusal shows its reason and a retry. A
+   `409` or `502` whose body is the connection records it and shows its `pairing.last_error`,
+   never the status text.
 4. **Complete** (`wizard-step-complete`) mints the connection's signing key and offers **Use this
    agent for all signing**, pre-checked only when the gateway has no stored default yet
    (`default_signing.connection_id` in `GET /v1/settings`): connecting a second agent must never
    silently repoint signing away from one. **Done** returns to the tab.
 
 `?id=` resumes a created connection at the grant step, or at the last step when it is connected.
+A revoked or degraded one opens at the grant step showing its state and reason
+(`wizard-out-of-use`) and pairs only after **Pair again** (`wizard-pair-again`), since pairing
+replaces its state and the agent DID it pinned.
 
 ### Gateway signing
 
@@ -2772,7 +2777,10 @@ stores nothing and says what applies meanwhile (`surface-signing-pick-agent`).
 
 - **Surface Builder → Surface**: a surface that sets nothing follows its issuer's source, then
   the gateway-wide default; the source shown is the one it follows, with a note
-  (`surface-signing-inherited`) saying which, and **Use the gateway-wide default**
+  (`surface-signing-inherited`) saying which. The gateway-wide default is read from
+  `default_resolution` in `GET /v1/vta/status`, which reports the dashboard's Gateway signing
+  when one is set; when it cannot be read (no `vta_connections.view`) the note says "Following the
+  gateway-wide default, which could not be read." and names no source. **Use the gateway-wide default**
   (`surface-signing-reset`) takes an own choice back.
 - **Identity → Issuers**: the list has a **Signing key source** column (`issuers-signing-<id>`:
   Default, Gateway secret, or `VTA · <agent name>`), and the issuer editor
