@@ -3952,6 +3952,7 @@ async fn proxy_charged_request(
                     connection_guard: ConnectionGuard::new(None, None),
                     body_bytes: body_bytes.clone(),
                     trace_id: trace_id.clone(),
+                    egress_trace_id: egress_trace_id.clone(),
                     ucp_operation: ucp_operation.clone(),
                     authenticated_identity: authenticated_identity.clone(),
                     source_auth_context: source_auth_context.clone(),
@@ -4219,6 +4220,7 @@ async fn proxy_charged_request(
                 connection_guard,
                 body_bytes,
                 trace_id,
+                egress_trace_id,
                 ucp_operation,
                 authenticated_identity,
                 source_auth_context: source_auth_context.clone(),
@@ -11067,6 +11069,9 @@ struct FabricSend<'a> {
     connection_guard: ConnectionGuard,
     body_bytes: axum::body::Bytes,
     trace_id: String,
+    /// The trace id sent onward: `trace_id`, or the fresh one of a surface
+    /// that terminates trace ids, computed once by the Access Point.
+    egress_trace_id: String,
     ucp_operation: Option<String>,
     authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity>,
     source_auth_context: Option<crate::surface_context::SourceAuthContext>,
@@ -11116,6 +11121,7 @@ async fn handle_fabric_request_inner(
         mut connection_guard,
         body_bytes,
         trace_id,
+        egress_trace_id,
         ucp_operation,
         authenticated_identity,
         source_auth_context,
@@ -11140,18 +11146,6 @@ async fn handle_fabric_request_inner(
         .as_str();
 
     channel_info!(config_id, "🏭 Handling fabric protocol request");
-
-    // Egress trace id for the fabric hop: keep the incoming `trace_id` for this
-    // gateway's own VP + audit, but forward a fresh id in the fabric message +
-    // caller binding VP when the surface terminates traces, so the downstream
-    // gateway starts a new trace.
-    let egress_trace_id = crate::proxy::trace::egress_trace_id(
-        state
-            .surface
-            .access_point
-            .terminate_trace_id,
-        &trace_id,
-    );
 
     // Bridge for this gateway's operator: when the trace is terminated, record the
     // own → downstream mapping here (stays local; the remote gateway only ever sees
@@ -24693,6 +24687,7 @@ mod fabric_send_tests {
                 connection_guard: super::ConnectionGuard::new(None, None),
                 body_bytes: axum::body::Bytes::from(body.to_string()),
                 trace_id: "trace-1".to_string(),
+                egress_trace_id: "trace-1".to_string(),
                 ucp_operation: None,
                 authenticated_identity: Some(caller),
                 source_auth_context: None,
@@ -24760,6 +24755,7 @@ mod fabric_send_tests {
                     json!({"jsonrpc": "2.0", "id": "m-1", "method": "message/send"}).to_string(),
                 ),
                 trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
+                egress_trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
                 ucp_operation: None,
                 authenticated_identity: Some(caller),
                 source_auth_context: None,
@@ -24817,6 +24813,13 @@ mod fabric_send_tests {
                     json!({"jsonrpc": "2.0", "id": "m-1", "method": "message/send"}).to_string(),
                 ),
                 trace_id: own.to_string(),
+                egress_trace_id: crate::proxy::trace::egress_trace_id(
+                    peer.state
+                        .surface
+                        .access_point
+                        .terminate_trace_id,
+                    own,
+                ),
                 ucp_operation: None,
                 authenticated_identity: None,
                 source_auth_context: None,
@@ -24941,6 +24944,7 @@ mod fabric_send_tests {
                     json!({"jsonrpc": "2.0", "id": "m-1", "method": "message/send"}).to_string(),
                 ),
                 trace_id: "trace-1".to_string(),
+                egress_trace_id: "trace-1".to_string(),
                 ucp_operation: None,
                 authenticated_identity: None,
                 source_auth_context: None,
@@ -25015,6 +25019,7 @@ mod fabric_send_tests {
                 connection_guard: super::ConnectionGuard::new(None, None),
                 body_bytes: axum::body::Bytes::from(body.to_string()),
                 trace_id: "trace-1".to_string(),
+                egress_trace_id: "trace-1".to_string(),
                 ucp_operation: None,
                 authenticated_identity: None,
                 source_auth_context: None,
@@ -25125,6 +25130,7 @@ mod fabric_send_tests {
                 connection_guard: super::ConnectionGuard::new(None, None),
                 body_bytes: axum::body::Bytes::from(body.to_string()),
                 trace_id: "trace-1".to_string(),
+                egress_trace_id: "trace-1".to_string(),
                 ucp_operation: None,
                 authenticated_identity: None,
                 source_auth_context: None,
@@ -25976,6 +25982,7 @@ mod fabric_send_tests {
                 connection_guard: super::ConnectionGuard::new(None, None),
                 body_bytes: axum::body::Bytes::from(body.to_string()),
                 trace_id: "trace-1".to_string(),
+                egress_trace_id: "trace-1".to_string(),
                 ucp_operation: None,
                 authenticated_identity: None,
                 source_auth_context: None,
@@ -26154,6 +26161,7 @@ mod fabric_send_tests {
                     connection_guard: super::ConnectionGuard::new(None, None),
                     body_bytes: axum::body::Bytes::from(body.to_string()),
                     trace_id: "trace-1".to_string(),
+                    egress_trace_id: "trace-1".to_string(),
                     ucp_operation: None,
                     authenticated_identity: (!case.key_failed).then(|| key.clone()),
                     source_auth_context: Some(if case.key_failed {
