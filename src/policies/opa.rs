@@ -412,6 +412,14 @@ allow if {
         }));
         assert!(!refused.allow);
         assert_eq!(refused.reason.as_deref(), Some("Calling agent is not recognised"));
+        let no_identity = decide(serde_json::json!({
+            "trust_check_results": { "managed_agent": [{
+                "ok": false,
+                "error": { "code": "MANAGED_AGENT_IDENTITY_UNAVAILABLE", "message": "none" }
+            }] }
+        }));
+        assert!(!no_identity.allow);
+        assert_eq!(no_identity.reason.as_deref(), Some("Calling agent has no managed identity"));
     }
 
     #[test]

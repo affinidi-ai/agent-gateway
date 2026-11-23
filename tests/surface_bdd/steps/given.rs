@@ -1661,6 +1661,17 @@ fn transit_point_has_managed_agent_trust_check(
         .push(element);
 }
 
+#[given(expr = "transit point {string} has a Trust Recorder for trust registry {string}")]
+fn transit_point_has_trust_recorder(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    trust_registry_id: String,
+) {
+    transit_point_config_mut(world, &transit_point)
+        .trust_recorder_entries
+        .push(trust_recorder_entry(&trust_registry_id, "did:web:example.com:issuer"));
+}
+
 #[given(expr = "the surface has a policy that denies a target Trust Check reporting error code {string}")]
 fn surface_has_policy_denying_target_trust_check_error_code(
     world: &mut SurfaceWorld,

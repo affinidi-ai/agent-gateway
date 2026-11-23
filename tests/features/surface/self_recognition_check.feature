@@ -52,6 +52,13 @@ Feature: Self recognition check on a Transit Point
     And the managed-agent Trust Check reported error code "MANAGED_AGENT_IDENTITY_UNAVAILABLE"
     And external agent "charlie" was not called
 
+  Scenario: A Transit Point's Trust Recorder whose trust registry does not exist is shown as skipped
+    Given transit point "tp1" presents the surface's managed agent identity on its outbound calls
+    And transit point "tp1" has a Trust Recorder for trust registry "missing-registry"
+    When managed agent "bravo" sends an A2A message/send request with the agent-identity extension through Transit Point "tp1"
+    Then the response status is 200
+    And within ten seconds the Trust Recorder status of surface "alpha" is "skipped"
+
   @wip
   Scenario: A managed agent whose recognition was turned off is refused by policy
     Given transit point "tp1" has a managed-agent Trust Check for trust registry "alpha-registry"

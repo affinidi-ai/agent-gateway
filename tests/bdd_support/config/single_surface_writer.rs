@@ -213,6 +213,12 @@ fn transit_point_json(
                 .clone(),
         );
     }
+    if !transit_point
+        .trust_recorder_entries
+        .is_empty()
+    {
+        transit_point_json["trust_recorder"] = serde_json::json!({ "entries": transit_point.trust_recorder_entries });
+    }
     if let Some(policy) = &transit_point.policy {
         transit_point_json["policy"] = serde_json::json!({ "policy_definition_id": policy.id });
     }

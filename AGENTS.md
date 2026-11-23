@@ -138,7 +138,8 @@ destination only, not on a `fabric://` one; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 A Transit Point Trust Check element with `"subject": "managed_agent"` (the self recognition
-check) survives every dashboard save with its blank entity, and a save keeps a Transit Point's
+check) survives every dashboard save with its blank entity (an explicit entity is kept, shown as
+replacing the calling agent's DID with a Clear button), and a save keeps a Transit Point's
 stored `identity_injection` while its `inject_vp` is `true`; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder) and
 [`docs/POLICY.md`](docs/POLICY.md#self-recognition-check).

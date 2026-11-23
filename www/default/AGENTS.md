@@ -887,7 +887,14 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   "managed_agent"`, the self recognition check). Switching drops the stored entity. A
   managed-agent query shows a fixed note (`trust-check-query-<n>-entity-managed-agent`) in place
   of the Entity ID picker and saves a blank `entity_id`, which the gateway fills in with the DID
-  the managed agent calls out under. MCP Transit Points cannot check their destination
+  the managed agent calls out under. A stored managed-agent query with an explicit entity keeps
+  it on save and shows instead a note that it replaces the calling agent's DID
+  (`trust-check-query-<n>-entity-managed-agent-override`) with a **Clear** button
+  (`-entity-managed-agent-clear`) that blanks it. When the Transit Point presents no managed
+  identity (no `identity_injection.inject_vp` and no managed identity node,
+  `transitPointPresentsManagedIdentity`), the fullscreen editor adds a `--warning-text` note
+  (`-entity-managed-agent-no-identity`) that the check reports
+  `MANAGED_AGENT_IDENTITY_UNAVAILABLE`. MCP Transit Points cannot check their destination
   (`transitPointChecksDestination`): there the select offers only the managed agent, with a note
   (`trust-check-query-<n>-subject-only-managed-agent`), and new queries start as managed-agent
   queries. The sidebar list labels a managed-agent query "Managed agent · <type>", and both the
@@ -1024,7 +1031,7 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
 | Fullscreen leg label             | `trust-check-fullscreen-leg`                                                                       |
 | Managed Agent URL-target warning | `trust-check-panel-managed-agent-target-warning`                                                   |
 | Read-only migrated copy line     | `trust-check-panel-read-only`, `trust-check-fullscreen-read-only`                                  |
-| Checks select and notes          | `trust-check-query-<n>-subject`, `-subject-only-managed-agent`, `-entity-managed-agent`            |
+| Checks select and notes          | `trust-check-query-<n>-subject`, `-subject-only-managed-agent`, `-entity-managed-agent`, `-entity-managed-agent-override`, `-entity-managed-agent-clear`, `-entity-managed-agent-no-identity` |
 | Fullscreen query list            | `trust-check-fullscreen-queries`                                                                   |
 | Migrated warning and Keep        | `trust-check-panel-migrated-warning`, `trust-check-fullscreen-migrated-warning`, each with `-keep` |
 | Review summary                   | `surface-migrated-trust-checks-summary`                                                            |
@@ -1040,7 +1047,9 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   `trust-recorder-target-response`, writes `access_point.trust_recorder`), and each Transit
   Point's own on its Managed Agent → Transit Point request arrow (`request:trust-recorder`,
   ordered before that Transit Point's Trust Check, node `trust-recorder-<transit point node id>`,
-  parented to the Transit Point). The Transit Point factory writes the second as
+  parented to the Transit Point). `deriveEdges` binds the second to that Transit Point's arrow,
+  so it is drawn on the arrow and drags only along it, like the Trust Check beside it. The
+  Transit Point factory writes the second as
   `transit.points[i].trust_recorder` and the element's own `buildPayload` skips it; removing the
   node removes the Transit Point's recorder. The stored surface owns both recorders' entries
   (`payloadOwnsConfig`): the canvas layout restores a recorder only while the payload has it, or

@@ -497,11 +497,27 @@ allow if {
     every r in input.trust_check_results.managed_agent { r.ok }
 }
 
-deny_reason := "Calling agent is not recognised" if not allow
+deny_reason := "Calling agent has no managed identity" if {
+    not allow
+    some r in input.trust_check_results.managed_agent
+    r.error.code == "MANAGED_AGENT_IDENTITY_UNAVAILABLE"
+} else := "Calling agent is not recognised" if not allow
 ```
 
 The first rule allows every call while the Transit Point has no managed-agent elements, so pair
-this policy with them.
+this policy with them. A failed result carries its reason in `error.code`, so the second
+`deny_reason` tells a Transit Point that resolves no managed agent DID apart from an agent the
+trust registry does not recognise.
+
+The check answers whether the trust registry recognises a DID, not who presents it: any
+request the Transit Point sends under that DID passes. It assumes the managed agent is the
+operator's own, and lets the trust registry withdraw its recognition; it does not stop an agent
+that controls its own identity from claiming another one, and the registry decides what this
+gateway may write to it. To bind a Transit Point to the agent calling it, authenticate that
+agent with the Transit Point's own `source_auth` (mTLS, JWT or API key, see
+[Transit Point source authentication](SOURCE_AUTH.md#transit-point-source-authentication)),
+and its responses with `target.response_auth` (see
+[Response authentication](SOURCE_AUTH.md#response-authentication)).
 
 A Transit Point's own policy that denies answers `403` with the `detail` "Request blocked by
 surface policy", followed by `: <deny_reason>` when the policy sets one, so the managed agent
@@ -510,10 +526,11 @@ learns why it was refused. That reason reaches the caller: never build it from `
 A Transit Point with its own `trust_recorder` writes its managed agent's records in the
 background on every request except a discovery read, without waiting, so the agent is
 recognised once those records exist, which may be after its first call. It writes before the
-Trust Check and policy, so a call policy refuses is recorded too, and a record the operator
-removes or makes inactive is written again by the next call through any Transit Point that
-records the same agent in that registry. To turn recognition off, remove that recorder entry
-as well. See [Transit Point Trust Recorder](SOURCE_AUTH.md#transit-point-trust-recorder).
+Trust Check and policy, so a call policy refuses is recorded too. A record the operator removes
+is written again by the next call through any Transit Point that records the same agent in that
+registry; one made inactive is written again only if the registry accepts the create, and a
+registry that answers with a conflict leaves it inactive. To turn recognition off, remove that
+recorder entry as well. See [Transit Point Trust Recorder](SOURCE_AUTH.md#transit-point-trust-recorder).
 
 Managed-agent elements run on A2A, AP2, MCP and HTTP Transit Points, including `fabric://`
 ones, and not on discovery reads. Each query is a `trust_check` record with `leg`

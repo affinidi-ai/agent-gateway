@@ -2092,17 +2092,22 @@ on the response leg and on discovery, and is idempotent. The surface's Trust Rec
 ### Transit Point Trust Recorder
 
 A Transit Point's own `trust_recorder` has the same entries, cap and save rules as the
-surface's. Like the surface's recorder on the response leg, it fires on every request through
-the Transit Point, except a discovery read, in the background: it writes its entries' records
+surface's. It fires on every request through the Transit Point except a discovery read, in
+the background (the surface's recorder fires on discovery reads too): it writes its entries' records
 for the DID the Transit Point calls out under (its own managed identity, or the surface's it
 injects), never waits for them and never refuses the request. Writes are idempotent. A request
 with no managed agent DID writes nothing. Because the request does not wait, the Transit
 Point's Trust Check can ask about the agent before its first records exist, so a policy that
 requires recognition can refuse the agent's first call. It writes before the Trust Check and
-policy, so a call policy refuses is recorded too, and a record the operator removes or makes
-inactive is written again by the next call through any Transit Point that records the same
-agent in that registry; to turn recognition off, remove that recorder entry as well. In the
-Surface Builder it is the Trust Recorder on the Managed Agent → Transit Point arrow.
+policy, so a call policy refuses is recorded too. A record the operator removes is written
+again by the next call through any Transit Point that records the same agent in that registry;
+one made inactive is written again only if the registry accepts the create, and a registry that
+answers with a conflict leaves it inactive. To turn recognition off, remove that recorder entry
+as well. The recorder writes whatever the trust registry lets this gateway write, so the
+registry, not the gateway, decides which records an operator's recorder can create; see
+[_Self recognition check_](POLICY.md#self-recognition-check) for what recognition does and does
+not prove. In the Surface Builder it is the Trust Recorder on the Managed Agent → Transit Point
+arrow.
 
 The outcome is stored as that DID's [recorder status](#recorder-status) on the surface, which
 the surface's recorder and other Transit Points' recorders writing for the same DID also

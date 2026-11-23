@@ -446,6 +446,8 @@ pub struct SurfaceTransitPointConfig {
     pub header_metadata_mapping: TransitPointHeaderMetadataMappingConfig,
     pub managed_identity: Option<TransitPointManagedIdentityConfig>,
     pub trust_check_list: Vec<serde_json::Value>,
+    /// The entries of the Transit Point's own `trust_recorder`.
+    pub trust_recorder_entries: Vec<serde_json::Value>,
     pub policy: Option<RequestPolicyFixture>,
     pub require_transit_token: bool,
     /// The Transit Point's own `source_auth`.
@@ -485,6 +487,7 @@ impl SurfaceTransitPointConfig {
             header_metadata_mapping: Default::default(),
             managed_identity: None,
             trust_check_list: Vec::new(),
+            trust_recorder_entries: Vec::new(),
             policy: None,
             require_transit_token: false,
             source_auth: None,

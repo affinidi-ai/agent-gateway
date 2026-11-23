@@ -179,6 +179,95 @@ async fn operator_has_created_surface_with_trust_recorder(
     assert_eq!(response.status, 201, "creating surface {route}: {}", response.body);
 }
 
+fn transit_point_with_recorder(
+    alias: &str,
+    entries: Vec<Value>,
+) -> Value {
+    json!({
+        "name": alias, "alias": alias, "protocol": "a2a",
+        "target_endpoint": "https://partner.example/a2a", "listen_path": format!("/transit/{alias}"),
+        "require_transit_token": false, "allow_unauthenticated_callers": true,
+        "trust_recorder": {"entries": entries}
+    })
+}
+
+fn recorder_entry(
+    trust_registry_id: &str,
+    authority_did: &str,
+) -> Value {
+    json!({
+        "trust_registry_id": trust_registry_id, "issuer_did": "did:web:example.com:issuer",
+        "authority_did": authority_did, "include_owned_agent": true
+    })
+}
+
+async fn create_surface_with_transit_point_recorder(
+    world: &mut SurfaceWorld,
+    route: &str,
+    alias: &str,
+    authority_did: &str,
+    entry_count: usize,
+) {
+    let port = world
+        .infra
+        .as_ref()
+        .expect("scenario infra must exist")
+        .gateway_port;
+    create_surface(world, route, |payload, trust_registry_id| {
+        let entries = vec![recorder_entry(trust_registry_id, authority_did); entry_count];
+        payload["transit"] = json!({
+            "outbound_listen_address": format!("http://localhost:{port}"),
+            "points": [transit_point_with_recorder(alias, entries)]
+        });
+    })
+    .await;
+}
+
+#[given(
+    expr = "the operator has created the surface for route {string} whose Transit Point {string} has a Trust Recorder taking DID {string} as its authority"
+)]
+async fn operator_has_created_surface_with_transit_point_recorder(
+    world: &mut SurfaceWorld,
+    route: String,
+    alias: String,
+    did: String,
+) {
+    create_surface_with_transit_point_recorder(world, &route, &alias, &did, 1).await;
+    let response = world
+        .admin_response
+        .take()
+        .expect("the surface create was answered");
+    assert_eq!(response.status, 201, "creating surface {route}: {}", response.body);
+}
+
+#[when(
+    expr = "the operator creates the surface for route {string} whose Transit Point {string} has a Trust Recorder with {int} entries"
+)]
+async fn operator_creates_surface_with_counted_transit_point_recorder_entries(
+    world: &mut SurfaceWorld,
+    route: String,
+    alias: String,
+    count: usize,
+) {
+    create_surface_with_transit_point_recorder(world, &route, &alias, "did:web:recorder-authority.example", count)
+        .await;
+}
+
+#[then(
+    expr = "the refusal says a Trust Recorder entry of Transit Point {string} of the surface under test uses the Authority"
+)]
+fn refusal_names_transit_point_trust_recorder_entry(
+    world: &mut SurfaceWorld,
+    alias: String,
+) {
+    let uses = uses_of_surface_under_test(world);
+    assert!(
+        uses.iter()
+            .any(|used| used["element"] == "trust_recorder" && used["transit_point"] == alias.as_str()),
+        "expected a Trust Recorder entry of Transit Point {alias} among {uses:?}"
+    );
+}
+
 #[given(expr = "the operator has deleted the Authority {string} with force")]
 async fn operator_has_force_deleted_authority(
     world: &mut SurfaceWorld,
