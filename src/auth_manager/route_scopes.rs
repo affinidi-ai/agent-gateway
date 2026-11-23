@@ -442,7 +442,10 @@ pub fn scoped_access(
         Some(_) => ScopedAccess::Refused,
         None if ROUTE_SCOPES
             .iter()
-            .any(|(_, path, _)| *path == route) =>
+            .any(|(_, path, _)| *path == route)
+            || CLOSED_TO_SCOPED_TOKENS
+                .iter()
+                .any(|(_, path)| *path == route) =>
         {
             ScopedAccess::MethodNotAllowed
         }
@@ -500,6 +503,15 @@ mod tests {
     fn a_method_the_route_does_not_list_is_not_allowed() {
         assert_eq!(access(&["settings.view"], Method::PATCH, "/v1/settings"), ScopedAccess::MethodNotAllowed);
         assert_eq!(access(&[], Method::PUT, "/v1/settings/audit-events"), ScopedAccess::MethodNotAllowed);
+    }
+
+    #[test]
+    fn a_method_a_closed_route_does_not_serve_is_not_allowed() {
+        assert_eq!(access(&["settings.view"], Method::POST, "/v1/profile"), ScopedAccess::MethodNotAllowed);
+        assert_eq!(access(&["settings.edit"], Method::PATCH, "/v1/user-settings"), ScopedAccess::MethodNotAllowed);
+        for method in [Method::GET, Method::PUT, Method::HEAD] {
+            assert_eq!(access(&["settings.view"], method, "/v1/profile"), ScopedAccess::Refused);
+        }
     }
 
     #[test]

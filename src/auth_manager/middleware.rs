@@ -1865,6 +1865,7 @@ mod tests {
         let app = scoped_token_app(Arc::new(SessionManager::new()));
 
         assert_eq!(status_with_bearer(&app, Method::PATCH, "/api/v1/settings", SETTINGS_VIEW_TOKEN).await, 405);
+        assert_eq!(status_with_bearer(&app, Method::POST, "/api/v1/profile", SETTINGS_VIEW_TOKEN).await, 405);
     }
 
     #[tokio::test]
@@ -2063,7 +2064,7 @@ mod tests {
                                 .unwrap();
                             (vec![write.method().to_string()], write.path().to_string())
                         };
-                        let full = format!("{}{route_path}", route_file_prefix(&file));
+                        let full = format!("{}{route_path}", route_file_prefix(file));
                         routes.push(RegisteredRoute {
                             location: format!("{file}:{}", source[..at].lines().count()),
                             methods,

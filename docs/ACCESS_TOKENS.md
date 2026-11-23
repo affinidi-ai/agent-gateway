@@ -404,12 +404,15 @@ its per-call events exports the `credential_delegation` log target and filters i
 them, so those lines are told apart by `surface_id`.
 
 A feature-gated management route checks both the bound user's role and the PAT's feature
-scopes. The role-only routes listed in [`RBAC.md`](RBAC.md#permissions-endpoint) check only the
-owner's role, and routes open to any signed-in caller, such as the caller's own profile and
-settings, need no feature. The routes on the caller's own notifications need a session sign-in, not
-a PAT: with a PAT, the notification list is empty, the unread count is `0`, and reading, creating,
-updating or deleting a notification answers `401` (see
-[`INTEGRATIONS.md`](INTEGRATIONS.md#in-dashboard-notifications)). A scoped PAT may create or
+scopes. For a session or a PAT without explicit scopes, the role-only routes listed in
+[`RBAC.md`](RBAC.md#permissions-endpoint) check only the owner's role, and routes open to any
+signed-in caller, such as the caller's own profile and settings, need no feature. A PAT with
+explicit scopes also needs a scope that covers each of those routes, and is refused on the
+caller's own profile and settings whatever its scopes ([Feature scopes](#feature-scopes)). The
+routes on the caller's own notifications need a session sign-in, not a PAT: a scoped PAT without
+the matching `notifications.*` scope gets `403`, and any other PAT gets an empty notification
+list, an unread count of `0`, and `401` on reading, creating, updating or deleting a notification
+(see [`INTEGRATIONS.md`](INTEGRATIONS.md#in-dashboard-notifications)). A scoped PAT may create or
 update tokens only with a non-empty subset of its own scopes.
 
 Resource-scoped PAT routing is fail-closed for unknown nested tenant-resource
