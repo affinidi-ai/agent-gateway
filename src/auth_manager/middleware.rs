@@ -1919,12 +1919,8 @@ mod tests {
         assert!(!text.contains("agpat_"), "{text}");
     }
 
-    /// Data-plane listeners and test servers: none of their routes is behind the guard.
-    const ROUTE_FILES_OUTSIDE_THE_GUARD: &[&str] = &[
-        "src/proxy/server.rs",
-        "src/jwt_bearer/test_utils.rs",
-        "src/gateways/connection_points/message_processor/fabric_partner_grant_tests.rs",
-    ];
+    /// The data plane's listeners: none of their routes is behind the guard.
+    const ROUTE_FILES_OUTSIDE_THE_GUARD: &[&str] = &["src/proxy/server.rs"];
 
     /// Public DID documents registered next to guarded routes but served from the server root.
     const ROUTES_OUTSIDE_THE_GUARD: &[&str] = &[
@@ -1976,34 +1972,71 @@ mod tests {
         permissions: Vec<String>,
     }
 
-    fn registered_routes() -> Vec<RegisteredRoute> {
-        let method = regex::Regex::new(r"\b(get|post|put|patch|delete|head|any)\s*\(").unwrap();
-        let feature = regex::Regex::new(r"Feature::(\w+)").unwrap();
-        let policy_write = regex::Regex::new(r"^\s*PolicyWrite::(\w+)").unwrap();
-        let test_module = regex::Regex::new(r"#\[cfg\(test\)\]\s*(pub(\([^)]*\))?\s+)?mod\s").unwrap();
+    /// Every `.rs` file under `src/`, by its path from the crate root, with its text.
+    fn source_files() -> Vec<(String, String)> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut pending = vec![root.join("src")];
-        let mut routes = Vec::new();
+        let mut files = Vec::new();
         while let Some(dir) = pending.pop() {
             for entry in std::fs::read_dir(&dir).unwrap() {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
-                    if !path.ends_with("component_tests") {
-                        pending.push(path);
-                    }
-                    continue;
+                    pending.push(path);
+                } else if path.extension() == Some(std::ffi::OsStr::new("rs")) {
+                    let file = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    files.push((file, std::fs::read_to_string(&path).unwrap()));
                 }
-                let file = path
-                    .strip_prefix(root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                if !file.ends_with(".rs") || ROUTE_FILES_OUTSIDE_THE_GUARD.contains(&file.as_str()) {
-                    continue;
-                }
-                let source = std::fs::read_to_string(&path).unwrap();
-                let source = &source[..test_module
-                    .find(&source)
+            }
+        }
+        files
+    }
+
+    /// The modules, as paths from the crate root without `.rs`, that their parent
+    /// declares with `#[cfg(test)] mod name;`: their files and submodules are test code.
+    fn test_only_modules(sources: &[(String, String)]) -> Vec<String> {
+        let declaration = regex::Regex::new(r"#\[cfg\(test\)\]\s*(pub(\([^)]*\))?\s+)?mod\s+(\w+)\s*;").unwrap();
+        sources
+            .iter()
+            .flat_map(|(file, source)| {
+                let (directory, name) = file.rsplit_once('/').unwrap();
+                let parent = match name {
+                    "mod.rs" | "main.rs" | "lib.rs" => directory.to_string(),
+                    _ => file
+                        .trim_end_matches(".rs")
+                        .to_string(),
+                };
+                declaration
+                    .captures_iter(source)
+                    .map(move |captures| format!("{parent}/{}", &captures[3]))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn registered_routes() -> Vec<RegisteredRoute> {
+        let method = regex::Regex::new(r"\b(get|post|put|patch|delete|head|any)\s*\(").unwrap();
+        let feature = regex::Regex::new(r"Feature::(\w+)").unwrap();
+        let policy_write = regex::Regex::new(r"^\s*PolicyWrite::(\w+)").unwrap();
+        let inline_test_module = regex::Regex::new(r"#\[cfg\(test\)\]\s*(pub(\([^)]*\))?\s+)?mod\s+\w+\s*\{").unwrap();
+        let sources = source_files();
+        let test_only = test_only_modules(&sources);
+        let mut routes = Vec::new();
+        for (file, source) in &sources {
+            let module = file.trim_end_matches(".rs");
+            if ROUTE_FILES_OUTSIDE_THE_GUARD.contains(&file.as_str())
+                || test_only
+                    .iter()
+                    .any(|test| module == test || module.starts_with(&format!("{test}/")))
+            {
+                continue;
+            }
+            {
+                let source = &source[..inline_test_module
+                    .find(source)
                     .map_or(source.len(), |module| module.start())];
                 for call in [".route(", ".policy_write("] {
                     for (at, _) in source.match_indices(call) {
