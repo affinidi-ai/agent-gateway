@@ -124,7 +124,7 @@ impl DynamoDbConfigStore {
 
         // Load AWS configuration from environment with Tokio sleep implementation
         // This includes credentials from environment variables, AWS credentials file, SSO, and IAM roles
-        let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::v2026_11_17())
             .sleep_impl(std::sync::Arc::new(aws_smithy_async::rt::sleep::TokioSleep::new()));
 
         // Set profile if provided

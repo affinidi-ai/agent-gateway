@@ -35,6 +35,7 @@ Project glossary (ubiquitous language) lives in [`CONTEXT.md`](CONTEXT.md). Use 
 12. **DashMap is authoritative at runtime.** Disk writes immediate. Manual `_storage/` edits need restart or `POST /v1/config/reload` — unless `cache_refresh_interval_secs` > 0, in which case **DashMap-backed** cached stores pick up external/manual disk writes within that interval (their serialized refresh scans reconcile cache with disk). RwLock-backed stores (policy definitions, global policies) do not poll on this interval and reconcile from disk on restart; explicit configuration reload uses their current in-memory state.
 13. **Leave code better** — DRY, no dead code, single-responsibility functions.
 14. **Always test** — positive and negative cases.
+15. **AWS clients pin an explicit `BehaviorVersion`**, never `BehaviorVersion::latest()`. Every `aws_config::load_defaults` / `aws_config::defaults` call names the same version, so an SDK upgrade cannot change retry, timeout or signing behavior without a diff. Raising the pin is a deliberate change: update every call site together, and write a changelog entry saying what the new version changes. A deprecation warning on the pinned version is the signal to do it, not a reason to reach for `latest()`.
 
 ## Changelog fragments
 

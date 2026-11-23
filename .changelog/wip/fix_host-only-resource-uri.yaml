@@ -1,0 +1,19 @@
+branch: fix/host-only-resource-uri
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-20T12:30:00Z'
+      title: Accept a bare-host resource or issuer such as https://mcp.slack.com
+      description: >-
+        A credential provider whose resource was a host with no path, the form MCP
+        servers publish (Slack's is https://mcp.slack.com), was refused with "resource
+        must be a canonical HTTPS URI", because the URL parser writes such a URL with a
+        trailing slash. The same rule refused a bare-host issuer for an identity
+        strategy. A bare host is now accepted, and stored, compared and sent exactly as
+        written, so the provider receives the resource it published. Every other
+        rewritten form is still refused: an upper-case host, an explicit default port, a
+        query, a fragment, credentials, or anything that is not https.
+  removed: []
+  security: []
+  breaking: []

@@ -33,7 +33,7 @@ impl StreamPublisher for KinesisPublisher {
         use aws_sdk_kinesis::primitives::Blob;
 
         // Build AWS config for the specified region
-        let aws_config = aws_config::defaults(BehaviorVersion::latest())
+        let aws_config = aws_config::defaults(BehaviorVersion::v2026_11_17())
             .region(aws_sdk_kinesis::config::Region::new(region.to_string()))
             .load()
             .await;

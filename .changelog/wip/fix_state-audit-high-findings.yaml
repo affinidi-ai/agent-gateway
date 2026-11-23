@@ -154,16 +154,6 @@ changes:
         `facilitator_mode` and `sts.replay_protection` and shows `single_use_store` and
         `sts.id_jag_max_lifetime_secs`.
   security:
-    - timestamp: '2026-11-23T00:00:00Z'
-      title: Update cookie to 0.18.3
-      description: >-
-        cookie 0.18.1 could repeat private cookie nonces in a process that forks
-        (RUSTSEC-2026-0594). The gateway now uses 0.18.3, which fixes it.
-    - timestamp: '2026-11-23T00:00:00Z'
-      title: Update url to 2.5.9
-      description: >-
-        url 2.5.8 could overflow the stack in `Url::origin()` on nested `blob:` URLs
-        (servo/rust-url#1186). The gateway now uses 2.5.9, which fixes it.
     - timestamp: '2026-11-18T00:00:00Z'
       title: Accept trust registry status changes only from that registry
       description: >-
