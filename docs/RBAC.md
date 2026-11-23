@@ -14,8 +14,12 @@ and rejects a missing feature with `403 Forbidden`. Dashboard visibility checks 
 defence in depth; they do not replace route enforcement.
 
 Management PAT authorization further intersects the bound user's role with the PAT's feature scopes.
-Resource and tenant constraints are separate authorization dimensions; they do not change the
-shape of the RBAC permissions response.
+A PAT with explicit feature scopes is also refused with `403` by the authentication middleware on
+any route none of its scopes covers, including routes a session reaches with no permission; deny is
+the default, and [`route_scopes.rs`](../src/auth_manager/route_scopes.rs) lists the permissions that
+cover each route. See [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#feature-scopes). A new management route
+needs an entry there as well as its `require_feature(...)`. Resource and tenant constraints are
+separate authorization dimensions; they do not change the shape of the RBAC permissions response.
 
 ## Permissions endpoint
 
@@ -39,11 +43,11 @@ set to `false` when no authenticated user can be resolved.
 For a session login the map reflects the user's role. When the caller authenticated with a personal
 access token (`agpat_`), a key is `true` only when the owner's role grants the feature and the
 token's feature scopes include it. This matches the feature-gated routes, which check the same
-intersection. A token created without feature scopes reports the owner's full role. Some routes
-authorize on the owner's role only and never read the token's feature scopes, so a token is limited
-there only by its owner's role: user management (`/v1/users`), settings writes, `sign-jwt`, backup
-and restore, and storage export. For those routes the map can show `false` for a feature the route
-still accepts. Resource patterns limit which resource ids a token can reach, not which features it
+intersection. A token created without feature scopes reports the owner's full role. Routes whose
+handler authorizes on the owner's role only (user management (`/v1/users`), settings writes,
+`sign-jwt`, backup and restore, and storage export) also need the feature among the token's scopes,
+which the authentication middleware checks, so the map matches them too. A token with explicit
+scopes reaches this endpoint whatever its scopes. Resource patterns limit which resource ids a token can reach, not which features it
 holds, so they do not change the map: a resource-scoped token is still refused on unscoped writes
 even when the map says `true`. The response carries `Cache-Control: no-store` and
 `Vary: Authorization, Cookie` because its body depends on the caller's credential, which arrives in

@@ -360,6 +360,11 @@ async fn operator_downloads_server_logs(
     record(world, Caller::Operator(&operator), Method::GET, "/v1/logs/download", None).await;
 }
 
+#[when("the personal access token reads the gateway settings")]
+async fn personal_access_token_reads_gateway_settings(world: &mut SurfaceWorld) {
+    record(world, Caller::PersonalAccessToken, Method::GET, "/v1/settings", None).await;
+}
+
 #[when(expr = "operator {string} truncates stored metrics")]
 async fn operator_truncates_stored_metrics(
     world: &mut SurfaceWorld,

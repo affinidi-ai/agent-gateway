@@ -7,7 +7,9 @@ Feature: Management route permissions
   access token or one scoped by required headers alone cannot download them and is shown none
   of their lines on the dashboard. Listing and reading agents needs surfaces.view, and a tenant's
   token sees only the agents of its own surfaces. A tenant's token reads an agent card only
-  through a surface of its own tenant.
+  through a surface of its own tenant. A personal access token with feature scopes reaches a
+  route only when one of its scopes covers it, including a route a signed-in operator reaches
+  without any permission: reading the gateway settings needs settings.view.
 
   Scenario: An administrator downloads the server logs
     Given a log file "agent-gateway.log"
@@ -232,3 +234,15 @@ Feature: Management route permissions
     When operator "ada" validates a credential provider
     Then the admin API response status is 200
     And the response reports the token endpoint the credential provider validation checked
+
+  Scenario: A personal access token whose scopes do not cover the gateway settings cannot read them
+    Given operator "ada" has the "administrator" role
+    And operator "ada" holds a personal access token with scopes "surfaces.view"
+    When the personal access token reads the gateway settings
+    Then the admin API response status is 403
+
+  Scenario: A personal access token with settings.view reads the gateway settings
+    Given operator "ada" has the "administrator" role
+    And operator "ada" holds a personal access token with scopes "settings.view"
+    When the personal access token reads the gateway settings
+    Then the admin API response status is 200

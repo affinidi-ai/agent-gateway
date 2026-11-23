@@ -36,6 +36,11 @@ const CONSENT_PENDING_PATHS: &[&str] = &[
 /// headers are not evaluated. Token authentication and revocation still apply.
 const TOKEN_SELF_INSPECTION_PATHS: &[&str] = &["/v1/token-info", "/api/v1/token-info"];
 
+/// Routes, by their path as registered, that an access token with explicit scopes
+/// reaches whatever its scopes: each describes only the calling token. Every other route needs a
+/// scope that `route_scopes` lists for it.
+const SCOPED_TOKEN_ALLOWED_ROUTES: &[&str] = &["/v1/token-info", "/v1/permissions"];
+
 const PUBLIC_PATH_PREFIXES: &[&str] = &[
     "/auth/",                    // Passkey auth flows
     "/saml/",                    // SAML auth flows
@@ -291,6 +296,30 @@ pub async fn require_session_auth(
     StatusCode::UNAUTHORIZED.into_response()
 }
 
+/// The route `request` matched, by its path as registered (such as
+/// `/v1/surfaces/{surface_id}`), and what an access token with explicit `scopes`
+/// gets there, or `None` when the request matched no route.
+fn scoped_route_access(
+    request: &Request,
+    scopes: &[String],
+) -> Option<(String, crate::auth_manager::route_scopes::ScopedAccess)> {
+    let matched = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()?;
+    let original_path = request
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map_or_else(|| request.uri().path(), |uri| uri.path());
+    let route =
+        crate::auth_manager::route_scopes::registered_route(matched.as_str(), original_path, request.uri().path());
+    let access = if SCOPED_TOKEN_ALLOWED_ROUTES.contains(&route) {
+        crate::auth_manager::route_scopes::ScopedAccess::Allowed
+    } else {
+        crate::auth_manager::route_scopes::scoped_access(scopes, request.method(), route)
+    };
+    Some((route.to_string(), access))
+}
+
 /// The rest of [`require_session_auth`] for a request authenticated by an
 /// access token, run as `actor` with a request id of its own. A write this
 /// token may not make is refused here, before any route layer runs, so a
@@ -325,6 +354,23 @@ async fn access_token_request(
     }
 
     let refused = |status: StatusCode| record_refusal(&request, &actor, status.into_response());
+    if let Some(scopes) = principal.scopes.as_deref() {
+        use crate::auth_manager::route_scopes::ScopedAccess;
+        match scoped_route_access(&request, scopes) {
+            Some((_, ScopedAccess::Allowed)) => {}
+            Some((_, ScopedAccess::MethodNotAllowed)) => return StatusCode::METHOD_NOT_ALLOWED.into_response(),
+            Some((route, ScopedAccess::Refused)) => {
+                warn!(
+                    token_id = %principal.token_id,
+                    method = %request.method(),
+                    route = %route,
+                    "Access token scopes do not cover the route"
+                );
+                return refused(StatusCode::FORBIDDEN);
+            }
+            None => return StatusCode::NOT_FOUND.into_response(),
+        }
+    }
     let resource_scoped = principal
         .resource_scope
         .is_some();
@@ -651,9 +697,9 @@ pub(crate) fn pat_scope_allows(
     feature: &crate::rbac::Feature,
 ) -> bool {
     match pat {
-        Some(crate::auth_manager::pat::PatContext(Some(scopes))) => scopes
-            .iter()
-            .any(|scope| scope == feature.as_str()),
+        Some(crate::auth_manager::pat::PatContext(Some(scopes))) => {
+            crate::auth_manager::pat::scope_grants(scopes, feature)
+        }
         _ => true,
     }
 }
@@ -1706,6 +1752,411 @@ mod tests {
                 resource_scope: None,
             })
         }
+    }
+
+    const SETTINGS_VIEW_TOKEN: &str = "agpat_S3ttingsView9vR4tY8wB3nL6cF1hJ5dS0gA2eU7iO4";
+
+    struct SettingsViewPat;
+
+    #[async_trait::async_trait]
+    impl crate::auth_manager::pat::PatAuthenticator for SettingsViewPat {
+        async fn authenticate(
+            &self,
+            token: &str,
+        ) -> Option<crate::auth_manager::pat::PatPrincipal> {
+            let scopes = match token {
+                SETTINGS_VIEW_TOKEN => Some(vec!["settings.view".to_string()]),
+                ACCESS_TOKEN => None,
+                _ => return None,
+            };
+            Some(crate::auth_manager::pat::PatPrincipal {
+                user_id: "user-1".to_string(),
+                scopes,
+                token_id: "agat_scoped".to_string(),
+                delegation_depth: 0,
+                resource_scope: None,
+            })
+        }
+    }
+
+    fn scoped_token_app(sessions: Arc<SessionManager>) -> Router {
+        let routes = Router::new()
+            .route("/v1/settings", get(ok_handler))
+            .route("/v1/config/networking", get(ok_handler))
+            .route("/v1/surfaces", get(ok_handler))
+            .route("/v1/surfaces/validate-policy", axum::routing::post(ok_handler))
+            .route("/v1/profile", get(ok_handler))
+            .route("/v1/token-info", get(ok_handler))
+            .route("/v1/permissions", get(ok_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                AuthGuardState::new(sessions, None, Arc::new(crate::terms::TermsManager::disabled()))
+                    .with_pat_authenticator(Some(Arc::new(SettingsViewPat))),
+                require_session_auth,
+            ));
+        Router::new().nest("/api", routes)
+    }
+
+    async fn status_with_bearer(
+        app: &Router,
+        method: Method,
+        path: &str,
+        token: &str,
+    ) -> u16 {
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    #[tokio::test]
+    async fn a_scoped_access_token_reaches_the_routes_its_scopes_cover() {
+        let app = scoped_token_app(Arc::new(SessionManager::new()));
+
+        assert_eq!(status_with_bearer(&app, Method::GET, "/api/v1/settings", SETTINGS_VIEW_TOKEN).await, 200);
+        assert_eq!(status_with_bearer(&app, Method::GET, "/api/v1/config/networking", SETTINGS_VIEW_TOKEN).await, 200);
+    }
+
+    #[tokio::test]
+    async fn a_scoped_access_token_is_refused_on_routes_its_scopes_do_not_cover() {
+        let app = scoped_token_app(Arc::new(SessionManager::new()));
+
+        assert_eq!(status_with_bearer(&app, Method::GET, "/api/v1/surfaces", SETTINGS_VIEW_TOKEN).await, 403);
+        assert_eq!(
+            status_with_bearer(&app, Method::POST, "/api/v1/surfaces/validate-policy", SETTINGS_VIEW_TOKEN).await,
+            403
+        );
+        assert_eq!(status_with_bearer(&app, Method::GET, "/api/v1/profile", SETTINGS_VIEW_TOKEN).await, 403);
+    }
+
+    #[tokio::test]
+    async fn a_scoped_access_token_always_reaches_the_routes_that_describe_it() {
+        let app = scoped_token_app(Arc::new(SessionManager::new()));
+
+        assert_eq!(status_with_bearer(&app, Method::GET, "/api/v1/token-info", SETTINGS_VIEW_TOKEN).await, 200);
+        assert_eq!(status_with_bearer(&app, Method::GET, "/api/v1/permissions", SETTINGS_VIEW_TOKEN).await, 200);
+    }
+
+    #[tokio::test]
+    async fn a_scoped_access_token_on_an_unknown_path_is_not_found() {
+        let app = scoped_token_app(Arc::new(SessionManager::new()));
+
+        assert_eq!(status_with_bearer(&app, Method::GET, "/api/v1/no-such-route", SETTINGS_VIEW_TOKEN).await, 404);
+    }
+
+    #[tokio::test]
+    async fn a_scoped_access_token_is_answered_on_head_as_on_get() {
+        let app = scoped_token_app(Arc::new(SessionManager::new()));
+
+        assert_eq!(status_with_bearer(&app, Method::HEAD, "/api/v1/settings", SETTINGS_VIEW_TOKEN).await, 200);
+        assert_eq!(status_with_bearer(&app, Method::HEAD, "/api/v1/surfaces", SETTINGS_VIEW_TOKEN).await, 403);
+    }
+
+    #[tokio::test]
+    async fn a_scoped_access_token_using_a_method_the_route_does_not_serve_is_not_allowed() {
+        let app = scoped_token_app(Arc::new(SessionManager::new()));
+
+        assert_eq!(status_with_bearer(&app, Method::PATCH, "/api/v1/settings", SETTINGS_VIEW_TOKEN).await, 405);
+    }
+
+    #[tokio::test]
+    async fn a_scoped_access_token_does_not_reach_a_fallback_behind_the_guard() {
+        let sessions = Arc::new(SessionManager::new());
+        let session_token = sessions
+            .create_session("alice".into(), "user-1".into())
+            .await;
+        let app = Router::new()
+            .route("/v1/settings", get(ok_handler))
+            .fallback(ok_handler)
+            .layer(axum::middleware::from_fn_with_state(
+                AuthGuardState::new(sessions, None, Arc::new(crate::terms::TermsManager::disabled()))
+                    .with_pat_authenticator(Some(Arc::new(SettingsViewPat))),
+                require_session_auth,
+            ));
+
+        assert_eq!(status_with_bearer(&app, Method::GET, "/v1/anything", SETTINGS_VIEW_TOKEN).await, 404);
+        assert_eq!(status_with_bearer(&app, Method::GET, "/v1/anything", &session_token).await, 200);
+    }
+
+    #[tokio::test]
+    async fn a_token_without_explicit_scopes_and_a_session_reach_every_route_as_before() {
+        let sessions = Arc::new(SessionManager::new());
+        let session_token = sessions
+            .create_session("alice".into(), "user-1".into())
+            .await;
+        let app = scoped_token_app(sessions);
+
+        for credential in [ACCESS_TOKEN, session_token.as_str()] {
+            assert_eq!(status_with_bearer(&app, Method::GET, "/api/v1/surfaces", credential).await, 200);
+            assert_eq!(
+                status_with_bearer(&app, Method::POST, "/api/v1/surfaces/validate-policy", credential).await,
+                200
+            );
+            assert_eq!(status_with_bearer(&app, Method::GET, "/api/v1/profile", credential).await, 200);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_scoped_access_token_is_logged_by_route_without_the_token() {
+        let app = scoped_token_app(Arc::new(SessionManager::new()));
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        assert_eq!(status_with_bearer(&app, Method::GET, "/api/v1/surfaces", SETTINGS_VIEW_TOKEN).await, 403);
+
+        let text = logs.text();
+        assert!(text.contains("Access token scopes do not cover the route"), "{text}");
+        assert!(text.contains("agat_scoped"), "{text}");
+        assert!(text.contains("/v1/surfaces"), "{text}");
+        assert!(!text.contains(SETTINGS_VIEW_TOKEN), "{text}");
+        assert!(!text.contains("agpat_"), "{text}");
+    }
+
+    /// Data-plane listeners and test servers: none of their routes is behind the guard.
+    const ROUTE_FILES_OUTSIDE_THE_GUARD: &[&str] = &[
+        "src/proxy/server.rs",
+        "src/jwt_bearer/test_utils.rs",
+        "src/gateways/connection_points/message_processor/fabric_partner_grant_tests.rs",
+    ];
+
+    /// Public DID documents registered next to guarded routes but served from the server root.
+    const ROUTES_OUTSIDE_THE_GUARD: &[&str] = &[
+        "/.well-known/did.json",
+        "/.well-known/did/did.jsonl",
+        "/.well-known/did.jsonl",
+        "/.well-known/did-witness.json",
+        "/surface/{surface_id}/did.json",
+        "/surface/{surface_id}/did.jsonl",
+        "/surface/{surface_id}/did-witness.json",
+        "/issuers/{id}/did.json",
+        "/issuers/{id}/did.jsonl",
+        "/departments/{id}/did.json",
+        "/departments/{id}/did.jsonl",
+    ];
+
+    fn route_file_prefix(file: &str) -> &'static str {
+        match file {
+            "src/x402/admin_api.rs" | "src/mpp/admin_api.rs" | "src/payments_ledger/admin_api.rs" => "/admin",
+            _ => "",
+        }
+    }
+
+    fn call_arguments(
+        source: &str,
+        start: usize,
+    ) -> &str {
+        let bytes = source.as_bytes();
+        let (mut depth, mut index, mut in_string) = (1usize, start, false);
+        while index < bytes.len() && depth > 0 {
+            match bytes[index] {
+                b'\\' if in_string => index += 1,
+                b'"' => in_string = !in_string,
+                b'(' if !in_string => depth += 1,
+                b')' if !in_string => depth -= 1,
+                _ => {}
+            }
+            index += 1;
+        }
+        &source[start..index.saturating_sub(1)]
+    }
+
+    struct RegisteredRoute {
+        location: String,
+        /// Empty when the method router is built in another statement.
+        methods: Vec<String>,
+        path: String,
+        /// The `Feature` variants named where the route is registered.
+        permissions: Vec<String>,
+    }
+
+    fn registered_routes() -> Vec<RegisteredRoute> {
+        let method = regex::Regex::new(r"\b(get|post|put|patch|delete|head|any)\s*\(").unwrap();
+        let feature = regex::Regex::new(r"Feature::(\w+)").unwrap();
+        let policy_write = regex::Regex::new(r"^\s*PolicyWrite::(\w+)").unwrap();
+        let test_module = regex::Regex::new(r"#\[cfg\(test\)\]\s*(pub(\([^)]*\))?\s+)?mod\s").unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut pending = vec![root.join("src")];
+        let mut routes = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    if !path.ends_with("component_tests") {
+                        pending.push(path);
+                    }
+                    continue;
+                }
+                let file = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if !file.ends_with(".rs") || ROUTE_FILES_OUTSIDE_THE_GUARD.contains(&file.as_str()) {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                let source = &source[..test_module
+                    .find(&source)
+                    .map_or(source.len(), |module| module.start())];
+                for call in [".route(", ".policy_write("] {
+                    for (at, _) in source.match_indices(call) {
+                        let arguments = call_arguments(source, at + call.len());
+                        let (methods, route_path) = if call == ".route(" {
+                            let Some(literal) = arguments
+                                .trim_start()
+                                .strip_prefix('"')
+                            else {
+                                continue;
+                            };
+                            let methods = method
+                                .captures_iter(arguments)
+                                .map(|captures| captures[1].to_uppercase())
+                                .collect();
+                            (methods, literal[..literal.find('"').unwrap()].to_string())
+                        } else {
+                            let name = &policy_write
+                                .captures(arguments)
+                                .unwrap()[1];
+                            let write = crate::audit::policy_refusals::PolicyWrite::ALL
+                                .into_iter()
+                                .find(|write| format!("{write:?}") == name)
+                                .unwrap();
+                            (vec![write.method().to_string()], write.path().to_string())
+                        };
+                        let full = format!("{}{route_path}", route_file_prefix(&file));
+                        routes.push(RegisteredRoute {
+                            location: format!("{file}:{}", source[..at].lines().count()),
+                            methods,
+                            path: crate::auth_manager::route_scopes::registered_route(&full, &full, &full).to_string(),
+                            permissions: feature
+                                .captures_iter(arguments)
+                                .map(|captures| captures[1].to_string())
+                                .collect(),
+                        });
+                    }
+                }
+            }
+        }
+        routes
+    }
+
+    fn declared_routes() -> Vec<(&'static str, &'static str)> {
+        use crate::auth_manager::route_scopes::{CLOSED_TO_SCOPED_TOKENS, ROUTE_SCOPES};
+        ROUTE_SCOPES
+            .iter()
+            .map(|(method, path, _)| (*method, *path))
+            .chain(
+                CLOSED_TO_SCOPED_TOKENS
+                    .iter()
+                    .copied(),
+            )
+            .collect()
+    }
+
+    /// Reads route paths from the source, so a path built at run time is not seen.
+    /// A route whose methods cannot be read there must be declared for every method.
+    #[test]
+    fn every_guarded_route_declares_what_covers_it_for_a_scoped_token() {
+        let declared = declared_routes();
+        let undeclared: Vec<String> = registered_routes()
+            .into_iter()
+            .filter(|route| {
+                !is_public_path(&route.path)
+                    && !is_public_path(&format!("/api{}", route.path))
+                    && !SCOPED_TOKEN_ALLOWED_ROUTES.contains(&route.path.as_str())
+                    && !ROUTES_OUTSIDE_THE_GUARD.contains(&route.path.as_str())
+            })
+            .flat_map(|route| {
+                let methods = if route.methods.is_empty() {
+                    vec![crate::auth_manager::route_scopes::ANY.to_string()]
+                } else {
+                    route.methods
+                };
+                methods
+                    .into_iter()
+                    .filter(|method| {
+                        !declared
+                            .iter()
+                            .any(|(declared_method, path)| *path == route.path && declared_method == method)
+                    })
+                    .map(|method| format!("{method} {} ({})", route.path, route.location))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert!(
+            undeclared.is_empty(),
+            "add these routes to route_scopes::ROUTE_SCOPES with the permission that covers them, \
+             to route_scopes::CLOSED_TO_SCOPED_TOKENS, or to SCOPED_TOKEN_ALLOWED_ROUTES:\n{}",
+            undeclared.join("\n")
+        );
+    }
+
+    #[test]
+    fn every_declared_route_is_a_registered_route() {
+        let routes = registered_routes();
+        let stale: Vec<String> = declared_routes()
+            .into_iter()
+            .filter(|(method, path)| {
+                !routes.iter().any(|route| {
+                    route.path == *path
+                        && (route.methods.is_empty()
+                            || route
+                                .methods
+                                .iter()
+                                .any(|registered| registered == method))
+                })
+            })
+            .map(|(method, path)| format!("{method} {path}"))
+            .collect();
+
+        assert!(stale.is_empty(), "route_scopes declares routes no router registers:\n{}", stale.join("\n"));
+    }
+
+    /// A permission check applied to a whole router, or made in the handler, is not
+    /// named where the route is registered, so those routes are not compared.
+    #[test]
+    fn every_route_scope_names_a_permission_its_route_checks() {
+        let mismatched: Vec<String> = registered_routes()
+            .into_iter()
+            .filter(|route| !route.permissions.is_empty())
+            .flat_map(|route| {
+                route
+                    .methods
+                    .iter()
+                    .filter_map(|method| {
+                        let listed = crate::auth_manager::route_scopes::route_permissions(
+                            &Method::from_bytes(method.as_bytes()).unwrap(),
+                            &route.path,
+                        )?;
+                        let unchecked: Vec<String> = listed
+                            .iter()
+                            .map(|permission| format!("{permission:?}"))
+                            .filter(|permission| {
+                                !route
+                                    .permissions
+                                    .contains(permission)
+                            })
+                            .collect();
+                        (!unchecked.is_empty()).then(|| {
+                            format!(
+                                "{method} {}: route_scopes lists {unchecked:?}, the route checks {:?} ({})",
+                                route.path, route.permissions, route.location
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert!(mismatched.is_empty(), "route_scopes and the routes disagree:\n{}", mismatched.join("\n"));
     }
 
     #[tokio::test]

@@ -1,0 +1,38 @@
+branch: fix/refuse-scoped-tokens-uncovered-routes
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-11-23T08:56:21Z'
+      title: ⭐ Refuse scoped access tokens on management routes none of their scopes cover
+      description: >-
+        An access token with explicit scopes could call any management route that checks no
+        permission, whatever its scopes, so a narrowly scoped token could read the gateway's
+        settings and configuration. The authentication middleware now refuses such a token with
+        403 on every route none of its scopes covers, and a route without a listed permission is
+        refused by default. GET /v1/token-info and GET /v1/permissions stay reachable to every
+        token, HEAD is answered like GET, and a method a route does not serve gets 405. Tokens
+        without explicit scopes and dashboard sessions behave as before. Existing
+        scoped tokens need these scopes for routes that checked none: dashboard.view for
+        /v1/dashboard/stats, /delta, /surface/{id}/metrics, /surface/{id}/ucp-operations,
+        /metrics/hierarchical and /system-metrics; settings.view for GET /v1/settings,
+        /v1/settings/audit-events, /v1/config/surface-routing, /v1/config/x402 and
+        /v1/config/networking; metrics.view for GET /v1/metrics/otlp-status; surfaces.edit for
+        POST /v1/surfaces/validate-policy; surfaces.view for GET
+        /v1/trust-check/predefined-queries; notifications.view, notifications.edit or
+        notifications.delete for /v1/notifications and /v1/notifications/{id} by method, and
+        notifications.view for /v1/notifications/unread/count; an issuers permission for the
+        legacy /v1/departments redirects; and trust_registries.view for the trust registry DID
+        documents under /api/trust-registries. No scope covers GET /v1/identity/did-document, GET
+        /v1/identities/by-hash/{identity_hash}/rotations, GET and PUT /v1/profile, POST
+        /v1/profile/avatar, GET, POST and DELETE /v1/user-settings, GET
+        /v1/user-settings/overrides, GET /v1/terms/status, POST /v1/terms/acceptances and POST
+        /v1/verify/{did}, so a scoped token is refused there. Routes that checked only the owner's
+        role now also need the permission among a scoped token's scopes: users.view, users.edit
+        or users.delete for /v1/users and /v1/users/{id}, settings.edit for POST and DELETE
+        /v1/settings and POST /agents-api/v1/sign-jwt, and storage.admin for backup, restore and
+        storage export. Reissue a scoped token with the scopes it needs. Each refusal is logged
+        with the token id and route, never the token.
