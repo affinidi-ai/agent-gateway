@@ -59,8 +59,17 @@ changes:
         Context form. It was a hyphenated UUID. The new form appears in X-Gateway-Trace-Id, in the
         transit token, in audit records and in logs. A Managed Agent or a log pipeline that reads
         the value as a hyphenated UUID must accept the new form; a parser that accepts a UUID
-        without hyphens, as earlier gateways do, needs no change. An Access Point also writes a
-        trace id it continues from X-Gateway-Trace-Id in this form, and no longer continues a
-        braced or urn: one. A Transit Point request with neither a transit token nor that header
-        still starts a hyphenated UUID, and a gateway that receives a request over a Fabric stream
-        still records its trace id hyphenated.
+        without hyphens, as earlier gateways do, needs no change. An Access Point and a Transit
+        Point also write a trace id they continue from X-Gateway-Trace-Id in this form, and no
+        longer continue a braced or urn: one. A gateway that receives a request over a Fabric
+        stream still records its trace id hyphenated.
+    - timestamp: '2026-11-23T18:00:00Z'
+      title: Resolve a Transit Point's trace from its transit token, then its headers
+      description: >-
+        A Transit Point now continues the trace of the transit token it verified, also where it
+        does not require one, and records it with trace_source transit_token and, when the
+        managed agent's traceparent names that trace, its span as parent_span_id. Without a
+        verified token it reads traceparent and X-Gateway-Trace-Id as an Access Point does, and
+        otherwise starts a 32 hex trace. The records it writes before its transit token is checked
+        for the last time (a refused caller, a rate limit, a refused body) no longer carry a
+        trace id, only their span, so a token refused later never names their trace.

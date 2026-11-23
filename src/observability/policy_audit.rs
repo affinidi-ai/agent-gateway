@@ -113,8 +113,9 @@ pub struct RequestScope {
     id: String,
     variant: std::sync::OnceLock<String>,
     /// The trace the request continues or starts, on a request that reads
-    /// trace headers. Its span is the request's id.
-    trace: Option<crate::proxy::trace::RequestTrace>,
+    /// trace headers, set once its entry point resolved it. Its span is the
+    /// request's id.
+    trace: std::sync::OnceLock<crate::proxy::trace::RequestTrace>,
 }
 
 impl RequestScope {
@@ -123,7 +124,7 @@ impl RequestScope {
         Arc::new(Self {
             id,
             variant: std::sync::OnceLock::new(),
-            trace: None,
+            trace: std::sync::OnceLock::new(),
         })
     }
 
@@ -135,7 +136,7 @@ impl RequestScope {
                 .as_str()
                 .to_string(),
             variant: std::sync::OnceLock::new(),
-            trace: Some(trace),
+            trace: std::sync::OnceLock::from(trace),
         })
     }
 
@@ -156,12 +157,26 @@ pub fn current_request_id() -> Option<String> {
         .ok()
 }
 
+/// The span of the request being served, when an entry point scoped one
+/// under a span id.
+pub fn current_request_span() -> Option<crate::proxy::trace::SpanId> {
+    current_request_id().and_then(|id| crate::proxy::trace::SpanId::parse(&id).ok())
+}
+
 /// The trace of the request being served, when its entry point read one.
 pub fn current_request_trace() -> Option<crate::proxy::trace::RequestTrace> {
     REQUEST
-        .try_with(|scope| scope.trace.clone())
+        .try_with(|scope| scope.trace.get().cloned())
         .ok()
         .flatten()
+}
+
+/// Records the trace the request being served continues or starts, once its
+/// entry point resolved it, so every record written after carries its parent
+/// span and trace source. The first trace set is kept. Does nothing outside a
+/// request.
+pub fn set_request_trace(trace: crate::proxy::trace::RequestTrace) {
+    let _ = REQUEST.try_with(|scope| scope.trace.set(trace));
 }
 
 /// Records the surface variant the request being served resolved to, and

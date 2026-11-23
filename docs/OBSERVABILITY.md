@@ -356,10 +356,18 @@ is sampled when the caller's continued `traceparent` was, and unsampled when the
 the trace. The caller's `tracestate` goes on unchanged only when its `traceparent` is continued.
 A surface with `terminate_trace_id` sends the fresh trace in both headers, with no `tracestate`.
 A Target bound by external consent is sent the trace id in `X-Gateway-Trace-Id` alone. A
-request to a `fabric://` Target carries the caller's trace headers as before. A Transit Point request
-that carries neither a transit token nor such a header starts a hyphenated UUID. A request sent
+request to a `fabric://` Target carries the caller's trace headers as before. A request sent
 over a Fabric stream carries its trace id as a hyphenated UUID, and the receiving gateway records
 that form.
+
+A Transit Point continues the trace of the transit token it verified, whether or not it requires
+one, with `trace_source` `transit_token`. The managed agent's `traceparent` gives the parent span
+only when it names that trace; a trace header naming another trace is ignored, with no warning.
+Without a verified token it reads `traceparent` and `X-Gateway-Trace-Id` as an Access Point does,
+and starts a new 32 hex trace when neither is valid. A token it refuses gives nothing: its trace id
+reaches no record, header or log line. The trace is resolved once the token was checked for the
+last time, so the records a Transit Point writes before that (a refused caller, a rate limit, a
+refused body) carry the request's `span_id` and no `trace_id`.
 
 ## Access log
 

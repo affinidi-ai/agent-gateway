@@ -583,9 +583,13 @@ pub struct OutboundPipelineContext {
     /// Point's `trust_check_list` is empty; otherwise the routed Transit
     /// Point's results under `target`.
     pub trust_check_results: Option<crate::trust_registry_verification::TrustCheckResultsContext>,
-    /// The request's trace id: the transit token's when one was verified, else
-    /// a valid `X-Gateway-Trace-Id`, else a fresh one.
+    /// The request's trace id once [`step_resolve_trace`] resolved it; until
+    /// then the request's span id, which only log lines carry.
     pub trace_id: String,
+    /// The trace the request continues or starts, set by
+    /// [`step_resolve_trace`] once the transit token was checked for the last
+    /// time.
+    pub trace: Option<crate::proxy::trace::RequestTrace>,
     /// Timestamp recorded at context creation (used for latency metrics).
     pub start_time: Instant,
     /// Pre-compiled rules engine for outbound request extension validation (from live channel state).
@@ -596,9 +600,9 @@ pub struct OutboundPipelineContext {
     /// Carries the original caller context from the inbound request.
     pub transit_token_claims: Option<crate::proxy::transit_token::TransitTokenClaims>,
     /// Claims of a valid transit token sent to a Transit Point that does not
-    /// require one. Only `input.transit.caller`, the per-caller rate limit and
-    /// the Fabric hop count read them: delegation, Workload Binding, stream
-    /// expiry and the trace id keep treating the call as carrying no token.
+    /// require one. Only `input.transit.caller`, the per-caller rate limit,
+    /// the Fabric hop count and the trace id read them: delegation, Workload
+    /// Binding and stream expiry keep treating the call as carrying no token.
     pub optional_transit_token_claims: Option<crate::proxy::transit_token::TransitTokenClaims>,
     /// Size in bytes of the upstream response body, captured by
     /// `step_process_response` before the body is consumed. Used by
@@ -807,20 +811,10 @@ impl OutboundPipelineContext {
         let outbound_rules_engine = None;
         let outbound_response_rules_engine = None;
 
-        // Fallback trace continuation: reuse a valid inbound `X-Gateway-Trace-Id`
-        // if the managed agent forwarded it. The authoritative carrier is the
-        // transit token (see `step_validate_transit_token`, which overrides this
-        // from `claims.trace_id`); this only helps when no transit token is used
-        // but the agent still echoes the header. UUID-checked to block injection.
-        let trace_id = original_headers
-            .get("X-Gateway-Trace-Id")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| {
-                uuid::Uuid::parse_str(s)
-                    .ok()
-                    .map(|_| s.to_string())
-            })
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let trace_id = crate::observability::policy_audit::current_request_span()
+            .unwrap_or_else(crate::proxy::trace::SpanId::mint)
+            .as_str()
+            .to_string();
 
         Ok(Self {
             request: Some(req),
@@ -849,6 +843,7 @@ impl OutboundPipelineContext {
             target_identity_failure: None,
             trust_check_results: None,
             trace_id,
+            trace: None,
             start_time: Instant::now(),
             _outbound_rules_engine: outbound_rules_engine,
             outbound_response_rules_engine,
@@ -1083,6 +1078,8 @@ async fn outbound_proxy_handler_in_request_scope(
         step_validate_transit_token(&state, &mut ctx).await?;
     }
 
+    step_resolve_trace(&mut ctx);
+
     // A call that would take the request past the Fabric hop limit is refused
     // before anything is resolved or forwarded for it.
     step_check_fabric_hops(&ctx)?;
@@ -1315,9 +1312,9 @@ async fn validate_transit_token(
         // Per-TP opt-out: this transit point is configured to accept
         // calls without a transit token (e.g. dev/testing or a TP whose
         // callers cannot carry one). A token the agent sends anyway is still
-        // checked so policy and the per-caller rate limit see the caller it
-        // names, and only those: it does not drive delegation, Workload
-        // Binding, stream expiry or the trace id. One that does not verify is ignored and the caller stays
+        // checked so policy, the per-caller rate limit and the trace id see
+        // it, and only those: it does not drive delegation, Workload
+        // Binding or stream expiry. One that does not verify is ignored and the caller stays
         // anonymous. Each pass replaces the last, so a token the first pass
         // accepted within the clock leeway and the strict modern MCP pass
         // refuses no longer names the caller.
@@ -1439,17 +1436,35 @@ fn adopt_transit_token(
     ctx: &mut OutboundPipelineContext,
     claims: crate::proxy::transit_token::TransitTokenClaims,
 ) {
-    // Continue the originating inbound request's trace across the transit hop.
-    // The inbound pipeline stamped its `trace_id` into this token; reusing it
-    // (over the fresh id minted in `OutboundContext::new`) keeps one end-to-end
-    // trace through the TP leg — so the injected VPs and audit on the GW1→TP→GW2
-    // chain all share one id. The managed agent echoes the token reliably, so
-    // this is the robust carrier (vs. hoping it forwards `X-Gateway-Trace-Id`).
-    if let Some(tid) = claims.trace_id.clone() {
-        ctx.trace_id = tid;
-    }
-
     ctx.transit_token_claims = Some(claims);
+}
+
+/// Resolves the trace the request continues or starts, once its transit token
+/// was checked for the last time, so a token a later check refuses never gives
+/// it: the verified token's trace id first, required or not, then the trace
+/// headers. Every record written from here carries it; those written before
+/// carry the request's span alone.
+fn step_resolve_trace(ctx: &mut OutboundPipelineContext) {
+    use crate::observability::policy_audit::{current_request_span, set_request_trace};
+
+    let token_trace_id = ctx
+        .transit_token_claims
+        .as_ref()
+        .or(ctx
+            .optional_transit_token_claims
+            .as_ref())
+        .and_then(|claims| claims.trace_id.as_deref());
+    let trace = crate::proxy::trace::RequestTrace::from_transit_point_request(
+        token_trace_id,
+        &ctx.original_headers,
+        current_request_span().unwrap_or_else(crate::proxy::trace::SpanId::mint),
+    );
+    set_request_trace(trace.clone());
+    ctx.trace_id = trace
+        .trace_id
+        .as_str()
+        .to_string();
+    ctx.trace = Some(trace);
 }
 
 /// The Fabric crossings a call to a `fabric://` target makes: one more than
@@ -1717,7 +1732,7 @@ async fn authenticate_transit_caller(
                 "Transit Point caller authentication failed"
             );
             crate::audit::request_events::auth_failed(
-                &transit_audit_facts(ctx),
+                &untraced_audit_facts(ctx),
                 crate::audit::request_events::source_auth_scheme(&config),
                 crate::audit::request_events::source_auth_reason(&error),
                 true,
@@ -2327,13 +2342,11 @@ async fn step_rate_limit(
                 debug!(request_id = %ctx.trace_id, overflow = refusal.overflow, "Outbound rate limit exceeded (per caller)");
                 crate::audit::request_events::transit_point_caller_rate_limited(
                     &crate::audit::request_events::RequestFacts {
-                        surface_id: &ctx.surface.surface_id,
-                        channel_name: &ctx.surface.name,
-                        trace_id: Some(&ctx.trace_id),
                         via_fabric: ctx
                             .transit_token_claims
                             .as_ref()
                             .is_some_and(|claims| claims.fabric.is_some()),
+                        ..untraced_audit_facts(ctx)
                     },
                     &ctx.virtual_channel.alias,
                     caller.as_deref(),
@@ -2453,15 +2466,7 @@ async fn step_extract_protocol_context_with_versions(
             if let Some(policy) = &mcp_http {
                 let error = policy.body_read_error(error);
                 if error.status == StatusCode::PAYLOAD_TOO_LARGE {
-                    crate::audit::request_events::mcp_request_rejected(
-                        &crate::audit::request_events::RequestFacts {
-                            surface_id: &ctx.surface.surface_id,
-                            channel_name: &ctx.surface.name,
-                            trace_id: Some(&ctx.trace_id),
-                            via_fabric: false,
-                        },
-                        &error,
-                    );
+                    crate::audit::request_events::mcp_request_rejected(&untraced_audit_facts(ctx), &error);
                 }
                 return OutboundPipelineError::McpValidation(error);
             }
@@ -2545,7 +2550,7 @@ async fn step_extract_protocol_context_with_versions(
         crate::protocols::extensions::verify_mcp_metadata_identity(
             &body,
             state.vc_issuer.as_ref(),
-            &transit_audit_facts(ctx),
+            &untraced_audit_facts(ctx),
             None,
         )
         .await
@@ -2935,6 +2940,15 @@ fn transit_audit_facts(ctx: &OutboundPipelineContext) -> crate::audit::request_e
         channel_name: &ctx.surface.name,
         trace_id: Some(&ctx.trace_id),
         via_fabric: false,
+    }
+}
+
+/// [`transit_audit_facts`] of a record written before [`step_resolve_trace`]:
+/// it carries the request's span and no trace id.
+fn untraced_audit_facts(ctx: &OutboundPipelineContext) -> crate::audit::request_events::RequestFacts<'_> {
+    crate::audit::request_events::RequestFacts {
+        trace_id: None,
+        ..transit_audit_facts(ctx)
     }
 }
 
@@ -5333,12 +5347,7 @@ fn record_body_too_large(
         "Request body too large"
     );
     crate::audit::request_events::request_rejected(
-        &crate::audit::request_events::RequestFacts {
-            surface_id: &ctx.surface.surface_id,
-            channel_name: &ctx.surface.name,
-            trace_id: Some(&ctx.trace_id),
-            via_fabric: false,
-        },
+        &untraced_audit_facts(ctx),
         crate::audit::request_events::RejectionStage::Admission,
         crate::audit::request_events::RejectionReason::BodyTooLarge,
         StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
@@ -8302,6 +8311,7 @@ mod tests {
             target_identity_failure: None,
             trust_check_results: None,
             trace_id: "test-request-id".to_string(),
+            trace: None,
             start_time: Instant::now(),
             _outbound_rules_engine: None,
             outbound_response_rules_engine: None,
@@ -10630,6 +10640,182 @@ mod tests {
         assert_eq!(decision.span_id, decision.request_id);
     }
 
+    /// A Transit Point's records name the parent span and the source of the
+    /// trace it continues or starts: a verified transit token's, with the
+    /// managed agent's span as the parent when its `traceparent` names that
+    /// trace, also on a Transit Point that does not require a token; else a
+    /// new trace in the written form.
+    #[tokio::test]
+    async fn a_transit_points_records_name_the_trace_it_resolved() {
+        let traced = |decision: &crate::delegation_vault::audit::DelegationAuditEvent| {
+            (
+                decision.trace_id.clone(),
+                decision
+                    .parent_span_id
+                    .clone(),
+                decision.trace_source.clone(),
+            )
+        };
+        let (state, issuer) = traced_transit_state(true);
+        let token = traced_transit_token(&issuer, TOKEN_TRACE_ID);
+        let traceparent = format!("00-{TOKEN_TRACE_ID}-53995c3f42cd8ad8-01");
+        let decision =
+            transit_policy_decision(state, &[("x-transit-token", &token), ("traceparent", &traceparent)]).await;
+        assert_eq!(
+            traced(&decision),
+            (Some(TOKEN_TRACE_ID.to_string()), Some("53995c3f42cd8ad8".to_string()), Some("transit_token".to_string()))
+        );
+
+        let (state, issuer) = traced_transit_state(false);
+        let token = traced_transit_token(&issuer, "4BF92F35-77B3-4DA6-A3CE-929D0E0E4736");
+        let decision = transit_policy_decision(state, &[("x-transit-token", &token)]).await;
+        assert_eq!(traced(&decision), (Some(TOKEN_TRACE_ID.to_string()), None, Some("transit_token".to_string())));
+
+        let (state, _) = traced_transit_state(false);
+        let decision = transit_policy_decision(state, &[]).await;
+        let (trace_id, parent_span_id, trace_source) = traced(&decision);
+        assert_eq!((parent_span_id, trace_source), (None, Some("minted".to_string())));
+        assert!(
+            trace_id
+                .as_deref()
+                .is_some_and(|trace_id| crate::proxy::trace::TraceId::from_written(trace_id).is_ok()),
+            "a new trace id is 32 lowercase hexadecimal digits: {trace_id:?}"
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(
+            &mut self,
+            bytes: &[u8],
+        ) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap()
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&'a self) -> CapturedLogs {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+        }
+    }
+
+    /// The trace id of a transit token the Transit Point refuses reaches no
+    /// record, no response header and no log line: a token for another
+    /// surface or another Transit Point, one signed with another key, and one
+    /// that expired. Where the Transit Point does not require a token, the
+    /// request follows its trace headers instead.
+    #[tokio::test]
+    async fn a_refused_transit_tokens_trace_id_reaches_no_record_header_or_log() {
+        use crate::proxy::transit_token::{TransitTokenClaims, TransitTokenIssuer, TransitTokenKey};
+
+        const REFUSED_TRACE_ID: &str = "0af7651916cd43dd8448eb211c80319c";
+        let (_, issuer) = traced_transit_state(true);
+        let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
+        let expired: TransitTokenClaims = serde_json::from_value(json!({
+            "iss": "gw-test", "surface_id": "traced-surface", "iat": now - 600, "exp": now - 300,
+            "jti": uuid::Uuid::new_v4().to_string(), "allowed_transit_points": ["partner-a"],
+            "trace_id": REFUSED_TRACE_ID
+        }))
+        .unwrap();
+        let refused_tokens = [
+            (
+                "another surface",
+                issuer
+                    .issue("another-surface", None, None, None, None, Some(REFUSED_TRACE_ID), vec!["partner-a".into()])
+                    .unwrap(),
+            ),
+            (
+                "another Transit Point",
+                issuer
+                    .issue("traced-surface", None, None, None, None, Some(REFUSED_TRACE_ID), vec!["partner-b".into()])
+                    .unwrap(),
+            ),
+            (
+                "another key",
+                traced_transit_token(
+                    &TransitTokenIssuer::new(TransitTokenKey::generate().unwrap(), "gw-test".into()),
+                    REFUSED_TRACE_ID,
+                ),
+            ),
+            ("expired", issuer.sign(&expired).unwrap()),
+        ];
+        let mut leaks = Vec::new();
+        for requires_token in [true, false] {
+            for (why, token) in &refused_tokens {
+                let (mut state, _) = traced_transit_state(requires_token);
+                state.transit_token_issuer = Some(Arc::new(issuer.clone()));
+                let request = Request::builder()
+                    .method("POST")
+                    .uri("/outbound/mcp/partner-a")
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .header("x-transit-token", token)
+                    .header("x-gateway-trace-id", TOKEN_TRACE_ID)
+                    .body(axum::body::Body::from(
+                        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string(),
+                    ))
+                    .unwrap();
+                let logs = CapturedLogs::default();
+                let logging = tracing::subscriber::set_default(
+                    tracing_subscriber::fmt()
+                        .with_writer(logs.clone())
+                        .with_max_level(tracing::Level::TRACE)
+                        .finish(),
+                );
+                let (response, events) =
+                    crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
+                        "127.0.0.1:12345"
+                            .parse()
+                            .unwrap(),
+                        state,
+                        request,
+                        crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                    )))
+                    .await;
+                drop(logging);
+                let response = response.unwrap_or_else(|error| error.into_response());
+                for (place, text) in [
+                    ("a record", serde_json::to_string(&events).unwrap()),
+                    ("a response header", format!("{:?}", response.headers())),
+                    ("the log", logs.text()),
+                ] {
+                    if text.contains(REFUSED_TRACE_ID) {
+                        leaks.push(format!("{why}, required {requires_token}: {place}"));
+                    }
+                }
+                let traced: Vec<_> = events
+                    .iter()
+                    .map(|event| event.trace_id.as_deref())
+                    .collect();
+                if requires_token && response.status() != StatusCode::UNAUTHORIZED {
+                    leaks.push(format!("{why}, required: answered {}", response.status()));
+                }
+                if !requires_token && !traced.contains(&Some(TOKEN_TRACE_ID)) {
+                    leaks.push(format!("{why}, not required: not under its X-Gateway-Trace-Id, {traced:?}"));
+                }
+            }
+        }
+        assert!(leaks.is_empty(), "a refused token's trace id was used: {leaks:#?}");
+    }
+
     // ── detect_protocol_and_operation ───────────────────────────────────────
 
     #[test]
@@ -11920,7 +12106,10 @@ mod tests {
                         .as_str()
                 )
             );
-            assert_eq!(events[0].trace_id.as_deref(), Some("test-request-id"));
+            assert_eq!(
+                events[0].trace_id, None,
+                "a caller refused before its transit token is checked is recorded under its span alone"
+            );
         }
 
         let mut admitted = context(Some("right-key"));
@@ -16300,7 +16489,7 @@ mod tests {
 
     /// A valid token sent to a Transit Point that does not require one names
     /// the caller to policy only. The claims that drive delegation, Workload
-    /// Binding, stream expiry and the trace id stay empty, as without a token.
+    /// Binding and stream expiry stay empty, as without a token.
     #[tokio::test]
     async fn an_optional_transit_token_reaches_policy_only() {
         let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(

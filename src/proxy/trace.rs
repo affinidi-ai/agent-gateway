@@ -294,6 +294,59 @@ impl RequestTrace {
         }
     }
 
+    /// The trace of a request to a Transit Point, under this gateway's span
+    /// `span_id`. The trace id of the transit token the Transit Point
+    /// verified, `token_trace_id`, is continued first: the `traceparent`'s
+    /// span is its parent only when it names that trace, and any other trace
+    /// header is ignored without a warning. Without a verified token, or with
+    /// one whose trace id is not valid, the headers are read as
+    /// [`Self::from_headers`] reads them.
+    pub fn at_transit_point(
+        token_trace_id: Option<&str>,
+        traceparent: &[&str],
+        x_gateway_trace_id: &[&str],
+        span_id: SpanId,
+    ) -> (Self, Option<TraceDisagreement>) {
+        let Some(trace_id) = token_trace_id.and_then(|trace_id| valid_header(TraceId::parse(trace_id))) else {
+            return Self::from_headers(traceparent, x_gateway_trace_id, span_id);
+        };
+        let parent = single(traceparent)
+            .and_then(|header| valid_header(Traceparent::parse(header)))
+            .filter(|traceparent| traceparent.trace_id == trace_id);
+        let continued = Self {
+            trace_id,
+            span_id,
+            parent_span_id: parent
+                .as_ref()
+                .map(|traceparent| {
+                    traceparent
+                        .parent_span_id
+                        .clone()
+                }),
+            trace_source: TraceSource::TransitToken,
+            continued_flags: parent.map(|traceparent| traceparent.flags),
+        };
+        (continued, None)
+    }
+
+    /// The trace of a Transit Point request that arrived with `headers`,
+    /// under this gateway's span `span_id`: [`Self::at_transit_point`] over
+    /// the trace id of the transit token it verified, `token_trace_id`, and
+    /// every field of the trace headers, as [`Self::from_request_headers`]
+    /// reads them.
+    pub fn from_transit_point_request(
+        token_trace_id: Option<&str>,
+        headers: &axum::http::HeaderMap,
+        span_id: SpanId,
+    ) -> Self {
+        warned(Self::at_transit_point(
+            token_trace_id,
+            &header_fields(headers, "traceparent"),
+            &header_fields(headers, "x-gateway-trace-id"),
+            span_id,
+        ))
+    }
+
     /// The trace of a request that arrived with `headers`, under this
     /// gateway's span `span_id`: [`Self::from_headers`] over every field of
     /// `traceparent` and `X-Gateway-Trace-Id`. A field whose value is not
@@ -303,23 +356,11 @@ impl RequestTrace {
         headers: &axum::http::HeaderMap,
         span_id: SpanId,
     ) -> Self {
-        let (trace, disagreement) = Self::from_headers(
+        warned(Self::from_headers(
             &header_fields(headers, "traceparent"),
             &header_fields(headers, "x-gateway-trace-id"),
             span_id,
-        );
-        if let Some(disagreement) = disagreement {
-            tracing::warn!(
-                traceparent_trace_id = disagreement
-                    .traceparent_trace_id
-                    .as_str(),
-                x_gateway_trace_id = disagreement
-                    .x_gateway_trace_id
-                    .as_str(),
-                "traceparent and X-Gateway-Trace-Id name different traces; X-Gateway-Trace-Id is continued"
-            );
-        }
-        trace
+        ))
     }
 
     /// The request's own trace, sent onward under this gateway's span.
@@ -454,6 +495,23 @@ pub fn is_trace_header(name: &str) -> bool {
     ["traceparent", "tracestate", "x-gateway-trace-id"]
         .iter()
         .any(|header| name.eq_ignore_ascii_case(header))
+}
+
+/// `resolved`'s trace, with a warning naming both validated trace ids when the
+/// trace headers named different traces.
+fn warned((trace, disagreement): (RequestTrace, Option<TraceDisagreement>)) -> RequestTrace {
+    if let Some(disagreement) = disagreement {
+        tracing::warn!(
+            traceparent_trace_id = disagreement
+                .traceparent_trace_id
+                .as_str(),
+            x_gateway_trace_id = disagreement
+                .x_gateway_trace_id
+                .as_str(),
+            "traceparent and X-Gateway-Trace-Id name different traces; X-Gateway-Trace-Id is continued"
+        );
+    }
+    trace
 }
 
 /// Every field of header `name`, in the order received. A value that is not
@@ -864,6 +922,72 @@ mod tests {
         }
     }
 
+    /// The `transit_point` cases the Transit Point refuses before any trace is
+    /// resolved. Run by the Transit Point's own tests, which send it requests.
+    const REFUSED_AT_THE_TRANSIT_POINT: [&str; 2] =
+        ["transit_required_token_unverified_refused", "transit_required_token_absent_refused"];
+
+    #[test]
+    fn transit_point_traces_resolve_as_the_vectors_say() {
+        let mut refused = Vec::new();
+        for case in vector_cases("transit_point") {
+            let (name, input, expected) = (&case["name"], &case["input"], &case["expected"]);
+            if expected["refused"] == json!(true) {
+                assert_eq!(input["requires_token"], json!(true), "{name}");
+                assert_ne!(input["transit_token"]["verified"], json!(true), "{name}");
+                refused.push(
+                    name.as_str()
+                        .unwrap()
+                        .to_string(),
+                );
+                continue;
+            }
+            let token = &input["transit_token"];
+            let verified_token_trace_id = (token["verified"] == json!(true)).then(|| {
+                token["trace_id"]
+                    .as_str()
+                    .unwrap()
+            });
+            assert_eq!(json!(verified_token_trace_id.is_some()), case["accepted"], "{name}");
+            let (trace, disagreement) = RequestTrace::at_transit_point(
+                verified_token_trace_id,
+                &header_values(&input["traceparent"]),
+                &header_values(&input["x_gateway_trace_id"]),
+                own_span(),
+            );
+            assert_eq!(json!(trace.trace_source.as_str()), expected["trace_source"], "{name}");
+            if trace.trace_source == TraceSource::Minted {
+                assert_eq!(expected["trace_id"], Value::Null, "{name}");
+                assert_eq!(TraceId::from_written(trace.trace_id.as_str()).as_ref(), Ok(&trace.trace_id), "{name}");
+            } else {
+                assert_eq!(json!(trace.trace_id.as_str()), expected["trace_id"], "{name}");
+            }
+            assert_eq!(trace.span_id, own_span(), "{name}");
+            assert_eq!(
+                json!(
+                    trace
+                        .parent_span_id
+                        .as_ref()
+                        .map(SpanId::as_str)
+                ),
+                expected["parent_span_id"],
+                "{name}"
+            );
+            assert_eq!(
+                json!(
+                    trace
+                        .continued_flags
+                        .map(|flags| flags.to_string())
+                ),
+                expected["continued_flags"],
+                "{name}"
+            );
+            assert_eq!(disagreement, None, "{name}");
+            assert_eq!(expected["warning"], Value::Null, "{name}");
+        }
+        assert_eq!(refused, REFUSED_AT_THE_TRANSIT_POINT);
+    }
+
     fn request_headers(fields: &[(&'static str, &[u8])]) -> axum::http::HeaderMap {
         let mut headers = axum::http::HeaderMap::new();
         for (name, value) in fields {
@@ -974,7 +1098,7 @@ mod tests {
         ("trace_termination", "run here"),
         ("trace_source", "run here, the cases of Gateway"),
         ("request_forwarded", "run by the request_forwarded record in audit::request_events"),
-        ("transit_point", "not run: a Transit Point does not resolve its trace by these rules yet"),
+        ("transit_point", "run here, but for what is sent: no send path decides its trace headers by target class yet"),
         ("transit_request_forwarded", "not run: Gateway writes no transit_request_forwarded record yet"),
         ("mcp_meta", "not run: Gateway does not write MCP metadata by its target's class yet"),
         ("link", "not Gateway's: Agent Watch follows links"),
