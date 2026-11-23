@@ -723,7 +723,11 @@ mod tests {
         for case in vector_cases("traceparent_compose") {
             let (name, input, expected) = (&case["name"], &case["input"], &case["expected"]);
             if matches!(input["target_class"].as_str(), Some("third_party" | "external_consent")) {
-                not_run.push(name.as_str().unwrap().to_string());
+                not_run.push(
+                    name.as_str()
+                        .unwrap()
+                        .to_string(),
+                );
                 continue;
             }
             let trace_id = TraceId::from_written(

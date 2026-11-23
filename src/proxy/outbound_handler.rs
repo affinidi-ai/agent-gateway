@@ -10528,6 +10528,108 @@ mod tests {
         assert_ne!(seen[0], seen[1], "each request has its own id");
     }
 
+    /// The trace id a transit token carries in tests.
+    const TOKEN_TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+    /// The state of a gateway serving surface `traced-surface`, whose Transit
+    /// Point `partner-a` runs a policy and requires a transit token when
+    /// `requires_token` is set, and the issuer of its transit tokens.
+    fn traced_transit_state(
+        requires_token: bool
+    ) -> (OutboundProxyState, crate::proxy::transit_token::TransitTokenIssuer) {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "traced-surface", "name": "Traced surface",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
+            "target": {"endpoint": "http://127.0.0.1:1"},
+            "transit": {"opa_policy_definition_id": "def-1", "points": [{"alias": "partner-a", "protocol": "mcp",
+                "require_transit_token": requires_token, "allow_unauthenticated_callers": true,
+                "target_endpoint": "http://127.0.0.1:9"}]}
+        }))
+        .unwrap();
+        let (state, issuer) = transit_token_test_state();
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(surface);
+        (state, issuer)
+    }
+
+    /// A transit token `issuer` issued for `traced-surface` and its Transit
+    /// Point `partner-a`, carrying `trace_id`.
+    fn traced_transit_token(
+        issuer: &crate::proxy::transit_token::TransitTokenIssuer,
+        trace_id: &str,
+    ) -> String {
+        issuer
+            .issue("traced-surface", None, None, None, None, Some(trace_id), vec!["partner-a".to_string()])
+            .unwrap()
+    }
+
+    /// The policy decision record of one `tools/list` the managed agent sends
+    /// Transit Point `partner-a` of `state` with `headers`.
+    async fn transit_policy_decision(
+        state: OutboundProxyState,
+        headers: &[(&str, &str)],
+    ) -> crate::delegation_vault::audit::DelegationAuditEvent {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/outbound/mcp/partner-a")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request
+            .body(axum::body::Body::from(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string()))
+            .unwrap();
+        let (_, events) = crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
+            "127.0.0.1:12345"
+                .parse()
+                .unwrap(),
+            state,
+            request,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+        )))
+        .await;
+        let mut decisions: Vec<_> = events
+            .into_iter()
+            .filter(|event| {
+                matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision { .. })
+            })
+            .collect();
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        decisions.remove(0)
+    }
+
+    /// A Transit Point's records carry the trace of a verified transit token,
+    /// else of a valid `X-Gateway-Trace-Id`, and the request's span.
+    #[tokio::test]
+    async fn a_transit_points_records_carry_its_trace_and_span() {
+        let (state, issuer) = traced_transit_state(true);
+        let token = traced_transit_token(&issuer, TOKEN_TRACE_ID);
+        let decision = transit_policy_decision(
+            state,
+            &[("x-transit-token", &token), ("x-gateway-trace-id", "0af7651916cd43dd8448eb211c80319c")],
+        )
+        .await;
+        assert_eq!(decision.trace_id.as_deref(), Some(TOKEN_TRACE_ID));
+        assert_eq!(decision.span_id, decision.request_id);
+        assert!(
+            decision
+                .span_id
+                .as_deref()
+                .is_some_and(|span| crate::proxy::trace::SpanId::parse(span).is_ok()),
+            "{decision:?}"
+        );
+
+        let (state, _) = traced_transit_state(false);
+        let decision =
+            transit_policy_decision(state, &[("x-gateway-trace-id", "0af7651916cd43dd8448eb211c80319c")]).await;
+        assert_eq!(decision.trace_id.as_deref(), Some("0af7651916cd43dd8448eb211c80319c"));
+        assert_eq!(decision.span_id, decision.request_id);
+    }
+
     // ── detect_protocol_and_operation ───────────────────────────────────────
 
     #[test]
