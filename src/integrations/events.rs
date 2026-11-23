@@ -659,9 +659,11 @@ mod tests {
     }
 
     #[test]
-    fn request_forwarded_is_offered_to_event_sets_in_the_requests_group() {
-        let event = find_event("audit.request_forwarded").expect("audit.request_forwarded is in the catalogue");
-        assert_eq!((event.family, event.group), (AUDIT.id, Some("requests")));
+    fn forwarded_requests_are_offered_to_event_sets_in_the_requests_group() {
+        for id in ["audit.request_forwarded", "audit.transit_request_forwarded"] {
+            let event = find_event(id).unwrap_or_else(|| panic!("{id} is in the catalogue"));
+            assert_eq!((event.family, event.group), (AUDIT.id, Some("requests")), "{id}");
+        }
     }
 
     #[test]

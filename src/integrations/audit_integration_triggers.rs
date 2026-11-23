@@ -584,6 +584,7 @@ mod tests {
             | DelegationAuditAction::RateLimited { .. }
             | DelegationAuditAction::RequestRejected { .. }
             | DelegationAuditAction::RequestForwarded { .. }
+            | DelegationAuditAction::TransitRequestForwarded { .. }
             | DelegationAuditAction::IdentityBindingFailed { .. }
             | DelegationAuditAction::IdentityBindingVerified { .. }
             | DelegationAuditAction::DelegationFailed { .. }
@@ -683,6 +684,9 @@ mod tests {
             DelegationAuditAction::RequestForwarded {
                 flow: "access_point".to_string(),
                 caller_did: None,
+            },
+            DelegationAuditAction::TransitRequestForwarded {
+                transit_point: "tools".to_string(),
             },
             DelegationAuditAction::IdentityBindingFailed {
                 outcome: IdentityBindingFailure::Absent,

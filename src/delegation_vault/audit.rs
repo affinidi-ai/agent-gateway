@@ -828,6 +828,13 @@ pub enum DelegationAuditAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_did: Option<String>,
     },
+    /// A Transit Point request was handed to its target. The record names no
+    /// caller: the original caller is on the Access Point's record of the
+    /// same trace.
+    TransitRequestForwarded {
+        /// The Transit Point's alias.
+        transit_point: String,
+    },
     IdentityBindingFailed {
         outcome: IdentityBindingFailure,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -938,6 +945,7 @@ impl DelegationAuditAction {
                 | Self::RateLimited { .. }
                 | Self::RequestRejected { .. }
                 | Self::RequestForwarded { .. }
+                | Self::TransitRequestForwarded { .. }
                 | Self::IdentityBindingFailed { .. }
                 | Self::IdentityBindingVerified { .. }
                 | Self::RequestFailed { .. }
@@ -1878,6 +1886,7 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::RateLimited { .. } => "rate_limited",
         DelegationAuditAction::RequestRejected { .. } => "request_rejected",
         DelegationAuditAction::RequestForwarded { .. } => "request_forwarded",
+        DelegationAuditAction::TransitRequestForwarded { .. } => "transit_request_forwarded",
         DelegationAuditAction::IdentityBindingFailed { .. } => "identity_binding_failed",
         DelegationAuditAction::IdentityBindingVerified { .. } => "identity_binding_verified",
         DelegationAuditAction::DelegationFailed { .. } => "delegation_failed",
