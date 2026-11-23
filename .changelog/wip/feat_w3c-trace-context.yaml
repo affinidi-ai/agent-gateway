@@ -31,12 +31,7 @@ changes:
         Audit integration templates can now use AUDIT_SPAN_ID, AUDIT_PARENT_SPAN_ID and
         AUDIT_TRACE_SOURCE for every audit record, so a receiver such as Agent Watch can follow a
         request across appliances without parsing the whole record.
-  changed:
-    - timestamp: '2026-11-23T11:30:00Z'
-      title: Name the unknown audit events a settings update is refused for
-      description: >-
-        A settings update whose audit_events holds a name outside the audit event catalog is
-        still refused, and the refusal now names the unknown events.
+  changed: []
   fixed: []
   removed: []
   security: []
