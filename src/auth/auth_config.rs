@@ -245,7 +245,11 @@ fn logged_unread_keys(unread: &[String]) -> Vec<String> {
     unread
         .iter()
         .take(MAX_LOGGED_UNREAD_SAML_KEYS)
-        .map(|key| key.chars().take(MAX_LOGGED_KEY_CHARS).collect())
+        .map(|key| {
+            key.chars()
+                .take(MAX_LOGGED_KEY_CHARS)
+                .collect()
+        })
         .collect()
 }
 
@@ -276,7 +280,11 @@ fn collect_unread_keys(
         if value.is_null() {
             continue;
         }
-        let path = if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") };
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
         if IGNORED_SAML_KEYS.contains(&path.as_str()) {
             continue;
         }
@@ -476,7 +484,9 @@ mod tests {
 
     #[test]
     fn logged_unread_keys_names_at_most_20_keys() {
-        let unread: Vec<String> = (0..25).map(|index| format!("key_{index:02}")).collect();
+        let unread: Vec<String> = (0..25)
+            .map(|index| format!("key_{index:02}"))
+            .collect();
 
         assert_eq!(logged_unread_keys(&unread), unread[..20].to_vec());
     }
@@ -520,7 +530,11 @@ mod tests {
     fn load_from_file_reports_missing_file() {
         let dir = tempfile::tempdir().unwrap();
 
-        let error = SamlConfig::load_from_file(dir.path().join("missing.json")).unwrap_err();
+        let error = SamlConfig::load_from_file(
+            dir.path()
+                .join("missing.json"),
+        )
+        .unwrap_err();
 
         assert!(error.starts_with("Failed to read SAML config file"), "{error}");
     }
