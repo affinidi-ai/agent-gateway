@@ -5864,6 +5864,35 @@ pub(crate) mod tests {
         );
     }
 
+    /// A Fabric receive pays under the trace id the Fabric message named,
+    /// whatever its form: the payment call's `traceparent` names that id, or a
+    /// hash of it, under a fresh span, sampled.
+    #[tokio::test]
+    async fn a_payment_call_for_a_received_trace_keeps_its_traceparent() {
+        use sha2::{Digest, Sha256};
+
+        let gate = paid_gate();
+        install_test_transport("gw-received", gate.clone());
+        let surface = mcp_surface("gw-received", json!({"require_all": true}));
+        let fabric = no_fabric();
+        let intake = read(&surface, &x402_headers(&unique("proof")), &tool_call("t", json!({})));
+        let received = GateCall {
+            egress_trace_id: "trace-from-the-peer",
+            ..call(&surface, &fabric)
+        };
+        assert!(matches!(charge(&intake, received).await, GateOutcome::Paid(_)));
+        let sent = gate.last();
+        let traceparent = sent.headers["traceparent"].clone();
+        let parts: Vec<&str> = traceparent
+            .split('-')
+            .collect();
+        let hashed = hex::encode(&Sha256::digest(b"trace-from-the-peer")[..16]);
+        assert_eq!((parts[0], parts[1], parts[3]), ("00", hashed.as_str(), "01"), "{traceparent}");
+        assert_eq!(parts[2].len(), 16, "{traceparent}");
+        assert_eq!(sent.trace_id, "trace-from-the-peer");
+        assert_eq!(sent.payment_context["correlation"]["trace_context"], sent.headers["traceparent"]);
+    }
+
     #[tokio::test]
     async fn records_use_the_ingress_trace_and_the_wire_uses_the_egress_trace() {
         let gate = paid_gate();
