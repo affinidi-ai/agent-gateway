@@ -1158,6 +1158,45 @@ async fn the_target_gets_nothing_of_the_callers_but_its_request() {
     assert_eq!(headers["cache-control"], "no-store");
 }
 
+/// A Target bound by external consent is sent the request's trace id in
+/// `X-Gateway-Trace-Id` alone, in its written form, and neither a
+/// `traceparent` nor a `tracestate`, whatever trace headers the caller sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_target_bound_by_external_consent_is_sent_the_trace_id_alone() {
+    let fixture = Fixture::new(vec![Answer::status(200)], vec![vendor_result()]).await;
+    fixture
+        .store(&owner_key(), "owner-access")
+        .await;
+    let (mut parts, body) = mcp_call(Some(KEY)).into_parts();
+    for (name, value) in [
+        ("traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+        ("tracestate", "congo=t61rcWkgMzE"),
+        ("x-gateway-trace-id", "0AF76519-16CD-43DD-8448-EB211C80319C"),
+    ] {
+        parts
+            .headers
+            .insert(name, axum::http::HeaderValue::from_static(value));
+    }
+    let (status, _, body) = fixture
+        .send(axum::http::Request::from_parts(parts, body))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+
+    let heads = fixture.vendor_heads();
+    assert_eq!(heads.len(), 1);
+    let (line, headers) = &heads[0];
+    let values = |name: &str| -> Vec<&str> {
+        headers
+            .iter()
+            .filter(|(sent, _)| sent == name)
+            .map(|(_, value)| value.as_str())
+            .collect()
+    };
+    assert_eq!(values("x-gateway-trace-id"), ["0af7651916cd43dd8448eb211c80319c"], "{line}: {headers:?}");
+    assert!(values("traceparent").is_empty(), "{line} sent a traceparent: {headers:?}");
+    assert!(values("tracestate").is_empty(), "{line} sent a tracestate: {headers:?}");
+}
+
 /// Of the caller's headers the vendor is sent only the protocol headers its
 /// requests need: `Content-Type`, `Accept`, MCP's protocol version and
 /// session, and A2A's version and extensions. No other header the caller set
