@@ -1416,28 +1416,25 @@ pub(crate) fn replace_request_header(
     }
 }
 
-/// `request` with the trace headers of `trace`, each once. The caller's
-/// `tracestate` fields (`caller_headers`) pass on, joined, only when `trace`
+/// `request` with the trace headers of `trace` the Access Point's target
+/// receives, each once: its Managed Agent is a Fabric target, and a Target
+/// bound by external consent (`bound_target`) gets the trace id alone. The
+/// caller's `tracestate` (`caller_headers`) passes on only when `trace`
 /// continues the caller's `traceparent`. Gateway does not export the request's
 /// span yet, so the sampled flag follows [`crate::proxy::trace::SpanExport::Off`].
-/// A Target bound by external consent (`bound_target`) is sent the trace id
-/// alone, as before W3C trace context.
 fn with_onward_trace_headers(
     mut request: reqwest::RequestBuilder,
     trace: &crate::proxy::trace::OutgoingTrace,
     caller_headers: &HeaderMap,
     bound_target: bool,
 ) -> reqwest::RequestBuilder {
-    if bound_target {
-        return request.header("x-gateway-trace-id", trace.trace_id().as_str());
-    }
-    let tracestate: Vec<&str> = caller_headers
-        .get_all("tracestate")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .collect();
-    let tracestate = (!tracestate.is_empty()).then(|| tracestate.join(","));
-    for (name, value) in trace.headers(crate::proxy::trace::SpanExport::Off, tracestate.as_deref()) {
+    use crate::proxy::trace::TargetClass;
+    let class = if bound_target {
+        TargetClass::ExternalConsent
+    } else {
+        TargetClass::Fabric
+    };
+    for (name, value) in trace.headers_toward(class, crate::proxy::trace::SpanExport::Off, caller_headers) {
         request = request.header(name, value);
     }
     request

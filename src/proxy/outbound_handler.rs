@@ -2821,12 +2821,14 @@ fn is_proxy_forwarding_header(name: &str) -> bool {
 }
 
 /// The headers a Transit Point sends to its target, over HTTP or Fabric: the
-/// managed agent's forwardable headers, then the target authentication header,
-/// then the delegated credential headers, each replacing any earlier header of
-/// the same name, so the target receives one value of each credential header. An
-/// agent header named like the `target_auth` header or like the header of any
-/// delegated credential binding of the Transit Point is never forwarded, whether
-/// or not the gateway adds its own value.
+/// managed agent's forwardable headers but its trace headers, then the trace
+/// headers the target's class gets ([`transit_trace_headers`]), then the
+/// target authentication header, then the delegated credential headers, each
+/// replacing any earlier header of the same name, so the target receives one
+/// value of each credential header. An agent header named like the
+/// `target_auth` header or like the header of any delegated credential binding
+/// of the Transit Point is never forwarded, whether or not the gateway adds its
+/// own value.
 async fn transit_request_headers(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
@@ -2840,8 +2842,14 @@ async fn transit_request_headers(
     for (name, value) in &ctx.original_headers {
         if should_forward_outbound_request_header(name.as_str(), mapping)
             && !crate::proxy::handler::is_credential_header(name.as_str(), &credential_headers)
+            && !crate::proxy::trace::is_trace_header(name.as_str())
         {
             headers.append(name.clone(), value.clone());
+        }
+    }
+    for (name, value) in transit_trace_headers(ctx) {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&value) {
+            headers.insert(name, value);
         }
     }
     if let Some((name, value)) = target_auth {
@@ -2851,6 +2859,57 @@ async fn transit_request_headers(
         headers.insert(name.clone(), value.clone());
     }
     Ok(headers)
+}
+
+/// The trace headers the Transit Point sends its target, by the class of its
+/// target ([`crate::proxy::trace::TargetClass::of_transit_target`]): the
+/// request's trace toward a `fabric://` target, none toward any other.
+fn transit_trace_headers(ctx: &OutboundPipelineContext) -> Vec<(&'static str, String)> {
+    ctx.trace
+        .as_ref()
+        .map(|trace| {
+            trace
+                .outgoing()
+                .headers_toward(
+                    crate::proxy::trace::TargetClass::of_transit_target(
+                        &ctx.virtual_channel
+                            .target_endpoint,
+                    ),
+                    crate::proxy::trace::SpanExport::Off,
+                    &ctx.original_headers,
+                )
+        })
+        .unwrap_or_default()
+}
+
+/// The MCP request body the Transit Point sends its target: `params._meta`
+/// carries the trace the target's class gets
+/// ([`crate::proxy::trace::mcp_body_toward`]).
+fn send_mcp_metadata_by_target_class(ctx: &mut OutboundPipelineContext) {
+    if ctx.virtual_channel.protocol != crate::config::agent_surface::TransitProtocol::Mcp {
+        return;
+    }
+    let sent = transit_trace_headers(ctx);
+    let sent_traceparent = sent
+        .iter()
+        .find(|(name, _)| *name == "traceparent")
+        .map(|(_, traceparent)| traceparent.as_str());
+    if let Some(body) = ctx
+        .body_bytes
+        .as_deref()
+        .and_then(|body| {
+            crate::proxy::trace::mcp_body_toward(
+                crate::proxy::trace::TargetClass::of_transit_target(
+                    &ctx.virtual_channel
+                        .target_endpoint,
+                ),
+                body,
+                sent_traceparent,
+            )
+        })
+    {
+        ctx.body_bytes = Some(Bytes::from(body));
+    }
 }
 
 /// The names of the headers that carry the Transit Point's credentials: its
@@ -6262,6 +6321,7 @@ async fn step_forward_request(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<UpstreamResponse, OutboundPipelineError> {
+    send_mcp_metadata_by_target_class(ctx);
     if ctx
         .virtual_channel
         .target_endpoint
@@ -10799,6 +10859,50 @@ mod tests {
             Some("rojo=00f067aa0ba902b7"),
             "{sent:?}"
         );
+    }
+
+    /// A Transit Point's target reached at an address of its own is a third
+    /// party: it is sent no `traceparent`, `tracestate` or
+    /// `X-Gateway-Trace-Id`, and an MCP request's `params._meta` loses its
+    /// `traceparent` and `tracestate` and keeps the rest.
+    #[tokio::test]
+    async fn a_third_party_target_is_sent_no_trace() {
+        let target = crate::component_tests::helpers::MockServer::start_with_response(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"content": []}}).to_string(),
+        )
+        .await;
+        let (state, issuer) = partner_a_state(json!({"points": [{"alias": "partner-a", "protocol": "mcp",
+            "allow_unauthenticated_callers": true, "target_endpoint": format!("http://{}", target.addr)}]}));
+        let token = traced_transit_token(&issuer, TOKEN_TRACE_ID);
+        let traceparent = format!("00-{TOKEN_TRACE_ID}-53995c3f42cd8ad8-01");
+
+        let (response, _) = send_to_partner_a(
+            state,
+            &[
+                ("x-transit-token", &token),
+                ("traceparent", &traceparent),
+                ("tracestate", "rojo=00f067aa0ba902b7"),
+                ("x-gateway-trace-id", TOKEN_TRACE_ID),
+            ],
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "echo", "arguments": {},
+                "_meta": {"traceparent": traceparent, "tracestate": "rojo=00f067aa0ba902b7", "progressToken": "t-1"}}}),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let received = target
+            .last_request_rx
+            .borrow()
+            .clone()
+            .expect("the target was called");
+        let trace_headers: Vec<&String> = received
+            .headers
+            .keys()
+            .filter(|name| crate::proxy::trace::is_trace_header(name))
+            .collect();
+        assert!(trace_headers.is_empty(), "the target received {trace_headers:?}");
+        let body: serde_json::Value = serde_json::from_str(&received.body).unwrap();
+        assert_eq!(body["params"]["_meta"], json!({"progressToken": "t-1"}), "{body}");
     }
 
     /// A Transit Point request refused before it is forwarded writes no

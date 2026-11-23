@@ -463,6 +463,112 @@ impl OutgoingTrace {
     }
 }
 
+/// The class of the target a request is sent to, by the route it takes, which
+/// decides the trace it is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetClass {
+    /// A target over the Fabric, and an Access Point's Managed Agent: the trace
+    /// is continued.
+    Fabric,
+    /// Every other target: it is sent no trace.
+    ThirdParty,
+    /// An Access Point's Target bound by external consent: it is sent the trace
+    /// id in `X-Gateway-Trace-Id` alone.
+    ExternalConsent,
+}
+
+impl TargetClass {
+    /// The class of a Transit Point's target at `endpoint`.
+    pub fn of_transit_target(endpoint: &str) -> Self {
+        if endpoint.starts_with("fabric://") {
+            Self::Fabric
+        } else {
+            Self::ThirdParty
+        }
+    }
+}
+
+impl OutgoingTrace {
+    /// The trace headers a request that arrived with `received` headers is
+    /// sent with toward a target of `class`, each once: [`Self::headers`]
+    /// toward a Fabric target, the trace id in `X-Gateway-Trace-Id` alone
+    /// toward a Target bound by external consent, and none toward a third
+    /// party.
+    pub fn headers_toward(
+        &self,
+        class: TargetClass,
+        export: SpanExport,
+        received: &axum::http::HeaderMap,
+    ) -> Vec<(&'static str, String)> {
+        match class {
+            TargetClass::Fabric => self.headers(export, received_tracestate(received).as_deref()),
+            TargetClass::ExternalConsent => vec![(
+                "x-gateway-trace-id",
+                self.trace_id
+                    .as_str()
+                    .to_string(),
+            )],
+            TargetClass::ThirdParty => Vec::new(),
+        }
+    }
+}
+
+/// The `tracestate` a request arrived with, its fields joined in the order
+/// received.
+fn received_tracestate(headers: &axum::http::HeaderMap) -> Option<String> {
+    let fields: Vec<&str> = headers
+        .get_all("tracestate")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    (!fields.is_empty()).then(|| fields.join(","))
+}
+
+/// `params._meta` of an MCP request as it is sent to a target of `class`.
+/// Toward a Fabric target a `traceparent` it carries is replaced by the one
+/// sent in the header, `sent_traceparent`, and none is added; toward a third
+/// party `traceparent` and `tracestate` are removed; toward a Target bound by
+/// external consent nothing changes. Every other key stays as it is.
+pub fn mcp_meta_toward(
+    class: TargetClass,
+    meta: &mut serde_json::Map<String, serde_json::Value>,
+    sent_traceparent: Option<&str>,
+) {
+    match class {
+        TargetClass::Fabric => {
+            if let (Some(carried), Some(sent)) = (meta.get_mut("traceparent"), sent_traceparent) {
+                *carried = serde_json::Value::from(sent);
+            }
+        }
+        TargetClass::ThirdParty => {
+            meta.remove("traceparent");
+            meta.remove("tracestate");
+        }
+        TargetClass::ExternalConsent => {}
+    }
+}
+
+/// An MCP request `body` as it is sent to a target of `class`, by
+/// [`mcp_meta_toward`]; `None` when it is sent as it is: not a JSON object,
+/// without `params._meta`, or with nothing to change there.
+pub fn mcp_body_toward(
+    class: TargetClass,
+    body: &[u8],
+    sent_traceparent: Option<&str>,
+) -> Option<Vec<u8>> {
+    let mut request: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let meta = request
+        .get_mut("params")?
+        .get_mut("_meta")?
+        .as_object_mut()?;
+    let received = meta.clone();
+    mcp_meta_toward(class, meta, sent_traceparent);
+    if *meta == received {
+        return None;
+    }
+    serde_json::to_vec(&request).ok()
+}
+
 /// The trace a payment call goes out under.
 #[derive(Debug, Clone, Copy)]
 pub enum PaymentTrace<'a> {
@@ -767,27 +873,44 @@ mod tests {
         traceparent.get(53..)
     }
 
-    /// The `traceparent_compose` cases toward a target sent no composed
-    /// `traceparent`. Not run yet: no send path decides its trace headers by
-    /// its target's class.
-    const COMPOSED_BY_TARGET_CLASS: [&str; 2] = [
-        "compose_transit_point_to_a_third_party_target_sends_none",
-        "compose_access_point_to_an_external_consent_target_sends_the_trace_id_alone",
-    ];
+    /// The target class a vector names, a Fabric target when it names none.
+    fn class_of(input: &Value) -> TargetClass {
+        match input["target_class"].as_str() {
+            None | Some("fabric") => TargetClass::Fabric,
+            Some("third_party") => TargetClass::ThirdParty,
+            Some("external_consent") => TargetClass::ExternalConsent,
+            Some(other) => panic!("no target class {other}"),
+        }
+    }
+
+    /// The `tracestate` a vector's request arrived with, as its headers.
+    fn received_headers(input: &Value) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        for tracestate in header_values(&input["tracestate"]) {
+            headers.append("tracestate", tracestate.parse().unwrap());
+        }
+        headers
+    }
+
+    /// What `headers` send, as the vectors' `expected.sent` names it.
+    fn sent(headers: &[(&'static str, String)]) -> Value {
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(sent, _)| *sent == name)
+                .map(|(_, value)| value.as_str())
+        };
+        json!({
+            "traceparent_trace_id": header("traceparent").and_then(|traceparent| traceparent.get(3..35)),
+            "tracestate": header("tracestate"),
+            "x_gateway_trace_id": header("x-gateway-trace-id"),
+        })
+    }
 
     #[test]
     fn outgoing_traceparent_names_the_span_and_flags() {
-        let mut not_run = Vec::new();
         for case in vector_cases("traceparent_compose") {
             let (name, input, expected) = (&case["name"], &case["input"], &case["expected"]);
-            if matches!(input["target_class"].as_str(), Some("third_party" | "external_consent")) {
-                not_run.push(
-                    name.as_str()
-                        .unwrap()
-                        .to_string(),
-                );
-                continue;
-            }
             let trace_id = TraceId::from_written(
                 input["trace_id"]
                     .as_str()
@@ -798,7 +921,7 @@ mod tests {
                     .as_str()
                     .unwrap(),
             );
-            let composed = trace_id
+            let headers = trace_id
                 .ok()
                 .zip(span_id.ok())
                 .map(|(trace_id, span_id)| {
@@ -807,8 +930,16 @@ mod tests {
                         span_id,
                         continued_flags: flags(&input["continued_flags"]),
                     }
-                    .traceparent(export(input))
-                });
+                    .headers_toward(class_of(input), export(input), &received_headers(input))
+                })
+                .unwrap_or_default();
+            if !expected["sent"].is_null() {
+                assert_eq!(sent(&headers), expected["sent"], "{name}");
+            }
+            let composed = headers
+                .into_iter()
+                .find(|(header, _)| *header == "traceparent")
+                .map(|(_, traceparent)| traceparent);
             assert_eq!(json!(composed.is_some()), case["accepted"], "{name}");
             assert_eq!(json!(composed), expected["traceparent"], "{name}");
             assert_eq!(
@@ -821,7 +952,6 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(not_run, COMPOSED_BY_TARGET_CLASS);
     }
 
     /// The outgoing trace of a `tracestate_and_flags` case.
@@ -984,8 +1114,75 @@ mod tests {
             );
             assert_eq!(disagreement, None, "{name}");
             assert_eq!(expected["warning"], Value::Null, "{name}");
+            let headers = trace
+                .outgoing()
+                .headers_toward(class_of(input), SpanExport::Off, &received_headers(input));
+            assert_eq!(sent(&headers), expected["sent"], "{name}");
         }
         assert_eq!(refused, REFUSED_AT_THE_TRANSIT_POINT);
+    }
+
+    #[test]
+    fn mcp_metadata_is_sent_as_the_vectors_say() {
+        for case in vector_cases("mcp_meta") {
+            let (name, input, expected) = (&case["name"], &case["input"], &case["expected"]);
+            let mut meta = input["body_other"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            for (field, key) in [("body_traceparent", "traceparent"), ("body_tracestate", "tracestate")] {
+                if let Some(value) = input[field].as_str() {
+                    meta.insert(key.to_string(), json!(value));
+                }
+            }
+            let received = meta.clone();
+            mcp_meta_toward(class_of(input), &mut meta, input["sent_traceparent"].as_str());
+            assert_eq!(json!(meta.get("traceparent")), expected["body_traceparent"], "{name}");
+            if let Some(tracestate) = expected.get("body_tracestate") {
+                assert_eq!(json!(meta.get("tracestate")), *tracestate, "{name}");
+            }
+            if let Some(other) = expected.get("body_other") {
+                let mut kept = meta.clone();
+                kept.remove("traceparent");
+                kept.remove("tracestate");
+                assert_eq!(json!(kept), *other, "{name}");
+            }
+            let replaced = meta
+                .get("traceparent")
+                .is_some()
+                && meta.get("traceparent") != received.get("traceparent");
+            assert_eq!(json!(replaced), case["accepted"], "{name}");
+        }
+    }
+
+    #[test]
+    fn an_mcp_body_is_rewritten_only_when_its_metadata_changes() {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "echo",
+            "_meta": {"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                "tracestate": "rojo=00f067aa0ba902b7", "progressToken": "t-1"}}});
+        let sent: Value = serde_json::from_slice(
+            &mcp_body_toward(TargetClass::ThirdParty, body.to_string().as_bytes(), None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sent["params"]["_meta"], json!({"progressToken": "t-1"}));
+        assert_eq!(sent["params"]["name"], "echo");
+        for unchanged in [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"_meta": {"progressToken": "t-1"}}}),
+        ] {
+            assert_eq!(
+                mcp_body_toward(
+                    TargetClass::ThirdParty,
+                    unchanged
+                        .to_string()
+                        .as_bytes(),
+                    None
+                ),
+                None
+            );
+        }
+        assert_eq!(mcp_body_toward(TargetClass::ThirdParty, b"not json", None), None);
+        assert_eq!(mcp_body_toward(TargetClass::ExternalConsent, body.to_string().as_bytes(), None), None);
     }
 
     fn request_headers(fields: &[(&'static str, &[u8])]) -> axum::http::HeaderMap {
@@ -1098,9 +1295,9 @@ mod tests {
         ("trace_termination", "run here"),
         ("trace_source", "run here, the cases of Gateway"),
         ("request_forwarded", "run by the request_forwarded record in audit::request_events"),
-        ("transit_point", "run here, but for what is sent: no send path decides its trace headers by target class yet"),
+        ("transit_point", "run here"),
         ("transit_request_forwarded", "run by the transit_request_forwarded record in audit::request_events"),
-        ("mcp_meta", "not run: Gateway does not write MCP metadata by its target's class yet"),
+        ("mcp_meta", "run here"),
         ("link", "not Gateway's: Agent Watch follows links"),
         ("caller_identity_verified", "not Gateway's: Agent Stream writes it"),
         ("caller_key", "not Gateway's: Agent Watch builds caller keys"),

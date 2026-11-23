@@ -57,6 +57,15 @@ changes:
         request is forwarded with: the Access Point's span, sampled only when the caller's
         continued trace was. It carried a fresh span, always sampled. A payment made by a
         gateway that received the request over the Fabric is unchanged.
+    - timestamp: '2026-11-23T20:00:00Z'
+      title: Send a Transit Point's target its trace by the target's class
+      description: >-
+        A Transit Point no longer passes the managed agent's traceparent, tracestate and
+        X-Gateway-Trace-Id on. A fabric:// target receives the Transit Point's own traceparent and
+        X-Gateway-Trace-Id of the request's trace, with tracestate only when the agent's
+        traceparent was continued, and an MCP body's params._meta traceparent is replaced by it.
+        Any other target, a third party, receives no trace header, and traceparent and tracestate
+        are removed from an MCP body's params._meta, so a vendor never learns the trace.
   fixed: []
   removed: []
   security: []
