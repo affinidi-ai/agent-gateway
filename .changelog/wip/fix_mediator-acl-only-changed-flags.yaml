@@ -86,4 +86,9 @@ changes:
         Connection Point lists already leave them out. A paused acceptance's temporary point holds
         the inviter's invitation secret, which a caller with view access could otherwise read and
         redeem first.
+    - timestamp: '2026-11-23T10:30:00Z'
+      title: Update cookie to 0.18.3 for RUSTSEC-2026-0594
+      description: >-
+        Bumps cookie from 0.18.1 to 0.18.3, past RUSTSEC-2026-0594: private cookie nonces can repeat
+        in a process that forks. Restores a passing cargo audit. No code changes.
   breaking: []
