@@ -1099,7 +1099,7 @@ mod tests {
         ("trace_source", "run here, the cases of Gateway"),
         ("request_forwarded", "run by the request_forwarded record in audit::request_events"),
         ("transit_point", "run here, but for what is sent: no send path decides its trace headers by target class yet"),
-        ("transit_request_forwarded", "not run: Gateway writes no transit_request_forwarded record yet"),
+        ("transit_request_forwarded", "run by the transit_request_forwarded record in audit::request_events"),
         ("mcp_meta", "not run: Gateway does not write MCP metadata by its target's class yet"),
         ("link", "not Gateway's: Agent Watch follows links"),
         ("caller_identity_verified", "not Gateway's: Agent Stream writes it"),

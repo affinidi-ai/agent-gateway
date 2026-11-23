@@ -178,6 +178,47 @@ pub fn request_forwarded(forwarding: Forwarding<'_>) {
     })
 }
 
+/// What a Transit Point knows about a request at the moment it hands it to its
+/// target.
+pub struct TransitForwarding<'a> {
+    pub surface: &'a crate::config::agent_surface::AgentSurface,
+    pub transit_point: &'a crate::config::agent_surface::TransitPoint,
+    pub trace_id: &'a str,
+    /// The protected agent's DID, when the Transit Point resolved one.
+    pub agent_identity_did: Option<&'a str>,
+}
+
+/// The Transit Point is handing a request to its target, over HTTP or the
+/// Fabric. The record names no caller. The target URL is written without its
+/// credentials.
+pub fn transit_request_forwarded(forwarding: TransitForwarding<'_>) {
+    emit("transit_request_forwarded", || {
+        let (surface, transit_point) = (forwarding.surface, forwarding.transit_point);
+        let facts = RequestFacts {
+            surface_id: &surface.surface_id,
+            channel_name: &surface.name,
+            trace_id: Some(forwarding.trace_id),
+            via_fabric: transit_point
+                .target_endpoint
+                .starts_with("fabric://"),
+        };
+        let mut record = facts.record(DelegationAuditAction::TransitRequestForwarded {
+            transit_point: transit_point.alias.clone(),
+        });
+        record.tenant_id = surface.tenant_id.clone();
+        record.protocol = Some(
+            transit_point
+                .protocol
+                .to_string(),
+        );
+        record.target_endpoint = Some(crate::observability::loggable::url(&transit_point.target_endpoint));
+        record.agent_identity_did = forwarding
+            .agent_identity_did
+            .map(str::to_string);
+        record
+    })
+}
+
 /// The gateway refused the request. `http_status` and `rpc_error_code` are
 /// what the caller received; a Fabric refusal records no HTTP status, as no
 /// HTTP response is involved.
@@ -646,6 +687,122 @@ mod tests {
         assert_eq!(
             refused,
             ["refused_before_forwarding", "transit_point_request", "fabric_receive"],
+            "each refusing case has its own test where the request is served"
+        );
+    }
+
+    /// A surface whose Transit Point `tools` sends to `endpoint`, a URL with a
+    /// planted password, query value and fragment unless it is `fabric://`.
+    fn transit_forwarding_surface(endpoint: &str) -> crate::config::agent_surface::AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": "orders", "name": "Orders", "tenant_id": "tenant-a",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
+            "target": {"endpoint": "https://agent.example/a2a"},
+            "transit": {"points": [{"alias": "tools", "protocol": "mcp", "target_endpoint": endpoint}]}
+        }))
+        .unwrap()
+    }
+
+    /// Every record written while a Transit Point records a request it
+    /// forwards to `endpoint`, inside a request whose trace is `trace`.
+    async fn recorded_transit_forwarding(
+        trace: crate::proxy::trace::RequestTrace,
+        endpoint: &str,
+    ) -> Vec<serde_json::Value> {
+        use crate::observability::policy_audit::{RequestScope, in_request};
+        let surface = transit_forwarding_surface(endpoint);
+        let trace_id = trace
+            .trace_id
+            .as_str()
+            .to_string();
+        let ((), records) = crate::audit::producer::capture(in_request(RequestScope::traced(trace), async {
+            transit_request_forwarded(TransitForwarding {
+                surface: &surface,
+                transit_point: &surface.transit_points()[0],
+                trace_id: &trace_id,
+                agent_identity_did: Some("did:web:agent.example"),
+            });
+        }))
+        .await;
+        records
+            .iter()
+            .map(|record| serde_json::to_value(record).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn transit_request_forwarded_writes_the_vectors_fields() {
+        use crate::proxy::trace::{RequestTrace, SpanId};
+        let cases = crate::proxy::trace::vector_cases("transit_request_forwarded");
+        for case in cases
+            .iter()
+            .filter(|case| case["accepted"] == true)
+        {
+            let (name, input, expected) = (&case["name"], &case["input"], &case["expected"]);
+            let span = SpanId::parse("53995c3f42cd8ad8").unwrap();
+            let traceparent = ["00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"];
+            let (trace, _) = match input["trace_source"].as_str() {
+                Some("transit_token") => {
+                    RequestTrace::at_transit_point(Some("4bf92f3577b34da6a3ce929d0e0e4736"), &traceparent, &[], span)
+                }
+                Some("header") => RequestTrace::at_transit_point(None, &traceparent, &[], span),
+                other => panic!("{name}: no trace for {other:?}"),
+            };
+            let endpoint = if input["via_fabric"] == true {
+                "fabric://peer-gateway/peer-surface"
+            } else {
+                "https://tools:planted-password@tools.example/mcp?key=planted-query#planted-fragment"
+            };
+            let records = recorded_transit_forwarding(trace, endpoint).await;
+            let forwarded: Vec<&serde_json::Value> = records
+                .iter()
+                .filter(|record| record["event"]["transit_request_forwarded"].is_object())
+                .collect();
+            assert_eq!(forwarded.len(), 1, "{name}: one transit_request_forwarded record, got {records:?}");
+            let record = forwarded[0];
+            for path in expected["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .chain(
+                    expected["when_known"]
+                        .as_array()
+                        .unwrap(),
+                )
+            {
+                let path = path.as_str().unwrap();
+                assert!(field(record, path).is_some(), "{name}: {path} is missing from {record}");
+            }
+            for path in expected["absent"]
+                .as_array()
+                .unwrap()
+            {
+                let path = path.as_str().unwrap();
+                assert!(field(record, path).is_none(), "{name}: {path} is present in {record}");
+            }
+            assert_eq!(record["trace_source"], expected["trace_source"], "{name}");
+            assert_eq!(record["span_id"], record["request_id"], "{name}");
+            assert_eq!(record["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736", "{name}");
+            assert_eq!(record["parent_span_id"], "00f067aa0ba902b7", "{name}");
+            assert_eq!(record["event"]["transit_request_forwarded"]["transit_point"], "tools", "{name}");
+            assert_eq!(record["via_fabric"], input["via_fabric"], "{name}");
+            let stored = record.to_string();
+            for planted in ["planted-password", "planted-query", "planted-fragment"] {
+                assert!(!stored.contains(planted), "{name}: the record holds {planted}: {stored}");
+            }
+        }
+        let refused: Vec<&str> = cases
+            .iter()
+            .filter(|case| case["accepted"] == false)
+            .map(|case| case["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            refused,
+            [
+                "transit_refused_before_forwarding",
+                "transit_record_not_for_an_access_point_request",
+                "transit_record_not_for_a_fabric_receive"
+            ],
             "each refusing case has its own test where the request is served"
         );
     }
