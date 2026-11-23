@@ -116,37 +116,12 @@ impl McpReplay {
                     StsError::ServerError("MCP replay storage unavailable".into())
                 }),
             Self::Dynamodb { client, table } => {
-                use crate::storage::dynamodb_generic_repository::{PK, SK, object_key};
-                use aws_sdk_dynamodb::types::AttributeValue;
-
-                let (partition, sort) = object_key("StsMcpReplay", &hex::encode(digest));
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    client
-                        .put_item()
-                        .table_name(table)
-                        .item(PK, AttributeValue::S(partition))
-                        .item(SK, AttributeValue::S(sort))
-                        .item("expires_at", AttributeValue::N(expiry.to_string()))
-                        .condition_expression("attribute_not_exists(#pk) OR #expiry <= :now")
-                        .expression_attribute_names("#pk", PK)
-                        .expression_attribute_names("#expiry", "expires_at")
-                        .expression_attribute_values(":now", AttributeValue::N(now.to_string()))
-                        .send(),
-                )
-                .await
-                .map_err(|_| StsError::ServerError("MCP replay storage timed out".into()))?;
-                match result {
-                    Ok(_) => Ok(true),
-                    Err(error)
-                        if error
-                            .as_service_error()
-                            .is_some_and(|error| error.is_conditional_check_failed_exception()) =>
-                    {
-                        Ok(false)
-                    }
-                    Err(_) => Err(StsError::ServerError("MCP replay storage unavailable".into())),
-                }
+                crate::storage::single_use::dynamodb_record_unique(client, table, "StsMcpReplay", &digest, expiry, now)
+                    .await
+                    .map_err(|error| {
+                        tracing::error!(%error, "Failed to record an MCP ID-JAG redemption");
+                        StsError::ServerError("MCP replay storage unavailable".into())
+                    })
             }
         }
     }

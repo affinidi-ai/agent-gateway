@@ -60,7 +60,7 @@ The runtime implementation is in
 | Method | Typical caller | Behavior |
 | --- | --- | --- |
 | `reload_channels` | Full-reload implementation | Replaces the complete runtime surface set and swaps the router of every bound listener. |
-| `reload_channels_with_fallback` | `POST /v1/config/reload` | Loads the requested configuration and uses the cached snapshot only when loading the requested source fails. |
+| `reload_channels_with_fallback` | `POST /v1/config/reload` | Reloads from the requested configuration; when it cannot be loaded, changes nothing and reports the failure (`POST /v1/config/reload` answers `500`). |
 | `reload_single_channel` | `reload_single_channel_with_fallback` | Rebuilds one surface and swaps it into the current inbound listener state. |
 | `reload_single_channel_with_fallback` | `POST /v1/config/reload/{config_id}` and surface mutation paths | Serializes and applies the single-surface update; a source-load error is returned rather than silently substituting another surface. |
 
@@ -71,9 +71,7 @@ flowchart TD
     M --> L["Build the configuration: surfaces from<br/>_storage/agent_surfaces/, the rest from memory"]
     L --> OK{Built?}
     OK -- yes --> R[Full reload]
-    OK -- no --> CC{Cached snapshot?}
-    CC -- yes --> RC["Full reload from the cached<br/>snapshot, with a warning"]
-    CC -- no --> E[Error]
+    OK -- no --> K["Keep the running configuration"] --> E["500 naming the failure"]
 ```
 
 Full and single-surface reloads share a reload lock so they cannot concurrently mutate listener

@@ -852,10 +852,24 @@ async fn dynamodb_record(
     expires_at: u64,
     now: u64,
 ) -> Result<bool, SingleUseError> {
-    use crate::storage::dynamodb_generic_repository::{PK, SK};
+    dynamodb_record_unique(client, table, namespace.record_type(), key, expires_at, now).await
+}
+
+/// Records `key` under `record_type` in `table` until `expires_at` with one
+/// conditional put: `true` when no unexpired record of it exists, `false` when
+/// one does.
+pub(crate) async fn dynamodb_record_unique(
+    client: &aws_sdk_dynamodb::Client,
+    table: &str,
+    record_type: &str,
+    key: &[u8; 32],
+    expires_at: u64,
+    now: u64,
+) -> Result<bool, SingleUseError> {
+    use crate::storage::dynamodb_generic_repository::{PK, SK, object_key};
     use aws_sdk_dynamodb::types::AttributeValue;
 
-    let (partition, sort) = dynamodb_key(namespace, key);
+    let (partition, sort) = object_key(record_type, &hex::encode(key));
     let result = tokio::time::timeout(
         DYNAMODB_TIMEOUT,
         client

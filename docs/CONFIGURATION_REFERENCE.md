@@ -559,7 +559,8 @@ x402 transactions recorded before the upgrade are kept as they are and stay read
 admin API. Nothing writes a new one or settles, retries or recovers them, and only a
 settlement-complete from a transaction's own facilitator gateway completes one whose settlement is
 still in progress (see [FABRIC.md](FABRIC.md)). The daily cleanup deletes only final records, so an
-unsettled record stays on disk until an operator deletes it. `facilitator_private_keys` is ignored
+unsettled record stays on disk until an operator deletes it with `DELETE /api/admin/x402/transactions/{id}`,
+which deletes a record at any stage. `facilitator_private_keys` is ignored
 and dropped when `x402.json` loads, with a warning: remove it from the file. A surface cannot charge through
 local x402; see [Surface payment policy](#surface-payment-policy).
 

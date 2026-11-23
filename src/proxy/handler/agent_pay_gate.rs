@@ -1596,14 +1596,23 @@ impl Authorization {
     }
 }
 
-/// Receipts whose void is decided but not yet durably recorded. A receipt is
-/// added the moment the void is decided, so continuation evidence of it is
-/// refused on this node before the record is written, and stays when the
+/// Receipts whose void is decided but not yet durably recorded, by digest,
+/// with when the entry expires. A receipt is added the moment the void is
+/// decided, so continuation evidence of it is refused on this node before the
+/// record is written, and stays, until no continuation can carry it, when the
 /// record cannot be written.
-static VOIDING: LazyLock<dashmap::DashSet<[u8; 32]>> = LazyLock::new(dashmap::DashSet::new);
+static VOIDING: LazyLock<dashmap::DashMap<[u8; 32], Instant>> = LazyLock::new(dashmap::DashMap::new);
+
+/// How long a receipt stays in [`VOIDING`]: the longest an MCP continuation can
+/// carry it, as long as the durable record keeps it.
+const VOIDING_KEPT: Duration = Duration::from_secs(crate::mcp::continuations::MAX_TTL_SECS);
 
 fn mark_voiding(receipt: &str) {
-    VOIDING.insert(evidence_digest(receipt));
+    let now = Instant::now();
+    VOIDING.retain(|_, expires| *expires > now);
+    VOIDING
+        .entry(evidence_digest(receipt))
+        .or_insert(now + VOIDING_KEPT);
 }
 
 /// Records the receipt of a voided authorization in the single-use store until
@@ -1644,7 +1653,10 @@ async fn record_voided(
 /// Whether the receipt's authorization was voided. A store that cannot answer
 /// counts it as voided.
 async fn evidence_voided(receipt: &str) -> bool {
-    if VOIDING.contains(&evidence_digest(receipt)) {
+    if VOIDING
+        .get(&evidence_digest(receipt))
+        .is_some_and(|expires| *expires > Instant::now())
+    {
         return true;
     }
     match crate::storage::single_use::global() {
@@ -6656,8 +6668,33 @@ pub(crate) mod tests {
         assert!(!evidence_voided(&untouched).await);
 
         void_evidence(&receipt).await;
-        assert!(!VOIDING.contains(&evidence_digest(&receipt)), "the local entry goes once the record is durable");
+        assert!(!VOIDING.contains_key(&evidence_digest(&receipt)), "the local entry goes once the record is durable");
         assert!(evidence_voided(&receipt).await, "the durable record refuses it from then on");
+    }
+
+    #[tokio::test]
+    async fn a_local_void_entry_expires_once_no_continuation_can_carry_it() {
+        let expired = unique("expired-void");
+        let kept = unique("kept-void");
+        VOIDING.insert(evidence_digest(&expired), Instant::now() - Duration::from_secs(1));
+        assert!(!evidence_voided(&expired).await, "an expired entry refuses nothing");
+
+        mark_voiding(&kept);
+
+        assert!(!VOIDING.contains_key(&evidence_digest(&expired)), "expired entries are pruned");
+        let expires = *VOIDING
+            .get(&evidence_digest(&kept))
+            .unwrap();
+        assert!(expires > Instant::now() + VOIDING_KEPT - Duration::from_secs(5));
+        assert!(evidence_voided(&kept).await);
+        mark_voiding(&kept);
+        assert_eq!(
+            *VOIDING
+                .get(&evidence_digest(&kept))
+                .unwrap(),
+            expires,
+            "a repeated void keeps its first expiry"
+        );
     }
 
     #[tokio::test]

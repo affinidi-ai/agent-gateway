@@ -5,12 +5,13 @@ changes:
       title: Add single_use_store to keep single-use records on disk or in DynamoDB
       description: >-
         gateway.json `single_use_store` selects where single-use records are kept:
-        `{"backend":"disk"}` (the default, one owner-only journal per kind under
-        `_storage/single_use/`, synced before a record is accepted and compacted at
-        startup) or `{"backend":"dynamodb","table":"..."}` shared by every node. The
-        disk backend is per node: instances sharing one `_storage` volume take turns with it
-        through a lock, and nodes with their own `_storage` need DynamoDB. The gateway refuses
-        to start when MCP continuations are kept in DynamoDB while this store is on disk.
+        `{"backend":"disk"}` (the default) or `{"backend":"dynamodb","table":"..."}` shared
+        by every node. The disk backend keeps one owner-only journal per kind in `single_use/` of
+        the `_storage` folder that holds the stored surfaces, synced before a record is accepted and
+        compacted at startup. Instances sharing one `_storage` volume take turns with it through a
+        lock: the Active node holds the journals, and a node that does not hold them refuses every
+        single-use check. Nodes with their own `_storage` need DynamoDB, and the gateway refuses to
+        start when MCP continuations are kept in DynamoDB while this store is on disk.
   changed:
     - timestamp: '2026-11-18T00:00:00Z'
       title: Refuse channel_config_source "file" when the gateway starts
@@ -18,16 +19,6 @@ changes:
         The bootstrap configuration accepted channel_config_source = "file", although the gateway
         could neither start nor reload with it. Validation now names the two sources it supports,
         local and dynamodb.
-    - timestamp: '2026-11-18T00:00:00Z'
-      title: Keep recorded x402 transactions as they are
-      description: >-
-        x402 transactions recorded before local x402 payment was withdrawn are no longer settled,
-        retried, recovered at startup or synced to a peer. Startup recovery could mark a failed
-        settlement completed with both a rejection and a receipt attached, and the sync worker
-        could tell a peer a payment completed before it settled. Nothing writes a new record, so
-        the admin API lists and reads only the records written before the upgrade. A record now
-        changes only when its own facilitator gateway reports it completed while its settlement
-        is in progress, and an unsettled record stays until an operator removes it.
     - timestamp: '2026-11-18T00:00:00Z'
       title: Refuse to start on a settings.json that cannot be read
       description: >-
@@ -38,10 +29,10 @@ changes:
     - timestamp: '2026-11-19T00:00:00Z'
       title: Refuse ID-JAGs whose remaining lifetime exceeds the configured cap
       description: >-
-        jwt-bearer redemption now refuses, with invalid_grant, an ID-JAG whose exp is
-        more than `sts.id_jag_max_lifetime_secs` (default 900, 1 to 3600) after now, so
-        a long-lived grant cannot be held for later use. A value outside the range
-        stops the gateway at startup.
+        jwt-bearer redemption, including the embedded MCP issuer profile, now refuses with
+        invalid_grant an ID-JAG whose exp is more than `sts.id_jag_max_lifetime_secs` (default
+        900, 1 to 3600) after now, so a long-lived grant cannot be held for later use. A value
+        outside the range stops the gateway at startup.
     - timestamp: '2026-11-19T00:00:00Z'
       title: Stop using sts.replay_protection.backend
       description: >-
@@ -49,13 +40,6 @@ changes:
         accepted so existing configurations load, and any value other than in_process
         logs a startup warning. The embedded `sts.mcp_replay` capacity is still validated
         but no longer bounds anything.
-    - timestamp: '2026-11-20T00:00:00Z'
-      title: Keep the single-use journals beside the stored surfaces
-      description: >-
-        The single-use journals live in the `_storage` folder that holds
-        `[storage_paths].agent_surfaces` (`_storage/single_use/` by default, unchanged) instead
-        of beside `[storage_paths].mpp_transactions`, so moving MPP storage no longer moves
-        replay protection.
   fixed:
     - timestamp: '2026-11-18T00:00:00Z'
       title: Stop Connection Point listeners that are still connecting
@@ -145,30 +129,19 @@ changes:
         the temporary file behind for good. Opening a storage directory now removes such files
         once they are ten minutes old, keeping newer ones that may belong to a save still
         running on another instance sharing the volume.
-    - timestamp: '2026-11-20T00:00:00Z'
-      title: Bound MCP ID-JAG redemption by the configured lifetime cap
-      description: >-
-        The embedded MCP issuer profile refused an ID-JAG living longer than 900 seconds even
-        when `sts.id_jag_max_lifetime_secs` allowed more, while the other ID-JAG path accepted
-        it. Both now use the configured cap.
-    - timestamp: '2026-11-20T00:00:00Z'
-      title: Let instances sharing a _storage volume take turns with the single-use store
-      description: >-
-        The disk single-use store takes an exclusive lock on `single_use/single-use.lock`:
-        instances sharing one `_storage` volume take turns, the Active node holding the journals
-        and a node stepping down to Standby releasing them, so one instance no longer replaces
-        the journal another is appending to. Until a node holds the journals its single-use
-        checks fail closed. A record whose journal line fails is never kept by a compaction, and
-        a forget racing a new record leaves the record and the journal agreeing across a
-        restart.
   removed:
     - timestamp: '2026-11-18T00:00:00Z'
-      title: Remove the x402 settlement workers and embedded facilitator
+      title: Remove x402 settlement and keep recorded x402 transactions as they are
       description: >-
         The x402 settlement worker, settlement sync worker, startup recovery, embedded and remote
         facilitators, the Fabric facilitator service and the facilitator address script are
-        removed, along with the x402, alloy and Solana crates only they used. A Fabric
-        settle-response is now dropped. x402.json settings for them still load and are ignored.
+        removed, along with the x402, alloy and Solana crates only they used; their x402.json
+        settings still load and are ignored. Startup recovery could mark a failed settlement
+        completed with both a rejection and a receipt attached, and the sync worker could tell a
+        peer a payment completed before it settled. Nothing writes a new x402 transaction, and a
+        recorded one changes only when its own facilitator gateway reports it completed while its
+        settlement is in progress. The admin API reads them and now deletes one at any stage, the
+        only way to remove one left unsettled. A Fabric settle-response is dropped.
     - timestamp: '2026-11-20T00:00:00Z'
       title: Remove the facilitator blocks from the example x402.json and gateway.json
       description: >-
@@ -181,6 +154,11 @@ changes:
         `facilitator_mode` and `sts.replay_protection` and shows `single_use_store` and
         `sts.id_jag_max_lifetime_secs`.
   security:
+    - timestamp: '2026-11-23T00:00:00Z'
+      title: Update cookie to 0.18.3
+      description: >-
+        cookie 0.18.1 could repeat private cookie nonces in a process that forks
+        (RUSTSEC-2026-0594). The gateway now uses 0.18.3, which fixes it.
     - timestamp: '2026-11-23T00:00:00Z'
       title: Update url to 2.5.9
       description: >-
@@ -242,8 +220,8 @@ changes:
       title: Stop settling x402 payments already verified
       description: >-
         x402 transactions recorded before the upgrade with a settlement pending are no longer
-        settled, retried or synced by this gateway. Settle any you still need through the
-        payment rail they were made on.
+        settled, retried or synced. Settle any you still need through the payment rail they were
+        made on, then delete them with `DELETE /api/admin/x402/transactions/{id}`.
     - timestamp: '2026-11-20T00:00:00Z'
       title: Answer a configuration reload that could not load with 500
       description: >-
