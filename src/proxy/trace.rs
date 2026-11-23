@@ -422,6 +422,32 @@ impl OutgoingTrace {
     }
 }
 
+/// The trace a payment call goes out under.
+#[derive(Debug, Clone, Copy)]
+pub enum PaymentTrace<'a> {
+    /// An Access Point request's onward trace.
+    Onward(&'a OutgoingTrace),
+    /// The trace id a Fabric receive was sent, in whatever form it arrived.
+    Received(&'a str),
+}
+
+impl PaymentTrace<'_> {
+    /// The trace id the payment call names.
+    pub fn trace_id(&self) -> &str {
+        match self {
+            Self::Onward(trace) => trace.trace_id().as_str(),
+            Self::Received(trace_id) => trace_id,
+        }
+    }
+}
+
+/// The trace of a request that named `trace_id` in `X-Gateway-Trace-Id`, under
+/// a fresh span, for tests that need a request's trace.
+#[cfg(test)]
+pub(crate) fn request_trace_for(trace_id: &str) -> RequestTrace {
+    RequestTrace::from_headers(&[], &[trace_id], SpanId::mint()).0
+}
+
 /// Whether `name` is a trace header this gateway writes itself, so a caller's
 /// copy of it is never passed on.
 pub fn is_trace_header(name: &str) -> bool {

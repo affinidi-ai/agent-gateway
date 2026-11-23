@@ -1771,7 +1771,8 @@ struct InboundPayment<'a> {
     identity: Option<&'a crate::source_auth::AuthenticatedIdentity>,
     identity_binding: Option<&'a crate::surface_context::IdentityBindingContext>,
     trace_id: &'a str,
-    egress_trace_id: &'a str,
+    /// The trace the request is sent onward with.
+    onward: &'a crate::proxy::trace::OutgoingTrace,
     source_addr: &'a str,
     start_time: std::time::Instant,
 }
@@ -1802,7 +1803,7 @@ impl InboundPayment<'_> {
                         .map(|binding| binding.agent_did.as_str()),
                 },
                 trace_id: self.trace_id,
-                egress_trace_id: self.egress_trace_id,
+                onward: crate::proxy::trace::PaymentTrace::Onward(self.onward),
                 deadline_ms: None,
                 evidence,
                 fabric: &state.listener_manager,
@@ -3982,7 +3983,7 @@ async fn proxy_charged_request(
                     connection_guard: ConnectionGuard::new(None, None),
                     body_bytes: body_bytes.clone(),
                     trace_id: trace_id.clone(),
-                    egress_trace_id: egress_trace_id.clone(),
+                    outgoing_trace: outgoing_trace.clone(),
                     ucp_operation: ucp_operation.clone(),
                     authenticated_identity: authenticated_identity.clone(),
                     source_auth_context: source_auth_context.clone(),
@@ -4250,7 +4251,7 @@ async fn proxy_charged_request(
                 connection_guard,
                 body_bytes,
                 trace_id,
-                egress_trace_id,
+                outgoing_trace: outgoing_trace.clone(),
                 ucp_operation,
                 authenticated_identity,
                 source_auth_context: source_auth_context.clone(),
@@ -4670,7 +4671,7 @@ async fn proxy_charged_request(
                     source_addr: &source_addr,
                     start_time,
                     trace_id: trace_id.clone(),
-                    egress_trace_id: &egress_trace_id,
+                    onward: &outgoing_trace,
                     authenticated_identity: authenticated_identity.as_ref(),
                     source_auth_failed,
                     policy_input: &policy_input,
@@ -4776,7 +4777,7 @@ async fn proxy_charged_request(
                     source_addr: &source_addr,
                     start_time,
                     trace_id: trace_id.clone(),
-                    egress_trace_id: &egress_trace_id,
+                    onward: &outgoing_trace,
                     authenticated_identity: authenticated_identity.as_ref(),
                     source_auth_failed,
                     policy_input: &policy_input,
@@ -4905,7 +4906,7 @@ async fn proxy_charged_request(
                     source_addr: &source_addr,
                     start_time,
                     trace_id: trace_id.clone(),
-                    egress_trace_id: &egress_trace_id,
+                    onward: &outgoing_trace,
                     authenticated_identity: authenticated_identity.as_ref(),
                     source_auth_failed,
                     policy_input: &policy_input,
@@ -6410,7 +6411,7 @@ async fn proxy_charged_request(
         identity: authenticated_identity.as_ref(),
         identity_binding: identity_binding.as_ref(),
         trace_id: &trace_id,
-        egress_trace_id: &egress_trace_id,
+        onward: &outgoing_trace,
         source_addr: &source_addr,
         start_time,
     };
@@ -11101,9 +11102,9 @@ struct FabricSend<'a> {
     connection_guard: ConnectionGuard,
     body_bytes: axum::body::Bytes,
     trace_id: String,
-    /// The trace id sent onward: `trace_id`, or the fresh one of a surface
-    /// that terminates trace ids, computed once by the Access Point.
-    egress_trace_id: String,
+    /// The trace sent onward, computed once by the Access Point: the request's
+    /// own, or a fresh one when the surface terminates trace ids.
+    outgoing_trace: crate::proxy::trace::OutgoingTrace,
     ucp_operation: Option<String>,
     authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity>,
     source_auth_context: Option<crate::surface_context::SourceAuthContext>,
@@ -11153,7 +11154,7 @@ async fn handle_fabric_request_inner(
         mut connection_guard,
         body_bytes,
         trace_id,
-        egress_trace_id,
+        outgoing_trace,
         ucp_operation,
         authenticated_identity,
         source_auth_context,
@@ -11165,6 +11166,10 @@ async fn handle_fabric_request_inner(
         mcp_continuations,
         payment,
     } = request;
+    let egress_trace_id = outgoing_trace
+        .trace_id()
+        .as_str()
+        .to_string();
     let source_auth_failed =
         matches!(source_auth_context, Some(crate::surface_context::SourceAuthContext::Failed { .. }));
     let modern_mcp_context = mcp_classification.and_then(crate::mcp::modern_mcp_context);
@@ -12137,7 +12142,7 @@ async fn handle_fabric_request_inner(
         identity: authenticated_identity.as_ref(),
         identity_binding: identity_binding.as_ref(),
         trace_id: &trace_id,
-        egress_trace_id: &egress_trace_id,
+        onward: &outgoing_trace,
         source_addr: &source_addr,
         start_time,
     };
@@ -15592,7 +15597,8 @@ struct McpProxyRequest<'a> {
     source_addr: &'a str,
     start_time: std::time::Instant,
     trace_id: String,
-    egress_trace_id: &'a str,
+    /// The trace the request is sent onward with.
+    onward: &'a crate::proxy::trace::OutgoingTrace,
     authenticated_identity: Option<&'a crate::source_auth::AuthenticatedIdentity>,
     source_auth_failed: bool,
     policy_input: &'a crate::surface_context::PolicyInput,
@@ -15639,7 +15645,7 @@ async fn handle_mcp_proxy_request_inner(
         source_addr,
         start_time,
         trace_id,
-        egress_trace_id,
+        onward,
         authenticated_identity,
         source_auth_failed,
         policy_input,
@@ -15927,7 +15933,7 @@ async fn handle_mcp_proxy_request_inner(
                     .identity_binding
                     .as_ref(),
                 trace_id: &trace_id,
-                egress_trace_id,
+                onward,
                 source_addr,
                 start_time,
             };
@@ -24719,7 +24725,7 @@ mod fabric_send_tests {
                 connection_guard: super::ConnectionGuard::new(None, None),
                 body_bytes: axum::body::Bytes::from(body.to_string()),
                 trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
-                egress_trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
+                outgoing_trace: crate::proxy::trace::request_trace_for("0af7651916cd43dd8448eb211c80319c").outgoing(),
                 ucp_operation: None,
                 authenticated_identity: Some(caller),
                 source_auth_context: None,
@@ -24787,7 +24793,7 @@ mod fabric_send_tests {
                     json!({"jsonrpc": "2.0", "id": "m-1", "method": "message/send"}).to_string(),
                 ),
                 trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
-                egress_trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
+                outgoing_trace: crate::proxy::trace::request_trace_for("4bf92f3577b34da6a3ce929d0e0e4736").outgoing(),
                 ucp_operation: None,
                 authenticated_identity: Some(caller),
                 source_auth_context: None,
@@ -24845,12 +24851,11 @@ mod fabric_send_tests {
                     json!({"jsonrpc": "2.0", "id": "m-1", "method": "message/send"}).to_string(),
                 ),
                 trace_id: own.to_string(),
-                egress_trace_id: crate::proxy::trace::egress_trace_id(
+                outgoing_trace: crate::proxy::trace::request_trace_for(own).onward(
                     peer.state
                         .surface
                         .access_point
                         .terminate_trace_id,
-                    own,
                 ),
                 ucp_operation: None,
                 authenticated_identity: None,
@@ -24976,7 +24981,7 @@ mod fabric_send_tests {
                     json!({"jsonrpc": "2.0", "id": "m-1", "method": "message/send"}).to_string(),
                 ),
                 trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
-                egress_trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
+                outgoing_trace: crate::proxy::trace::request_trace_for("0af7651916cd43dd8448eb211c80319c").outgoing(),
                 ucp_operation: None,
                 authenticated_identity: None,
                 source_auth_context: None,
@@ -25051,7 +25056,7 @@ mod fabric_send_tests {
                 connection_guard: super::ConnectionGuard::new(None, None),
                 body_bytes: axum::body::Bytes::from(body.to_string()),
                 trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
-                egress_trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
+                outgoing_trace: crate::proxy::trace::request_trace_for("0af7651916cd43dd8448eb211c80319c").outgoing(),
                 ucp_operation: None,
                 authenticated_identity: None,
                 source_auth_context: None,
@@ -25162,7 +25167,7 @@ mod fabric_send_tests {
                 connection_guard: super::ConnectionGuard::new(None, None),
                 body_bytes: axum::body::Bytes::from(body.to_string()),
                 trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
-                egress_trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
+                outgoing_trace: crate::proxy::trace::request_trace_for("0af7651916cd43dd8448eb211c80319c").outgoing(),
                 ucp_operation: None,
                 authenticated_identity: None,
                 source_auth_context: None,
@@ -26014,7 +26019,7 @@ mod fabric_send_tests {
                 connection_guard: super::ConnectionGuard::new(None, None),
                 body_bytes: axum::body::Bytes::from(body.to_string()),
                 trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
-                egress_trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
+                outgoing_trace: crate::proxy::trace::request_trace_for("0af7651916cd43dd8448eb211c80319c").outgoing(),
                 ucp_operation: None,
                 authenticated_identity: None,
                 source_auth_context: None,
@@ -26193,7 +26198,8 @@ mod fabric_send_tests {
                     connection_guard: super::ConnectionGuard::new(None, None),
                     body_bytes: axum::body::Bytes::from(body.to_string()),
                     trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
-                    egress_trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
+                    outgoing_trace: crate::proxy::trace::request_trace_for("0af7651916cd43dd8448eb211c80319c")
+                        .outgoing(),
                     ucp_operation: None,
                     authenticated_identity: (!case.key_failed).then(|| key.clone()),
                     source_auth_context: Some(if case.key_failed {

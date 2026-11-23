@@ -4539,7 +4539,7 @@ impl FabricPayment<'_> {
                         .map(|binding| binding.agent_did.as_str()),
                 },
                 trace_id: &trace_id,
-                egress_trace_id: &egress_trace_id,
+                onward: crate::proxy::trace::PaymentTrace::Received(&egress_trace_id),
                 deadline_ms: self
                     .message
                     .message_body

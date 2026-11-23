@@ -2136,8 +2136,8 @@ pub(crate) struct GateCall<'a> {
     /// This gateway's own trace id, which its audit trail, ledger and
     /// credentials record.
     pub trace_id: &'a str,
-    /// The trace id of the outbound leg: all the payment gateway sees.
-    pub egress_trace_id: &'a str,
+    /// The trace of the outbound leg: all the payment gateway sees.
+    pub onward: crate::proxy::trace::PaymentTrace<'a>,
     /// The caller's deadline, epoch milliseconds.
     pub deadline_ms: Option<u64>,
     pub evidence: Option<&'a ContinuationPayment>,
@@ -3187,7 +3187,8 @@ async fn exchange(
             shortened = true;
         }
     }
-    let traceparent = traceparent(hop.call.egress_trace_id);
+    let egress_trace_id = hop.call.onward.trace_id();
+    let traceparent = traceparent(egress_trace_id);
     let intake = hop.intake;
     let wire = GateWireRequest {
         fabric_target,
@@ -3206,14 +3207,11 @@ async fn exchange(
             &intake.resource,
             &hop.call.caller,
             key,
-            hop.call.egress_trace_id,
+            egress_trace_id,
             &traceparent,
         ),
         timeout,
-        trace_id: hop
-            .call
-            .egress_trace_id
-            .to_string(),
+        trace_id: egress_trace_id.to_string(),
     };
     let sent = hop.transport.send(wire).await;
     record_transport_result(
@@ -3822,7 +3820,7 @@ pub(crate) mod tests {
             surface,
             caller: Caller::default(),
             trace_id: "ingress-trace",
-            egress_trace_id: "0af7651916cd43dd8448eb211c80319c",
+            onward: crate::proxy::trace::PaymentTrace::Received("0af7651916cd43dd8448eb211c80319c"),
             deadline_ms: None,
             evidence: None,
             fabric,
@@ -5877,7 +5875,7 @@ pub(crate) mod tests {
         let fabric = no_fabric();
         let intake = read(&surface, &x402_headers(&unique("proof")), &tool_call("t", json!({})));
         let received = GateCall {
-            egress_trace_id: "trace-from-the-peer",
+            onward: crate::proxy::trace::PaymentTrace::Received("trace-from-the-peer"),
             ..call(&surface, &fabric)
         };
         assert!(matches!(charge(&intake, received).await, GateOutcome::Paid(_)));
