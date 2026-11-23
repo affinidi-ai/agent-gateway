@@ -143,6 +143,27 @@ describe('validateSurfacePayload', () => {
       const issues = validateSurfacePayload(surface(refused), { stored: surface(), routing: null });
       expect(issues.find(i => i.path?.endsWith('listen_path'))).toBeUndefined();
     });
+
+    // What the page passes for a variant view: the stored surface resolved through that
+    // variant's overrides, not the base surface and not nothing. Against either of those
+    // an untouched legacy path reads as newly introduced and blocks an unrelated save.
+    it('exempts a legacy path a variant view already holds', () => {
+      const base = surface('/outbound/agents/partner-a');
+      const variantView = surface(refused);
+      expect(
+        validateSurfacePayload(variantView, { stored: variantView, routing }).find(i =>
+          i.path?.endsWith('listen_path')
+        )
+      ).toBeUndefined();
+      // The two readings the page used to pass for that same view.
+      for (const stored of [base, null]) {
+        expect(
+          validateSurfacePayload(variantView, { stored, routing }).find(i =>
+            i.path?.endsWith('listen_path')
+          )
+        ).toMatchObject({ severity: 'error' });
+      }
+    });
   });
 
   it('flags missing surface name as an error', () => {

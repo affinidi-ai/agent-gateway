@@ -162,6 +162,38 @@ describe('offeredChannelPrefixes', () => {
       offeredChannelPrefixes(config, 'outbound', 'https://own.example.net').map(p => p.prefix)
     ).toEqual(['/agents']);
   });
+
+  // A root surface prefix has no usable plain form: it is the whole listener, which the
+  // gateway does not accept a Listen Path directly under, so the picker would otherwise
+  // offer nothing a save would take on such a deployment.
+  it('offers the /outbound form of a root prefix even on a dedicated listener', () => {
+    const root = [{ id: 'root', name: 'root', prefix: '/' }];
+    const config = makeConfig(['https://gateway.example.com'], ['https://own.example.net'], root);
+    config.shared_hostname_outbound_addresses = [];
+    const offered = offeredChannelPrefixes(config, 'outbound', 'https://own.example.net');
+    expect(offered.map(p => p.prefix)).toEqual(['/outbound']);
+    expect(
+      listenPathProblem(
+        { listen_address: 'https://own.example.net', listen_path: '/outbound/partner-a' },
+        config
+      )
+    ).toBeNull();
+  });
+
+  it('prefers the outbound prefixes the gateway advertises', () => {
+    const config = makeConfig(
+      ['https://gateway.example.com'],
+      ['https://gateway.example.com'],
+      channels
+    );
+    config.shared_hostname_outbound_addresses = ['https://gateway.example.com'];
+    config.outbound_channel_path_prefix = [
+      { id: 'agents', name: 'agents', prefix: '/outbound/agents' },
+    ];
+    expect(
+      offeredChannelPrefixes(config, 'outbound', 'https://gateway.example.com').map(p => p.prefix)
+    ).toEqual(['/outbound/agents']);
+  });
 });
 
 describe('listenPathProblem', () => {

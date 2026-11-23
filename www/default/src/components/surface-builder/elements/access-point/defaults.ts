@@ -18,7 +18,20 @@ export interface RoutingConfig {
    * field, which is the only reason `computeSharedOutboundAddresses` still falls back.
    */
   shared_hostname_outbound_addresses?: string[];
-  channel_path_prefix: Array<{ id: string; name: string; prefix: string }>;
+  channel_path_prefix: ChannelPrefix[];
+  /**
+   * The same prefixes under `/outbound`, as the gateway builds them. A Transit Point's
+   * `listen_path` under one of these is reachable at every outbound address, whichever
+   * hostname its listener has. Absent from a gateway older than the field, which is why
+   * `outboundChannelPrefixes` can still derive them.
+   */
+  outbound_channel_path_prefix?: ChannelPrefix[];
+}
+
+export interface ChannelPrefix {
+  id: string;
+  name: string;
+  prefix: string;
 }
 
 export const OUTBOUND_PREFIX = '/outbound';
@@ -62,15 +75,40 @@ export function offeredChannelPrefixes(
   routing: RoutingConfig,
   addressSource: 'inbound' | 'outbound',
   address: string
-): Array<{ id: string; name: string; prefix: string }> {
+): ChannelPrefix[] {
   const plain = routing.channel_path_prefix ?? [];
   if (addressSource !== 'outbound') return plain;
-  const outbound = plain.map(c => ({
+  const outbound = outboundChannelPrefixes(routing);
+  if (computeSharedOutboundAddresses(routing).has(address)) return outbound;
+  // An outbound listener with a hostname of its own serves the plain prefixes as well,
+  // except a root channel: its plain form is the whole listener, which the gateway does
+  // not accept as a prefix, so only its `/outbound` form is usable there. Without this,
+  // a gateway whose only surface prefix is `/` offered a picker that could compose
+  // nothing the save would take.
+  return plain.map((c, idx) => (isRootPrefix(c.prefix) ? (outbound[idx] ?? c) : c));
+}
+
+/** A surface prefix that is the whole listener, so nothing can be set directly under it. */
+function isRootPrefix(prefix: string): boolean {
+  return prefix.replace(/\/$/, '') === '';
+}
+
+/**
+ * The channel prefixes under `/outbound`: the gateway's own list when it sends one, and
+ * otherwise the same rule applied here, so the two cannot disagree about which paths are
+ * on offer.
+ */
+function outboundChannelPrefixes(routing: RoutingConfig): ChannelPrefix[] {
+  const plain = routing.channel_path_prefix ?? [];
+  const advertised = routing.outbound_channel_path_prefix;
+  return plain.map((c, idx) => ({
     id: `outbound-${c.id}`,
     name: `outbound → ${c.name}`,
-    prefix: `${OUTBOUND_PREFIX}${c.prefix.replace(/\/$/, '')}`,
+    prefix:
+      advertised?.find(o => o.id === c.id)?.prefix ??
+      advertised?.[idx]?.prefix ??
+      `${OUTBOUND_PREFIX}${c.prefix.replace(/\/$/, '')}`,
   }));
-  return computeSharedOutboundAddresses(routing).has(address) ? outbound : plain;
 }
 
 /**
@@ -147,6 +185,16 @@ export function getCachedRoutingConfig(): RoutingConfig | null {
 }
 
 /**
+ * What `listenPathProblem` reads: the two fields of a Transit Point, from a canvas node's
+ * config or from a built payload's `transit.points[]`, that decide where it answers. Both
+ * are `unknown` because either source may be missing them or carry something else.
+ */
+export interface TransitPointRoute {
+  listen_path?: unknown;
+  listen_address?: unknown;
+}
+
+/**
  * What blocks a save of one Transit Point's Listen Path, or `null`. The two refusals the
  * admin API answers such a save with, in the same order, so the dashboard refuses exactly
  * what the gateway would (`listen_path_problems` in `src/proxy/server.rs`):
@@ -166,23 +214,24 @@ export function getCachedRoutingConfig(): RoutingConfig | null {
  * check against and the answer is `null`.
  */
 export function listenPathProblem(
-  config: any,
+  point: TransitPointRoute,
   routing: RoutingConfig | null = getCachedRoutingConfig()
 ): string | null {
   if (!routing) return null;
-  const composed = typeof config?.listen_path === 'string' ? config.listen_path.trim() : '';
+  const composed = typeof point.listen_path === 'string' ? point.listen_path.trim() : '';
   if (!composed) return null;
   const channels = routing.channel_path_prefix ?? [];
-  const every = channels.flatMap(c => {
+  const outbound = outboundChannelPrefixes(routing);
+  const every = channels.flatMap((c, idx) => {
     const plain = c.prefix.replace(/\/$/, '');
-    return [plain, `${OUTBOUND_PREFIX}${plain}`].filter(Boolean);
+    return [plain, outbound[idx]?.prefix ?? `${OUTBOUND_PREFIX}${plain}`].filter(Boolean);
   });
   const offered = every.map(p => `${p}/`).join(', ') || 'this gateway configures none';
   const match = every.find(p => composed === p || composed.startsWith(`${p}/`));
   if (!match || composed === match) {
     return `Listen Path "${composed}" claims no segment of its own under a surface prefix this gateway serves Transit Points on (${offered}). Pick a prefix and a path under it, or clear the path to answer at the derived ${OUTBOUND_PREFIX} route.`;
   }
-  const address = typeof config?.listen_address === 'string' ? config.listen_address : '';
+  const address = typeof point.listen_address === 'string' ? point.listen_address : '';
   const sharedHostname = computeSharedOutboundAddresses(routing).has(address);
   const underOutbound = composed === OUTBOUND_PREFIX || composed.startsWith(`${OUTBOUND_PREFIX}/`);
   if (sharedHostname && !underOutbound) {

@@ -48,6 +48,10 @@ import {
   useVariantSnapshots,
   BASE_VARIANT_ID,
 } from '../components/surface-builder/variants/useVariantSnapshots';
+import {
+  resolveVariant,
+  type SurfaceOverrides,
+} from '../components/surface-builder/variants/resolve';
 import ConfirmPopover from '../components/shared/ConfirmPopover';
 import {
   hydrateSurfaceCanvas,
@@ -860,6 +864,30 @@ const SurfaceDetailPage: React.FC = () => {
   );
 
   /**
+   * The stored surface as the view behind `variantId` holds it today: the surface itself
+   * for base, and for a variant the surface resolved through that variant's stored
+   * overrides.
+   *
+   * Validation compares a draft with what is stored, and the gateway exempts a claim the
+   * same view already holds (a Transit Point's `listen_path`, for one). A snapshot checked
+   * against the base surface, or against nothing, therefore reads an untouched legacy
+   * value as newly introduced and blocks a save that never touched it. `null` when the
+   * view is not stored at all, such as a variant added in this session, where everything
+   * it carries really is new.
+   */
+  const storedViewFor = (variantId: string): unknown => {
+    if (!surface) return null;
+    if (variantId === BASE_VARIANT_ID) return surface;
+    const variants: unknown = (surface as unknown as { variants?: unknown }).variants;
+    const stored = Array.isArray(variants)
+      ? (variants as Array<{ id?: unknown; overrides?: SurfaceOverrides }>).find(
+          v => String(v?.id) === variantId
+        )
+      : undefined;
+    return stored ? resolveVariant(surface, stored.overrides) : null;
+  };
+
+  /**
    * Build a single, user-facing reason explaining why the surface cannot
    * be saved right now. Returns `null` when ready to PUT. Surfaces the
    * first incomplete element's label + reason so the toast matches what
@@ -937,7 +965,12 @@ const SurfaceDetailPage: React.FC = () => {
         protocol,
         status,
       });
-      const issues = validateSurfacePayload(draftPayload, { stored: surface ?? undefined });
+      // Against the stored view the canvas is showing, which is a variant whenever one is
+      // active, not the base surface underneath it.
+      const activeId = variantSnapshots.activeVariantId ?? BASE_VARIANT_ID;
+      const issues = validateSurfacePayload(draftPayload, {
+        stored: surface ? storedViewFor(activeId) : undefined,
+      });
       const firstError = issues.find(i => i.severity === 'error');
       if (firstError) {
         return { message: firstError.message, nodeId: firstError.nodeId };
@@ -948,7 +981,6 @@ const SurfaceDetailPage: React.FC = () => {
       // round-trip the broken overrides untouched. `getVariantSnapshot`
       // returns the last resolved payload for each id; for the active
       // variant we already used the live `draftPayload` above.
-      const activeId = variantSnapshots.activeVariantId ?? BASE_VARIANT_ID;
       const ids: string[] = [BASE_VARIANT_ID, ...variantSnapshots.variants.map(v => v.id)];
       for (const vid of ids) {
         if (vid === activeId) continue;
@@ -1016,7 +1048,9 @@ const SurfaceDetailPage: React.FC = () => {
           // a payload `nodesFromSurface` can't decode will trip the
           // structural validator anyway.
         }
-        const variantIssues = validateSurfacePayload(snap, { stored: null });
+        // Each snapshot against its own stored view, so a legacy value this save never
+        // touched stays exempt, as it is for the gateway.
+        const variantIssues = validateSurfacePayload(snap, { stored: storedViewFor(vid) });
         const variantErr = variantIssues.find(i => i.severity === 'error');
         if (variantErr) {
           return {

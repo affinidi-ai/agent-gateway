@@ -344,7 +344,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   outbound one offers those prefixes with `/outbound` in front when the gateway lists the selected
   address in `shared_hostname_outbound_addresses` (`computeSharedOutboundAddresses`), since the
   inbound pipeline owns every non-`/outbound` path there, and the plain prefixes on an outbound
-  address of its own. That classification comes from the gateway, which decides it per listener
+  address of its own, except a root surface prefix, whose plain form is the whole listener and
+  which the gateway therefore offers only under `/outbound`. The `/outbound` forms come from the
+  response's `outbound_channel_path_prefix` when it carries them, and are derived by the same rule
+  when it does not. That classification comes from the gateway, which decides it per listener
   with the same function its save gate uses; comparing the two address lists for equal strings
   missed an outbound `https://host:9443` beside an inbound `https://host`, and an alias URL of a
   shared listener, and the save then refused what the picker had offered.

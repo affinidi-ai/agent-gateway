@@ -80,7 +80,10 @@ changes:
         prefixes leaves the field unset rather than claiming one its path does not start with, and
         a stored prefix the picker no longer offers is re-derived from the route instead of shown
         as selected, so a surface stored before this reads correctly without being rewritten. A
-        new Transit Point seeds an offered prefix as well.
+        new Transit Point seeds an offered prefix as well. A root surface prefix is offered only
+        in its /outbound form, on every outbound address: its plain form is the whole listener,
+        which a listen_path may not be set directly under, so a gateway whose only surface prefix
+        is / had a picker that could compose nothing a save would take.
     - timestamp: '2026-11-23T16:20:00Z'
       title: Tell the dashboard which outbound addresses share an inbound hostname
       description: >-

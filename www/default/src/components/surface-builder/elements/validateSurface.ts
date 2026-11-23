@@ -16,6 +16,7 @@ import {
   getCachedRoutingConfig,
   listenPathProblem,
   type RoutingConfig,
+  type TransitPointRoute,
 } from './access-point/defaults';
 import { registry } from './registry';
 import { targetAuthBreaches } from './targetAuthRules';
@@ -35,6 +36,29 @@ export interface ValidationIssue {
    * by the JSON editor to highlight the offending slice.
    */
   path?: string;
+}
+
+/**
+ * The fields of a stored Transit Point this layer compares a draft with. The stored
+ * surface arrives as `unknown`, so every one of them is narrowed before it is read.
+ */
+interface StoredTransitPoint extends TransitPointRoute {
+  id?: unknown;
+  alias?: unknown;
+}
+
+/** The stored surface's Transit Points, or none when it has, or is, nothing usable. */
+function storedTransitPoints(stored: unknown): StoredTransitPoint[] {
+  if (!stored || typeof stored !== 'object') return [];
+  const transit = (stored as { transit?: unknown }).transit;
+  if (!transit || typeof transit !== 'object') return [];
+  const points = (transit as { points?: unknown }).points;
+  return Array.isArray(points) ? (points as StoredTransitPoint[]) : [];
+}
+
+/** One field of a value that may not have it, as a string, or `''`. */
+function text(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
 }
 
 export interface ValidateSurfaceOptions {
@@ -191,9 +215,7 @@ export function validateSurfacePayload(
 
   // What the stored surface's Transit Points already claim, so a save that keeps a
   // claim is told apart from one that introduces or changes it. Empty on a create.
-  const storedPoints: any[] = Array.isArray((options.stored as any)?.transit?.points)
-    ? (options.stored as any).transit.points
-    : [];
+  const storedPoints: StoredTransitPoint[] = storedTransitPoints(options.stored);
 
   // A Listen Path the gateway will not serve, refused here before the round trip, and
   // only when this save introduces or changes it. That is what the admin API refuses:
@@ -203,13 +225,13 @@ export function validateSurfacePayload(
   const routing = options.routing === undefined ? getCachedRoutingConfig() : options.routing;
   if (routing) {
     tps.forEach((tp, idx) => {
-      const path = typeof tp?.listen_path === 'string' ? tp.listen_path.trim() : '';
+      const path = text(tp?.listen_path);
       if (!path) return;
-      const alias = typeof tp?.alias === 'string' ? tp.alias : '';
+      const alias = text(tp?.alias);
       const before = storedPoints.find(
         stored => (alias && stored?.alias === alias) || (tp?.id && stored?.id === tp.id)
       );
-      const kept = typeof before?.listen_path === 'string' ? before.listen_path.trim() : '';
+      const kept = text(before?.listen_path);
       if (kept === path) return;
       const problem = listenPathProblem(tp, routing);
       if (problem) {
@@ -229,16 +251,15 @@ export function validateSurfacePayload(
     // save gate refuses is a path the gateway would not serve (`listenPathProblem`),
     // not the absence of one.
     for (const stored of storedPoints) {
-      const was = typeof stored?.listen_path === 'string' ? stored.listen_path.trim() : '';
+      const was = text(stored?.listen_path);
       if (!was) continue;
-      const alias = typeof stored?.alias === 'string' ? stored.alias : '';
+      const alias = text(stored?.alias);
       const now = tps.find(
         tp => (alias && tp?.alias === alias) || (stored?.id && tp?.id === stored.id)
       );
       // The point itself being gone is a removal the operator can see on the canvas.
       if (!now) continue;
-      const kept = typeof now.listen_path === 'string' ? now.listen_path.trim() : '';
-      if (kept) continue;
+      if (text(now.listen_path)) continue;
       issues.push({
         severity: 'warning',
         message: `Transit point "${alias}" no longer has a Listen Path, so "${was}" stops answering and callers reach it at its derived /outbound route.`,
