@@ -78,9 +78,48 @@ pub fn resolve(config: &VtaConfig) -> DefaultResolution {
     }
 }
 
+/// What the appliance signs with now: the gateway-wide default chosen in the
+/// dashboard when one is set, otherwise what the configuration resolved to.
+pub fn effective(
+    configured: &DefaultResolution,
+    dashboard: Option<&crate::config::agent_surface::SurfaceSigningConfig>,
+) -> DefaultResolution {
+    use crate::config::agent_surface::SigningBackendKind;
+    match dashboard.and_then(|signing| signing.backend) {
+        Some(SigningBackendKind::Vta) => DefaultResolution {
+            backend: "vta",
+            reason: "Gateway signing in the dashboard settings names a trust agent".to_string(),
+            explicit: true,
+        },
+        Some(SigningBackendKind::Local) => {
+            DefaultResolution::local("Gateway signing in the dashboard settings names the gateway secret", true)
+        }
+        None => configured.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_dashboard_default_wins_over_the_configuration() {
+        use crate::config::agent_surface::{SigningBackendKind, SurfaceSigningConfig};
+        let configured = resolve(&disabled());
+        let through_agent = SurfaceSigningConfig {
+            backend: Some(SigningBackendKind::Vta),
+            connection_id: Some("agent".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(effective(&configured, Some(&through_agent)).backend, "vta");
+        let local = SurfaceSigningConfig {
+            backend: Some(SigningBackendKind::Local),
+            ..Default::default()
+        };
+        assert_eq!(effective(&resolve(&enabled()), Some(&local)).backend, "local");
+        assert_eq!(effective(&configured, None), configured);
+        assert_eq!(effective(&configured, Some(&SurfaceSigningConfig::default())), configured);
+    }
 
     fn disabled() -> VtaConfig {
         VtaConfig::default()

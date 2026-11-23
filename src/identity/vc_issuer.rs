@@ -1697,11 +1697,13 @@ impl VCIssuer {
             {
                 Ok(provisioned) => Some(provisioned),
                 // An inferred provisioner may simply lack the grant to create
-                // contexts, which cannot be known before trying. Falling back
-                // to the key this would have minted anyway keeps onboarding
-                // working; an explicitly configured one still fails, because
-                // the operator asked for the stronger guarantee.
-                Err(e) if provisioner.optional() => {
+                // contexts, which cannot be known before trying. When the agent
+                // refuses it, falling back to the key this would have minted
+                // anyway keeps onboarding working. Any other failure, such as an
+                // unreachable agent, fails as an explicitly configured
+                // provisioner does, so a passing outage never leaves an agent
+                // with a gateway-held key for good.
+                Err(e) if provisioner.optional() && crate::vta::agent_contexts::is_capability_refusal(&e) => {
                     warn!(
                         target: "vta_audit",
                         error = %e,
@@ -4647,6 +4649,78 @@ mod tests {
             "unexpected error: {err}"
         );
         assert_eq!(key_ids(&document, "assertionMethod"), vec![format!("{did}#key-1")]);
+    }
+
+    /// An inferred provisioner that fails with `error`.
+    struct FailingInferredProvisioner(fn() -> crate::vta::VtaError);
+
+    #[async_trait::async_trait]
+    impl crate::vta::agent_contexts::AgentKeyProvisioner for FailingInferredProvisioner {
+        async fn provision(
+            &self,
+            _identity_hash: &str,
+        ) -> Result<crate::vta::agent_contexts::ProvisionedAgent> {
+            Err(anyhow::Error::new((self.0)()).context("provisioning a VTA context for agent"))
+        }
+
+        fn optional(&self) -> bool {
+            true
+        }
+    }
+
+    async fn onboard_with(provisioner: FailingInferredProvisioner) -> Result<AgentIdentityResponse> {
+        crate::gateways::did_cache::init_shared_resolver()
+            .await
+            .unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let identity_store = Arc::new(MockIdentityStore::new()) as Arc<dyn IdentityStore>;
+        let vp_challenge_store = Arc::new(MockVpChallengeStore::new()) as Arc<dyn VpChallengeStore>;
+        let issuer = VCIssuer::new(temp_dir.path(), "example.com", identity_store, vp_challenge_store, None, None)
+            .await
+            .unwrap();
+        issuer
+            .set_agent_provisioner(Arc::new(provisioner))
+            .await;
+        let mut fields = HashMap::new();
+        fields.insert("agentIdentity".to_string(), json!({"llmInfo": {"model": "gpt-4", "provider": "openai"}}));
+        issuer
+            .issue_or_get_credential(fields, None, None, None)
+            .await
+    }
+
+    /// A trust agent that refuses to create the agent's context leaves the
+    /// agent with the key the gateway would have minted anyway.
+    #[tokio::test]
+    async fn an_agent_is_onboarded_with_a_gateway_held_key_when_the_trust_agent_refuses() {
+        let response = onboard_with(FailingInferredProvisioner(|| crate::vta::VtaError::Http {
+            status: 403,
+            body: r#"{"payload":{"code":"permissionDenied"}}"#.to_string(),
+        }))
+        .await
+        .expect("a refusal falls back");
+        assert!(!response.credential.is_empty());
+    }
+
+    /// An unreachable trust agent fails onboarding rather than leaving the
+    /// agent with a gateway-held key for good.
+    #[tokio::test]
+    async fn onboarding_fails_while_the_trust_agent_cannot_be_reached() {
+        for error in [
+            || crate::vta::VtaError::Transport("connection refused".to_string()),
+            || crate::vta::VtaError::Http {
+                status: 503,
+                body: String::new(),
+            },
+            || crate::vta::VtaError::QuotaExceeded("spent".to_string()),
+        ] {
+            assert!(
+                onboard_with(FailingInferredProvisioner(error))
+                    .await
+                    .is_err(),
+                "{:?}",
+                error()
+            );
+        }
     }
 
     /// The issued VC's issuer field must match the proxy_did.

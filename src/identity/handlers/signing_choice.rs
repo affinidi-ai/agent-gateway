@@ -29,6 +29,21 @@ pub(crate) enum SigningChoiceError {
     Store(String),
 }
 
+pub(crate) const VTA_BLOCK_REQUIRED: &str = "signing.connection_id is required: with none, or with `default` or \
+     `vta-bootstrap`, the choice signs through the `[vta]` block, which is not enabled on this gateway";
+
+/// Whether `signing` signs through the `[vta]` block: it names no connection, or the
+/// ids that stand for that block.
+fn names_the_vta_block(signing: &SurfaceSigningConfig) -> bool {
+    signing
+        .connection_id
+        .as_deref()
+        .is_none_or(|id| {
+            id == crate::vta::key_directory::DEFAULT_CONNECTION_ID
+                || id == crate::vta::connections::BOOTSTRAP_CONNECTION_ID
+        })
+}
+
 pub(crate) const APPLIANCE_CONNECTION_REQUIRED: &str =
     "signing.connection_id must name an existing trust agent connection that belongs to the whole appliance";
 
@@ -59,6 +74,9 @@ pub(crate) async fn validate_signing_choice(
                 .to_string(),
         ));
     }
+    if signing.backend == Some(SigningBackendKind::Vta) && !vta.enabled && names_the_vta_block(signing) {
+        return Err(SigningChoiceError::Invalid(VTA_BLOCK_REQUIRED.to_string()));
+    }
     match owner {
         SigningOwner::Resource(tenant_id) => {
             let Some(store) = connections else {
@@ -67,7 +85,8 @@ pub(crate) async fn validate_signing_choice(
             super::surface_tenancy::check_signing_connection(store, tenant_id, signing)
                 .await
                 .map_err(|error| match error {
-                    super::surface_tenancy::SigningConnectionError::NotAccessible => {
+                    super::surface_tenancy::SigningConnectionError::NotAccessible
+                    | super::surface_tenancy::SigningConnectionError::ContextNotOwned => {
                         SigningChoiceError::Invalid(error.message())
                     }
                     super::surface_tenancy::SigningConnectionError::Store(_) => {
@@ -382,6 +401,59 @@ mod tests {
         let message =
             invalid(validate_signing_choice(&on_vta_block, SigningOwner::Appliance, Some(&store), &disabled).await);
         assert!(message.contains("signing.context_id is required"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_choice_through_the_vta_block_is_refused_while_the_block_is_off() {
+        let (store, _tmp) = store_with(&[]).await;
+        let on = VtaConfig {
+            enabled: true,
+            ..VtaConfig::default()
+        };
+        for connection_id in [None, Some(crate::vta::key_directory::DEFAULT_CONNECTION_ID), Some("vta-bootstrap")] {
+            let choice = SurfaceSigningConfig {
+                connection_id: connection_id.map(str::to_string),
+                ..through("unused")
+            };
+            for owner in [SigningOwner::Appliance, SigningOwner::Resource(None), SigningOwner::Resource(Some("t"))] {
+                let message =
+                    invalid(validate_signing_choice(&choice, owner, Some(&store), &VtaConfig::default()).await);
+                assert_eq!(message, VTA_BLOCK_REQUIRED, "{connection_id:?} {owner:?}");
+            }
+            for owner in [SigningOwner::Appliance, SigningOwner::Resource(None)] {
+                validate_signing_choice(&choice, owner, Some(&store), &on)
+                    .await
+                    .unwrap_or_else(|e| panic!("{connection_id:?} {owner:?}: the [vta] block serves it: {e:?}"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tenant_resource_cannot_name_a_context_of_the_appliances_own_agent() {
+        let (store, _tmp) = store_with(&[]).await;
+        let provisioning = VtaConfig {
+            enabled: true,
+            auto_provision_contexts: true,
+            ..VtaConfig::default()
+        };
+        for connection_id in [None, Some(crate::vta::key_directory::DEFAULT_CONNECTION_ID), Some("vta-bootstrap")] {
+            let named = SurfaceSigningConfig {
+                connection_id: connection_id.map(str::to_string),
+                context_id: Some("another-tenants-context".to_string()),
+                ..through("unused")
+            };
+            let message = invalid(
+                validate_signing_choice(&named, SigningOwner::Resource(Some("t")), Some(&store), &provisioning).await,
+            );
+            assert!(message.contains("creates that tenant's contexts itself"), "{connection_id:?}: {message}");
+            validate_signing_choice(&named, SigningOwner::Resource(None), Some(&store), &provisioning)
+                .await
+                .expect("an appliance-wide resource may name the appliance's contexts");
+            let unnamed = SurfaceSigningConfig { context_id: None, ..named };
+            validate_signing_choice(&unnamed, SigningOwner::Resource(Some("t")), Some(&store), &provisioning)
+                .await
+                .expect("the gateway creates the tenant's own context");
+        }
     }
 
     #[tokio::test]

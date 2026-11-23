@@ -51,7 +51,7 @@ static SYNC: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Canonical `(host, port)` key for an endpoint, or `None` when it names no
 /// host (a unix socket path, a relative URL).
-fn origin_key(raw: &str) -> Option<String> {
+pub fn origin_key(raw: &str) -> Option<String> {
     let url = Url::parse(raw.trim()).ok()?;
     let host = url
         .host_str()?

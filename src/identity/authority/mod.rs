@@ -34,6 +34,12 @@ pub trait CredentialAuthority: Send + Sync {
     /// issuer-signed JWTs without resolving the issuer DID document.
     async fn issuer_jwks(&self) -> Result<Value>;
 
+    /// Issuer DIDs this gateway signed tokens as before, whose keys it still
+    /// publishes in [`Self::issuer_jwks`]. None by default.
+    async fn earlier_issuer_dids(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Sign `claims` into a compact JWS (JWT) with the issuer key.
     async fn sign_token(
         &self,

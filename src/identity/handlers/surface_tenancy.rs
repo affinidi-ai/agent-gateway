@@ -122,14 +122,20 @@ fn may_sign_through(
 pub(crate) enum SigningConnectionError {
     /// The connection does not exist or belongs to another tenant.
     NotAccessible,
+    /// A tenant's resource names a context of the appliance's own trust agent.
+    ContextNotOwned,
     /// The connection store could not be read.
     Store(String),
 }
+
+const SIGNING_CONTEXT_NOT_OWNED: &str = "signing.context_id cannot be set on a tenant's surface or issuer that signs \
+     through the appliance's own trust agent: the gateway creates that tenant's contexts itself";
 
 impl SigningConnectionError {
     pub(crate) fn message(&self) -> String {
         match self {
             Self::NotAccessible => SIGNING_CONNECTION_NOT_ACCESSIBLE.to_string(),
+            Self::ContextNotOwned => SIGNING_CONTEXT_NOT_OWNED.to_string(),
             Self::Store(error) => format!("could not read the trust agent connection: {error}"),
         }
     }
@@ -139,24 +145,32 @@ impl SigningConnectionError {
 /// by `owner_tenant_id` may sign through.
 ///
 /// The appliance's own connections, the bootstrap one and the default, belong to no tenant and are
-/// always usable. Without this check a tenant could point a surface, or an issuer, at another
+/// always usable, but a tenant's resource signs through them only in a context the gateway creates
+/// for it: the agent's grant covers every context, so a named one could be the appliance's or
+/// another tenant's. Without this check a tenant could point a surface, or an issuer, at another
 /// tenant's connection and have its tokens signed by that tenant's key.
 pub(crate) async fn check_signing_connection(
     store: &dyn crate::vta::connections::VtaConnectionStorage,
     owner_tenant_id: Option<&str>,
     signing: &crate::config::agent_surface::SurfaceSigningConfig,
 ) -> Result<(), SigningConnectionError> {
-    let Some(connection_id) = signing
+    let connection_id = signing
         .connection_id
-        .as_deref()
-    else {
-        return Ok(());
-    };
-    if connection_id == crate::vta::connections::BOOTSTRAP_CONNECTION_ID
-        || connection_id == crate::vta::key_directory::DEFAULT_CONNECTION_ID
-    {
+        .as_deref();
+    if connection_id.is_none_or(|id| {
+        id == crate::vta::connections::BOOTSTRAP_CONNECTION_ID || id == crate::vta::key_directory::DEFAULT_CONNECTION_ID
+    }) {
+        if signing.backend == Some(crate::config::agent_surface::SigningBackendKind::Vta)
+            && owner_tenant_id.is_some()
+            && signing.context_id.is_some()
+        {
+            return Err(SigningConnectionError::ContextNotOwned);
+        }
         return Ok(());
     }
+    let Some(connection_id) = connection_id else {
+        return Ok(());
+    };
     let connection = store
         .get(connection_id)
         .await

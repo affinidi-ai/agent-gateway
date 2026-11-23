@@ -113,6 +113,15 @@ impl VtaAgentProvisioner {
     }
 }
 
+/// Whether provisioning failed because the trust agent refused it (`403`), such
+/// as a grant without `context-create`, rather than for a reason that may pass:
+/// an unreachable agent, an open circuit, a timeout or a spent quota.
+pub fn is_capability_refusal(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(cause.downcast_ref::<crate::vta::VtaError>(), Some(crate::vta::VtaError::Http { status: 403, .. }))
+    })
+}
+
 #[async_trait]
 impl AgentKeyProvisioner for VtaAgentProvisioner {
     async fn provision(
@@ -124,7 +133,10 @@ impl AgentKeyProvisioner for VtaAgentProvisioner {
             .creator
             .create_context(&name)
             .await
-            .map_err(|e| anyhow!("provisioning a VTA context for agent `{identity_hash}`: {e}"))?;
+            .map_err(|e| {
+                let message = format!("provisioning a VTA context for agent `{identity_hash}`: {e}");
+                anyhow::Error::new(e).context(message)
+            })?;
         let context_id = context_id
             .as_str()
             .to_string();
@@ -133,7 +145,10 @@ impl AgentKeyProvisioner for VtaAgentProvisioner {
             .creator
             .signing_did(&context_id)
             .await
-            .map_err(|e| anyhow!("the provisioned agent context `{context_id}` has no identity: {e}"))?;
+            .map_err(|e| {
+                let message = format!("the provisioned agent context `{context_id}` has no identity: {e}");
+                anyhow::Error::new(e).context(message)
+            })?;
 
         Ok(ProvisionedAgent {
             did,

@@ -32,6 +32,7 @@ Feature: The gateway rotates the control key of a connection the operator added
     When the operator renames the custom connection
     Then the admin API response status is 200
     And the connection still names the rotated key after the edit
+    And the custom connection can still sign
 
   Scenario: The connection list shows when the control key was rotated
     Given the operator has connected a custom trust agent that reads the gateway's published DID

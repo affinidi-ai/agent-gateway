@@ -243,15 +243,19 @@ impl ConnectionKeyRotator {
             .map_err(|e| VtaError::Config(format!("VTA connection lookup failed: {e}")))
     }
 
+    /// Save the control key fields of `connection`, the only ones a rotation
+    /// owns, onto the stored record.
     async fn save(
         &self,
         connection: VtaConnection,
     ) -> Result<(), VtaError> {
-        self.store
-            .update(connection)
-            .await
-            .map(|_| ())
-            .map_err(|e| VtaError::Config(format!("VTA connection could not be saved: {e}")))
+        crate::vta::connections::modify(self.store.as_ref(), &connection.id, |stored| {
+            stored.control_key_ref = connection.control_key_ref;
+            stored.control_key_state = connection.control_key_state;
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| VtaError::Config(format!("VTA connection could not be saved: {e}")))
     }
 
     async fn seed_of(
@@ -943,6 +947,7 @@ mod tests {
         accepted: Mutex<Vec<String>>,
         switches: Mutex<Vec<String>>,
         transport_failures: Mutex<u32>,
+        revoke_during_switch: Mutex<Option<Arc<FakeStore>>>,
     }
 
     impl FakeClients {
@@ -956,6 +961,7 @@ mod tests {
                 ),
                 switches: Mutex::new(vec![]),
                 transport_failures: Mutex::new(0),
+                revoke_during_switch: Mutex::new(None),
             })
         }
 
@@ -971,7 +977,7 @@ mod tests {
     impl ConnectionClients for FakeClients {
         async fn switch_key(
             &self,
-            _id: &str,
+            id: &str,
             key: Arc<dyn SignerKeyProvider>,
         ) -> Result<(), VtaError> {
             let vm = key
@@ -984,6 +990,19 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(vm.clone());
+            let revoking = self
+                .revoke_during_switch
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(store) = revoking {
+                crate::vta::connections::modify(store.as_ref(), id, |stored| {
+                    stored.pairing = crate::vta::pairing::revoke(&stored.pairing);
+                    stored.status = stored.pairing.state.into();
+                })
+                .await
+                .unwrap();
+            }
             {
                 let mut failures = self
                     .transport_failures
@@ -1172,6 +1191,36 @@ mod tests {
         assert_ne!(keys[0].multibase, f.old.public_key_multibase());
         assert_eq!(f.clients.switches(), vec!["key-2".to_string()], "signed in once, as the new key");
         assert_eq!(f.secrets.ids(), vec!["vta-control-key-conn-r-key-2".to_string()], "the old seed is gone");
+    }
+
+    #[tokio::test]
+    async fn a_revoke_while_the_key_is_switched_stays_revoked() {
+        let f = fixture(&["key-1", "key-2"]).await;
+        *f.clients
+            .revoke_during_switch
+            .lock()
+            .unwrap() = Some(f.store.clone());
+
+        f.rotator
+            .start(ID, Some("ada"))
+            .await
+            .expect("start");
+        f.rotator
+            .drive(ID)
+            .await
+            .expect("drive");
+
+        let record = f.record().await;
+        assert_eq!(record.pairing.state, PairingState::Revoked, "the rotation did not save over the revoke");
+        assert_eq!(record.status, VtaConnectionStatus::Error);
+        assert_eq!(
+            record
+                .control_key_state
+                .verification_method
+                .as_deref(),
+            Some("#key-2"),
+            "the rotation still recorded its own fields"
+        );
     }
 
     #[tokio::test]

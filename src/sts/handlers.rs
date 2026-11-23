@@ -359,6 +359,22 @@ impl StsSubjectVerifier for JwtBearerSubjectVerifier {
                 .map(VerifiedAssertion::issued_by_this_gateway);
         }
 
+        // A token signed under an earlier gateway-wide default, such as one the
+        // gateway's own key signed before the default moved to a trust agent,
+        // claims the issuer it was signed as. It is still ours while that
+        // signer's keys are published.
+        if self
+            .self_authority
+            .earlier_issuer_dids()
+            .await
+            .contains(&iss)
+        {
+            return self
+                .verify_local_jwt(token, &iss)
+                .await
+                .map(VerifiedAssertion::issued_by_this_gateway);
+        }
+
         // A VTA-signed token claims the `did:key` of the key that signed it, so
         // a surface mapped to its own key, or a key retired by a rotation,
         // claims a different issuer than the appliance's current one. It is
@@ -4492,12 +4508,17 @@ mod tests {
     /// DID is **not** the local gateway's.
     struct BackendAuthority {
         issuer_did: String,
+        earlier: Vec<String>,
     }
 
     #[async_trait::async_trait]
     impl crate::identity::authority::CredentialAuthority for BackendAuthority {
         async fn issuer_did(&self) -> anyhow::Result<String> {
             Ok(self.issuer_did.clone())
+        }
+
+        async fn earlier_issuer_dids(&self) -> Vec<String> {
+            self.earlier.clone()
         }
 
         async fn issuer_jwks(&self) -> anyhow::Result<Value> {
@@ -4569,6 +4590,13 @@ mod tests {
     }
 
     fn subject_verifier_for(issuer_did: &str) -> JwtBearerSubjectVerifier {
+        subject_verifier_with_earlier(issuer_did, &[])
+    }
+
+    fn subject_verifier_with_earlier(
+        issuer_did: &str,
+        earlier: &[&str],
+    ) -> JwtBearerSubjectVerifier {
         let jwks_client = Arc::new(crate::jwt_bearer::JwksClient::new());
         let jwt_verifier = Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(jwks_client));
         JwtBearerSubjectVerifier::new(
@@ -4576,8 +4604,29 @@ mod tests {
             Arc::new(EmptyStrategies),
             Arc::new(BackendAuthority {
                 issuer_did: issuer_did.to_string(),
+                earlier: earlier
+                    .iter()
+                    .map(|did| did.to_string())
+                    .collect(),
             }),
         )
+    }
+
+    /// A token the gateway signed as its own did:web before the gateway-wide
+    /// default moved to a trust agent is still recognised as the gateway's own.
+    #[tokio::test]
+    async fn self_trust_recognises_an_earlier_issuer_of_this_gateway() {
+        let earlier = "did:web:gateway.example";
+        let verifier = subject_verifier_with_earlier("did:key:z6MkVta", &[earlier]);
+        let token = jwt_with(r#"{"alg":"EdDSA","typ":"JWT"}"#, &format!(r#"{{"iss":"{earlier}","sub":"u"}}"#));
+
+        let err = verifier
+            .verify_jwt(&token, None)
+            .await
+            .expect_err("an unsigned token never verifies");
+        let text = err.to_string();
+        assert!(!text.contains("no verification strategy"), "it takes the self-trust path: {text}");
+        assert!(text.contains("verification failed"), "it fails at signature verification: {text}");
     }
 
     /// The regression this ticket exists to prevent: when signing moves to a

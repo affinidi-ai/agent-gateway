@@ -529,6 +529,27 @@ impl VtaConnectionStorage for FileSystemVtaConnectionStore {
     }
 }
 
+/// Serialises every read-then-write of a connection record in this process.
+static WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Re-read connection `id` and save it with `change` applied, holding one lock
+/// for both, so a writer that awaited a trust agent never saves the copy it
+/// loaded before over what another writer saved meanwhile. Each writer changes
+/// only the fields it owns.
+pub async fn modify(
+    store: &dyn VtaConnectionStorage,
+    id: &str,
+    change: impl FnOnce(&mut VtaConnection),
+) -> Result<VtaConnection> {
+    let _guard = WRITES.lock().await;
+    let mut connection = store
+        .get(id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("VTA connection {id} not found"))?;
+    change(&mut connection);
+    store.update(connection).await
+}
+
 /// Migrate the bootstrap `[vta]` block into a record, once.
 ///
 /// Idempotent by construction: the record always carries

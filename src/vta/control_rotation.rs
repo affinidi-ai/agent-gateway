@@ -308,7 +308,14 @@ impl super::control_key::ControlKeyReloader for StoredKeyReloader {
     async fn reload(&self) -> Option<Arc<dyn SignerKeyProvider>> {
         // A rotation running right now settles its own pending key.
         let _quiet = Rotating::begin(&self.control_key_path)?;
-        if let Err(e) = settle_pending(&self.config, &self.vta_did, &self.control_key_path).await {
+        if let Err(e) = settle_pending_unless_standby(
+            crate::server::mode::is_standby(),
+            &self.config,
+            &self.vta_did,
+            &self.control_key_path,
+        )
+        .await
+        {
             tracing::warn!(target: "vta_audit", "could not settle a pending control key: {}", e.log_detail());
         }
         let seed = read_seed(&self.control_key_path)
@@ -365,6 +372,21 @@ pub async fn rotate_live(
 /// trust agent refuses it, the swap never happened: the current key is still
 /// the one, so drop the pending key. If the agent cannot be reached the answer
 /// is unknown, and the error says so rather than guessing.
+/// [`settle_pending`] on the Active node only. A Standby sharing storage with
+/// the Active node could otherwise drop the key the Active node is switching
+/// to, before the trust agent has taken it.
+pub async fn settle_pending_unless_standby(
+    standby: bool,
+    config: &VtaConfig,
+    vta_did: &str,
+    control_key_path: &Path,
+) -> Result<Option<Rotated>, VtaError> {
+    if standby {
+        return Ok(None);
+    }
+    settle_pending(config, vta_did, control_key_path).await
+}
+
 pub async fn settle_pending(
     config: &VtaConfig,
     vta_did: &str,
@@ -1302,6 +1324,39 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "nothing was discarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_standby_leaves_a_pending_key_for_the_active_node() {
+        let mock = new_mock();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = enrolled_gateway(&mock, dir.path()).await;
+        let url = serve(&mock).await;
+        write_seed(&pending_key_path(&path), &ControlKey::generate())
+            .await
+            .unwrap();
+
+        settle_pending_unless_standby(true, &config(&url), VTA, &path)
+            .await
+            .expect("a standby does nothing");
+        assert!(
+            read_seed(&pending_key_path(&path))
+                .await
+                .unwrap()
+                .is_some(),
+            "the Active node may still be switching to it"
+        );
+
+        settle_pending_unless_standby(false, &config(&url), VTA, &path)
+            .await
+            .expect("settled");
+        assert!(
+            read_seed(&pending_key_path(&path))
+                .await
+                .unwrap()
+                .is_none(),
+            "the Active node drops a key the trust agent refuses"
         );
     }
 

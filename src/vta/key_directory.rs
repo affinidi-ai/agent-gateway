@@ -1217,18 +1217,83 @@ pub fn provisions_contexts_on(
 /// The JWKS also publishes the keys tokens signed earlier may carry: the local
 /// key, the `[vta]` key, and every key this authority signed with before the
 /// default moved off it, so a switch does not invalidate tokens in flight.
+///
+/// The earlier signers' public keys and issuer DIDs are kept in a file when one
+/// is given, so tokens they signed still verify after a restart.
 pub struct ApplianceAuthority {
     directory: Arc<KeyDirectory>,
     signer: RwLock<Option<(KeyRef, Arc<dyn CredentialAuthority>)>>,
-    previous_keys: RwLock<Vec<serde_json::Value>>,
+    previous: RwLock<SignerHistory>,
+    history_path: Option<std::path::PathBuf>,
 }
+
+/// The public keys and issuer DIDs of the signers the gateway-wide default
+/// moved off. Public material only.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+struct SignerHistory {
+    #[serde(default)]
+    keys: Vec<serde_json::Value>,
+    #[serde(default)]
+    issuer_dids: Vec<String>,
+}
+
+/// File name of the signer history under the gateway's storage directory.
+pub const SIGNER_HISTORY_FILE: &str = "appliance_signer_history.json";
 
 impl ApplianceAuthority {
     pub fn new(directory: Arc<KeyDirectory>) -> Self {
         Self {
             directory,
             signer: RwLock::new(None),
-            previous_keys: RwLock::new(Vec::new()),
+            previous: RwLock::new(SignerHistory::default()),
+            history_path: None,
+        }
+    }
+
+    /// Keep the earlier signers in `path`, starting from what it already holds.
+    pub async fn with_history(
+        mut self,
+        path: std::path::PathBuf,
+    ) -> Self {
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => match serde_json::from_slice::<SignerHistory>(&bytes) {
+                Ok(history) => *self.previous.get_mut() = history,
+                Err(e) => tracing::warn!(
+                    target: "vta_audit",
+                    error = %e,
+                    "the earlier gateway-wide signers could not be read; tokens they signed may stop verifying",
+                ),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                target: "vta_audit",
+                error = %e,
+                "the earlier gateway-wide signers could not be read; tokens they signed may stop verifying",
+            ),
+        }
+        self.history_path = Some(path);
+        self
+    }
+
+    async fn save_history(
+        &self,
+        history: &SignerHistory,
+    ) {
+        let Some(path) = &self.history_path else {
+            return;
+        };
+        let written = match serde_json::to_vec_pretty(history) {
+            Ok(bytes) => crate::storage::filesystem::atomic_write_file_with_mode(path, &bytes, None)
+                .await
+                .map_err(|e| format!("{e:?}")),
+            Err(e) => Err(e.to_string()),
+        };
+        if let Err(e) = written {
+            tracing::warn!(
+                target: "vta_audit",
+                error = %e,
+                "the earlier gateway-wide signers could not be saved; tokens they signed stop verifying after a restart",
+            );
         }
     }
 
@@ -1248,6 +1313,24 @@ impl ApplianceAuthority {
         self.note_signer(key_ref, &authority)
             .await;
         Ok(authority)
+    }
+
+    /// The keys of the last signer that resolved, which tokens it signed carry.
+    async fn last_signer_keys(&self) -> Vec<serde_json::Value> {
+        let last = self
+            .signer
+            .read()
+            .await
+            .as_ref()
+            .map(|(_, authority)| Arc::clone(authority));
+        match last {
+            Some(authority) => authority
+                .issuer_jwks()
+                .await
+                .map(|jwks| jwks_keys(&jwks))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
     }
 
     /// Remembers the keys of the signer `key_ref` replaces, so they stay published.
@@ -1271,20 +1354,35 @@ impl ApplianceAuthority {
         let Some(previous) = replaced else {
             return;
         };
-        match previous.issuer_jwks().await {
-            Ok(jwks) => {
-                let mut kept = self
-                    .previous_keys
-                    .write()
-                    .await;
-                merge_keys(&mut kept, jwks_keys(&jwks));
+        let keys = match previous.issuer_jwks().await {
+            Ok(jwks) => jwks_keys(&jwks),
+            Err(e) => {
+                tracing::warn!(
+                    target: "vta_audit",
+                    error = %e,
+                    "the keys of the previous appliance signer could not be read; tokens it signed may stop verifying",
+                );
+                Vec::new()
             }
-            Err(e) => tracing::warn!(
-                target: "vta_audit",
-                error = %e,
-                "the keys of the previous appliance signer could not be read; tokens it signed may stop verifying",
-            ),
-        }
+        };
+        let issuer_did = previous
+            .issuer_did()
+            .await
+            .ok();
+        let history = {
+            let mut kept = self.previous.write().await;
+            merge_keys(&mut kept.keys, keys);
+            if let Some(did) = issuer_did
+                && !kept
+                    .issuer_dids
+                    .contains(&did)
+            {
+                kept.issuer_dids.push(did);
+            }
+            kept.clone()
+        };
+        self.save_history(&history)
+            .await;
     }
 
     /// Keys of the signers built into this appliance, which tokens signed under
@@ -1334,22 +1432,53 @@ impl CredentialAuthority for ApplianceAuthority {
             .await
     }
 
+    /// The current signer's keys, then every earlier and built-in key. A
+    /// current signer that cannot be resolved, such as one whose connection was
+    /// just disabled, still leaves the keys outstanding tokens carry published.
     async fn issuer_jwks(&self) -> anyhow::Result<serde_json::Value> {
-        let current = self
-            .current()
-            .await?
-            .issuer_jwks()
-            .await?;
-        let mut keys = jwks_keys(&current);
+        let current = match self.current().await {
+            Ok(current) => current.issuer_jwks().await,
+            Err(e) => Err(e),
+        };
+        let mut keys = match current {
+            Ok(current) => jwks_keys(&current),
+            Err(e) => {
+                tracing::warn!(
+                    target: "vta_audit",
+                    error = %e,
+                    "the gateway-wide signer's keys could not be read; publishing the earlier ones",
+                );
+                self.last_signer_keys().await
+            }
+        };
         merge_keys(
             &mut keys,
-            self.previous_keys
+            self.previous
                 .read()
                 .await
+                .keys
                 .clone(),
         );
         merge_keys(&mut keys, self.built_in_keys().await);
         Ok(serde_json::json!({ "keys": keys }))
+    }
+
+    async fn earlier_issuer_dids(&self) -> Vec<String> {
+        let mut dids = self
+            .previous
+            .read()
+            .await
+            .issuer_dids
+            .clone();
+        let built_in = std::iter::once(&self.directory.local).chain(self.directory.vta.as_ref());
+        for authority in built_in {
+            if let Ok(did) = authority.issuer_did().await
+                && !dids.contains(&did)
+            {
+                dids.push(did);
+            }
+        }
+        dids
     }
 
     async fn sign_token(
@@ -2905,6 +3034,101 @@ mod tests {
             ),
             vec!["b-1", "a-1", "local-1"],
             "the signing key first, then the earlier signer's and the gateway's own"
+        );
+    }
+
+    /// A signer that stops resolving, such as one whose connection was disabled,
+    /// still leaves the keys outstanding tokens carry published.
+    #[tokio::test]
+    async fn the_jwks_keeps_the_earlier_keys_when_the_signer_cannot_be_resolved() {
+        let default = Arc::new(SwitchableDefault(std::sync::Mutex::new(default_signing_with("key-a"))));
+        let dir = directory_with(None);
+        dir.cache
+            .write()
+            .await
+            .insert(vta_jwt_ref("key-a"), StubAuthority::new("did:key:a", vec!["a-1"]) as Arc<dyn CredentialAuthority>);
+        let authority = ApplianceAuthority::new(Arc::new(
+            dir.with_appliance_default(Arc::clone(&default) as Arc<dyn ApplianceSigningDefault>),
+        ));
+        authority
+            .sign_token(&serde_json::json!({ "sub": "u" }))
+            .await
+            .unwrap();
+
+        *default.0.lock().unwrap() = Some(appliance_vta_signing("vta-gone"));
+        assert!(
+            authority
+                .sign_token(&serde_json::json!({ "sub": "u" }))
+                .await
+                .is_err(),
+            "nothing signs with an unresolvable key"
+        );
+        assert_eq!(
+            kids(
+                &authority
+                    .issuer_jwks()
+                    .await
+                    .expect("the JWKS is still served")
+            ),
+            vec!["a-1", "local-1"]
+        );
+    }
+
+    /// The earlier signers survive a restart, and their issuer DIDs, with the
+    /// built-in ones, are offered as this gateway's own.
+    #[tokio::test]
+    async fn the_earlier_signers_are_kept_across_a_restart() {
+        let history = tempfile::tempdir().unwrap();
+        let path = history
+            .path()
+            .join(SIGNER_HISTORY_FILE);
+        let default = Arc::new(SwitchableDefault(std::sync::Mutex::new(default_signing_with("key-a"))));
+        let build = |default: Arc<SwitchableDefault>| async move {
+            let dir = directory_with(None);
+            for (key_id, authority) in [
+                ("key-a", StubAuthority::new("did:key:a", vec!["a-1"])),
+                ("key-b", StubAuthority::new("did:key:b", vec!["b-1"])),
+            ] {
+                dir.cache
+                    .write()
+                    .await
+                    .insert(vta_jwt_ref(key_id), authority as Arc<dyn CredentialAuthority>);
+            }
+            ApplianceAuthority::new(Arc::new(dir.with_appliance_default(default as Arc<dyn ApplianceSigningDefault>)))
+        };
+        let before = build(Arc::clone(&default))
+            .await
+            .with_history(path.clone())
+            .await;
+        before
+            .sign_token(&serde_json::json!({ "sub": "u" }))
+            .await
+            .unwrap();
+        *default.0.lock().unwrap() = default_signing_with("key-b");
+        before
+            .sign_token(&serde_json::json!({ "sub": "u" }))
+            .await
+            .unwrap();
+
+        let after = build(Arc::clone(&default))
+            .await
+            .with_history(path)
+            .await;
+        assert_eq!(
+            kids(
+                &after
+                    .issuer_jwks()
+                    .await
+                    .unwrap()
+            ),
+            vec!["b-1", "a-1", "local-1"],
+            "the key that signed before the switch is still published"
+        );
+        assert_eq!(
+            after
+                .earlier_issuer_dids()
+                .await,
+            vec!["did:key:a".to_string(), "did:key:local".to_string()]
         );
     }
 

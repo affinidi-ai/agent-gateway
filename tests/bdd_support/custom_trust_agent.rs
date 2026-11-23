@@ -87,6 +87,7 @@ struct AgentState {
     signed_in: Vec<(String, String)>,
     refused: Vec<String>,
     answer_signer: AnswerSigner,
+    unavailable: bool,
 }
 
 #[derive(Debug)]
@@ -241,6 +242,14 @@ async fn trust_tasks(
         .as_str()
         .unwrap_or_default()
         .to_string();
+
+    if state
+        .lock()
+        .expect("mock state")
+        .unavailable
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "restarting" }))).into_response();
+    }
 
     if task.contains("auth/challenge") {
         return Json(json!({ "challenge": "c", "sessionId": "s" })).into_response();
@@ -401,6 +410,14 @@ impl CustomTrustAgent {
             .lock()
             .expect("mock state")
             .answer_signer = signer;
+    }
+
+    /// Answer every task with `503`, as an agent that is restarting does.
+    pub fn become_unavailable(&self) {
+        self.state
+            .lock()
+            .expect("mock state")
+            .unavailable = true;
     }
 
     /// The DID an impostor signs its answers as.

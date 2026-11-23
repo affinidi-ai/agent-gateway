@@ -154,7 +154,9 @@ pub async fn select_signing_backends(
 
     let rotatable_key_path = rotatable_control_key_path(config);
     if let Some(path) = &rotatable_key_path
-        && let Err(e) = control_rotation::settle_pending(config, vta_did, path).await
+        && let Err(e) =
+            control_rotation::settle_pending_unless_standby(crate::server::mode::is_standby(), config, vta_did, path)
+                .await
     {
         tracing::warn!(target: "vta_audit", "could not settle a pending control key: {}", e.log_detail());
     }

@@ -2643,7 +2643,16 @@ pub async fn create_identity_api_router(
     }
     let key_directory = std::sync::Arc::new(key_directory);
     let sts_signing_authority: std::sync::Arc<dyn crate::identity::authority::CredentialAuthority> =
-        std::sync::Arc::new(crate::vta::key_directory::ApplianceAuthority::new(std::sync::Arc::clone(&key_directory)));
+        std::sync::Arc::new(
+            crate::vta::key_directory::ApplianceAuthority::new(std::sync::Arc::clone(&key_directory))
+                .with_history(
+                    sts_vc_issuer
+                        .get_storage_path()
+                        .await
+                        .join(crate::vta::key_directory::SIGNER_HISTORY_FILE),
+                )
+                .await,
+        );
 
     // What this appliance signs with when nobody has said.
     let default_resolution = std::sync::Arc::new(crate::vta::onboarding_default::resolve(&sts_vta_config));

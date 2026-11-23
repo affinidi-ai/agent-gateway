@@ -505,6 +505,15 @@ fn to_connection(
     }
 }
 
+/// Whether an edit points the connection at another trust agent: a different
+/// endpoint, agent DID or transport.
+fn points_elsewhere(
+    existing: &VtaConnection,
+    body: &VtaConnectionRequest,
+) -> bool {
+    existing.endpoint != body.endpoint || existing.vta_did != body.vta_did || existing.transport != body.transport
+}
+
 /// The published DID survives an edit, because the grant names it. It belongs
 /// to the control key, so a connection pointed at a different key loses it.
 fn kept_control_did(
@@ -759,8 +768,13 @@ pub async fn update_connection(
         )
             .into_response();
     }
-    if existing.enabled
-        && !body.enabled
+    let repointed = points_elsewhere(&existing, &body);
+    if (existing.enabled && !body.enabled
+        || repointed
+            && existing
+                .pairing
+                .state
+                .is_usable())
         && let Some(response) = guard_disconnect(
             &state,
             &id,
@@ -809,18 +823,30 @@ pub async fn update_connection(
     }
     let mut updated = to_connection(id.clone(), body, existing.status);
     updated.control_did = kept_control_did(&existing, &updated);
-    // Which key of the DID the gateway signs in with is the gateway's to change,
-    // never the request's.
-    updated.control_key_state = existing
-        .control_key_state
-        .clone();
     if let Err(message) = updated.validate() {
         return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response();
     }
-    match state
-        .store
-        .update(updated)
-        .await
+    // An edit changes only what the operator edits. The keys stay published so
+    // tokens they signed keep verifying, and the pairing stays unless the edit
+    // points the connection at another agent, whose grant has to be approved
+    // and verified again. Which key of the DID the gateway signs in with is the
+    // gateway's to change, never the request's.
+    match crate::vta::connections::modify(state.store.as_ref(), &id, |stored| {
+        if repointed {
+            stored.pairing = Default::default();
+            stored.status = stored.pairing.state.into();
+        }
+        stored.name = updated.name;
+        stored.description = updated.description;
+        stored.enabled = updated.enabled;
+        stored.transport = updated.transport;
+        stored.endpoint = updated.endpoint;
+        stored.vta_did = updated.vta_did;
+        stored.default_context_id = updated.default_context_id;
+        stored.control_key_ref = updated.control_key_ref;
+        stored.control_did = updated.control_did;
+    })
+    .await
     {
         Ok(updated) => {
             info!(id = %id, enabled = updated.enabled, "VTA connection updated");
@@ -969,20 +995,19 @@ async fn load_for_pairing(
 
 async fn persist_pairing(
     state: &VtaConnectionAdminState,
-    mut connection: VtaConnection,
+    connection: VtaConnection,
     pairing: crate::vta::pairing::PairingRecord,
 ) -> Result<VtaConnection, (StatusCode, Json<ErrorBody>)> {
-    connection.status = pairing.state.into();
-    connection.pairing = pairing;
     let id = connection.id.clone();
-    let updated = state
-        .store
-        .update(connection)
-        .await
-        .map_err(|e| {
-            error!(id = %id, error = %e, "Failed to persist VTA pairing state");
-            (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Internal server error"))
-        })?;
+    let updated = crate::vta::connections::modify(state.store.as_ref(), &id, |stored| {
+        stored.status = pairing.state.into();
+        stored.pairing = pairing;
+    })
+    .await
+    .map_err(|e| {
+        error!(id = %id, error = %e, "Failed to persist VTA pairing state");
+        (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Internal server error"))
+    })?;
     // Pairing changes whether the connection may sign, so the cached connector
     // must go: a revoke has to take effect on the very next request.
     invalidate(state, &id).await;
@@ -1128,9 +1153,9 @@ pub async fn verify_connection(
                 error = %e.log_detail(),
                 "VTA pairing verification failed",
             );
-            // Not reaching the trust agent says nothing about the grant, so a
-            // working connection keeps signing.
-            if matches!(e, crate::vta::VtaError::Transport(_)) {
+            // An agent that cannot answer for now says nothing about the grant,
+            // so a working connection keeps signing.
+            if e.is_unavailable() {
                 return (StatusCode::BAD_GATEWAY, ErrorBody::json(operator_message(&e))).into_response();
             }
             // Never a fallback to local signing — the connection stays
@@ -1451,6 +1476,8 @@ pub async fn vta_status(
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
     State(state): State<VtaConnectionAdminState>,
     pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
 ) -> impl IntoResponse {
     if let Err(e) = require_permission(
         &user_id,
@@ -1465,20 +1492,31 @@ pub async fn vta_status(
         return e.into_response();
     }
     let config = &state.vta_config;
+    // A tenant sees the addresses of the connections it may see, and nothing
+    // of the appliance's own trust agent.
+    let tenant_view = tenant_context(&context).is_some();
+    let reserved_origins = if tenant_view {
+        visible_connection_origins(&state, &context, &scope).await
+    } else {
+        crate::vta::isolation::reserved_origins()
+    };
     // The identity an operator grants on their trust agent. Exposed here
     // because it is redacted in logs and encrypted on disk, so this authorised
     // response is the only place it can be read — and an operator cannot grant
     // what they cannot see. `None` when no stable key is configured, which is
     // the case where showing one would be worse than showing nothing.
-    let control_did = bootstrap_control_did(config)
-        .await
-        .ok();
-    let through_trust_agent = crate::vta::inventory::signs_through_trust_agent(
-        config,
-        crate::storage::settings_store::global_settings()
-            .and_then(|settings| settings.default_signing)
-            .as_ref(),
-    );
+    let control_did = if tenant_view {
+        None
+    } else {
+        bootstrap_control_did(config)
+            .await
+            .ok()
+    };
+    let dashboard_default =
+        crate::storage::settings_store::global_settings().and_then(|settings| settings.default_signing);
+    let through_trust_agent = crate::vta::inventory::signs_through_trust_agent(config, dashboard_default.as_ref());
+    let default_resolution =
+        crate::vta::onboarding_default::effective(&state.default_resolution, dashboard_default.as_ref());
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -1496,17 +1534,40 @@ pub async fn vta_status(
             "context_did_hosting": config.context_did_hosting.as_str(),
             // The control key this gateway rotates with `acl/swap-key`: absent
             // unless it holds a `did:key` control key in a file.
-            "control_key": crate::vta::control_key_live::status(),
+            "control_key": if tenant_view { None } else { crate::vta::control_key_live::status() },
             // What this appliance signs with when nobody has said, and why
             //. Reported so "why is it signing with this?" never
             // requires reading config or code.
-            "default_resolution": state.default_resolution.as_ref(),
+            "default_resolution": default_resolution,
             // Addresses that are off-limits as proxy targets, so an operator
             // can see why a surface pointing at one was refused.
-            "reserved_origins": crate::vta::isolation::reserved_origins(),
+            "reserved_origins": reserved_origins,
         })),
     )
         .into_response()
+}
+
+/// The reserved origins of the verified connections this caller may see.
+async fn visible_connection_origins(
+    state: &VtaConnectionAdminState,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Vec<String> {
+    let connections = match state.store.list().await {
+        Ok(connections) => connections,
+        Err(e) => {
+            error!(error = %e, "Failed to list VTA connections for the status of a tenant");
+            return Vec::new();
+        }
+    };
+    connections
+        .iter()
+        .filter(|connection| crate::vta::isolation::reserves_endpoint(connection))
+        .filter(|connection| connection_allowed(connection, context, scope))
+        .filter_map(|connection| crate::vta::isolation::origin_key(&connection.endpoint))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// How a refused rotation is answered: the status, the seconds to wait (for a
@@ -2022,11 +2083,8 @@ pub async fn rotate_connection_key(
         return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response();
     }
 
-    match state
-        .store
-        .update(connection)
-        .await
-    {
+    let keys = connection.keys;
+    match crate::vta::connections::modify(state.store.as_ref(), &id, |stored| stored.keys = keys).await {
         Ok(updated) => {
             info!(
                 target: "vta_audit",
@@ -2178,11 +2236,8 @@ pub async fn provision_connection_key(
         return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response();
     }
 
-    match state
-        .store
-        .update(connection)
-        .await
-    {
+    let keys = connection.keys;
+    match crate::vta::connections::modify(state.store.as_ref(), &id, |stored| stored.keys = keys).await {
         Ok(updated) => {
             info!(
                 target: "vta_audit",

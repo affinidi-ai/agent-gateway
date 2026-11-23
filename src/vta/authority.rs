@@ -255,6 +255,12 @@ impl VtaCredentialAuthority {
                 response.alg
             )));
         }
+        // A public key recorded with the key id, rather than read from the
+        // agent, is only as good as whoever typed it: a token is published only
+        // once that key verifies it.
+        if let Some(public_key) = &self.signing_key_public {
+            verify_jws_signature(&response.jws, public_key)?;
+        }
         if let Some(audit) = &self.audit {
             let subject = claims
                 .get("sub")
@@ -267,6 +273,41 @@ impl VtaCredentialAuthority {
         }
         Ok(response.jws)
     }
+}
+
+/// Checks that the compact `jws` carries a signature the Ed25519 multibase
+/// public key `public_key_mb` verifies.
+fn verify_jws_signature(
+    jws: &str,
+    public_key_mb: &str,
+) -> Result<(), VtaError> {
+    use ed25519_dalek::Verifier as _;
+    let (signing_input, signature) = jws
+        .rsplit_once('.')
+        .ok_or_else(|| VtaError::Protocol("keys/sign-jws returned a JWS that is not compact".to_string()))?;
+    let (_base, bytes) = multibase::decode(public_key_mb)
+        .map_err(|e| VtaError::Protocol(format!("VTA public key is not multibase: {e}")))?;
+    let key_bytes: [u8; 32] = match bytes.as_slice() {
+        [0xed, 0x01, key @ ..] if key.len() >= 32 => key[..32]
+            .try_into()
+            .map_err(|_| VtaError::Protocol("VTA signing key is not an ed25519 multibase key".to_string()))?,
+        _ => return Err(VtaError::Protocol("VTA signing key is not an ed25519 multibase key".to_string())),
+    };
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|e| VtaError::Protocol(format!("VTA signing key is not a valid ed25519 key: {e}")))?;
+    let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(signature)
+        .ok()
+        .and_then(|bytes| ed25519_dalek::Signature::from_slice(&bytes).ok())
+        .ok_or_else(|| VtaError::Protocol("keys/sign-jws returned a JWS without an ed25519 signature".to_string()))?;
+    key.verify(signing_input.as_bytes(), &signature)
+        .map_err(|_| {
+            VtaError::Protocol(
+                "keys/sign-jws returned a signature the recorded public key does not verify; the key id and public \
+                 key recorded for this connection are not the same key"
+                    .to_string(),
+            )
+        })
 }
 
 /// Convert an Ed25519 multibase public key (as the VTA records it, `z`-prefixed
@@ -806,6 +847,43 @@ mod poc_tests {
                 .await
                 .is_err()
         );
+    }
+
+    fn multibase_of(key: &SigningKey) -> String {
+        let mut prefixed = vec![0xed_u8, 0x01];
+        prefixed.extend_from_slice(&key.verifying_key().to_bytes());
+        multibase::encode(multibase::Base::Base58Btc, &prefixed)
+    }
+
+    #[tokio::test]
+    async fn a_token_signed_by_the_recorded_public_key_is_returned() {
+        use crate::identity::authority::CredentialAuthority;
+        let signing = Arc::new(SigningKey::from_bytes(&[16u8; 32]));
+        let (base, _vta) = spawn(Arc::clone(&signing)).await;
+        let auth = authority(&base, "key-gateway-jwt").with_signing_key_public(Some(multibase_of(&signing)));
+        let jws = auth
+            .sign_token(&json!({ "sub": "urn:agent:a" }))
+            .await
+            .expect("the recorded key verifies the signature");
+        let (_header, payload) = verify_compact_jws(&jws, &signing.verifying_key());
+        assert_eq!(payload["sub"], "urn:agent:a");
+    }
+
+    #[tokio::test]
+    async fn a_token_the_recorded_public_key_does_not_verify_is_refused() {
+        use crate::identity::authority::CredentialAuthority;
+        let signing = Arc::new(SigningKey::from_bytes(&[17u8; 32]));
+        let (base, _vta) = spawn(signing).await;
+        let typed = SigningKey::from_bytes(&[18u8; 32]);
+        let auth = authority(&base, "key-gateway-jwt").with_signing_key_public(Some(multibase_of(&typed)));
+        let err = auth
+            .sign_token(&json!({ "sub": "urn:agent:a" }))
+            .await
+            .expect_err("a signature the recorded key does not verify is never returned");
+        match err.downcast_ref::<VtaError>() {
+            Some(VtaError::Protocol(message)) => assert!(message.contains("not the same key"), "{message}"),
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

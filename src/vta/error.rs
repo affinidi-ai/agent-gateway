@@ -114,6 +114,20 @@ impl VtaError {
             .unwrap_or(false)
     }
 
+    /// Whether the agent could not answer for now: it was not reached, or it or
+    /// its proxy answered `408`, `429` or a `5xx`. Such an error says nothing
+    /// about the grant.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport(_)
+                | Self::Http {
+                    status: 408 | 429 | 500..=599,
+                    ..
+                }
+        )
+    }
+
     /// Whether the operation may be safely retried once: a transport-level
     /// failure (connection/timeout), or a `429` in which the agent explicitly
     /// told us to come back.

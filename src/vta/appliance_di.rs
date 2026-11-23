@@ -578,6 +578,7 @@ mod live_tests {
 mod fallback_tests {
     use super::*;
     use crate::vta::agent_contexts::{AgentKeyProvisioner, ProvisionedAgent};
+    use anyhow::Context as _;
 
     struct AlwaysFails(bool);
 
@@ -587,7 +588,11 @@ mod fallback_tests {
             &self,
             _identity_hash: &str,
         ) -> Result<ProvisionedAgent> {
-            anyhow::bail!("permission denied: forbidden: context-create")
+            Err(crate::vta::VtaError::Http {
+                status: 403,
+                body: r#"{"payload":{"code":"permissionDenied"}}"#.to_string(),
+            })
+            .context("provisioning a VTA context for agent")
         }
 
         fn optional(&self) -> bool {

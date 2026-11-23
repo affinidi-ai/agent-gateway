@@ -106,6 +106,11 @@ async fn custom_agent_stops_signing(world: &mut SurfaceWorld) {
     agent(world).sign_answers_as(AnswerSigner::Nobody);
 }
 
+#[given("the custom trust agent answers every request with 503")]
+async fn custom_agent_unavailable(world: &mut SurfaceWorld) {
+    agent(world).become_unavailable();
+}
+
 #[given("the operator has rotated the custom connection's control key")]
 async fn operator_has_rotated(world: &mut SurfaceWorld) {
     let id = connection_id(world);
@@ -295,4 +300,15 @@ async fn not_connected_unsigned(world: &mut SurfaceWorld) {
     let pairing = &body(world)["pairing"];
     assert_eq!(pairing["state"], "degraded", "{}", body(world));
     assert_eq!(pairing["pinned_vta_did"], custom_trust_agent_did(), "the pin is kept");
+}
+
+#[then("the custom connection can still sign")]
+async fn can_still_sign(world: &mut SurfaceWorld) {
+    let id = connection_id(world);
+    let status = send(world, Method::GET, &format!("/v1/vta/connections/{id}/status"), None).await;
+    assert_eq!(status.status, 200, "{}", status.body);
+    assert_eq!(status.body["usable"], true, "{}", status.body);
+    let connection = send(world, Method::GET, &format!("/v1/vta/connections/{id}"), None).await;
+    assert_eq!(connection.body["pairing"]["state"], "connected", "{}", connection.body);
+    assert_eq!(connection.body["status"], "connected", "{}", connection.body);
 }

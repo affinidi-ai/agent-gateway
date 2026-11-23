@@ -53,9 +53,10 @@ surface's choice.
 A `signing` block names `backend` (`local` or `vta`) and, for a trust agent, `connection_id`,
 `context_id` and `key_id`. Surface, issuer and Gateway signing saves run one check: a trust agent
 choice must name `key_id`, and `context_id` unless it goes through an enabled `[vta]` block with
-`auto_provision_contexts` (contexts are created only through that connection); a surface or issuer
-may sign only through its own tenant's connection or an appliance-wide one; Gateway signing must
-name an existing appliance-wide connection. Changing a surface's, an issuer's or the gateway-wide
+`auto_provision_contexts` (contexts are created only through that connection); a choice that names
+no connection, `default` or `vta-bootstrap` signs through the `[vta]` block and is refused while the
+block is off; a surface or issuer may sign only through its own tenant's connection or an
+appliance-wide one; Gateway signing must name an existing appliance-wide connection. Changing a surface's, an issuer's or the gateway-wide
 signing choice needs `key_management.edit` on top of the route's own permission; a save that sends
 the stored choice back unchanged does not. In the
 dashboard this is the **Signing key source** field: **Gateway secret** or **Verifiable Trust
@@ -100,7 +101,7 @@ oracle. A scope nobody chose a trust agent for issues under the gateway-wide sig
 | --- | --- |
 | Tokens and credentials the gateway signs | Signed by the trust agent |
 | The Fabric issuer attestation | Signs as, and claims, the trust agent context |
-| Agents onboarded from then on | Their key is created inside the trust agent; the gateway never holds the private half |
+| Agents onboarded from then on | Their key is created inside the trust agent; the gateway never holds the private half. When the agent refuses (`403`, such as a grant without `context-create`) the agent gets a gateway-held key instead; any other failure, such as an unreachable agent, fails onboarding |
 | Agents that already exist | Unchanged: they keep their gateway-held keys, since moving them would change their DIDs |
 | TLS, SAML, x402 and DIDComm keys | Unchanged; `vta::key_surfaces` computes which keys stay local and why |
 
@@ -132,8 +133,9 @@ The `iss` value and the verification keys come from the same authority, so they 
   keys and the carried-over local key), so a resource server verifies by selecting on `kid`.
 - `/.well-known/oauth-authorization-server` advertises the same `issuer`.
 - The gateway's MCP Resource Server and loopback ID-JAG redemption resolve self-trust from the
-  same authority. A token issued under the gateway DID or the `did:key` of any key it publishes
-  (retired keys included) is the gateway's own, both when it is verified and when token exchange
+  same authority. A token issued under the gateway DID, an issuer DID the gateway signed as
+  before Gateway signing last changed (its own `did:web` included), or the `did:key` of any key it
+  publishes (retired keys included) is the gateway's own, both when it is verified and when token exchange
   refuses self-issued subject and actor tokens; an ID-JAG signed by a retired key is redeemed
   through jwt-bearer, never exchanged.
 
@@ -282,7 +284,12 @@ never crosses the network in clear, and cloud metadata hosts are refused.
 
 ### Disconnecting
 
-Revoking, deleting or disabling a connection is refused with `409` while Gateway signing, a
+Editing a connection changes only the fields sent: its pairing, keys and control key state stay,
+so a renamed connection keeps signing and tokens its keys signed keep verifying. An edit that
+points it at another endpoint, agent DID or transport resets its pairing, so the new agent has to
+be granted and verified again.
+
+Revoking, deleting, disabling or repointing a connection is refused with `409` while Gateway signing, a
 surface or an issuer signs through it (`signing_users`, and `hidden_signing_users` for those the
 caller may not see), while agents onboarded through it keep their key there
 (`stranded_agents`; revoking strands them, and the only recovery is re-onboarding with a new DID),
@@ -307,7 +314,11 @@ cannot call `POST /v1/vta/control-key/rotate`. A connection that something signs
 moved to a tenant that may not use it. `GET /v1/key-management/inventory` lists only the surfaces
 and issuers the caller may see, and for a tenant PAT only its own orphaned contexts. A connection's
 `control_key_ref` must name a secret its tenant may reference. Gateway signing, the `[vta]` block
-and its control key are appliance-wide. See
+and its control key are appliance-wide. A tenant's surface or issuer that signs through the
+appliance's own trust agent (no connection, `default` or `vta-bootstrap`) cannot name a context:
+the agent's grant covers every context, so the gateway creates the tenant's own. For a tenant PAT,
+`GET /v1/vta/status` lists only the reserved addresses of the connections it may see, and leaves out
+the appliance control DID and control key. See
 [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#trust-agent-connections) and
 [`RBAC.md`](RBAC.md#trust-agents-and-key-management).
 
@@ -390,7 +401,8 @@ superseded. The new key is stored as pending before the swap is sent, and the sw
 never retried automatically. The pending key is dropped only when the trust agent refuses the swap
 outright (`400`, `401` or `403`); any other answer, a timeout included, may come after the swap
 was applied, so the rotation is settled at the next start, on the next refused sign-in or before
-the next rotation, by asking the trust agent which key is live.
+the next rotation, by asking the trust agent which key is live. Only the Active node settles it: a
+Standby sharing storage leaves the pending key alone, since the Active node may be switching to it.
 
 `vta_control_key_rotation.json`, beside the key file, records when the gateway began holding the
 key and when it last rotated. `GET /v1/vta/status` reports it as
@@ -419,7 +431,9 @@ trust agent call.
 An internal key cannot be recovered if the trust agent is lost. Recovery is re-provision and
 rotate: mint a new key, sign with it, and keep the old one published as a retiring key
 (`[[vta.retiring_keys]]` with its `public_key`, or the connection's retired keys after
-`POST /v1/vta/connections/{id}/rotate`) until every token it signed has expired. Name an owner
+`POST /v1/vta/connections/{id}/rotate`) until every token it signed has expired. A public key
+recorded with a key id, rather than read from the trust agent, is checked on every signature: a
+token the recorded key does not verify is refused, never published. Name an owner
 for the trust agent's encrypted backup (`pnm backup export`) and its restore test. A trust agent
 operator with host access can still use the key, though not extract it.
 
@@ -431,9 +445,14 @@ operator with host access can still use the key, though not extract it.
    (`/connections/trust-agents/connect`). Enter a name, the trust agent's address and DID, and the
    context it granted, then **Create and pair**.
 2. Run the printed `vta acl create` command on the trust agent, as its administrator.
-3. **Verify** checks the grant; a refusal shows its reason.
+3. **Verify** checks the grant; a refusal shows its reason. An agent that cannot answer for now
+   (not reached, or `408`, `429` or a `5xx`) leaves a connected connection connected; only a
+   definite refusal degrades it.
 4. **Complete** provisions the connection's signing key and offers **Use this agent for all
    signing**, pre-checked only while no default is stored. **Done** applies it.
+
+Opening a revoked or degraded connection from its row shows its state and reason, with **Pair
+again**; pairing it replaces the state and the agent DID it pinned, so it never starts unasked.
 
 Settings → Security → Gateway signing then shows **Verifiable Trust Agent** with the connection.
 To check it, issue a credential (`POST /v1/identity/issue` with a new `agent_identity.sub`): its
@@ -544,8 +563,9 @@ staying scoped to one context, which each such test names.
   signer's keys (with a connection's retired keys), the gateway's own key, the `[vta]` key and the
   keys of the signer used before Gateway signing last changed, so a token a surface signs with
   another trust agent key may not verify through it; such a token verifies by resolving its
-  `iss`. The previous signer's keys are kept in memory only, so after a restart a token it
-  signed verifies only by resolving its `iss`.
+  `iss`. The earlier signers' public keys and issuer DIDs are kept in
+  `appliance_signer_history.json` in the storage directory, so they stay published across a
+  restart, and the JWKS keeps serving them while the current signer cannot be resolved.
 - **Context `did:webvh` logs hosted by the gateway are republished on the next signature.** After
   the trust agent's operator rotates a context's key, a verifier resolving the DID sees the
   previous key, which signed everything so far, until the gateway next signs as it. Hosting on the
