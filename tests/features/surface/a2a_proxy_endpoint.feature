@@ -23,6 +23,13 @@ Feature: A2A proxy endpoint targets a non-A2A managed agent
     And the A2A response result contains text from non-A2A managed agent "bravo"
     And the A2A response id matches the request id
 
+  Scenario: A request forwarded through the A2A proxy is recorded as forwarded
+    Given the VP Audit Log keeps only audit event "request_forwarded"
+    When the caller sends an A2A message/send request to surface "alpha" with text "hello worker"
+    Then the response status is 200
+    And non-A2A managed agent "bravo" received text "hello worker"
+    And the VP Audit Log records the forwarded request once
+
   Scenario: Multiple text parts are sent to the Target service deterministically
     When the caller sends an A2A message/send request to surface "alpha" with text parts "hello" and "worker"
     Then the response status is 200

@@ -6449,6 +6449,14 @@ async fn proxy_charged_request(
             if let Some(receipt) = &gate_receipt {
                 receipt.commit().await;
             }
+            // Every check has passed: the request is handed to the A2A proxy now.
+            crate::audit::request_events::request_forwarded(crate::audit::request_events::Forwarding {
+                surface: &state.surface,
+                trace_id: &trace_id,
+                agent_identity_did: request_agent_did.as_deref(),
+                identity: authenticated_identity.as_ref(),
+                actor_did: request_agent_did.as_deref(),
+            });
             crate::a2a_proxies::A2aProxyTargetAdapter::dispatch_message_send(
                 &proxy,
                 prepared,
