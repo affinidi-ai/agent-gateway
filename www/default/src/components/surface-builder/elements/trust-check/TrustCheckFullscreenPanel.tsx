@@ -15,6 +15,7 @@ import {
   readOnlyTrustCheckProtocol,
   readQueries,
   pickAuthorities,
+  transitPointPresentsManagedIdentity,
   transitPointSubjectChoice,
   trustCheckLeg,
   type AuthorityRow,
@@ -51,6 +52,8 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
   const leg = trustCheckLeg(node, allNodes);
   const readOnlyProtocol = readOnlyTrustCheckProtocol({ ...node, config }, allNodes);
   const subjectChoice = transitPointSubjectChoice(node, allNodes);
+  const managedIdentityMissing =
+    transitPointPresentsManagedIdentity(node, allNodes ?? []) === false;
   const isApMa = leg === 'caller';
   const legLabel = isApMa ? 'caller' : 'target';
 
@@ -261,6 +264,7 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
             handleQueryTypeChangeAt={handleQueryTypeChangeAt}
             saveAttempted={saveAttempted}
             subjectChoice={subjectChoice}
+            managedIdentityMissing={managedIdentityMissing}
           />
         )}
       </div>

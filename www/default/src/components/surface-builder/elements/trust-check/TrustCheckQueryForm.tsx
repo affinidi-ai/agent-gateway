@@ -1,5 +1,5 @@
 import React from 'react';
-import { Form } from 'react-bootstrap';
+import { Button, Form } from 'react-bootstrap';
 import type { Authority, Issuer, TrustRegistry } from '../../../../types';
 import { topAndTail } from '../../../../utils/stringUtils';
 import { deepLinks } from '../../../../utils/deepLinks';
@@ -120,6 +120,8 @@ interface TrustCheckQueryFormProps {
    * Checks select. Absent on every other leg.
    */
   subjectChoice?: TrustCheckSubjectChoice;
+  /** True on a Transit Point that presents no managed agent identity on its outbound calls. */
+  managedIdentityMissing?: boolean;
 }
 
 type CheckedSubject = 'destination' | 'managed_agent';
@@ -151,6 +153,7 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
   handleQueryTypeChangeAt,
   saveAttempted = false,
   subjectChoice,
+  managedIdentityMissing = false,
 }) => {
   const queryType: TrustCheckRecordType =
     queryConfig.query_type === 'recognition' ? 'recognition' : 'authorization';
@@ -262,10 +265,44 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
         <div className="col-12">
           <Form.Label className="fw-semibold small mb-1">Entity ID</Form.Label>
           {checksManagedAgent ? (
-            <Form.Text className="text-muted d-block" data-testid={tid('entity-managed-agent')}>
-              The DID the managed agent calls out under, from this Transit Point's own identity or
-              the surface's.
-            </Form.Text>
+            <>
+              {entityValue.trim() !== '' ? (
+                <div
+                  className="d-flex align-items-center gap-2"
+                  data-testid={tid('entity-managed-agent-override')}
+                >
+                  <Form.Text className="text-muted">
+                    Asks about <code>{entityValue}</code> instead of the calling managed
+                    agent&apos;s DID.
+                  </Form.Text>
+                  <Button
+                    variant="link"
+                    size="sm"
+                    className="p-0"
+                    onClick={() => updateEntityAt(index, '')}
+                    data-testid={tid('entity-managed-agent-clear')}
+                  >
+                    Clear
+                  </Button>
+                </div>
+              ) : (
+                <Form.Text className="text-muted d-block" data-testid={tid('entity-managed-agent')}>
+                  The DID the managed agent calls out under, from this Transit Point's own identity
+                  or the surface's.
+                </Form.Text>
+              )}
+              {managedIdentityMissing && (
+                <Form.Text
+                  className="d-block"
+                  style={{ color: 'var(--warning-text)' }}
+                  data-testid={tid('entity-managed-agent-no-identity')}
+                >
+                  This Transit Point presents no managed agent identity, so this query reports
+                  MANAGED_AGENT_IDENTITY_UNAVAILABLE. Give it a managed identity or turn on VP
+                  injection.
+                </Form.Text>
+              )}
+            </>
           ) : (
             <SubjectPickerSelect
               testid={tid('entity')}

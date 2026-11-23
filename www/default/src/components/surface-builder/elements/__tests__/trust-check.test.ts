@@ -864,6 +864,51 @@ describe('trustCheckDefinition — hydrate → buildPayload round-trip', () => {
     expect(destination.query.entity_id).not.toBe('');
   });
 
+  it('keeps an explicit entity on a managed-agent query through a load and save', () => {
+    const nodes = registry.nodesFromPayload({
+      name: 'roundtrip',
+      status: 'active' as const,
+      tags: [],
+      access_point: { route: '/a2a', protocol: 'a2a' },
+      target: { endpoint: 'https://upstream/y' },
+      transit: {
+        points: [
+          {
+            alias: 'partner',
+            protocol: 'a2a',
+            target_endpoint: 'https://partner.example/a2a',
+            trust_check_list: [
+              {
+                id: 'self',
+                trust_registry_id: 'tr-1',
+                query_type: 'recognition',
+                query: {
+                  authority_id: 'did:web:authority.example',
+                  entity_id: 'did:web:other.example',
+                },
+                subject: 'managed_agent',
+              },
+            ],
+          },
+        ],
+      },
+    });
+    const tc = nodes.find(n => n.type === 'trust-check')!;
+    expect(tc.config.queries[0].query.entity_id).toBe('did:web:other.example');
+    const ctx = {
+      protocol: 'a2a',
+      surfaceMeta: { name: 'roundtrip', tags: [], status: 'active' },
+      allNodes: nodes,
+      nodesOfType: (type: string) => nodes.filter(n => n.type === type),
+      firstNodeOfType: (type: string) => nodes.find(n => n.type === type),
+    } as any;
+    const [self] = registry.buildPayload(ctx).transit.points[0].trust_check_list;
+    expect(self).toMatchObject({
+      subject: 'managed_agent',
+      query: { entity_id: 'did:web:other.example' },
+    });
+  });
+
   it('saves a managed-agent list on an MCP Transit Point from its queries, not as a read-only copy', () => {
     const managedAgentElement = {
       id: 'self',

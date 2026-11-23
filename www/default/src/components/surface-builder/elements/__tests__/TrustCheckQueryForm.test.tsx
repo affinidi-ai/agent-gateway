@@ -4,6 +4,7 @@ import { MemoryRouter } from 'react-router-dom';
 import TrustCheckQueryForm from '../trust-check/TrustCheckQueryForm';
 import {
   readOnlyTrustCheckProtocol,
+  transitPointPresentsManagedIdentity,
   transitPointSubjectChoice,
   type TrustCheckQueryConfig,
 } from '../trust-check/definition';
@@ -658,6 +659,48 @@ describe('TrustCheckQueryForm — Checks select on a Transit Point', () => {
     expect(screen.queryByTestId('trust-check-query-0-entity')).toBeNull();
   });
 
+  it('shows a stored entity that replaces the calling agent, and clears it', () => {
+    const updateEntityAt = jest.fn();
+    renderForm(
+      baseProps({
+        isApMa: false,
+        subjectChoice: 'destination-or-managed-agent',
+        updateEntityAt,
+        queryConfig: { ...managedAgentQuery, query: { entity_id: 'did:web:other.example' } },
+      })
+    );
+    const override = screen.getByTestId('trust-check-query-0-entity-managed-agent-override');
+    expect(override).toHaveTextContent('did:web:other.example');
+    expect(override).toHaveTextContent("instead of the calling managed agent's DID");
+    expect(screen.queryByTestId('trust-check-query-0-entity-managed-agent')).toBeNull();
+    fireEvent.click(screen.getByTestId('trust-check-query-0-entity-managed-agent-clear'));
+    expect(updateEntityAt).toHaveBeenCalledWith(0, '');
+  });
+
+  it('says when the Transit Point presents no managed agent identity', () => {
+    const { unmount } = renderForm(
+      baseProps({
+        isApMa: false,
+        subjectChoice: 'destination-or-managed-agent',
+        queryConfig: managedAgentQuery,
+        managedIdentityMissing: true,
+      })
+    );
+    expect(
+      screen.getByTestId('trust-check-query-0-entity-managed-agent-no-identity')
+    ).toHaveTextContent('MANAGED_AGENT_IDENTITY_UNAVAILABLE');
+    unmount();
+
+    renderForm(
+      baseProps({
+        isApMa: false,
+        subjectChoice: 'destination-or-managed-agent',
+        queryConfig: managedAgentQuery,
+      })
+    );
+    expect(screen.queryByTestId('trust-check-query-0-entity-managed-agent-no-identity')).toBeNull();
+  });
+
   it('offers only the managed agent on a Transit Point that cannot check its destination', () => {
     renderForm(
       baseProps({
@@ -671,6 +714,46 @@ describe('TrustCheckQueryForm — Checks select on a Transit Point', () => {
     ).toBeInTheDocument();
     fireEvent.click(screen.getByTestId('trust-check-query-0-subject'));
     expect(screen.queryByText('Destination agent')).toBeNull();
+  });
+});
+
+describe('transitPointPresentsManagedIdentity', () => {
+  const node = { parentId: 'tp' };
+
+  it('is true for a Transit Point with its own managed identity or VP injection', () => {
+    expect(
+      transitPointPresentsManagedIdentity(node, [
+        { id: 'tp', type: 'transit-point-a2a', config: {} },
+        {
+          id: 'identity-tp-request',
+          type: 'identity',
+          parentId: 'tp',
+          slotId: 'request:identity-managed_identity',
+        },
+      ])
+    ).toBe(true);
+    expect(
+      transitPointPresentsManagedIdentity(node, [
+        {
+          id: 'tp',
+          type: 'transit-point-a2a',
+          config: { identity_injection: { inject_vp: true } },
+        },
+      ])
+    ).toBe(true);
+  });
+
+  it('is false for a Transit Point with neither, and undefined off a Transit Point', () => {
+    expect(
+      transitPointPresentsManagedIdentity(node, [
+        { id: 'tp', type: 'transit-point-a2a', config: {} },
+      ])
+    ).toBe(false);
+    expect(
+      transitPointPresentsManagedIdentity({ parentId: 'access-point' }, [
+        { id: 'access-point', type: 'access-point' },
+      ])
+    ).toBeUndefined();
   });
 });
 

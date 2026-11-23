@@ -720,6 +720,34 @@ export function transitPointSubjectChoice(
     : 'managed-agent-only';
 }
 
+/**
+ * Whether the Transit Point a Trust Check hangs off presents a managed agent identity on its
+ * outbound calls: its own managed identity, or the surface's it injects. Undefined off a
+ * Transit Point.
+ */
+export function transitPointPresentsManagedIdentity(
+  node: { parentId?: string },
+  allNodes: ReadonlyArray<{
+    id: string;
+    type: string;
+    parentId?: string;
+    slotId?: string;
+    config?: any;
+  }>
+): boolean | undefined {
+  const parent = parentTransitPoint(node, allNodes) as { id: string; config?: any } | undefined;
+  if (!parent) return undefined;
+  return (
+    parent.config?.identity_injection?.inject_vp === true ||
+    allNodes.some(
+      n =>
+        n.type === 'identity' &&
+        n.parentId === parent.id &&
+        n.slotId === 'request:identity-managed_identity'
+    )
+  );
+}
+
 function parentTransitPoint(
   node: { parentId?: string },
   allNodes: ReadonlyArray<{ id: string; type: string }> | undefined
