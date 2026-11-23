@@ -461,6 +461,27 @@ async fn operator_creates_appliance_provider(
 }
 
 #[when(
+    expr = "the operator creates the credential provider {string} for the resource {string} using secrets {string} and {string}"
+)]
+async fn operator_creates_provider_for_resource(
+    world: &mut SurfaceWorld,
+    provider_id: String,
+    resource: String,
+    client_id_secret: String,
+    client_secret_secret: String,
+) {
+    let mut body = client_credentials_provider_body(
+        &provider_id,
+        "https://192.0.2.1/token",
+        None,
+        (&client_id_secret, &client_secret_secret),
+    );
+    body["resource"] = json!(resource);
+    let response = send(world, Method::POST, "/v1/credential-providers", Some(&body)).await;
+    world.admin_response = Some(response);
+}
+
+#[when(
     expr = "the operator creates the credential provider {string} for tenant {string} using secrets {string} and {string}"
 )]
 async fn operator_creates_tenant_provider(
@@ -605,6 +626,25 @@ async fn credential_provider_is_stored(
 ) {
     let ids = provider_ids(world).await;
     assert!(ids.contains(&provider_id), "provider {provider_id} is not among {ids:?}");
+}
+
+#[then(expr = "the credential provider {string} is stored for the resource {string}")]
+async fn credential_provider_is_stored_for_resource(
+    world: &mut SurfaceWorld,
+    provider_id: String,
+    resource: String,
+) {
+    let response = send(world, Method::GET, "/v1/credential-providers", None).await;
+    assert_eq!(response.status, 200, "listing credential providers: {}", response.body);
+    let stored = response
+        .body
+        .as_array()
+        .expect("the provider list is an array")
+        .iter()
+        .find(|provider| provider["provider_id"] == provider_id.as_str())
+        .unwrap_or_else(|| panic!("provider {provider_id} is not stored: {}", response.body))
+        .clone();
+    assert_eq!(stored["resource"], resource.as_str(), "{stored}");
 }
 
 #[then(expr = "no credential provider {string} is stored")]
