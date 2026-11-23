@@ -89,11 +89,8 @@ async fn request_with_disagreeing_trace_headers(world: &mut SurfaceWorld) {
     let x_gateway_trace_id = uuid::Uuid::new_v4()
         .simple()
         .to_string();
-    send_request_and_record(
-        world,
-        vec![generated_traceparent(), (X_GATEWAY_TRACE_ID.to_string(), x_gateway_trace_id)],
-    )
-    .await;
+    send_request_and_record(world, vec![generated_traceparent(), (X_GATEWAY_TRACE_ID.to_string(), x_gateway_trace_id)])
+        .await;
 }
 
 #[then(expr = "MCP server {string} received a traceparent that continues the caller's trace")]
@@ -121,7 +118,7 @@ fn mcp_server_received_a_traceparent_continuing_the_callers_trace(
 
 #[then("the VP Audit Log records the forwarded request under the caller's trace in its written form")]
 async fn vp_audit_log_records_the_forwarded_request_under_the_callers_trace_in_its_written_form(
-    world: &mut SurfaceWorld,
+    world: &mut SurfaceWorld
 ) {
     let caller = sent(world, X_GATEWAY_TRACE_ID);
     let record = the_forwarded_record(world).await;
@@ -205,13 +202,12 @@ fn gateway_log_warns_that_the_trace_headers_named_different_traces(world: &mut S
     let named_trace = written_form(&sent(world, X_GATEWAY_TRACE_ID));
     let log = gateway_log(world);
     assert!(
-        log.lines()
-            .any(|line| {
-                line.contains("WARN")
-                    && line.contains("name different traces")
-                    && line.contains(&traceparent_trace)
-                    && line.contains(&named_trace)
-            }),
+        log.lines().any(|line| {
+            line.contains("WARN")
+                && line.contains("name different traces")
+                && line.contains(&traceparent_trace)
+                && line.contains(&named_trace)
+        }),
         "expected a warning that traceparent {traceparent_trace} and X-Gateway-Trace-Id {named_trace} name different traces:\n{log}"
     );
 }

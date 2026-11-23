@@ -144,7 +144,9 @@ pub fn request_forwarded(forwarding: Forwarding<'_>) {
         let surface = forwarding.surface;
         let caller = forwarding
             .identity
-            .map(|identity| crate::observability::policy_audit::recorded_caller(Some(identity), None, forwarding.actor_did))
+            .map(|identity| {
+                crate::observability::policy_audit::recorded_caller(Some(identity), None, forwarding.actor_did)
+            })
             .unwrap_or_default();
         let facts = RequestFacts {
             surface_id: &surface.surface_id,
@@ -554,7 +556,9 @@ mod tests {
 
     /// Every record written while `forwarding` is recorded inside a request
     /// that continued the caller's `traceparent` under span `53995c3f42cd8ad8`.
-    async fn recorded_forwarding(identity: Option<&crate::source_auth::AuthenticatedIdentity>) -> Vec<serde_json::Value> {
+    async fn recorded_forwarding(
+        identity: Option<&crate::source_auth::AuthenticatedIdentity>
+    ) -> Vec<serde_json::Value> {
         use crate::observability::policy_audit::{RequestScope, in_request};
         use crate::proxy::trace::{RequestTrace, SpanId};
         let surface = forwarding_surface();
@@ -671,15 +675,16 @@ mod tests {
             decision["event"]["policy_decision"]["caller_did"]
         );
         assert_eq!(
-            record["target_endpoint"],
-            "https://agent.example/mcp?key=<redacted>",
+            record["target_endpoint"], "https://agent.example/mcp?key=<redacted>",
             "the target URL loses its user name, password, query value and fragment"
         );
         let stored = record.to_string();
         for planted in ["planted-claim-secret", "planted-password", "planted-query", "planted-fragment"] {
             assert!(!stored.contains(planted), "the record holds {planted}: {stored}");
         }
-        assert!(field(&record, "user_identity_hash").is_none() && field(&record, "caller.user_identity_hash").is_none());
+        assert!(
+            field(&record, "user_identity_hash").is_none() && field(&record, "caller.user_identity_hash").is_none()
+        );
     }
 
     #[tokio::test]

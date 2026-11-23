@@ -13,13 +13,7 @@ pub(crate) fn generated_traceparent() -> (String, String) {
         .simple()
         .to_string()[..16]
         .to_string();
-    (
-        "traceparent".to_string(),
-        format!(
-            "00-{}-{span_id}-01",
-            uuid::Uuid::new_v4().simple()
-        ),
-    )
+    ("traceparent".to_string(), format!("00-{}-{span_id}-01", uuid::Uuid::new_v4().simple()))
 }
 
 #[when("the caller sends a request to the surface with a valid API key and a traceparent set")]

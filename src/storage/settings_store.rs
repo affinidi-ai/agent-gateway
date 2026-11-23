@@ -464,10 +464,7 @@ impl SettingsStore {
             .map(String::as_str)
             .collect();
         if !unknown.is_empty() {
-            anyhow::bail!(
-                "Audit events must be names from the audit event catalog; unknown: {}",
-                unknown.join(", ")
-            );
+            anyhow::bail!("Audit events must be names from the audit event catalog; unknown: {}", unknown.join(", "));
         }
 
         // Update in-memory settings

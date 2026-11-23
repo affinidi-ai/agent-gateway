@@ -684,9 +684,7 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
             event
                 .surface_name
                 .filter(|name| !name.is_empty()),
-            recorded
-                .caller_did
-                .as_deref(),
+            recorded.caller_did.as_deref(),
             if http_method.is_empty() {
                 None
             } else {

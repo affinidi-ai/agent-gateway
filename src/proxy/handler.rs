@@ -16828,11 +16828,11 @@ pub(crate) fn compute_transit_token_caller_context(
 #[cfg(test)]
 mod fabric_send_policy_tests;
 #[cfg(test)]
+mod request_forwarded_tests;
+#[cfg(test)]
 mod response_auth_tests;
 #[cfg(test)]
 mod target_auth_audit_tests;
-#[cfg(test)]
-mod request_forwarded_tests;
 #[cfg(test)]
 mod trace_tests;
 #[cfg(test)]
