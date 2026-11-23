@@ -1365,6 +1365,11 @@ pub async fn update_provider(
     if let Err(error) = refuse_gone_secrets(&state, &updated).await {
         return error.into_response();
     }
+    if let Err(refused) =
+        refuse_response_key_reuse(&state, &updated, tenant_context(&context), resource_scope(&scope)).await
+    {
+        return *refused;
+    }
     let updated = match stored_deactivation(&state, &updated.id).await {
         Ok(deactivated_at) => CredentialProvider {
             deactivated_at: deactivated_at.filter(|_| updated.takes_consent()),
@@ -1408,6 +1413,79 @@ async fn stored_deactivation(
             ))
         }
     }
+}
+
+/// Refuse `provider` when its service token reads a secret
+/// ([`CredentialProvider::service_token_secret_refs`]) that is the Response authentication API
+/// key of a surface sending the provider to its Target or a Transit Point, by Target
+/// authentication or a credential binding, in its base or a variant: the managed agent or
+/// another agent would then hold the key the surface checks its responses against. Only the
+/// surfaces that may reference the provider are read, and a surface whose variants cannot be
+/// resolved is skipped. The refusal names the surface only when the caller may see it.
+async fn refuse_response_key_reuse(
+    state: &CredentialProviderState,
+    provider: &CredentialProvider,
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
+) -> Result<(), Box<Response>> {
+    let secret_refs = provider.service_token_secret_refs();
+    let Some(surfaces) = state
+        .surfaces
+        .as_ref()
+        .filter(|_| !secret_refs.is_empty())
+    else {
+        return Ok(());
+    };
+    let surfaces = surfaces
+        .list_all()
+        .await
+        .map_err(|error| {
+            warn!(target: "credential_delegation", error = %error, "Failed to list surfaces for a provider update");
+            Box::new(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Failed to check the surfaces that send this provider"})),
+                )
+                    .into_response(),
+            )
+        })?;
+    for surface in surfaces
+        .iter()
+        .filter(|surface| can_reference(surface.tenant_id.as_deref(), provider.tenant_id.as_deref()))
+    {
+        let Ok(keys) = crate::identity::handlers::surface_response_auth::response_keys(surface) else {
+            continue;
+        };
+        let Some(key) = keys.iter().find(|key| {
+            secret_refs.contains(&key.secret_id.as_str())
+                && key
+                    .provider_ids
+                    .contains(&provider.id)
+        }) else {
+            continue;
+        };
+        let visible = can_access(surface.tenant_id.as_deref(), context)
+            && scope_allows_resource(scope, context, ResourceKind::Surfaces, &surface.surface_id);
+        let named = if visible {
+            format!("surface '{}' ({})", surface.name, surface.surface_id)
+        } else {
+            "a surface".to_string()
+        };
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "Secret '{}' is the Response authentication key of {named}, which sends this provider to \
+                         its Target or a Transit Point",
+                        key.secret_id
+                    ),
+                })),
+            )
+                .into_response(),
+        ));
+    }
+    Ok(())
 }
 
 /// The provider bindings lock as an update holds it until its store.
@@ -5178,6 +5256,94 @@ mod jwt_provider_tests {
         add_tenant_a_secret(&state, "TENANT_ONLY").await;
         let (status, response) = create(&state, api_key_provider("operator-2", "TENANT_ONLY")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    }
+
+    /// A state whose API key providers `sent` and `unsent` read `CLIENT_SECRET`, with a surface
+    /// whose Target authentication sends `sent` and whose responses carry the key in
+    /// `RESPONSE_KEY`.
+    async fn with_response_keyed_surface(directory: &tempfile::TempDir) -> CredentialProviderState {
+        use crate::surfaces::AgentSurfaceStore;
+
+        let mut state = with_key_material(directory).await;
+        add_secret(&state, "RESPONSE_KEY", "response-key").await;
+        let surfaces = Arc::new(
+            crate::surfaces::FileSystemAgentSurfaceStore::new(
+                directory
+                    .path()
+                    .join("surfaces"),
+            )
+            .await
+            .unwrap(),
+        );
+        state.surfaces = Some(surfaces.clone());
+        for id in ["sent", "unsent"] {
+            state
+                .store
+                .create(
+                    serde_json::from_value(json!({
+                        "id": id, "name": id, "provider_id": id, "provider_type": "api_key",
+                        "api_key_secret_ref": "CLIENT_SECRET",
+                        "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        surfaces
+            .save(
+                &serde_json::from_value(json!({
+                    "surface_id": "bravo-surface", "name": "Bravo",
+                    "access_point": {"listen_address": "0.0.0.0:8443", "route": "/bravo", "protocol": "a2a"},
+                    "target": {
+                        "endpoint": "https://bravo.example",
+                        "auth": {"method": {"credential_provider": {"provider_id": "sent"}}},
+                        "response_auth": {"api_key": {"header_name": "X-Agent-Key", "secret_id": "RESPONSE_KEY"}}
+                    }
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        state
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_pointing_a_sent_provider_at_a_surfaces_response_key_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_response_keyed_surface(&directory).await;
+
+        let (status, response) = update(&state, "sent", json!({"api_key_secret_ref": "RESPONSE_KEY"})).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(
+            response["error"],
+            "Secret 'RESPONSE_KEY' is the Response authentication key of surface 'Bravo' (bravo-surface), which \
+             sends this provider to its Target or a Transit Point"
+        );
+        assert_eq!(
+            state
+                .store
+                .get("sent")
+                .await
+                .unwrap()
+                .unwrap()
+                .api_key_secret_ref
+                .as_deref(),
+            Some("CLIENT_SECRET"),
+            "the provider is kept as it was"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_to_another_secret_or_of_a_provider_no_keyed_surface_sends_saves() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_response_keyed_surface(&directory).await;
+
+        let (status, response) = update(&state, "sent", json!({"api_key_secret_ref": "NOT_A_KEY"})).await;
+        assert_eq!(status, StatusCode::OK, "an unrelated secret: {response}");
+        let (status, response) = update(&state, "unsent", json!({"api_key_secret_ref": "RESPONSE_KEY"})).await;
+        assert_eq!(status, StatusCode::OK, "a provider no surface with the key sends: {response}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

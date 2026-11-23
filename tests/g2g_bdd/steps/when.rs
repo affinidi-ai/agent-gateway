@@ -998,6 +998,7 @@ pub(crate) async fn send_rpc(
 
     world.response_elapsed = Some(sent_at.elapsed());
     world.response_status = Some(response.status);
+    world.response_headers = response.headers;
     world.response_content_type = response.content_type;
     world.response_body = Some(response.body);
 }

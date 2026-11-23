@@ -1,4 +1,4 @@
-import React, { useEffect, useId, useRef, useState } from 'react';
+import React, { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 
 interface ConfirmPopoverProps {
@@ -80,7 +80,7 @@ const ConfirmPopover: React.FC<ConfirmPopoverProps> = ({
   const titleId = useId();
   const [pos, setPos] = useState<Placement | null>(null);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     let raf = 0;
     const tick = () => {
       const next = placeConfirmPopover(
@@ -102,7 +102,7 @@ const ConfirmPopover: React.FC<ConfirmPopoverProps> = ({
       );
       raf = requestAnimationFrame(tick);
     };
-    raf = requestAnimationFrame(tick);
+    tick();
     return () => cancelAnimationFrame(raf);
   }, [anchor]);
 

@@ -171,8 +171,8 @@ describe('ConfirmPopover placement', () => {
 
     const dialog = await screen.findByRole('dialog');
 
-    await waitFor(() => expect(dialog).toHaveClass('confirm-popover--right'));
-    expect(dialog).toHaveStyle({ left: `${40 + 32 + 12}px` });
+    await waitFor(() => expect(dialog).toHaveStyle({ left: `${40 + 32 + 12}px` }));
+    expect(dialog).toHaveClass('confirm-popover--right');
   });
 
   it('opens to the left of an anchor with room on its left', async () => {
@@ -181,7 +181,7 @@ describe('ConfirmPopover placement', () => {
 
     const dialog = await screen.findByRole('dialog');
 
-    await waitFor(() => expect(dialog).toHaveClass('confirm-popover--left'));
-    expect(dialog).toHaveStyle({ left: `${900 - 12 - 300}px` });
+    await waitFor(() => expect(dialog).toHaveStyle({ left: `${900 - 12 - 300}px` }));
+    expect(dialog).toHaveClass('confirm-popover--left');
   });
 });

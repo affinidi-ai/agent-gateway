@@ -187,7 +187,8 @@ with `send_resource: false`, and tell an external consent provider that sends it
 re-created with `send_resource: false`; see _Credential provider editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 
-The secret editor has one save button and never shows a stored secret value; see
+The secret editor has one save button and never shows a stored secret value, and deleting a
+secret that other resources use asks first and can force the delete; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 
 Deleting an API key on the Secrets page or the API key page opens a confirmation dialog that
@@ -284,7 +285,13 @@ Callback URL in a second request once the gateway returns the path it built from
 generated for the provider, then opens that provider, also when the second request fails; a
 stored provider without a Callback URL shows the gateway's own one), and target
 authentication on a Managed Agent or Transit
-Point can take its credential from a credential provider; see _Credential provider editor_ and
+Point can take its credential from a credential provider, with optional scopes. The Surface
+Builder shows header name and format problems next to the fields, which block Save in a stored
+setting too, blocks Save while a Managed Agent's secret method has no secret picked, shows a
+Target that is not https and a leg that authenticates no caller as advisories that allow Save
+(the gateway refuses them only when `target_https` or `target_source_auth` is `enforce`), advises
+on a passthrough fallback, keeps a stored `target_auth` it did not edit, and keeps Target
+authentication settings out of the canvas data; see _Credential provider editor_ and
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 
 A Transit Point's static-secret target authentication picks its secret from a tenant-aware list
@@ -364,7 +371,11 @@ agent, built by the gateway from the surfaces that target it; MCP surfaces are l
 status is shown. Its empty state offers a **Create a surface** link, which opens `/surfaces/new`,
 to users with `surfaces.edit` only. Its Agent Card tab shows the card the gateway serves for
 Direct, Proxied and Fabric routes with a **Card source** row, and keeps the surface picker, with a
-Retry, when the card can't be read through the chosen surface; see _Agents page_ in
+Retry, when the card can't be read through the chosen surface. Its list shows the protocol with the
+shared `ProtocolBadge` (`components/shared/ProtocolBadge.tsx`) the Surfaces page and the template
+picker use, never restyled per page, the Identities and Used by surfaces counts as the Surfaces page's square count
+badge, and every row value at the table's body size. Its Connection tab lists each of the agent's
+DIDs with a copy button; see _Agents page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#agents-page).
 
 The Identities page shows one row per surface Managed Agent, with its earlier DIDs (from its
@@ -373,6 +384,13 @@ versions in the expanded row, each earlier DID with its own actions; rows carry 
 `rotation_count`, and Version History loads the rotations when opened; see _Identities page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page) and
 [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#identity-versions).
+
+The Managed Agent panel's **Response Authentication** section writes `target.response_auth`
+(Off, API key or mTLS), is shown only for an HTTP or HTTPS Target, offers mTLS only on an
+`https://` one, keeps a stored setting the operator did not edit and sends `null` once it is
+switched off. In the base view it names the variants that keep no setting of their own and
+offers **Copy to variants**, which never saves by itself; see _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Agent Identity panel doesn't offer From API Key on the Managed Agent's response identity,
 and a stored one keeps working; see _Surface Builder_ in
@@ -412,6 +430,45 @@ The Capture view's **Clear** button clears captured payloads and policy inputs, 
 holds the payload stream only (the Policy Input card says so while a listen is on), and its card
 titles share one style; see _Policy input capture_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-input-capture).
+
+The policy editor's create and edit pages share Start from (create only), Details and Policy
+sections built from the shared dashboard components, and are read-only without
+`policies.edit`; see _Policy definition editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#policy-definition-editor). Templates need no
+gateway API and link to their Apply Policies docs section. A new policy shows only the
+**Start from** gallery, with no card selected, until a template is used; Details and the
+Policy section, on the Rules view, appear after that. The gallery lists only the built-in
+templates of the policy's Type, so **Define Gateway Policy** and **Define Agent
+Surface Policy** each start from their own templates, the Type set by that button and never
+changeable, with a **Create custom policy** button
+under the list that starts a custom policy (allow-all Rego, Name and Description emptied) at
+once, or shows it in the templates column first when it would replace rules or edits. It has no search or category
+filters, its cards carry no role or default decision badges, and on an Agent Surface policy a
+template that serves surfaces only has a muted "Agent surface only" note. A setting that
+depends on the deployment (issuers, audiences, DIDs, destinations, paths, surface IDs,
+subjects, role and claim values) starts empty with a sample as its placeholder, and Use this
+template and Add to policy stay disabled until it is filled; previews use the sample, labelled
+as one. A gallery card shows its settings, How it decides, its Rego and docs link in the templates column, and **Use this template** fills the
+Rego and an empty or template-filled Description, never the Name, asking in place first (focus on Cancel) unless the Rego is an untouched
+start. **Add rules from a template** lists only templates that add rules, each marked **Adds
+rules**; a whole-policy template is used from Start from. The Policy section's
+**Rules | Rego** toggle lists the rules grouped by
+template, states above them what the policy decides (or that it can't, pointing to the Rego),
+marks each rule other than `allow` and `deny_reason` "Used by allow" or "Not used by allow",
+shows a plain allow rule's conditions one per line, joined by a muted "and", when it has
+several and splits cleanly (otherwise the rule stays on one line), with Remove per group and
+per rule, disabled while `allow` reads the rule, with a reason that names the rule reading
+it, and on an `allow` definition that is not a plain allow (badged "Sets allow"), with a
+reason that points to the Rego view; under Default ALLOW each group with allow rules is marked as having no effect, and on a
+new policy a group written for the other Type is marked and blocks Create until it is
+removed. Once rules are added the gallery still names the template the policy started from
+and counts the templates added. **Add rules from a template** lists only templates that add
+rules, so several combine in a new or saved policy, and counts the
+whole policies and other-Type templates it leaves out. Once rules are added to a saved policy
+a Template examples card runs their examples through the existing simulate endpoint, says why
+a row differs and loads its input in Test (dry-run). Templates are the built-in catalogue that
+ships with the dashboard only; nothing saves, stores or shares a template; see
+_Policy templates_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-templates).
 
 The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see
 _Maintenance actions_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#maintenance-actions).

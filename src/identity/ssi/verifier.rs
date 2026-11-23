@@ -787,6 +787,15 @@ mod tests {
         holder_did: &str,
         vcs: Vec<Value>,
     ) -> Value {
+        present_for(holder_key, holder_did, vcs, ssi::verification_methods::ProofPurpose::Assertion).await
+    }
+
+    async fn present_for(
+        holder_key: &JWK,
+        holder_did: &str,
+        vcs: Vec<Value>,
+        proof_purpose: ssi::verification_methods::ProofPurpose,
+    ) -> Value {
         LocalVpIssuer::new(Arc::new(LocalVpSigner::new()))
             .issue(VpIssuerPayload::Credentials(Credentials {
                 holder_key: Cow::Borrowed(holder_key),
@@ -794,6 +803,7 @@ mod tests {
                 verifiable_credentials: Cow::Owned(vcs),
                 challenge: None,
                 domain: None,
+                proof_purpose,
             }))
             .await
             .expect("VP issuance should succeed")
@@ -954,7 +964,14 @@ mod tests {
             "id": "urn:uuid:5d5d5d5d-0000-4000-8000-000000000001",
         });
         let vp = LocalVpSigner::new()
-            .sign(unsigned_vp, &attacker_key, &attacker_did, None, None)
+            .sign(
+                unsigned_vp,
+                &attacker_key,
+                &attacker_did,
+                None,
+                None,
+                ssi::verification_methods::ProofPurpose::Assertion,
+            )
             .await
             .expect("attacker can sign a presentation with its own key");
 
@@ -1007,6 +1024,7 @@ mod tests {
                 verifiable_credentials: Cow::Owned(vec![vc]),
                 challenge: None,
                 domain: None,
+                proof_purpose: ssi::verification_methods::ProofPurpose::Assertion,
             }))
             .await
             .unwrap();
@@ -1410,6 +1428,43 @@ mod tests {
             .expect("a VP key listed under no relationship must be refused");
 
         assert!(err.contains("VP proof key") && err.contains("is not listed under assertionMethod"), "{err}");
+    }
+
+    /// ssi alone never checks the proof purpose: it accepts a presentation that declares
+    /// `authentication` although the holder lists its key under `assertionMethod` only. The
+    /// purpose check refuses it.
+    #[tokio::test]
+    async fn only_the_purpose_check_refuses_authentication_by_a_key_listed_for_assertion() {
+        let issuer_key = JWK::generate_ed25519().unwrap();
+        let issuer_did = two_key_peer_did(&issuer_key);
+        let holder_key = JWK::generate_ed25519().unwrap();
+        let holder = did_web_signer(&holder_key, &["assertionMethod"]);
+        let f = Fixture {
+            issuer_config: signer_config(&issuer_did, &issuer_key),
+            issuer_did,
+            holder_key,
+            holder_did: holder.0.clone(),
+            verifier: LocalVerifier::new(verifier_with(&[]).await),
+        };
+        let vc = issue_vc(&f, &f.holder_did).await;
+        let vp = present_for(&f.holder_key, &f.holder_did, vec![vc], ProofPurpose::Authentication).await;
+        let client = verifier_with(&[holder]).await;
+        let env = create_signature_environment(None)
+            .await
+            .unwrap();
+        let params = VerificationParameters::from_resolver(VerificationMethodDIDResolver::<_, AnyMethod>::new(
+            CompositeResolver::new(client.clone()),
+        ))
+        .with_json_ld_loader(env.json_ld_loader);
+        let typed: AnyDataIntegrity<JsonPresentation<AnyDataIntegrity<JsonCredential>>> =
+            serde_json::from_value(vp.clone()).unwrap();
+
+        ensure_verified(typed.verify(&params).await, "VP").expect("ssi alone accepts the declared purpose");
+        let err = verify_under(&client, &vp)
+            .await
+            .err()
+            .expect("the purpose check refuses a key not listed under authentication");
+        assert!(err.contains("is not listed under authentication"), "{err}");
     }
 
     #[tokio::test]

@@ -374,6 +374,9 @@ pub struct TargetOverrides {
     pub auth: Option<TargetAuthConfig>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_auth: Option<crate::config::response_auth::ResponseAuthConfig>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyRef>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -457,6 +460,11 @@ impl TargetOverrides {
             base.auth = self.auth;
         } else if let Some(v) = self.auth {
             base.auth = Some(v);
+        }
+        if complete {
+            base.response_auth = self.response_auth;
+        } else if let Some(v) = self.response_auth {
+            base.response_auth = Some(v);
         }
         if complete {
             base.policy = self.policy;
@@ -985,6 +993,7 @@ mod tests {
             target: Target {
                 endpoint: "https://prod.example.com".to_string(),
                 auth: None,
+                response_auth: None,
                 policy: None,
                 response_policy: None,
                 payment_policy: None,

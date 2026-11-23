@@ -1,8 +1,10 @@
 /**
  * Policy definition editor tests
  *
- * Asserts the "Policy Instructions & Examples" panel on the Create Policy
- * Definition page expands and collapses from anywhere on its header.
+ * Asserts the "Rego reference" panel in the Rego view of the Create policy
+ * page expands and collapses from anywhere on its header. A new policy shows
+ * only Start from until a template is used, and then opens on the Rules view,
+ * so each test uses Deny by default and switches to Rego first.
  */
 
 import {expect, test} from '../helpers/fixtures';
@@ -13,6 +15,12 @@ const BASE_URL = process.env.AG_BASE_URL || 'http://localhost:8080';
 test.describe('Policy definition editor — instructions panel', () => {
     test.beforeEach(async ({page}) => {
         await page.goto(`${BASE_URL}/policy-definitions/new`);
+        await page.getByTestId('policy-template-card-deny-by-default').click();
+        await page
+            .getByTestId('policy-templates-column')
+            .getByTestId('policy-template-gallery-use-button')
+            .click();
+        await page.getByTestId('policy-view-rego').click();
         await expect(page.getByTestId('policy-instructions-toggle')).toBeVisible();
     });
 
@@ -25,17 +33,17 @@ test.describe('Policy definition editor — instructions panel', () => {
 
     test('expands when the title text is clicked', async ({page}) => {
         const toggle = page.getByTestId('policy-instructions-toggle');
-        await toggle.getByText('Policy Instructions & Examples').click();
+        await toggle.getByText('Rego reference').click();
 
         await expect(toggle).toHaveAttribute('aria-expanded', 'true');
         await expect(page.getByTestId('policy-instructions-body')).toBeVisible();
-        await expect(page.getByTestId('policy-instructions-body').getByText('Policy Structure')).toBeVisible();
+        await expect(page.getByTestId('policy-instructions-input-fields')).toBeVisible();
         await captureFullPage(page, 'policy-instructions-expanded-via-title');
     });
 
     test('collapses again when the empty header area is clicked', async ({page}) => {
         const toggle = page.getByTestId('policy-instructions-toggle');
-        await toggle.getByText('Policy Instructions & Examples').click();
+        await toggle.getByText('Rego reference').click();
         await expect(page.getByTestId('policy-instructions-body')).toBeVisible();
 
         const title = await page.getByTestId('policy-instructions-title').boundingBox();
@@ -63,7 +71,7 @@ test.describe('Policy definition editor — instructions panel', () => {
     });
 
     test('keeps the title a heading that holds the toggle button', async ({page}) => {
-        const heading = page.getByRole('heading', {name: 'Policy Instructions & Examples'});
+        const heading = page.getByRole('heading', {name: 'Rego reference'});
         await expect(heading).toBeVisible();
         await expect(heading.getByRole('button')).toHaveAttribute('aria-expanded', 'false');
         await expect(heading.getByRole('button')).toHaveAttribute('aria-controls', 'policyDefInstructions');
@@ -81,7 +89,7 @@ test.describe('Policy definition editor — instructions panel', () => {
     test('does not disturb the policy editor below it', async ({page}) => {
         const toggle = page.getByTestId('policy-instructions-toggle');
         await toggle.click();
-        const editor = page.getByPlaceholder('...add policy here...');
+        const editor = page.getByTestId('policy-rego-textarea');
         await editor.fill('package gateway.policy\ndefault allow = true');
         await expect(editor).toHaveValue('package gateway.policy\ndefault allow = true');
     });

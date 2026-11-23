@@ -266,8 +266,9 @@ fn fabric_route_probe_stage(
 }
 
 /// A route that never answers `200`, so no probe can show it ready: the target's mock
-/// answers another status, or the sending surface's Target credential goes in the header the
-/// receiving surface checks with a value it does not accept.
+/// answers another status, the sending surface's Target credential goes in the header the
+/// receiving surface checks with a value it does not accept, or the receiving surface
+/// authenticates its Target's responses, which the mock proves only once the scenario says so.
 fn route_refuses_by_design(
     topology: &TopologyBuilder,
     link: &FabricLink,
@@ -294,7 +295,7 @@ fn route_refuses_by_design(
         }
         _ => false,
     };
-    mock_refuses || credential_refused
+    mock_refuses || credential_refused || target.response_auth.is_some()
 }
 
 fn surface_spec<'a>(

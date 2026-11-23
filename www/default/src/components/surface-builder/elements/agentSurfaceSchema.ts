@@ -91,6 +91,7 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'target.fabric_target_name',
   'target.fabric_delegated_credentials',
   'target.delegated_credentials_for_fabric_callers',
+  'target.response_auth',
 
   // ── Transit (SharedTransitConfig is flattened into transit.*) ────
   'transit.points',

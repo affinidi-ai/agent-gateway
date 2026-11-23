@@ -106,19 +106,31 @@ impl SseEventBuffer {
     }
 }
 
+/// Why [`send_mcp_request`] got no response.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum McpRequestError {
+    /// The upstream's response failed the surface's Response authentication.
+    #[error("the upstream response failed response authentication: {}", .0.reason())]
+    Unauthenticated(ResponseAuthFailure),
+    #[error(transparent)]
+    Body(#[from] crate::proxy::upstream_body::UpstreamBodyError),
+}
+
 /// Send an MCP JSON-RPC request to the upstream target and auto-detect
 /// whether the response is SSE or plain JSON.
 ///
 /// The request is sent as POST with `Accept: text/event-stream, application/json`
 /// which tells the upstream we can handle either format (Streamable HTTP spec).
-/// A JSON body is read within `limits`; an SSE stream is returned unread.
+/// A JSON body is read within `limits`; an SSE stream is returned unread. The response must
+/// first pass `check`.
 pub(crate) async fn send_mcp_request(
     client: &reqwest::Client,
     target_url: &str,
     body: Bytes,
     extra_headers: Option<&reqwest::header::HeaderMap>,
     limits: crate::proxy::upstream_body::UpstreamBodyLimits,
-) -> Result<UpstreamMcpResponse, crate::proxy::upstream_body::UpstreamBodyError> {
+    check: Option<ResponseCheck<'_>>,
+) -> Result<UpstreamMcpResponse, McpRequestError> {
     let mut req = client
         .post(target_url)
         .header(CONTENT_TYPE, CT_JSON)
@@ -132,10 +144,13 @@ pub(crate) async fn send_mcp_request(
         }
     }
 
-    let response = req
-        .send()
-        .await
-        .map_err(reqwest::Error::without_url)?;
+    let mut sent = req.send().await;
+    if let Some(check) = check {
+        authenticate_sent(check.surface, &mut sent, check.secrets)
+            .await
+            .map_err(McpRequestError::Unauthenticated)?;
+    }
+    let response = sent.map_err(crate::proxy::upstream_body::UpstreamBodyError::from)?;
     let status = response.status();
     let headers = response.headers().clone();
 
@@ -786,6 +801,128 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::info;
 
+use crate::proxy::response_auth::{ResponseAuthFailure, authenticate_sent};
+
+/// The surface whose Response authentication every response of a Legacy SSE session is
+/// checked against, the stream and each message POST alike, the secrets its key is read from,
+/// and the stamp of the mTLS settings the session's client was built with
+/// ([`crate::proxy::response_auth::TargetTls`]), `None` without them.
+#[derive(Clone, Copy)]
+pub struct ResponseCheck<'a> {
+    pub surface: &'a crate::config::agent_surface::AgentSurface,
+    pub secrets: Option<&'a Arc<dyn crate::secrets::SecretsStore>>,
+    pub stamp: Option<[u8; 32]>,
+}
+
+/// Why a request over a Legacy SSE session got no response.
+#[derive(Debug, thiserror::Error)]
+pub enum LegacySseError {
+    /// A response from the upstream failed the surface's Response authentication.
+    #[error("the upstream response failed response authentication: {}", .0.reason())]
+    Unauthenticated(ResponseAuthFailure),
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for LegacySseError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+/// The key a session is cached under: `base_url`, and for a surface with Response
+/// authentication also the surface and its setting, so its session is never one another
+/// surface opened, nor one opened under a setting it no longer has.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct SessionKey {
+    base_url: String,
+    surface: Option<SurfaceSessionKey>,
+}
+
+/// The surface part of a [`SessionKey`]. An mTLS setting adds the stamp of the TLS settings
+/// the session's client was built with ([`ResponseCheck::stamp`]), so a renewed certificate
+/// opens a new session rather than reusing one that trusts the old certificate, and a session
+/// opened with the old settings is never stored under the new stamp.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct SurfaceSessionKey {
+    surface_id: String,
+    setting: String,
+    stamp: Option<[u8; 32]>,
+}
+
+impl SessionKey {
+    /// Whether this is a session of the same surface on the same base URL under the same
+    /// setting as `fresh`, but with other certificates.
+    fn is_superseded_by(
+        &self,
+        fresh: &SessionKey,
+    ) -> bool {
+        self.base_url == fresh.base_url
+            && self
+                .surface
+                .as_ref()
+                .zip(fresh.surface.as_ref())
+                .is_some_and(|(stored, fresh)| {
+                    stored.surface_id == fresh.surface_id
+                        && stored.setting == fresh.setting
+                        && stored.stamp != fresh.stamp
+                })
+    }
+}
+
+/// The [`SessionKey`] of a session to `base_url` checked against `check`.
+pub(crate) fn session_key(
+    base_url: &str,
+    check: Option<ResponseCheck<'_>>,
+) -> SessionKey {
+    SessionKey {
+        base_url: base_url.to_string(),
+        surface: check.and_then(|check| {
+            let setting = check
+                .surface
+                .target
+                .response_auth
+                .as_ref()?;
+            Some(SurfaceSessionKey {
+                surface_id: check
+                    .surface
+                    .surface_id
+                    .clone(),
+                setting: serde_json::to_string(setting).unwrap_or_default(),
+                stamp: check.stamp,
+            })
+        }),
+    }
+}
+
+/// Remove from `sessions` every session of a surface with Response authentication, of
+/// `surface_id` when one is given; dropping a session stops its reader.
+fn forget_from(
+    sessions: &mut HashMap<SessionKey, Arc<UpstreamSseSession>>,
+    surface_id: Option<&str>,
+) {
+    sessions.retain(|key, _| {
+        key.surface
+            .as_ref()
+            .is_none_or(|stored| surface_id.is_some_and(|surface_id| surface_id != stored.surface_id))
+    });
+}
+
+/// `sent` once it passed `check`: a TLS handshake that failed the mTLS server trust, or a
+/// response whose headers fail the check, is [`LegacySseError::Unauthenticated`].
+async fn checked(
+    mut sent: Result<reqwest::Response, reqwest::Error>,
+    check: Option<ResponseCheck<'_>>,
+    failed: &str,
+) -> Result<reqwest::Response, LegacySseError> {
+    if let Some(check) = check {
+        authenticate_sent(check.surface, &mut sent, check.secrets)
+            .await
+            .map_err(LegacySseError::Unauthenticated)?;
+    }
+    sent.map_err(|error| LegacySseError::Failed(format!("{failed}: {}", error.without_url())))
+}
+
 /// A single persistent connection to an upstream Legacy SSE server.
 struct UpstreamSseSessionInner {
     post_url: String,
@@ -798,6 +935,15 @@ struct UpstreamSseSessionInner {
     next_id: std::sync::atomic::AtomicU64,
     /// Set to `false` when the background SSE reader exits.
     alive: Arc<std::sync::atomic::AtomicBool>,
+    /// The background SSE reader, stopped once the session is dropped so its connection, and
+    /// the TLS settings it was opened with, do not outlive the session.
+    reader: tokio::task::AbortHandle,
+}
+
+impl Drop for UpstreamSseSessionInner {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
 }
 
 /// Handle to a persistent upstream SSE session.
@@ -810,26 +956,32 @@ impl UpstreamSseSession {
     ///
     /// Opens `GET {base_url}/sse`, reads the `endpoint` event, spawns a
     /// background task to read responses, and returns the session handle.
+    /// The stream and every response to the session's own messages pass `check`.
     pub async fn connect(
         client: &reqwest::Client,
         base_url: &str,
         channel_name: &str,
         max_event_bytes: usize,
-    ) -> Result<Self, String> {
+        check: Option<ResponseCheck<'_>>,
+    ) -> Result<Self, LegacySseError> {
         use tokio::time::{Duration, timeout};
 
         let sse_url = format!("{}/sse", base_url.trim_end_matches('/'));
         info!(channel = channel_name, "UpstreamSseSession: connecting to {}", loggable::url(&sse_url));
 
-        let response = client
-            .get(&sse_url)
-            .header(ACCEPT, CT_EVENT_STREAM)
-            .send()
-            .await
-            .map_err(|e| format!("SSE connect failed: {}", e.without_url()))?;
+        let response = checked(
+            client
+                .get(&sse_url)
+                .header(ACCEPT, CT_EVENT_STREAM)
+                .send()
+                .await,
+            check,
+            "SSE connect failed",
+        )
+        .await?;
 
         if !response.status().is_success() {
-            return Err(format!("SSE endpoint returned {}", response.status()));
+            return Err(format!("SSE endpoint returned {}", response.status()).into());
         }
 
         let mut byte_stream = response.bytes_stream();
@@ -878,7 +1030,7 @@ impl UpstreamSseSession {
         let pending_clone = pending.clone();
         let alive_clone = alive.clone();
         let ch_name = channel_name.to_string();
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             while let Some(chunk_result) = byte_stream.next().await {
                 match chunk_result {
                     Ok(bytes) => {
@@ -927,7 +1079,8 @@ impl UpstreamSseSession {
             for (_, tx) in map.drain() {
                 let _ = tx.send(String::new());
             }
-        });
+        })
+        .abort_handle();
 
         let session = Self {
             inner: Arc::new(UpstreamSseSessionInner {
@@ -936,6 +1089,7 @@ impl UpstreamSseSession {
                 pending,
                 next_id: std::sync::atomic::AtomicU64::new(1),
                 alive,
+                reader,
             }),
         };
 
@@ -956,6 +1110,7 @@ impl UpstreamSseSession {
                 init_req
                     .to_string()
                     .as_bytes(),
+                check,
             )
             .await
         {
@@ -967,20 +1122,28 @@ impl UpstreamSseSession {
                     .inner
                     .alive
                     .store(false, std::sync::atomic::Ordering::SeqCst);
-                return Err(format!("SSE session initialize failed: {e}"));
+                return Err(match e {
+                    LegacySseError::Unauthenticated(failure) => LegacySseError::Unauthenticated(failure),
+                    LegacySseError::Failed(e) => format!("SSE session initialize failed: {e}").into(),
+                });
             }
         }
 
-        // Fire-and-forget the initialized notification
         let notif = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
         });
-        if let Err(e) = session
-            .send_request(notif.to_string().as_bytes())
+        match session
+            .send_request(notif.to_string().as_bytes(), check)
             .await
         {
-            tracing::warn!(channel = channel_name, error = %e, "UpstreamSseSession: notifications/initialized failed");
+            Ok(_) => {}
+            Err(LegacySseError::Unauthenticated(failure)) => {
+                return Err(LegacySseError::Unauthenticated(failure));
+            }
+            Err(e) => {
+                tracing::warn!(channel = channel_name, error = %e, "UpstreamSseSession: notifications/initialized failed");
+            }
         }
 
         Ok(session)
@@ -1001,13 +1164,17 @@ impl UpstreamSseSession {
     ///
     /// A request goes upstream under a gateway-assigned id, and the response
     /// is returned with the caller's id restored, so two callers sharing the
-    /// session with the same id each get their own response.
+    /// session with the same id each get their own response. The response to
+    /// the POST must pass `check`.
     pub async fn send_request(
         &self,
         json_rpc_body: &[u8],
-    ) -> Result<String, String> {
+        check: Option<ResponseCheck<'_>>,
+    ) -> Result<String, LegacySseError> {
         if !self.is_alive() {
-            return Err("SSE session is no longer alive".to_string());
+            return Err("SSE session is no longer alive"
+                .to_string()
+                .into());
         }
 
         use tokio::time::{Duration, timeout};
@@ -1015,7 +1182,9 @@ impl UpstreamSseSession {
         let mut req_json: serde_json::Value =
             serde_json::from_slice(json_rpc_body).map_err(|e| format!("Invalid JSON: {e}"))?;
         if req_json.is_array() {
-            return Err("JSON-RPC batches are not supported on the Legacy SSE transport".to_string());
+            return Err("JSON-RPC batches are not supported on the Legacy SSE transport"
+                .to_string()
+                .into());
         }
 
         let caller_id = req_json
@@ -1050,19 +1219,22 @@ impl UpstreamSseSession {
             None => (None, json_rpc_body.to_vec()),
         };
 
-        let resp = self
-            .inner
-            .client
-            .post(&self.inner.post_url)
-            .header(CONTENT_TYPE, CT_JSON)
-            .body(upstream_body)
-            .send()
-            .await
-            .map_err(|e| format!("POST failed: {}", e.without_url()))?;
+        let resp = checked(
+            self.inner
+                .client
+                .post(&self.inner.post_url)
+                .header(CONTENT_TYPE, CT_JSON)
+                .body(upstream_body)
+                .send()
+                .await,
+            check,
+            "POST failed",
+        )
+        .await?;
 
         let status = resp.status();
         if !status.is_success() && status.as_u16() != 202 {
-            return Err(format!("Session POST returned {}", status));
+            return Err(format!("Session POST returned {}", status).into());
         }
 
         let Some((_registration, rx, caller_id)) = waiter else {
@@ -1074,6 +1246,7 @@ impl UpstreamSseSession {
             Ok(Err(_)) => Err("SSE session closed before response".to_string()),
             Err(_) => Err("Timeout waiting for response from upstream SSE".to_string()),
         }
+        .map_err(LegacySseError::from)
     }
 }
 
@@ -1136,7 +1309,7 @@ fn with_caller_id(
 /// Used by GW2's message processor to maintain one SSE connection per
 /// upstream MCP server.
 pub struct UpstreamSseSessionManager {
-    pub sessions: RwLock<HashMap<String, Arc<UpstreamSseSession>>>,
+    pub sessions: RwLock<HashMap<SessionKey, Arc<UpstreamSseSession>>>,
 }
 
 impl UpstreamSseSessionManager {
@@ -1146,19 +1319,24 @@ impl UpstreamSseSessionManager {
         }
     }
 
-    /// Get or create a persistent session for the given base URL.
-    /// Evicts dead sessions automatically.
+    /// Get or create a persistent session for the given base URL, under
+    /// [`session_key`]. Evicts dead sessions automatically. A new session of a surface with
+    /// Response authentication evicts that surface's sessions on `base_url` under the same
+    /// setting with older certificates; its sessions under another setting, such as another
+    /// surface variant's, are kept.
     pub async fn get_or_connect(
         &self,
         client: &reqwest::Client,
         base_url: &str,
         channel_name: &str,
         max_event_bytes: usize,
-    ) -> Result<Arc<UpstreamSseSession>, String> {
+        check: Option<ResponseCheck<'_>>,
+    ) -> Result<Arc<UpstreamSseSession>, LegacySseError> {
+        let key = session_key(base_url, check);
         // Fast path: read lock — return cached session if alive
         {
             let sessions = self.sessions.read().await;
-            if let Some(session) = sessions.get(base_url) {
+            if let Some(session) = sessions.get(&key) {
                 if session.is_alive() {
                     return Ok(session.clone());
                 }
@@ -1171,18 +1349,34 @@ impl UpstreamSseSessionManager {
         let mut sessions = self.sessions.write().await;
 
         // Double-check: another task may have connected while we waited for the lock
-        if let Some(existing) = sessions.get(base_url) {
+        if let Some(existing) = sessions.get(&key) {
             if existing.is_alive() {
                 return Ok(existing.clone());
             }
             // Dead — remove before inserting new one
-            sessions.remove(base_url);
+            sessions.remove(&key);
         }
 
-        let session = UpstreamSseSession::connect(client, base_url, channel_name, max_event_bytes).await?;
+        let session = UpstreamSseSession::connect(client, base_url, channel_name, max_event_bytes, check).await?;
         let session = Arc::new(session);
-        sessions.insert(base_url.to_string(), session.clone());
+        sessions.retain(|stored, _| !stored.is_superseded_by(&key));
+        sessions.insert(key, session.clone());
         Ok(session)
+    }
+
+    /// Close every session of the surface `surface_id` with Response authentication, on any
+    /// base URL. Sessions shared by surfaces without the setting are kept.
+    pub(crate) async fn forget_surface(
+        &self,
+        surface_id: &str,
+    ) {
+        forget_from(&mut *self.sessions.write().await, Some(surface_id));
+    }
+
+    /// Close every session of a surface with Response authentication. Sessions shared by
+    /// surfaces without the setting are kept.
+    pub(crate) async fn forget_all_surfaces(&self) {
+        forget_from(&mut *self.sessions.write().await, None);
     }
 }
 
@@ -1190,27 +1384,69 @@ impl UpstreamSseSessionManager {
 pub static UPSTREAM_SSE_SESSIONS: std::sync::LazyLock<UpstreamSseSessionManager> =
     std::sync::LazyLock::new(UpstreamSseSessionManager::new);
 
+/// Close every session of the surface `surface_id` with Response authentication, see
+/// [`UpstreamSseSessionManager::forget_surface`].
+pub(crate) fn forget_surface_sessions(surface_id: &str) {
+    forget_sessions(Some(surface_id.to_string()));
+}
+
+/// Close every session of a surface with Response authentication, see
+/// [`UpstreamSseSessionManager::forget_all_surfaces`].
+pub(crate) fn forget_all_surface_sessions() {
+    forget_sessions(None);
+}
+
+/// Forget the sessions now when the map is free, otherwise once a connect holding it is done,
+/// so a surface save or a configuration reload never waits on an upstream.
+fn forget_sessions(surface_id: Option<String>) {
+    if let Ok(mut sessions) = UPSTREAM_SSE_SESSIONS
+        .sessions
+        .try_write()
+    {
+        forget_from(&mut sessions, surface_id.as_deref());
+        return;
+    }
+    tokio::spawn(async move {
+        match surface_id {
+            Some(surface_id) => {
+                UPSTREAM_SSE_SESSIONS
+                    .forget_surface(&surface_id)
+                    .await
+            }
+            None => {
+                UPSTREAM_SSE_SESSIONS
+                    .forget_all_surfaces()
+                    .await
+            }
+        }
+    });
+}
+
 /// Send a JSON-RPC request via a persistent upstream Legacy SSE session.
 ///
 /// If the cached session dies mid-request (upstream closed the connection),
 /// evicts it and retries once with a fresh session. `max_event_bytes` caps one
 /// incomplete SSE event (`a2a.max_body_size`); a session shared by several
-/// callers keeps the cap it connected with.
+/// callers keeps the cap it connected with. Every response of the session
+/// must pass `check`; one that fails ends the request as
+/// [`LegacySseError::Unauthenticated`], without a retry.
 pub async fn send_via_persistent_sse(
     client: &reqwest::Client,
     base_url: &str,
     json_rpc_body: &[u8],
     channel_name: &str,
     max_event_bytes: usize,
-) -> Result<String, String> {
+    check: Option<ResponseCheck<'_>>,
+) -> Result<String, LegacySseError> {
     let session = UPSTREAM_SSE_SESSIONS
-        .get_or_connect(client, base_url, channel_name, max_event_bytes)
+        .get_or_connect(client, base_url, channel_name, max_event_bytes, check)
         .await?;
     match session
-        .send_request(json_rpc_body)
+        .send_request(json_rpc_body, check)
         .await
     {
         Ok(resp) => Ok(resp),
+        Err(e @ LegacySseError::Unauthenticated(_)) => Err(e),
         Err(e) if !session.is_alive() => {
             tracing::warn!(
                 channel = channel_name,
@@ -1222,12 +1458,12 @@ pub async fn send_via_persistent_sse(
                 .sessions
                 .write()
                 .await
-                .remove(base_url);
+                .remove(&session_key(base_url, check));
             let new_session = UPSTREAM_SSE_SESSIONS
-                .get_or_connect(client, base_url, channel_name, max_event_bytes)
+                .get_or_connect(client, base_url, channel_name, max_event_bytes, check)
                 .await?;
             new_session
-                .send_request(json_rpc_body)
+                .send_request(json_rpc_body, check)
                 .await
         }
         Err(e) => Err(e),
@@ -1312,16 +1548,21 @@ mod tests {
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await });
 
-        let session =
-            UpstreamSseSession::connect(&reqwest::Client::new(), &format!("http://{address}"), "test", 1024 * 1024)
-                .await
-                .expect("the session connects");
+        let session = UpstreamSseSession::connect(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            "test",
+            1024 * 1024,
+            None,
+        )
+        .await
+        .expect("the session connects");
         let call = |who: &'static str| {
             let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"who": who}});
             let session = &session;
             async move {
                 let response = session
-                    .send_request(body.to_string().as_bytes())
+                    .send_request(body.to_string().as_bytes(), None)
                     .await
                     .unwrap();
                 serde_json::from_str::<serde_json::Value>(&response).unwrap()
@@ -1409,10 +1650,15 @@ mod tests {
             .unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await });
-        let session =
-            UpstreamSseSession::connect(&reqwest::Client::new(), &format!("http://{address}"), "test", 1024 * 1024)
-                .await
-                .expect("the session connects");
+        let session = UpstreamSseSession::connect(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            "test",
+            1024 * 1024,
+            None,
+        )
+        .await
+        .expect("the session connects");
         let request = |answer: bool| {
             serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"answer": answer}})
                 .to_string()
@@ -1420,7 +1666,7 @@ mod tests {
 
         let response: serde_json::Value = serde_json::from_str(
             &session
-                .send_request(request(true).as_bytes())
+                .send_request(request(true).as_bytes(), None)
                 .await
                 .unwrap(),
         )
@@ -1431,7 +1677,7 @@ mod tests {
         let batch = format!("[{}]", request(true));
         assert!(
             session
-                .send_request(batch.as_bytes())
+                .send_request(batch.as_bytes(), None)
                 .await
                 .is_err()
         );
@@ -1440,7 +1686,7 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(200),
-                session.send_request(request(false).as_bytes())
+                session.send_request(request(false).as_bytes(), None)
             )
             .await
             .is_err(),
@@ -1455,6 +1701,503 @@ mod tests {
                 .is_empty(),
             "a dropped caller leaves no waiter"
         );
+    }
+
+    /// A Legacy SSE upstream that answers every request with its params, whose stream carries
+    /// `stream_key`, whose answers to request POSTs carry `post_key` and whose answers to
+    /// notification POSTs carry `notification_key` in the key header, when given.
+    async fn keyed_legacy_upstream(
+        stream_key: Option<&'static str>,
+        post_key: Option<&'static str>,
+        notification_key: Option<&'static str>,
+    ) -> String {
+        use axum::response::IntoResponse;
+        use axum::response::sse::Event;
+        use tokio::sync::mpsc;
+
+        fn keyed(
+            mut response: axum::response::Response,
+            key: Option<&'static str>,
+        ) -> axum::response::Response {
+            if let Some(key) = key {
+                response.headers_mut().insert(
+                    axum::http::HeaderName::from_bytes(crate::proxy::response_auth::BRAVO_KEY_HEADER.as_bytes())
+                        .unwrap(),
+                    axum::http::HeaderValue::from_static(key),
+                );
+            }
+            response
+        }
+
+        let (events, receiver) = mpsc::channel::<Event>(16);
+        let receiver = Arc::new(Mutex::new(Some(receiver)));
+        let app = axum::Router::new()
+            .route(
+                "/sse",
+                axum::routing::get(move || {
+                    let receiver = receiver.clone();
+                    async move {
+                        let Some(receiver) = receiver.lock().await.take() else {
+                            return axum::http::StatusCode::CONFLICT.into_response();
+                        };
+                        let endpoint = futures::stream::once(async {
+                            Event::default()
+                                .event("endpoint")
+                                .data("/messages")
+                        });
+                        let stream = endpoint
+                            .chain(ReceiverStream::new(receiver))
+                            .map(Ok::<_, Infallible>);
+                        keyed(Sse::new(stream).into_response(), stream_key)
+                    }
+                }),
+            )
+            .route(
+                "/messages",
+                axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                    let events = events.clone();
+                    async move {
+                        if request.get("id").is_none() {
+                            return keyed(axum::http::StatusCode::ACCEPTED.into_response(), notification_key);
+                        }
+                        let answer =
+                            serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": request["params"]});
+                        let _ = events
+                            .send(Event::default().data(answer.to_string()))
+                            .await;
+                        keyed(axum::http::StatusCode::ACCEPTED.into_response(), post_key)
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        format!("http://{address}")
+    }
+
+    fn bravo_surface(response_auth: serde_json::Value) -> crate::config::agent_surface::AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": "legacy-sse-bravo", "name": "legacy-sse-bravo",
+            "access_point": {"listen_address": "0.0.0.0:9000", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "https://bravo.example", "response_auth": response_auth}
+        }))
+        .unwrap()
+    }
+
+    const TOOLS_CALL: &[u8] = br#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"who":"bravo"}}"#;
+
+    #[tokio::test]
+    async fn a_legacy_sse_session_whose_responses_carry_the_key_answers_the_request() {
+        let base = keyed_legacy_upstream(
+            Some(crate::proxy::response_auth::BRAVO_KEY),
+            Some(crate::proxy::response_auth::BRAVO_KEY),
+            Some(crate::proxy::response_auth::BRAVO_KEY),
+        )
+        .await;
+        let (_dir, secrets) = crate::proxy::response_auth::bravo_key_store().await;
+        let surface = bravo_surface(crate::proxy::response_auth::api_key_bravo());
+        let check = ResponseCheck {
+            surface: &surface,
+            secrets: Some(&secrets),
+            stamp: None,
+        };
+
+        let answer =
+            send_via_persistent_sse(&reqwest::Client::new(), &base, TOOLS_CALL, "test", 1024 * 1024, Some(check))
+                .await
+                .expect("the session answers");
+
+        let answer: serde_json::Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(answer, serde_json::json!({"jsonrpc": "2.0", "id": 9, "result": {"who": "bravo"}}));
+    }
+
+    #[tokio::test]
+    async fn a_legacy_sse_session_with_a_response_without_the_key_is_refused_and_not_kept() {
+        let (_dir, secrets) = crate::proxy::response_auth::bravo_key_store().await;
+        let surface = bravo_surface(crate::proxy::response_auth::api_key_bravo());
+        let check = ResponseCheck {
+            surface: &surface,
+            secrets: Some(&secrets),
+            stamp: None,
+        };
+        for (case, stream_key, post_key) in [
+            ("a stream without the key", None, Some(crate::proxy::response_auth::BRAVO_KEY)),
+            ("a message POST without the key", Some(crate::proxy::response_auth::BRAVO_KEY), None),
+        ] {
+            let base = keyed_legacy_upstream(stream_key, post_key, post_key).await;
+
+            let outcome =
+                send_via_persistent_sse(&reqwest::Client::new(), &base, TOOLS_CALL, "test", 1024 * 1024, Some(check))
+                    .await;
+
+            assert!(
+                matches!(outcome, Err(LegacySseError::Unauthenticated(ResponseAuthFailure::KeyMissing))),
+                "{case}: {outcome:?}"
+            );
+            assert!(
+                !UPSTREAM_SSE_SESSIONS
+                    .sessions
+                    .read()
+                    .await
+                    .contains_key(&session_key(&base, Some(check))),
+                "{case}: the refused session was kept"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_legacy_sse_session_whose_initialized_notification_answer_lacks_the_key_is_refused_and_not_kept() {
+        let base = keyed_legacy_upstream(
+            Some(crate::proxy::response_auth::BRAVO_KEY),
+            Some(crate::proxy::response_auth::BRAVO_KEY),
+            None,
+        )
+        .await;
+        let (_dir, secrets) = crate::proxy::response_auth::bravo_key_store().await;
+        let surface = bravo_surface(crate::proxy::response_auth::api_key_bravo());
+        let check = ResponseCheck {
+            surface: &surface,
+            secrets: Some(&secrets),
+            stamp: None,
+        };
+        let manager = UpstreamSseSessionManager::new();
+
+        let outcome = manager
+            .get_or_connect(&reqwest::Client::new(), &base, "test", 1024 * 1024, Some(check))
+            .await
+            .err();
+
+        assert!(
+            matches!(outcome, Some(LegacySseError::Unauthenticated(ResponseAuthFailure::KeyMissing))),
+            "{outcome:?}"
+        );
+        assert!(
+            manager
+                .sessions
+                .read()
+                .await
+                .is_empty()
+        );
+    }
+
+    /// A session on `bravo.example` whose reader never ends on its own, with that reader.
+    fn idle_session() -> (Arc<UpstreamSseSession>, tokio::task::JoinHandle<()>) {
+        let reader = tokio::spawn(std::future::pending::<()>());
+        let session = UpstreamSseSession {
+            inner: Arc::new(UpstreamSseSessionInner {
+                post_url: "http://bravo.example/messages".to_string(),
+                client: reqwest::Client::new(),
+                pending: Arc::default(),
+                next_id: std::sync::atomic::AtomicU64::new(1),
+                alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                reader: reader.abort_handle(),
+            }),
+        };
+        (Arc::new(session), reader)
+    }
+
+    /// `manager` holding an idle session under each of `keys`, with their readers.
+    async fn manager_with_sessions(
+        keys: &[SessionKey]
+    ) -> (UpstreamSseSessionManager, Vec<tokio::task::JoinHandle<()>>) {
+        let manager = UpstreamSseSessionManager::new();
+        let mut readers = Vec::new();
+        {
+            let mut sessions = manager.sessions.write().await;
+            for key in keys {
+                let (session, reader) = idle_session();
+                sessions.insert(key.clone(), session);
+                readers.push(reader);
+            }
+        }
+        (manager, readers)
+    }
+
+    async fn kept_keys(manager: &UpstreamSseSessionManager) -> std::collections::HashSet<SessionKey> {
+        manager
+            .sessions
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    async fn assert_stopped(reader: tokio::task::JoinHandle<()>) {
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+            .await
+            .expect("the evicted session's reader stops");
+        assert!(stopped.is_err_and(|error| error.is_cancelled()));
+    }
+
+    fn surface_key(
+        base: &str,
+        surface: &crate::config::agent_surface::AgentSurface,
+    ) -> SessionKey {
+        session_key(
+            base,
+            Some(ResponseCheck {
+                surface,
+                secrets: None,
+                stamp: None,
+            }),
+        )
+    }
+
+    fn plain_key(base: &str) -> SessionKey {
+        session_key(base, None)
+    }
+
+    fn another_setting() -> crate::config::agent_surface::AgentSurface {
+        bravo_surface(serde_json::json!({"api_key": {"header_name": "x-agent-key", "secret_id": "bravo-key"}}))
+    }
+
+    fn another_surface() -> crate::config::agent_surface::AgentSurface {
+        let mut surface = bravo_surface(crate::proxy::response_auth::api_key_bravo());
+        surface.surface_id = "another-surface".to_string();
+        surface
+    }
+
+    #[tokio::test]
+    async fn a_new_session_of_a_surface_evicts_and_stops_its_sessions_under_older_certificates_only() {
+        let key = Some(crate::proxy::response_auth::BRAVO_KEY);
+        let base = keyed_legacy_upstream(key, key, key).await;
+        let (_dir, secrets) = crate::proxy::response_auth::bravo_key_store().await;
+        let surface = bravo_surface(crate::proxy::response_auth::api_key_bravo());
+        let mut older_certificates = surface_key(&base, &surface);
+        if let Some(stored) = older_certificates
+            .surface
+            .as_mut()
+        {
+            stored.stamp = Some([1u8; 32]);
+        }
+        let variant = surface_key(&base, &another_setting());
+        let other_surface = surface_key(&base, &another_surface());
+        let (manager, mut readers) =
+            manager_with_sessions(&[older_certificates, variant.clone(), other_surface.clone(), plain_key(&base)])
+                .await;
+        let check = ResponseCheck {
+            surface: &surface,
+            secrets: Some(&secrets),
+            stamp: None,
+        };
+
+        manager
+            .get_or_connect(&reqwest::Client::new(), &base, "test", 1024 * 1024, Some(check))
+            .await
+            .map_err(|error| error.to_string())
+            .expect("the session connects");
+
+        assert_eq!(
+            kept_keys(&manager).await,
+            [surface_key(&base, &surface), variant, other_surface, plain_key(&base)].into()
+        );
+        assert_stopped(readers.remove(0)).await;
+        for reader in readers {
+            assert!(!reader.is_finished(), "a variant's, another surface's and the shared session keep reading");
+        }
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_surface_stops_its_sessions_on_every_target_url() {
+        let base = "http://bravo.example";
+        let old_target = "http://old-bravo.example";
+        let surface = bravo_surface(crate::proxy::response_auth::api_key_bravo());
+        let other_surface = surface_key(base, &another_surface());
+        let (manager, mut readers) = manager_with_sessions(&[
+            surface_key(base, &surface),
+            surface_key(old_target, &surface),
+            surface_key(base, &another_setting()),
+            other_surface.clone(),
+            plain_key(base),
+        ])
+        .await;
+
+        manager
+            .forget_surface(&surface.surface_id)
+            .await;
+
+        assert_eq!(kept_keys(&manager).await, [other_surface, plain_key(base)].into());
+        for reader in readers.drain(..3) {
+            assert_stopped(reader).await;
+        }
+        for reader in readers {
+            assert!(!reader.is_finished(), "another surface's and the shared session keep reading");
+        }
+    }
+
+    #[tokio::test]
+    async fn forgetting_all_surfaces_stops_only_their_sessions() {
+        let base = "http://bravo.example";
+        let other_upstream = "http://charlie.example";
+        let (manager, mut readers) = manager_with_sessions(&[
+            surface_key(base, &bravo_surface(crate::proxy::response_auth::api_key_bravo())),
+            surface_key(other_upstream, &another_surface()),
+            plain_key(base),
+            plain_key(other_upstream),
+        ])
+        .await;
+
+        manager
+            .forget_all_surfaces()
+            .await;
+
+        assert_eq!(kept_keys(&manager).await, [plain_key(base), plain_key(other_upstream)].into());
+        for reader in readers.drain(..2) {
+            assert_stopped(reader).await;
+        }
+        for reader in readers {
+            assert!(!reader.is_finished(), "a shared session keeps reading");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_newline_in_a_surface_id_or_target_url_does_not_confuse_forgetting() {
+        let base = "http://bravo.example";
+        let mut split_id = bravo_surface(crate::proxy::response_auth::api_key_bravo());
+        split_id.surface_id = "a\nb".to_string();
+        let mut plain_id = split_id.clone();
+        plain_id.surface_id = "a".to_string();
+        let split_id_key = surface_key(base, &split_id);
+        let plain_id_key = surface_key(&format!("{base}\nb"), &plain_id);
+        let (manager, mut readers) =
+            manager_with_sessions(&[split_id_key.clone(), plain_id_key.clone(), plain_key(&format!("{base}\na"))])
+                .await;
+
+        manager
+            .forget_surface("a")
+            .await;
+
+        assert_eq!(kept_keys(&manager).await, [split_id_key, plain_key(&format!("{base}\na"))].into());
+        assert_stopped(readers.remove(1)).await;
+        assert!(!readers[0].is_finished(), "the surface \"a\\nb\" keeps reading");
+
+        manager
+            .forget_surface("a\nb")
+            .await;
+
+        assert_eq!(kept_keys(&manager).await, [plain_key(&format!("{base}\na"))].into());
+        assert_stopped(readers.remove(0)).await;
+        assert!(!readers[0].is_finished(), "a shared session keeps reading");
+    }
+
+    #[tokio::test]
+    async fn a_legacy_sse_upstream_that_fails_the_mtls_server_trust_is_refused() {
+        let (port, _dir, store) = crate::proxy::response_auth::untrusted_target().await;
+        let surface = bravo_surface(crate::proxy::response_auth::pinned_bravo());
+        let tls = crate::proxy::response_auth::target_tls(&surface, Some(&store))
+            .await
+            .unwrap()
+            .expect("an mTLS surface has TLS settings");
+        let base = format!("https://127.0.0.1:{port}");
+        let (client, _) =
+            crate::egress::pinned_forward_client_with_tls(&base, std::time::Duration::from_secs(5), Some(&tls.config))
+                .unwrap();
+        let check = ResponseCheck {
+            surface: &surface,
+            secrets: None,
+            stamp: Some(tls.stamp),
+        };
+
+        let outcome = send_via_persistent_sse(&client, &base, TOOLS_CALL, "test", 1024 * 1024, Some(check)).await;
+
+        assert!(
+            matches!(outcome, Err(LegacySseError::Unauthenticated(ResponseAuthFailure::ServerUntrusted))),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_sse_session_is_kept_under_the_stamp_of_the_settings_its_client_was_built_with() {
+        let (_port, _dir, store) = crate::proxy::response_auth::untrusted_target().await;
+        let surface = bravo_surface(crate::proxy::response_auth::pinned_bravo());
+        let built = || async {
+            crate::proxy::response_auth::target_tls(&surface, Some(&store))
+                .await
+                .unwrap()
+                .expect("an mTLS surface has TLS settings")
+                .stamp
+        };
+        let first = built().await;
+        let renewed = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).expect("renewed certificate");
+        store
+            .update(
+                "bravo",
+                crate::certificates::UpdateCertificateRequest {
+                    name: None,
+                    description: None,
+                    tags: None,
+                    kind: None,
+                    certificate_pem: Some(renewed.cert.pem()),
+                    private_key_pem: None,
+                    expires_at: None,
+                    active: None,
+                    identity_did: None,
+                },
+            )
+            .await
+            .expect("certificate renewed");
+        let second = built().await;
+        assert_ne!(first, second, "the renewal changes the stamp");
+        let base = keyed_legacy_upstream(None, None, None).await;
+        let manager = UpstreamSseSessionManager::new();
+        let check = ResponseCheck {
+            surface: &surface,
+            secrets: None,
+            stamp: Some(first),
+        };
+
+        manager
+            .get_or_connect(&reqwest::Client::new(), &base, "test", 1024 * 1024, Some(check))
+            .await
+            .map_err(|error| error.to_string())
+            .expect("the session connects");
+
+        let kept = kept_keys(&manager).await;
+        assert_eq!(kept, [session_key(&base, Some(check))].into());
+        assert!(
+            kept.iter().all(|key| key
+                .surface
+                .as_ref()
+                .and_then(|surface| surface.stamp)
+                == Some(first)),
+            "kept under the stamp of the settings the client was built with: {kept:?}"
+        );
+    }
+
+    #[test]
+    fn a_surface_with_response_authentication_gets_a_session_of_its_own() {
+        let base = "http://bravo.example";
+        let plain = bravo_surface(serde_json::Value::Null);
+        let keyed = bravo_surface(crate::proxy::response_auth::api_key_bravo());
+        let mut other_surface = keyed.clone();
+        other_surface.surface_id = "another-surface".to_string();
+        let mut other_setting = keyed.clone();
+        other_setting
+            .target
+            .response_auth = Some(
+            serde_json::from_value(
+                serde_json::json!({"api_key": {"header_name": "X-Other-Key", "secret_id": "bravo-key"}}),
+            )
+            .unwrap(),
+        );
+        let key = |surface: &crate::config::agent_surface::AgentSurface| {
+            session_key(
+                base,
+                Some(ResponseCheck {
+                    surface,
+                    secrets: None,
+                    stamp: None,
+                }),
+            )
+        };
+
+        assert_eq!(key(&plain), plain_key(base), "a surface without the setting shares the upstream's session");
+        assert_ne!(key(&keyed), plain_key(base));
+        assert_ne!(key(&keyed), key(&other_surface), "another surface with the same setting");
+        assert_ne!(key(&keyed), key(&other_setting), "the same surface under another setting");
     }
 
     #[test]

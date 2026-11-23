@@ -66,10 +66,19 @@ export interface SurfaceMetaValue {
    * which refuses callers whose credential fails, as a closed one does.
    */
   legacyAccessPoint?: boolean;
+  /**
+   * Whether the Access Point on the canvas checks its callers: a caller authentication method,
+   * or on MCP a resource token. Absent when the page does not say.
+   */
+  accessPointChecksCallers?: boolean;
   /** Status of each API key the stored surface names, by key id; absent while creating. */
   apiKeyStatuses?: ApiKeyStatuses;
   /** DIDs of the Authorities register; `null` while it loads or when it could not be loaded. */
   authorityDids?: ReadonlySet<string> | null;
+  /** Aliases of the variants whose own http(s) Target has no Response authentication; set in the base view only. */
+  variantsWithoutResponseAuth?: readonly string[];
+  /** Gives those variants the base's Response authentication `value`, without saving. */
+  onCopyResponseAuthToVariants?: (value: unknown) => void;
   /** Selects the Access Point and points at the Caller Context element in the palette. */
   onConfigureAuthentication?: () => void;
   setName: (v: string) => void;

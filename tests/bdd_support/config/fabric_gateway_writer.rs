@@ -112,6 +112,9 @@ fn secret_fixtures(surface: &SurfaceSpec) -> Vec<SecretFixture> {
     {
         secrets.push(SecretFixture::new(&target_auth.secret_id, secret_value));
     }
+    if let Some(response_auth) = &surface.response_auth {
+        secrets.push(SecretFixture::new(&response_auth.secret_id, &response_auth.secret_value));
+    }
     if let Some(provider) = &surface.target_auth_provider {
         secrets.extend(target_auth_provider_secrets(provider));
     }
@@ -241,6 +244,9 @@ fn build_surface_fixture(
     if let Some(provider) = &surface.target_auth_provider {
         fixture =
             fixture.with_target_auth(credential_provider_target_auth_json(TARGET_AUTH_PROVIDER_ID, &provider.fallback));
+    }
+    if let Some(response_auth) = &surface.response_auth {
+        fixture = fixture.with_target_response_auth(response_auth.setting());
     }
     if let Some(policy) = &surface.mcp_tool_policy {
         fixture = fixture.with_mcp_tool_policy(&policy.allowed_tool, &policy.policy_definition_id);

@@ -1,0 +1,134 @@
+branch: feat/policy-template-library
+changes:
+  added:
+    - timestamp: '2026-11-19T18:00:00Z'
+      title: Start and build policies from templates in the policy editor
+      description: >-
+        Creating a policy starts with a Start from gallery of templates for common policies:
+        deny by default, require an authenticated caller, allow by JWT claim or role, allow by
+        JWT issuer and audience, restrict MCP tools by role, require Trust Registry recognition,
+        require a verified credential subject, allowlist outbound destinations, a business-hours
+        access window, a monitor-only baseline, all or at least N trust checks pass, and HTTP
+        method, path, surface and subject allowlists, plus MCP tool policies for tool bindings
+        on MCP Targets. Each template's description says which policy input it reads and what
+        that input needs, such as a verified caller DID for Trust Registry recognition, a
+        closed Access Point whose Caller Context methods are all JWT Bearer reading the
+        Authorization header with the Bearer scheme for the MCP tool policies, which read the
+        unverified bearer token, and the Transit Point policy slots for
+        the outbound allowlist, which decides only where input.transit is set and allows the
+        request a fabric:// Target sends; a trust check that queries several authorities counts
+        once, the surface allowlist matches surface IDs, the path allowlist's prefixes start
+        with the Access Point route and match whole path segments, and the templates that read the
+        caller say they decide on the Access Point and Target request policies, and the
+        verified credential subject and Trust Registry templates that they deny every request
+        as a fabric:// Target's request policy. Templates follow the Apply Policies guides and link to their own
+        docs section. Define Gateway Policy lists only templates for gateways and Define Agent
+        Surface Policy only templates for surfaces, with a muted note on a template for surfaces
+        only; the cards carry no role or default decision badges, six show until Show all, and
+        no card is selected until the user picks one. Choosing a card shows its settings, its
+        Rego, how it decides on sample inputs and its docs link in the column beside the form,
+        and Use this template fills the Rego and the Description, keeping a typed Description and
+        never changing the Name, with settings that are checked first; the Details and Policy
+        sections appear only then. Settings that depend on the deployment, such as issuers,
+        audiences, DIDs, destinations, paths, surface IDs, subjects and role or claim values,
+        start empty with a sample as the placeholder, and Use this template and Add to policy
+        stay disabled, saying why under the field, until they are filled; the Rego preview uses
+        the samples meanwhile and says so, and only typed values are written. Create custom policy, under the list, starts an allow-all
+        policy instead and empties the Name and Description, which its Undo restores. Change reopens the gallery and Cancel closes
+        it; when the policy already has rules or hand edits, Use and Create custom policy ask in
+        place before they replace them. The Business-hours access window template allows or
+        denies requests inside a daily HH:MM window in a chosen time zone, which may cross
+        midnight, on the listed days or every day, and denies a request whose time it can't
+        read in that time zone in either mode; it is a whole policy, offered under Start
+        from only. Add rules from a template lists only templates that add rules, labelled
+        Adds rules, says how many whole policies and templates for the other Type it leaves
+        out, and appends a template's rules to a new or saved policy, so several can be
+        combined; on an empty policy it warns that the rules make it deny every request they
+        don't allow. A Rules | Rego toggle shows the policy, opening on Rules. The Rules view says
+        in one line above the rules what the policy decides, or that it can't and to read the
+        Rego, lists the policy's rules grouped by the template they came from, marks each rule
+        other than allow and deny_reason Used by allow or Not used by allow, shows each
+        condition of an allow rule with several on its own line, the later ones after "and",
+        or the rule on one line when it can't be split cleanly, removes a template's rules or
+        a single rule unless the allow rule still reads it, saying which rule does, or unless
+        the rule sets allow in a way other than a plain allow rule, marked Sets allow, which is
+        removed in the Rego view, switches an
+        allow-all policy to deny by default, marks groups that have no effect while the default
+        is ALLOW, and on a new policy blocks Create while a group written for the other Type
+        remains. Start from names the template the policy started from and counts the
+        templates added until a hand edit. On a saved policy a Template examples card checks the
+        added template's examples with the existing dry-run, explains a row that differs and
+        loads its input into Test (dry-run), with Undo. The templates are a built-in catalogue
+        that ships with the dashboard; templates are not saved, stored or shared, and no
+        gateway API changes.
+  changed:
+    - timestamp: '2026-11-20T12:00:00Z'
+      title: Document the MCP tool policy input and request fields in the policy docs
+      description: >-
+        docs/POLICY.md now describes the input of a policy bound to MCP tools (input.mcp,
+        input.jwt as the claims of the request's Authorization bearer token, input.channel and
+        input.request), input.http with a path that starts with the Access Point route,
+        input.channel and input.gateway with where direction and target_id are set, including
+        the outbound evaluation of a fabric:// Target's send, which carries the peer gateway's
+        DID and no input.transit, input.gateway.source_id or input.extension_identity,
+        input.agent.trust_verification beside did_verified, and how to
+        require every Trust Check when a check queries several authorities.
+    - timestamp: '2026-11-19T14:00:00Z'
+      title: Set a new policy's Type from the Define button that opened it
+      description: >-
+        Define Gateway Policy and Define Agent Surface Policy set the new policy's Type, so the
+        create page no longer shows a Type field and its header names the Type instead
+        ("Create Gateway Policy"). A policy can't drift to a Type its templates were not
+        written for. Opened without a Define button, from a typed or bookmarked link, the page
+        creates a Gateway policy and shows its Type locked. A saved policy still shows its Type,
+        read-only.
+    - timestamp: '2026-11-18T22:00:00Z'
+      title: Show the policy editor read-only to users who can't edit policies
+      description: >-
+        Without the policies.edit permission the policy editor shows the policy read-only: the
+        Rego and Details can't be changed, there is no Create or Save button, Ctrl+S does
+        nothing, a package mismatch offers no Fix it, there is no Test (dry-run) panel, and a
+        note says the policy can be viewed but not changed. Saving and the dry-run already
+        needed that permission, so the page no longer offers actions the gateway refuses.
+    - timestamp: '2026-11-18T20:00:00Z'
+      title: Restore a discarded policy draft only from the discard notice's Undo
+      description: >-
+        Leaving the policy editor with unsaved changes and opening it again any other way now
+        starts fresh and closes the discard notice, so its Undo never points at a dropped
+        draft; only Undo on that notice brings the draft back, and browser Back to the page that
+        Undo reopened does not bring back a later draft.
+    - timestamp: '2026-11-18T18:00:00Z'
+      title: Redesign the policy editor into Details and Policy sections
+      description: >-
+        The policy create and edit pages group Name, Description, Type and an Enabled switch
+        into one Details section (Name, then a two-line Description, then Type and Status side
+        by side), show a saved policy's ID and SHA on one line with copy buttons, the SHA of the
+        revision Save just wrote, and show the Rego with line numbers and a banner when it
+        doesn't compile. An Undo or an edit made while Save runs stays unsaved instead of being
+        overwritten, a failed save keeps the change and its Undo, the SHA is hidden when the
+        saved revision can't be read back, and a policy that fails to load shows the error
+        instead of an empty form.
+  fixed:
+    - timestamp: '2026-11-20T15:00:00Z'
+      title: Stop a replaced dashboard toast from closing the next one or undoing twice
+      description: >-
+        When a new notice replaced an Undo notice on screen, the old one kept its timer and its
+        u key shortcut, so it could close the newer notice early and one press of u ran both
+        undos. A new notice now stops the one it replaces, and each notice closes only itself.
+        Discarding an editor again while its first discard notice still showed also cleared
+        the second draft, so that notice's Undo restored nothing; it now restores it.
+    - timestamp: '2026-11-19T20:00:00Z'
+      title: Fit the policy editor's dry-run Run button to its label
+      description: >-
+        The Test (dry-run) panel's "Run against the draft above" button had a fixed width
+        narrower than its label, so the text spilled past the button. It now sizes to its label.
+    - timestamp: '2026-11-18T18:00:00Z'
+      title: Describe the policy input the gateway sends in the policy editor
+      description: >-
+        The policy editor's Rego reference and the dry-run sample input used input.jwt, which
+        gateway and surface policies never get, so policies copied from them never matched.
+        They now use input.source_auth, list the other caller fields, and describe the separate
+        input of policies bound to MCP tools, which does carry input.jwt.
+  removed: []
+  security: []
+  breaking: []

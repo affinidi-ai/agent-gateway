@@ -965,6 +965,7 @@ fn audited_refusal_reason(refusal: &str) -> &'static str {
         "a request that fails MCP admission" => "mcp_admission",
         "a malformed request" => "invalid_envelope",
         "a rejected request extension" => "extension_rejected",
+        "a Target response that is not authenticated" => "target_response_auth_failed",
         other => panic!("no audited reason for the request refusal '{other}'"),
     }
 }
@@ -3856,6 +3857,21 @@ fn named_mcp_server_received_request_with_binding_vp(
         "MCP server '{}' forwarded request identity-binding verifiablePresentation should be a valid VP, got: {}",
         server_name,
         vp
+    );
+}
+
+#[then(expr = "MCP server {string} received the forwarded MCP request with a VP whose proof claims {string}")]
+fn named_mcp_server_received_vp_claiming_purpose(
+    world: &mut SurfaceWorld,
+    server_name: String,
+    purpose: String,
+) {
+    let request = get_mcp_request_for_actor(world, &server_name);
+    let binding = get_mcp_binding_extension(request, &format!("MCP server '{}'", server_name));
+    let presentation = decode_vp(&binding["verifiablePresentation"]);
+    assert_eq!(
+        presentation["proof"]["proofPurpose"], purpose,
+        "MCP server '{server_name}' forwarded VP should claim {purpose}, got: {presentation}"
     );
 }
 

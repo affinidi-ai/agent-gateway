@@ -1,17 +1,63 @@
 import React from 'react';
 import { Link } from 'react-router-dom';
-import type { AgentDetails, AgentRegistryOutcome } from '../../api';
+import type { AgentDetails, AgentIdentity, AgentRegistryOutcome } from '../../api';
 import { CopyButton } from '../../components/shared/CopyButton';
 import { TrustRecorderStateBadge } from '../../components/trust-recorder/TrustRecorderStateBadge';
 import { usePermissions } from '../../context/PermissionsContext';
 import { trustRecorderReasonText } from '../../utils/trustRecorderStatus';
-import { AgentDid } from '../AgentsPage/AgentBadges';
 import type { AgentConnectionTarget } from '../AgentsPage/agentLabels';
-import { connectionTarget, routeDescription } from '../AgentsPage/agentLabels';
+import { connectionTarget, routeDescription, shortenDid } from '../AgentsPage/agentLabels';
 
 /** The A2A proxy or remote gateway by name, as plain text, or by id when it has none. */
 const TargetLabel: React.FC<{ name?: string | null; id: string }> = ({ name, id }) =>
   name ? <span title={id}>{name}</span> : <code>{id}</code>;
+
+/** A shortened DID in monospace, the full value as tooltip, with a copy button. */
+const AgentDid: React.FC<{ did: string }> = ({ did }) => (
+  <span className="d-inline-flex align-items-center" style={{ minWidth: 0 }}>
+    <code className="small text-break" title={did} data-testid="agents-did">
+      {shortenDid(did)}
+    </code>
+    <CopyButton text={did} title="Copy DID" data-testid="agents-copy-did-button" />
+  </span>
+);
+
+const IDENTITY_SOURCES: Record<AgentIdentity['source'], string> = {
+  surface: 'Surface DID',
+  managed: 'Managed identity',
+};
+
+/** Every DID of the agent, which the Agents list only counts. */
+const IdentitiesSection: React.FC<{ identities: AgentIdentity[] }> = ({ identities }) => (
+  <section className="mt-4" data-testid="agent-connection-identities">
+    <h6 className="agent-preview-section-title m-0">Identities</h6>
+    <div className="small text-muted mb-3">The DIDs the agent is reached as.</div>
+    {identities.length === 0 ? (
+      <p className="text-muted small mb-0" data-testid="agent-connection-identities-empty">
+        No surface using this agent has a DID.
+      </p>
+    ) : (
+      <table className="table table-sm align-middle mb-0 agent-preview-changes">
+        <thead>
+          <tr>
+            <th scope="col">Identity</th>
+            <th scope="col">Source</th>
+          </tr>
+        </thead>
+        <tbody>
+          {identities.map(identity => (
+            <tr key={identity.did} data-testid="agent-connection-identity">
+              <td>
+                <AgentDid did={identity.did} />
+              </td>
+              <td>{IDENTITY_SOURCES[identity.source] ?? identity.source}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    )}
+  </section>
+);
 
 const ROUTE_DESCRIPTIONS: Record<AgentConnectionTarget['kind'], string> = {
   url: routeDescription('url'),
@@ -28,7 +74,7 @@ const TrustRegistrySection: React.FC<{ outcomes: AgentRegistryOutcome[] }> = ({ 
   const { hasPermission } = usePermissions();
   return (
     <section className="mt-4" data-testid="agent-connection-trust-registry">
-      <h6 className="m-0 fw-bold">Trust registry</h6>
+      <h6 className="agent-preview-section-title m-0">Trust registry</h6>
       <div className="small text-muted mb-3">
         Where the agent&apos;s identities were recorded. Recording is not a trust decision.
       </div>
@@ -166,7 +212,7 @@ const ConnectionTab: React.FC<{ agent: AgentDetails }> = ({ agent }) => {
   return (
     <div data-testid="agent-connection-tab">
       <div className="mb-3">
-        <h6 className="m-0 fw-bold">Route</h6>
+        <h6 className="agent-preview-section-title m-0">Route</h6>
         <div className="small text-muted" data-testid="agent-connection-description">
           {ROUTE_DESCRIPTIONS[target.kind]}
         </div>
@@ -191,6 +237,7 @@ const ConnectionTab: React.FC<{ agent: AgentDetails }> = ({ agent }) => {
         </tbody>
       </table>
 
+      <IdentitiesSection identities={agent.identities} />
       <TrustRegistrySection outcomes={agent.trust_registry.registries ?? []} />
     </div>
   );

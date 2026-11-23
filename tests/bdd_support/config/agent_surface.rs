@@ -89,6 +89,7 @@ pub struct TargetFixture {
     pub endpoint: String,
     pub auth: Option<Value>,
     pub mirror: Option<Value>,
+    pub response_auth: Option<Value>,
     pub mcp_proxy_id: Option<String>,
     pub a2a_proxy_id: Option<String>,
     pub policy_definition_id: Option<String>,
@@ -107,6 +108,7 @@ impl Default for TargetFixture {
             endpoint: "".to_string(),
             auth: None,
             mirror: None,
+            response_auth: None,
             mcp_proxy_id: None,
             a2a_proxy_id: None,
             policy_definition_id: None,
@@ -155,6 +157,7 @@ impl AgentSurfaceFixture {
                 endpoint: target_endpoint.into(),
                 auth: None,
                 mirror: None,
+                response_auth: None,
                 mcp_proxy_id: None,
                 a2a_proxy_id: None,
                 policy_definition_id: None,
@@ -279,6 +282,14 @@ impl AgentSurfaceFixture {
         mirror: Value,
     ) -> Self {
         self.target.mirror = Some(mirror);
+        self
+    }
+
+    pub fn with_target_response_auth(
+        mut self,
+        response_auth: Value,
+    ) -> Self {
+        self.target.response_auth = Some(response_auth);
         self
     }
 
@@ -501,6 +512,9 @@ impl AgentSurfaceFixture {
         if let Some(mirror) = &self.target.mirror {
             target["networking"] = json!({ "mirror": mirror });
         }
+        if let Some(response_auth) = &self.target.response_auth {
+            target["response_auth"] = response_auth.clone();
+        }
         if let Some(proxy_id) = &self.target.mcp_proxy_id {
             target["mcp_proxy_id"] = json!(proxy_id);
         }
@@ -660,6 +674,7 @@ impl Default for AgentSurfaceFixture {
                 endpoint: "".to_string(),
                 auth: None,
                 mirror: None,
+                response_auth: None,
                 mcp_proxy_id: None,
                 a2a_proxy_id: None,
                 policy_definition_id: None,

@@ -344,6 +344,9 @@ fn write_single_surface_config_inner(
         }
         surface_fixture = surface_fixture.with_caller_key(setting);
     }
+    if let Some(response_auth) = &surface_config.response_auth {
+        surface_fixture = surface_fixture.with_target_response_auth(response_auth.setting());
+    }
     if !surface_config
         .browser_origins
         .is_empty()
@@ -1069,6 +1072,9 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
         && let Some(secret_value) = &caller_key.secret_value
     {
         secrets.push(SecretFixture::new(&caller_key.secret_id, secret_value));
+    }
+    if let Some(response_auth) = &surface_config.response_auth {
+        secrets.push(SecretFixture::new(&response_auth.secret_id, &response_auth.secret_value));
     }
     if let Some(provider) = &surface_config.target_auth_provider {
         secrets.extend(target_auth_provider_secrets(provider));

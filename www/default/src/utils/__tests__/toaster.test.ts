@@ -1,3 +1,4 @@
+import { act } from 'react';
 import { removeToast, showToast, showUndoToast } from '../toaster';
 
 const PAYLOAD = '<img src=x onerror="window.__toastXss = true">';
@@ -196,5 +197,60 @@ describe('showUndoToast', () => {
     expect(toast.querySelector('img')).toBeNull();
     expect(toast.textContent).toContain(PAYLOAD);
     expect((window as unknown as { __toastXss?: boolean }).__toastXss).toBeUndefined();
+  });
+
+  it('stops a replaced toast: its timer leaves the new toast and u undoes only the new one', () => {
+    const firstUndo = jest.fn();
+    const firstExpire = jest.fn();
+    const secondUndo = jest.fn();
+    showUndoToast({ message: 'first', onUndo: firstUndo, onExpire: firstExpire });
+    jest.advanceTimersByTime(4000);
+    showUndoToast({ message: 'second', onUndo: secondUndo });
+    expect(firstExpire).toHaveBeenCalledTimes(1);
+
+    jest.advanceTimersByTime(1500);
+    expect(document.querySelectorAll('#app-toast')).toHaveLength(1);
+    expect(getToast().textContent).toContain('second');
+
+    act(() => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'u' }));
+    });
+    expect(secondUndo).toHaveBeenCalledTimes(1);
+    expect(firstUndo).not.toHaveBeenCalled();
+    expect(document.getElementById('app-toast')).toBeNull();
+  });
+
+  it('leaves a newer toast in place when the replaced one is dismissed late', () => {
+    const dismiss = showUndoToast({ message: 'first', onUndo: jest.fn() });
+    showUndoToast({ message: 'second', onUndo: jest.fn() });
+    dismiss();
+    expect(getToast().textContent).toContain('second');
+  });
+
+  it('is replaced by a plain toast, whose timer then is the only one', () => {
+    const onUndo = jest.fn();
+    showUndoToast({ message: 'first', duration: 1000, onUndo });
+    showToast('success', 'saved', { autoRemove: true, duration: 3000 });
+    jest.advanceTimersByTime(1500);
+    expect(getToast().textContent).toContain('saved');
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'u' }));
+    expect(onUndo).not.toHaveBeenCalled();
+  });
+});
+
+describe('a replaced plain toast', () => {
+  beforeEach(() => jest.useFakeTimers());
+
+  afterEach(() => {
+    removeToast();
+    jest.useRealTimers();
+  });
+
+  it('does not remove the newer toast when its own timer ends', () => {
+    showToast('success', 'first', { autoRemove: true, duration: 1000 });
+    jest.advanceTimersByTime(500);
+    showToast('success', 'second', { autoRemove: true, duration: 3000 });
+    jest.advanceTimersByTime(600);
+    expect(getToast().textContent).toContain('second');
   });
 });

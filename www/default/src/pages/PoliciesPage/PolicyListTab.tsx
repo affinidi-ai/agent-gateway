@@ -9,12 +9,13 @@ import { DOCS_URL } from '../../config/docs';
 import { apiClient } from '../../api';
 import ConfirmPopover from '../../components/shared/ConfirmPopover';
 import { useGlobalPolicyAssignments } from './useGlobalPolicyAssignments';
+import type { PolicyType } from '../../types';
 
 export interface PolicyDefinition {
   id: string;
   name: string;
   description: string;
-  policy_type: 'gateway' | 'agent_surface';
+  policy_type: PolicyType;
   policy: string;
   enabled: boolean;
   created_at: string;
@@ -27,7 +28,7 @@ const truncateHash = (hash?: string): string =>
   hash ? (hash.length > 19 ? `${hash.slice(0, 19)}…` : hash) : '—';
 
 interface PolicyListTabProps {
-  policyType: 'gateway' | 'agent_surface';
+  policyType: PolicyType;
   label: string;
   icon: string;
   externalSearchTerm?: string;

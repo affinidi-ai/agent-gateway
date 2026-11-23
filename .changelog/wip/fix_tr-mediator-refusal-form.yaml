@@ -1,0 +1,25 @@
+branch: fix/tr-mediator-refusal-form
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-19T10:00:00Z'
+      title: Read a Trust Registry refusal in either form a mediator sends it in
+      description: >-
+        From v0.52 a mediator refuses with a trust-task-error document instead of a problem
+        report, and a Trust Registry connection read only the problem report: the refusal fell
+        through as an unrecognised message and was dropped, so a registry the mediator had
+        rejected stayed shown as connected over a socket that no longer worked. The reader now
+        routes a refusal in either form exactly as it has always routed a problem report — to
+        the query waiting on it, ignored when that query is gone, and otherwise marking the
+        registry Failed — and a refusal that answers a query reports its code instead of
+        failing to parse. What triggers a rebuild is unchanged, and a registry the mediator
+        rejects is marked Failed as it was before v0.52, which a manual reconnect clears, and
+        only a refusal that answers none of the gateway's queries reaches it. The refusal log line now carries the
+        code and message as fields and no longer says "problem-report". A refused query is
+        read in either form too, which nothing is known to send today and which guards the
+        gateway against a mediator that starts to. A query's DIDComm id is now the thread it
+        opens, so a refusal that names the query by its id is recognised as well.
+  removed: []
+  security: []
+  breaking: []
