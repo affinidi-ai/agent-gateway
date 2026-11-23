@@ -10751,6 +10751,24 @@ mod tests {
         }
     }
 
+    /// A Transit Point request refused before it is forwarded writes no
+    /// `transit_request_forwarded` record: one without its required transit
+    /// token, and one its policy denies.
+    #[tokio::test]
+    async fn a_refused_transit_point_request_is_not_recorded_as_forwarded() {
+        let tools_list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        let (state, _) = traced_transit_state(true);
+        let (without_token, events) = send_to_partner_a(state, &[], tools_list.clone()).await;
+        assert_eq!(without_token.status(), StatusCode::UNAUTHORIZED);
+        assert!(transit_forwarded(&events).is_empty(), "refused without a token, got {events:?}");
+
+        let (state, issuer) = traced_transit_state(true);
+        let token = traced_transit_token(&issuer, TOKEN_TRACE_ID);
+        let (denied, events) = send_to_partner_a(state, &[("x-transit-token", &token)], tools_list).await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert!(transit_forwarded(&events).is_empty(), "refused by its policy, got {events:?}");
+    }
+
     /// A Transit Point whose target is `fabric://` records the request when it
     /// hands it to the Fabric, whether or not the peer then answers.
     #[tokio::test]

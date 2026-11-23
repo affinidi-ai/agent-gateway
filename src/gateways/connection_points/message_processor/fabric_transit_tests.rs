@@ -258,8 +258,9 @@ fn a2a_body() -> Value {
         "params": { "message": { "role": "user", "messageId": "m-1", "parts": [{ "kind": "text", "text": "hi" }] } } })
 }
 
-/// A request a peer sends over Fabric writes no `request_forwarded` record:
-/// that record belongs to the Access Point that took the caller's request.
+/// A request a peer sends over Fabric writes no `request_forwarded` record,
+/// which belongs to the Access Point that took the caller's request, and no
+/// `transit_request_forwarded` record, which belongs to a Transit Point.
 #[tokio::test]
 async fn a_fabric_receive_is_not_recorded_as_forwarded() {
     if ran_in_child("ATG_FABRIC_RECEIVE_NOT_FORWARDED_CHILD").await {
@@ -283,6 +284,12 @@ async fn a_fabric_receive_is_not_recorded_as_forwarded() {
             .iter()
             .all(|event| !matches!(event.event, DelegationAuditAction::RequestForwarded { .. })),
         "no request_forwarded record for a Fabric receive, got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event.event, DelegationAuditAction::TransitRequestForwarded { .. })),
+        "no transit_request_forwarded record for a Fabric receive, got {events:?}"
     );
 }
 

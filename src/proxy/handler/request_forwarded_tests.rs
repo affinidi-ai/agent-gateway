@@ -110,6 +110,27 @@ async fn a_refused_request_is_not_recorded_as_forwarded() {
     assert!(forwarded(&events).is_empty(), "no request_forwarded record for a refused request, got {events:?}");
 }
 
+/// A request an Access Point forwards writes no `transit_request_forwarded`
+/// record, which belongs to a Transit Point.
+#[tokio::test]
+async fn an_access_point_request_is_not_recorded_as_a_transit_request() {
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}).to_string())
+            .await;
+    let surface = super::variant_routing_tests::surface(&target.url(), json!([]), None);
+
+    let (status, events) = send_with_planted_values(super::variant_routing_tests::router(surface)).await;
+
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(forwarded(&events).len(), 1, "the Access Point forwarded the request: {events:?}");
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event.event, DelegationAuditAction::TransitRequestForwarded { .. })),
+        "no transit_request_forwarded record for an Access Point request, got {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn an_access_point_records_the_request_it_forwards() {
     let target =
