@@ -323,6 +323,47 @@ async fn post_unsigned_saml_response(world: &mut SurfaceWorld) {
     );
 }
 
+#[given(expr = "{string} has signed in with SAML as the first user and that event was received")]
+async fn first_user_has_signed_in_with_saml(
+    world: &mut SurfaceWorld,
+    subject: String,
+) {
+    sign_in_with_saml_roles(world, subject, String::new()).await;
+    let status = world
+        .caller_response
+        .as_ref()
+        .expect("the first user's answer")
+        .status;
+    assert_eq!(status, 200, "the first SAML user signs in as the primary administrator: {:?}", world.caller_response);
+    receive_sign_in_payload(world, EVENT_TOPIC, "data", "user.login", &[("login_method", "saml")]).await;
+}
+
+#[when(expr = "{string} signs in with SAML carrying the identity provider roles {string}")]
+async fn sign_in_with_saml_roles(
+    world: &mut SurfaceWorld,
+    subject: String,
+    roles: String,
+) {
+    ensure_gateway_running(world).await;
+    let roles: Vec<String> = roles
+        .split(',')
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
+        .map(str::to_string)
+        .collect();
+    let infra = world
+        .infra
+        .as_ref()
+        .expect("the gateway runs");
+    let answer =
+        crate::bdd_support::saml_idp::sign_in(infra._temp_dir.path(), infra.gateway_port, &subject, &roles).await;
+    world.caller_response = Some(crate::bdd_support::admin_client::RecordedResponse {
+        status: answer.status,
+        headers: Default::default(),
+        body: serde_json::from_str(&answer.body).unwrap_or(Value::String(answer.body)),
+    });
+}
+
 #[when("a passkey sign-in is completed without a sign-in the gateway started")]
 async fn finish_with_unissued_challenge(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
@@ -401,6 +442,17 @@ async fn stream_receives_sign_in(
 ) {
     world.sign_in_event =
         Some(receive_sign_in_payload(world, EVENT_TOPIC, "data", &event_type, &[("login_method", &method)]).await);
+}
+
+#[then(expr = "the integration receives a {string} event with login method {string} for user {string}")]
+async fn stream_receives_sign_in_of_user(
+    world: &mut SurfaceWorld,
+    event_type: String,
+    method: String,
+    username: String,
+) {
+    let data = [("login_method", method.as_str()), ("username", username.as_str())];
+    world.sign_in_event = Some(receive_sign_in_payload(world, EVENT_TOPIC, "data", &event_type, &data).await);
 }
 
 #[then(expr = "the integration receives a {string} event with login method {string} and failure reason {string}")]
@@ -521,6 +573,15 @@ async fn event_names_console_user(
     assert!(chrono::DateTime::parse_from_rfc3339(updated_at).is_ok(), "new_state updated_at {updated_at:?}");
 }
 
+#[then(expr = "that event reports the user role {string}")]
+fn event_reports_the_user_role(
+    world: &mut SurfaceWorld,
+    role: String,
+) {
+    let data = &sign_in_event(world)["data"];
+    assert_eq!(data["user_role"], role, "the event data is {data}");
+}
+
 #[then("that event names no failure reason")]
 fn event_names_no_failure_reason(world: &mut SurfaceWorld) {
     let data = &sign_in_event(world)["data"];
@@ -567,6 +628,13 @@ async fn event_is_the_only_one(world: &mut SurfaceWorld) {
     tokio::time::sleep(EXACTLY_ONCE_WAIT).await;
     let received = payloads(world, EVENT_TOPIC);
     assert_eq!(received.len(), 1, "expected one sign-in event; the stream received {received:?}");
+}
+
+#[then("the integration receives no other sign-in event besides the first user's")]
+async fn event_is_the_only_one_besides_the_first_users(world: &mut SurfaceWorld) {
+    tokio::time::sleep(EXACTLY_ONCE_WAIT).await;
+    let received = payloads(world, EVENT_TOPIC);
+    assert_eq!(received.len(), 2, "expected the first user's event and one more; the stream received {received:?}");
 }
 
 #[then("the integration receives no sign-in event")]

@@ -337,10 +337,12 @@ pub async fn saml_acs(
                 error!("SAML sign-in blocked by appliance limit: {}", limit.message());
                 return Ok(saml_error_page(StatusCode::FORBIDDEN, "Sign-in unavailable", &limit.message()));
             }
-            if e.downcast_ref::<super::user_provisioning::RoleRefused>()
-                .is_some()
-            {
-                warn!("SAML sign-in refused: {}", e);
+            if let Some(refused) = e.downcast_ref::<super::user_provisioning::RoleRefused>() {
+                warn!(saml_subject = ?refused.subject, idp_role = ?refused.idp_role, "SAML sign-in refused: {}", e);
+                crate::integrations::trigger_user_login_failed(
+                    crate::integrations::LoginMethod::Saml,
+                    crate::integrations::LoginFailure::RoleNotMapped,
+                );
                 return Ok(saml_error_page(
                     StatusCode::FORBIDDEN,
                     "Sign-in unavailable",

@@ -62,6 +62,43 @@ Feature: Sign-in integration events
     And that event does not contain "member@example.test"
     And the integration receives no other sign-in event
 
+  Scenario: A SAML sign-in whose role is mapped to a gateway role signs in with that role
+    Given human users sign in with SAML
+    And "alpha" has signed in with SAML as the first user and that event was received
+    When "mallory" signs in with SAML carrying the identity provider roles "gw-admins"
+    Then the response status is 200
+    And the integration receives a "user.login" event with login method "saml" for user "mallory"
+    And that event reports the user role "administrator"
+    And the integration receives no other sign-in event besides the first user's
+
+  Scenario: A SAML sign-in with several roles gets the highest mapped one whatever their order
+    Given human users sign in with SAML
+    And "alpha" has signed in with SAML as the first user and that event was received
+    When "mallory" signs in with SAML carrying the identity provider roles "contractors,gw-power,gw-all"
+    Then the response status is 200
+    And the integration receives a "user.login" event with login method "saml" for user "mallory"
+    And that event reports the user role "poweruser"
+    And the integration receives no other sign-in event besides the first user's
+
+  Scenario: A SAML sign-in whose role is named like a gateway role but not mapped is refused
+    Given human users sign in with SAML
+    And "alpha" has signed in with SAML as the first user and that event was received
+    When "mallory" signs in with SAML carrying the identity provider roles "admin"
+    Then the response status is 403
+    And the integration receives a "user.login_failed" event with login method "saml" and failure reason "role_not_mapped"
+    And that event carries only the fields of a sign-in event for no account
+    And that event does not contain "mallory"
+    And that event matches the reference event "user.login_failed.role_not_mapped"
+    And the integration receives no other sign-in event besides the first user's
+
+  Scenario: A SAML sign-in with no role is refused
+    Given human users sign in with SAML
+    And "alpha" has signed in with SAML as the first user and that event was received
+    When "mallory" signs in with SAML carrying the identity provider roles ""
+    Then the response status is 403
+    And the integration receives a "user.login_failed" event with login method "saml" and failure reason "role_not_mapped"
+    And the integration receives no other sign-in event besides the first user's
+
   Scenario: Completing a passkey sign-in the gateway did not start raises nothing
     When a passkey sign-in is completed without a sign-in the gateway started
     Then the response status is 400

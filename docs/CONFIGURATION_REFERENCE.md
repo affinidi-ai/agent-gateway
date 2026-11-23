@@ -626,13 +626,23 @@ Read when `auth_mode = "saml"`. Ignored otherwise.
 unexpected identity-provider role to `administrator` grants full management access, so
 treat it as a security-relevant setting rather than a convenience.
 
-A role comes only from an explicit `role_mapping` entry. A role value with no entry, or a
-sign-in with no role value, gets `default_role` when it is set and is otherwise refused with a
-`403` page and no user created or updated; a value that merely looks like a gateway role, such as
-`admin`, is not mapped. The first user to sign in to an appliance with no users is still the
-primary administrator, and the primary administrator keeps that role at every later sign-in. A
-`role_mapping` value or `default_role` that is not `administrator`, `poweruser` or `user`
-(spelled exactly so) stops the gateway at startup, naming the entry.
+A role comes only from an explicit `role_mapping` entry. The identity provider may send several
+role values; the highest role any of them maps to wins, whatever their order, and values with no
+entry are ignored. When no value has an entry, or the sign-in has no role value, the sign-in gets
+`default_role` when it is set and is otherwise refused: the browser gets a `403` page, no user is
+created or updated and a stored role is left as it was, so an existing session or token keeps its
+rights until it is revoked by hand. A value that merely looks like a gateway role, such as `admin`,
+is not mapped. A refusal is logged with the SAML subject and the role values received (an absent
+claim is shown as none) and raises a `user.login_failed` event with failure reason
+`role_not_mapped` ([`docs/INTEGRATIONS.md`](INTEGRATIONS.md#sign-in-events)).
+
+The first user to sign in to an appliance with no users is still the primary administrator, and
+the primary administrator signs in and is updated as usual, keeping that role, even when the role
+is unmapped. A `role_mapping` value or `default_role` that is not `administrator`, `poweruser` or
+`user` (spelled exactly so, in lower case) stops the gateway at startup, naming the entry. At
+startup the gateway warns when `default_role` is `administrator`, since every unmapped sign-in
+then becomes an administrator, and when `role_mapping` is empty and `default_role` is unset, since
+every sign-in but the first user's is then refused.
 
 Each SAML sign-in sets the user's role from the identity provider, with one exception: the
 first user to sign in becomes the primary administrator and keeps that role whatever the

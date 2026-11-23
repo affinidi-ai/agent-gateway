@@ -2005,6 +2005,10 @@ pub async fn run_axum_proxy(
                     )
                 })?;
 
+                for warning in saml_config.role_warnings() {
+                    warn!("{}", warning);
+                }
+
                 crate::source_auth::client_ip::warn_if_login_throttle_shares_one_limit(
                     "login_throttle",
                     &saml_config.login_throttle,

@@ -4,6 +4,7 @@ use tracing::{info, warn};
 
 use crate::auth::auth_config::SamlConfig;
 use crate::auth::saml::graph_api::GraphApiClient;
+use crate::auth::saml::service::SamlAttributes;
 use crate::auth::storage::{PasskeyStorage, UserData};
 use crate::auth::types::{UserRole, UserStatus};
 
@@ -59,10 +60,18 @@ fn changes_reported_state(
 /// Provision or update a user from SAML attributes
 pub async fn provision_user_from_saml(
     storage: &PasskeyStorage,
-    attributes: &HashMap<String, String>,
+    all_attributes: &SamlAttributes,
     config: &SamlConfig,
     avatars_storage_path: &str,
 ) -> Result<Provisioned> {
+    let attributes: HashMap<String, String> = all_attributes
+        .iter()
+        .filter_map(|(name, values)| {
+            values
+                .first()
+                .map(|value| (name.clone(), value.clone()))
+        })
+        .collect();
     // Extract user attributes using configured mappings
     let user_id_attr = attributes
         .get(
@@ -119,7 +128,7 @@ pub async fn provision_user_from_saml(
         .map(|s| s.to_string());
 
     // Determine role from SAML attributes
-    let role = determine_role(attributes, config);
+    let role = determine_role(all_attributes, config).map_err(|refused| refused.for_subject(user_id_attr));
 
     let user_write_guard = storage
         .user_write_guard()
@@ -140,10 +149,16 @@ pub async fn provision_user_from_saml(
         user.job_title = job_title;
         if !user.is_primary {
             user.role = role?;
-        } else if let Ok(role) = &role
-            && *role != UserRole::Administrator
-        {
-            warn!(user_id = %user.user_id, idp_role = %role, "Kept the primary administrator's role over the IdP role");
+        } else {
+            match &role {
+                Ok(role) if *role != UserRole::Administrator => {
+                    warn!(user_id = %user.user_id, idp_role = %role, "Kept the primary administrator's role over the IdP role");
+                }
+                Ok(_) => {}
+                Err(refused) => {
+                    warn!(user_id = %user.user_id, idp_role = ?refused.idp_role, "Kept the primary administrator's role; the IdP role maps to no gateway role");
+                }
+            }
         }
         user.updated_at = chrono::Utc::now();
         user.last_logged_in = Some(chrono::Utc::now());
@@ -171,6 +186,9 @@ pub async fn provision_user_from_saml(
         }
 
         let final_role = if is_first_user {
+            if let Err(refused) = &role {
+                warn!(idp_role = ?refused.idp_role, "Created the first user as administrator; the IdP role maps to no gateway role");
+            }
             UserRole::Administrator
         } else {
             role?
@@ -242,35 +260,70 @@ pub async fn provision_user_from_saml(
     Ok(Provisioned { user, change })
 }
 
-/// A sign-in whose identity-provider role maps to no gateway role and no `default_role` is set.
+/// The longest identity-provider role value kept for a refusal's log line.
+const MAX_LOGGED_ROLE_CHARS: usize = 200;
+
+/// A sign-in whose identity-provider role values map to no gateway role while no `default_role`
+/// is set. `idp_role` is the values received, joined, capped and `None` when the claim was absent;
+/// it is identity-provider input, so log it only with `?`.
 #[derive(Debug, thiserror::Error)]
 #[error("identity-provider role is not mapped to a gateway role")]
-pub struct RoleRefused;
+pub struct RoleRefused {
+    pub subject: Option<String>,
+    pub idp_role: Option<String>,
+}
 
-/// Resolve the gateway role from the identity provider's role value: only an explicit
-/// `role_mapping` entry, else `default_role`, else refused.
-fn determine_role(
-    attributes: &HashMap<String, String>,
-    config: &SamlConfig,
-) -> Result<UserRole, RoleRefused> {
-    let mapped = attributes
-        .get(&config.attribute_mapping.role)
-        .and_then(|saml_role| {
-            config
-                .role_mapping
-                .get(saml_role)
-        });
-    let name = mapped.or(config.default_role.as_ref());
-    match name.and_then(|name| UserRole::from_config_name(name)) {
-        Some(role) => {
-            info!(role = %role, "SAML role resolved");
-            Ok(role)
-        }
-        None => {
-            info!("SAML role has no role_mapping entry and no default_role is set");
-            Err(RoleRefused)
+impl RoleRefused {
+    fn for_subject(
+        self,
+        subject: &str,
+    ) -> Self {
+        Self {
+            subject: Some(subject.to_string()),
+            ..self
         }
     }
+}
+
+fn privilege(role: &UserRole) -> u8 {
+    match role {
+        UserRole::Administrator => 2,
+        UserRole::PowerUser => 1,
+        UserRole::User => 0,
+    }
+}
+
+/// Resolve the gateway role from the identity provider's role values: the highest role an
+/// explicit `role_mapping` entry gives any value, else `default_role`, else refused.
+fn determine_role(
+    attributes: &SamlAttributes,
+    config: &SamlConfig,
+) -> Result<UserRole, RoleRefused> {
+    let values = attributes
+        .get(&config.attribute_mapping.role)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mapped = values
+        .iter()
+        .filter_map(|value| config.role_mapping.get(value))
+        .filter_map(|name| UserRole::from_config_name(name))
+        .max_by_key(privilege);
+    let role = mapped.or_else(|| {
+        config
+            .default_role
+            .as_deref()
+            .and_then(UserRole::from_config_name)
+    });
+    role.ok_or_else(|| RoleRefused {
+        subject: None,
+        idp_role: (!values.is_empty()).then(|| {
+            values
+                .join(",")
+                .chars()
+                .take(MAX_LOGGED_ROLE_CHARS)
+                .collect()
+        }),
+    })
 }
 
 /// Fetch avatar from Microsoft Graph API and save to disk
@@ -339,12 +392,12 @@ mod tests {
     fn saml_attributes(
         user_id: &str,
         username: &str,
-    ) -> HashMap<String, String> {
+    ) -> SamlAttributes {
         let mapping = SamlAttributeMapping::default();
         HashMap::from([
-            (mapping.user_id, user_id.to_string()),
-            (mapping.username, username.to_string()),
-            (mapping.email, format!("{username}@example.test")),
+            (mapping.user_id, vec![user_id.to_string()]),
+            (mapping.username, vec![username.to_string()]),
+            (mapping.email, vec![format!("{username}@example.test")]),
         ])
     }
 
@@ -431,10 +484,10 @@ mod tests {
     }
 
     fn with_role(
-        mut attributes: HashMap<String, String>,
+        mut attributes: SamlAttributes,
         role: &str,
-    ) -> HashMap<String, String> {
-        attributes.insert(SamlAttributeMapping::default().role, role.to_string());
+    ) -> SamlAttributes {
+        attributes.insert(SamlAttributeMapping::default().role, vec![role.to_string()]);
         attributes
     }
 
@@ -562,7 +615,10 @@ mod tests {
     async fn the_primary_administrator_keeps_the_role_whatever_the_idp_sends() {
         let dir = tempdir().unwrap();
         let (storage, avatars) = user_storage(&dir).await;
-        let config = test_saml_config();
+        let mut config = test_saml_config();
+        config
+            .role_mapping
+            .insert("gw-all".to_string(), "user".to_string());
         let first = provision_user_from_saml(&storage, &saml_attributes("saml-admin", "admin"), &config, &avatars)
             .await
             .unwrap();
@@ -570,7 +626,7 @@ mod tests {
         assert_eq!(first.user.role, UserRole::Administrator);
 
         for attributes in
-            [saml_attributes("saml-admin", "admin"), with_role(saml_attributes("saml-admin", "admin"), "user")]
+            [saml_attributes("saml-admin", "admin"), with_role(saml_attributes("saml-admin", "admin"), "gw-all")]
         {
             let again = provision_user_from_saml(&storage, &attributes, &config, &avatars)
                 .await
@@ -689,5 +745,86 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.role, UserRole::Administrator);
+    }
+
+    fn with_roles(
+        mut attributes: SamlAttributes,
+        roles: &[&str],
+    ) -> SamlAttributes {
+        attributes.insert(
+            SamlAttributeMapping::default().role,
+            roles
+                .iter()
+                .map(|role| role.to_string())
+                .collect(),
+        );
+        attributes
+    }
+
+    #[test]
+    fn the_highest_mapped_role_among_several_values_wins_whatever_their_order() {
+        let mut config = mapped_config();
+        config
+            .role_mapping
+            .insert("gw-all".to_string(), "user".to_string());
+        config
+            .role_mapping
+            .insert("gw-power".to_string(), "poweruser".to_string());
+        for roles in [["contractors", "gw-admins"], ["gw-admins", "contractors"]] {
+            let resolved = determine_role(&with_roles(HashMap::new(), &roles), &config).unwrap();
+            assert_eq!(resolved, UserRole::Administrator, "{roles:?}");
+        }
+        let resolved = determine_role(&with_roles(HashMap::new(), &["gw-all", "gw-power"]), &config).unwrap();
+        assert_eq!(resolved, UserRole::PowerUser);
+    }
+
+    #[test]
+    fn several_unmapped_values_are_refused_and_an_unmapped_admin_name_among_them_grants_nothing() {
+        let config = mapped_config();
+        let refused = determine_role(&with_roles(HashMap::new(), &["contractors", "admin"]), &config).unwrap_err();
+        assert_eq!(refused.idp_role.as_deref(), Some("contractors,admin"));
+    }
+
+    #[test]
+    fn a_refusal_names_the_values_received_or_none_for_an_absent_claim_and_caps_them() {
+        let config = mapped_config();
+        let absent = determine_role(&HashMap::new(), &config).unwrap_err();
+        assert_eq!(absent.idp_role, None);
+
+        let long = "x".repeat(MAX_LOGGED_ROLE_CHARS + 50);
+        let capped = determine_role(&with_role(HashMap::new(), &long), &config).unwrap_err();
+        assert_eq!(
+            capped
+                .idp_role
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_LOGGED_ROLE_CHARS
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_new_user_is_named_by_the_saml_subject() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let config = mapped_config();
+        provision_user_from_saml(&storage, &saml_attributes("saml-first", "first"), &config, &avatars)
+            .await
+            .unwrap();
+
+        let err = provision_user_from_saml(
+            &storage,
+            &with_role(saml_attributes("saml-2", "jane"), "contractors"),
+            &config,
+            &avatars,
+        )
+        .await
+        .unwrap_err();
+
+        let refused = err
+            .downcast_ref::<RoleRefused>()
+            .unwrap();
+        assert_eq!(refused.subject.as_deref(), Some("saml-2"));
+        assert_eq!(refused.idp_role.as_deref(), Some("contractors"));
     }
 }

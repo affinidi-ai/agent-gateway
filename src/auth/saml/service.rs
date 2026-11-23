@@ -33,6 +33,9 @@ impl std::fmt::Display for TooManyPendingAuthnRequests {
 
 impl std::error::Error for TooManyPendingAuthnRequests {}
 
+/// The attributes of an assertion: every value of each attribute, in the order the identity provider sent them.
+pub type SamlAttributes = HashMap<String, Vec<String>>;
+
 /// SAML Service Provider implementation
 pub struct SamlService {
     /// SAML configuration
@@ -431,12 +434,12 @@ impl SamlService {
         check_assertion_conditions(conditions, Utc::now(), &self.config.sp_entity_id)
     }
 
-    /// Extract user attributes from assertion
+    /// Extract user attributes from assertion, every value of each attribute in the order sent
     pub fn extract_attributes(
         &self,
         assertion: &Assertion,
-    ) -> Result<HashMap<String, String>> {
-        let mut attributes = HashMap::new();
+    ) -> Result<SamlAttributes> {
+        let mut attributes = SamlAttributes::new();
 
         // attribute_statements is Option<Vec<AttributeStatement>>
         if let Some(statements) = &assertion.attribute_statements
@@ -444,11 +447,14 @@ impl SamlService {
         {
             for attr in &attribute_statement.attributes {
                 // Use 'values' instead of 'attribute_values' per samael API
-                if let Some(attr_value) = attr.values.first() {
-                    // AttributeValue has a 'value: Option<String>' field
-                    // attr.name is also Option<String>
-                    if let (Some(name), Some(text)) = (&attr.name, &attr_value.value) {
-                        attributes.insert(name.clone(), text.clone());
+                if let Some(name) = &attr.name {
+                    let values: Vec<String> = attr
+                        .values
+                        .iter()
+                        .filter_map(|attr_value| attr_value.value.clone())
+                        .collect();
+                    if !values.is_empty() {
+                        attributes.insert(name.clone(), values);
                     }
                 }
             }
@@ -458,7 +464,7 @@ impl SamlService {
         if let Some(subject) = &assertion.subject
             && let Some(name_id) = &subject.name_id
         {
-            attributes.insert("NameID".to_string(), name_id.value.clone());
+            attributes.insert("NameID".to_string(), vec![name_id.value.clone()]);
         }
 
         Ok(attributes)

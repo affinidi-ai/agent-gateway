@@ -5,24 +5,29 @@ changes:
       title: Add default_role to saml.json for sign-ins with no role mapping
       description: >-
         saml.json accepts an optional default_role (administrator, poweruser or user) that a SAML sign-in gets
-        when its identity-provider role has no role_mapping entry. Without it such a sign-in is refused.
+        when none of its identity-provider role values has a role_mapping entry. Without it such a sign-in is
+        refused. The gateway warns at startup when default_role is administrator, or when role_mapping is empty
+        and default_role is unset.
+    - timestamp: '2026-11-23T09:00:00Z'
+      title: Raise user.login_failed with reason role_not_mapped when a SAML role is refused
+      description: >-
+        A SAML sign-in refused because its role maps to no gateway role now raises a user.login_failed
+        integration event with failure reason role_not_mapped, naming no account, and logs the SAML subject
+        and the role values received.
   changed: []
   fixed: []
   removed: []
-  security:
+  security: []
+  breaking:
     - timestamp: '2026-11-20T12:00:00Z'
       title: ⭐ Grant SAML roles only through an explicit role_mapping entry
       description: >-
         Previously a SAML role value with no role_mapping entry was matched by name, so an identity-provider
         group or role called admin or administrator signed users in as Gateway administrator, and a power-user
-        spelling as power user, without anyone mapping it. A role now comes only from role_mapping; an unmapped
-        or missing role gets default_role or is refused with a 403 page. A role_mapping value or default_role
-        that names an unknown role stops the gateway at startup instead of becoming user.
-  breaking:
-    - timestamp: '2026-11-20T12:00:00Z'
-      title: Refuse SAML sign-ins whose role is not in role_mapping
-      description: >-
-        SAML sign-ins that relied on the name match, or on having no role at all, are now refused unless
-        saml.json maps the role in role_mapping or sets default_role. Add a role_mapping entry for every
-        identity-provider role that should sign in, or set default_role to user to keep admitting the rest.
+        spelling as power user, without anyone mapping it. A role now comes only from role_mapping, taking the
+        highest role any of the sent role values maps to. A sign-in whose values have no entry, or with no role
+        value, gets default_role or is refused with a 403 page and no user created or updated. Before
+        upgrading, add a role_mapping entry for every identity-provider role that should sign in, or set
+        default_role to user to keep admitting the rest. A role_mapping value or default_role that is not
+        exactly administrator, poweruser or user, which used to become user, now stops the gateway at startup.
         The first user on an empty appliance and the primary administrator are unaffected.
