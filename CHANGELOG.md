@@ -7,10 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
-
-- **Remove a cargo-audit ignore entry that no longer matches Cargo.lock** — RUSTSEC-2026-0104 (rustls-webpki) was ignored for rustls-webpki 0.101.7, which is no longer in Cargo.lock. The ignore is gone, so `cargo audit` reports the advisory again if an affected version comes back.
-
 ## [1.0.9] - 2026-11-12
 
 ### Breaking

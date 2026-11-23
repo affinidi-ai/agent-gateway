@@ -1,0 +1,11 @@
+branch: remove-stale-advisory-ignores
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-23T00:00:00Z'
+      title: Remove a cargo-audit ignore that no longer matches Cargo.lock
+      description: RUSTSEC-2026-0104 (rustls-webpki) was ignored for rustls-webpki 0.101.7, which is no longer in Cargo.lock. The ignore is gone, so cargo audit reports the advisory again if an affected version comes back.
+  breaking: []
