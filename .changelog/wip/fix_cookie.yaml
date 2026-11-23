@@ -3,15 +3,16 @@ changes:
   added: []
   changed:
     - timestamp: '2026-11-23T12:30:00Z'
-      title: Take the AWS SDK retry behaviour the rest of the gateway already uses
+      title: Take the AWS SDK behaviour the rest of the gateway already uses
       description: >-
         The Secrets Manager and Parameter Store config loaders pinned the AWS SDK behaviour
-        version to v2026_01_12, which the SDK now deprecates in favour of v2026_11_10 and its
-        Retry Behavior 2.1 rules. Both loaders move to v2026_11_10. Every other AWS client in the
-        gateway, for KMS, Kinesis and DynamoDB, asks for the latest behaviour version and so
-        already follows those rules, so this aligns how the two loaders retry with how the rest
-        of the process does. Retry counts and backoff when reading a secret or a parameter at
-        startup can differ; nothing about which secret or parameter is read changes.
+        version to v2026_01_12, which the SDK deprecates. Both loaders move to v2026_11_17,
+        which applies the Retry Behavior 2.1 rules and a default read timeout to AWS SDK
+        clients. Every other AWS client in the gateway, for KMS, Kinesis and DynamoDB, asks for
+        the latest behaviour version and so already works that way, so this aligns the two
+        loaders with the rest of the process. Retry counts and backoff when reading a secret or
+        a parameter at startup can differ, and a read that previously hung now times out;
+        nothing about which secret or parameter is read changes.
   fixed: []
   removed: []
   security:
