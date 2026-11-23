@@ -2652,7 +2652,7 @@ fn build_api_key_source_auth_header(
     (api_key_source_auth(world).0, key_value)
 }
 
-fn build_valid_api_key_source_auth_header(world: &SurfaceWorld) -> (String, String) {
+pub(crate) fn build_valid_api_key_source_auth_header(world: &SurfaceWorld) -> (String, String) {
     api_key_source_auth(world)
 }
 
