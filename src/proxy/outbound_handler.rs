@@ -10751,6 +10751,56 @@ mod tests {
         }
     }
 
+    /// A Transit Point request over the Fabric continues the trace of its
+    /// verified transit token: the Fabric message names it, and so do the
+    /// `traceparent` and `X-Gateway-Trace-Id` it carries, with the managed
+    /// agent's `tracestate`.
+    #[tokio::test]
+    async fn a_transit_point_request_over_the_fabric_continues_its_trace() {
+        let (state, issuer) = traced_transit_state(true);
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel
+            .target_endpoint = "fabric://peer-gateway/peer-surface".into();
+        ctx.transit_token_claims = Some(
+            issuer
+                .validate(&traced_transit_token(&issuer, TOKEN_TRACE_ID), 900)
+                .unwrap(),
+        );
+        for (name, value) in [
+            ("traceparent", format!("00-{TOKEN_TRACE_ID}-53995c3f42cd8ad8-01")),
+            ("x-gateway-trace-id", TOKEN_TRACE_ID.to_string()),
+            ("tracestate", "rojo=00f067aa0ba902b7".to_string()),
+        ] {
+            ctx.original_headers
+                .insert(name, value.parse().unwrap());
+        }
+        step_resolve_trace(&mut ctx);
+
+        let (sent, _) = fabric_forward_headers(&state, &mut ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.trace_id, TOKEN_TRACE_ID, "the Fabric message names the token's trace");
+        assert_eq!(
+            sent.get("TRACEPARENT")
+                .and_then(|traceparent| traceparent.get(3..35)),
+            Some(TOKEN_TRACE_ID),
+            "{sent:?}"
+        );
+        assert_eq!(
+            sent.get("X-GATEWAY-TRACE-ID")
+                .map(String::as_str),
+            Some(TOKEN_TRACE_ID),
+            "{sent:?}"
+        );
+        assert_eq!(
+            sent.get("TRACESTATE")
+                .map(String::as_str),
+            Some("rojo=00f067aa0ba902b7"),
+            "{sent:?}"
+        );
+    }
+
     /// A Transit Point request refused before it is forwarded writes no
     /// `transit_request_forwarded` record: one without its required transit
     /// token, and one its policy denies.
