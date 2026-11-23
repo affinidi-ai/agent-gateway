@@ -128,28 +128,28 @@ fn mcp_server_received_a_traceparent_continuing_the_callers_trace(
     );
 }
 
-#[then("the VP Audit Log records the forwarded request under the caller's trace in its written form")]
-async fn vp_audit_log_records_the_forwarded_request_under_the_callers_trace_in_its_written_form(
-    world: &mut SurfaceWorld
-) {
-    let caller = sent(world, X_GATEWAY_TRACE_ID);
-    let record = forwarded_record(world).await;
-    assert_eq!(
-        record["trace_id"],
-        written_form(&caller),
-        "expected the record under the caller's trace {caller} in its written form; record: {record}"
-    );
-}
-
-#[then("the VP Audit Log records the forwarded request under the X-Gateway-Trace-Id trace")]
-async fn vp_audit_log_records_the_forwarded_request_under_the_x_gateway_trace_id_trace(world: &mut SurfaceWorld) {
+/// Asserts the `request_forwarded` record is under the trace the request's
+/// `X-Gateway-Trace-Id` named, in its written form.
+async fn assert_recorded_under_the_x_gateway_trace_id(world: &mut SurfaceWorld) {
     let named = sent(world, X_GATEWAY_TRACE_ID);
     let record = forwarded_record(world).await;
     assert_eq!(
         record["trace_id"],
         written_form(&named),
-        "expected the record under the X-Gateway-Trace-Id trace {named}; record: {record}"
+        "expected the record under the X-Gateway-Trace-Id trace {named} in its written form; record: {record}"
     );
+}
+
+#[then("the VP Audit Log records the forwarded request under the caller's trace in its written form")]
+async fn vp_audit_log_records_the_forwarded_request_under_the_callers_trace_in_its_written_form(
+    world: &mut SurfaceWorld
+) {
+    assert_recorded_under_the_x_gateway_trace_id(world).await;
+}
+
+#[then("the VP Audit Log records the forwarded request under the X-Gateway-Trace-Id trace")]
+async fn vp_audit_log_records_the_forwarded_request_under_the_x_gateway_trace_id_trace(world: &mut SurfaceWorld) {
+    assert_recorded_under_the_x_gateway_trace_id(world).await;
 }
 
 #[then("the VP Audit Log records the forwarded request under a newly minted trace")]
