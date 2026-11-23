@@ -256,7 +256,9 @@ and when the surface's default variant is misconfigured. A template can send it 
 `"audit_surface_variant": "${AUDIT_SURFACE_VARIANT}"`. `AUDIT_SPAN_ID`, `AUDIT_PARENT_SPAN_ID` and
 `AUDIT_TRACE_SOURCE` carry the record's span, parent span and trace source, so a receiver can
 follow a request across appliances by W3C Trace Context; each is empty when the record has none.
-`audit.request_forwarded` is one record per request an Access Point forwards.
+`audit.request_forwarded` is one record per request an Access Point forwards, and
+`audit.transit_request_forwarded` one per request a Transit Point forwards, over the Fabric too,
+naming no caller.
 
 A user's `OLD_STATE` and `NEW_STATE` carry only `user_id`, `role`, `status`, `is_primary`,
 `created_at`, and `updated_at`

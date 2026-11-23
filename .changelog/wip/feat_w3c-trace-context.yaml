@@ -31,6 +31,16 @@ changes:
         Audit integration templates can now use AUDIT_SPAN_ID, AUDIT_PARENT_SPAN_ID and
         AUDIT_TRACE_SOURCE for every audit record, so a receiver such as Agent Watch can follow a
         request across appliances without parsing the whole record.
+    - timestamp: '2026-11-23T19:00:00Z'
+      title: Record each request a Transit Point forwards as transit_request_forwarded
+      description: >-
+        A new audit event, transit_request_forwarded in the Requests group
+        (audit.transit_request_forwarded for integrations), records each Transit Point request at
+        the moment it is handed to its target, over HTTP, to its MCP Proxy or over the Fabric, with
+        its trace, span, parent span and trace source, the Transit Point, the target without
+        credentials and whether it crossed the Fabric. It names no caller: Agent Watch reaches the
+        original caller through the Access Point's request_forwarded of the same trace. A refused
+        request writes none.
   changed:
     - timestamp: '2026-11-23T14:00:00Z'
       title: Send the Managed Agent one set of trace headers

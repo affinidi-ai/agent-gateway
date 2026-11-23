@@ -590,6 +590,9 @@ pub struct OutboundPipelineContext {
     /// [`step_resolve_trace`] once the transit token was checked for the last
     /// time.
     pub trace: Option<crate::proxy::trace::RequestTrace>,
+    /// Whether the request's `transit_request_forwarded` record was written,
+    /// so a request sent again (a refused grant's retry) is recorded once.
+    pub forwarding_recorded: bool,
     /// Timestamp recorded at context creation (used for latency metrics).
     pub start_time: Instant,
     /// Pre-compiled rules engine for outbound request extension validation (from live channel state).
@@ -844,6 +847,7 @@ impl OutboundPipelineContext {
             trust_check_results: None,
             trace_id,
             trace: None,
+            forwarding_recorded: false,
             start_time: Instant::now(),
             _outbound_rules_engine: outbound_rules_engine,
             outbound_response_rules_engine,
@@ -2941,6 +2945,24 @@ fn transit_audit_facts(ctx: &OutboundPipelineContext) -> crate::audit::request_e
         trace_id: Some(&ctx.trace_id),
         via_fabric: false,
     }
+}
+
+/// Records, once per request, that the Transit Point is handing it to its
+/// target. Each send calls it just before it sends, after every check that
+/// could refuse the request.
+fn record_transit_forwarding(ctx: &mut OutboundPipelineContext) {
+    if std::mem::replace(&mut ctx.forwarding_recorded, true) {
+        return;
+    }
+    crate::audit::request_events::transit_request_forwarded(crate::audit::request_events::TransitForwarding {
+        surface: &ctx.surface,
+        transit_point: &ctx.virtual_channel,
+        trace_id: &ctx.trace_id,
+        agent_identity_did: match &ctx.resolved_identity {
+            ProtectedAgentIdentity::Managed { did, .. } => Some(did),
+            ProtectedAgentIdentity::Anonymous => None,
+        },
+    });
 }
 
 /// [`transit_audit_facts`] of a record written before [`step_resolve_trace`]:
@@ -6489,6 +6511,7 @@ async fn step_forward_request_mcp_proxy(
             if grant.is_some() && prepared.sends_a_method_override() {
                 return Err(refuse_external_grant(ctx, "mcp_proxy_spec_overrides_the_method"));
             }
+            record_transit_forwarding(ctx);
             let records_the_grant = grant.is_some() && prepared.calls_a_tool();
             let answer = tokio::time::timeout(
                 resolve_outbound_timeout(ctx),
@@ -6739,6 +6762,7 @@ async fn step_forward_request_fabric(
         .clone()
         .unwrap_or_default();
 
+    record_transit_forwarding(ctx);
     if is_modern {
         let response = crate::proxy::fabric_forward::forward_stream_via_fabric(
             &state.listener_manager,
@@ -6970,6 +6994,7 @@ async fn step_forward_request_http(
                 .map_err(|_| refuse_delegation(ctx, DelegationRefusal::Unavailable))?,
         );
     }
+    record_transit_forwarding(ctx);
     if matches!(
         ctx.mcp_classification
             .as_ref(),
@@ -8312,6 +8337,7 @@ mod tests {
             trust_check_results: None,
             trace_id: "test-request-id".to_string(),
             trace: None,
+            forwarding_recorded: false,
             start_time: Instant::now(),
             _outbound_rules_engine: None,
             outbound_response_rules_engine: None,
@@ -10547,13 +10573,21 @@ mod tests {
     fn traced_transit_state(
         requires_token: bool
     ) -> (OutboundProxyState, crate::proxy::transit_token::TransitTokenIssuer) {
+        partner_a_state(json!({"opa_policy_definition_id": "def-1", "points": [{"alias": "partner-a",
+            "protocol": "mcp", "require_transit_token": requires_token, "allow_unauthenticated_callers": true,
+            "target_endpoint": "http://127.0.0.1:9"}]}))
+    }
+
+    /// The state of a gateway serving surface `traced-surface` with `transit`,
+    /// and the issuer of its transit tokens.
+    fn partner_a_state(
+        transit: serde_json::Value
+    ) -> (OutboundProxyState, crate::proxy::transit_token::TransitTokenIssuer) {
         let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
             "surface_id": "traced-surface", "name": "Traced surface",
             "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
             "target": {"endpoint": "http://127.0.0.1:1"},
-            "transit": {"opa_policy_definition_id": "def-1", "points": [{"alias": "partner-a", "protocol": "mcp",
-                "require_transit_token": requires_token, "allow_unauthenticated_callers": true,
-                "target_endpoint": "http://127.0.0.1:9"}]}
+            "transit": transit
         }))
         .unwrap();
         let (state, issuer) = transit_token_test_state();
@@ -10576,12 +10610,14 @@ mod tests {
             .unwrap()
     }
 
-    /// The policy decision record of one `tools/list` the managed agent sends
-    /// Transit Point `partner-a` of `state` with `headers`.
-    async fn transit_policy_decision(
+    /// The answer to, and the audit records of, one MCP request with `body`
+    /// the managed agent sends Transit Point `partner-a` of `state` with
+    /// `headers`.
+    async fn send_to_partner_a(
         state: OutboundProxyState,
         headers: &[(&str, &str)],
-    ) -> crate::delegation_vault::audit::DelegationAuditEvent {
+        body: serde_json::Value,
+    ) -> (Response, Vec<crate::delegation_vault::audit::DelegationAuditEvent>) {
         let mut request = Request::builder()
             .method("POST")
             .uri("/outbound/mcp/partner-a")
@@ -10591,9 +10627,9 @@ mod tests {
             request = request.header(*name, *value);
         }
         let request = request
-            .body(axum::body::Body::from(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string()))
+            .body(axum::body::Body::from(body.to_string()))
             .unwrap();
-        let (_, events) = crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
+        let (response, events) = crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
             "127.0.0.1:12345"
                 .parse()
                 .unwrap(),
@@ -10602,6 +10638,17 @@ mod tests {
             crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
         )))
         .await;
+        (response.unwrap_or_else(|error| error.into_response()), events)
+    }
+
+    /// The policy decision record of one `tools/list` the managed agent sends
+    /// Transit Point `partner-a` of `state` with `headers`.
+    async fn transit_policy_decision(
+        state: OutboundProxyState,
+        headers: &[(&str, &str)],
+    ) -> crate::delegation_vault::audit::DelegationAuditEvent {
+        let (_, events) =
+            send_to_partner_a(state, headers, json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await;
         let mut decisions: Vec<_> = events
             .into_iter()
             .filter(|event| {
@@ -10638,6 +10685,93 @@ mod tests {
             transit_policy_decision(state, &[("x-gateway-trace-id", "0af7651916cd43dd8448eb211c80319c")]).await;
         assert_eq!(decision.trace_id.as_deref(), Some("0af7651916cd43dd8448eb211c80319c"));
         assert_eq!(decision.span_id, decision.request_id);
+    }
+
+    /// The `transit_request_forwarded` records among `events`, as stored.
+    fn transit_forwarded(events: &[crate::delegation_vault::audit::DelegationAuditEvent]) -> Vec<serde_json::Value> {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event,
+                    crate::delegation_vault::audit::DelegationAuditAction::TransitRequestForwarded { .. }
+                )
+            })
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect()
+    }
+
+    /// A Transit Point records each request it hands to its target, once,
+    /// under the trace it resolved, with no caller and nothing of the request's
+    /// credentials, header values or body.
+    #[tokio::test]
+    async fn a_transit_point_records_the_request_it_forwards() {
+        let target = crate::component_tests::helpers::MockServer::start_with_response(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}).to_string(),
+        )
+        .await;
+        let (state, issuer) = partner_a_state(json!({"points": [{"alias": "partner-a", "protocol": "mcp",
+            "allow_unauthenticated_callers": true, "target_endpoint": format!("http://{}", target.addr)}]}));
+        let token = traced_transit_token(&issuer, TOKEN_TRACE_ID);
+        let traceparent = format!("00-{TOKEN_TRACE_ID}-53995c3f42cd8ad8-01");
+
+        let (response, events) = send_to_partner_a(
+            state,
+            &[
+                ("x-transit-token", &token),
+                ("traceparent", &traceparent),
+                ("authorization", "Bearer planted-token"),
+                ("x-planted", "planted-header-value"),
+            ],
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"cursor": "planted-body"}}),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            target
+                .request_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let records = transit_forwarded(&events);
+        assert_eq!(records.len(), 1, "one transit_request_forwarded record, got {events:?}");
+        let record = &records[0];
+        assert_eq!(record["event"]["transit_request_forwarded"]["transit_point"], "partner-a");
+        assert_eq!(
+            (&record["trace_id"], &record["parent_span_id"], &record["trace_source"]),
+            (&json!(TOKEN_TRACE_ID), &json!("53995c3f42cd8ad8"), &json!("transit_token"))
+        );
+        assert_eq!(record["span_id"], record["request_id"]);
+        assert_eq!(record["via_fabric"], false);
+        assert!(record.get("caller").is_none(), "{record}");
+        let stored = record.to_string();
+        for planted in ["planted-token", "planted-header-value", "planted-body", &token] {
+            assert!(!stored.contains(planted), "the record holds {planted}: {stored}");
+        }
+    }
+
+    /// A Transit Point whose target is `fabric://` records the request when it
+    /// hands it to the Fabric, whether or not the peer then answers.
+    #[tokio::test]
+    async fn a_fabric_transit_point_records_the_request_it_forwards() {
+        let (state, _) = partner_a_state(json!({"points": [{"alias": "partner-a", "protocol": "mcp",
+            "require_transit_token": false, "allow_unauthenticated_callers": true,
+            "target_endpoint": "fabric://peer-gateway/peer-surface"}]}));
+
+        let (_, events) = send_to_partner_a(
+            state,
+            &[("x-gateway-trace-id", TOKEN_TRACE_ID)],
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+
+        let records = transit_forwarded(&events);
+        assert_eq!(records.len(), 1, "one transit_request_forwarded record, got {events:?}");
+        assert_eq!(
+            (&records[0]["via_fabric"], &records[0]["trace_id"], &records[0]["trace_source"]),
+            (&json!(true), &json!(TOKEN_TRACE_ID), &json!("header"))
+        );
     }
 
     /// A Transit Point's records name the parent span and the source of the

@@ -802,6 +802,19 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   `event.request_forwarded.caller_did`, built as on `policy_decision`. It never carries an
   identity hash, the request body, a header value or a token. A refused request, a Transit
   Point request and a Fabric receive write none.
+- `transit_request_forwarded`: a Transit Point handed a request to its target, over HTTP, to its
+  `proxy://` MCP Proxy or over the Fabric, after every check, just before the send. One per
+  request, also when a refused grant's refresh sends it again. The record carries the request's
+  `trace_id`, `parent_span_id` and `trace_source` as the Transit Point resolved them (the verified
+  transit token first), `request_id` and `span_id` (the Transit Point's span),
+  `event.transit_request_forwarded.transit_point` (its alias), the surface (`surface_id`,
+  `channel_name`, `surface_variant`, `tenant_id`), the Transit Point's `protocol`,
+  `target_endpoint` without user name, password, fragment or query values, the protected agent's
+  DID (`agent_identity_did`) when the Transit Point resolved one, and `via_fabric` (`true` for a
+  `fabric://` target). It names no caller (no `caller`, no `caller_did`): the original caller is on
+  the Access Point's `request_forwarded` of the same trace. It never carries an identity hash, the
+  request body, a header value or a token. A refused Transit Point request, an Access Point request
+  and a Fabric receive write none.
 - `request_rejected`: the gateway refused the request before or while forwarding it.
   `http_status` is the HTTP status the caller received, on HTTP paths only (the Access Point and
   the Transit Point); it is absent on every Fabric refusal (`via_fabric: true`), where no HTTP
@@ -1146,8 +1159,9 @@ aggregation or sampling. `auth_failed` and the routing `request_rejected` are re
 the surface rate limit is checked, and `rate_limited` once for every request the limit refuses,
 so an unauthenticated or unroutable client produces one record per request it sends
 (unroutable ones against surface `unknown`). `request_forwarded` is one record for every
-request an Access Point forwards, so a sink that selects it receives as many records as the
-appliance serves requests. Selecting these events for an Email or Slack
+request an Access Point forwards, and `transit_request_forwarded` one for every request a Transit
+Point forwards, so a sink that selects them receives as many records as the appliance serves
+requests. Selecting these events for an Email or Slack
 integration sends one message per record. They also count towards the journal size and its
 1 GiB backlog cap (see _Backlog_ below), so a flood can make a slow sink skip records.
 
