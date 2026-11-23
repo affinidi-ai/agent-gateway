@@ -457,12 +457,17 @@ impl SettingsStore {
             anyhow::bail!("Metrics retention must be between 1 and 10,080 minutes (7 days)");
         }
 
-        if new_settings
+        let unknown: Vec<&str> = new_settings
             .audit_events
             .iter()
-            .any(|event| event_bit(event).is_none())
-        {
-            anyhow::bail!("Audit events must be names from the audit event catalog");
+            .filter(|event| event_bit(event).is_none())
+            .map(String::as_str)
+            .collect();
+        if !unknown.is_empty() {
+            anyhow::bail!(
+                "Audit events must be names from the audit event catalog; unknown: {}",
+                unknown.join(", ")
+            );
         }
 
         // Update in-memory settings
@@ -1008,11 +1013,12 @@ mod tests {
             audit_events: vec!["policy_decision".to_string(), "no_such_event".to_string()],
             ..DashboardSettings::default()
         };
-        assert!(
-            store
-                .update(settings)
-                .is_err()
-        );
+        let refusal = store
+            .update(settings)
+            .expect_err("an unknown audit event is refused")
+            .to_string();
+        assert!(refusal.contains("no_such_event"), "the refusal names the unknown audit event: {refusal}");
+        assert!(!refusal.contains("policy_decision"), "the refusal names only unknown audit events: {refusal}");
         assert!(
             store
                 .get()
