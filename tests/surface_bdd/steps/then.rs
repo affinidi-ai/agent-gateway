@@ -3859,6 +3859,21 @@ fn named_mcp_server_received_request_with_binding_vp(
     );
 }
 
+#[then(expr = "MCP server {string} received the forwarded MCP request with a VP whose proof claims {string}")]
+fn named_mcp_server_received_vp_claiming_purpose(
+    world: &mut SurfaceWorld,
+    server_name: String,
+    purpose: String,
+) {
+    let request = get_mcp_request_for_actor(world, &server_name);
+    let binding = get_mcp_binding_extension(request, &format!("MCP server '{}'", server_name));
+    let presentation = decode_vp(&binding["verifiablePresentation"]);
+    assert_eq!(
+        presentation["proof"]["proofPurpose"], purpose,
+        "MCP server '{server_name}' forwarded VP should claim {purpose}, got: {presentation}"
+    );
+}
+
 #[then(expr = "MCP server {string} received two forwarded MCP requests with VPs proving different caller Agent DIDs")]
 fn named_mcp_server_received_two_binding_vps_for_different_dids(
     world: &mut SurfaceWorld,

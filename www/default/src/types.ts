@@ -375,6 +375,9 @@ export interface DidWebVhIdentity {
   trust_score?: TrustScoreResponse;
 }
 
+/** The plane a policy definition decides on: the gateway or an Agent Surface. */
+export type PolicyType = 'gateway' | 'agent_surface';
+
 export interface PolicyConfig {
   overall_min: number;
   components: {

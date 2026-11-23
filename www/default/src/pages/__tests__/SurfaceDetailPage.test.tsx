@@ -66,6 +66,10 @@ function MockSurfaceFormShell(props: any) {
       <button onClick={() => setPublic(false)}>Close Access Point</button>
       <output data-testid="access-point-notice">{props.accessPointNotice ?? ''}</output>
       <output data-testid="legacy-access-point">{String(props.legacyAccessPoint)}</output>
+      <output data-testid="selected-node-type">
+        {props.builder.state.nodes.find((n: any) => n.id === props.builder.state.selectedNodeId)
+          ?.type ?? ''}
+      </output>
       {props.manageActions}
     </div>
   );
@@ -497,6 +501,145 @@ describe('SurfaceDetailPage API key references', () => {
       ])
     );
     expect(updateSurface).not.toHaveBeenCalled();
+  });
+});
+
+describe('SurfaceDetailPage Target authentication header clash', () => {
+  let updateSurface: jest.SpyInstance;
+
+  const targetAuth = (headerName: string) => ({
+    method: {
+      static_secret: {
+        secret_id: 'partner-key',
+        header_name: headerName,
+        header_format: '{value}',
+      },
+    },
+    auth_type: 'custom',
+    fallback: 'reject',
+  });
+
+  const withBinding = (over: Record<string, unknown>): AgentSurface =>
+    ({
+      ...stored({
+        public: true,
+        caller_authentication: {
+          methods: [
+            {
+              type: 'api_key',
+              secret_id: 'caller-key',
+              extraction: { source: 'http_header', field: 'X-Api-Key' },
+            },
+          ],
+        },
+      }),
+      outbound_credentials: [
+        {
+          credential_provider_id: 'prov-1',
+          scopes: ['read'],
+          consent_mode: 'on_demand',
+          required_for: 'all',
+          inject_as: { type: 'bearer_header' },
+        },
+      ],
+      ...over,
+    }) as unknown as AgentSurface;
+
+  const withVariantTarget = (headerName: string): AgentSurface =>
+    withBinding({
+      variants: [
+        {
+          id: 'v-beta',
+          alias: 'beta',
+          name: 'Beta',
+          overrides: {
+            target: { endpoint: 'https://agent.example', auth: targetAuth(headerName) },
+          },
+        },
+      ],
+    });
+
+  const withTransitPoint = (headerName: string): AgentSurface =>
+    withBinding({
+      transit: {
+        points: [
+          {
+            id: 'tp-1',
+            alias: 'partner',
+            protocol: 'mcp',
+            listen_address: '0.0.0.0:0',
+            target_endpoint: 'https://partner.example',
+            require_transit_token: true,
+            target_auth: targetAuth(headerName),
+          },
+        ],
+      },
+    });
+
+  const renderPage = async (surface: AgentSurface) => {
+    jest.spyOn(apiClient, 'getSurface').mockResolvedValue(surface);
+    updateSurface.mockImplementation(async (_id: string, payload: Partial<AgentSurface>) => ({
+      ...surface,
+      ...payload,
+    }));
+    render(
+      <MemoryRouter initialEntries={['/surfaces/srf-1']}>
+        <Routes>
+          <Route path="/surfaces/:surfaceId" element={<SurfaceDetailPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    await screen.findByTestId('surface-save-button');
+  };
+
+  const errorToasts = () => toast.mock.calls.filter(c => c[0] === 'error').map(c => c[1]);
+
+  beforeEach(() => {
+    jest.restoreAllMocks();
+    toast.mockReset();
+    updateSurface = jest.spyOn(apiClient, 'updateSurface');
+  });
+
+  it('blocks Save from the base view on a header clash in an inactive variant, naming the variant', async () => {
+    await renderPage(withVariantTarget('Authorization'));
+
+    fireEvent.click(screen.getByTestId('surface-save-button'));
+
+    await waitFor(() =>
+      expect(errorToasts()).toEqual([
+        'Variant "Beta": target.auth.header_name Authorization is already sent by a credential binding',
+      ])
+    );
+    expect(updateSurface).not.toHaveBeenCalled();
+  });
+
+  it('jumps from a header clash on a Transit Point to that Transit Point', async () => {
+    await renderPage(withTransitPoint('Authorization'));
+
+    fireEvent.click(screen.getByTestId('surface-save-button'));
+
+    await waitFor(() =>
+      expect(errorToasts()).toEqual([
+        "transit.points['partner'].target_auth.header_name Authorization is already sent by a credential binding",
+      ])
+    );
+    expect(updateSurface).not.toHaveBeenCalled();
+    expect(screen.getByTestId('selected-node-type')).toHaveTextContent('');
+    const { action } = toast.mock.calls.find(c => c[0] === 'error')![2];
+    expect(action.label).toBe('Show me');
+
+    act(() => action.onClick());
+
+    expect(screen.getByTestId('selected-node-type')).toHaveTextContent('transit-point-mcp');
+  });
+
+  it('saves when the variant sends its Target credential in a header nothing else sends', async () => {
+    await renderPage(withVariantTarget('X-Partner-Key'));
+
+    fireEvent.click(screen.getByTestId('surface-save-button'));
+
+    await waitFor(() => expect(updateSurface).toHaveBeenCalledTimes(1));
+    expect(errorToasts()).toEqual([]);
   });
 });
 

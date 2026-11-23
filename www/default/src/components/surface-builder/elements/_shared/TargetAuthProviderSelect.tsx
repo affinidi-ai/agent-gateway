@@ -19,6 +19,8 @@ interface TargetAuthProviderSelectProps {
   value: string;
   onChange: (providerId: string) => void;
   small?: boolean;
+  /** The id of the element that says why the choice is refused, while it is. */
+  errorId?: string;
 }
 
 /**
@@ -31,6 +33,7 @@ const TargetAuthProviderSelect: React.FC<TargetAuthProviderSelectProps> = ({
   value,
   onChange,
   small,
+  errorId,
 }) => {
   const [providers, setProviders] = useState<ProviderOption[]>([]);
   const [loading, setLoading] = useState(true);
@@ -69,6 +72,8 @@ const TargetAuthProviderSelect: React.FC<TargetAuthProviderSelectProps> = ({
         value={value}
         onChange={event => onChange(event.target.value)}
         disabled={loading}
+        aria-invalid={!!errorId}
+        aria-describedby={errorId}
       >
         <option value="">
           {loading ? '-- Loading providers... --' : '-- Select a credential provider --'}

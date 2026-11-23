@@ -500,6 +500,33 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bare_host_resource_is_sent_as_stored() {
+        let scopes = ["read".to_string()];
+        for grant_type in ["authorization_code", "refresh_token"] {
+            let server = RecordingServer::start_answering(vec![Answer::json(
+                200,
+                json!({"access_token": "access", "token_type": "Bearer"}),
+            )])
+            .await;
+            let mut record = serde_json::to_value(provider(&server, "none", None)).unwrap();
+            record["resource"] = json!("https://vendor.example");
+            let provider: CredentialProvider = serde_json::from_value(record).unwrap();
+            let request = match grant_type {
+                "authorization_code" => code(),
+                _ => TokenRequest::Refresh {
+                    refresh_token: "the-refresh",
+                    scopes: &scopes,
+                },
+            };
+            request_token(&provider, None, Some(&server.origin()), request)
+                .await
+                .unwrap();
+            let sent = form(&server.requests()[0].1);
+            assert_eq!(sent["resource"], "https://vendor.example", "{grant_type}");
+        }
+    }
+
     /// A `private_key_jwt` client redeems a code with a client assertion its
     /// key signs, built by the shared RFC 7523 assertion code and addressed to
     /// the provider's issuer, and no secret.

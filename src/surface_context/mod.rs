@@ -48,8 +48,8 @@ pub struct PolicyInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_check_results: Option<crate::trust_registry_verification::TrustCheckResultsContext>,
 
-    /// The Transit Point call's own context. Present on every outbound
-    /// evaluation, never on an inbound one.
+    /// The Transit Point call's own context. Present on every Transit Point
+    /// evaluation, never on an inbound one or on the send of a `fabric://` Target.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transit: Option<TransitContext>,
 }

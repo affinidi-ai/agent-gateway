@@ -13,6 +13,7 @@
  */
 
 import { registry } from './registry';
+import { targetAuthBreaches } from './targetAuthRules';
 
 export type ValidationSeverity = 'error' | 'warning';
 
@@ -31,13 +32,26 @@ export interface ValidationIssue {
   path?: string;
 }
 
+export interface ValidateSurfaceOptions {
+  /**
+   * The stored surface, or null when there is none to compare with. When given, the Target
+   * authentication rules that need the whole surface are checked: a header clash is an error
+   * whatever was stored, and a leg that checks no caller a warning unless the stored surface
+   * already had it.
+   */
+  stored?: unknown;
+}
+
 /**
  * Validate the built payload. Cheap, side-effect-free, no async. Caller
  * access never blocks a save and raises no issue here: the gateway's save
  * answers with a `Warning` header for a public, a not-ready, and a legacy
  * Access Point that admits every caller.
  */
-export function validateSurfacePayload(payload: any): ValidationIssue[] {
+export function validateSurfacePayload(
+  payload: any,
+  options: ValidateSurfaceOptions = {}
+): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   if (!payload || typeof payload !== 'object') {
     issues.push({ severity: 'error', message: 'Surface payload is missing or malformed.' });
@@ -160,6 +174,17 @@ export function validateSurfacePayload(payload: any): ValidationIssue[] {
         message:
           'The primary target enables Workload Binding but the surface has no managed-identity source to sign the VP — add an Identity element or enable a managed agent DID.',
         path: 'target.workload_binding',
+      });
+    }
+  }
+
+  if (options.stored !== undefined) {
+    for (const { rule, message, nodeId } of targetAuthBreaches(payload, options.stored)) {
+      issues.push({
+        severity: rule === 'callers' ? 'warning' : 'error',
+        message,
+        nodeId,
+        path: 'target.auth',
       });
     }
   }

@@ -14,8 +14,15 @@ jest.mock('../../../api', () => ({
   },
 }));
 
-function renderCreateForm() {
-  return render(
+jest.mock('../../../context/PermissionsContext', () => ({
+  usePermissions: () => ({ hasPermission: () => true }),
+}));
+
+beforeEach(() => window.sessionStorage.clear());
+
+/** Opens the create form and creates a custom policy, which shows the Details and Policy sections. */
+async function renderCreateForm() {
+  const view = render(
     <PageTitleProvider>
       <MemoryRouter initialEntries={['/policy-definitions/new']}>
         <Routes>
@@ -24,24 +31,27 @@ function renderCreateForm() {
       </MemoryRouter>
     </PageTitleProvider>
   );
+  await screen.findByTestId('policy-template-card-deny-by-default');
+  fireEvent.click(screen.getByTestId('policy-template-gallery-create-custom-button'));
+  return view;
 }
 
 describe('EditPolicyDefinitionPage — policy type selector', () => {
-  it('offers exactly Gateway and Agent Surfaces', () => {
-    renderCreateForm();
+  it('offers exactly Gateway and Agent Surfaces', async () => {
+    await renderCreateForm();
     const optionLabels = screen.getAllByRole('option').map(o => o.textContent);
     expect(optionLabels).toEqual(['Gateway', 'Agent Surfaces']);
   });
 
-  it('does not offer a legacy Channel option', () => {
-    renderCreateForm();
+  it('does not offer a legacy Channel option', async () => {
+    await renderCreateForm();
     expect(screen.queryByRole('option', { name: /channel/i })).toBeNull();
   });
 });
 
 describe('EditPolicyDefinitionPage — package/type mismatch', () => {
   it('blocks save when the declared package does not match the selected type', async () => {
-    renderCreateForm();
+    await renderCreateForm();
     // The create form defaults to Type=Gateway. Declaring a surface package is a
     // mismatch that must block the save.
     const editor = screen.getByPlaceholderText('...add policy here...');
@@ -54,7 +64,7 @@ describe('EditPolicyDefinitionPage — package/type mismatch', () => {
   });
 
   it('the "Fix it" action rewrites the package to the canonical one and re-enables save', async () => {
-    renderCreateForm();
+    await renderCreateForm();
     const editor = screen.getByPlaceholderText('...add policy here...') as HTMLTextAreaElement;
     fireEvent.change(editor, {
       target: { value: 'package surface.policy\ndefault allow = true' },
@@ -73,44 +83,44 @@ describe('EditPolicyDefinitionPage — instructions panel', () => {
   const toggle = () => screen.getByTestId('policy-instructions-toggle');
   const body = () => screen.getByTestId('policy-instructions-body');
 
-  it('starts collapsed', () => {
-    renderCreateForm();
+  it('starts collapsed', async () => {
+    await renderCreateForm();
     expect(toggle()).toHaveAttribute('aria-expanded', 'false');
     expect(body()).not.toHaveClass('show');
   });
 
-  it('expands and collapses when the title is clicked', () => {
-    renderCreateForm();
+  it('expands and collapses when the title is clicked', async () => {
+    await renderCreateForm();
 
-    fireEvent.click(screen.getByText('Policy Instructions & Examples'));
+    fireEvent.click(screen.getByText('Rego reference'));
     expect(toggle()).toHaveAttribute('aria-expanded', 'true');
     expect(body()).toHaveClass('show');
 
-    fireEvent.click(screen.getByText('Policy Instructions & Examples'));
+    fireEvent.click(screen.getByText('Rego reference'));
     expect(toggle()).toHaveAttribute('aria-expanded', 'false');
     expect(body()).not.toHaveClass('show');
   });
 
-  it('toggles when the arrow is clicked', () => {
-    renderCreateForm();
+  it('toggles when the arrow is clicked', async () => {
+    await renderCreateForm();
     fireEvent.click(screen.getByTestId('policy-instructions-chevron'));
     expect(body()).toHaveClass('show');
   });
 
-  it('keeps the title a heading that holds the toggle button', () => {
-    renderCreateForm();
-    const heading = screen.getByRole('heading', { name: /Policy Instructions & Examples/i });
+  it('keeps the title a heading that holds the toggle button', async () => {
+    await renderCreateForm();
+    const heading = screen.getByRole('heading', { name: /Rego reference/i });
     expect(heading).toContainElement(toggle());
-    expect(screen.getByRole('button', { name: /Policy Instructions & Examples/i })).toBe(toggle());
+    expect(screen.getByRole('button', { name: /Rego reference/i })).toBe(toggle());
   });
 
-  it('points the toggle at the body it expands', () => {
-    renderCreateForm();
+  it('points the toggle at the body it expands', async () => {
+    await renderCreateForm();
     expect(toggle()).toHaveAttribute('aria-controls', body().id);
   });
 
-  it('flips the arrow to match the state', () => {
-    renderCreateForm();
+  it('flips the arrow to match the state', async () => {
+    await renderCreateForm();
     const chevron = () => screen.getByTestId('policy-instructions-chevron');
     expect(chevron()).toHaveClass('fa-chevron-down');
 
@@ -121,7 +131,7 @@ describe('EditPolicyDefinitionPage — instructions panel', () => {
 
   it('toggles from the keyboard with Enter and Space only', async () => {
     const user = userEvent.setup();
-    renderCreateForm();
+    await renderCreateForm();
     toggle().focus();
 
     await user.keyboard('{Enter}');
@@ -134,8 +144,19 @@ describe('EditPolicyDefinitionPage — instructions panel', () => {
     expect(toggle()).toHaveAttribute('aria-expanded', 'false');
   });
 
-  it('keeps the examples in the DOM for the selected policy type', () => {
-    renderCreateForm();
+  it('keeps the examples in the DOM for the selected policy type', async () => {
+    await renderCreateForm();
     expect(body()).toHaveTextContent('package gateway.policy');
+  });
+
+  it('describes the caller context input and the MCP tool policy input apart', async () => {
+    await renderCreateForm();
+    const callerFields = screen.getByTestId('policy-instructions-input-fields');
+    expect(callerFields).toHaveTextContent('input.source_auth.claims');
+    expect(callerFields).not.toHaveTextContent('input.jwt');
+    const toolFields = screen.getByTestId('policy-instructions-tool-input-fields');
+    expect(toolFields).toHaveTextContent('input.jwt.<claim>');
+    expect(toolFields).toHaveTextContent('input.mcp.params.name – The tool being called');
+    expect(toolFields).toHaveTextContent('input.mcp.method – Always tools/call');
   });
 });

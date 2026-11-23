@@ -1,5 +1,6 @@
 import React from 'react';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
 import CredentialProvidersTab, { providerDeleteError } from '../CredentialProvidersTab';
@@ -13,6 +14,8 @@ const mockHasPermission = jest.fn();
 jest.mock('../../../context/PermissionsContext', () => ({
   usePermissions: () => ({ hasPermission: mockHasPermission, loading: false }),
 }));
+const grant = (...held: string[]) =>
+  mockHasPermission.mockImplementation((permission: string) => held.includes(permission));
 jest.mock('../../../utils/toaster', () => ({ showToast: jest.fn() }));
 
 const mockFetch = apiClient.fetch as jest.Mock;
@@ -320,5 +323,106 @@ describe('CredentialProvidersTab deactivation', () => {
     expect(screen.getByTestId('credential-provider-delete-button-billing')).toBeInTheDocument();
     expect(screen.queryByTestId('credential-provider-deactivate-button-billing')).toBeNull();
     expect(screen.queryByTestId('credential-provider-activate-button-billing')).toBeNull();
+  });
+});
+
+describe('CredentialProvidersTab actions', () => {
+  const renderTab = async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve([item('p1', 'https://oauth2.googleapis.com/token', null)]),
+    });
+    render(
+      <MemoryRouter>
+        <CredentialProvidersTab />
+      </MemoryRouter>
+    );
+    await screen.findByTestId('credential-provider-row-p1');
+  };
+
+  afterEach(() => {
+    grant();
+  });
+
+  it('shows neither Add nor Delete with view only', async () => {
+    grant('credential_providers.view');
+    await renderTab();
+    expect(screen.queryByTestId('credential-providers-add-button')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('credential-provider-delete-button-p1')).not.toBeInTheDocument();
+  });
+
+  it('shows Add but not Delete with edit only', async () => {
+    grant('credential_providers.view', 'credential_providers.edit');
+    await renderTab();
+    expect(screen.getByTestId('credential-providers-add-button')).toBeInTheDocument();
+    expect(screen.queryByTestId('credential-provider-delete-button-p1')).not.toBeInTheDocument();
+  });
+
+  it('shows Delete with the delete permission', async () => {
+    grant('credential_providers.view', 'credential_providers.delete');
+    await renderTab();
+    expect(screen.getByTestId('credential-provider-delete-button-p1')).toBeInTheDocument();
+    expect(screen.queryByTestId('credential-providers-add-button')).not.toBeInTheDocument();
+  });
+});
+
+describe('CredentialProvidersTab refused delete', () => {
+  afterEach(() => {
+    grant();
+  });
+
+  const renderWithDelete = async (reply: { status: number; body: unknown }) => {
+    grant('credential_providers.view', 'credential_providers.delete');
+    mockFetch.mockImplementation((_url: string, init?: RequestInit) =>
+      Promise.resolve(
+        init?.method === 'DELETE'
+          ? {
+              ok: false,
+              status: reply.status,
+              statusText: 'Conflict',
+              text: () => Promise.resolve(JSON.stringify(reply.body)),
+            }
+          : {
+              ok: true,
+              json: () =>
+                Promise.resolve([item('p1', 'https://oauth2.googleapis.com/token', null)]),
+            }
+      )
+    );
+    render(
+      <MemoryRouter>
+        <CredentialProvidersTab />
+      </MemoryRouter>
+    );
+    const remove = await screen.findByTestId('credential-provider-delete-button-p1');
+    await userEvent.click(remove);
+    await userEvent.click(remove);
+  };
+
+  it('shows the server message and the binding surface inline, with no override', async () => {
+    await renderWithDelete({
+      status: 409,
+      body: {
+        error: 'The credential provider is bound by an agent surface; remove the binding first',
+        code: 'provider_in_use',
+        surface_id: 'billing-agent',
+      },
+    });
+
+    const error = await screen.findByTestId('credential-providers-delete-error');
+    expect(error).toHaveTextContent(
+      'The credential provider is bound by an agent surface; remove the binding first (surface billing-agent) (409)'
+    );
+    expect(screen.queryByRole('button', { name: /anyway/i })).not.toBeInTheDocument();
+    expect(screen.getByTestId('credential-provider-row-p1')).toBeInTheDocument();
+  });
+
+  it('shows a plain refusal message when the body names no references', async () => {
+    await renderWithDelete({ status: 409, body: { message: 'Still in use' } });
+    await waitFor(() =>
+      expect(screen.getByTestId('credential-providers-delete-error')).toHaveTextContent(
+        'Still in use (409)'
+      )
+    );
   });
 });

@@ -99,21 +99,30 @@ You choose how much of the identity the gateway manages, from fully managed to f
 
 The gateway hosts the `did:webvh` logs for the identities it manages, so they resolve with
 standard DID tooling such as the Universal Resolver. Its own DID is served at
-`/.well-known/did.jsonl`, each managed agent's under `/dids/{path}/did.jsonl`, and surfaces,
+`/.well-known/did.jsonl`, each managed agent's under `/surface/{id}/did.jsonl`, and surfaces,
 issuers, trust registries, and Connection Points each at their own path. Each document
 carries the verification methods and service endpoints another system needs to check a
-signature. The gateway's DID and newly created managed agent DIDs list the Multikey that signs
-their credentials and presentations (`#key-2`) under `assertionMethod`, so strict Data
-Integrity verifiers accept them; the gateway's DID also lists it under `authentication`, the
-proof purpose presentations conventionally claim. A gateway whose published DID document leaves
-the Multikey out of either adds it when it starts Active, or when a Standby node is promoted (see
+signature. The gateway's DID and managed agent DIDs list the Multikey that signs their
+credentials and presentations (`#key-2`) under `assertionMethod` and `authentication`, so strict
+Data Integrity verifiers accept them. An agent's presentations claim `authentication`, the proof
+purpose presentations conventionally claim, once its `did:webvh` DID log lists the key there, and
+`assertionMethod` before; a legacy `did:web` agent keeps claiming `assertionMethod`. An agent DID
+that got the key listed by a repair claims `authentication` only 65 minutes after that version: the
+hour a peer's DID resolver may keep the earlier document, which accepts `assertionMethod` only,
+plus a margin for clock differences; a
+DID that listed it from its first version claims it at once. A gateway whose published DID document leaves the Multikey out of
+either adds it when it starts Active, or when a Standby node is promoted (see
 [Server mode](CONFIGURATION_RELOAD.md#server-mode)): a `did:webvh` DID gets a new log
 version signed with the gateway key, so the DID and its earlier versions stay as they are, and a
-`did:web` DID gets its document rewritten. No key is created or replaced: the new version and
-the stored `did.json` differ from what they held only by the Multikey added to
-`assertionMethod` and `authentication`. A document that lacks either relationship, publishes
-another key as its own `#key-2` or publishes `#key-2` more than once is left as it is; a stored `did.json` that is missing or does not parse
-is written again from the latest log version. A log that does not verify, or whose latest version
+`did:web` DID gets its document rewritten. Each managed agent DID is repaired the same way at
+those times, with a new log version signed by the agent's own key; an agent DID document that
+does not publish the Multikey gets it published too, as the agent key it already holds, and an
+agent document that lacks either relationship gets it. No key is created or replaced: the new
+version and the stored `did.json` differ from what they held only by the Multikey added to
+`assertionMethod` and `authentication`. A gateway document that lacks either relationship, and
+any document that publishes another key as its own `#key-2` or publishes `#key-2` more than once,
+is left as it is; a stored `did.json` that is missing or does not parse is written again from the
+latest log version. A log that does not verify, or whose latest version
 is dated more than a second ahead of the node's clock, is left as it is and the gateway
 logs a warning; the repair runs again on the next start.
 

@@ -2133,7 +2133,7 @@ Each entry has one state:
 | --- | --- |
 | Recorded (`recorded`) | At least one record was written or already existed, and none failed. |
 | Partly recorded (`partial`) | Some records were written or already existed and some failed. |
-| Failed (`failed`) | No record was written. The reason is `no_response` (no reply within 10 seconds), `rejected` (the registry sent a problem report) or `error`. |
+| Failed (`failed`) | No record was written. The reason is `no_response` (no reply within 10 seconds), `rejected` (the registry refused, as a problem report or as the `trust-task-error` document a mediator from v0.52 sends) or `error`. |
 | Skipped (`skipped`) | The entry was not written. The reason is `registry_not_found`, `registry_not_connected`, `no_surface_issuer` (the `{{ surface.issuer_did }}` template did not resolve), `authority_not_found` (the Authority the entry was picked from no longer exists) or `error` (the trust registry lookup failed). |
 | Not attempted yet (`not_attempted`) | The surface has a Trust Recorder and no outcome is stored yet, for example right after it was added. |
 
