@@ -42,7 +42,13 @@ changes:
         bound by external consent still receives X-Gateway-Trace-Id alone.
   fixed: []
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-11-23T15:00:00Z'
+      title: Update cookie and url for two published advisories
+      description: >-
+        cookie is updated to 0.18.3 for RUSTSEC-2026-0594 (private cookie nonces can repeat in
+        processes that fork) and url to 2.5.9 for RUSTSEC-2026-0592 (stack overflow in
+        Url::origin() on nested blob: URLs), with form_urlencoded 1.2.3, which url 2.5.9 needs.
   breaking:
     - timestamp: '2026-11-20T14:02:20Z'
       title: Start trace ids as 32 lowercase hexadecimal digits
