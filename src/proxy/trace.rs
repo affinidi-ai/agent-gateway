@@ -546,14 +546,18 @@ pub fn egress_trace_id(
     }
 }
 
+/// The trace context vectors shared with the other appliances.
+#[cfg(test)]
+fn vectors() -> serde_json::Value {
+    serde_json::from_str(include_str!("../../tests/fixtures/trace_context/trace-context-vectors.json")).unwrap()
+}
+
 /// The cases of `group` in the trace context vectors shared with the other
 /// appliances. Every group has accepting and refusing cases.
 #[cfg(test)]
 pub(crate) fn vector_cases(group: &str) -> Vec<serde_json::Value> {
-    use serde_json::{Value, json};
-    let vectors: Value =
-        serde_json::from_str(include_str!("../../tests/fixtures/trace_context/trace-context-vectors.json")).unwrap();
-    let cases = vectors["groups"][group]["cases"]
+    use serde_json::json;
+    let cases = vectors()["groups"][group]["cases"]
         .as_array()
         .unwrap_or_else(|| panic!("no vector group {group}"))
         .clone();
@@ -705,10 +709,23 @@ mod tests {
         traceparent.get(53..)
     }
 
+    /// The `traceparent_compose` cases toward a target sent no composed
+    /// `traceparent`. Not run yet: no send path decides its trace headers by
+    /// its target's class.
+    const COMPOSED_BY_TARGET_CLASS: [&str; 2] = [
+        "compose_transit_point_to_a_third_party_target_sends_none",
+        "compose_access_point_to_an_external_consent_target_sends_the_trace_id_alone",
+    ];
+
     #[test]
     fn outgoing_traceparent_names_the_span_and_flags() {
+        let mut not_run = Vec::new();
         for case in vector_cases("traceparent_compose") {
             let (name, input, expected) = (&case["name"], &case["input"], &case["expected"]);
+            if matches!(input["target_class"].as_str(), Some("third_party" | "external_consent")) {
+                not_run.push(name.as_str().unwrap().to_string());
+                continue;
+            }
             let trace_id = TraceId::from_written(
                 input["trace_id"]
                     .as_str()
@@ -742,6 +759,7 @@ mod tests {
                 "{name}"
             );
         }
+        assert_eq!(not_run, COMPOSED_BY_TARGET_CLASS);
     }
 
     /// The outgoing trace of a `tracestate_and_flags` case.
@@ -941,37 +959,53 @@ mod tests {
         }
     }
 
+    /// Where each vector group is run, or why Gateway does not run it.
+    const VECTOR_GROUPS: [(&str, &str); 15] = [
+        ("trace_id", "run here"),
+        ("span_id", "run here"),
+        ("traceparent_parse", "run here"),
+        ("traceparent_compose", "run here"),
+        ("incoming_headers", "run here"),
+        ("tracestate_and_flags", "run here"),
+        ("trace_termination", "run here"),
+        ("trace_source", "run here, the cases of Gateway"),
+        ("request_forwarded", "run by the request_forwarded record in audit::request_events"),
+        ("transit_point", "not run: a Transit Point does not resolve its trace by these rules yet"),
+        ("transit_request_forwarded", "not run: Gateway writes no transit_request_forwarded record yet"),
+        ("mcp_meta", "not run: Gateway does not write MCP metadata by its target's class yet"),
+        ("link", "not Gateway's: Agent Watch follows links"),
+        ("caller_identity_verified", "not Gateway's: Agent Stream writes it"),
+        ("caller_key", "not Gateway's: Agent Watch builds caller keys"),
+    ];
+
     #[test]
-    fn every_vector_group_is_run_here_or_belongs_to_another_rule() {
-        let run_here = [
-            "trace_id",
-            "span_id",
-            "traceparent_parse",
-            "traceparent_compose",
-            "incoming_headers",
-            "tracestate_and_flags",
-            "trace_termination",
-            "trace_source",
-        ];
-        let not_this_modules_rule = ["mcp_meta", "transit_point", "link", "caller_identity_verified", "caller_key"];
-        let run_by_the_audit_record = ["request_forwarded"];
-        let vectors: Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/trace_context/trace-context-vectors.json"))
-                .unwrap();
-        let mut groups: Vec<&str> = vectors["groups"]
+    fn every_vector_group_is_run_or_named_and_the_version_is_pinned() {
+        let vectors = vectors();
+        assert_eq!(vectors["version"], 6, "the vectors version this gateway is tested against");
+        let groups = vectors["groups"]
             .as_object()
-            .unwrap()
+            .unwrap();
+        let cases: usize = groups
+            .values()
+            .map(|group| {
+                group["cases"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        assert_eq!(cases, 162, "the case count of vectors version 6");
+        let mut named: Vec<&str> = VECTOR_GROUPS
+            .iter()
+            .map(|(group, _)| *group)
+            .collect();
+        named.sort_unstable();
+        let mut present: Vec<&str> = groups
             .keys()
             .map(String::as_str)
             .collect();
-        groups.sort_unstable();
-        let mut known: Vec<&str> = run_here
-            .into_iter()
-            .chain(not_this_modules_rule)
-            .chain(run_by_the_audit_record)
-            .collect();
-        known.sort_unstable();
-        assert_eq!(groups, known);
+        present.sort_unstable();
+        assert_eq!(present, named);
     }
 
     #[test]
