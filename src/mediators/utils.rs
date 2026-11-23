@@ -10,7 +10,7 @@ use tracing::info;
 
 use crate::egress::{EgressError, EgressPolicy, bdd_egress_allowlist, guarded_send_inner};
 use crate::http_client::EXTERNAL_TIMEOUT_SECS;
-use trust_tasks_rs::specs::messaging::account::update::v0_1::{MediatorAcl, MediatorAclAccessListMode};
+use affinidi_messaging_sdk::tasks::messaging::account::update::v0_2::{MediatorAcl, MediatorAclAccessListMode};
 
 /// well-known DID document response structure
 #[derive(Debug, Deserialize)]

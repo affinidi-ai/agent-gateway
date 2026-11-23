@@ -46,6 +46,56 @@ version and client declarations (see
 `input.mcp` only for modern requests, so a rule keyed on `input.mcp` never
 matched legacy Fabric traffic; it now does, and a decision can change on upgrade.
 
+A legacy JSON-RPC message without an `id`, whatever its `method`, carries no `input.mcp`; a rule that allows requests without `input.mcp` allows them whatever they call.
+
+### Request, surface and direction (`input.http`, `input.channel`, `input.gateway`)
+
+Every gateway and surface policy input carries these fields (`PolicyInput` in
+[`src/surface_context/mod.rs`](../src/surface_context/mod.rs)):
+
+| Field | Value |
+| --- | --- |
+| `input.http.method`, `input.http.path` | The request's HTTP method and its whole path, which starts with the Access Point route (`/my-surface/public/docs` for a route `/my-surface`). On a Transit Point, the request the managed agent sends: its path starts with `/outbound`, the route and the Transit Point's alias (`/outbound/my-surface/partner-a/...`), or with the Transit Point's own `listen_path`. |
+| `input.http.headers` | The request's headers, without credential headers such as `Authorization`, cookies and API keys. |
+| `input.channel.config_id` | The surface id: unique, and unchanged when the surface is renamed. |
+| `input.channel.name` | The surface's display name, which other surfaces may share. |
+| `input.channel.variant_alias` | The surface variant the request selects: set on Fabric receive and on a Transit Point; absent on a direct request and for the default variant. |
+| `input.gateway.direction` | `inbound` for a request arriving at the Access Point, directly or over Fabric receive: the gateway policy, the Access Point policy and the Target's request policy see it. `outbound` for a request the managed agent sends through a Transit Point: the gateway policy, the shared Transit Point policy and the Transit Point's own policy see it. Also `outbound` for the request a surface with a `fabric://` Target sends to the peer gateway: the Target's request policy sees it there, and so do the MCP tool gating conditions on that leg, without `input.transit`. Test `input.transit` to tell a Transit Point evaluation from that one. |
+| `input.gateway.target_id` | On a Transit Point, its configured `target_endpoint`, such as `https://api.example.com/mcp`, or `fabric://{gateway_id}/{surface_id}` on a Fabric route; never the URL of one request. On the send of a `fabric://` Target, the peer gateway's DID. Absent on `inbound`. |
+| `input.gateway.source_id` | On a Transit Point, the managed agent's DID when it has one. On Fabric receive, the DID that sent the forward request. Absent on the send of a `fabric://` Target. |
+
+### MCP tool policy input
+
+A policy bound to MCP tools (`target.mcp_tool_policies`) decides each `tools/call` to an MCP
+Target: a direct HTTP Target, a `proxy://` MCP Proxy, the sending gateway of a `fabric://`
+Target, and Fabric receive. Other MCP methods pass this gate. Its input is
+the tool call (`McpPolicyContext` in [`src/mcp/policy.rs`](../src/mcp/policy.rs)), not the
+caller context the gateway and surface policies get:
+
+```json
+{
+  "mcp": {
+    "method": "tools/call",
+    "params": {"name": "search", "arguments": {"query": "open invoices"}},
+    "protocol": "json-rpc-2.0"
+  },
+  "jwt": {"sub": "user@example.com", "role": "admin"},
+  "channel": {"name": "tools", "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40", "protocol": "mcp"},
+  "request": {"source_ip": "203.0.113.10", "method": "POST", "path": "/mcp"}
+}
+```
+
+| Field | Value |
+| --- | --- |
+| `input.mcp.method` | Always `tools/call`. |
+| `input.mcp.params` | The call's `params`; the tool name is `input.mcp.params.name`. |
+| `input.mcp.protocol_version`, `client_capabilities`, `client_info` | Set for a modern (`2026-07-28`) request only. |
+| `input.jwt` | The claims of the bearer token in the request's `Authorization` header, absent without one; on Fabric receive, of the header the sending gateway forwarded. The gateway decodes these claims without verifying the token. A tool policy that reads `input.jwt` belongs only on a closed Access Point whose Caller Context methods are all JWT Bearer reading the `Authorization` header with the `Bearer` scheme. |
+| `input.channel` | The surface's `name`, `id` (the surface id) and `protocol` (`mcp`). |
+| `input.request` | `source_ip` (`fabric` on Fabric receive), `method` and `path`. |
+
+The input has no `source_auth`, `agent`, `extension_identity` or `trust_check_results`.
+
 ### Payment context (`input.payment`)
 
 On a surface with an `agent_pay` payment policy, every policy that runs for it gets
@@ -127,6 +177,127 @@ them from their own surfaces, but may update or delete only definitions owned by
 their tenant and within their resource pattern. `PUT /v1/policy-assignments`
 rejects any tenant-scoped PAT with 403. See
 [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#tenant-ownership).
+
+## Policy input capture
+
+The gateway does not log the policy input. To write a policy against real requests, an operator
+listens to the policy input of one surface from its Capture view in the dashboard. It is meant for
+developing and testing policies, not for monitoring, so it is off until an administrator turns on
+the `policy_input_capture` system feature flag (Settings › Admin › Feature Flags, or
+`feature_flags.policy_input_capture` in `POST /api/v1/settings`). It is a system-only flag: a
+user's own settings never turn it on. Listening is a
+request on the dashboard WebSocket, with no admin API route and nothing stored on the surface:
+
+- `{"type": "capture_policy_input", "surface_id": "<id>"}` starts listening, and
+  `{"type": "stop_capturing_policy_input", "surface_id": "<id>"}` stops it.
+- The gateway answers each with `{"type": "policy_input_capture", "surface_id", "listening"}`, and
+  an `error` when it refuses or ends a listen: `policy input capture needs dashboard sign-in` (the
+  connection carries no signed-in dashboard user, as when the gateway serves the dashboard without
+  authentication or without role checks), `your dashboard session has ended; sign
+  in again` (the connection's session is no longer live), `policy input capture is turned off` (the
+  flag is off), `needs surfaces.edit and policies.edit`, `invalid surface
+  id` (empty, over 256 bytes, or holding a control character or a bidirectional or zero-width
+  format character) or `listening to too many surfaces on this connection` (more than
+  10). The answer to a stop has no `error`, even when its surface id is not valid.
+- Starting needs the flag on and a dashboard session whose user holds `surfaces.edit` and
+  `policies.edit` ([`RBAC.md`](RBAC.md#policy-input-capture)). The session, the flag and the
+  permissions are checked again on each keep-alive ping; once the session ends, the flag is turned
+  off or either permission is gone, the connection stops listening to every surface and is told
+  why. The flag is also read on every policy evaluation, so turning it off stops new captures at
+  once. A due check runs before any queued capture is
+  sent, and the captures still queued when access is lost are discarded. A client that has not
+  read a message within 10 seconds is disconnected, so it cannot delay the check.
+- Each listen that starts records `policy_input_capture_started`, and each that ends records
+  `policy_input_capture_stopped` with its reason, in the VP Audit Log when auditing selects either
+  event and in any Governance Audit integration that selects either one
+  ([`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)). Each start and stop is also
+  written to the log at info, whatever auditing selects. A refused listen records nothing.
+- Listening ends when the connection closes, so reloading or leaving the page ends it. Captures
+  still queued when the connection closes are not sent. The dashboard sends its listens again
+  after a reconnect.
+- Captures and `policy_input_skipped` notices queued before a stop, or by an earlier listen to
+  the same surface, are not sent; those of the connection's other surfaces still are.
+
+A surface's policy input is captured while at least one connection listens to it, and only the
+listening connections receive the captures, each through its own queue of at most 64; a capture
+that finds a connection's queue full is dropped for that connection, and the connection is told how
+many it missed with `{"type": "policy_input_skipped", "config_id", "skipped"}` before its next
+capture. While every listening connection's queue is full, an evaluation is counted as missed for
+each of them and its input is not masked or serialized. The Capture view shows that count.
+Capture runs on the node the dashboard is connected to: requests another node of the appliance
+serves are not captured there.
+
+While a connection listens, each evaluation of a request or response policy on the surface sends
+it one `policy_input_captured` update, once the policy has decided:
+
+| Field | Value |
+| --- | --- |
+| `config_id` | The surface id |
+| `timestamp` | When the policy decided, RFC 3339 |
+| `slot` | The policy, in words: `inbound` (the Access Point policy), `target` (the Target's request policy), `inbound variant <alias>`, `target variant <alias>`, `outbound`, `transit <alias>`, `response` (the Target's response policy), `transit <alias> response`, `gateway` (the gateway-level policy on an inbound request), `gateway outbound` (the gateway-level policy on an outbound request, `input.gateway.direction` `outbound`) or `appliance <plane>` (an appliance-wide plane) |
+| `transit_point` | The Transit Point alias, for a Transit Point request or response policy |
+| `policies` | The policy definitions the slot evaluated, each `{"id", "name", "version"}`: one for a surface slot, every member of the set for the gateway and appliance-wide planes; a legacy inline gateway policy has neither `id` nor `name`. A monitor-only appliance-wide member is listed without its outcome: a deny it would have made does not change `decision` or `decided_by` |
+| `decided_by` | The `id` of the member that denied, when a gateway or appliance-wide set denies, or that failed to evaluate, on an appliance-wide plane |
+| `plane` | `surface`, `gateway` or `appliance` |
+| `engine` | The compiled policy key: the surface id, `inbound:`, `outbound:`, `variant:` or `transit:<surface>:<alias>` for a surface request policy, `response:<policy definition id>` or `response:transit:<surface>:<alias>` for a response policy, the gateway id, or the appliance-wide plane |
+| `input` | The policy input, credentials masked: the request input of a request policy, `response`, `caller` and `surface` (with `transit` and `source_auth` on a Transit Point leg) for a response policy |
+| `decision` | `allow`, `deny` or `error` (an evaluation error, which denies) |
+| `reason` | The deny reason, or the evaluation error; an appliance-wide error carries its generic reason (`Appliance-wide policy evaluation error`, `Appliance-wide policy input error` or `Failed to serialize policy input`), not the engine's error text |
+| `surface_variant` | The surface variant of the request, when there is one |
+
+Policies run appliance-wide, gateway, Access Point, Target, and a deny ends the chain, so a slot
+after it sends nothing. Captures are sent on the direct, Fabric and MCP proxy paths alike. MCP tool
+policies, the `tools/list` filtering of a surface policy, and a fail-closed deny of a slot whose
+policy did not compile (the request is denied before any policy runs) are not captured. A
+surface with no
+policy of its own has no surface evaluation to capture, so only a gateway or appliance-wide policy
+that applies to it is shown; to see the input of each request, add a request policy first (one that
+allows everything is enough). The Capture view says so while the surface has none.
+
+Only a dashboard WebSocket opened with a session (`websocket_require_auth`, on by default) can
+listen; a socket that carries no signed-in dashboard user is refused with `policy input capture
+needs dashboard sign-in` and never receives captures. Nothing is written to the log or
+stored, so a capture is gone once it has been sent. A listen is checked against the user's
+permissions, not against the surface: dashboard sessions are appliance-wide, so a user with both
+permissions can listen to any surface, and a listen naming a surface that does not exist receives
+nothing. Scoping dashboard sessions to tenants or surfaces would need the listen check to apply the
+same scope.
+
+Before a capture is sent, every credential in the input becomes `<redacted>`: the value of a key
+named like a credential (the [credential names](CONFIGURATION_REFERENCE.md#log-redaction) of log
+redaction, such as `token` or `api_key`), any JWT (three dot-separated base64url segments whose
+first decodes to a JSON object), and the token of any `Bearer` or `Basic`
+authorization value, also inside longer text (`Authorization: Bearer <redacted> please`). A
+JWT joined to the word before it, as in `CSRF=<redacted>` or `session_<redacted>`, is masked
+too, and a JWT followed by `.` and more text, as in `<JWT>.example.com` or `<JWT>.<JWT>`, is
+masked together with the dotted text after it. A `Bearer` token is one of letters, digits or `-._~+/=` that is at least 12 characters long, or at
+least 6 with a digit or one of those symbols; a `Basic` token is one that decodes as base64 to
+`user:password`. Message text such as `Basic authentication` or `Bearer arms` is kept. In every
+absolute URL in the input, query parameter names are kept and every query value becomes
+`<redacted>`, and the userinfo (user name and password) becomes `<redacted>`
+(`https://<redacted>@host/path`), up to the last `@` before the path, query or fragment. A
+fragment that holds `name=value` parameters, as an OAuth redirect's does
+(`#access_token=<redacted>&state=<redacted>`), is masked like a query; a plain anchor such as
+`#top` is kept. A deny
+reason and an evaluation error get the same masking, since a policy can build its reason from
+input text and an engine error can quote it. `http.path`
+is shown as the request log line shows it: query parameter names are kept and every query value
+becomes `<redacted>`, since a request received over Fabric carries the caller's full path and query,
+and capability ids in the path are shortened. Masking matches these shapes only, so a credential in
+another shape, such as an opaque key under a field name that is not a credential name, is sent as
+it is. Object keys are never masked: only values are, so a credential used as a key is sent as it
+is. Policies still see the full path. Headers that
+carry credentials never reach the policy input. After this masking, the operator's
+[log redaction rules](CONFIGURATION_REFERENCE.md#log-redaction) (`logging.redaction.rules`) are
+applied to every string value in the input, to each string field as a log line writes it
+(`"name":"value"`, so a rule that matches a field name with its value, such as the built-in quoted
+credential fields rule for `"clientsecret":"..."`, masks the whole value as `<redacted>`), and to
+the deny reason and error, so a capture masks at least what the log masks. The built-in rules also catch credential assignments in free text
+(`password=[REDACTED]`, `api_key: [REDACTED]`), `agpat_` tokens, PEM private keys and email
+addresses, each shown with the rule's replacement. With `logging.redaction.enabled` set to `false`
+only the masking above applies. The rules are read at startup. Message bodies, tool arguments and
+claims are sent with only this masking applied. Policy input capture is meant for writing and
+testing policies: the captures hold caller data.
 
 ## Appliance-wide (global) enforcement
 
@@ -337,6 +508,27 @@ Builder's fullscreen editor picks that list in one multi-select of the Issuers a
 registers; see _Authority lists_ in
 [`www/default/AGENTS.md`](../www/default/AGENTS.md).
 
+A rule over every result, such as `every r in input.trust_check_results.target { r.ok }`,
+requires every authority of every element. To require every element, each passing when any
+of its authorities recognises the entity, group the results by `id`, as the dashboard's
+_All trust checks pass_ and _At least N trust checks pass_ templates do:
+
+```rego
+check_ids contains r.id if {
+    some r in input.trust_check_results.target
+}
+
+passed_ids contains r.id if {
+    some r in input.trust_check_results.target
+    r.ok == true
+}
+
+allow if {
+    count(check_ids) > 0
+    count(check_ids - passed_ids) == 0
+}
+```
+
 Accepted risk: nothing bounds how many authorities a leg queries. Every request sends one TRQP
 message per listed authority, all at once, through the trust registry's connection and its
 mediator, and writes one audit record and one `agent_gateway_trust_check_total` sample per
@@ -345,9 +537,13 @@ the mediator and the audit sinks. Keep lists to the authorities a policy needs. 
 times out never marks the registry connection `Failed`: every request the gateway sends to a
 registry has a thread id starting with `ag-req-` (`REQUEST_THREAD_PREFIX` in
 [`src/trust_registries/communication.rs`](../src/trust_registries/communication.rs)), and a
-problem report on such a thread that no query still awaits is logged and ignored, however late
-it arrives. Only a problem report on any other thread is taken as the registry rejecting the
-gateway.
+refusal on such a thread that no query still awaits is logged and ignored, however late
+it arrives, whether it arrives as a problem report or as the `trust-task-error` document a
+mediator at v0.52 or later sends. That newer form can also name the query in its own
+`threadId` or `inResponseTo`, and is then delivered to that query, or ignored in the same way
+once the query is no longer awaited. A correlator naming anything other than such a query says
+nothing about the gateway's queries and changes nothing. Every other refusal is taken as the
+registry rejecting the gateway.
 
 Gateway 1.0.9 and earlier cannot read `query.authority_ids`, even a list of one. It skips any
 stored surface or managed connection with a Trust Check that sets `query.authority_ids`, and
@@ -470,6 +666,13 @@ Check flagged an identity mismatch). Both carry how the DID was established:
 | | `unverified` | Nothing in the request proves the DID: `x-identity` payload pseudonyms, surface-configured identities (`static`, `from_mtls`, a stored-key `from_api_key`), and a plain API Key on an inbound `from_api_key` slot, whose DID every holder of the secret shares. |
 | `input.extension_identity.verified`, `input.agent.did_verified` | `true` / `false` | Boolean projection: everything but `unverified` is verified. |
 
+`input.agent.trust_verification` is `true` when every Trust Registry recognition query for
+`input.agent.did` passed, `false` when one did not, and absent without Trust Registry data. On
+the caller leg, `input.agent.did` and the Trust Registry fields beside it come from the request
+body's trust-registry extension, so a policy that requires the caller to be recognised also
+requires `input.agent.did_verified == true`: the recognised DID is then the caller identity the
+gateway established.
+
 On a direct request to a surface whose inbound identity is `from_api_key`, the
 caller is the API key it presents (see
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#from_api_key-on-the-inbound-slot)). Fabric
@@ -512,10 +715,11 @@ The same rule denies every request on the direct A2A path, which never produces
 
 ## Caller in Transit Point policy input
 
-Every outbound evaluation (gateway, surface, per-Transit-Point and response policies, and
-MCP tool gating conditions on a Transit Point) gets `input.transit`. It is never on an
+Every Transit Point evaluation (gateway, surface, per-Transit-Point and response policies,
+and MCP tool gating conditions on a Transit Point) gets `input.transit`. It is never on an
 inbound evaluation, where `input.source_auth` and `input.extension_identity` carry the
-caller. It names two principals, each in its own field, because one call can carry both:
+caller, nor on the `outbound` evaluation of the request a `fabric://` Target sends, where
+only `input.source_auth` does. It names two principals, each in its own field, because one call can carry both:
 
 - `input.transit.caller` is the end user the transit token names, as the Access Point
   authenticated them. Without a transit token it is `anonymous`.
@@ -526,6 +730,16 @@ caller. It names two principals, each in its own field, because one call can car
 A rule about the end user reads `caller`, and a rule about the client reads `client`;
 neither stands in for the other. A policy that reads `caller` must test `verified` first: a
 caller named only by an unverified DID is reported, and never as verified.
+
+The policy editor's built-in templates that read the caller (`input.source_auth`,
+`input.agent` or `input.extension_identity`) decide on the Access Point and Target request
+policies. On a Transit Point `input.source_auth` is the client the Transit Point
+authenticated, `input.agent` describes the destination and there is no
+`input.extension_identity`; an inbound response policy gets none of the three. On the send of
+a `fabric://` Target, the Target's request policy gets `input.source_auth` but no
+`input.extension_identity`, and its `input.agent` describes this Access Point's own card, not
+the caller, so the templates that read `input.extension_identity` or `input.agent` deny every
+request there.
 
 A Transit Point's response policy gets `input.transit`, and `input.source_auth` when the
 Transit Point authenticated a client, beside its `input.response`, `input.caller` and

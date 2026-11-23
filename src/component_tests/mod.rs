@@ -49,6 +49,7 @@ mod upstream_response_bounds_e2e;
 
 #[cfg(test)]
 mod freeze {
+    use crate::component_test_freeze::refusal;
     use std::path::{Path, PathBuf};
 
     const FROZEN_FILES: &[(&str, usize)] = &[
@@ -105,10 +106,6 @@ mod freeze {
         ("trust_recorder_status_e2e.rs", 1),
         ("upstream_response_bounds_e2e.rs", 12),
     ];
-
-    const GUIDANCE: &str = "src/component_tests is frozen: cover new behaviour with a Gherkin scenario under tests/features (see docs/development/TESTING.md)";
-
-    const FROM_MAIN: &str = "if a rebase brought this in from main, set its entry in FROZEN_FILES in src/component_tests/mod.rs to main's count";
 
     const LOWER_THE_PIN: &str = "lower or remove its entry in FROZEN_FILES in src/component_tests/mod.rs in the same change, so deleted tests cannot come back";
 
@@ -185,7 +182,7 @@ mod freeze {
             })
             .collect();
         added.sort();
-        assert!(added.is_empty(), "{GUIDANCE}; new files: {added:?}; {FROM_MAIN}");
+        assert!(added.is_empty(), "{}", refusal("new files", &added));
 
         let missing: Vec<_> = FROZEN_FILES
             .iter()
@@ -222,7 +219,7 @@ mod freeze {
             }
         }
         assert!(inspected > 0, "no component test files were inspected; the guard would pass vacuously");
-        assert!(grown.is_empty(), "{GUIDANCE}; grown files: {grown:?}; {FROM_MAIN}");
+        assert!(grown.is_empty(), "{}", refusal("grown files", &grown));
         assert!(shrunk.is_empty(), "fewer tests than pinned: {shrunk:?}; {LOWER_THE_PIN}");
     }
 

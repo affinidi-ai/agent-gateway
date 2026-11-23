@@ -206,7 +206,7 @@ The bootstrap file. Startup only; changes need a restart.
 | --- | --- |
 | top level | `channel_config_source` (`local` or `dynamodb`), AWS region and profile, `secrets_backend`, `backup_encryption_key`, `auth_mode`, session timeout, WebSocket auth and buffer, metrics retention and cache, `server_mode` |
 | `[tenancy.trusted_tenant_header]` | Declares that an authenticated edge writes the tenant header. Enables broad header-derived PAT selectors. |
-| `[credential_policy]` | How strictly credential providers and Target credentials are held to four rules. `token_endpoint_https`, `tenant_credential_isolation`, `target_https` and `target_source_auth` are each `"warn"` (default) or `"enforce"`; any other value fails startup. In `"enforce"`, `target_https` and `target_source_auth` also refuse a new or changed Target authentication that breaks them on save (for `target_source_auth`, also a new `a2a-proxy://` Target whose A2A proxy would send its Direct Line credential for unchecked callers); in `"warn"` such a save succeeds with a warning. `insecure_token_endpoints` lists exact token endpoint URLs that may use http deliberately (default empty), relaxing only the https rule, never the refusal of a token endpoint that resolves to loopback or cloud metadata; an entry that is not a valid http URL without a user name or password fails startup. `token_request_timeout_secs` is how long a token request to a credential provider may take, from 1 to 120 seconds (default 30); `0` or a larger value fails startup. `default_max_consent_age_secs` and `max_consent_age_ceiling_secs` limit how long a person's consent may be used, each from 60 to 31,536,000 seconds and unset by default: the default applies to a credential provider that sets no `max_consent_age_secs`, and no provider's or binding's limit reaches past the ceiling; a value out of range, or a default above the ceiling, fails startup (see [Consent time limit](CREDENTIAL_DELEGATION.md#consent-time-limit)). Absent section means every rule is `warn` and no consent is limited. The report also names a stored JWT Bearer provider without a subject under a fifth rule, `jwt_subject`, which only warns and has no setting. See [Credential policy](CONFIGURATION_RELOAD.md#credential-policy). |
+| `[credential_policy]` | How strictly credential providers and Target credentials are held to four rules. `token_endpoint_https`, `tenant_credential_isolation`, `target_https` and `target_source_auth` are each `"warn"` (default) or `"enforce"`; any other value fails startup. In `"enforce"`, `target_https` and `target_source_auth` also refuse a new or changed Target authentication that breaks them on save (for `target_source_auth`, also a new `a2a-proxy://` Target whose A2A proxy would send its Direct Line credential for unchecked callers); in `"warn"` such a save succeeds with a warning. `insecure_token_endpoints` lists exact token endpoint URLs that may use http deliberately (default empty), relaxing only the https rule, never the refusal of a token endpoint that resolves to loopback or cloud metadata; an entry that is not a valid http URL without a user name or password fails startup. `token_request_timeout_secs` is how long a token request to a credential provider may take, from 1 to 120 seconds (default 30); `0` or a larger value fails startup. `default_max_consent_age_secs` and `max_consent_age_ceiling_secs` limit how long a person's consent may be used, each from 60 to 31,536,000 seconds and unset by default: the default applies to a credential provider that sets no `max_consent_age_secs`, the ceiling applies to such a provider while no default is set, and no provider's or binding's limit reaches past the ceiling. Both reach the consents already stored: setting either ends the stored consents it limits that are older than it, at the latest at the next hourly pass (the first runs ten minutes after startup), and revokes the grants by binding among them at the vendor; a node logs at `WARN`, when it starts active or becomes active, how many consents the two keys end. A value out of range, or a default above the ceiling, fails startup (see [Consent time limit](CREDENTIAL_DELEGATION.md#consent-time-limit)). Absent section means every rule is `warn` and no consent is limited. The report also names a stored JWT Bearer provider without a subject under a fifth rule, `jwt_subject`, which only warns and has no setting. See [Credential policy](CONFIGURATION_RELOAD.md#credential-policy). |
 | `[encryption]` | Encryption at rest: on or off, key source, KMS settings |
 | `[config_files]` | Where the other configuration files are |
 | `[storage_paths]` | Where each record kind is persisted under `_storage/`. The Trust Recorder status store has no key: it sits beside the identities directory as `trust_recorder_status/`. |
@@ -216,7 +216,7 @@ The bootstrap file. Startup only; changes need a restart.
 | `[reconnect_policy]` | Backoff for DIDComm connection points and for the background retry of a trust registry connection |
 | `[oob_connection]` | How long an out-of-band pairing invitation stays pending |
 | `[a2a]` | Default A2A revision, body size (`max_body_size`, at least 1 byte; `0` fails startup), timeouts, fabric timeouts and envelope lifetime, inbound cache sizing. See [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md). |
-| `[logging]` | Level, JSON output, log directory. Log redaction is not read here; see [Log redaction](#log-redaction). |
+| `[logging]` | Level, JSON output, log directory, and `delegation_events` (default `true`): `false` writes none of the per-call credential delegation events to the log (see [Governance audit forwarding](OBSERVABILITY.md#governance-audit-forwarding)). Log redaction is not read here; see [Log redaction](#log-redaction). |
 | `[audit]` | How the VP Audit Log file is rotated: `vp_audit_log_max_bytes` (default 8388608) and `vp_audit_log_keep` (default 0, keep every rotated file), and the advisory `vp_audit_log_soft_cap_bytes` the Audit page shows the history against (default 1073741824). See [Governance audit forwarding](OBSERVABILITY.md#governance-audit-forwarding). |
 | `[extension_inspection]` | Whether to parse A2A extensions, and which URIs to watch |
 
@@ -406,6 +406,11 @@ also copy any built-in rules you still want from
 | No `rules` | The built-in rules below apply. |
 | `rules` | Your rules replace the built-in rules and run in order. An empty list applies no pattern. |
 
+A rule's match that lies inside a UUID without covering all of it is left as it is, so a
+broad pattern such as the example phone number rule does not mangle surface ids and the
+`[CHANNEL:<id>]` prefix a surface's Monitoring log filters on. A rule that matches a whole
+UUID still masks it.
+
 A rule whose pattern does not compile is skipped with a warning on stderr. At startup
 stderr reports the number of rules in use, or a warning when redaction is off, and the
 `Startup configuration` log line shows `log_redaction=on` or `off`.
@@ -437,9 +442,13 @@ In OTLP exports, an attribute whose name is a credential name is replaced with
 attribute by its name. The names, ignoring case, are `authorization`, `cookie`, `token`,
 `session_id`, `sessionid`, `jsessionid`, `password`, `passwd`, `secret`, `secret_key`,
 `api_key`, `apikey`, `caller_key`, `private_key`, `credential` and `credentials`, alone or after
-a `.`, `_` or `-`: `http.request.header.authorization`, `x-api-key`, `x-caller-key` and
-`mcp_session_id` match,
-`token_count` and `secret_id` do not. Fields named like a credential lose the
+a `.`, `_`, `-` or space, or after a camelCase word break (a lowercase letter or digit followed
+by an uppercase letter), and `key`, `auth` and `pat` as the whole name only:
+`http.request.header.authorization`, `x-api-key`, `x-caller-key`, `mcp_session_id`,
+`accessToken`, `clientSecret`, `API Key` and `key` match,
+`token_count`, `secret_id`, `maxTokens`, `apiKeyId`, `primary_key` and `oauth` do not. The same
+names mark credential-named keys in captured [policy input](POLICY.md#policy-input-capture), and
+these rules apply to captures too. Fields named like a credential lose the
 8-character prefix the gateway logs for correlation, in local logs as well as in OTLP
 exports.
 
@@ -698,7 +707,7 @@ neither lists them nor acts on them.
   `403`; payment gateways already connected keep taking payments and every read route still
   works. The dashboard hides its agent-pay UI while it is off, except the Payments page, which
   needs only `payments.view`. A user's own settings cannot
-  override this flag or `mediator_federation`
+  override this flag, `mediator_federation` or `policy_input_capture`
   ([`SYSTEM_ONLY_FLAGS`](../src/storage/settings_store.rs)). At startup the gateway turns it on
   when a payment gateway already exists and the flag has not been set either way, so an upgrade
   never hides a payment gateway that is taking payments.
@@ -1150,6 +1159,61 @@ credential, which an enforced rule refuses at save, a `caller_key` on an `http` 
 `enforce` saves with that `Warning`, and its requests are forwarded without the key. A PUT that leaves
 `caller_key` out keeps the stored one, so a Surface Builder save keeps it; `null` removes it. See
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#caller-keys).
+
+## Surface response authentication
+
+A surface's optional `target.response_auth` makes the gateway accept a response from an http or
+https Target only when it proves it comes from the registered managed agent, by a key it returns
+(`api_key`) or by its server certificate (`mtls`, https only); any other response is refused
+with `502` before anything uses it, and one with a status in
+`networking.retry.retryable_status_codes` that fails is never retried. It is a Target field, set
+through the admin API; a variant may set its own, as with `target.auth`, and a variant saved
+from the dashboard is complete and carries its own, so each such variant needs its own setting.
+A `PUT` that leaves it out keeps the stored one, and
+`null` removes it, for the surface's `target` and for a stored variant's `overrides.target`.
+
+It covers the response leg only, the Managed Agent's answers to the gateway; a call the managed
+agent makes through a Transit Point is authenticated by that Transit Point's own `source_auth`
+(see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-source-authentication)), and responses from
+a Transit Point's destination are not checked. An `api_key` check
+runs after the request was sent, so a server answering at the Target URL has already received
+the request, the transit token, the Target credential and the forwarded caller headers when its
+answer is refused; only `mtls` stops such a server before anything is sent.
+
+```json
+"target": {
+  "endpoint": "https://bravo.example/a2a",
+  "response_auth": { "api_key": { "header_name": "X-Agent-Key", "secret_id": "bravo-response-key" } }
+}
+```
+
+| Field | Default | Behaviour |
+| --- | --- | --- |
+| `api_key.header_name` | Required | The response header the managed agent returns its key in, compared ignoring case. Removed from every response, so the caller never receives it. A save refuses a name that is not an HTTP field name, a reserved header, or one Target authentication, a credential binding, a forwarded caller token, header metadata mapping or `caller_key` already sends to the Target. It also refuses a header the gateway reads or sets on the Target's response, such as `Content-Type`, `Location`, `Set-Cookie`, `Cache-Control` or a payment header (`Payment-Response`, `Payment-Receipt`, `X-Payment-Response`…); [`SOURCE_AUTH.md`](SOURCE_AUTH.md#response-authentication) lists them. |
+| `api_key.secret_id` | Required | The `secret_id` of a secret holding the accepted keys, comma-separated, so a key can be rotated. A save refuses a secret that does not exist, belongs to another tenant (an appliance-wide one is accepted) or holds no non-blank key, and one the gateway sends out or accepts from callers: the `secret_id` of a `static_secret` Target authentication, of a Transit Point's `static_secret` `target_auth`, of `caller_key`, of an Access Point `api_key` caller authentication method, or of an enabled `$SECRET:<id>` value in the Target's or the shared transit custom metadata, or a secret read for the service token of a credential provider the surface sends to its Target or a Transit Point (`credential_provider` Target authentication, `outbound_credentials` or `transit_credentials`). A credential provider update that would read such a secret is refused too. On an `http://` Target the key is sent unencrypted and gives no protection on the network path, so use an `https://` Target, or `mtls`. |
+| `mtls.server_trust` | Required | The trust the Target's server certificate must pass in the TLS handshake, the caller mTLS `MtlsTrust` shape: `{"type": "pinned", "certificate_ids": [...]}`, stored `client_leaf` certificates matched by SHA-256 leaf fingerprint only, with neither expiry nor host name checked, so removing a certificate from the list is the only way to stop trusting it, or `{"type": "ca", "ca_certificate_ids": [...]}`, stored `ca` certificates the chain must end at, with the Target's host checked against the certificate. Only these certificates are trusted, never the system's or public CAs. A save refuses an empty list, a certificate of the wrong kind, one that does not exist, is inactive or belongs to another tenant, and `check_crl` or `require_ocsp` set to `true`. |
+| `mtls.client_certificate_id` | None | A stored `client_leaf` certificate, with its private key, the gateway presents to the managed agent. A save refuses another kind, an inactive one, one stored without its key, and, while `credential_policy.tenant_credential_isolation` is `enforce`, one that is not the surface's own tenant's. |
+
+```json
+"response_auth": { "mtls": {
+  "server_trust": { "type": "pinned", "certificate_ids": ["bravo-server-cert"] },
+  "client_certificate_id": "gateway-client-cert"
+} }
+```
+
+A save refuses `response_auth` on a `proxy://`, `a2a-proxy://` or `fabric://` Target, `mtls` on
+an `http://` Target or on a Target bound by external consent, and `api_key` on an `http://` Target while `credential_policy.target_https`
+is `enforce` (in `warn` it saves with a `Warning` header). The mTLS settings are built once per
+surface and setting, again when a certificate the setting names changes, and dropped when the
+surface is saved or deleted, on configuration reload and on the periodic disk refresh; a
+handshake whose server
+certificate fails the trust is refused like any other failed response. No other key is read: the
+object takes no other field, and the Target refuses
+unknown fields, so a release without Response authentication does not load a surface that sets
+it; where several nodes share `_storage/`, set it only once every node runs a release with it.
+So that callers never see the key, set `api_key` before the managed agent starts sending the
+header, and stop the agent sending it before removing the setting, since without it the header
+passes through. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#response-authentication).
 
 ## Remote gateway records
 

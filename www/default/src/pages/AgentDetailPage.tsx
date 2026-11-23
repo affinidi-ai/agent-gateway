@@ -4,7 +4,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { AgentDetails, ApiError, apiClient } from '../api';
 import { AppButton } from '../components/shared/AppButton';
 import { usePageTitle } from '../context/PageTitleContext';
-import { UNNAMED_AGENT } from './AgentsPage/agentLabels';
+import { displayName } from './AgentsPage/agentLabels';
 import AgentCardTab from './AgentDetailPage/AgentCardTab';
 import AgentDetailHeader from './AgentDetailPage/AgentDetailHeader';
 import ConnectionTab from './AgentDetailPage/ConnectionTab';
@@ -25,7 +25,7 @@ const AgentDetailPage: React.FC = () => {
 
   const latestRequest = useRef(0);
 
-  usePageTitle(agent ? (agent.name ?? UNNAMED_AGENT) : null);
+  usePageTitle(agent ? displayName(agent) : null);
 
   const loadAgent = useCallback(async () => {
     const request = ++latestRequest.current;

@@ -1,0 +1,11 @@
+branch: fix/email-input
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-19T00:00:00Z'
+      title: Keep the caret in place when editing the login username
+      description: Typing or deleting in the middle of the username on the sign-in page no longer moves the caret to the end, because the form is no longer remounted on every keystroke.
+  removed: []
+  security: []
+  breaking: []

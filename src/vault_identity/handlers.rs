@@ -67,13 +67,13 @@ pub async fn generate_did_webvh_identity(
 
     // --- 3. Convert Ed25519 key to library Secret for multibase public key ---
     let temp_key_id = "did:key:temp#temp".to_string();
-    let raw_secret = didwebvh_rs::prelude::Secret::from_str(&temp_key_id, &ed25519_jwk_value)
+    let raw_secret = didwebvh_rs::prelude::Secret::from_jwk_value(&temp_key_id, &ed25519_jwk_value)
         .map_err(|e| anyhow::anyhow!("Failed to convert Ed25519 key to Secret: {}", e))?;
     let multibase_pubkey = raw_secret
         .get_public_keymultibase()
         .map_err(|e| anyhow::anyhow!("Failed to get multibase public key: {}", e))?;
     let did_key_id = format!("did:key:{0}#{0}", multibase_pubkey);
-    let mut auth_secret = didwebvh_rs::prelude::Secret::from_str(&did_key_id, &ed25519_jwk_value)
+    let mut auth_secret = didwebvh_rs::prelude::Secret::from_jwk_value(&did_key_id, &ed25519_jwk_value)
         .map_err(|e| anyhow::anyhow!("Failed to build auth secret: {}", e))?;
     auth_secret.id = did_key_id;
 
@@ -82,7 +82,7 @@ pub async fn generate_did_webvh_identity(
     // (publicKeyJwk) and `#key-2` as Multikey (publicKeyMultibase). Agent VP/VC
     // proofs use the `eddsa-rdfc-2022` cryptosuite, whose verifier requires a
     // Multikey verification method — so `#key-2` must be present and referenced
-    // by assertionMethod, mirroring `serve_agent_did_document`.
+    // by assertionMethod and authentication, mirroring `serve_agent_did_document`.
     let did_document_json = serde_json::json!({
         "id": placeholder_did,
         "@context": [
@@ -104,7 +104,10 @@ pub async fn generate_did_webvh_identity(
                 "publicKeyMultibase": multibase_pubkey.clone()
             }
         ],
-        "authentication": [format!("{}#key-1", placeholder_did)],
+        "authentication": [
+            format!("{}#key-1", placeholder_did),
+            format!("{}#key-2", placeholder_did)
+        ],
         "assertionMethod": [
             format!("{}#key-1", placeholder_did),
             format!("{}#key-2", placeholder_did)
@@ -438,6 +441,15 @@ mod tests {
             .as_str()
             .unwrap_or("");
         assert!(state_id.contains("apikey"), "state.id must contain the 'apikey' path segment, got: {}", state_id);
-        let _ = did; // used for context
+        let signing_key = format!("{did}#key-2");
+        for relationship in ["assertionMethod", "authentication"] {
+            assert!(
+                entry["state"][relationship]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!(signing_key)),
+                "{relationship} must list the signing key"
+            );
+        }
     }
 }

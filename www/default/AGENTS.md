@@ -72,7 +72,10 @@ Applies to:
 `showToast` and `showUndoToast` (`utils/toaster.ts`) render the message and the action label as
 text (`textContent`), never as HTML, so a name or a server error message in a toast cannot run
 script. Pass plain text only: markup such as `<b>` shows literally, and callers must not
-escape the text themselves.
+escape the text themselves. `showUndoToast` returns a function that dismisses that toast
+without Undo, as its close button does. A new toast replaces the one on screen and stops it:
+the replaced toast's timer and `u` key no longer act, and an Undo toast counts as dismissed
+without Undo (its `onExpire` runs). `removeToast` does the same. This holds on every page.
 
 ## Test identifiers
 
@@ -89,8 +92,10 @@ are the consumer; the convention is documented in
 | Canvas node   | `surface-node-<type>`, for example `surface-node-payment`                            |
 
 An indexed or per-row button keeps the `-button` suffix before the index or id, for example
-`payments-details-button-<id>`. On `/surfaces/<id>` the save button is `surface-save-button`
-and the banner for a refused save is `surface-error-alert`.
+`payments-details-button-<id>`. On `/surfaces/<id>` the save button is `surface-save-button`,
+the banner for a refused save is `surface-error-alert`, and the delete button is
+`surface-delete-button`, which opens `surface-delete-confirm` with `surface-delete-confirm-name`,
+`surface-delete-confirm-confirm` and `surface-delete-confirm-cancel` (see _Surface delete_).
 
 ## CLI consent page
 
@@ -113,6 +118,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
 
 ## Surface Builder
 
+- The palette offers the A2A Transit Point only on A2A and AP2 surfaces and the MCP Transit
+  Point only on MCP surfaces (`protocols` on the node definition); a DIDComm surface, or one
+  with no protocol yet, is offered neither. Transit Points already on a surface keep
+  rendering and editing.
 - Sidebars may include small, legible configuration controls. Move dense editors,
   repeated rows, long lists, JSON and schema editors, and advanced controls into an
   element `FullscreenPanel`. When fullscreen is used, keep the sidebar focused on counts
@@ -286,6 +295,41 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   always-visible warning says a paired gateway that sends a person's own token gets that
   person's grant. A variant carries it in `overrides.target`. Test ids:
   `managed-agent-partner-grants-switch` and `managed-agent-partner-grants-warning`.
+- **Response Authentication** is the Managed Agent panel's
+  `managed-agent/ResponseAuthSection.tsx` (rules and wording in `managed-agent/responseAuth.ts`),
+  shown only for an HTTP or HTTPS Target. It edits `target.response_auth` in its wire shape:
+  **Off**, **API key** (response header, default `X-Agent-Key`, and a secret from
+  `useApiKeySecrets`) or **mTLS** (trust by pinned certificate or Certificate Authority, with
+  checkboxes listing the active `client_leaf` or `ca` certificates of `GET /certificates`, and an
+  optional client certificate from the `client_leaf` ones; the list does not say which have a
+  private key, so `FieldHelp` says one is needed and the gateway refuses the save otherwise).
+  mTLS is a disabled option on an `http://` Target, and its `FieldHelp` says why. An API key on
+  an `http://` Target shows an always-visible warning. A stored id the lists do not have stays
+  shown, so it can be cleared, and a shape the panel cannot read is kept as "Set through the API".
+  The Target's config takes `response_auth` only from the stored surface, never from the canvas
+  blob, so one removed through the API stays removed. The gateway keeps a stored one a `PUT`
+  leaves out, so Save sends the value unchanged when the operator did not edit it, `null` once
+  switched off or when the Target is no longer HTTP or HTTPS, and nothing when there is none. A
+  variant carries it in `overrides.target`, with `null` to clear its stored override. `validate`
+  blocks Save for an API key without a header or secret, and for mTLS without a trusted
+  certificate or on an `http://` Target. The gateway's refusal (`target.response_auth…`, or
+  `variants['<alias>'].target.response_auth…` in that variant's view) and its `Warning` headers
+  show in the section with the field name in plain words; a warning stays until the endpoint or
+  the setting changes. A save sends every variant as a complete override, which replaces the
+  base's setting with the variant's own, so while the base view has a setting, an
+  `InfoBanner` warning (`-variants-warning`) names the variants whose snapshot has an HTTP or
+  HTTPS Target and no setting (`variantsWithoutResponseAuth`; a variant never opened has no
+  snapshot and is saved from the base, so it is not named). Its **Copy to variants** button
+  (`-copy-to-variants`, disabled while the base setting is incomplete or the surface is
+  read-only) writes the base value, in its wire shape, into those snapshots only, so the next
+  Save sends it in each one's `overrides.target`; it never saves by itself, and the warning
+  disappears once no variant is left without it. Test ids, with prefix
+  `managed-agent-response-auth`: `-section`,
+  `-method`, `-header`, `-secret`, `-add-secret-link`, `-http-warning`, `-trust-mode`,
+  `-trust-certificates`, `-trust-cert-<id>`, `-add-certificate-link`, `-client-cert`,
+  `-certificates-error`, `-unsupported`, `-variants-warning`, `-copy-to-variants`, `-problem`,
+  `-save-warning`, `-save-error`, and
+  `field-help-managed-agent-response-auth` / `-client-cert`.
 - The Agent Identity panel (`identity/IdentityPanel.tsx`) disables **From API Key** on the
   Managed Agent response identity (`response:identity-protected`), since the key picker lists
   API keys issued to callers, and none of them identifies the Managed Agent; the inbound and
@@ -578,13 +622,103 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   (`_shared/TargetAuthProviderSelect.tsx`), which lists only Client Credentials, JWT Bearer,
   Client Credentials JWT and API Key providers, since the gateway refuses an Authorization Code
   provider here. `_shared/providerTargetAuth.ts` maps the form to and from the wire
-  `method.credential_provider`, and a Transit Point with the option but no provider blocks Save.
+  `method.credential_provider`, and a Managed Agent or Transit Point with the option but no
+  provider blocks Save.
   Test ids: `managed-agent-target-auth-provider`, `transit-point-target-auth-provider`, each with
   `-add-link`, and `transit-point-target-auth-provider-header-name` / `-header-format`.
+  - **Scopes.** The credential provider method has an optional space-separated **Scopes** input
+    (`managed-agent-target-auth-scopes`, `transit-point-target-auth-provider-scopes`) wired to the
+    wire `scopes`; empty uses the provider's default scopes.
+  - **Rules that block Save**, which the gateway refuses in every mode: a header name that is not
+    an HTTP token or is reserved (Host, Content-Length, Transfer-Encoding, Connection, Keep-Alive,
+    Proxy-Connection, TE, Upgrade, Trailer, and the gateway's own transit, caller, identity, trace and
+    MCP session headers: 23 names in all); a format without exactly one `{value}` or with CR, LF
+    or NUL; a provider method with no provider picked; on the Managed Agent, a secret method
+    with no secret picked, which would send no `target.auth` and so remove a stored credential
+    (the Transit Point secret picker has the same rule). Header names are compared as the gateway
+    compares them, in any letter case and with `_` read as `-` (`sameHeaderName`), so
+    `X_Transit_Token` is reserved too. In the Managed Agent's full-screen editor the header,
+    format, provider and secret (`managed-agent-target-auth-secret-error`) messages show next to
+    their inputs, each in a `role="alert"` region and
+    tied to its input with `aria-invalid` and `aria-describedby`; the Managed Agent and Transit
+    Point panels show every message in a notice (`*-target-auth-errors`), and the Transit
+    Point's header inputs point at that notice the same way. Rules that need the whole surface
+    live in `elements/targetAuthRules.ts`, run by `validateSurfacePayload` when the page passes
+    the stored surface (`stored`, `null` for a new one): a header another credential on the same
+    leg already sends (a binding, header metadata mapping, the token header of any JWT Bearer
+    caller method that forwards it) blocks Save, on the Managed Agent or on the Transit Point it
+    belongs to. The surface page runs the clash check on the view being saved and on every other
+    variant, whose error names the variant. The toast's **Show me** selects the canvas node that
+    has the problem: a Transit Point's node is the one at its position among the Transit Point
+    nodes of the payload's `canvas.nodes`, never an id built from its index, and a payload whose
+    canvas data lists a different number of Transit Points names no node.
+  - **A stored problem blocks too.** The gateway refuses a header name, format or clash problem
+    on every save, one in a stored setting the operator did not edit included, so the dashboard
+    shows it as an error next to its field and blocks Save until it is fixed. The editors drop
+    only the spaces and tabs around a header name or format (`trimSpaces`), never a line break or
+    NUL, so a stored value that ends in one is reported whether or not its panel was opened. A
+    blank field sends the default, except a blank the stored setting already had
+    (`blankHeaderValue`), which stays blank and is reported; the forms load a stored blank as
+    blank (`storedHeaderValue`). The Managed Agent's full-screen editor shows the Header Format
+    input for the Custom type, and for any other type while its format has an error and until the
+    type is chosen again, so the message always has its input.
+  - **Advisories that allow Save.** A Target that is not `https://` (`http://`, `fabric://` and
+    `a2a-proxy://` are not) and a leg that authenticates no caller (an Access Point with no source
+    authentication, a Transit Point that authenticates no caller) are shown as an advisory
+    (`*-target-auth-advisories`, warning styling) and never block Save: the gateway refuses them
+    on save only while its `target_https` or `target_source_auth` rule is `enforce`, and in
+    `warn` saves with a `Warning: 299` header. The dashboard does not read the rule mode. The
+    Managed Agent's `proxy://` Target gets no https advisory, since the gateway decides it from
+    the MCP proxy's `base_url`, which the editor does not see; a Transit Point's `proxy://`
+    target endpoint does, since the gateway checks it as written. The Managed Agent editors learn whether the
+    Access Point checks its callers from `accessPointChecksCallers` in `SurfaceMetaContext`,
+    which the surface pages set from the draft payload (`hasCallerAuthentication`). After a
+    save in `warn` the header's message shows in the save toast and the surface page's save
+    warnings banner; in `enforce` the gateway's 400 shows in the page's error alert. The
+    whole-surface caller check is a `warning` issue in `validateSurfacePayload`, left out when
+    the stored surface already had it on the same leg with the same setting and endpoint.
+  - **Advice with no gateway rule.** The same box also shows a passthrough fallback (the
+    request goes on without the credential when the credential cannot be resolved) and a stored
+    method the editor cannot show, each ending "Save is allowed".
+  - **Messages name their kind.** `TargetAuthProblemNotice` opens every message with **Error:**
+    or **Advisory:**, so colour is not the only difference, and keeps its
+    `role="alert"` and `role="status"` regions mounted while empty, so a message that appears is
+    announced.
+  - **Lossless save.** Each Managed Agent and Transit Point keeps the stored `target_auth` in
+    the node config (`_stored_target_auth`); the edited fields are merged onto it
+    (`mergeTargetAuth`), so a field the editor does not show survives. That holds while the edit
+    keeps the stored credential: another method kind, secret or provider replaces the stored
+    setting, so nothing unseen follows a credential it was not set for. A Transit Point whose
+    auth form was never opened sends the stored `target_auth` unchanged, and so does a Managed
+    Agent or Transit Point whose stored method the editor cannot show, until the operator
+    chooses a secret or a provider.
+  - **Never in the canvas data.** The Target authentication form fields, the stored copy and a
+    Transit Point's `target_auth` are left out of the canvas blob on save and ignored when one
+    is read (`withoutTargetAuth` in `elements/registry.ts`; the key lists are
+    `MANAGED_AGENT_TARGET_AUTH_FORM_KEYS` and `TRANSIT_POINT_TARGET_AUTH_FORM_KEYS`), so a node
+    the stored surface no longer has comes back without a Target authentication. A new form
+    field must be added to its key list.
+- **Transit Point secret picker.** For Bearer Token, API Key Header and Custom Header, the Transit
+  Point panel picks the secret from the secrets store (`transit-point/TargetAuthSecretField.tsx`,
+  labelled **Secret Reference**) and saves its `secret_id` as `method.static_secret.secret_id`. Options come
+  from the shared `components/shared/SecretOptions.tsx` (`Name (secret_id)`, tenant-aware, all
+  secret types). A refresh icon button beside the select reloads only the list
+  (`useTargetAuthSecrets`); it uses the Managed Agent panel's sync icon and spin but sits beside
+  the field, not on the label line, so it isn't missed. **Add secret** below opens `/secrets/new`
+  in a new tab, and the help text never changes. A stored secret that no longer exists stays
+  selected as `<secret_id> (not found)` with a warning; an out-of-tenant one keeps its
+  `outOfTenantLabel` and is explained in full below the field. A list that can't load says
+  "Couldn't load secrets." with **Try again**, or, when the request is refused (403), "You don't
+  have access to secrets. Ask an administrator."; both keep the stored value and show no refresh
+  button. The element's `validate` blocks Save while no secret is picked
+  (`targetAuthSecretProblem`, field `auth_secret`), since an empty secret would otherwise drop
+  target authentication. Test ids: `transit-point-target-auth-secret`, with `-refresh`,
+  `-add-link`, `-error`, `-missing`, `-outside-tenant`, `-load-error`, `-retry` and `-denied`.
 - **Tenant-aware pickers.** A surface's tenant (`tenantId` in `SurfaceMetaContext`, from the stored
   surface's `tenant_id`; `null` is appliance-wide, absent while creating) decides what the credential
   provider pickers (`TargetAuthProviderSelect`, `TransitCredentialBindingSection`,
-  `OutboundCredentialsListSection`) and the Custom Metadata secret menu offer: only items with the
+  `OutboundCredentialsListSection`), the Transit Point secret picker (`TargetAuthSecretField`) and
+  the Custom Metadata secret menu offer: only items with the
   same `tenant_id` (`utils/tenantScope.ts`, `splitByTenant`). The delegation pickers
   (`TransitCredentialBindingSection`, `OutboundCredentialsListSection`) also offer a tenant surface
   appliance-wide authorization code providers, which send the user's own token and which the gateway
@@ -624,6 +758,112 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
 | Add method button, menu, menu entry | `<area>-add-method-button`, `<area>-add-method-menu`, `<area>-add-method-<method type>` |
 | Selected method's settings (editor) | `caller-auth-editor-method-settings`                                                    |
 | JWT audience claim and its warnings | `caller-auth-jwt-audience-claim`, `-audience-claim-warning`, `caller-auth-audiences-missing-warning` |
+
+### Policy input capture
+
+- The surface's Capture view (`monitoring/capture/SurfaceCapturePanel.tsx`) has a **Policy Input**
+  card (`monitoring/capture/PolicyInputCaptureCard.tsx`) between the latest payload and the
+  payload history. Its header holds the **Listen to policy input** button
+  (`monitoring/PolicyInputCaptureControl.tsx`), shown only on a saved surface (never while
+  creating). The Monitoring view itself has only the Capture button.
+- The Capture view's toolbar holds **Pause**/**Resume** (payload capture only), **Clear**
+  (`btn-outline-danger`; it clears captured payloads and policy inputs) and **Copy All Stages**.
+  Every card title in the view is a `font-weight-bold text-primary` `h6`, and the Surface Route
+  line copies with the shared `CopyButton`.
+- The button is shown only while the `policy_input_capture` feature flag is on (see _Feature
+  flags_). While it is off, the card shows no button, no empty-state hint and no no-policy note;
+  an `alert alert-info` (`policy-input-capture-off`) says "Policy input capture is turned off on
+  this gateway. An administrator can turn it on under Settings › Admin › Feature Flags
+  (`policy_input_capture`)." Evaluations already in the list stay. Until the settings have loaded
+  the card shows neither the button nor that notice. When the settings could not be read
+  (`state.settingsLoadFailed` in `AppContext`, set while `settings` holds `FALLBACK_SETTINGS`;
+  `usePolicyInputCaptureFlag` returns it as `loadFailed` and is its only reader), the card shows
+  an `alert alert-danger` (`policy-input-capture-settings-error`) saying "Could not read the
+  gateway settings" with an `outline-danger` **Retry** (`policy-input-capture-settings-retry`)
+  that calls `actions.loadSettings`, in place of the turned-off notice. When the gateway's flag is turned off while
+  the page still reads it on, the gateway's refusal (`policy input capture is turned off`) ends
+  listening and shows as the inline error, like any other refusal.
+- Capture is live and lasts only while the view is open: the button turns into **Stop
+  listening**, and an effect keyed on the surface and the listening state sends
+  `capture_policy_input` (and its cleanup `stop_capturing_policy_input`) on the dashboard
+  WebSocket through `actions.listenToPolicyInput` in `AppContext`. Clicking again, leaving the
+  Capture view (unmount) or reloading the page stops it; a new surface id moves listening to that
+  surface. Nothing is stored, so a reload starts with listening off. `AppContext` keeps the open
+  listens in a `PolicyInputListens` (`context/policyInputListens.ts`) and sends them again after a
+  socket reconnect. There is no duration and no admin API call.
+- While listening, a green "Listening" indicator shows when the dashboard socket is connected
+  (`state.wsStatus === 'CONNECTED'`), and a warning "Waiting for the dashboard connection" in its
+  place otherwise. While the Capture view's Pause holds the payload stream during a listen, a
+  muted line (`policy-input-capture-paused-note`) says "Pause holds payload capture only; policy
+  input keeps arriving. Use Stop listening to stop it." (`SurfaceCapturePanel` passes
+  `stream.isPaused` to the card as `payloadPaused`, and the card to the control.)
+- The button needs both `surfaces.edit` and `policies.edit`; without either it is disabled with
+  "Needs permission to edit surfaces and policies" beside it. When the gateway ends listening
+  (`listening: false` with an `error`, such as a refusal, an ended session or a permission lost at
+  a keep-alive ping), the button
+  goes back to **Listen to policy input** without sending a stop of its own
+  (`listenToPolicyInput(id, false, false)`), and an `error` shows inline beside it until the user
+  clicks again or a later answer starts listening. A `listening: false` answer without an `error`
+  answers this page's own stop and changes nothing, so a stop answered after the user listened
+  again doesn't turn the button off.
+- The card follows the Capture view's existing cards, Payload History in particular: a
+  `card shadow mb-4` whose `text-primary` `h6` header holds the icon, the title and a `count/max`
+  `text-bg-primary` badge, with the warning and muted hint lines beneath it (see below) and the
+  listen control on the right; a
+  `table table-hover table-sm` with a **Timestamp** column rendered by `formatDateTime(…, true)`
+  (`timestamp-cell`) and the policy slot as a `text-bg-secondary` badge, like a payload's Channel;
+  the no-policy note as an `alert alert-info` with an icon, like the route and Target lines. The
+  input's copy button is the shared `CopyButton`, which shows a check when it copied; a failed
+  copy shows an error toast. The rest of the Capture view keeps its own markup.
+- The card lists the last 50 `policy_input_captured` WebSocket updates of the surface (see
+  `monitoring/capture/usePolicyInputCaptureStream.ts`), newest first: time, policy slot with a
+  variant badge and, under it, the name and version of each policy the slot ran (`policies`; the
+  name, else the id, else "inline policy"; the member that denied a gateway or appliance-wide set
+  in red with "(denied)"), a decision badge (Allow green, Deny red, Error yellow) with the reason, a
+  **Show input** toggle that opens the input JSON, and a copy button for the input. Above the
+  list an "All policy slots" select shows one slot's rows (the header's hint says the last 50
+  evaluations are kept and that one request can add several rows); a chosen slot that has
+  left the list (cleared or rolled off) falls back to all slots. With none it says to
+  listen and send a request, and that on an appliance with several nodes only requests served by
+  this dashboard's node show. Clear applies to it too; Pause holds only the payload
+  stream, so the card keeps every evaluation of a listen while payloads are paused, and says so
+  while a listen is on. Each row's input is formatted as JSON only when its row is opened or
+  its copy button is clicked (`CopyButton` takes `text` as a string or a function that builds
+  it). When the gateway reports
+  captures it dropped for this dashboard (`policy_input_skipped`), a warning alert
+  (`policy-input-capture-skipped`) above the list says how many evaluations were not shown;
+  Clear resets it. The header stacks
+  the title and count badge, then a warning line (`text-warning` with a triangle icon,
+  `policy-input-capture-warning`): "For developing and testing policies only", then the muted
+  hint line; the Listen control sits on the right.
+- While the surface has no policy the gateway captures (`surfaceHasPolicy`: an Access Point,
+  Target or Target response policy, the shared Transit Point policy
+  `transit.opa_policy_definition_id`, a Transit Point policy or response policy, or a variant's
+  Access Point, Target or Target response policy), the card shows an info note above the list: the surface has nothing of
+  its own to capture, only a gateway or appliance-wide policy shows, and a request policy (an
+  allow-all one is enough) should be added first. The button's `FieldHelp` says the same.
+- The note that captures show each request and response policy evaluation (not MCP tool
+  policies), only those of this dashboard's node on a multi-node appliance, hold request data with
+  credentials masked, reach only the listening user, are neither logged nor stored, are for
+  developing and testing policies only, and stop when listening stops sits behind the button's
+  `FieldHelp`.
+- The Audit Log's Category filter offers `policy_input_capture_started` and
+  `policy_input_capture_stopped` ("Policy Input Capture Started" / "Stopped", in the overflow
+  menu like the other low-frequency categories).
+
+| Policy input capture element                    | Test id                                                                |
+| ----------------------------------------------- | ---------------------------------------------------------------------- |
+| Control, button, listening, missing permission  | `policy-input-capture`, `policy-input-capture-listen`, `policy-input-capture-listening`, `policy-input-capture-not-allowed` |
+| Waiting for the connection                      | `policy-input-capture-waiting`                                         |
+| Pause note while listening                      | `policy-input-capture-paused-note`                                     |
+| Hint line (kept count), slot filter             | `policy-input-capture-kept`, `policy-input-capture-slot-filter`        |
+| Warning line, skipped notice                    | `policy-input-capture-warning`, `policy-input-capture-skipped`         |
+| Help and error                                  | `field-help-policy-input-capture`, `policy-input-capture-error`        |
+| Card, empty state, no-policy note, row          | `policy-input-capture-card`, `policy-input-capture-empty`, `policy-input-capture-no-policy`, `policy-input-capture-row` |
+| Turned-off notice                               | `policy-input-capture-off`                                             |
+| Settings read error, its Retry                  | `policy-input-capture-settings-error`, `policy-input-capture-settings-retry` |
+| Reason, input toggle, input, copy               | `policy-input-capture-reason`, `policy-input-capture-toggle`, `policy-input-capture-input`, `policy-input-capture-copy` |
+| Policy the slot ran                             | `policy-input-capture-policy`                                          |
 
 ## Trust Check
 
@@ -1265,9 +1505,11 @@ link in a token's expanded row on Credential Tokens, both shown with `audit.view
 The delegation categories are the ones the gateway audits: `consent_granted`, `consent_expired`,
 `consent_limited`, `token_revoked` and `user_tokens_revoked`. What the gateway does with a credential on each call
 (`token_injected`, `token_refreshed`, `refresh_failed`, `consent_required`, `token_not_found`
-and the elicitation events) is written to its log and is no audit event, so the Audit Log
-offers no category for it and no link selects it. A record of one that an older gateway
-audited is still shown, with its label (`categoryLabel`).
+and the elicitation events) is written to its log, or nowhere while `[logging] delegation_events`
+is `false`, and is no audit event, so the Audit Log offers no category for it and no link selects it. A record of one that an older gateway
+audited is still shown, with its label (`categoryLabel`). A category `categoryLabel` has no label
+for is named in title case from its event name (`auth_failed` as "Auth Failed"), with `API`, `DID`,
+`JWT`, `MCP` and `VP` in capitals, never as the raw lowercase name.
 
 - The Audit Log offers each delegation category in its Category filter, labels and narrates
   `consent_expired` ("Consent expired", a warning, apart from a revocation) and
@@ -1432,7 +1674,7 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   (`credential-provider-consent-limit-error`, `invalid-feedback`) and takes the focus. Changing
   the number or the unit clears the field's error. On a stored provider, a limit shorter than the
   stored one, one set where none was, or an emptied field where a limit was stored (sent as `0`,
-  since the gateway's default may then be the shorter) is sent to
+  since the gateway's default or ceiling may then be the shorter) is sent to
   `GET /credential-providers/{id}/consent-impact?max_consent_age_secs=<seconds>` once the field
   has stayed unchanged for 400 ms (`EditCredentialProviderPage/useConsentImpact.ts`). While its
   `ending_consents` is above 0, a warning under the field
@@ -1461,8 +1703,8 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   (`text-bg-success`), or a "Deactivated" badge (`credential-provider-deactivated-badge-<id>`,
   `text-bg-secondary`) with "No new consent" under it. The Type column shows only the type. The
   row stays in the list either way. Deactivate and Activate are shown with
-  `credential_providers.edit`, the permission their routes ask for; the tab's other controls
-  keep `settings.edit`.
+  `credential_providers.edit`, the permission their routes ask for, as **Add Provider** is; the
+  row delete button is shown with `credential_providers.delete`.
   The editor shows a warning (`credential-provider-deactivated-notice`) that nobody can consent
   again while access already given keeps working, and never sends `deactivated_at` on save. The
   Delegated Access tab marks the access of a deactivated provider "No new consent"
@@ -1474,6 +1716,26 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   HTTP Basic or Form body, from `CLIENT_AUTHENTICATION_LABELS`); no badge without one. A
   refused delete shows the API's reason and, for a `409`, the surface that binds the provider
   (`providerDeleteError`).
+- Credential provider pages follow their own permissions, not `settings.*`.
+  `/credential-providers/new` needs `credential_providers.edit`; `/credential-providers/:id`
+  needs `credential_providers.view`. A user with view but not edit gets the editor read-only: the
+  form is a disabled `fieldset`, there is no Save (`Cmd+S` and Enter do nothing), and
+  `credential-provider-editor-read-only-notice`, the first thing in the card, explains why.
+  The Callback URL notice (`credential-provider-callback-url`) then shows above the form
+  instead of inside it, since a disabled `fieldset` would disable its copy button. A
+  save error shows in an alert (`credential-provider-editor-error`), and Back and Cancel (which
+  reads **Back** while read-only) return to `/credentials?tab=credential-providers`. The tab
+  shows **Add Provider** with `.edit` and the row delete button with `.delete`.
+- The Credentials page and its sidebar entry open for `settings.view`,
+  `credential_providers.view` or `delegation_vault.view` (`ProtectedRoute`'s `permission` takes
+  one permission or a list of which any one is enough). The JWT Verification tab needs
+  `settings.view`, the Credential Providers tab `credential_providers.view`, and the Credential
+  Tokens and Delegated Access tabs `delegation_vault.view`, the permission the vault API asks
+  for. The page opens on the first of JWT Verification, Credential Providers and Credential
+  Tokens the user may see.
+- The credential provider routes live in `src/pages/credentialProviderRoutes.tsx`. The retired
+  OIDC Providers pages are gone; `/oidc-providers` and every path under it redirect to
+  `/credentials?tab=credential-providers`.
 
 ## Secret editor
 
@@ -1488,6 +1750,20 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
 - **Show the value you entered** (`secret-value-reveal-checkbox`) appears only while the
   value field is editable, and reveals only what was typed or generated on this page. The
   value field is `secret-value-input`.
+- Deleting a secret from the Secrets page asks the gateway first. A 409 with `references` (a
+  surface, credential provider, A2A proxy or STS client that uses the secret) opens
+  `ConfirmDeleteSecretModal` (`confirm-delete-secret-modal`), built on the shared
+  `components/shared/WarningDialog.tsx`: it names each reference by kind and
+  name (`ReferenceList`), adds "and N more you cannot view" for `hidden_references`, and offers
+  Cancel (focused first, sends nothing) and **Delete secret anyway** (`confirm-delete-secret-confirm`, repeats
+  the delete with `?force=true`). While the forced delete runs both buttons stay focusable with
+  `aria-disabled` and ignore clicks, so focus stays in the dialog. A 409 without `references` (an integration endpoint uses the
+  secret) and every other failure show inline (`secrets-delete-error`), with no override and no
+  toast.
+- A refused credential provider delete shows the `providerDeleteError` message inline on the
+  Credential Providers tab (`credential-providers-delete-error`), with no override. The
+  provider editor lists the references of a refused retype under its error
+  (`credential-provider-editor-references`).
 
 ## API key delete
 
@@ -1522,6 +1798,53 @@ When the key's surface was deleted (`surface_deleted: true` on `GET /api-keys/{a
 the detail page shows the info alert "This API key is no longer in use because the associated
 surface has been deleted." (`api-key-surface-deleted-info`) at the top of Key Information.
 
+## Surface delete
+
+The surface page's delete button (`surface-delete-button`, `btn-danger` with a trash icon, shown
+only with `surfaces.delete`, which the gateway requires for the `DELETE`; `surfaces.edit` alone
+shows Save but no delete button) sends nothing: it opens `surface-delete-confirm`, a
+[confirm popover](#confirm-popover) beside the button (on its right when the builder sidebar is
+at the window's left edge), and clicking the button again
+closes it. Its title "Delete Surface?" carries a red `fa-triangle-exclamation` icon. Its body
+first names the surface, "Delete `<name>`?" in bold (`surface-delete-confirm-name`, the surface
+id when it has no name), then reads "You are about to permanently delete this surface and all
+associated configuration. This action cannot be undone." then "Are you sure you want to
+continue?". **Delete** (`surface-delete-confirm-confirm`, `btn-danger`) sends the `DELETE`;
+**Cancel** (`surface-delete-confirm-cancel`), the close button, Escape and a click outside send
+nothing. While the delete runs, Delete shows `…`, Delete, Cancel and the close button are
+disabled, Escape and a click outside do nothing, and the page's delete button shows a spinner.
+Delete is also disabled while a save runs, and Cmd/Ctrl+S does not save while the popover is
+open. A delete succeeds with the toast `Surface "<name>" deleted` and returns to `/surfaces`; a
+failed one closes the popover, returns focus to the delete button and shows the gateway's message
+in `surface-error-alert`. The popover closes if the page moves to another surface.
+
+## Confirm popover
+
+`components/shared/ConfirmPopover.tsx` is the shared inline confirmation: a speech bubble beside
+the button that opened it (`role="dialog"` named by its title), portalled to `<body>`. It opens
+to the left of the button (`confirm-popover--left`) and flips to its right
+(`confirm-popover--right`) when the left has no room, as for the surface page's trash button in
+the builder sidebar with the navigation collapsed; it stays at least 8px inside the window on
+both axes, and its tail points at the button's middle. Cancel takes focus when it opens and focus returns to that button when it closes, and while it
+is open no key reaches a `window` listener, so the page's shortcuts (Cmd/Ctrl+S, the Surface
+Builder's canvas keys) never act behind it. Its `icon` is `fa-info-circle` (default) or
+`fa-triangle-exclamation`, shown red when `confirmVariant` is `danger`. Each use passes its own
+`testId`; the confirm and Cancel buttons are `<testId>-confirm` and `<testId>-cancel`. Its
+styles are the `.confirm-popover*` classes in `dashboard.css`.
+
+Two pages use it:
+
+- **Surface delete** (`surface-delete-confirm`), above.
+- **Policies list** (`policy-confirm-popover`), from a row's delete and Enforce globally
+  actions: "Delete policy" with a red **Delete**, naming the policy and how many surfaces or
+  gateways reference it, and "Enforce globally" with **Continue**, naming how many will enforce
+  it. Confirm is disabled while that count loads.
+
+Use the popover to confirm one action on the button that triggers it. Use
+`components/shared/WarningDialog.tsx`, a centred modal, when the confirmation needs more room or
+blocks a flow, as API key delete and revoke, the secret delete confirmation
+(`ConfirmDeleteSecretModal`) and the Authority-in-use dialog do.
+
 ## Authority delete
 
 The Authorities list (`pages/AuthoritiesPage.tsx`, `authorities-delete-button-<id>`) and the
@@ -1544,13 +1867,525 @@ the list page's error alert and the editor's error toast. Every value is rendere
 
 ## Policy definition editor
 
-The **Policy Instructions & Examples** panel on the Create Policy Definition page is collapsed
-by default. Its title is a heading holding one full-width button (`policy-instructions-toggle`,
+The create and edit pages share one editor card in three sections, each titled by
+`PolicySectionTitle` (unnumbered, like the other edit forms; the dashboard numbers steps only in
+`WizardProgress` wizards), separated by a rule. The page follows the credential provider editor
+(`/credential-providers/new`): section titles are `font-weight-bold text-primary` `h6`s with a
+Font Awesome icon (Start from `fa-layer-group`, Details `fa-info-circle`, Policy `fa-code`);
+each field label is a plain `<label className="mb-0">` in a `field-label-with-help` row with its
+`FieldHelp` beside it, never inside the label; inputs and selects are full-size `form-control`
+(never `form-control-sm`); and Name, which is required, carries a red `*`.
+
+- **Start from** (create only): `TemplateGallery` (`policy-template-gallery`), described under
+  _Policy templates_. For users with `policies.edit` the create form shows only this section
+  until a template is used or a custom policy created; Details and Policy then appear. Until
+  then the header has no **Create** button (`policy-definition-editor-save-button`) and
+  Cmd/Ctrl+S saves nothing.
+- **Details** (`PolicyDetailsSection`, `policy-details-section`): Name full width, then
+  Description full width as a two-row textarea, then Type (when shown, see below) and Status
+  (an **Enabled** switch, `policy-definition-enabled-switch`) side by side, so the two controls
+  line up (the Status label is a `span`, as the switch has its own label), with the Status
+  explanation in a `FieldHelp`. The Rego, template setting and sample input labels follow the
+  same label rule. On a saved policy the Policy ID and SHA follow on one
+  line of monospace values, each with a copy button (`policy-definition-id`,
+  `policy-definition-sha`, `-copy-button`), never as disabled inputs.
+- **Policy** (`PolicyEditorSection`, `policy-editor-section`): a **Rules | Rego** switch, one
+  joined `btn-group btn-group-sm policy-view-switch` (`role="group"`, `aria-label="Policy view"`)
+  of two `AppButton`s with icons, the active one `primary` and the other `secondary` (white, light
+  grey border; the shared dark-theme rules apply), both the same width (`min-width: 5.5rem`) and
+  with no shadow so the halves sit flush (`policy-view-rules`, `policy-view-rego`,
+  `aria-pressed`), a status row with the rule count, default decision,
+  compile status (`policy-compile-status`) and **Add rules from a template**. Both views stay
+  mounted and the hidden one gets `d-none` (`policy-view-rules-panel`, `policy-view-rego-panel`).
+  Both a new and a saved policy open on Rules; only Write Rego, Open Rego and a rule's line
+  numbers switch to the Rego view. The Rego view has the **Rego reference** panel, then the textarea
+  (`policy-rego-textarea`, `wrap="off"`) with a line-number gutter (`.policy-rego-gutter`)
+  that follows its scroll, so the line numbers in the Rules view match, then compile errors and
+  the package mismatch with **Fix it**.
+
+The editor and its templates use the shared dashboard components, not local copies: every
+action button the templates add is an `AppButton` (size `sm`; link-style actions use
+`variant="link"`), while the editor's own Save/Create and **Fix it** stay the plain Bootstrap
+`btn btn-sm` buttons they always were; a policy's or template's default decision is
+`DecisionBadge` (`TemplateBadges.tsx`, `.policy-default-decision`, always "Default DENY" or
+"Default ALLOW"): a quiet outline in `--muted-text` with an `fa-shield-alt` icon for DENY, and
+amber (`--warning-text` on a light amber tint) with an `fa-exclamation-triangle` icon for ALLOW,
+because allowing by default is the less safe choice; the icons are `aria-hidden`, the tokens
+switch with `body.dark-theme`, and the Audit Log's `.audit-decision` pill is left as it is (the
+Rules view's decision summary reuses its `audit-decision--deny` pill, unchanged, for
+"Otherwise: DENY"); the `DecisionBadge` tooltip says "Denies requests that no rule allows" for DENY and "Allows
+requests that no allow rule decides" for ALLOW; an
+example's expected and actual decision
+and the gallery's MCP tool policy tag (`secondary`) are `Badge`s (a template's `reads` paths
+are matched by the Add rules search, never shown), an alert the templates add that carries an action is a non-collapsible
+`InfoBanner` with the button as its child and the test id on a wrapping `div`, the template
+search and category filter is the shared `SearchInput` and `FilterChipGroup`
+(`TemplateFilterBar.tsx`), code blocks use `.policy-preview-block`, and the templates column's
+panels are a `card shadow mb-4` with the standard `card-header py-3` title (`h6 m-0
+font-weight-bold text-primary`) and their description in the body. A policy Type's name comes
+from the one `POLICY_TYPE_NAMES` map in `policyTemplates/types.ts`, and the editor sets no
+inline `style` except `SearchInput`'s `wrapperStyle` for the full-width column search, as
+`LogsFilterBar` does, and the Test (dry-run) panel's run button and sample input; error text in
+its alerts and the Rego view's uses `.policy-error-text`. `PolicyTemplates.css` uses the
+`dashboard.css` tokens, never an undefined token, and no literal colour but `rgba` tints of
+the brand blue and amber, as `dashboard.css` uses, and white on `--primary-solid`: a dark surface is
+`--dark-card` with `--dark-border`, borders take the brand colours (`--accent-blue`,
+`--danger`) and text the text-safe ones, and a rule summary, Policy ID and SHA are plain
+`<code>` in the dashboard's code colours. Text in the Rego reference takes the heading, body and
+`alert-warning` colours, never `text-dark`, which `body.dark-theme` does not swap outside a card
+header. The exceptions are the selectable `.policy-template-row` cards and rows (`--gray-0`, or
+`--dark-card` under `body.dark-theme`, selected with the Audit Log's `.audit-item--selected`
+`--accent-blue` border and tint),
+the Rego reference heading toggle, the examples card's `btn-close`, Back, the Rego view's package-mismatch
+alert with **Fix it** (Bootstrap `alert-danger`), the Rules view's
+rule-kind badges (`.policy-rules__kind`, a neutral `--muted-text` outline for every kind, so a
+rule's kind never reads as an allow or deny decision), the Add rules template badge
+(`AddsRulesBadge` in `TemplateBadges.tsx`, the same outline), and the Rules view's amber group lines
+(`.policy-rules__misfit`, `--warning-text` on a light amber tint, with a `body.dark-theme`
+border).
+
+A definition that fails to
+load shows only Back and the error (`policy-definition-load-error`), never an editable form.
+Without `policies.edit` the page is read-only, since the gateway refuses a create or save
+without it: a muted line with a lock icon under the intro says "You can view this policy but not
+change it." (`policy-definition-read-only-note`), the Rego textarea is `readOnly`, Name and
+Description are `readOnly`, Type and Enabled are disabled, there is no Create or Save button
+(`policy-definition-editor-save-button`), Ctrl+S does nothing, a package mismatch offers no
+**Fix it**. There is no Test (dry-run) panel
+(`policy-simulate-panel`), since the gateway's simulate endpoint also needs `policies.edit`,
+and no gallery, templates column, Add rules or Remove (below).
+
+The **Rego reference** panel in the Rego view is collapsed by default. It lists the two inputs a
+policy can get, each with a link to its section of the OPA policies reference page: the
+request's caller context that gateway and surface policies read (`PolicyInput` in
+`src/surface_context/mod.rs`: `input.source_auth`, `input.http`, `input.gateway`,
+`input.transit`, `input.mcp`, `input.trust_check_results`, `input.extension_identity`;
+`policy-instructions-input-fields`),
+which the Test (dry-run) default sample input follows, and the tool call that a policy bound to
+MCP tools reads (`McpPolicyContext` in `src/mcp/policy.rs`: `input.jwt`, the claims of the
+request's `Authorization` bearer token, `input.mcp.method`, always `tools/call`,
+`input.mcp.params.name` as the tool name, `input.channel`, `input.request`;
+`policy-instructions-tool-input-fields`). Its title is a heading holding one full-width button (`policy-instructions-toggle`,
 with `aria-expanded` and `aria-controls="policyDefInstructions"`), so the whole header row
 toggles, Enter and Space work natively, and screen readers still announce the heading. The
 title is `policy-instructions-title`, the arrow `policy-instructions-chevron` sits inside the
 button and flips with the state, and the body is `policy-instructions-body`. Build collapsible
 panels the same way, and do not put `role="button"` on a wrapper around a heading.
+
+### Policy templates
+
+Policy templates live in `pages/SettingsPage/policyTemplates/`. The editor never calls a
+template API. The only templates are the built-in catalogue that ships with the dashboard in
+`builtinPolicyTemplates.json`; nothing saves, stores or shares a template, and there is no
+Save as template. No template is marked Recommended. The page's template state and
+the actions that change the Rego, each with Undo, live in `usePolicyTemplateActions`, and the
+Start from gallery's state (open, selected card, focus, what the policy started from, Use and
+Create custom policy) in `useTemplateGallery`.
+
+- **Layers.** The folder is kept reusable in three layers, and an import only points down:
+  - *Logic* (plain `.ts`, no React): `types.ts` (with `FieldText`, `UsedTemplate`,
+    `AddedRules`), `policyDefaults.ts`, `regoRules.ts` (parsing, rule use),
+    `regoTemplate.ts` (rendering, `insertTemplateRules`, `defaultDecision` for a catalogue
+    template and `policyDefaultDecision` for the editor's policy, which reads only its
+    top-level `default allow`), `templateSettings.ts` (setting
+    text to Rego), `policyStart.ts` (`policyStart`, `replaceText`, `groupsForOtherType`) and
+    `policyTemplateLibrary.ts` (`groupTemplateEntries`, `galleryTemplates`, `surfaceOnlyKeys`
+    and `buildTemplateLibrary`). Functions take `readonly` template lists.
+  - *Hooks*: `useTemplateSettings`, `useTemplateFilter`, `usePolicyTemplateActions`,
+    `useTemplateGallery`.
+  - *Components* (`.tsx`), which export components only, so no logic lives in a component
+    file.
+- **App seams.** The feature calls the dashboard's `showUndoToast` (the undo toast) and
+  `simulatePolicy` (the dry-run endpoint) directly. After a save the page reads the definition
+  back and merges only its `content_hash` and `updated_at` into the form, so the SHA shown is
+  the saved revision's; when that read fails the SHA is hidden. The page takes the
+  templates from `POLICY_TEMPLATE_LIBRARY` (`builtinPolicyTemplates.ts`, `{entries, templates}`,
+  built once from the catalogue by `buildTemplateLibrary`, Agent Surface variants first;
+  `templates` feeds `groupsForOtherType`), and hands them to
+  `useTemplateGallery` (`entries`, which returns the gallery's `cards` and `surfaceOnly`) and to
+  `PolicyTemplatesPanel` (`library`), so `TemplateGallery` and the panel never list templates
+  themselves. The catalogue (`builtinPolicyTemplates.*`, with its `DOCS_URL` links and
+  `POLICY_TEMPLATE_LIBRARY`) and `RegoReference` are dashboard content, not part of the
+  reusable layers.
+
+- **Catalogue.** A JSON entry holds its rules without a `package` line and lists the
+  `policy_types` it serves; `builtinPolicyTemplates.ts` adds the package per type. Every entry
+  must compile on the gateway's Regorus and give each example's `expected` decision (checked
+  by the gateway's tests, below), and may
+  read only fields of the gateway's `PolicyInput` (`src/surface_context/mod.rs`). Caller
+  identity is `input.source_auth` (`method`, and for `jwt_bearer` its `subject` and `claims`);
+  gateway and surface policies get no `input.jwt`. Templates that read `source_auth`,
+  `trust_check_results` or `agent` list only `agent_surface`. Entries follow the Apply Policies
+  guides and the OPA policies concept and reference pages on docs.affinidi.com; each has `docs`
+  (`page`, a `DOCS_URL` key of a direct doc-site URL, since the catalog redirect may drop a
+  `#section`; `anchor`; `label`), which becomes the template's `docs_href` and link text. Entries
+  with `"input": "mcp_tool"` (category **MCP tool policies**, `agent_surface` only) are for
+  policies bound to MCP tools, which decide each `tools/call` to an MCP Target: they read
+  `McpPolicyContext` (`src/mcp/policy.rs`: `input.jwt`, the claims of the request's
+  `Authorization` bearer token, which their descriptions say needs JWT Bearer caller
+  authentication on that header; `input.mcp.method`, always `tools/call`; the tool name in
+  `input.mcp.params.name`), carry an "MCP tool policy" badge in the gallery, and are whole
+  policies (below). Trust check templates group `input.trust_check_results.target` by `id`, so
+  a check that queries several authorities counts once and passes when any of its results is
+  `ok`. Allow listed surfaces matches `input.channel.config_id`, the surface id, not its name. A setting is a `{{key}}` placeholder with `kind` `integer` (`min`, `max`),
+  `string`, `string_list`, `choice` or `time_of_day`. A string's `format: "time_zone"` accepts
+  IANA names only (written in their canonical spelling); a list's `allowed` names the only values
+  accepted, matched without regard to case and written in the listed spelling, and an `optional`
+  list may be left empty, written as `set()`; a `choice` (a select) writes the `rego` text of the
+  picked option, which may be empty; a `time_of_day` (a time input) takes `HH:MM` and writes the
+  minutes since midnight, and its `differs_from` names a time it must not equal. Business-hours
+  access window uses them all: its **Inside the window** choice writes `in_access_window`
+  (Allow requests) or `not in_access_window` (Deny requests) into an `allow` rule that first
+  requires `access_minute`, so a time zone the clock can't read denies in both modes; its
+  **From** and **Until** times make a window that crosses midnight when Until is earlier, its
+  **Days** may be empty for every day (a day is the request's date in the time zone, also for
+  the hours after midnight: Monday to Friday 22:00–06:00 covers 00:00–06:00 and 22:00–24:00 on
+  Monday to Friday, which the Until help says with that example), and it is a
+  whole policy, since added to another policy its allow rule would let requests through
+  whatever that policy's other rules say. A template that reads the clock (`time.now_ns()`) has no examples.
+  An entry is `standalone` when it is meant to be the whole policy: its rules only set the
+  default decision (Deny by default, Monitor-only baseline) or allow requests outside what they
+  restrict (Restrict MCP tools by role, Allowlist outbound destinations).
+  `templateRole` (`regoTemplate.ts`) gives every template one role: `policy` (a **Whole
+  policy**) for a standalone template, an MCP tool template, or one with no rules left once its
+  `default allow` line is dropped; `rules` (**Adds rules**) otherwise. A whole policy is used
+  only from Start from; only templates that add rules are listed under Add rules. Each column
+  row and preview under Add rules shows the `AddsRulesBadge`
+  (`policy-template-role-badge`: "Adds rules" with `fa-list-check`); Start from cards and their detail show no role or default decision badge.
+  A custom policy is a whole policy. Allow listed
+  paths denies a path that contains `..`, `%2e`, `%25`, a backslash or `%5c`, with those checks
+  inside its one `allow` rule rather than in a helper rule.
+- **Settings defaults.** A deployment-specific setting (issuers, audiences, DIDs, outbound
+  destinations, path prefixes, surface IDs, subjects, role and claim values, safe tool names)
+  has an empty `default` and a `sample`. Behaviour switches (business-hours mode), counts (N),
+  universal values (time zone `UTC`, method `GET`, the business-hours days and times) and
+  well-known claim names (`role`) keep a prefilled `default` and no `sample`. A setting with a
+  `sample` starts empty with `e.g. <sample>` as its placeholder and `aria-required`; while it is
+  empty (`missingSettings` in `templateSettings.ts`) it shows "Required before the template
+  can be used." under the field (`<field test id>-required`, `small text-muted`, linked by
+  `aria-describedby`, never `is-invalid`), and Use this template and Add to policy stay
+  disabled, since an empty list renders no Rego. Show Rego and the lines Add to policy adds
+  preview the Rego with each empty setting's sample (`renderPreview`), with "Shown with sample
+  values for the empty settings." above it (`SampleValuesNote`, `<prefix>-sample-note`); Use
+  and Add to policy write only what was typed. How it decides says "Examples use the default
+  settings and the sample values shown in empty fields." on a template with a sample.
+  `builtinPolicyTemplates.test.ts` checks every entry renders under its package with its
+  samples, lists the settings that have one, and checks each of them blocks rendering while empty.
+  `__fixtures__/renderedTemplates.json` holds the modules `regoTemplate.ts` renders: every
+  entry under each of its types with its defaults and samples (`sampleParameterValues`,
+  `<id>:<type>`), and the Business-hours
+  access window with the settings `renderedTemplates.test.ts` names (`<id>:<variant>:<type>`).
+  That test writes it and fails while it differs, has a missing or an extra key; never edit
+  it by hand, regenerate it with `UPDATE_RENDERED_TEMPLATES=1 CI=true npm test --prefix
+  www/default -- --watchAll=false renderedTemplates` and commit it with the catalogue or
+  renderer change. The gateway's `src/policies/builtin_templates_tests.rs` compiles every
+  module with Regorus, decides each catalogue example, requires a module for every entry and
+  type, and evaluates the business-hours variants at fixed instants. The catalogue
+  holds the starter templates of the template library except rate controls, which are set on
+  the surface's Rate Limit panel.
+- **Rendering.** `regoTemplate.ts` fills settings as Rego literals: integers checked against
+  their range, list values as JSON string literals in a set, so a value cannot end its string.
+  A setting that fails its check shows its error under the field and blocks Use and Add to
+  policy. A `time_zone` setting refuses a UTC offset such as `+01:00`, which browsers accept
+  and the gateway's Regorus does not; a name must start with a letter and hold no `:`.
+- **Start from gallery** (create only, `policies.edit`): `TemplateGallery` is the only place a
+  policy starts from a template. A new policy has no card selected and shows only Start from:
+  Details and Policy appear once a template is used or a custom policy created (`templatePicked` in
+  `usePolicyTemplateActions`, `true` on a saved policy and a restored draft; the Undo of the
+  first Use sets it back, which hides them and reopens the gallery). Until then the form's Rego is `DEFAULT_POLICY` (`policyDefaults.ts`,
+  `default allow := false`). The
+  grid of cards in the `.policy-template-row` style (`policy-template-card-<key>`, with
+  `is-selected` and `aria-pressed`) holds one card per template with a variant for the
+  policy's Type (`buildTemplateLibrary` groups a template's variants under its catalogue id;
+  `galleryTemplates` keeps only the policy's Type), so **Define Gateway Policy** (`?type=gateway`) lists only templates for
+  gateways and **Define Agent Surface Policy** (`?type=agent_surface`) only templates for
+  surfaces. Each card shows its summary and category, **MCP tool policy** where it applies,
+  and no role or default decision badge. On an Agent Surface policy
+  a template with no Gateway variant (`surfaceOnlyKeys`) has a muted "Agent surface only" note
+  at the card's end (`policy-template-card-scope`, `.policy-template-card__scope`, `0.75rem`
+  in `--muted-text`), never a `Badge`. The gallery has no search or category filters. Six
+  templates show until **Show all (N)** (`policy-template-gallery-show-all`, an
+  `outline-secondary` button), which moves focus to the first card it brings into view. Under the list, after a top border, "None of these fit?" and
+  **Create custom policy** (`policy-template-gallery-create-custom-button`, `outline-primary`
+  with `fa-plus`, `aria-pressed` while its detail is shown; `.policy-template-gallery__custom`)
+  follow the Trust Registry pattern: pick a template, or create a custom one. It calls
+  `pickBlank` (Rego `ALLOW_ALL_POLICY`, used template `blank`, its start named "Custom policy";
+  the Name and Description are emptied, typed or filled, and its Undo restores them) at once,
+  unless a template was used and the Rego is no longer an untouched start (`replaceText` in
+  `policyStart.ts` is not null): then it selects `blank`, and the templates column
+  shows the Custom policy detail, whose **Create custom policy** asks in place before it
+  replaces anything, its question ending "and empties the Name and Description." The help text above the grid points to
+  **Add rules from a template** by name, not by where the column sits, since the column stacks
+  under the editor below `xl`. The page holds the gallery's open state and selected card, and
+  while the gallery is open the templates column shows `TemplateGalleryDetail`
+  (`policy-template-gallery-detail-panel`, a `card shadow mb-4` titled "Template details") in
+  place of Add rules. With no card selected it says "Pick a template under Start from to see
+  what it does, then use it." (`policy-template-gallery-detail-empty`, the
+  `.policy-templates-panel__placeholder` style). Choosing a card selects it, shows its detail
+  there (`policy-template-gallery-detail`) and moves focus to the detail's heading
+  (`policy-template-gallery-detail-heading`, `tabIndex={-1}`); Change with no card selected
+  focuses the first card. The Custom policy detail has its description,
+  **Show Rego** with `ALLOW_ALL_POLICY` and **Create custom policy** in place of Use. A template's detail is built from
+  `TemplatePreview.tsx` and `useTemplateSettings` like the column's preview: description, setting fields (`policy-template-gallery-param-<key>`), **Show Rego**
+  (`policy-template-gallery-show-rego`, collapsed by default), which shows the Rego the current
+  settings render to in a `policy-preview-block` (`policy-template-gallery-rego`), or "Fix the
+  settings above to see the Rego." while a setting is invalid, **How it
+  decides** with each example's sample input behind **Show input**
+  (`policy-template-gallery-example-input-<i>`, `-json`, at most `16rem` tall and scrolling,
+  `.policy-template-example-input`), the docs link
+  (`policy-template-gallery-docs-link`) and **Use this template**
+  (`policy-template-gallery-use-button`), disabled while a setting is invalid or a required
+  one is empty (_Settings defaults_ above). Nothing fills
+  the form until Use, which fills Description and Rego with the settings shown, never the
+  Name, and offers Undo, which restores those fields and the used template. The page keeps
+  the used template, `usedTemplate: {id, fieldText} | null` in `usePolicyTemplateActions`, which
+  only Use and Create custom policy set (`blank` for a custom policy); everything else is derived from it and the
+  Rego. Use fills the Description only while it is empty or still as the last Use filled it
+  (the template's own description); a typed one is kept, for every card. The gallery then collapses to one line
+  (`policy-template-gallery-summary`) and the templates column goes back to Add rules. `policyStart` (`policyStart.ts`), computed once by the
+  page and passed to the gallery, decides what it says. The Rego still follows its start while
+  each template group in it holds exactly the lines Add to policy wrote (`addedRules` in
+  `usePolicyTemplateActions`, `{name, body}` per Add, restored by Undo with the rest) and the
+  Rego with those groups taken out equals what the start renders to: the used template with
+  its settings, `ALLOW_ALL_POLICY` for a custom policy, or `DEFAULT_POLICY` (Deny by default) when no
+  template was used. While it does it says
+  "Started from <name> · Pre-filled from the template. Edit freely."
+  (`policy-definition-prefilled-hint`, not for a custom policy) or, once rules were added, "Started
+  from <name> · N templates added" (`policy-template-gallery-added-count`, N counting the
+  template groups in the Rego). It says "Custom Rego" once the Rego no longer follows the
+  start: a hand edit anywhere, inside an added group too, or a rule of the start removed. A template
+  whose `package` line or imports `insertTemplateRules` adds to the start's own lines also
+  counts as a change; no default template has either.
+  Undo of Use, Create custom policy, Add rules, Remove, Remove rule and Deny by default restores the Rego
+  and the used template together. Only the latest action can be undone, and its Undo drops
+  edits made since, so each toast ends "Undo restores the Rego from before this change." (Use
+  and Create custom policy: "the form", since their Undo also restores the Description, and
+  for Create custom policy the Name; Use never changes the Name). A new toast replaces the one
+  on screen (see _Toasts_). Save leaves the Undo toast on screen: a successful save merges only
+  the stored `content_hash` and `updated_at` into the form, so an Undo or edit made while the
+  save runs stays unsaved and the form stays dirty, and a failed save keeps the change and its
+  Undo. Use of a template, or Create custom policy, moves focus to **Change**
+  (`policy-template-gallery-change-button`), which reopens
+  it with the used card selected and its settings as they were used, also after a hand edit,
+  and moves focus to the selected card, or to the first card when none is selected. Use
+  there replaces the Rego, and **Cancel** beside the title
+  (`policy-template-gallery-cancel-button`, shown only once a template was used) collapses the
+  gallery without using another, which brings back Add rules. Use (of a template or a custom policy)
+  replaces at once before any template was used (`templatePicked` false) and while the Rego is an untouched start (`policyStart` is not
+  null and counts no added templates); otherwise its
+  first click asks in place under the button, never in a modal
+  (`policy-template-gallery-replace-confirm`): "This replaces the N rules in the Policy
+  section.", or "This replaces your edits in the Policy section." when there are no rules to
+  count or the Rego can't be read, with **Replace** (`danger`,
+  `policy-template-gallery-replace-button`) and **Cancel**
+  (`policy-template-gallery-replace-cancel-button`). Opening it moves focus to Cancel, so a
+  second Enter can't replace; Cancel and Escape close it and return focus to Use; picking
+  another card closes it. Replace applies the template with the usual Undo. After a discard and
+  Undo the page keeps only the form, with the gallery collapsed and Details and Policy shown.
+  The editor restores a left draft only when the discard toast's Undo reopens it
+  (`restoreOnlyOnUndo` on the `useDiscardWithUndo` snapshot, which Undo marks with
+  `{ discardUndo: true }` navigation state, which the hook clears from the history entry once
+  read, so browser Back to that entry is not another Undo); opened any other way it drops the draft, dismisses
+  that draft's discard toast if it is still showing (`showUndoToast` returns a dismiss function,
+  kept per snapshot key), and starts fresh, with no template selected. Without
+  `restoreOnlyOnUndo`, as in the Surface Builder, any visit restores the draft and the toast
+  stays. A second discard of the same editor replaces that toast; the replaced toast expires
+  without clearing the stored draft, which belongs to the newer toast, so its Undo restores the
+  second draft.
+  The Type is set by the Define button that opened the page (`?type=`) and can't be changed.
+  While `?type=` names a Type, Details has no Type field and the card header says
+  "Create <Type> Policy". Opened without it, the page is a Gateway policy titled "Create Policy",
+  and `policy-definition-type-select` shows disabled with "Set by the Define button that opens
+  this page. It can't be changed here." A saved policy always shows its Type, disabled.
+- **Templates column** (`PolicyTemplatesPanel`, `policy-templates-panel`): for users with
+  `policies.edit` the page always has two columns, the editor card (`col-xl-8`) and a templates
+  column (`col-xl-4`, `policy-templates-column`, sticky from `xl` below the top bar), so the
+  editor's width never changes. Template examples, Test (dry-run) and Version history sit in
+  the editor column under the editor card, so a taller templates column never pushes them down;
+  without `policies.edit` the editor is full width and there is no column. The column only adds
+  rules ("Add rules from a template", no close button); only the template details, on the
+  create form while Start from is open, swap in their own panel, and closing Start from
+  returns to Add rules. **Add rules from a template**
+  (`policy-templates-insert-button`, in the Policy section and the empty rules list) brings back
+  the Add rules panel, closing Start from when Change reopened it, scrolls to the column and
+  focuses its search, and Change doesn't take that focus. It lists only templates
+  that add rules of the policy's Type, in one list with no tabs, and says under the list
+  how many it leaves out (`policy-templates-left-out-note`: "17 templates
+  left out: 3 are whole policies, 14 are for Agent Surface policies.", then "Pick a whole
+  policy under Start from." on the create form or "Whole policies are offered only when
+  creating a policy." on a saved one while any whole policy is left out), and
+  its body opens with "Adds rules to the
+  end of this policy." It has a search
+  (`policy-templates-search-input`), category chips shown when the list holds more than one
+  category (`filter-chip-<key>` inside `policy-templates-categories`), rows
+  (`policy-templates-row-<id>`) with a DENY or ALLOW decision pill in a list at most `300px`
+  tall that scrolls (`.policy-templates-panel__list`), so the preview under it stays in sight,
+  and a preview (heading `policy-templates-preview-heading`). Picking a row scrolls the column
+  only as far as needed to show the preview (`block: 'nearest'`, nothing moves when it is
+  already in view) and leaves focus on the row; with nothing
+  selected, or while the search or a category hides the selected row, it says "Pick a template
+  to preview the rules it adds.", `policy-templates-preview-empty`, and the preview comes back
+  when the row is listed again. The preview shows the description, default
+  decision, setting fields (`policy-templates-param-<key>`), the lines it adds, How it decides
+  with each example's input (`policy-templates-example-input-<i>`), the docs link
+  (`policy-templates-docs-link`) and **Add to policy**
+  (`policy-templates-insert-rules-button`), disabled while a setting is invalid or a required
+  one is empty. While the policy allows by default the preview
+  warns "This policy allows every request by default, so these rules change nothing until you
+  choose Deny by default." (`policy-templates-allow-default-note`, a warning `InfoBanner`). On an
+  empty policy it warns instead "This policy is empty, so it allows every request. These rules
+  make it deny every request they don't allow." (`policy-templates-empty-policy-note`).
+- **Add to policy** shows the lines it adds (`policy-templates-insert-preview`) with a note,
+  "Allow rules combine with OR: a request passes when any allow rule matches. Its `default
+  allow` line is not copied." (`policy-templates-or-note`), and appends
+  them to the end of the Rego between `# Inserted from template: <name>` and
+  `# End of template: <name>` comments, offers Undo, and keeps the panel open so several
+  templates can be combined, on the create form and on a saved policy. The template's `default
+  allow` line is never copied, its `package` line only when the Rego has none, and its imports
+  go after the policy's `package` line. When the Rego allows by default, the Rules view warns
+  that the allow rules change nothing (below). A template's helper rules that depend on its settings are Rego functions taking the
+  setting as an argument, so adding the same template twice with different settings keeps both
+  checks apart. Add to policy moves the Policy section to the Rules view.
+- **Rules view** (`PolicyRulesList`, `policy-rules-list`) of the Policy section lists the rules
+  `regoRules.ts` reads from the Rego as it changes: the rule count (`policy-rules-count`) and
+  default decision sit in the section's status row, then come the rules written
+  in the editor and one group per added template (`policy-rules-group-<n>`), each a `card mb-2`
+  whose `card-header py-2` names the source, gives the group's rule count ("2 rules",
+  `policy-rules-group-<n>-count`), the **Just added** mark and, for a template group, **Remove
+  group** on the right; the group's in-use reason and amber lines sit in a `card-body` under the
+  header. The rules are rows of a `table table-sm align-middle mb-0` with a `thead-light` header
+  (Kind, Rule, Line, and a visually hidden Actions column only with `policies.edit`), fixed
+  layout so the Rule column truncates instead of scrolling sideways. Each rule
+  (`policy-rules-group-<n>-rule-<m>`, the row) has a neutral outline role badge
+  (`policy-rules-group-<n>-rule-<m>-kind`, from `ruleRoles` in `regoRules.ts`, shown with or
+  without `policies.edit`): Allows (a plain allow rule, as `isPlainAllow` reads it), Sets
+  allow (any other rule whose read name is `allow`, such as `allow := false if …` or a dotted
+  `allow.x`; title "Sets allow in a way the Rules view can't read; read the Rego"), Deny
+  reason (only a rule named `deny_reason`), or, for every
+  other name, `deny` included, "Used by allow" when `allow` reads it, directly or through other
+  rules, or while the Rego reads its package as a whole document (title "allow reads this rule,
+  directly or through other rules") and "Not used by
+  allow" otherwise (title "allow doesn't read this rule, so it doesn't change whether a request
+  is allowed"); the walk starts from every rule whose read name is `allow`. Then the
+  rule on one line (`; ` where a newline separates expressions inside brackets, a space
+  otherwise, so `h if { a; b }` and `allow { a; b }` for a brace on the next line; whitespace
+  only collapsed when the text can't be tokenized) with its full text in `title`, except that a plain allow rule which
+  `splitConditions` in `regoRules.ts` splits into two or more conditions shows them as a
+  `ul.list-unstyled` (`policy-rules-group-<n>-rule-<m>-conditions`), one truncated `<code>`
+  line per condition (`-condition-<k>`, the condition in `title`), every line after the first
+  starting with a muted `small` "and"; a condition over several lines is flattened to one
+  (whitespace collapsed outside strings, `; ` where a newline separates expressions inside a
+  block). A rule that is not a plain allow, has `else`, one condition, no conditions, a raw
+  string over lines, a line that starts or ends mid-expression (such as `with` on the next
+  line), a condition that starts with `[` or `(`, or a character the splitter doesn't know
+  keeps the one-line view. Then its line numbers, which switch to the Rego
+  view and select the rule (`-show-button`): a small `outline-secondary` `AppButton` with a
+  `fa-code` icon and only the numbers in monospace (`5`, `5–8`), since the column is headed
+  Line; its title is "Show in the Rego" and its accessible name "Show <rule> in the Rego, line 5". The rules outside any template group are titled
+  **Your rules** (pen icon), and "Your rules · started from <template>" on the create form while
+  `policyStart` says the Rego still follows the template Use filled it from. A template group is
+  titled "From template: <name>" (layer icon), the last added one is marked **Just added**
+  (`policy-rules-just-added`), and **Remove group** (`policy-rules-group-<n>-remove-button`,
+  `outline-danger`, `policies.edit`) deletes the group's lines with Undo. Removing the last rule
+  of a template group removes the whole group, its `# Inserted from template` line included, with
+  one Undo that brings both back ("Removed the rule <rule>, the last from the template <name>.");
+  a template group left with no rules by a hand edit in the Rego still says "No rules left from
+  this template." and shows no table. Each rule has its
+  own remove button (`policy-rules-group-<n>-rule-<m>-remove-button`, the list tables'
+  `outline-danger` trash icon button, named "Remove the rule <head>", `policies.edit`), which
+  deletes the rule's lines and the comment lines directly above it, with Undo. `regoRules.ts` decides which Remove is refused, and why (`ruleUse` and `groupUse` return
+  the reader, the whole-document read, a reason with no reader, or null): a rule is
+  in use when an `allow` rule, a dotted one such as `allow.x` included, reads its name, directly
+  or through other rules, from outside that rule, such as `count(deny) == 0`, `not deny_x`, `not deny_reason`, a function call `h(x)` or
+  `data.<package>.<name>`, and a dotted rule such as `blocked.ip` is read by its first segment;
+  a template group is in use when `allow` reads a name the group defines through rules outside
+  the group. A read from `deny_reason` alone doesn't count, since the gateway decides on `allow`
+  and reads `deny_reason` only as text, so `deny` rules that only `deny_reason` reads are free;
+  names inside strings are not reads. A rule head and the lines under it that start with `if`,
+  `contains`, `else`, `:=`, `=` or `{` are one rule, as is a line that ends mid-expression (its
+  last token `if`, `not`, `in`, `with`, `as`, `some`, `every`, `contains`, `else`, `,` or an
+  infix operator, a keyword after a dot excepted), so `allow` with `if { count(deny) == 0 }`
+  on the next line reads `deny` and `allow if not` reads the `blocked` on the next line; an
+  `import` or `package` line never continues onto the next. While the Rego imports a `data` path, or reads `data`, its
+  package or a parent as a whole document (`data.<package>["name"]`, `doc := data.<package>`),
+  every rule but `allow` counts as in use. A rule whose read name is `allow` but that is not a
+  plain allow is in use (`sets-allow`), and so is a group that holds one, unless it has an
+  identical copy elsewhere: the reasons are "This rule sets allow in a way the Rules view can't
+  read; remove it in the Rego view." and "A rule in this template sets allow in a way the Rules
+  view can't read; remove it in the Rego view." A plain `allow` rule, a rule with an identical definition
+  left (the same template added twice), and a group whose used rules all have identical copies
+  outside it can always be removed; one of several different definitions of a used name stays
+  in use. Rules are compared by their
+  code with comments removed and strings kept, so a `#` inside a string is code. A refused
+  Remove is disabled and says why in muted text under the rule
+  (`policy-rules-group-<n>-rule-<m>-in-use`: "Another rule uses this (allow, line 10); remove
+  that rule first.", naming the first rule by line that reads it, never another definition of
+  the same name) or under the group header (`policy-rules-group-<n>-in-use`: "A rule outside
+  this template uses its rules (allow, line 10); remove that rule first."), linked to the button
+  by `aria-describedby` and repeated in the rule button's `title`; when no reading rule can be
+  named the reason leaves out the parentheses, and Remove stays refused. While the Rego reads the
+  policy as a whole document both say "The Rego reads the policy as a whole document; remove
+  rules in the Rego view." After the banners and before the groups a muted `small` line with
+  `fa-info-circle` (`policy-rules-summary`, from `summarizeDecision`) states what this policy
+  decides, always starting "This policy" since gateway policy runs first: with any allow
+  definition that is not plain (a value other than true, arguments, a dot, `[ ]`, `contains`,
+  `else`, or a `default allow` other than true or false) "The Rules view can't summarise how
+  this policy sets allow. Read the Rego.", which wins over every other case; with `default
+  allow := true` "This policy allows every request: the default is ALLOW."; with an allow rule
+  that has no conditions "This policy allows every request: an allow rule has no conditions.";
+  with plain allow rules "This policy allows a request when its allow rule matches." (one) or
+  "… when any allow rule matches." (several), then "Otherwise:" and the Audit Log's
+  `audit-decision audit-decision--deny` DENY pill (`policy-rules-summary-otherwise`), followed
+  by "(no default is set)" when there is no `default allow`; and with no allow rule "This
+  policy denies every request: no rule allows one." or "… no rule allows one and no default is
+  set.". It is hidden while the Rego doesn't parse or compile, has a mismatched package, is
+  empty, or has no rules; while a compile is pending it shows from the parse. A policy that allows
+  by default and has allow rules, all of them plain, shows a warning `InfoBanner` (`policy-rules-allow-default-warning`) with
+  **Deny by default** (`policy-rules-set-default-deny-button`), which sets `default allow` to
+  false and drops a `# Allow all traffic by default` comment directly above it, the one a custom
+  policy and policies created before templates carry. Under that banner each group with allow
+  rules, Your rules included, carries an amber line "No effect while the default is ALLOW."
+  (`policy-rules-group-<n>-no-effect`), which doesn't block saving. On the create form a
+  template group whose template has no variant for the current Type (`groupsForOtherType` in
+  `policyStart.ts`, matched by name against the default templates) carries an amber line under
+  its header (`policy-rules-group-<n>-other-type`: "Written for Agent Surface policies. It
+  reads input Gateway policies don't get. Remove it to create this policy."), keeps its
+  Remove group, and a warning banner (`policy-rules-other-type-banner`) says "Remove the rules
+  written for Agent Surface policies to create this policy."; Create is disabled, and Ctrl+S
+  refuses, until those groups are removed. An empty Rego shows Default
+  ALLOW and "An empty policy allows every request.", as the gateway treats it; Rego with no rules
+  and no `default allow` says "No default is set, so every request is denied.", and with a
+  default "The default decision (deny) applies to every request." or "(allow)". Removing a group
+  keeps the Just added mark and examples card while another group of that template remains. With no rules, an empty state
+  (`policy-rules-empty`) offers **Add rules from a template** (`policy-rules-add-button`) and
+  **Write Rego** (`policy-rules-write-rego-button`). While the Rego doesn't compile a danger `InfoBanner`
+  (`policy-rules-invalid-banner`) offers **Open Rego**
+  (`policy-rules-invalid-open-rego-button`) and names a package mismatch when that is the
+  cause, and while a bracket is open, or a top-level statement has no rule name or is named
+  after a Rego keyword (such as an `if { … }` body a template line separates from its head), the
+  view says so (`policy-rules-unparsed`, with `policy-rules-open-rego-button`) instead of
+  listing rules.
+- **Adding to a saved policy** also shows the **Template examples**
+  card (`policy-template-examples-card`) above Test (dry-run): each example runs through
+  `POST /policy-definitions/{id}/simulate` with the draft Rego. Its columns are Example,
+  Expected, This policy, Result (**Matches** or **Differs** `Badge`) and **Load in Test**
+  (`policy-template-example-row-<i>-load-button`), which writes that example's input into
+  Test (dry-run)'s sample input, scrolls to it and focuses it, with an Undo toast ("Loaded
+  <example> into Test (dry-run). Undo restores the sample input from before.") that puts the
+  earlier sample input back; the sample input is part of the policy form, so this makes the
+  form dirty. A row that
+  differs is highlighted and says why under its name (`policy-template-example-row-<i>-why`):
+  for an expected DENY that this policy allows, that the policy allows every request by default
+  when its `default allow` is true, and otherwise that another allow rule lets the request
+  through and allow rules combine with OR; for an expected ALLOW it denies, to load it in Test,
+  with the simulate `reason` when there is one. The simulate response doesn't say which rule
+  decided, so the reason never names one. Examples are written for the default settings and
+  the samples (`usesDefaultSettings` compares with `sampleParameterValues`), so
+  when a setting was changed before inserting, the card says so
+  (`policy-template-examples-changed-settings`), shows no Result and highlights no row. Every
+  template that adds rules has examples (`builtinPolicyTemplates.test.ts` checks it), so the
+  card always has rows; a clock-dependent template without examples is a whole policy. The
+  panel scrolls into view when it opens.
 
 ## Audit page: policy changes
 
@@ -1593,6 +2428,15 @@ word it only through `utils/surfaceVariant.ts`, which the Metrics page uses too.
   refused** in the deny tone, with a Refusal group of Stage, Reason, HTTP status, JSON-RPC error
   and Requested variant. `http_status` is absent on a Fabric refusal and `rpc_error_code` present
   only when the caller got a JSON-RPC error; a row shows only when the value is recorded.
+- A `target_auth_failed` record carries `target_auth` (`outcome` and, when the token endpoint
+  sent one, `oauth_error`), shown as **Credential outcome** and **OAuth error** in the Refusal
+  group. With outcome `passthrough` the request was forwarded without the Target credential: it is
+  titled **Forwarded without Target credential** in the warn tone, not as a refusal. With outcome
+  `refused_by_target` the Target refused the gateway's credential: it is titled **Target refused
+  the credential** in the deny tone, and `upstream_status` shows as **Target status**. When the
+  failing credential is a Transit Point's, `target_auth.transit_point` carries its alias: both
+  summaries name that Transit Point in place of the Target, and it shows as **Transit Point**
+  in the Refusal group.
 - `requested_variant` is caller-chosen text: render it as React text only.
 - The Metrics page shows the `$alias` badge for a configured alias only, never for `_base_`.
 
@@ -1908,9 +2752,13 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
 - The Agents page shows no status anywhere: no list column, filter or dimmed rows, no
   details header badge.
 - Each list row is a link (`role="link"`, named by the agent name and endpoint host) and ends with a
-  chevron cell (`agents-row-chevron`); Enter or Space on the row opens the details.
+  chevron cell (`agents-row-chevron`); Enter or Space on the row opens the details. The chevron is
+  `--muted-text`, and `--accent-blue-text` while the row is hovered or focused, in both themes.
 - The details page has three tabs, **Agent Card** (opened first), **Connection** and **Traffic**.
-  Identities and surfaces are shown only in the list, never repeated on the details page.
+  Surfaces are shown only in the list, never repeated on the details page. The list only counts
+  identities; the **Connection** tab lists each DID with a copy button.
+- An agent without a name, or with an empty one, shows **Unnamed agent** everywhere
+  (`displayName`).
 - The details page sets the top-bar title to the agent name (**Unnamed agent** without one) with
   `usePageTitle`; while loading, or when the agent is missing, the route default stays. The
   back button is `btn-outline-secondary`.
@@ -1925,17 +2773,35 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
   (`DOCS_URL.surfaces`, `docsPlacement="actions"`); without `surfaces.edit` only the docs link
   shows, since the page needs only `surfaces.view` and `/surfaces/new` needs `surfaces.edit`.
 - Columns: Agent, Route, Protocol, Identities, Used by surfaces, Trust registry, Last activity.
-  The protocol badge (`agents-protocol-badge`) uses the Surfaces page's colours (A2A
-  `text-bg-primary`, AP2 `text-bg-warning`, MCP `text-bg-info`, else `text-bg-secondary`).
-  The count badges of **Identities** and **Used by surfaces** match the Surfaces page's Transit
-  Points count: a square `badge text-bg-primary`, not a pill.
+  The protocol badge (`agents-protocol-badge`) is the shared `ProtocolBadge`
+  (`components/shared/ProtocolBadge.tsx`), the one the Surfaces page uses: A2A
+  `text-bg-primary`, AP2 `text-bg-warning`, MCP `text-bg-info`, DIDComm `text-bg-success`, any
+  other protocol upper-cased in `text-bg-secondary`. Never restyle it per page. The template
+  picker's protocol badge (`getTemplateProtocolBadge`) reads the same list.
+  The count badges of **Used by surfaces** and **Identities** match the Surfaces page's Transit
+  Points count: a square `badge text-bg-primary`, not a pill, at the same size, so never inside a
+  `small` element (a badge's size is relative to its parent).
+  Font sizes: every value in a row is the table's 12px body text, never `small`; only the endpoint
+  host under the name is `small`. Every badge in a row is 9px (0.75em of the cell text):
+  `.agents-table .app-badge` in `AgentRegistry.css` sizes the shared `Badge` (rem-based) the same
+  as the Bootstrap badges (em-based) beside it.
   **Used by surfaces** shows a count badge and the surface names joined with commas on one
-  truncated line, with the full list in the tooltip. It has no links. **Identities** shows the same
-  count badge, then the first DID in `identities`, shortened in the middle and muted with a copy
-  button, and `+N` for the rest; every DID is in the tooltip. Without any it shows **No DID**: a
-  warning badge while surfaces use the agent (the API does not say which surface holds which DID),
-  muted text otherwise.
-- The agent name (`agents-name`) is the strongest text in a row; DIDs stay muted. The table's
+  truncated line, with the full list in the tooltip. The surface names and the endpoint host are
+  cut only at their column's edge (the cell has `max-width: 0`), never at a fixed width, so wide
+  screens show them in full. It has no links. **Identities** shows no DID,
+  only the count, in the same square count badge as **Used by surfaces**
+  (`agents-identities-count`), followed by "identity" or "identities" (`identityNoun`), with every
+  DID in `identities` in the tooltip. Without any it shows **No identity** in
+  `text-muted` text, like an empty **Used by surfaces** cell: the badge is only for a count, and
+  never a warning, since a surface without a DID is a valid setup. While surfaces use the agent its tooltip says none of them has a DID (the API does not
+  say which surface holds which DID). The **Trust registry** header stays on one line (`text-nowrap`).
+- The agent name matches the A2A Proxies list on the Proxies page: a plain `<strong>` at the
+  table's font size, with the endpoint host under it in `small text-muted`. An agent without a
+  name shows "Unnamed agent" the same way (`agents-unnamed`), never italic or muted. The name
+  (`agents-name`) is the strongest text in a row: bold, in the table's text colour like a surface
+  name on the Surfaces page. The global `.table td:first-child` rule would grey it, so
+  `AgentRegistry.css` gives the first cell `var(--bs-table-color)`. The host under it stays
+  `small text-muted`. The table's
   column headers (`agents-table`) keep the uppercase `.table-sm` default, like the Surfaces page.
 - **Agent** shows the endpoint host under the name (`endpointHost`: the URL origin with its
   scheme, such as `https://agent.example`, the A2A proxy, or `gateway/channel`), so rows with the
@@ -1944,32 +2810,43 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
   `a2a-proxy://` and `fabric://` schemes are never shown. An endpoint `connectionTarget` cannot
   show gets no line.
 - Raw API values are never shown. `pages/AgentsPage/agentLabels.ts` maps them: runtime `url`,
-  `a2a-proxy`, `gateway` to the route Direct, Proxied, Fabric, and the protocol badge to the
+  `a2a-proxy`, `gateway` to the route Direct, Proxied, Fabric; the protocol badge shows the
   protocol only (`A2A`), never the route. Shared badges are in `pages/AgentsPage/AgentBadges.tsx`.
 - The route is called **Route** everywhere (list column, Connection heading). The list renders it
-  with `AgentRouteBadge`: a neutral bordered badge (`badge text-bg-light border
-  agent-route-badge`) with the route icon and label, its meaning (`routeDescription`) as the
-  tooltip and as visually hidden text (`agents-runtime`). The details page shows no route badge:
+  with `AgentRoute`: plain text at the normal text size and colour, never a badge (the row's
+  badges are for counts, the protocol and the trust registry state), with the route icon and
+  label, its meaning (`routeDescription`) as the tooltip and as visually hidden text
+  (`agents-runtime`). The details page shows no route:
   not in the header, not on the Connection tab, whose description says the route.
-- An agent with a `null` name shows **Unnamed agent** in muted text, in the list and the details
-  header, with the endpoint host beside it in the header (`agent-details-endpoint-host`). The API
+- An agent with a `null` name shows **Unnamed agent** styled like a name, never italic or muted,
+  in the list, the details header and the Agent Card preview, with the endpoint host beside it in
+  the header (`agent-details-endpoint-host`). The API
   names Direct, Proxied and Fabric agents from their Agent Card; a Proxied or Fabric name comes
   from the card the gateway serves and can take a refresh of the list to appear after the
   background lookup. A canvas target name that only names a surface (a surface's own name, or a
   generated `<kind>_surface_<n>`) is never the agent's name.
 - **Trust registry** shows **Recorded** with the Agent Identities page's badge
   (`TrustRecorderStateBadge`, state `recorded`: success tone, no icon), with a tooltip saying
-  recording is not trust, when `trust_registry.recorded` is true, else **Not recorded**
-  (`badge-none`), with no tooltip.
+  recording is not trust, when `trust_registry.recorded` is true, else **Not recorded** in the
+  same shared `Badge` (`size="sm"`) in the `secondary` tone, so both states share one shape and
+  size, with no tooltip.
 - Agent `id` is opaque and never read as a surface id; surface links come from `surfaces[]`.
+- Section headings on every details tab (**Route**, **Trust registry**, **Skills**, **Changes by
+  the gateway**) use `.agent-preview-section-title`. Secondary text in `AgentRegistry.css` uses
+  `--muted-text` at `0.875em`, the size of `.small`, never a fixed pixel size or a `--gray-*`
+  shade, and the Agent Card avatar is white on `--primary-solid`.
 - The **Connection** tab (`AgentDetailPage/ConnectionTab.tsx`) is read-only and has no surfaces
   list. Built from `endpoint` by `connectionTarget`, it shows a **Route** heading with a one-line
   description of the route under it, then a Field / Value table styled like the Agent Card's
   **Changes by the gateway** table (`agent-preview-changes`; the target rows; a URL endpoint has a
-  copy button). It has no route path diagram. Under it, a **Trust registry** section
+  copy button). It has no route path diagram. Under it, an **Identities** section
+  (`agent-connection-identities`) lists every DID in `identities` in the same table style:
+  Identity (the shortened DID with the full one as tooltip and a copy button, local to
+  `ConnectionTab.tsx`) and Source (**Surface DID** or **Managed identity**); without any it says
+  no surface using the agent has a DID. Then a **Trust registry** section
   (`agent-connection-trust-registry`) lists `trust_registry.registries` in the same table style:
   Trust registry (name, else id; links to the registry page only with `trust_registries.edit`),
-  Identity (`AgentDid`) and Status (`TrustRecorderStateBadge`, with the reason text under it).
+  Identity (the same DID cell) and Status (`TrustRecorderStateBadge`, with the reason text under it).
   Without outcomes it says no identity was sent to a trust registry. The Agents API fills
   `registries` on the details only: the best outcome per (registry, DID) across the agent's
   surfaces, for its current identities.
@@ -1999,7 +2876,7 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
   the API's `upstream_card`, with columns **Field**, **Change** and **Value**. **Change** is a
   badge (`<row>-change`): **Rewritten** (`text-bg-warning`) when the field existed before,
   **Added** (`text-bg-primary`) when it did not, **Removed** (`text-bg-secondary`) when the
-  served card dropped it. **Value** (`<row>`) is what callers get, in semibold code, `-` when
+  served card dropped it. **Value** (`<row>`) is what callers get, in regular-weight code, `-` when
   missing; a rewritten or removed one has a muted "Was <value>" line under it, its code muted too
   so the new value stands out (`<row>-was`), an added one none. `code` in `agent-preview-changes`
   cells is `inline-block` so wrapped chips don't overlap. Rows:
@@ -2059,8 +2936,9 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
 | Name, unnamed, endpoint host    | `agents-name`, `agents-unnamed`, `agents-endpoint-host`                                         |
 | Runtime, protocol, activity     | `agents-runtime`, `agents-protocol-badge`, `agents-last-activity`                               |
 | Surfaces, count, names          | `agents-surfaces`, `agents-surfaces-count`, `agents-surface-names`                              |
-| Identities, count, more         | `agents-identities`, `agents-identities-count`, `agents-identities-more`                        |
-| DID, copy, none                 | `agents-did`, `agents-copy-did-button`, `agents-no-did`                                         |
+| Identities, count, none         | `agents-identities`, `agents-identities-count`, `agents-no-identity`                            |
+| Details DID, copy               | `agents-did`, `agents-copy-did-button`                                                          |
+| Details identities, row, none   | `agent-connection-identities`, `agent-connection-identity`, `agent-connection-identities-empty` |
 | Trust registry                  | `agents-trust-recorded`, `agents-trust-not-recorded`                                            |
 | Back, details retry             | `agent-back-button`, `agent-retry-button`                                                       |
 | Details not found, load error   | `agent-not-found`, `agent-load-error`                                                           |
@@ -2069,12 +2947,11 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
 | Agent Card states               | `agent-card-tab`, `-loading`, `-error`, `-retry-button`, `agent-card-<no_agent_card\|not_running\|operator_only>`, `agent-card-surface-unavailable`, `agent-card-surface-retry-button` |
 | Agent Card source               | `agent-card-source`, `-source-text`, `agent-card-surface`, `agent-card-surface-select`, `agent-card-open-surface-button` |
 | Changes by the gateway          | `agent-card-gateway-changes`, `-no-did`; rows `-url`, `-extension`, `-did`, `-vp`, `-removed`, `-other-<field>`, each with `-change` and `-was`; `-vp-toggle-button`, `-vp-view` |
-| Connection tab                  | `agent-connection-tab`, `-description`, `-path`, `-caller-hop`, `-surfaces-hop`, `-target`, `-copy-endpoint` |
-| Connection target rows          | `agent-connection-endpoint`, `-proxy`, `-proxy-link`, `-gateway`, `-gateway-link`, `-remote-surface` |
 | Agent Card JSON, copy           | `agent-card-json`, `agent-card-copy-button`                                                     |
 | Agent Card view toggle, preview | `agent-card-view-preview`, `-view-json`, `agent-card-preview`, `-preview-name`, `-preview-details`, `-preview-skills`, `-preview-empty` |
 | Traffic cards, empty            | `agent-traffic-tab`, `agent-traffic-requests`, `-failed`, `-p95`, `agent-traffic-empty` |
-| Connection                      | `agent-connection-tab`, `-endpoint`, `-proxy`, `-proxy-link`, `-gateway`, `-gateway-link`, `-remote-surface` |
+| Connection                      | `agent-connection-tab`, `-description`, `-endpoint`, `-copy-endpoint`, `-proxy`, `-proxy-link`, `-gateway`, `-gateway-link`, `-remote-surface` |
+| Connection trust registry       | `agent-connection-trust-registry`, `-trust-registry-empty`, `agent-connection-registry-<registry-id>` |
 
 ## Remote gateway Issuer DIDs
 
@@ -2155,6 +3032,12 @@ Settings → **Admin** → **Feature Flags** is a table of the shared `FeatureFl
   payment gateway already exists and no operator has set it either way. The Connections permission
   list (`connectionsPermissions`) is shared by the route and the sidebar. When the settings cannot
   be loaded, `FALLBACK_SETTINGS` (every flag off) is used so the pages waiting for them render.
+- `policy_input_capture` (`settings-flag-policy_input_capture`) is default off and lets users
+  with `surfaces.edit` and `policies.edit` listen to a surface's policy input on its Capture
+  view (see _Policy input capture_). Read it through `utils/featureFlags.ts`
+  (`policyInputCaptureEnabled`, `usePolicyInputCaptureFlag`), never inline. The gateway checks the
+  same system flag: it refuses a listen while the flag is off and stops every listen at the next
+  keep-alive check after it is turned off.
 - `mediator_federation` is default off and experimental. On, the Connect via OOB wizard's
   details step (`gateway-add-via-oob/EnterDetailsStep.tsx`) shows a mediator picker
   (`wizard-oob-acceptor-mediator`) that lists only mediators with `status === 'active'` and
@@ -2341,6 +3224,11 @@ identities: an integration receives every event of its event set, from every res
 
 ### Audit Log header
 
+- The **About the Audit Log** panel (`AuditInfoBanner`) lists the delegation events the gateway
+  audits in one **Credential delegation** bullet (`consent_granted`, `consent_expired`,
+  `consent_limited`, `token_revoked`, `user_tokens_revoked`) and says that what the gateway does
+  with a delegated credential on each call is not audited but written to the gateway log, unless
+  `[logging] delegation_events` is `false`. It names no per-call event as an audit event.
 - The Audit Log header shows `audit-forward-button` to users with `integrations.view`. It
   counts the active integrations, with an active endpoint, whose event set holds audit
   events (`useAuditForwarding`), and opens `/integrations`.

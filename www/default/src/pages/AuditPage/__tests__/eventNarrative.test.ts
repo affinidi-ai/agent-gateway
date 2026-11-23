@@ -189,6 +189,99 @@ describe('eventNarrative', () => {
       expect(n.detail).toBe('The caller got HTTP 404.');
     });
 
+    it('describes a Target credential failure that was refused or forwarded without it', () => {
+      const refused = describeEntry(
+        at(
+          {
+            request_rejected: {
+              stage: 'forward',
+              reason: 'target_auth_failed',
+              http_status: 502,
+              target_auth: { outcome: 'rejected', oauth_error: 'invalid_client' },
+            },
+          },
+          { channel_name: 'Orders' }
+        )
+      );
+      expect(refused.tone).toBe('deny');
+      expect(refused.title).toBe('Request refused');
+      expect(refused.summary).toBe('Refused at forward on Orders: target auth failed.');
+
+      const forwarded = describeEntry(
+        at(
+          {
+            request_rejected: {
+              stage: 'forward',
+              reason: 'target_auth_failed',
+              target_auth: { outcome: 'passthrough' },
+            },
+          },
+          { channel_name: 'Orders' }
+        )
+      );
+      expect(forwarded.tone).toBe('warn');
+      expect(forwarded.title).toBe('Forwarded without Target credential');
+      expect(forwarded.summary).toBe(
+        'Forwarded on Orders without the Target credential: target auth failed, and the fallback is passthrough.'
+      );
+    });
+
+    it('describes a credential the Target refused, with the status it answered', () => {
+      const refused = describeEntry(
+        at(
+          {
+            request_rejected: {
+              stage: 'forward',
+              reason: 'target_auth_failed',
+              http_status: 500,
+              target_auth: { outcome: 'refused_by_target', upstream_status: 401 },
+            },
+          },
+          { channel_name: 'Orders' }
+        )
+      );
+      expect(refused.tone).toBe('deny');
+      expect(refused.title).toBe('Target refused the credential');
+      expect(refused.summary).toBe(
+        "The Target on Orders refused the gateway's credential with 401."
+      );
+      expect(refused.detail).toBe('The caller got HTTP 500.');
+
+      const noStatus = describeEntry(
+        at(
+          {
+            request_rejected: {
+              stage: 'forward',
+              reason: 'target_auth_failed',
+              target_auth: { outcome: 'refused_by_target' },
+            },
+          },
+          { channel_name: 'Orders' }
+        )
+      );
+      expect(noStatus.summary).toBe("The Target on Orders refused the gateway's credential.");
+    });
+
+    it('names the Transit Point whose credential failed, and the Target when there is none', () => {
+      const failure = (target_auth: Record<string, unknown>) =>
+        describeEntry(
+          at(
+            { request_rejected: { stage: 'forward', reason: 'target_auth_failed', target_auth } },
+            { channel_name: 'Orders' }
+          )
+        ).summary;
+
+      expect(failure({ outcome: 'passthrough', transit_point: 'partner' })).toBe(
+        'Forwarded on Orders without the credential of Transit Point partner: target auth failed, and the fallback is passthrough.'
+      );
+      expect(
+        failure({ outcome: 'refused_by_target', transit_point: 'partner', upstream_status: 403 })
+      ).toBe("Transit Point partner on Orders refused the gateway's credential with 403.");
+      expect(failure({ outcome: 'refused_by_target', transit_point: null })).toBe(
+        "The Target on Orders refused the gateway's credential."
+      );
+    });
+
     it('describes a disabled variant, a modern MCP refusal and a Fabric refusal', () => {
       const disabled = describeEntry(
         at(

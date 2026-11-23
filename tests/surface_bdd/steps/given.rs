@@ -109,6 +109,19 @@ pub(crate) fn tracked_surface_id(
                 .created_surface_id
                 .clone()
         })
+        .or_else(|| {
+            world
+                .actors
+                .gateway_instances()
+                .values()
+                .filter_map(|gateway| gateway.fixture.as_ref())
+                .any(|fixture| {
+                    fixture
+                        .agent_surfaces
+                        .contains_key(surface_name)
+                })
+                .then(|| surface_name.to_string())
+        })
         .unwrap_or_else(|| panic!("surface '{surface_name}' must have been created before this step"))
 }
 
@@ -2504,6 +2517,74 @@ fn rest_api_answers_pdf_document(
     );
 }
 
+#[given(expr = "REST API {string} answers a PDF document inside its JSON")]
+fn rest_api_answers_pdf_document_inside_json(
+    world: &mut SurfaceWorld,
+    rest_api_name: String,
+) {
+    const PDF: &[u8] = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n";
+    world
+        .actors
+        .expect_target_kind(&rest_api_name, TargetActorKind::RestApi);
+    set_target_response_for_actor(
+        world,
+        &rest_api_name,
+        MockResponse {
+            status: 200,
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: serde_json::json!({
+                "size": PDF.len(),
+                "data": base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE, PDF),
+            }),
+            stream: MockStream::None,
+        },
+    );
+}
+
+#[given(expr = "REST API {string} answers a PDF document inside its vendor JSON")]
+fn rest_api_answers_pdf_document_inside_vendor_json(
+    world: &mut SurfaceWorld,
+    rest_api_name: String,
+) {
+    const PDF: &[u8] = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n";
+    world
+        .actors
+        .expect_target_kind(&rest_api_name, TargetActorKind::RestApi);
+    set_target_response_for_actor(
+        world,
+        &rest_api_name,
+        MockResponse {
+            status: 200,
+            headers: HashMap::from([("content-type".to_string(), "application/vnd.weather+json".to_string())]),
+            body: serde_json::json!({
+                "size": PDF.len(),
+                "data": base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE, PDF),
+            }),
+            stream: MockStream::None,
+        },
+    );
+}
+
+#[given(expr = "REST API {string} answers JSON without its file")]
+fn rest_api_answers_json_without_its_file(
+    world: &mut SurfaceWorld,
+    rest_api_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&rest_api_name, TargetActorKind::RestApi);
+    set_target_response_for_actor(
+        world,
+        &rest_api_name,
+        MockResponse {
+            status: 200,
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: serde_json::json!({"size": 0}),
+            stream: MockStream::None,
+        },
+    );
+}
+
 #[given(expr = "REST API {string} answers a file of {int} bytes")]
 fn rest_api_answers_file_of_size(
     world: &mut SurfaceWorld,
@@ -3324,6 +3405,18 @@ fn surface_injects_custom_metadata(
 
 fn configure_mcp_surface_protocol(world: &mut SurfaceWorld) {
     world.surface_config.protocol = "mcp".to_string();
+}
+
+#[given(expr = "the {string} role is granted {string}")]
+fn role_is_granted(
+    world: &mut SurfaceWorld,
+    role: String,
+    feature: String,
+) {
+    world
+        .surface_config
+        .rbac_permissions
+        .push((feature, role));
 }
 
 #[given(expr = "operator {string} has the {string} role")]
@@ -4521,27 +4614,7 @@ async fn operator_has_limited_the_surfaces_binding(
     world: &mut SurfaceWorld,
     seconds: u64,
 ) {
-    use crate::bdd_support::config::single_surface_fixture::SEEDED_SURFACE_ID;
-    crate::steps::when::ensure_admin_session(world).await;
-    let client = world
-        .admin_client
-        .as_ref()
-        .expect("admin client must exist");
-    let stored = client
-        .get_surface_recorded(SEEDED_SURFACE_ID)
-        .await
-        .expect("read the surface through the admin API");
-    assert_eq!(stored.status, 200, "reading the surface: {}", stored.body);
-    let mut surface = stored.body;
-    let bindings = surface["outbound_credentials"]
-        .as_array_mut()
-        .unwrap_or_else(|| panic!("the surface has no outbound_credentials"));
-    assert_eq!(bindings.len(), 1, "the surface has one binding to limit: {bindings:?}");
-    bindings[0]["max_consent_age_secs"] = serde_json::json!(seconds);
-    let saved = client
-        .update_surface_recorded(SEEDED_SURFACE_ID, &surface)
-        .await
-        .expect("save the surface through the admin API");
+    let saved = crate::steps::when::limit_the_surfaces_binding(world, seconds).await;
     assert_eq!(saved.status, 200, "limiting the surface's binding: {}", saved.body);
 }
 
@@ -4560,14 +4633,53 @@ async fn operator_has_limited_the_callers_consent(
     assert_eq!(response.status, 200, "limiting the caller's consent: {}", response.body);
 }
 
-/// Moves the consent of every delegated credential the gateway holds back by
-/// `seconds`: the time it was given, and its end when it has one. The vault is
-/// read from disk on every request, so the gateway sees the older consent
-/// without a restart.
 #[given(expr = "the caller's consent was given {int} seconds ago")]
 fn callers_consent_was_given_seconds_ago(
     world: &mut SurfaceWorld,
     seconds: i64,
+) {
+    move_the_callers_consent(world, chrono::Duration::seconds(-seconds));
+}
+
+/// A consent time ahead of the gateway's clock, as a node whose clock runs
+/// ahead writes one.
+#[given(expr = "the caller's consent is dated {int} seconds ahead of the gateway's clock")]
+fn callers_consent_is_dated_ahead_of_the_clock(
+    world: &mut SurfaceWorld,
+    seconds: i64,
+) {
+    move_the_callers_consent(world, chrono::Duration::seconds(seconds));
+}
+
+/// The delegation vault is read when the gateway starts, so a scenario stores
+/// the consent before anything starts it.
+#[given(expr = "the delegation vault already holds a consent to OAuth provider {string} given {int} seconds ago")]
+fn vault_already_holds_a_consent(
+    world: &mut SurfaceWorld,
+    provider: String,
+    seconds: i64,
+) {
+    assert!(!crate::steps::when::gateway_is_running(world), "the consent is stored before the gateway starts");
+    assert!(
+        world
+            .surface_config
+            .credential_delegation
+            .as_ref()
+            .is_some_and(|delegation| delegation.provider_id == provider),
+        "the surface must require delegated credentials from OAuth provider {provider:?} first"
+    );
+    world
+        .surface_config
+        .stored_consent_age_secs = Some(seconds);
+}
+
+/// Moves the consent of the delegated credential the gateway holds by `by`,
+/// back in time when negative: the time it was given, and its end when it has
+/// one. The vault is read from disk on every request, so the gateway sees the
+/// moved consent without a restart.
+fn move_the_callers_consent(
+    world: &mut SurfaceWorld,
+    by: chrono::Duration,
 ) {
     let vault_dir = world
         .infra
@@ -4576,12 +4688,12 @@ fn callers_consent_was_given_seconds_ago(
         ._temp_dir
         .path()
         .join("_storage/delegation_vault");
-    let earlier = |token: &serde_json::Value, field: &str| {
+    let moved = |token: &serde_json::Value, field: &str| {
         token[field]
             .as_str()
             .map(|time| {
                 let time = chrono::DateTime::parse_from_rfc3339(time).expect("a stored time is RFC 3339");
-                serde_json::json!((time - chrono::Duration::seconds(seconds)).to_rfc3339())
+                serde_json::json!((time + by).to_rfc3339())
             })
     };
     let mut aged = 0;
@@ -4599,11 +4711,11 @@ fn callers_consent_was_given_seconds_ago(
         let mut token: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read a stored delegated credential"))
                 .expect("a stored delegated credential is JSON");
-        token["consent_granted_at"] = earlier(&token, "consent_granted_at").expect("a stored consent time");
-        if let Some(end) = earlier(&token, "consent_expires_at") {
+        token["consent_granted_at"] = moved(&token, "consent_granted_at").expect("a stored consent time");
+        if let Some(end) = moved(&token, "consent_expires_at") {
             token["consent_expires_at"] = end;
         }
-        std::fs::write(&path, serde_json::to_string_pretty(&token).unwrap()).expect("write the aged consent");
+        std::fs::write(&path, serde_json::to_string_pretty(&token).unwrap()).expect("write the moved consent");
         aged += 1;
     }
     assert_eq!(aged, 1, "the gateway must hold exactly one delegated credential");
@@ -4772,6 +4884,7 @@ fn a_gateway(
             Some(Level::Info)
         },
         policy_opa_entry: None,
+        policy_definition_id: None,
         terms_enabled: false,
         affinidi_terms_url: None,
         settings: None,
@@ -4827,6 +4940,7 @@ fn a_gateway_with_outbound_listener(
             Some(Level::Info)
         },
         policy_opa_entry: None,
+        policy_definition_id: None,
         terms_enabled: false,
         affinidi_terms_url: None,
         settings: None,

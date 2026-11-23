@@ -300,6 +300,16 @@ mod tests {
     }
 
     #[test]
+    fn a_selection_of_either_end_of_a_policy_input_capture_receives_both() {
+        let received = |selected: &[&str]| EventMask::from_categories(selected.iter().copied()).categories();
+        let both = ["policy_input_capture_started", "policy_input_capture_stopped"];
+
+        assert_eq!(received(&["policy_input_capture_started"]), both);
+        assert_eq!(received(&["policy_input_capture_stopped"]), both);
+        assert_eq!(received(&["policy_decision"]), ["policy_decision"]);
+    }
+
+    #[test]
     fn registry_keeps_each_sinks_drop_policy() {
         let hour = Duration::from_secs(3600);
         let registry = SinkRegistry::new(vec![

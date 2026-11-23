@@ -13,11 +13,15 @@ import FabricDelegatedCredentialsSection, {
 } from '../_shared/FabricDelegatedCredentialsSection';
 import { AgentCardLocationHelp } from '../_shared/AgentCardLocationHelp';
 import TargetAuthProviderSelect from '../_shared/TargetAuthProviderSelect';
+import TargetAuthProblemNotice, { targetAuthErrorsId } from '../_shared/TargetAuthProblemNotice';
+import { staticSecretAuthType, transitPointTargetAuthProblems } from './targetAuth';
 import {
   PROVIDER_TARGET_AUTH_DEFAULTS,
   providerTargetAuthFromApi,
+  storedHeaderValue,
 } from '../_shared/providerTargetAuth';
 import TransitCallerSection from './TransitCallerSection';
+import TargetAuthSecretField from './TargetAuthSecretField';
 import { newTransitPointId, deriveTransitPointAlias } from './factory';
 import GatewaySurfacePicker from '../_shared/GatewaySurfacePicker';
 import {
@@ -99,6 +103,7 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
         auth_header_name: provider.headerName,
         auth_header_format: provider.headerFormat,
         auth_fallback: provider.fallback,
+        auth_scopes: (provider.scopes ?? []).join(' '),
       });
       return;
     }
@@ -106,13 +111,9 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
       (ta.method && typeof ta.method === 'object' && (ta.method as any).static_secret) ||
       (ta.method === 'static_secret' ? ta : null);
     if (!ss) return;
-    const headerName: string = ss.header_name || 'Authorization';
-    const headerFormat: string = ss.header_format || '{value}';
-    let authType: string = 'custom_header';
-    if (headerFormat.startsWith('Bearer ')) authType = 'bearer';
-    else if (headerName === 'X-API-Key' || headerName.toLowerCase().includes('api-key')) {
-      authType = 'api_key';
-    }
+    const headerName = storedHeaderValue(ss.header_name, 'Authorization');
+    const headerFormat = storedHeaderValue(ss.header_format, '{value}');
+    const authType = staticSecretAuthType(headerName, headerFormat);
     authHydratedRef.current = true;
     updateFields({
       auth_type: authType,
@@ -130,6 +131,14 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
   );
 
   const tpProtocol = transitPointProtocol(node?.type);
+  const targetAuthProblems = transitPointTargetAuthProblems(config);
+  const targetAuthFieldAria = (field: string) =>
+    targetAuthProblems.errors[field]
+      ? {
+          'aria-invalid': true,
+          'aria-describedby': targetAuthErrorsId('transit-point-target-auth'),
+        }
+      : {};
 
   // Only A2A/AP2 destinations serve an agent card, so the location override
   // is shown for those protocols only. Protocol is encoded in the TP node
@@ -380,6 +389,12 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
 
       <div className="config-section">
         <label>Target Authentication</label>
+        <TargetAuthProblemNotice
+          testId="transit-point-target-auth"
+          errors={Object.values(targetAuthProblems.errors)}
+          advisories={targetAuthProblems.advisories}
+          notes={targetAuthProblems.notes}
+        />
         <Form.Select
           size="sm"
           data-testid="transit-point-target-auth-type"
@@ -415,6 +430,7 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
                 placeholder={PROVIDER_TARGET_AUTH_DEFAULTS.headerName}
                 value={config.auth_header_name || ''}
                 onChange={e => updateField('auth_header_name', e.target.value)}
+                {...targetAuthFieldAria('auth_header_name')}
               />
             </Form.Group>
             <Form.Group className="mt-2">
@@ -426,26 +442,36 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
                 placeholder={PROVIDER_TARGET_AUTH_DEFAULTS.headerFormat}
                 value={config.auth_header_format || ''}
                 onChange={e => updateField('auth_header_format', e.target.value)}
+                {...targetAuthFieldAria('auth_header_format')}
               />
               <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
                 Use <code>{'{value}'}</code> as the placeholder for the provider's token.
               </Form.Text>
+            </Form.Group>
+            <Form.Group className="mt-2">
+              <Form.Label className="small text-muted mb-1" htmlFor="transit-point-auth-scopes">
+                Scopes
+              </Form.Label>
+              <Form.Control
+                size="sm"
+                id="transit-point-auth-scopes"
+                type="text"
+                data-testid="transit-point-target-auth-provider-scopes"
+                placeholder="Space-separated; the provider's default scopes when empty"
+                value={config.auth_scopes || ''}
+                onChange={e => updateField('auth_scopes', e.target.value)}
+              />
             </Form.Group>
           </>
         )}
         {config.auth_type &&
           config.auth_type !== 'none' &&
           config.auth_type !== 'credential_provider' && (
-            <Form.Group className="mt-2">
-              <Form.Label className="small text-muted mb-1">Secret Reference</Form.Label>
-              <Form.Control
-                size="sm"
-                type="text"
-                placeholder="secret-name"
-                value={config.auth_secret || ''}
-                onChange={e => updateField('auth_secret', e.target.value)}
-              />
-            </Form.Group>
+            <TargetAuthSecretField
+              value={config.auth_secret || ''}
+              onChange={secretId => updateField('auth_secret', secretId)}
+              error={errorByField?.auth_secret}
+            />
           )}
         {(config.auth_type === 'api_key' || config.auth_type === 'custom_header') && (
           <Form.Group className="mt-2">
@@ -456,6 +482,7 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
               placeholder={config.auth_type === 'api_key' ? 'X-API-Key' : 'X-Auth'}
               value={config.auth_header_name || ''}
               onChange={e => updateField('auth_header_name', e.target.value)}
+              {...targetAuthFieldAria('auth_header_name')}
             />
           </Form.Group>
         )}
@@ -468,6 +495,7 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
               placeholder="{value}"
               value={config.auth_header_format || ''}
               onChange={e => updateField('auth_header_format', e.target.value)}
+              {...targetAuthFieldAria('auth_header_format')}
             />
             <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
               Use <code>{'{value}'}</code> as the placeholder for the secret value.

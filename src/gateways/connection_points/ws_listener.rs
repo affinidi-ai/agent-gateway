@@ -2463,27 +2463,19 @@ fn is_from_peer(
     message.metadata.authenticated && peer_did.is_some() && message.from_did.as_deref() == peer_did
 }
 
-/// The mediator reports `account.not_found` when it no longer has this
-/// connection point's account (e.g. its store was flushed). Unlike
+/// The mediator reports that it no longer has this connection point's account
+/// (e.g. its store was flushed) as `account.not_found`, or, from v0.52, under
+/// the Trust Task code of the task it refused (`…:unknownAccount`). Unlike
 /// `recipient.unknown` or `access_list.denied`, which are about the remote
 /// peer, this is about us, and the stale socket cannot recover the account.
 /// Returns the report's code when the reader must end so the supervision loop
 /// re-authenticates, which recreates the account and re-applies its ACL. The
 /// same report from any other sender is ignored.
-fn mediator_account_loss<'a>(
-    received_msg: &'a ReceivedMessage,
+fn mediator_account_loss(
+    received_msg: &ReceivedMessage,
     mediator_did: &str,
-) -> Option<&'a str> {
-    if !matches!(MessageType::from_str(&received_msg.message_type), MessageType::ProblemReport) {
-        return None;
-    }
-    let code = received_msg
-        .message_body
-        .get("code")
-        .and_then(|code| code.as_str())?;
-    if !code.contains("account.not_found") {
-        return None;
-    }
+) -> Option<String> {
+    let code = reported_account_loss(received_msg)?;
     if !mediator_reported(
         received_msg
             .from_did
@@ -2492,11 +2484,53 @@ fn mediator_account_loss<'a>(
     ) {
         warn!(
             from = ?received_msg.from_did,
-            "Ignoring an account.not_found problem report that did not come from the mediator"
+            "Ignoring a missing-account report that did not come from the mediator"
         );
         return None;
     }
     Some(code)
+}
+
+/// The code of a message saying this Connection Point's account is gone, in
+/// either form a mediator sends it: the problem report of a mediator before
+/// v0.52, or the `trust-task-error` document every later one sends. `None` for
+/// anything else, including another task's `unknownAccount`, which may be
+/// about a peer's account rather than ours.
+fn reported_account_loss(received_msg: &ReceivedMessage) -> Option<String> {
+    use crate::gateways::connection_points::account_watch::says_the_account_is_gone;
+
+    if let Some(refusal) = affinidi_messaging_sdk::errors::TrustTaskRefusal::from_document(&received_msg.message_body) {
+        // Only an unsolicited report says something about this socket. A
+        // refusal that answers a request — the account watch's own probe, say —
+        // arrives here too, and ending the reader on it would tear the socket
+        // down on every probe the mediator refuses.
+        if refusal
+            .in_response_to
+            .is_some()
+            || refusal.thread_id.is_some()
+        {
+            return None;
+        }
+        let code = refusal
+            .mediator_code()
+            .to_string();
+        return says_the_account_is_gone(&code).then_some(code);
+    }
+    if !matches!(MessageType::from_str(&received_msg.message_type), MessageType::ProblemReport) {
+        return None;
+    }
+    let code = received_msg
+        .message_body
+        .get("code")
+        .and_then(|code| code.as_str())?;
+    // A problem report carries the mediator's own code behind an `e.p.`
+    // prefix, which is what the descriptor compared here leaves out.
+    let descriptor = code
+        .rsplit_once('.')
+        .map_or(code, |(_, descriptor)| descriptor);
+    let matches_report =
+        says_the_account_is_gone(code) || code.contains("account.not_found") || says_the_account_is_gone(descriptor);
+    matches_report.then(|| code.to_string())
 }
 
 /// The sender's gateway record, when it is a registered, active gateway. A
@@ -5586,11 +5620,88 @@ mod tests {
 
         assert_eq!(received.from_did.as_deref(), Some(MEDIATOR_DID));
         assert_eq!(received.to_dids, vec![CONNECTION_POINT_DID.to_string()]);
-        assert_eq!(super::mediator_account_loss(&received, MEDIATOR_DID), Some("e.p.account.not_found"));
+        assert_eq!(super::mediator_account_loss(&received, MEDIATOR_DID), Some("e.p.account.not_found".to_string()));
         assert_eq!(
             super::mediator_account_loss(&received, &format!("{MEDIATOR_DID}#key-1")),
-            Some("e.p.account.not_found")
+            Some("e.p.account.not_found".to_string())
         );
+    }
+
+    /// What a mediator from v0.52 sends instead of a problem report: a
+    /// `trust-task-error` document, carried in the message body.
+    fn mediator_trust_task_error(
+        sender: &str,
+        code: &str,
+    ) -> super::ReceivedMessage {
+        let mut received = mediator_problem_report(sender, "unused");
+        received.message_type = "https://trusttasks.org/binding/didcomm/0.1/envelope".to_string();
+        received.message_body = serde_json::json!({
+            "id": "urn:uuid:1",
+            "type": "https://trusttasks.org/spec/trust-task-error/0.6",
+            "payload": {
+                "code": code,
+                "message": "account not found",
+                "retryable": false,
+            },
+        });
+        received
+    }
+
+    /// The same document as the answer to a request this gateway sent, which
+    /// is what the account watch's own probe gets back.
+    fn answered_trust_task_error(
+        sender: &str,
+        code: &str,
+    ) -> super::ReceivedMessage {
+        let mut received = mediator_trust_task_error(sender, code);
+        received.message_body["threadId"] = serde_json::json!("urn:uuid:our-request");
+        received.message_body["payload"]["inResponseTo"] = serde_json::json!({
+            "typeUri": "https://trusttasks.org/spec/messaging/account/get/0.2",
+            "id": "urn:uuid:our-request",
+        });
+        received
+    }
+
+    #[test]
+    fn a_refusal_that_answers_our_own_probe_keeps_the_socket() {
+        let received = answered_trust_task_error(MEDIATOR_DID, "messaging/account/get:unknownAccount");
+
+        assert_eq!(
+            super::mediator_account_loss(&received, MEDIATOR_DID),
+            None,
+            "the account watch's own probe is answered here; ending the reader on it churns the socket"
+        );
+    }
+
+    #[test]
+    fn a_trust_task_error_for_our_account_ends_the_reader() {
+        let received = mediator_trust_task_error(MEDIATOR_DID, "messaging/account/get:unknownAccount");
+
+        assert_eq!(
+            super::mediator_account_loss(&received, MEDIATOR_DID),
+            Some("messaging/account/get:unknownAccount".to_string()),
+            "the document a v0.52+ mediator sends is read, not only a problem report"
+        );
+    }
+
+    #[test]
+    fn another_task_losing_an_account_keeps_the_socket() {
+        for code in ["messaging/message/get:unknownAccount", "messaging/account/get:notAuthorised"] {
+            let received = mediator_trust_task_error(MEDIATOR_DID, code);
+
+            assert_eq!(
+                super::mediator_account_loss(&received, MEDIATOR_DID),
+                None,
+                "{code} is not this Connection Point's account going missing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trust_task_error_from_another_sender_keeps_the_socket() {
+        let received = mediator_trust_task_error("did:web:peer.example.com", "messaging/account/get:unknownAccount");
+
+        assert_eq!(super::mediator_account_loss(&received, MEDIATOR_DID), None);
     }
 
     #[test]

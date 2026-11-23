@@ -38,7 +38,7 @@ const Value: React.FC<{ value: string | null }> = ({ value }) =>
   value === null ? (
     <span className="text-muted">-</span>
   ) : (
-    <code className="small text-break fw-semibold">{value}</code>
+    <code className="small text-break">{value}</code>
   );
 
 type ChangeKind = 'rewritten' | 'added' | 'removed';
@@ -285,7 +285,7 @@ const AgentCardPreview: React.FC<AgentCardPreviewProps> = ({ card, upstreamCard 
         </span>
         <div className="agent-preview-title">
           <div className="agent-preview-name" data-testid="agent-card-preview-name">
-            {name ?? <span className="fst-italic">{UNNAMED_AGENT}</span>}
+            {name ?? UNNAMED_AGENT}
           </div>
           <div className="agent-preview-description">
             {description ?? <span className="fst-italic">No description</span>}

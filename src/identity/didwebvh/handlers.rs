@@ -81,13 +81,13 @@ pub(crate) fn build_signing_secret(
     private_key_jwk: &serde_json::Value
 ) -> Result<didwebvh_rs::prelude::Secret, String> {
     let temp_id = "did:key:temp#temp";
-    let raw = didwebvh_rs::prelude::Secret::from_str(temp_id, private_key_jwk)
+    let raw = didwebvh_rs::prelude::Secret::from_jwk_value(temp_id, private_key_jwk)
         .map_err(|e| format!("Failed to build key Secret: {e}"))?;
     let mb = raw
         .get_public_keymultibase()
         .map_err(|e| format!("Failed to get key multibase: {e}"))?;
     let key_id = format!("did:key:{0}#{0}", mb);
-    let mut secret = didwebvh_rs::prelude::Secret::from_str(&key_id, private_key_jwk)
+    let mut secret = didwebvh_rs::prelude::Secret::from_jwk_value(&key_id, private_key_jwk)
         .map_err(|e| format!("Failed to build signing Secret: {e}"))?;
     secret.id = key_id;
     Ok(secret)
@@ -216,8 +216,9 @@ async fn wait_for_next_version_time(raw_entries: &[String]) -> Result<(), String
         serde_json::from_str(newest).map_err(|e| format!("Failed to parse last log entry: {e}"))?;
     let previous = chrono::DateTime::parse_from_rfc3339(&newest.version_time)
         .map_err(|e| format!("The last log entry has an invalid versionTime: {e}"))?;
-    if let Some(wait) = crate::identity::vc_issuer::wait_before_next_version(previous.to_utc(), chrono::Utc::now())
-        .map_err(|e| e.to_string())?
+    if let Some(wait) =
+        crate::identity::didwebvh::signing_key_repair::wait_before_next_version(previous.to_utc(), chrono::Utc::now())
+            .map_err(|e| e.to_string())?
     {
         tokio::time::sleep(wait).await;
     }

@@ -118,6 +118,14 @@ its own tenant: when only an appliance-wide surface could reach it, the answer i
 `available: false` with `operator_only` and nothing is fetched, as in the preview. See
 [`POLICY.md`](POLICY.md) for the egress rules it follows.
 
+## Policy input capture
+
+Listening to a surface's policy input on the dashboard WebSocket needs both `surfaces.edit` and
+`policies.edit`, and the `policy_input_capture` system feature flag on; a session missing either
+permission is refused, and one that loses either stops listening at the next keep-alive ping.
+Turning the flag on or off needs `settings.edit`, like any system setting. Only the listening
+session receives the captured policy input. See [`POLICY.md`](POLICY.md#policy-input-capture).
+
 ## Payments admin API
 
 The x402 (`/api/admin/x402/...`) and MPP (`/api/admin/mpp/...`) admin routers require
@@ -196,7 +204,8 @@ The log holds every tenant's lines, the per-call credential delegation events am
 two routes below also give them only to an appliance-wide caller: a session, or a PAT with
 neither a resource pattern nor required headers. A tenant's PAT, and one scoped by a resource
 pattern or by required headers alone, is answered as a caller without `logs.view` is, `logs.view`
-or not (see [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#what-tenancy-does-not-partition)):
+or not, so it reads none of the per-call credential delegation events, which are written to this
+log only (see [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#what-tenancy-does-not-partition)):
 
 - `GET /v1/dashboard/delta` leaves out `changes.logs`, and `GET /v1/dashboard/stats` returns an
   empty `proxy_info.log_entries`, without reading the log file.

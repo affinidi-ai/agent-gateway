@@ -1,21 +1,38 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { apiClient } from '../../api';
-import { showToast } from '../../utils/toaster';
+import { showToast, showUndoToast } from '../../utils/toaster';
 import { useSafeNavigate } from '../../hooks/useSafeNavigate';
 import { usePageTitle } from '../../context/PageTitleContext';
+import { usePermissions } from '../../context/PermissionsContext';
 import { useDiscardWithUndo } from '../../components/surface-builder/hooks/useDiscardWithUndo';
-import FieldHelp from '../../components/shared/FieldHelp';
 import { Link } from '../../components/shared/Link';
 import { DOCS_URL } from '../../config/docs';
 import PolicySimulatePanel, { POLICY_SIMULATE_DEFAULT_INPUT } from './PolicySimulatePanel';
 import PolicyVersionHistory from './PolicyVersionHistory';
+import {
+  DEFAULT_POLICY,
+  DEFAULT_POLICY_VIEW,
+  EXPECTED_PACKAGE,
+} from './policyTemplates/policyDefaults';
+import PolicyDetailsSection from './PolicyDetailsSection';
+import PolicyEditorSection, { type PolicyView } from './policyTemplates/PolicyEditorSection';
+import PolicyTemplatesPanel from './policyTemplates/PolicyTemplatesPanel';
+import TemplateExamplesCheck from './policyTemplates/TemplateExamplesCheck';
+import TemplateGallery from './policyTemplates/TemplateGallery';
+import TemplateGalleryDetail from './policyTemplates/TemplateGalleryDetail';
+import { parsePolicyRules } from './policyTemplates/regoRules';
+import { POLICY_TYPE_NAMES, type PolicyType } from './policyTemplates/types';
+import { usePolicyTemplateActions } from './policyTemplates/usePolicyTemplateActions';
+import { useTemplateGallery } from './policyTemplates/useTemplateGallery';
+import { POLICY_TEMPLATE_LIBRARY } from './policyTemplates/builtinPolicyTemplates';
+import { groupsForOtherType } from './policyTemplates/policyStart';
 
 interface PolicyDefinition {
   id: string;
   name: string;
   description: string;
-  policy_type: 'gateway' | 'agent_surface';
+  policy_type: PolicyType;
   policy: string;
   enabled: boolean;
   created_at: string;
@@ -23,22 +40,6 @@ interface PolicyDefinition {
   sample_input?: string;
   content_hash?: string;
 }
-
-const EXPECTED_PACKAGE: Record<'gateway' | 'agent_surface', string> = {
-  gateway: 'gateway.policy',
-  agent_surface: 'surface.policy',
-};
-
-const DEFAULT_POLICY: Record<'gateway' | 'agent_surface', string> = {
-  gateway: `package gateway.policy
-
-# Allow all traffic by default
-default allow = true`,
-  agent_surface: `package surface.policy
-
-# Allow all traffic by default
-default allow = true`,
-};
 
 function extractPackage(policy: string): string | null {
   const m = policy.match(/^\s*package\s+([^\s{]+)/m);
@@ -50,23 +51,26 @@ const EditPolicyDefinitionPage: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   const [searchParams] = useSearchParams();
   const isCreateMode = !id || id === 'new';
-  const typeFromQuery = searchParams.get('type') as 'gateway' | 'agent_surface' | null;
+  const typeParam = searchParams.get('type');
+  const typeFromQuery: PolicyType = typeParam === 'agent_surface' ? 'agent_surface' : 'gateway';
+  const typeChosen = isCreateMode && (typeParam === 'gateway' || typeParam === 'agent_surface');
 
   const [form, setForm] = useState<PolicyDefinition>({
     id: '',
     name: '',
     description: '',
-    policy_type: typeFromQuery || 'gateway',
-    policy: DEFAULT_POLICY[typeFromQuery || 'gateway'],
+    policy_type: typeFromQuery,
+    policy: DEFAULT_POLICY[typeFromQuery],
     enabled: true,
     created_at: new Date().toISOString(),
   });
 
-  usePageTitle(isCreateMode ? 'Create Policy Definition' : 'Edit Policy');
+  usePageTitle(isCreateMode ? 'Create Policy' : 'Edit Policy');
 
   const [loading, setLoading] = useState(!isCreateMode);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const baselineRef = useRef<string>(JSON.stringify(form));
   const [isDirty, setIsDirty] = useState(false);
   const [isValidating, setIsValidating] = useState(false);
@@ -74,8 +78,91 @@ const EditPolicyDefinitionPage: React.FC = () => {
   const [policyErrors, setPolicyErrors] = useState<string[]>([]);
   const [packageMismatch, setPackageMismatch] = useState<string | null>(null);
   const [versionRefreshKey, setVersionRefreshKey] = useState(0);
-  const [instructionsOpen, setInstructionsOpen] = useState(false);
-  const toggleInstructions = useCallback(() => setInstructionsOpen(open => !open), []);
+  const [view, setView] = useState<PolicyView>(DEFAULT_POLICY_VIEW);
+  const templatesColumnRef = useRef<HTMLDivElement>(null);
+  const [focusAddRules, setFocusAddRules] = useState(0);
+  const { hasPermission } = usePermissions();
+  const canEditPolicies = hasPermission('policies.edit');
+  const showGallery = isCreateMode && canEditPolicies;
+  const {
+    usedTemplate,
+    templatePicked,
+    setTemplatePicked,
+    insertedTemplate,
+    dismissInsertedTemplate,
+    justAdded,
+    addedRules,
+    regoRef,
+    applyTemplate,
+    editPolicy,
+    pickBlank,
+    insertTemplate,
+    removeGroup,
+    removeRule,
+    denyByDefault,
+    showRule,
+  } = usePolicyTemplateActions(form, setForm, isCreateMode);
+  const gallery = useTemplateGallery({
+    enabled: showGallery,
+    entries: POLICY_TEMPLATE_LIBRARY.entries,
+    policy: form.policy,
+    policyType: form.policy_type,
+    templatePicked,
+    usedTemplate,
+    addedRules,
+    onUseTemplate: (template, rego, fieldText) => {
+      applyTemplate(template, rego, fieldText);
+      setView('rules');
+    },
+    onStartCustom: () => {
+      pickBlank();
+      setView('rules');
+    },
+  });
+  // A new policy shows only Start from until a template is used.
+  const { choosing } = gallery;
+  const otherTypeGroups = useMemo(
+    () =>
+      isCreateMode
+        ? groupsForOtherType(
+            parsePolicyRules(form.policy),
+            form.policy_type,
+            POLICY_TEMPLATE_LIBRARY.templates
+          )
+        : [],
+    [isCreateMode, form.policy, form.policy_type]
+  );
+  const writtenForOtherType = otherTypeGroups.find((t): t is PolicyType => t !== null) ?? null;
+  const simulateRef = useRef<HTMLDivElement>(null);
+  const [focusTest, setFocusTest] = useState(0);
+  const loadInTest = (name: string, input: Record<string, unknown>) => {
+    const previous = form.sample_input;
+    setForm(f => ({ ...f, sample_input: JSON.stringify(input, null, 2) }));
+    setFocusTest(n => n + 1);
+    showUndoToast({
+      message: `Loaded ${name} into Test (dry-run). Undo restores the sample input from before.`,
+      onUndo: () => setForm(f => ({ ...f, sample_input: previous })),
+    });
+  };
+
+  useEffect(() => {
+    if (focusTest === 0) return;
+    simulateRef.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
+    simulateRef.current?.querySelector<HTMLTextAreaElement>('textarea')?.focus();
+  }, [focusTest]);
+
+  const addTemplateRules: typeof insertTemplate = (...args) => {
+    insertTemplate(...args);
+    setView('rules');
+  };
+
+  useEffect(() => {
+    if (focusAddRules === 0) return;
+    templatesColumnRef.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
+    templatesColumnRef.current
+      ?.querySelector<HTMLInputElement>('input.search-input-field')
+      ?.focus();
+  }, [focusAddRules]);
 
   useEffect(() => {
     if (!isCreateMode && id) {
@@ -92,7 +179,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
           setLoading(false);
         })
         .catch(e => {
-          setError(e.message);
+          setLoadError(e.message || 'Failed to load the policy');
           setLoading(false);
         });
     }
@@ -111,7 +198,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
     const actual = extractPackage(form.policy);
     if (actual && actual !== expected) {
       setPackageMismatch(
-        `Package is "${actual}" but should be "${expected}" for ${form.policy_type === 'gateway' ? 'Gateway' : 'Agent Surface'} policies.`
+        `Package is "${actual}" but should be "${expected}" for ${POLICY_TYPE_NAMES[form.policy_type].name} policies.`
       );
     } else {
       setPackageMismatch(null);
@@ -143,6 +230,12 @@ const EditPolicyDefinitionPage: React.FC = () => {
       setError(packageMismatch);
       return;
     }
+    if (writtenForOtherType) {
+      setError(
+        `Remove the rules written for ${POLICY_TYPE_NAMES[writtenForOtherType].name} policies to create this policy.`
+      );
+      return;
+    }
     setSaving(true);
     setError(null);
     try {
@@ -168,9 +261,18 @@ const EditPolicyDefinitionPage: React.FC = () => {
         showToast('success', 'Policy created!');
         navigate(`/policy-definitions/${encodeURIComponent(payload.id)}`);
       } else {
-        // Stay in the editor and surface the newly appended version.
-        baselineRef.current = JSON.stringify(payload);
-        setForm(payload);
+        // Stay in the editor and surface the newly appended version, with its content hash.
+        // Only the stored fields are merged, so an edit or Undo made during the save stays dirty.
+        const stored: Partial<PolicyDefinition> | null = await apiClient
+          .fetch(`/api/v1/policy-definitions/${encodeURIComponent(payload.id)}`)
+          .then(r => (r.ok ? r.json() : null))
+          .catch(() => null);
+        const storedFields = {
+          content_hash: stored?.content_hash,
+          updated_at: stored?.updated_at ?? payload.updated_at,
+        };
+        baselineRef.current = JSON.stringify({ ...payload, ...storedFields });
+        setForm(f => ({ ...f, ...storedFields }));
         setVersionRefreshKey(k => k + 1);
         showToast('success', 'Policy updated!');
       }
@@ -179,7 +281,7 @@ const EditPolicyDefinitionPage: React.FC = () => {
     } finally {
       setSaving(false);
     }
-  }, [form, isCreateMode, navigate, packageMismatch]);
+  }, [form, isCreateMode, navigate, packageMismatch, writtenForOtherType]);
 
   // Track dirty state whenever form changes
   useEffect(() => {
@@ -194,11 +296,14 @@ const EditPolicyDefinitionPage: React.FC = () => {
     navigateTo: `/policies?tab=${form.policy_type}`,
     snapshot: {
       storageKey: `policy-draft:${id ?? 'new'}`,
+      restoreOnlyOnUndo: true,
       save: () => JSON.stringify(form),
       restore: saved => {
         try {
           const parsed = JSON.parse(saved) as PolicyDefinition;
           setForm(parsed);
+          setTemplatePicked(true);
+          gallery.close();
           setIsDirty(true);
         } catch (_ignored) {
           /* ignore */
@@ -216,21 +321,76 @@ const EditPolicyDefinitionPage: React.FC = () => {
 
   // Keyboard shortcut Ctrl+S / Cmd+S
   useEffect(() => {
+    if (!canEditPolicies) return;
     const handler = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 's') {
         e.preventDefault();
-        if (!saving) handleSave();
+        if (!saving && !choosing) handleSave();
       }
     };
     document.addEventListener('keydown', handler);
     return () => document.removeEventListener('keydown', handler);
-  }, [saving, handleSave]);
+  }, [saving, handleSave, canEditPolicies, choosing]);
+
+  const templatesPanel = (
+    <PolicyTemplatesPanel
+      policyType={form.policy_type}
+      library={POLICY_TEMPLATE_LIBRARY}
+      existingPolicy={form.policy}
+      isCreateMode={isCreateMode}
+      onInsert={addTemplateRules}
+    />
+  );
+
+  // The templates column is always there for an editor, so opening a panel never resizes the form.
+  const sidePanel = !canEditPolicies ? null : showGallery && gallery.open ? (
+    <TemplateGalleryDetail
+      selectedKey={gallery.selectedKey}
+      selected={gallery.selected}
+      policyType={form.policy_type}
+      policy={form.policy}
+      start={gallery.start}
+      templatePicked={templatePicked}
+      usedTemplate={usedTemplate}
+      focusKey={gallery.focusKey}
+      onPickBlank={gallery.startCustom}
+      onUseTemplate={gallery.pickTemplate}
+    />
+  ) : (
+    templatesPanel
+  );
+
+  // Add rules brings back the Add rules panel, then moves to its search once it has rendered.
+  const focusTemplatesColumn = () => {
+    if (gallery.open) gallery.close();
+    setFocusAddRules(n => n + 1);
+  };
 
   if (loading) {
     return (
       <div className="container-fluid">
         <div className="text-center py-5">
           <div className="spinner-border text-primary" role="status" />
+        </div>
+      </div>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <div className="container-fluid" data-testid="page-policy-definition-editor">
+        <div className="mb-3">
+          <button
+            className="btn btn-sm btn-secondary"
+            onClick={discard}
+            data-testid="policy-definition-editor-back-button"
+          >
+            <i className="fas fa-arrow-left"></i>
+          </button>
+        </div>
+        <div className="alert alert-danger" data-testid="policy-definition-load-error">
+          <i className="fas fa-exclamation-triangle me-2"></i>
+          <span className="policy-error-text">{loadError}</span>
         </div>
       </div>
     );
@@ -247,472 +407,172 @@ const EditPolicyDefinitionPage: React.FC = () => {
           <i className="fas fa-arrow-left"></i>
         </button>
       </div>
-      <div className="card shadow mb-4 channel-editor-card">
-        <div className="card-header py-3 d-flex justify-content-between align-items-center">
-          <h6 className="m-0 font-weight-bold text-primary">
-            <i className="fas fa-shield-alt"></i>{' '}
-            {isCreateMode ? 'Create Policy Definition' : `Edit Policy: ${form.name}`}
-          </h6>
-          <div className="d-flex align-items-center">
-            <button
-              className={`btn btn-sm btn-primary me-2 ${saving || !policyValid || !!packageMismatch ? 'disabled' : ''}`}
-              data-testid="policy-definition-editor-save-button"
-              onClick={handleSave}
-              disabled={saving || !policyValid || !!packageMismatch}
-            >
-              <i className={`fas ${saving ? 'fa-spinner fa-spin' : 'fa-save'}`}></i>
-              {saving ? ' Saving...' : isCreateMode ? ' Create' : ' Save'}
-            </button>
-          </div>
-        </div>
-
-        <div className="card-body-channel-editor p-3">
-          {error && (
-            <div className="alert alert-danger alert-dismissible fade show">
-              <i className="fas fa-exclamation-triangle me-2"></i>
-              <span
-                style={{
-                  whiteSpace: 'pre-wrap',
-                  fontFamily: 'Monaco, Consolas, "Courier New", monospace',
-                  fontSize: '0.8rem',
-                }}
-              >
-                {error}
-              </span>
-              <button
-                type="button"
-                className="btn-close"
-                onClick={() => setError(null)}
-                aria-label="Close"
-              />
-            </div>
-          )}
-
-          <p className="text-muted mb-3">
-            A policy is a rule, written in Rego (a small policy language), that the gateway
-            evaluates for every matching request and returns allow or deny. Changing the Rego
-            content creates a new version each time you save (name, description, and
-            enabled/disabled changes don&apos;t). Policies can be scoped to Gateway-wide or a
-            specific Agent Surface.{' '}
-            <Link href={DOCS_URL.policies} external variant="inline">
-              Learn more
-            </Link>
-          </p>
-
-          <div className="row">
-            <div className="col-md-6">
-              <div className="mb-3 mb-3">
-                <label className="font-weight-bold">
-                  Name{' '}
-                  <FieldHelp testId="field-help-policy-definition-name" ariaLabel="About Name">
-                    A short, memorable label, this is what you&apos;ll see in the policy list and in
-                    audit-log entries when this policy makes a decision.
-                  </FieldHelp>
-                </label>
-                <input
-                  type="text"
-                  className="form-control form-control-sm"
-                  value={form.name}
-                  onChange={e => {
-                    setForm({ ...form, name: e.target.value });
-                  }}
-                  placeholder="e.g. Require Authentication"
-                />
-              </div>
-            </div>
-            <div className="col-md-3">
-              <div className="mb-3 mb-3">
-                <label className="font-weight-bold">
-                  Type{' '}
-                  <FieldHelp testId="field-help-policy-definition-type" ariaLabel="About Type">
-                    Gateway policies attach to a gateway connection (your own appliance, or one
-                    remote peer) and can also be enforced appliance-wide from the policy list. Agent
-                    Surface policies apply only to one specific agent surface&apos;s traffic.
-                  </FieldHelp>
-                </label>
-                <select
-                  className="form-control form-control-sm dropdown-styling"
-                  value={form.policy_type}
-                  disabled={!isCreateMode}
-                  title={!isCreateMode ? "A policy's type is fixed once created." : undefined}
-                  onChange={e => {
-                    const newType = e.target.value as 'gateway' | 'agent_surface';
-                    const expectedPkg = EXPECTED_PACKAGE[newType];
-                    const currentPkg = extractPackage(form.policy);
-                    let newPolicy = form.policy;
-                    if (currentPkg && currentPkg !== expectedPkg) {
-                      newPolicy = form.policy.replace(
-                        /^(\s*package\s+)[^\s{]+/m,
-                        `$1${expectedPkg}`
-                      );
-                    }
-                    setForm({ ...form, policy_type: newType, policy: newPolicy });
-                  }}
-                >
-                  <option value="gateway">Gateway</option>
-                  <option value="agent_surface">Agent Surfaces</option>
-                </select>
-                {!isCreateMode ? (
-                  <small className="form-text text-muted">
-                    <i className="fas fa-lock me-1"></i>A policy&apos;s type is fixed once created.
-                  </small>
-                ) : (
-                  <small className="form-text text-muted">
-                    Choose based on where you want this rule enforced, this can&apos;t be changed
-                    after you save.
-                  </small>
+      <div className="row">
+        <div className={sidePanel ? 'col-xl-8' : 'col-12'}>
+          <div className="card shadow mb-4 channel-editor-card">
+            <div className="card-header py-3 d-flex justify-content-between align-items-center">
+              <h6 className="m-0 font-weight-bold text-primary">
+                <i className="fas fa-shield-alt"></i>{' '}
+                {!isCreateMode
+                  ? `Edit Policy: ${form.name}`
+                  : typeChosen
+                    ? `Create ${POLICY_TYPE_NAMES[form.policy_type].name} Policy`
+                    : 'Create Policy'}
+              </h6>
+              <div className="d-flex align-items-center gap-2">
+                {canEditPolicies && !choosing && (
+                  <button
+                    className={`btn btn-sm btn-primary me-2 ${saving || !policyValid || !!packageMismatch || !!writtenForOtherType ? 'disabled' : ''}`}
+                    data-testid="policy-definition-editor-save-button"
+                    onClick={handleSave}
+                    disabled={saving || !policyValid || !!packageMismatch || !!writtenForOtherType}
+                  >
+                    <i className={`fas ${saving ? 'fa-spinner fa-spin' : 'fa-save'}`}></i>
+                    {saving ? ' Saving...' : isCreateMode ? ' Create' : ' Save'}
+                  </button>
                 )}
               </div>
             </div>
-            <div className="col-md-3">
-              <div className="mb-3 mb-3">
-                <label className="font-weight-bold">Status</label>
-                <div className="form-check mt-1">
-                  <input
-                    className="form-check-input"
-                    type="checkbox"
-                    id="policy-enabled"
-                    checked={form.enabled}
-                    onChange={e => {
-                      setForm({ ...form, enabled: e.target.checked });
-                    }}
-                  />
-                  <label className="form-check-label" htmlFor="policy-enabled">
-                    Enabled
-                  </label>
-                </div>
-                <small className="form-text text-muted d-block">
-                  When off, this policy is never evaluated. If this policy is also enforced Globally
-                  on the list page, turning it off will make every request in that plane fail closed
-                  (denied) until it&apos;s re-enabled or removed from Global enforcement. Global
-                  assignments set to Monitor only are unaffected: they just stop logging this
-                  policy&apos;s decisions.
-                </small>
-              </div>
-            </div>
-          </div>
 
-          <div className="mb-3 mb-3">
-            <label className="font-weight-bold">
-              Description{' '}
-              <FieldHelp
-                testId="field-help-policy-definition-description"
-                ariaLabel="About Description"
-              >
-                Shown in the policy list and version history, use it to note what this policy
-                enforces and why, for whoever looks at this later.
-              </FieldHelp>
-            </label>
-            <input
-              type="text"
-              className="form-control form-control-sm"
-              value={form.description}
-              onChange={e => {
-                setForm({ ...form, description: e.target.value });
-              }}
-              placeholder="What does this policy do?"
-            />
-          </div>
-
-          {!isCreateMode && form.id && (
-            <div className="mb-3 mb-3">
-              <label className="font-weight-bold">Policy ID</label>
-              <input
-                type="text"
-                className="form-control font-monospace bg-light"
-                value={form.id}
-                disabled
-                readOnly
-                style={{ cursor: 'not-allowed' }}
-              />
-              <small className="form-text text-muted">
-                <i className="fas fa-lock me-1"></i>
-                Referenced by surfaces/gateways and shown in the Audit Log (cannot be changed).
-              </small>
-            </div>
-          )}
-
-          {!isCreateMode && form.content_hash && (
-            <div className="mb-3 mb-3">
-              <label className="font-weight-bold">SHA</label>
-              <input
-                type="text"
-                className="form-control font-monospace bg-light"
-                value={form.content_hash}
-                disabled
-                readOnly
-                style={{ cursor: 'not-allowed' }}
-              />
-              <small className="form-text text-muted">
-                <i className="fas fa-lock me-1"></i>
-                Content hash of the currently enforced revision (cannot be changed).
-              </small>
-            </div>
-          )}
-
-          {/* Policy Instructions */}
-          <div className="card shadow-sm mb-4 border-left-primary">
-            <div className="card-body">
-              <h6 className="mb-0">
-                <button
-                  type="button"
-                  className="btn btn-link w-100 p-0 border-0 d-flex justify-content-between align-items-center text-decoration-none text-start fw-bold text-primary"
-                  aria-expanded={instructionsOpen}
-                  aria-controls="policyDefInstructions"
-                  data-testid="policy-instructions-toggle"
-                  onClick={toggleInstructions}
-                >
-                  <span data-testid="policy-instructions-title">
-                    <i className="fas fa-graduation-cap me-2"></i>
-                    Policy Instructions & Examples
-                  </span>
-                  <span className="btn btn-sm btn-outline-primary" aria-hidden="true">
-                    <i
-                      className={`fas fa-chevron-${instructionsOpen ? 'up' : 'down'}`}
-                      data-testid="policy-instructions-chevron"
-                    ></i>
-                  </span>
-                </button>
-              </h6>
-
-              <div
-                className={`collapse${instructionsOpen ? ' show' : ''}`}
-                id="policyDefInstructions"
-                data-testid="policy-instructions-body"
-              >
-                <p className="text-gray-800 mb-3 mt-3">
-                  Write Rego policies to control access based on JWT claims, HTTP context, and
-                  routing information.
-                </p>
-
-                <div className="card bg-light border-0">
-                  <div className="card-body">
-                    <h6 className="font-weight-bold text-dark mb-3">
-                      <i className="fas fa-lightbulb me-2"></i>
-                      Policy Structure
-                    </h6>
-                    <p className="mb-3 text-gray-700">
-                      Policies must use the appropriate package and define an <code>allow</code>{' '}
-                      rule:
-                    </p>
-                    <pre
-                      className="p-3 rounded mb-3"
-                      style={{
-                        fontSize: '0.85rem',
-                        backgroundColor: 'var(--gray-50)',
-                        color: 'var(--gray-800)',
-                        border: '1px solid var(--gray-300)',
-                      }}
-                    >
-                      <code
-                        style={{ color: 'var(--gray-800)' }}
-                      >{`package ${EXPECTED_PACKAGE[form.policy_type]}
-
-# Default decision (true = allow all, false = deny all)
-default allow = false
-
-# Rules that evaluate to true allow the request
-allow if {
-  # Your conditions here
-}`}</code>
-                    </pre>
-
-                    <h6 className="font-weight-bold text-dark mb-3 mt-4">
-                      <i className="fas fa-database me-2"></i>
-                      Available Input Context
-                    </h6>
-                    <ul className="mb-3 text-gray-800">
-                      <li>
-                        <strong>input.jwt.*</strong> - JWT claims (sub, role, etc.)
-                      </li>
-                      <li>
-                        <strong>input.http.method</strong> - HTTP method
-                      </li>
-                      <li>
-                        <strong>input.http.path</strong> - Request path
-                      </li>
-                      <li>
-                        <strong>input.http.headers</strong> - HTTP headers
-                      </li>
-                      <li>
-                        <strong>input.gateway.direction</strong> - "inbound" or "outbound"
-                      </li>
-                      <li>
-                        <strong>input.channel.config_id</strong> - Target channel config ID
-                      </li>
-                      <li>
-                        <strong>input.channel.name</strong> - Target channel name
-                      </li>
-                    </ul>
-
-                    <h6 className="font-weight-bold text-dark mb-3 mt-4">
-                      <i className="fas fa-lock me-2"></i>
-                      Example: Require Authentication
-                    </h6>
-                    <pre
-                      className="p-3 rounded mb-3"
-                      style={{
-                        fontSize: '0.85rem',
-                        backgroundColor: 'var(--gray-50)',
-                        color: 'var(--gray-800)',
-                        border: '1px solid var(--gray-300)',
-                      }}
-                    >
-                      <code
-                        style={{ color: 'var(--gray-800)' }}
-                      >{`package ${EXPECTED_PACKAGE[form.policy_type]}
-
-default allow = false
-
-# Only allow authenticated requests
-allow if {
-  input.jwt.sub
-}`}</code>
-                    </pre>
-
-                    <h6 className="font-weight-bold text-dark mb-3 mt-4">
-                      <i className="fas fa-user-shield me-2"></i>
-                      Example: Admin-Only Access
-                    </h6>
-                    <pre
-                      className="p-3 rounded mb-3"
-                      style={{
-                        fontSize: '0.85rem',
-                        backgroundColor: 'var(--gray-50)',
-                        color: 'var(--gray-800)',
-                        border: '1px solid var(--gray-300)',
-                      }}
-                    >
-                      <code
-                        style={{ color: 'var(--gray-800)' }}
-                      >{`package ${EXPECTED_PACKAGE[form.policy_type]}
-
-default allow = false
-
-allow if {
-  input.jwt.role == "admin"
-}`}</code>
-                    </pre>
-
-                    <div className="alert alert-warning mb-0">
-                      <small className="text-dark">
-                        <i className="fas fa-exclamation-triangle me-2 text-warning"></i>
-                        <strong>Best Practice:</strong> Start with{' '}
-                        <code className="text-dark">default allow = false</code> and explicitly
-                        allow what you need.
-                      </small>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Rego Editor */}
-          <div>
-            <label className="font-weight-bold">
-              Policy Content (Rego){' '}
-              <FieldHelp
-                testId="field-help-policy-definition-content"
-                ariaLabel="About Policy Content"
-              >
-                Rego is the policy language OPA (Open Policy Agent) uses to evaluate these rules,
-                see the Instructions above for syntax and examples.
-              </FieldHelp>
-              {isValidating && (
-                <span className="ms-2 text-muted small">
-                  <i className="fas fa-spinner fa-spin"></i> Compiling...
-                </span>
-              )}
-              {!isValidating && form.policy.trim() && policyValid && !packageMismatch && (
-                <span className="ms-2 text-success small">
-                  <i className="fas fa-check-circle"></i> Valid
-                </span>
-              )}
-              {!isValidating && form.policy.trim() && (!policyValid || !!packageMismatch) && (
-                <span className="ms-2 text-danger small">
-                  <i className="fas fa-circle-exclamation"></i> Invalid
-                </span>
-              )}
-            </label>
-            <textarea
-              className={`form-control font-monospace small ${policyValid && !packageMismatch ? '' : 'is-invalid'}`}
-              rows={16}
-              style={{ fontSize: '0.875rem' }}
-              value={form.policy}
-              onChange={e => {
-                setForm({ ...form, policy: e.target.value });
-              }}
-              placeholder="...add policy here..."
-            />
-            <small className="form-text text-muted">
-              Leave empty to allow all traffic. Policy is evaluated with JWT claims, HTTP context,
-              and routing information. See the Instructions above for syntax and examples.
-            </small>
-            {policyErrors.length > 0 && (
-              <div className="alert alert-danger compile-error-alert py-2 px-3 mt-2 mb-0">
-                <i className="fas fa-exclamation-triangle me-2"></i>
-                {policyErrors.map((err, idx) => (
-                  <span
-                    key={idx}
-                    style={{
-                      whiteSpace: 'pre-wrap',
-                      fontFamily: 'Monaco, Consolas, "Courier New", monospace',
-                      fontSize: '0.8rem',
-                    }}
-                  >
-                    {err}
-                  </span>
-                ))}
-              </div>
-            )}
-            {packageMismatch && (
-              <div
-                className="alert alert-danger py-2 px-3 mt-2 mb-0 d-flex align-items-start"
-                style={{ fontSize: '0.85rem' }}
-              >
-                <i className="fas fa-exclamation-triangle mr-2 mt-1 flex-shrink-0" />
-                <div>
-                  <strong>Package mismatch:</strong> {packageMismatch}
+            <div className="card-body-channel-editor p-3">
+              {error && (
+                <div className="alert alert-danger alert-dismissible fade show">
+                  <i className="fas fa-exclamation-triangle me-2"></i>
+                  <span className="policy-error-text">{error}</span>
                   <button
                     type="button"
-                    className="btn btn-sm btn-danger ml-2 py-0 px-2"
-                    style={{ fontSize: '0.8rem' }}
-                    onClick={() => {
-                      const expected = EXPECTED_PACKAGE[form.policy_type];
-                      const fixed = form.policy.replace(
-                        /^(\s*package\s+)[^\s{]+/m,
-                        `$1${expected}`
-                      );
-                      setForm({ ...form, policy: fixed });
-                    }}
-                  >
-                    Fix it
-                  </button>
+                    className="btn-close"
+                    onClick={() => setError(null)}
+                    aria-label="Close"
+                  />
                 </div>
-              </div>
-            )}
+              )}
+
+              <p className="text-muted small mb-3">
+                A policy is Rego the gateway evaluates for every matching request to allow or deny
+                it.{' '}
+                <Link href={DOCS_URL.policies} external variant="inline">
+                  Learn more
+                </Link>
+              </p>
+              {!canEditPolicies && (
+                <p className="text-muted small mb-3" data-testid="policy-definition-read-only-note">
+                  <i className="fas fa-lock me-1" aria-hidden="true" />
+                  You can view this policy but not change it.
+                </p>
+              )}
+
+              {showGallery && (
+                <TemplateGallery
+                  cards={gallery.cards}
+                  surfaceOnly={gallery.surfaceOnly}
+                  start={gallery.start}
+                  usedTemplate={usedTemplate}
+                  expanded={gallery.open}
+                  onExpand={gallery.reopen}
+                  onCollapse={templatePicked ? gallery.close : undefined}
+                  selectedKey={gallery.selectedKey}
+                  onSelect={gallery.select}
+                  onCreateCustom={gallery.createCustom}
+                />
+              )}
+
+              {!choosing && (
+                <>
+                  <PolicyDetailsSection
+                    isCreateMode={isCreateMode}
+                    showType={!typeChosen}
+                    readOnly={!canEditPolicies}
+                    name={form.name}
+                    description={form.description}
+                    policyType={form.policy_type}
+                    enabled={form.enabled}
+                    policyId={form.id || undefined}
+                    contentHash={form.content_hash}
+                    onNameChange={name => setForm(f => ({ ...f, name }))}
+                    onDescriptionChange={description => setForm(f => ({ ...f, description }))}
+                    onEnabledChange={enabled => setForm(f => ({ ...f, enabled }))}
+                  />
+
+                  <PolicyEditorSection
+                    policy={form.policy}
+                    policyType={form.policy_type}
+                    onPolicyChange={editPolicy}
+                    view={view}
+                    onViewChange={setView}
+                    regoRef={regoRef}
+                    canEdit={canEditPolicies}
+                    isValidating={isValidating}
+                    policyValid={policyValid}
+                    policyErrors={policyErrors}
+                    packageMismatch={packageMismatch}
+                    onFixPackage={() =>
+                      setForm(f => ({
+                        ...f,
+                        policy: f.policy.replace(
+                          /^(\s*package\s+)[^\s{]+/m,
+                          `$1${EXPECTED_PACKAGE[f.policy_type]}`
+                        ),
+                      }))
+                    }
+                    justAdded={justAdded}
+                    otherTypeGroups={otherTypeGroups}
+                    startedFrom={gallery.startedFrom}
+                    onAdd={focusTemplatesColumn}
+                    onRemoveGroup={removeGroup}
+                    onRemoveRule={removeRule}
+                    onSetDefaultDeny={denyByDefault}
+                    onShowRule={showRule}
+                  />
+                </>
+              )}
+            </div>
           </div>
+          {!isCreateMode && form.id && insertedTemplate && (
+            <TemplateExamplesCheck
+              key={insertedTemplate.key}
+              policyId={form.id}
+              policyType={form.policy_type}
+              draftPolicy={form.policy}
+              template={insertedTemplate.template}
+              usesDefaultSettings={insertedTemplate.usesDefaultSettings}
+              onDismiss={dismissInsertedTemplate}
+              onLoadInTest={loadInTest}
+            />
+          )}
+          {!isCreateMode && form.id && canEditPolicies && (
+            <div ref={simulateRef}>
+              <PolicySimulatePanel
+                policyId={form.id}
+                policyType={form.policy_type}
+                draftPolicy={form.policy}
+                sampleInput={form.sample_input ?? POLICY_SIMULATE_DEFAULT_INPUT}
+                onSampleInputChange={value => setForm(f => ({ ...f, sample_input: value }))}
+                policyValid={policyValid && !packageMismatch}
+              />
+            </div>
+          )}
+          {!isCreateMode && form.id && (
+            <PolicyVersionHistory
+              policyId={form.id}
+              name={form.name}
+              description={form.description}
+              refreshKey={versionRefreshKey}
+            />
+          )}
         </div>
+        {sidePanel && (
+          <div className="col-xl-4">
+            <div
+              className="policy-templates-column"
+              ref={templatesColumnRef}
+              data-testid="policy-templates-column"
+            >
+              {sidePanel}
+            </div>
+          </div>
+        )}
       </div>
-      {!isCreateMode && form.id && (
-        <PolicySimulatePanel
-          policyId={form.id}
-          policyType={form.policy_type}
-          draftPolicy={form.policy}
-          sampleInput={form.sample_input ?? POLICY_SIMULATE_DEFAULT_INPUT}
-          onSampleInputChange={value => setForm(f => ({ ...f, sample_input: value }))}
-          policyValid={policyValid && !packageMismatch}
-        />
-      )}
-      {!isCreateMode && form.id && (
-        <PolicyVersionHistory
-          policyId={form.id}
-          name={form.name}
-          description={form.description}
-          refreshKey={versionRefreshKey}
-        />
-      )}
     </div>
   );
 };

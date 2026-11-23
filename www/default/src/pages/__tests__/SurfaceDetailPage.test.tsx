@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import SurfaceDetailPage from '../SurfaceDetailPage';
@@ -14,8 +14,12 @@ jest.mock('../../utils/toaster', () => ({
 jest.mock('../../components/surface-builder/SurfaceCanvas', () => ({
   getIncompleteReason: () => null,
 }));
+let mockDeniedPermission: string | null = null;
 jest.mock('../../context/PermissionsContext', () => ({
-  usePermissions: () => ({ hasPermission: () => true, loading: false }),
+  usePermissions: () => ({
+    hasPermission: (permission: string) => permission !== mockDeniedPermission,
+    loading: false,
+  }),
 }));
 jest.mock('../../context/PageTitleContext', () => ({ usePageTitle: () => undefined }));
 jest.mock('../../context/AppContext', () => ({
@@ -62,6 +66,10 @@ function MockSurfaceFormShell(props: any) {
       <button onClick={() => setPublic(false)}>Close Access Point</button>
       <output data-testid="access-point-notice">{props.accessPointNotice ?? ''}</output>
       <output data-testid="legacy-access-point">{String(props.legacyAccessPoint)}</output>
+      <output data-testid="selected-node-type">
+        {props.builder.state.nodes.find((n: any) => n.id === props.builder.state.selectedNodeId)
+          ?.type ?? ''}
+      </output>
       {props.manageActions}
     </div>
   );
@@ -496,6 +504,145 @@ describe('SurfaceDetailPage API key references', () => {
   });
 });
 
+describe('SurfaceDetailPage Target authentication header clash', () => {
+  let updateSurface: jest.SpyInstance;
+
+  const targetAuth = (headerName: string) => ({
+    method: {
+      static_secret: {
+        secret_id: 'partner-key',
+        header_name: headerName,
+        header_format: '{value}',
+      },
+    },
+    auth_type: 'custom',
+    fallback: 'reject',
+  });
+
+  const withBinding = (over: Record<string, unknown>): AgentSurface =>
+    ({
+      ...stored({
+        public: true,
+        caller_authentication: {
+          methods: [
+            {
+              type: 'api_key',
+              secret_id: 'caller-key',
+              extraction: { source: 'http_header', field: 'X-Api-Key' },
+            },
+          ],
+        },
+      }),
+      outbound_credentials: [
+        {
+          credential_provider_id: 'prov-1',
+          scopes: ['read'],
+          consent_mode: 'on_demand',
+          required_for: 'all',
+          inject_as: { type: 'bearer_header' },
+        },
+      ],
+      ...over,
+    }) as unknown as AgentSurface;
+
+  const withVariantTarget = (headerName: string): AgentSurface =>
+    withBinding({
+      variants: [
+        {
+          id: 'v-beta',
+          alias: 'beta',
+          name: 'Beta',
+          overrides: {
+            target: { endpoint: 'https://agent.example', auth: targetAuth(headerName) },
+          },
+        },
+      ],
+    });
+
+  const withTransitPoint = (headerName: string): AgentSurface =>
+    withBinding({
+      transit: {
+        points: [
+          {
+            id: 'tp-1',
+            alias: 'partner',
+            protocol: 'mcp',
+            listen_address: '0.0.0.0:0',
+            target_endpoint: 'https://partner.example',
+            require_transit_token: true,
+            target_auth: targetAuth(headerName),
+          },
+        ],
+      },
+    });
+
+  const renderPage = async (surface: AgentSurface) => {
+    jest.spyOn(apiClient, 'getSurface').mockResolvedValue(surface);
+    updateSurface.mockImplementation(async (_id: string, payload: Partial<AgentSurface>) => ({
+      ...surface,
+      ...payload,
+    }));
+    render(
+      <MemoryRouter initialEntries={['/surfaces/srf-1']}>
+        <Routes>
+          <Route path="/surfaces/:surfaceId" element={<SurfaceDetailPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    await screen.findByTestId('surface-save-button');
+  };
+
+  const errorToasts = () => toast.mock.calls.filter(c => c[0] === 'error').map(c => c[1]);
+
+  beforeEach(() => {
+    jest.restoreAllMocks();
+    toast.mockReset();
+    updateSurface = jest.spyOn(apiClient, 'updateSurface');
+  });
+
+  it('blocks Save from the base view on a header clash in an inactive variant, naming the variant', async () => {
+    await renderPage(withVariantTarget('Authorization'));
+
+    fireEvent.click(screen.getByTestId('surface-save-button'));
+
+    await waitFor(() =>
+      expect(errorToasts()).toEqual([
+        'Variant "Beta": target.auth.header_name Authorization is already sent by a credential binding',
+      ])
+    );
+    expect(updateSurface).not.toHaveBeenCalled();
+  });
+
+  it('jumps from a header clash on a Transit Point to that Transit Point', async () => {
+    await renderPage(withTransitPoint('Authorization'));
+
+    fireEvent.click(screen.getByTestId('surface-save-button'));
+
+    await waitFor(() =>
+      expect(errorToasts()).toEqual([
+        "transit.points['partner'].target_auth.header_name Authorization is already sent by a credential binding",
+      ])
+    );
+    expect(updateSurface).not.toHaveBeenCalled();
+    expect(screen.getByTestId('selected-node-type')).toHaveTextContent('');
+    const { action } = toast.mock.calls.find(c => c[0] === 'error')![2];
+    expect(action.label).toBe('Show me');
+
+    act(() => action.onClick());
+
+    expect(screen.getByTestId('selected-node-type')).toHaveTextContent('transit-point-mcp');
+  });
+
+  it('saves when the variant sends its Target credential in a header nothing else sends', async () => {
+    await renderPage(withVariantTarget('X-Partner-Key'));
+
+    fireEvent.click(screen.getByTestId('surface-save-button'));
+
+    await waitFor(() => expect(updateSurface).toHaveBeenCalledTimes(1));
+    expect(errorToasts()).toEqual([]);
+  });
+});
+
 describe('SurfaceDetailPage serving status', () => {
   const renderPage = async (surface: AgentSurface) => {
     jest.spyOn(apiClient, 'getSurface').mockResolvedValue(surface);
@@ -530,4 +677,204 @@ describe('SurfaceDetailPage serving status', () => {
       expect(screen.queryByTestId('surface-refusing-requests')).toBeNull();
     }
   );
+});
+
+describe('SurfaceDetailPage delete', () => {
+  afterEach(() => {
+    mockDeniedPermission = null;
+  });
+
+  const renderWithList = () =>
+    render(
+      <MemoryRouter initialEntries={['/surfaces/s1']}>
+        <Routes>
+          <Route path="/surfaces/:surfaceId" element={<SurfaceDetailPage />} />
+          <Route path="/surfaces" element={<output data-testid="surfaces-list" />} />
+        </Routes>
+      </MemoryRouter>
+    );
+
+  const openConfirmation = async () => {
+    fireEvent.click(await screen.findByTestId('surface-delete-button'));
+    return screen.findByTestId('surface-delete-confirm');
+  };
+
+  it('asks for confirmation, naming the surface, and deletes nothing on the first click', async () => {
+    const deleteSurface = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
+    renderWithList();
+
+    const confirmation = await openConfirmation();
+
+    expect(screen.getByRole('dialog', { name: 'Delete Surface?' })).toBe(confirmation);
+    expect(screen.getByTestId('surface-delete-confirm-name')).toHaveTextContent('Delete agent?');
+    expect(confirmation).toHaveTextContent(
+      'You are about to permanently delete this surface and all associated configuration. This action cannot be undone.'
+    );
+    expect(confirmation).toHaveTextContent('Are you sure you want to continue?');
+    expect(deleteSurface).not.toHaveBeenCalled();
+  });
+
+  it('names the surface by its id when it has no name', async () => {
+    jest.spyOn(apiClient, 'getSurface').mockResolvedValue({ ...surface, name: '' });
+    renderWithList();
+    await openConfirmation();
+
+    expect(screen.getByTestId('surface-delete-confirm-name')).toHaveTextContent('Delete s1?');
+  });
+
+  it('focuses Cancel, and on Cancel closes without deleting and refocuses the delete button', async () => {
+    const deleteSurface = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
+    renderWithList();
+    await openConfirmation();
+
+    const cancel = screen.getByTestId('surface-delete-confirm-cancel');
+    expect(cancel).toHaveFocus();
+    fireEvent.click(cancel);
+
+    expect(screen.queryByTestId('surface-delete-confirm')).toBeNull();
+    expect(screen.getByTestId('surface-delete-button')).toHaveFocus();
+    expect(deleteSurface).not.toHaveBeenCalled();
+  });
+
+  it('closes without deleting on Escape', async () => {
+    const deleteSurface = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
+    renderWithList();
+    await openConfirmation();
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    expect(screen.queryByTestId('surface-delete-confirm')).toBeNull();
+    expect(deleteSurface).not.toHaveBeenCalled();
+  });
+
+  it('closes when the delete button is clicked again', async () => {
+    renderWithList();
+    await openConfirmation();
+
+    fireEvent.click(screen.getByTestId('surface-delete-button'));
+
+    expect(screen.queryByTestId('surface-delete-confirm')).toBeNull();
+  });
+
+  it('does not save on Cmd+S while the confirmation is open', async () => {
+    const updateSurface = jest.spyOn(apiClient, 'updateSurface');
+    renderWithList();
+    await openConfirmation();
+
+    fireEvent.keyDown(screen.getByTestId('surface-delete-confirm-cancel'), {
+      key: 's',
+      metaKey: true,
+    });
+
+    expect(updateSurface).not.toHaveBeenCalled();
+  });
+
+  it('shows no delete button without surfaces.delete, even with surfaces.edit', async () => {
+    mockDeniedPermission = 'surfaces.delete';
+    renderWithList();
+
+    expect(await screen.findByTestId('surface-save-button')).toBeInTheDocument();
+    expect(screen.queryByTestId('surface-delete-button')).toBeNull();
+  });
+
+  it('shows the delete button with surfaces.delete, even without surfaces.edit', async () => {
+    mockDeniedPermission = 'surfaces.edit';
+    renderWithList();
+
+    await openConfirmation();
+
+    expect(screen.getByTestId('surface-delete-confirm-confirm')).toBeEnabled();
+  });
+
+  it('cannot open the confirmation while a save runs', async () => {
+    jest.spyOn(apiClient, 'updateSurface').mockReturnValue(new Promise(() => {}));
+    const deleteSurface = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
+    renderWithList();
+    fireEvent.click(await screen.findByTestId('surface-save-button'));
+
+    expect(await screen.findByTestId('surface-delete-button')).toBeDisabled();
+    fireEvent.click(screen.getByTestId('surface-delete-button'));
+
+    expect(screen.queryByTestId('surface-delete-confirm')).toBeNull();
+    expect(deleteSurface).not.toHaveBeenCalled();
+  });
+
+  it('sends one delete when Delete is clicked twice', async () => {
+    const deleteSurface = jest
+      .spyOn(apiClient, 'deleteSurface')
+      .mockReturnValue(new Promise(() => {}));
+    renderWithList();
+    await openConfirmation();
+
+    fireEvent.click(screen.getByTestId('surface-delete-confirm-confirm'));
+    fireEvent.click(screen.getByTestId('surface-delete-confirm-confirm'));
+
+    expect(deleteSurface).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes the confirmation when the page moves to another surface', async () => {
+    const deleteSurface = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
+    render(
+      <MemoryRouter initialEntries={['/surfaces/s1']}>
+        <Routes>
+          <Route
+            path="/surfaces/:surfaceId"
+            element={
+              <>
+                <SurfaceDetailPage />
+                <LocationProbe />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    );
+    await openConfirmation();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open another surface' }));
+
+    await waitFor(() =>
+      expect((apiClient.getSurface as jest.Mock).mock.calls.map(call => call[0])).toContain('s2')
+    );
+    await screen.findByTestId('surface-delete-button');
+    await act(() => new Promise<void>(resolve => requestAnimationFrame(() => resolve())));
+
+    expect(screen.queryByTestId('surface-delete-confirm')).toBeNull();
+    expect(deleteSurface).not.toHaveBeenCalled();
+  });
+
+  it('deletes the surface and returns to the surface list on Delete', async () => {
+    const deleteSurface = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
+    renderWithList();
+    await openConfirmation();
+
+    fireEvent.click(screen.getByTestId('surface-delete-confirm-confirm'));
+
+    expect(await screen.findByTestId('surfaces-list')).toBeInTheDocument();
+    expect(deleteSurface).toHaveBeenCalledTimes(1);
+    expect(deleteSurface).toHaveBeenCalledWith('s1');
+    expect(showToast).toHaveBeenCalledWith('success', 'Surface "agent" deleted');
+  });
+
+  it('closes the confirmation, shows the error and refocuses the delete button when the delete fails', async () => {
+    let rejectDelete: (error: Error) => void = () => {};
+    jest.spyOn(apiClient, 'deleteSurface').mockReturnValue(
+      new Promise<void>((_resolve, reject) => {
+        rejectDelete = reject;
+      })
+    );
+    renderWithList();
+    await openConfirmation();
+
+    fireEvent.click(screen.getByTestId('surface-delete-confirm-confirm'));
+
+    expect(await screen.findByTestId('surface-delete-button')).toBeDisabled();
+    expect(screen.getByTestId('surface-delete-confirm-cancel')).toBeDisabled();
+    rejectDelete(new Error('Surface is in use'));
+
+    expect(await screen.findByTestId('surface-error-alert')).toHaveTextContent('Surface is in use');
+    expect(screen.queryByTestId('surface-delete-confirm')).toBeNull();
+    expect(screen.queryByTestId('surfaces-list')).toBeNull();
+    await waitFor(() => expect(screen.getByTestId('surface-delete-button')).toHaveFocus());
+  });
 });

@@ -4,6 +4,9 @@ import AddResourceLink from '../../../shared/AddResourceLink';
 import { deepLinks } from '../../../../utils/deepLinks';
 import type { ConfigPanelProps } from '../types';
 import TargetAuthProviderSelect from '../_shared/TargetAuthProviderSelect';
+import TargetAuthProblemNotice from '../_shared/TargetAuthProblemNotice';
+import { managedAgentTargetAuthProblems } from './targetAuth';
+import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
 
 interface SecretOption {
   id: string;
@@ -38,6 +41,16 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
   const source = config.target_auth_source === 'provider' ? 'provider' : 'secret';
   const [secrets, setSecrets] = useState<SecretOption[]>([]);
   const [loadingSecrets, setLoadingSecrets] = useState(false);
+  const accessPointChecksCallers = useOptionalSurfaceMeta()?.accessPointChecksCallers;
+  const { errors, advisories, notes } = managedAgentTargetAuthProblems(config, {
+    accessPointChecksCallers,
+  });
+  const formatError = errors.target_auth_header_format;
+  const [formatErrorSeen, setFormatErrorSeen] = useState(false);
+  useEffect(() => {
+    if (formatError) setFormatErrorSeen(true);
+  }, [formatError]);
+  const showFormat = authType === 'custom' || !!formatError || formatErrorSeen;
 
   useEffect(() => {
     setLoadingSecrets(true);
@@ -67,6 +80,7 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
 
   const setAuthType = (newType: AuthType) => {
     const d = AUTH_TYPE_DEFAULTS[newType];
+    setFormatErrorSeen(false);
     updateFields({
       target_auth_type: newType,
       target_auth_header_name: d.headerName,
@@ -86,6 +100,13 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
           Inject credentials into requests sent to the target endpoint. Use this when the target
           requires authentication.
         </small>
+
+        <TargetAuthProblemNotice
+          testId="managed-agent-target-auth"
+          errors={[]}
+          advisories={advisories}
+          notes={notes}
+        />
 
         <div className="mb-3">
           <label htmlFor="target-auth-source" className="form-label fw-bold">
@@ -117,7 +138,39 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
               testId="managed-agent-target-auth-provider"
               value={config.target_auth_provider_id || ''}
               onChange={providerId => updateField('target_auth_provider_id', providerId)}
+              errorId={errors.target_auth_provider_id ? 'target-auth-provider-error' : undefined}
             />
+            <div role="alert">
+              {errors.target_auth_provider_id && (
+                <div
+                  className="text-danger small mt-1"
+                  id="target-auth-provider-error"
+                  data-testid="managed-agent-target-auth-provider-error"
+                >
+                  {errors.target_auth_provider_id}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {source === 'provider' && (
+          <div className="mb-3">
+            <label htmlFor="target-auth-scopes" className="form-label fw-bold">
+              Scopes
+            </label>
+            <input
+              type="text"
+              className="form-control"
+              id="target-auth-scopes"
+              data-testid="managed-agent-target-auth-scopes"
+              value={config.target_auth_scopes || ''}
+              onChange={e => updateField('target_auth_scopes', e.target.value)}
+              placeholder="Space-separated; the provider's default scopes when empty"
+            />
+            <small className="form-text text-muted">
+              Scopes to request for this Target. Leave empty to use the provider's default scopes.
+            </small>
           </div>
         )}
 
@@ -129,9 +182,14 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
             <select
               className="form-control dropdown-styling"
               id="target-auth-secret"
+              data-testid="managed-agent-target-auth-secret"
               value={config.target_auth_secret_id || ''}
               onChange={e => updateField('target_auth_secret_id', e.target.value)}
               disabled={loadingSecrets}
+              aria-invalid={errors.target_auth_secret_id ? true : undefined}
+              aria-describedby={
+                errors.target_auth_secret_id ? 'target-auth-secret-error' : undefined
+              }
             >
               <option value="">
                 {loadingSecrets ? '-- Loading secrets... --' : '-- Select a secret --'}
@@ -142,6 +200,17 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
                 </option>
               ))}
             </select>
+            <div role="alert">
+              {errors.target_auth_secret_id && (
+                <div
+                  className="text-danger small mt-1"
+                  id="target-auth-secret-error"
+                  data-testid="managed-agent-target-auth-secret-error"
+                >
+                  {errors.target_auth_secret_id}
+                </div>
+              )}
+            </div>
             <small className="form-text text-muted">
               Select a secret containing the credentials for the target endpoint
             </small>
@@ -189,13 +258,28 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
             value={config.target_auth_header_name || ''}
             onChange={e => updateField('target_auth_header_name', e.target.value)}
             placeholder="Authorization"
+            aria-invalid={!!errors.target_auth_header_name}
+            aria-describedby={
+              errors.target_auth_header_name ? 'target-auth-header-name-error' : undefined
+            }
           />
+          <div role="alert">
+            {errors.target_auth_header_name && (
+              <div
+                className="text-danger small"
+                id="target-auth-header-name-error"
+                data-testid="managed-agent-target-auth-header-name-error"
+              >
+                {errors.target_auth_header_name}
+              </div>
+            )}
+          </div>
           <small className="form-text text-muted">
             The HTTP header name to inject (e.g., Authorization, X-API-Key)
           </small>
         </div>
 
-        {authType === 'custom' && (
+        {showFormat && (
           <div className="mb-3">
             <label htmlFor="target-auth-header-format" className="form-label fw-bold">
               Header Format
@@ -208,7 +292,22 @@ const ManagedAgentAuthFullscreen: React.FC<ConfigPanelProps> = ({
               onChange={e => updateField('target_auth_header_format', e.target.value)}
               placeholder="Bearer {value}"
               style={{ fontFamily: 'monospace' }}
+              aria-invalid={!!errors.target_auth_header_format}
+              aria-describedby={
+                errors.target_auth_header_format ? 'target-auth-header-format-error' : undefined
+              }
             />
+            <div role="alert">
+              {errors.target_auth_header_format && (
+                <div
+                  className="text-danger small"
+                  id="target-auth-header-format-error"
+                  data-testid="managed-agent-target-auth-header-format-error"
+                >
+                  {errors.target_auth_header_format}
+                </div>
+              )}
+            </div>
             <small className="form-text text-muted">
               Format for the header value. Use <code>{'{value}'}</code> as a placeholder for the
               secret value.

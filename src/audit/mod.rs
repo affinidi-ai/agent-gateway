@@ -22,6 +22,7 @@ pub mod log_files;
 pub mod mcp_proxy_pin_changes;
 pub mod pipeline;
 pub mod policy_changes;
+pub mod policy_input_captures;
 pub mod policy_refusals;
 pub mod producer;
 pub mod registry;

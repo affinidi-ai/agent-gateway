@@ -73,7 +73,10 @@ pub fn built_in_rules() -> Vec<LogRedactionRule> {
 }
 
 /// Exported attribute names whose values are credentials. An attribute is one when its
-/// name, ignoring case, is one of these or ends with one after a `.`, `_` or `-`.
+/// name, ignoring case, is one of these or ends with one after a `.`, `_`, `-` or space. A
+/// lowercase letter or digit followed by an uppercase letter also separates words, so
+/// `accessToken` reads as `access_token`; a name also matches without that split, so
+/// `passWord` reads as `password`.
 const CREDENTIAL_ATTRIBUTE_NAMES: &[&str] = &[
     "authorization",
     "cookie",
@@ -93,17 +96,74 @@ const CREDENTIAL_ATTRIBUTE_NAMES: &[&str] = &[
     "credentials",
 ];
 
-fn is_credential_attribute(name: &str) -> bool {
-    let normalized = name
-        .to_ascii_lowercase()
-        .replace(['.', '-'], "_");
-    CREDENTIAL_ATTRIBUTE_NAMES
+/// Attribute names that are credentials only as the whole name, since as a suffix they
+/// would catch names such as `primary_key` or `oauth`.
+const WHOLE_CREDENTIAL_ATTRIBUTE_NAMES: &[&str] = &["key", "auth", "pat"];
+
+pub(crate) fn is_credential_attribute(name: &str) -> bool {
+    is_credential_name(&normalized_attribute_name(name, true))
+        || is_credential_name(&normalized_attribute_name(name, false))
+}
+
+/// `name` lowercased with `.`, `-` and space read as `_`, and, when `split_case` is set, a
+/// lowercase letter or digit followed by an uppercase letter separated by `_`.
+fn normalized_attribute_name(
+    name: &str,
+    split_case: bool,
+) -> String {
+    let mut normalized = String::with_capacity(name.len() + 4);
+    let mut previous: Option<char> = None;
+    for c in name.chars() {
+        if split_case
+            && c.is_ascii_uppercase()
+            && previous.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit())
+        {
+            normalized.push('_');
+        }
+        normalized.push(match c {
+            '.' | '-' | ' ' => '_',
+            other => other.to_ascii_lowercase(),
+        });
+        previous = Some(c);
+    }
+    normalized
+}
+
+fn is_credential_name(normalized: &str) -> bool {
+    WHOLE_CREDENTIAL_ATTRIBUTE_NAMES.contains(&normalized)
+        || CREDENTIAL_ATTRIBUTE_NAMES
+            .iter()
+            .any(|credential| {
+                normalized
+                    .strip_suffix(credential)
+                    .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('_'))
+            })
+}
+
+static UUID: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b").expect("valid UUID pattern")
+});
+
+fn is_fragment_of(
+    found: &std::ops::Range<usize>,
+    uuid: &std::ops::Range<usize>,
+) -> bool {
+    uuid.start <= found.start && found.end <= uuid.end && found != uuid
+}
+
+/// Whether `found` is a fragment of one of `uuids`, the UUIDs of a text in order. Only the
+/// UUIDs that start at or before `found` and do not end before it can hold it, and a binary
+/// search skips the ones that end before it, so each match costs a logarithmic number of
+/// checks however many UUIDs the text holds.
+fn is_fragment_of_a_uuid(
+    found: &std::ops::Range<usize>,
+    uuids: &[std::ops::Range<usize>],
+) -> bool {
+    let first = uuids.partition_point(|uuid| uuid.end < found.start);
+    uuids[first..]
         .iter()
-        .any(|credential| {
-            normalized
-                .strip_suffix(credential)
-                .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('_'))
-        })
+        .take_while(|uuid| uuid.start <= found.start)
+        .any(|uuid| is_fragment_of(found, uuid))
 }
 
 // ── Compiled ruleset ────────────────────────────────────────────────
@@ -149,7 +209,9 @@ impl LogRedactor {
         }
     }
 
-    /// Apply all rules in order to the input string.
+    /// Apply all rules in order to the input string. A match that lies inside a UUID
+    /// without covering all of it is kept, so a rule such as a phone number pattern
+    /// cannot mangle surface ids or other identifiers.
     /// Returns the input borrowed when no rule matches.
     #[inline]
     pub fn redact<'a>(
@@ -159,11 +221,26 @@ impl LogRedactor {
         let mut output = Cow::Borrowed(input);
         for rule in &self.rules {
             if rule.regex.is_match(&output) {
-                output = Cow::Owned(
-                    rule.regex
-                        .replace_all(&output, rule.replacement.as_str())
-                        .into_owned(),
-                );
+                let uuids: Vec<std::ops::Range<usize>> = UUID
+                    .find_iter(&output)
+                    .map(|m| m.range())
+                    .collect();
+                let redacted = rule
+                    .regex
+                    .replace_all(&output, |caps: &regex::Captures<'_>| {
+                        let found = caps
+                            .get(0)
+                            .map_or(0..0, |m| m.range());
+                        if is_fragment_of_a_uuid(&found, &uuids) {
+                            return caps[0].to_string();
+                        }
+                        let mut replaced = String::new();
+                        caps.expand(&rule.replacement, &mut replaced);
+                        replaced
+                    });
+                if redacted != output {
+                    output = Cow::Owned(redacted.into_owned());
+                }
             }
         }
         output
@@ -501,6 +578,18 @@ impl<P: LogProcessor> LogProcessor for RedactingLogProcessor<P> {
 
 // ── Tests ───────────────────────────────────────────────────────────
 
+/// A redactor with the rules of the example gateway configuration, every one of them compiled.
+#[cfg(test)]
+pub(crate) fn example_redactor() -> Arc<LogRedactor> {
+    let example: serde_json::Value =
+        serde_json::from_str(include_str!("../../config/examples/gateway.example.json")).unwrap();
+    let config: crate::config::types::LogRedactionConfig =
+        serde_json::from_value(example["logging"]["redaction"].clone()).unwrap();
+    let redactor = LogRedactor::from_config(&config);
+    assert_eq!(redactor.rule_count(), config.rules.len(), "every example rule must compile");
+    redactor
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,12 +759,7 @@ mod tests {
 
     /// Redactor built from the `logging.redaction` rules of `gateway.example.json`.
     fn full_redactor() -> Arc<LogRedactor> {
-        let example: serde_json::Value =
-            serde_json::from_str(include_str!("../../config/examples/gateway.example.json")).unwrap();
-        let config: LogRedactionConfig = serde_json::from_value(example["logging"]["redaction"].clone()).unwrap();
-        let redactor = LogRedactor::from_config(&config);
-        assert_eq!(redactor.rule_count(), config.rules.len(), "every example rule must compile");
-        redactor
+        example_redactor()
     }
 
     // ── Category 1: Always masked (high-risk secrets) ───────────────
@@ -828,6 +912,61 @@ mod tests {
         let input = "Fax: +44.20.7946.0958";
         let result = r.redact(input);
         assert!(result.contains("[REDACTED-PHONE]"), "Dotted phone not redacted: {result}");
+    }
+
+    #[test]
+    fn test_full_phone_rule_keeps_surface_ids_whole() {
+        let r = full_redactor();
+        for id in ["bf983d36-0281-4579-a1b2-c3d4e5f60718", "fb735810-d02c-4e7c-b555-123456789012"] {
+            let line = format!("[CHANNEL:{id}] Forwarding request {{\"config_id\":\"{id}\"}}");
+            assert_eq!(r.redact(&line).as_ref(), line);
+        }
+    }
+
+    #[test]
+    fn test_full_phone_beside_a_surface_id_is_still_redacted() {
+        let r = full_redactor();
+        let result = r.redact("[CHANNEL:bf983d36-0281-4579-a1b2-c3d4e5f60718] Contact: +1-555-123-4567");
+        assert_eq!(result.as_ref(), "[CHANNEL:bf983d36-0281-4579-a1b2-c3d4e5f60718] Contact: [REDACTED-PHONE]");
+    }
+
+    #[test]
+    fn test_a_match_is_a_uuid_fragment_only_inside_one_uuid() {
+        let uuids = [4..40, 45..81, 90..126];
+        for (found, expected) in [
+            (0..3, false),
+            (4..40, false),
+            (5..17, true),
+            (4..39, true),
+            (40..40, true),
+            (38..46, false),
+            (41..44, false),
+            (45..80, true),
+            (100..126, true),
+            (120..130, false),
+            (127..130, false),
+        ] {
+            assert_eq!(is_fragment_of_a_uuid(&found, &uuids), expected, "{found:?}");
+            assert_eq!(
+                uuids
+                    .iter()
+                    .any(|uuid| is_fragment_of(&found, uuid)),
+                expected,
+                "{found:?}"
+            );
+        }
+        assert!(!is_fragment_of_a_uuid(&(5..17), &[]));
+    }
+
+    #[test]
+    fn test_rule_matching_a_whole_uuid_still_redacts_it() {
+        let r = LogRedactor::from_config(&make_config(vec![(
+            "UUIDs",
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            "[REDACTED-UUID]",
+        )]));
+        let result = r.redact("user bf983d36-0281-4579-a1b2-c3d4e5f60718 signed in");
+        assert_eq!(result.as_ref(), "user [REDACTED-UUID] signed in");
     }
 
     #[test]
@@ -1253,6 +1392,24 @@ mod tests {
             "http.request.header.x-caller-key",
             "private_key",
             "credentials",
+            "accessToken",
+            "refreshToken",
+            "clientSecret",
+            "apiKey",
+            "xApiKey",
+            "sessionId",
+            "privateKey",
+            "oauth2Token",
+            "APIKey",
+            "API Key",
+            "Access Token",
+            "key",
+            "Key",
+            "auth",
+            "pat",
+            "passWord",
+            "PassWd",
+            "JSessionId",
         ] {
             assert!(is_credential_attribute(name), "{name} must be treated as a credential");
         }
@@ -1270,6 +1427,17 @@ mod tests {
             "http.uri",
             "caller.did",
             "message",
+            "maxTokens",
+            "tokenCount",
+            "apiKeyId",
+            "secretId",
+            "inputTokens",
+            "primary_key",
+            "keys",
+            "oauth",
+            "author",
+            "path",
+            "api_key_name",
         ] {
             assert!(!is_credential_attribute(name), "{name} must not be treated as a credential");
         }

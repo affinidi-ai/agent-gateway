@@ -98,7 +98,7 @@ pub struct NetworkConfig {
     pub external_consent_refresh_refusals: u32,
 
     /// Logging overrides (only redaction rules are used from gateway.json;
-    /// level/json/log_directory come from config.toml)
+    /// level/json/log_directory/delegation_events come from config.toml)
     #[serde(default)]
     pub logging: Option<crate::config::LoggingConfig>,
 

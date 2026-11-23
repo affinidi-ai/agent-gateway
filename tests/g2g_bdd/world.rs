@@ -15,6 +15,7 @@ use serde_json::Value;
 use crate::bdd_support::actors::ActorRegistry;
 use crate::bdd_support::admin_client::{AdminApiClient, GatewayRecord};
 use crate::bdd_support::config::fabric_surface_fixture::{SourceAuthSpec, SurfaceSpec};
+use crate::bdd_support::dashboard_socket::DashboardSocket;
 use crate::bdd_support::gateway_process::G2G_TEST_AUTH_TOKEN;
 use crate::bdd_support::json_rpc::{
     IdentityBindingProof, McpVersion, build_a2a_request_body, build_mcp_list_tools_body, build_mcp_tool_call_body,
@@ -265,8 +266,9 @@ fn fabric_route_probe_stage(
 }
 
 /// A route that never answers `200`, so no probe can show it ready: the target's mock
-/// answers another status, or the sending surface's Target credential goes in the header the
-/// receiving surface checks with a value it does not accept.
+/// answers another status, the sending surface's Target credential goes in the header the
+/// receiving surface checks with a value it does not accept, or the receiving surface
+/// authenticates its Target's responses, which the mock proves only once the scenario says so.
 fn route_refuses_by_design(
     topology: &TopologyBuilder,
     link: &FabricLink,
@@ -293,7 +295,7 @@ fn route_refuses_by_design(
         }
         _ => false,
     };
-    mock_refuses || credential_refused
+    mock_refuses || credential_refused || target.response_auth.is_some()
 }
 
 fn surface_spec<'a>(
@@ -386,6 +388,8 @@ pub struct G2gWorld {
     pub relayed_transit_point_calls: Option<usize>,
     /// The traffic of a surface's agent the operator read before the caller's action, by surface name.
     pub agent_traffic_baseline: HashMap<String, AgentTraffic>,
+    /// The operator's open dashboard WebSocket on one gateway, by gateway index.
+    pub dashboard_sockets: HashMap<usize, DashboardSocket>,
 }
 
 /// The Access Point request counts `GET /v1/agents/{id}` reports for an agent.
@@ -437,6 +441,7 @@ impl G2gWorld {
             consent_request: None,
             relayed_transit_point_calls: None,
             agent_traffic_baseline: HashMap::new(),
+            dashboard_sockets: HashMap::new(),
         }
     }
 

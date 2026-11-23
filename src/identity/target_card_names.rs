@@ -2,7 +2,8 @@
 //!
 //! For A2A and AP2 surfaces with an HTTP(S) target, the dashboard shows this name in place
 //! of the surface name. The name is self-asserted by the target and never verified, so it is
-//! never signed into the identity VC or published to trust registries.
+//! never signed into the identity VC or published to trust registries. A surface with
+//! `target.response_auth` has its card read under it, and an answer that fails shows no name.
 //! [`TargetCardNameService::lookup_or_spawn`] never waits.
 
 use std::sync::{Arc, OnceLock};
@@ -14,9 +15,11 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::config::agent_surface::{AgentSurface, SurfaceProtocol};
+use crate::config::response_auth::ResponseAuthConfig;
 use crate::identity::display_name::DisplayName;
 use crate::observability::caller_names::{AGENT_CARD_FETCH_TIMEOUT, AGENT_CARD_MAX_BYTES};
 use crate::observability::refresh_cache::RefreshCache;
+use crate::proxy::response_auth::ResponseAuthFailure;
 
 pub const TARGET_CARD_NAME_TTL: Duration = Duration::from_secs(300);
 const MAX_CONCURRENT_FETCHES: usize = 4;
@@ -63,6 +66,18 @@ pub trait TargetCardSource: Send + Sync {
         &self,
         location: &CardLocation,
     ) -> Option<Value>;
+
+    /// [`Self::fetch_agent_card`] for a `surface` with `target.response_auth`, whose answer
+    /// must pass it: `Err` when it does not or cannot be checked.
+    async fn fetch_checked_agent_card(
+        &self,
+        location: &CardLocation,
+        _surface: &AgentSurface,
+    ) -> Result<Option<Value>, ResponseAuthFailure> {
+        Ok(self
+            .fetch_agent_card(location)
+            .await)
+    }
 }
 
 enum CardName {
@@ -73,6 +88,7 @@ enum CardName {
 #[derive(Clone)]
 struct CardEntry {
     location: CardLocation,
+    response_auth: Option<ResponseAuthConfig>,
     name: Option<String>,
 }
 
@@ -110,20 +126,54 @@ impl TargetCardNameService {
         }
     }
 
-    /// Returns the cached name for the surface's current card location without waiting, and
-    /// starts a single background refresh when the entry is missing, stale, or was read from a
-    /// different location.
+    /// [`Self::lookup_or_spawn_for`] of a surface `surface_id` without Response authentication.
+    #[cfg(test)]
     pub fn lookup_or_spawn(
         self: &Arc<Self>,
         surface_id: &str,
         location: &CardLocation,
     ) -> Option<String> {
+        self.lookup(surface_id, location, None)
+    }
+
+    /// Returns the cached name for `surface`'s current card location without waiting, and
+    /// starts a single background refresh when the entry is missing, stale, or was read from a
+    /// different location or under another `target.response_auth`. A card read under the
+    /// surface's Response authentication that fails it yields no name.
+    pub fn lookup_or_spawn_for(
+        self: &Arc<Self>,
+        surface: &AgentSurface,
+        location: &CardLocation,
+    ) -> Option<String> {
+        self.lookup(&surface.surface_id, location, Some(surface))
+    }
+
+    fn lookup(
+        self: &Arc<Self>,
+        surface_id: &str,
+        location: &CardLocation,
+        surface: Option<&AgentSurface>,
+    ) -> Option<String> {
+        let checked_by = surface.filter(|surface| {
+            surface
+                .target
+                .response_auth
+                .is_some()
+        });
+        let response_auth = checked_by.and_then(|surface| {
+            surface
+                .target
+                .response_auth
+                .clone()
+        });
         let (cached, fresh) = match self.cache.get(surface_id) {
-            Some((entry, fresh)) if entry.location == *location => (entry.name, fresh),
+            Some((entry, fresh)) if entry.location == *location && entry.response_auth == response_auth => {
+                (entry.name, fresh)
+            }
             _ => (None, false),
         };
         if !fresh {
-            self.spawn_refresh(surface_id, location);
+            self.spawn_refresh(surface_id, location, checked_by.map(|surface| Arc::new(surface.clone())));
         }
         cached
     }
@@ -132,20 +182,29 @@ impl TargetCardNameService {
         self: &Arc<Self>,
         surface_id: &str,
         location: &CardLocation,
+        checked_by: Option<Arc<AgentSurface>>,
     ) {
         let service = Arc::clone(self);
         let owned_id = surface_id.to_string();
         let location = location.clone();
         self.cache
             .spawn_refresh(surface_id, move || async move {
+                let response_auth = checked_by
+                    .as_ref()
+                    .and_then(|surface| {
+                        surface
+                            .target
+                            .response_auth
+                            .clone()
+                    });
                 let name = match service
-                    .resolve(&owned_id, &location)
+                    .resolve(&owned_id, &location, checked_by.as_deref())
                     .await
                 {
                     CardName::Read(name) => name,
-                    CardName::Unreadable => service.last_known_name(&owned_id, &location),
+                    CardName::Unreadable => service.last_known_name(&owned_id, &location, response_auth.as_ref()),
                 };
-                CardEntry { location, name }
+                CardEntry { location, response_auth, name }
             });
     }
 
@@ -153,13 +212,31 @@ impl TargetCardNameService {
         &self,
         surface_id: &str,
         location: &CardLocation,
+        checked_by: Option<&AgentSurface>,
     ) -> CardName {
-        let Some(card) = self
-            .source
-            .fetch_agent_card(location)
-            .await
-        else {
-            return CardName::Unreadable;
+        let fetched = match checked_by {
+            Some(surface) => {
+                self.source
+                    .fetch_checked_agent_card(location, surface)
+                    .await
+            }
+            None => Ok(self
+                .source
+                .fetch_agent_card(location)
+                .await),
+        };
+        let card = match fetched {
+            Ok(Some(card)) => card,
+            Ok(None) => return CardName::Unreadable,
+            Err(failure) => {
+                warn!(
+                    surface_id,
+                    endpoint = %location.endpoint,
+                    reason = failure.reason(),
+                    "Target Agent Card failed Response authentication; no name shown"
+                );
+                return CardName::Read(None);
+            }
         };
         let Some(raw) = card
             .get("name")
@@ -180,10 +257,11 @@ impl TargetCardNameService {
         &self,
         surface_id: &str,
         location: &CardLocation,
+        response_auth: Option<&ResponseAuthConfig>,
     ) -> Option<String> {
         self.cache
             .get(surface_id)
-            .filter(|(e, _)| e.location == *location)
+            .filter(|(e, _)| e.location == *location && e.response_auth.as_ref() == response_auth)
             .and_then(|(e, _)| e.name)
     }
 
@@ -199,6 +277,10 @@ impl TargetCardNameService {
 
 struct HttpTargetCardSource;
 
+fn card_limits() -> crate::proxy::upstream_body::UpstreamBodyLimits {
+    crate::proxy::upstream_body::UpstreamBodyLimits::new(AGENT_CARD_MAX_BYTES, None, AGENT_CARD_FETCH_TIMEOUT.as_secs())
+}
+
 #[async_trait]
 impl TargetCardSource for HttpTargetCardSource {
     async fn fetch_agent_card(
@@ -210,14 +292,47 @@ impl TargetCardSource for HttpTargetCardSource {
             location.card_path.as_deref(),
             "managed-agent-name",
             AGENT_CARD_FETCH_TIMEOUT,
-            crate::proxy::upstream_body::UpstreamBodyLimits::new(
-                AGENT_CARD_MAX_BYTES,
-                None,
-                AGENT_CARD_FETCH_TIMEOUT.as_secs(),
-            ),
+            card_limits(),
         )
         .await
     }
+
+    async fn fetch_checked_agent_card(
+        &self,
+        location: &CardLocation,
+        surface: &AgentSurface,
+    ) -> Result<Option<Value>, ResponseAuthFailure> {
+        checked_card(
+            location,
+            surface,
+            crate::gateways::connection_points::message_processor::get_secrets_store(),
+            crate::proxy::server::get_certificates_store(),
+        )
+        .await
+    }
+}
+
+/// The card at `location`, read under `surface`'s Response authentication with its key secret
+/// from `secrets` and its certificates from `certificates`.
+async fn checked_card(
+    location: &CardLocation,
+    surface: &AgentSurface,
+    secrets: Option<Arc<dyn crate::secrets::SecretsStore>>,
+    certificates: Option<Arc<dyn crate::certificates::CertificateStore>>,
+) -> Result<Option<Value>, ResponseAuthFailure> {
+    crate::proxy::outbound_handler::fetch_checked_agent_card(
+        &location.endpoint,
+        location.card_path.as_deref(),
+        "managed-agent-name",
+        AGENT_CARD_FETCH_TIMEOUT,
+        card_limits(),
+        crate::proxy::outbound_handler::CardCheck {
+            surface,
+            secrets: secrets.as_ref(),
+            certificates: certificates.as_ref(),
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -237,6 +352,7 @@ impl TargetCardSource for NoTargetCards {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
     use serde_json::json;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -302,9 +418,14 @@ mod tests {
         location: CardLocation,
         name: Option<String>,
     ) {
-        service
-            .cache
-            .store(surface_id, CardEntry { location, name });
+        service.cache.store(
+            surface_id,
+            CardEntry {
+                location,
+                response_auth: None,
+                name,
+            },
+        );
     }
 
     fn surface(
@@ -532,5 +653,146 @@ mod tests {
         );
         store(&service, "named", location("http://a"), None);
         assert_eq!(service.changed_since(after), vec!["named".to_string()]);
+    }
+
+    /// Reads cards as [`HttpTargetCardSource`] does, with its own stores.
+    struct CheckedSource {
+        secrets: Option<Arc<dyn crate::secrets::SecretsStore>>,
+        certificates: Option<Arc<dyn crate::certificates::CertificateStore>>,
+    }
+
+    #[async_trait]
+    impl TargetCardSource for CheckedSource {
+        async fn fetch_agent_card(
+            &self,
+            _location: &CardLocation,
+        ) -> Option<Value> {
+            panic!("a surface with Response authentication reads its card checked")
+        }
+
+        async fn fetch_checked_agent_card(
+            &self,
+            location: &CardLocation,
+            surface: &AgentSurface,
+        ) -> Result<Option<Value>, ResponseAuthFailure> {
+            checked_card(location, surface, self.secrets.clone(), self.certificates.clone()).await
+        }
+    }
+
+    fn checked_surface(
+        endpoint: &str,
+        response_auth: Value,
+    ) -> AgentSurface {
+        serde_json::from_value(json!({
+            "surface_id": format!("bravo-{}", uuid::Uuid::new_v4()), "name": "Bravo",
+            "access_point": {"listen_address": "0.0.0.0:9000", "route": "/bravo", "protocol": "a2a"},
+            "target": {"endpoint": endpoint, "response_auth": response_auth}
+        }))
+        .expect("surface parses")
+    }
+
+    /// The name shown for `surface` once its card was read through `source`.
+    async fn checked_name(
+        source: CheckedSource,
+        surface: &AgentSurface,
+    ) -> Option<String> {
+        let service = Arc::new(TargetCardNameService::new(Arc::new(source)));
+        let location = CardLocation::for_surface(surface).expect("an A2A http Target");
+        service.lookup_or_spawn_for(surface, &location);
+        for _ in 0..400 {
+            if service.cache.is_idle()
+                && service
+                    .cache
+                    .get(&surface.surface_id)
+                    .is_some()
+            {
+                return service.lookup_or_spawn_for(surface, &location);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("target card lookup did not finish");
+    }
+
+    /// A Target on 127.0.0.1 serving its card named `Bravo Agent`, with the key of
+    /// [`crate::proxy::response_auth::api_key_bravo`] when `keyed`.
+    async fn card_target(keyed: bool) -> String {
+        use crate::proxy::response_auth::{BRAVO_KEY, BRAVO_KEY_HEADER};
+        let app = axum::Router::new().route(
+            "/.well-known/agent-card.json",
+            axum::routing::get(move || async move {
+                let mut response = axum::Json(json!({"name": "Bravo Agent"})).into_response();
+                if keyed {
+                    response.headers_mut().insert(
+                        axum::http::HeaderName::from_bytes(BRAVO_KEY_HEADER.as_bytes()).expect("a valid header name"),
+                        axum::http::HeaderValue::from_static(BRAVO_KEY),
+                    );
+                }
+                response
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        url
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_a_card_without_the_response_key_yields_no_name_and_one_with_it_does() {
+        use crate::proxy::response_auth::{api_key_bravo, bravo_key_store};
+        let (_dir, secrets) = bravo_key_store().await;
+        for (keyed, expected) in [(false, None), (true, Some("Bravo Agent"))] {
+            let surface = checked_surface(&card_target(keyed).await, api_key_bravo());
+            let source = CheckedSource {
+                secrets: Some(Arc::clone(&secrets)),
+                certificates: None,
+            };
+            assert_eq!(
+                checked_name(source, &surface)
+                    .await
+                    .as_deref(),
+                expected,
+                "keyed: {keyed}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_a_card_from_a_server_failing_the_mtls_trust_yields_no_name_and_a_trusted_one_does() {
+        use crate::proxy::response_auth::{pinned_bravo, trusted_target, untrusted_target};
+        let (trusted_port, _trusted_dir, trusted_certificates) = trusted_target(r#"{"name":"Bravo Agent"}"#).await;
+        let (untrusted_port, _untrusted_dir, untrusted_certificates) = untrusted_target().await;
+        for (port, certificates, expected) in
+            [(trusted_port, trusted_certificates, Some("Bravo Agent")), (untrusted_port, untrusted_certificates, None)]
+        {
+            let surface = checked_surface(&format!("https://127.0.0.1:{port}"), pinned_bravo());
+            let source = CheckedSource {
+                secrets: None,
+                certificates: Some(certificates),
+            };
+            assert_eq!(
+                checked_name(source, &surface)
+                    .await
+                    .as_deref(),
+                expected,
+                "port {port}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_surface_without_response_authentication_reads_its_card_unchecked() {
+        let source = FakeSource::with_card(json!({"name": "DateTime Agent"}));
+        let service = Arc::new(TargetCardNameService::new(source.clone()));
+        let plain = surface(SurfaceProtocol::A2a, "http://localhost:9000");
+        let loc = CardLocation::for_surface(&plain).unwrap();
+        service.lookup_or_spawn_for(&plain, &loc);
+        assert_eq!(
+            wait_for(&service, &plain.surface_id, &loc)
+                .await
+                .as_deref(),
+            Some("DateTime Agent")
+        );
     }
 }

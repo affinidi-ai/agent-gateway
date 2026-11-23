@@ -1822,3 +1822,282 @@ async fn the_retry_is_logged_under_its_caller_and_the_grants_use_recorded() {
         assert_eq!(kept.access_token, "second", "{subject}");
     }
 }
+
+impl Fixture {
+    /// Deactivate the vendor's provider, as the management API does.
+    async fn deactivate_provider(&self) {
+        let providers = self
+            .router
+            .credential_provider_store
+            .as_ref()
+            .unwrap();
+        let mut provider = providers
+            .get("vendor")
+            .await
+            .unwrap()
+            .unwrap();
+        provider.deactivated_at = Some(chrono::Utc::now());
+        providers
+            .update(provider)
+            .await
+            .unwrap();
+    }
+}
+
+/// A deactivated provider takes no new connect, so a caller with no grant of
+/// it is not told to connect: the binding is unavailable (`503`), recorded
+/// with the reason `provider_deactivated`. A grant given before the
+/// deactivation still goes to the Target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_caller_without_a_grant_of_a_deactivated_provider_is_not_told_to_connect() {
+    let fixture = Fixture::new(vec![Answer::status(200)], vec![vendor_result()]).await;
+    let target = format!("{}/mcp", fixture.vendor.origin());
+    fixture
+        .serve(vendor_surface("mcp", &target, "caller"))
+        .await;
+    fixture
+        .deactivate_provider()
+        .await;
+
+    let (status, headers, body) = fixture
+        .send(mcp_call(Some(KEY)))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["data"], json!({"reason": "connector_unavailable"}));
+    assert_eq!(headers["cache-control"], "no-store");
+    assert!(
+        fixture
+            .vendor
+            .requests()
+            .is_empty(),
+        "nothing is sent to the Target"
+    );
+
+    fixture
+        .store(&caller_key(&caller_principal()), "my-access")
+        .await;
+    let (status, _, body) = fixture
+        .send(mcp_call(Some(KEY)))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(fixture.vendor_saw(), [(Some("Bearer my-access".to_string()), false)]);
+}
+
+/// A Target that authenticates its responses by API key has every answer checked before the
+/// grant acts on it: a refusal of the token without the key is answered `502` and never
+/// refreshes the grant or retries, and a retry without the key is answered `502` too. A
+/// refusal and a retry that both carry the key are served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unauthenticated_answer_to_the_targets_grant_is_refused_before_any_refresh() {
+    use crate::proxy::response_auth::{BRAVO_KEY, BRAVO_KEY_HEADER, REFUSAL_MESSAGE, api_key_bravo};
+
+    let keyed = |answer: Answer| answer.with_header(BRAVO_KEY_HEADER, BRAVO_KEY);
+    for (case, vendor_answers, expected, vendor_requests, refreshes) in [
+        ("a refusal of the token without the key", vec![rejected_token(), keyed(vendor_result())], 502, 1, 0),
+        ("a retry without the key", vec![keyed(rejected_token()), vendor_result()], 502, 2, 1),
+        ("a refusal and a retry with the key", vec![keyed(rejected_token()), keyed(vendor_result())], 200, 2, 1),
+    ] {
+        let fixture = Fixture::new(vec![refresh_answer("second")], vendor_answers).await;
+        crate::secrets::SecretsStore::create(
+            fixture
+                .router
+                .secrets_store
+                .as_deref()
+                .unwrap(),
+            crate::secrets::CreateSecretRequest {
+                tenant_id: None,
+                name: "Response key".into(),
+                secret_id: "bravo-key".into(),
+                description: None,
+                value: BRAVO_KEY.into(),
+                secret_type: "ApiKey".into(),
+                tags: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let mut surface = vendor_surface("mcp", &format!("{}/mcp", fixture.vendor.origin()), "owner");
+        surface.target.response_auth = serde_json::from_value(api_key_bravo()).unwrap();
+        fixture.serve(surface).await;
+        fixture
+            .store(&owner_key(), "first")
+            .await;
+
+        let (status, headers, body) = fixture
+            .send(mcp_call(Some(KEY)))
+            .await;
+
+        assert_eq!(status.as_u16(), expected, "{case}: {body}");
+        if expected == 502 {
+            assert_eq!(body["error"]["message"], REFUSAL_MESSAGE, "{case}");
+        } else {
+            assert_eq!(body["result"], json!({"tools": []}), "{case}");
+        }
+        assert!(
+            headers
+                .get(BRAVO_KEY_HEADER)
+                .is_none(),
+            "{case}"
+        );
+        assert_eq!(
+            fixture
+                .vendor
+                .requests()
+                .len(),
+            vendor_requests,
+            "{case}"
+        );
+        assert_eq!(
+            fixture
+                .authorization_server
+                .requests()
+                .len(),
+            refreshes,
+            "{case}"
+        );
+        if refreshes == 0 {
+            let kept = fixture
+                .vault
+                .grant(&owner_key())
+                .await
+                .unwrap()
+                .expect("the grant is kept");
+            assert_eq!(kept.access_token, "first", "{case}");
+        }
+    }
+}
+
+/// A retry whose answer refuses the token again without the key is refused as a response that
+/// failed Response authentication, not as an unavailable connector.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unauthenticated_refusal_of_the_retry_is_refused_as_a_failed_response() {
+    use crate::audit::request_events::{RejectionReason, RejectionStage};
+    use crate::proxy::response_auth::{BRAVO_KEY, BRAVO_KEY_HEADER, REFUSAL_MESSAGE, api_key_bravo};
+
+    let fixture = Fixture::new(
+        vec![refresh_answer("second")],
+        vec![rejected_token().with_header(BRAVO_KEY_HEADER, BRAVO_KEY), rejected_token()],
+    )
+    .await;
+    crate::secrets::SecretsStore::create(
+        fixture
+            .router
+            .secrets_store
+            .as_deref()
+            .unwrap(),
+        crate::secrets::CreateSecretRequest {
+            tenant_id: None,
+            name: "Response key".into(),
+            secret_id: "bravo-key".into(),
+            description: None,
+            value: BRAVO_KEY.into(),
+            secret_type: "ApiKey".into(),
+            tags: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let mut surface = vendor_surface("mcp", &format!("{}/mcp", fixture.vendor.origin()), "owner");
+    surface.target.response_auth = serde_json::from_value(api_key_bravo()).unwrap();
+    fixture.serve(surface).await;
+    fixture
+        .store(&owner_key(), "first")
+        .await;
+
+    let ((status, _, body), events) = crate::audit::producer::capture(fixture.send(mcp_call(Some(KEY)))).await;
+
+    assert_eq!(status.as_u16(), 502, "{body}");
+    assert_eq!(body["error"]["code"], -32603, "{body}");
+    assert_eq!(body["error"]["message"], REFUSAL_MESSAGE, "{body}");
+    let rejections: Vec<_> = events
+        .into_iter()
+        .filter_map(|event| match event.event {
+            crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                stage,
+                reason,
+                http_status,
+                ..
+            } => Some((stage, reason, http_status)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rejections, vec![(RejectionStage::Forward, RejectionReason::TargetResponseAuthFailed, Some(502))]);
+    assert_eq!(
+        fixture
+            .vendor
+            .requests()
+            .len(),
+        2
+    );
+}
+
+/// A stored surface, loaded without the save rules, that combines Response authentication by
+/// mTLS with a Target bound by external consent is refused `502` before anything is sent: the
+/// grant's own client cannot speak the surface's TLS settings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stored_mtls_surface_bound_by_external_consent_is_refused_before_anything_is_sent() {
+    use crate::proxy::response_auth::{REFUSAL_MESSAGE, pinned_bravo, untrusted_target};
+
+    let mut fixture = Fixture::new(vec![Answer::status(200)], vec![vendor_result()]).await;
+    let (_, _certificates_dir, certificates) = untrusted_target().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let origin = format!("https://{}", listener.local_addr().unwrap());
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accepted = Arc::clone(&connections);
+    tokio::spawn(async move {
+        while listener
+            .accept()
+            .await
+            .is_ok()
+        {
+            accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    let issuer = fixture
+        .authorization_server
+        .origin();
+    fixture
+        .router
+        .credential_provider_store
+        .as_ref()
+        .unwrap()
+        .create(
+            serde_json::from_value(json!({
+                "id": "vendor-tls", "tenant_id": TENANT, "name": "Vendor over TLS", "provider_id": "vendor-tls",
+                "provider_type": "oauth2_authorization_code", "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"), "revocation_endpoint": format!("{issuer}/revoke"),
+                "token_endpoint_auth_method": "none", "client_id": "client-1",
+                "callback_url": "https://boris.example/cb", "resource": format!("{origin}/mcp"),
+                "default_scopes": ["read"],
+                "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    fixture
+        .router
+        .egress_allowlist = Some(format!("{issuer},{origin}"));
+    fixture
+        .router
+        .certificates_store = Some(certificates);
+    fixture
+        .store(&GrantKey::owner(Some(TENANT), "vendor-agent", TARGET, "vendor-tls"), "owner-access")
+        .await;
+    let mut surface = vendor_surface("mcp", &format!("{origin}/mcp"), "owner");
+    surface.outbound_credentials[0].credential_provider_id = "vendor-tls".to_string();
+    surface.target.response_auth = serde_json::from_value(pinned_bravo()).unwrap();
+    fixture.serve(surface).await;
+
+    let (status, _, body) = fixture
+        .send(mcp_call(Some(KEY)))
+        .await;
+
+    assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"]["message"], REFUSAL_MESSAGE);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 0, "the Target was never called");
+}

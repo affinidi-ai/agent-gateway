@@ -78,6 +78,8 @@ mod vault_identity; // Vault identity generation for API keys and certificates
 mod x402; // x402 protocol (HTTP Native Payments Protocol)
 
 #[cfg(test)]
+mod component_test_freeze;
+#[cfg(test)]
 mod component_tests;
 
 use config::{BootstrapConfig, GatewayConfig};
@@ -527,39 +529,6 @@ async fn async_main() -> Result<()> {
         .validate()
         .context("Configuration validation failed")?;
 
-    // ── (Future) one-shot agent-identity `#key-2` migration — trigger point ──
-    //
-    // NOT implemented. This is only the place it would hook in; the work must
-    // live inside `server::run_axum_proxy`'s orchestrator, where the identity
-    // store (`base_path()` + `find_by_hash`) and the VC issuer actually exist —
-    // `async_main` has neither yet.
-    //
-    // What caused the need:
-    //   Agent-identity `did:webvh` birth logs (`{identities}/{uuid}/did.jsonl`)
-    //   minted *before* the Multikey fix publish only `#key-1` (JsonWebKey2020).
-    //   Agent VPs are signed under `#key-2` (`vp_issuer::DEFAULT_SIGNING_KEY_ID`,
-    //   an Ed25519 Multikey). So when a *receiving* gateway resolves such a DID
-    //   over `fabric`, it cannot find `#key-2` and verification fails with
-    //   "could not find resource …#key-2" — the caller is marked unverified and
-    //   its real DID never crosses the hop. (Same root cause produces a `404`
-    //   when a record still resolves via `find_by_hash` but its `did.jsonl` was
-    //   removed.)
-    //
-    // Why it is usually NOT needed:
-    //   Every identity minted *after* the fix already carries `#key-2`, and a
-    //   fresh or wiped `_storage/identities` never holds a stale log. Only a
-    //   persistent store carried across the fix boundary is affected — i.e. an
-    //   in-place prod/staging upgrade where wiping real, registered identities
-    //   is not acceptable. Dev environments simply wipe the folder.
-    //
-    // What an implementation must do:
-    //   scan each agent-identity `did.jsonl`, detect a missing / `key-1`-only
-    //   log, re-mint through the `issue_or_get_credential` create path, and
-    //   re-register the new DID in the trust registry. Note the DID necessarily
-    //   changes (the SCID is content-derived from the birth entry), so TR
-    //   re-registration is mandatory. Must be idempotent and run once per
-    //   stale identity.
-
     // Run the Axum-based server (identity API is initialized inside if enabled)
     let result = tokio::select! {
         result = server::run_axum_proxy(config.clone(), bootstrap_config.clone()) => result,
@@ -891,7 +860,8 @@ fn log_startup_summary(
     gateway_config: &GatewayConfig,
 ) {
     info!(
-        "Startup configuration: source={}, server_mode={:?}, auth_mode={:?}, secrets_backend={}, log_redaction={}",
+        "Startup configuration: source={}, server_mode={:?}, auth_mode={:?}, secrets_backend={}, log_redaction={}, \
+         delegation_events={}",
         bootstrap_config.channel_config_source,
         bootstrap_config.server_mode,
         bootstrap_config.auth_mode,
@@ -904,8 +874,22 @@ fn log_startup_summary(
             "on"
         } else {
             "off"
+        },
+        if gateway_config
+            .logging
+            .delegation_events
+        {
+            "on"
+        } else {
+            "off"
         }
     );
+    if !gateway_config
+        .logging
+        .delegation_events
+    {
+        warn!("[logging] delegation_events is false: the per-call credential delegation events are written nowhere");
+    }
     if !bootstrap_config
         .logging
         .redaction
@@ -1163,6 +1147,11 @@ fn init_logging(
         Ok(level) => level,
         Err(e) => anyhow::bail!("Cannot parse log level: {}", e),
     };
+    audit::producer::set_delegation_event_logging(
+        config
+            .logging
+            .delegation_events,
+    );
 
     // Build the log redactor from gateway.json config (compiled once, shared via Arc)
     let redactor = observability::LogRedactor::from_config(&config.logging.redaction);

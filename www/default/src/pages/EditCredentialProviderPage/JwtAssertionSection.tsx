@@ -1,6 +1,7 @@
 import React from 'react';
 import FieldHelp from '../../components/shared/FieldHelp';
-import SecretSelect, { SecretOption } from './SecretSelect';
+import SecretSelect from './SecretSelect';
+import type { SecretOption } from '../../components/shared/SecretOptions';
 import type { OwnerTenant } from '../../utils/tenantScope';
 import {
   CredentialProviderType,

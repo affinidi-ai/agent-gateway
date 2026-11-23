@@ -345,6 +345,9 @@ fn write_single_surface_config_inner(
         }
         surface_fixture = surface_fixture.with_caller_key(setting);
     }
+    if let Some(response_auth) = &surface_config.response_auth {
+        surface_fixture = surface_fixture.with_target_response_auth(response_auth.setting());
+    }
     if !surface_config
         .browser_origins
         .is_empty()
@@ -674,6 +677,12 @@ fn write_single_surface_config_inner(
     if surface_config.signs_in_with_saml {
         crate::bdd_support::config::sign_in::sign_in_with_saml(base_dir, gateway_port);
     }
+    if !surface_config
+        .rbac_permissions
+        .is_empty()
+    {
+        write_rbac_permissions(base_dir, &surface_config.rbac_permissions);
+    }
     if surface_config.starts_standby {
         start_standby(base_dir);
     }
@@ -719,6 +728,12 @@ fn write_single_surface_config_inner(
     }
     if surface_config.writes_log_directory {
         set_log_directory(base_dir);
+    }
+    if surface_config.logs_no_delegation_events {
+        log_no_delegation_events(base_dir);
+    }
+    if let Some(age_secs) = surface_config.stored_consent_age_secs {
+        store_consent(base_dir, surface_config, age_secs);
     }
     if surface_config.serves_dashboard {
         serve_dashboard(base_dir);
@@ -858,6 +873,27 @@ pub fn write_second_node_config(
 }
 
 /// Starts the gateway in Standby mode.
+/// Writes `rbac.json` with `permissions` and points the gateway config at it.
+fn write_rbac_permissions(
+    base_dir: &Path,
+    permissions: &[(String, String)],
+) {
+    let rbac_path = base_dir.join("rbac.json");
+    let permissions: serde_json::Map<String, serde_json::Value> = permissions
+        .iter()
+        .map(|(feature, role)| (feature.clone(), serde_json::json!(role)))
+        .collect();
+    std::fs::write(&rbac_path, serde_json::json!({ "permissions": permissions }).to_string()).unwrap();
+    let config_path = base_dir.join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    assert!(config.contains("[config_files]\n"), "the gateway config must list its config files");
+    std::fs::write(
+        &config_path,
+        config.replacen("[config_files]\n", &format!("[config_files]\nrbac = \"{}\"\n", rbac_path.display()), 1),
+    )
+    .unwrap();
+}
+
 fn start_standby(base_dir: &Path) {
     let path = base_dir.join("config.toml");
     let config = std::fs::read_to_string(&path).unwrap();
@@ -870,6 +906,44 @@ fn log_warnings(base_dir: &Path) {
     let config = std::fs::read_to_string(&path).unwrap();
     assert!(config.contains("level = \"error\""), "the gateway config must set the log level");
     std::fs::write(&path, config.replacen("level = \"error\"", "level = \"warn\"", 1)).unwrap();
+}
+
+/// Sets `[logging] delegation_events = false`, so the gateway writes no per-call delegation
+/// event to its log.
+fn log_no_delegation_events(base_dir: &Path) {
+    let path = base_dir.join("config.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    assert!(config.contains("[logging]\n"), "the gateway config must have a logging table");
+    std::fs::write(&path, config.replacen("[logging]\n", "[logging]\ndelegation_events = false\n", 1)).unwrap();
+}
+
+/// Writes to the delegation vault a consent to the surface's OAuth provider given `age_secs`
+/// ago, with no end stored, as a gateway under no consent time limit stores one.
+fn store_consent(
+    base_dir: &Path,
+    surface_config: &SurfaceConfigBuilder,
+    age_secs: i64,
+) {
+    let delegation = surface_config
+        .credential_delegation
+        .as_ref()
+        .expect("the surface must require delegated credentials from an OAuth provider");
+    let given = (chrono::Utc::now() - chrono::Duration::seconds(age_secs)).to_rfc3339();
+    let vault = base_dir.join("_storage/delegation_vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    let token = serde_json::json!({
+        "id": "stored-before-start",
+        "agent_did": "did:web:agent.example",
+        "user_identity_hash": "sha256:stored-before-start",
+        "credential_provider_id": surface_config.provider_record_id(&delegation.provider_id),
+        "provider_id": delegation.provider_id,
+        "access_token": "stored-before-start",
+        "scopes": [],
+        "consent_granted_at": given,
+        "created_at": given,
+        "updated_at": given
+    });
+    std::fs::write(vault.join("stored-before-start.json"), serde_json::to_string_pretty(&token).unwrap()).unwrap();
 }
 
 /// Points the gateway's log directory at `_storage/logs`.
@@ -1004,6 +1078,9 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
         && let Some(secret_value) = &caller_key.secret_value
     {
         secrets.push(SecretFixture::new(&caller_key.secret_id, secret_value));
+    }
+    if let Some(response_auth) = &surface_config.response_auth {
+        secrets.push(SecretFixture::new(&response_auth.secret_id, &response_auth.secret_value));
     }
     if let Some(provider) = &surface_config.target_auth_provider {
         secrets.extend(target_auth_provider_secrets(provider));

@@ -596,6 +596,31 @@ pub struct AuthorityForceDeleteDetails {
     pub referrers: Vec<ReferrerDetails>,
 }
 
+/// A dashboard user starting or stopping a policy input capture on a surface, named by the
+/// record's `surface_id`. A stop says why it ended.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct PolicyInputCaptureDetails {
+    pub actor: Actor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<PolicyInputCaptureStop>,
+}
+
+/// Why a policy input capture ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyInputCaptureStop {
+    /// The user stopped listening.
+    Stopped,
+    /// The dashboard connection closed.
+    ConnectionClosed,
+    /// The user's dashboard session ended.
+    SessionEnded,
+    /// The user no longer holds `surfaces.edit` and `policies.edit`.
+    PermissionMissing,
+    /// The `policy_input_capture` feature flag was turned off.
+    TurnedOff,
+}
+
 /// A record that used a secret or an Authority when it was force-deleted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct ReferrerDetails {
@@ -846,6 +871,10 @@ pub enum DelegationAuditAction {
     McpProxyPinChanged(Box<McpProxyPinChangeDetails>),
     /// A save changed a surface's `browser_origins`.
     BrowserOriginsChanged(Box<BrowserOriginsChangeDetails>),
+    /// A dashboard user started capturing a surface's policy input.
+    PolicyInputCaptureStarted(Box<PolicyInputCaptureDetails>),
+    /// A dashboard user's policy input capture on a surface ended.
+    PolicyInputCaptureStopped(Box<PolicyInputCaptureDetails>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -904,6 +933,8 @@ impl DelegationAuditAction {
                 | Self::AuthorityForceDeleted(_)
                 | Self::McpProxyPinChanged(_)
                 | Self::BrowserOriginsChanged(_)
+                | Self::PolicyInputCaptureStarted(_)
+                | Self::PolicyInputCaptureStopped(_)
         )
     }
 }
@@ -1839,6 +1870,8 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::AuthorityForceDeleted(_) => "authority_force_deleted",
         DelegationAuditAction::McpProxyPinChanged(_) => "mcp_proxy_pin_changed",
         DelegationAuditAction::BrowserOriginsChanged(_) => "browser_origins_changed",
+        DelegationAuditAction::PolicyInputCaptureStarted(_) => "policy_input_capture_started",
+        DelegationAuditAction::PolicyInputCaptureStopped(_) => "policy_input_capture_stopped",
     }
 }
 

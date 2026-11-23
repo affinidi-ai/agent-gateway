@@ -910,7 +910,9 @@ headers and the request body, a nonempty body that is neither an image nor UTF-8
 `Content-Type`, is an embedded resource holding its bytes (see [`MCP_METADATA.md`](MCP_METADATA.md)),
 where `rmcp-openapi`'s client answers audio and video as "[Binary content: N bytes, ...]" and
 any other body that is not an image as text decoded by its declared charset (UTF-8 when it
-names none) with invalid bytes replaced, and a call the gateway refuses names its cause in the client's own words ("Invalid REST
+names none) with invalid bytes replaced, a file an operation declares inside its JSON answer
+with `x-gateway-file` is an embedded resource too, where `rmcp-openapi`'s client answers the
+JSON, and a call the gateway refuses names its cause in the client's own words ("Invalid REST
 tool arguments", "REST tool execution failed", "REST tool response exceeds its configured limit")
 rather than `rmcp-openapi`'s (for example "1 invalid parameter(s)"). Like the 2026-07-28 path, it
 vets each call's backend with the policy the proxy's `base_url` was saved under (loopback and cloud

@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useReducer, useEffect, ReactNode } from 'react';
+import { PolicyInputListens } from './policyInputListens';
 import {
   DashboardStats,
   Settings,
@@ -30,6 +31,8 @@ interface AppState {
   activeView: 'global' | 'filtered';
 
   settings: Settings | null;
+  /** Whether the last settings load failed, so `settings` holds `FALLBACK_SETTINGS`. */
+  settingsLoadFailed: boolean;
   userSettingsOverrides: UserSettingsOverrides | null;
 
   // Current filter configuration
@@ -81,6 +84,7 @@ type AppAction =
     }
   | { type: 'SET_ACTIVE_VIEW'; payload: 'global' | 'filtered' }
   | { type: 'SET_SETTINGS'; payload: Settings }
+  | { type: 'SET_SETTINGS_LOAD_FAILED'; payload: boolean }
   | { type: 'SET_USER_SETTINGS_OVERRIDES'; payload: UserSettingsOverrides | null }
   | { type: 'SET_LOADING'; payload: { key: keyof AppState['isLoading']; value: boolean } }
   | { type: 'SET_ERROR'; payload: string | null }
@@ -106,6 +110,7 @@ export const initialState: AppState = {
   filteredState: { ...initialDashboardStore },
   activeView: 'global',
   settings: null,
+  settingsLoadFailed: false,
   userSettingsOverrides: null,
   dashboardBucketOverride: null,
   dashboardFilters: null,
@@ -391,6 +396,8 @@ export function appReducer(state: AppState, action: AppAction): AppState {
 
     case 'SET_SETTINGS':
       return { ...state, settings: action.payload };
+    case 'SET_SETTINGS_LOAD_FAILED':
+      return { ...state, settingsLoadFailed: action.payload };
     case 'SET_USER_SETTINGS_OVERRIDES':
       return { ...state, userSettingsOverrides: action.payload };
     case 'SET_LOADING':
@@ -516,6 +523,11 @@ interface AppContextType {
     disconnectWebSocket: () => void;
     setWsKeepAlive: (keep: boolean) => void;
     setWsSubscription: (sections: string[]) => void;
+    /**
+     * Start or stop listening to a surface's policy input on the dashboard WebSocket.
+     * Listening is sent again after a reconnect and ends when the page unloads.
+     */
+    listenToPolicyInput: (surfaceId: string, listening: boolean, notify?: boolean) => void;
   };
 }
 
@@ -583,6 +595,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
   const scheduledRefreshTimeoutRef = React.useRef<NodeJS.Timeout | null>(null);
   const wsKeepAliveRef = React.useRef<boolean>(false);
   const wsSubscriptionRef = React.useRef<string[]>([]);
+  const policyInputListensRef = React.useRef(new PolicyInputListens());
 
   // Keep refs in sync with state
   React.useLayoutEffect(() => {
@@ -890,6 +903,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
       if (wsSubscriptionRef.current.length > 0) {
         ws.send(JSON.stringify({ type: 'subscribe', sections: wsSubscriptionRef.current }));
       }
+      policyInputListensRef.current.resend(ws);
     };
 
     ws.onmessage = event => {
@@ -1232,6 +1246,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         // Load effective settings (user overrides merged with system defaults)
         const settings = await apiClient.getUserSettings();
         dispatch({ type: 'SET_SETTINGS', payload: settings });
+        dispatch({ type: 'SET_SETTINGS_LOAD_FAILED', payload: false });
 
         // Also load the raw user overrides for the settings UI
         try {
@@ -1249,6 +1264,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         });
         // Set default settings to prevent app crash
         dispatch({ type: 'SET_SETTINGS', payload: FALLBACK_SETTINGS });
+        dispatch({ type: 'SET_SETTINGS_LOAD_FAILED', payload: true });
       } finally {
         dispatch({ type: 'SET_LOADING', payload: { key: 'settings', value: false } });
       }
@@ -1349,6 +1365,9 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         wsRef.current.send(JSON.stringify({ type: 'subscribe', sections }));
       }
     },
+    listenToPolicyInput: (surfaceId: string, listening: boolean, notify = true) => {
+      policyInputListensRef.current.set(wsRef.current, surfaceId, listening, notify);
+    },
   };
 
   // Initialize data and WebSocket on mount
@@ -1362,6 +1381,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         const settings = await apiClient.getUserSettings();
         settingsRef.current = settings; // Set ref immediately for loadDashboardStats
         dispatch({ type: 'SET_SETTINGS', payload: settings });
+        dispatch({ type: 'SET_SETTINGS_LOAD_FAILED', payload: false });
 
         // Also load user overrides for the settings UI
         try {
@@ -1378,6 +1398,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         });
         // Every flag reads off, and pages waiting for the settings render.
         dispatch({ type: 'SET_SETTINGS', payload: FALLBACK_SETTINGS });
+        dispatch({ type: 'SET_SETTINGS_LOAD_FAILED', payload: true });
       } finally {
         dispatch({ type: 'SET_LOADING', payload: { key: 'settings', value: false } });
       }

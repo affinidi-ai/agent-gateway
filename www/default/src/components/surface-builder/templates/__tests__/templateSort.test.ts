@@ -75,6 +75,11 @@ describe('getTemplateProtocolBadge', () => {
     expect(b?.badgeClass).toBe('text-bg-primary');
   });
 
+  it('returns the shared DIDComm badge for a didcomm tag', () => {
+    const b = getTemplateProtocolBadge(t({ tags: ['DIDComm'] }));
+    expect(b).toEqual({ key: 'didcomm', label: 'DIDComm', badgeClass: 'text-bg-success' });
+  });
+
   it('returns null for unknown protocols (no synthesised fallback)', () => {
     const b = getTemplateProtocolBadge(
       t({ surface: { access_point: { protocol: 'future-proto' } } })

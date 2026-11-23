@@ -57,6 +57,7 @@ Before running tests, ensure:
    export AG_TEST_TOKEN=your-32-plus-character-secret-token # Must match gateway config
    export AG_TEST_ALLOW_ROLE_OVERRIDE=true     # Allows UI tests to request administrator sessions
    export AG_TEST_USERNAME=test-user           # Optional: custom username
+   export AG_ALLOW_REMOTE_FLAG_WRITES=1        # Lets specs change a stored system flag on a non-local gateway
    ```
 
 ### Run All Tests
@@ -271,6 +272,7 @@ Reserved patterns:
 | Wizard navigation | `wizard-next`, `wizard-back`, `wizard-submit` | (shared across all wizards) |
 | Surface Builder canvas node | `surface-node-<type>` | `surface-node-payment` |
 | Surface Builder save | `surface-save-button`, `surface-error-alert` | (the save button and the refused-save banner on `/surfaces/<id>`) |
+| Surface delete | `surface-delete-button`, `surface-delete-confirm`, `surface-delete-confirm-name`, `surface-delete-confirm-confirm`, `surface-delete-confirm-cancel` | (the delete button on `/surfaces/<id>` and its confirm popover) |
 
 If you need a testid that does not yet exist on the dashboard, add it to the React
 component first (see the `data-testid` rules in [`www/default/AGENTS.md`](../www/default/AGENTS.md)),

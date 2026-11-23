@@ -4352,11 +4352,35 @@ async fn proxy_charged_request(
         Some(route) => route.target_url().to_string(),
         None => target_url,
     };
+    let target_tls = match crate::proxy::response_auth::hop_tls(
+        &state.surface,
+        &target_url,
+        state
+            .certificates_store
+            .as_ref(),
+    )
+    .await
+    {
+        Ok(Some(_)) if target_grant.is_some() => {
+            return Ok(crate::proxy::response_auth::refuse(
+                crate::proxy::response_auth::ResponseAuthFailure::Unverifiable,
+                &audit_facts,
+                &body_bytes,
+            ));
+        }
+        Ok(target_tls) => target_tls,
+        Err(failure) => return Ok(crate::proxy::response_auth::refuse(failure, &audit_facts, &body_bytes)),
+    };
+    let target_tls_stamp = target_tls
+        .as_ref()
+        .map(|tls| tls.stamp);
     let mut forward_client: Option<reqwest::Client> = target_grant
         .as_ref()
         .map(|route| route.client().clone());
     if forward_client.is_none() && !is_a2a_proxy_target && !is_mcp_proxy_target {
-        match pinned_target_client(&state, &channel_name, &target_url, &audit_facts).await {
+        match pinned_target_client(&state, &channel_name, &target_url, &audit_facts, target_tls.map(|tls| tls.config))
+            .await
+        {
             Ok(client) => forward_client = Some(client),
             Err(blocked) => return Ok(blocked),
         }
@@ -6487,6 +6511,7 @@ async fn proxy_charged_request(
             payment
                 .as_ref()
                 .is_some_and(agent_pay_gate::Intake::is_unpaid),
+            subscription_lifetime.as_mut(),
         )
         .await
         {
@@ -6500,9 +6525,6 @@ async fn proxy_charged_request(
                 body_bytes = prepared
                     .rewrite_body(&body_bytes)
                     .map_err(|error| ModernDelegationError::from(error).response(request))?;
-                if let Some(lifetime) = subscription_lifetime.as_mut() {
-                    prepared.restrict_to_consents(lifetime);
-                }
                 modern_request = Some(prepared.request.clone());
                 modern_delegation = Some(prepared);
             }
@@ -7853,6 +7875,11 @@ async fn proxy_charged_request(
     let reached_target = std::sync::atomic::AtomicBool::new(false);
     let sent_nothing =
         |error: &reqwest::Error| error.is_connect() && !reached_target.load(std::sync::atomic::Ordering::Relaxed);
+    let send_failed =
+        |error: reqwest::Error| match crate::proxy::response_auth::handshake_failure(&state.surface, &error) {
+            Some(failure) => crate::proxy::response_auth::refuse(failure, &audit_facts, &body_bytes),
+            None => handle_upstream_error(error, &state, &source_addr, &identity_hash, &channel_name, &ucp_operation),
+        };
 
     // Implement retry logic if configured
     let send_with_retry = || async {
@@ -7893,13 +7920,27 @@ async fn proxy_charged_request(
                 match sent {
                     Ok(resp) => {
                         let status = resp.status();
+                        let retryable = retry_config
+                            .retryable_status_codes
+                            .contains(&status.as_u16());
+                        if retryable
+                            && state
+                                .surface
+                                .target
+                                .response_auth
+                                .is_some()
+                            && !crate::proxy::response_auth::passes(
+                                &state.surface,
+                                resp.headers(),
+                                state.secrets_store.as_ref(),
+                            )
+                            .await
+                        {
+                            break Ok(resp);
+                        }
 
                         // Check if we should retry based on status code
-                        if attempt <= retry_config.max_attempts
-                            && retry_config
-                                .retryable_status_codes
-                                .contains(&status.as_u16())
-                        {
+                        if attempt <= retry_config.max_attempts && retryable {
                             warn!(
                                 channel = channel_name,
                                 attempt = attempt,
@@ -7926,6 +7967,9 @@ async fn proxy_charged_request(
                         break Ok(resp);
                     }
                     Err(e) => {
+                        if crate::proxy::response_auth::handshake_failure(&state.surface, &e).is_some() {
+                            break Err(e);
+                        }
                         if attempt <= retry_config.max_attempts {
                             let e = e.without_url();
                             warn!(channel = channel_name, attempt = attempt, error = %e, "Request failed, will retry");
@@ -7984,14 +8028,7 @@ async fn proxy_charged_request(
                             .iter()
                             .for_each(|receipt| receipt.revoke());
                     }
-                    return Err(handle_upstream_error(
-                        e,
-                        &state,
-                        &source_addr,
-                        &identity_hash,
-                        &channel_name,
-                        &ucp_operation,
-                    ));
+                    return Err(send_failed(e));
                 }
             }
         } else {
@@ -8004,7 +8041,7 @@ async fn proxy_charged_request(
                             .iter()
                             .for_each(|receipt| receipt.revoke());
                     }
-                    handle_upstream_error(e, &state, &source_addr, &identity_hash, &channel_name, &ucp_operation)
+                    send_failed(e)
                 })?
         };
         Ok::<_, Response>(upstream_response)
@@ -8033,22 +8070,43 @@ async fn proxy_charged_request(
     } else {
         send_response.await?
     };
+    let mut upstream_response = upstream_response;
+    if let Err(failure) = crate::proxy::response_auth::authenticate_response(
+        &state.surface,
+        upstream_response.headers_mut(),
+        state.secrets_store.as_ref(),
+    )
+    .await
+    {
+        connection_guard
+            .decrement()
+            .await;
+        return Ok(crate::proxy::response_auth::refuse(failure, &audit_facts, &body_bytes));
+    }
     // The vendor's answer to the Target's grant: a refusal of the token gets
     // one refresh and one retry, and its cookies and authentication challenges
     // never reach the caller.
     let mut upstream_response = match (target_grant.as_ref(), released_target_grant) {
-        (Some(route), Some(released)) => match route
-            .answer(&state, released, upstream_response, target_grant_retry)
-            .await
-        {
-            Ok(response) => response,
-            Err(refused) => {
-                connection_guard
-                    .decrement()
-                    .await;
-                return Ok(refused.response(&state.surface, &body_bytes));
+        (Some(route), Some(released)) => {
+            match route
+                .answer(&state, released, upstream_response, target_grant_retry)
+                .await
+            {
+                Ok(response) => response,
+                Err(crate::proxy::target_grant::TargetGrantRefusal::ResponseUnauthenticated(failure)) => {
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Ok(crate::proxy::response_auth::refuse(failure, &audit_facts, &body_bytes));
+                }
+                Err(refused) => {
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Ok(refused.response(&state.surface, &body_bytes));
+                }
             }
-        },
+        }
         _ => upstream_response,
     };
     if bound_target {
@@ -8130,12 +8188,28 @@ async fn proxy_charged_request(
             sse_status
         );
 
+        let sse_client = if matches!(
+            state
+                .surface
+                .target
+                .response_auth,
+            Some(crate::config::response_auth::ResponseAuthConfig::Mtls(_))
+        ) {
+            forward_client
+        } else {
+            &state.client
+        };
         match crate::mcp::sse_transport::send_via_persistent_sse(
-            &state.client,
+            sse_client,
             &state.surface.target.endpoint,
             &body_bytes,
             &channel_name,
             state.config.a2a.max_body_size,
+            Some(crate::mcp::sse_transport::ResponseCheck {
+                surface: &state.surface,
+                secrets: state.secrets_store.as_ref(),
+                stamp: target_tls_stamp,
+            }),
         )
         .await
         {
@@ -8153,6 +8227,12 @@ async fn proxy_charged_request(
                     .header("Content-Type", "application/json")
                     .body(axum::body::Body::from(json_response))
                     .unwrap());
+            }
+            Err(crate::mcp::sse_transport::LegacySseError::Unauthenticated(failure)) => {
+                connection_guard
+                    .decrement()
+                    .await;
+                return Ok(crate::proxy::response_auth::refuse(failure, &audit_facts, &body_bytes));
             }
             Err(e) => {
                 warn!(
@@ -11029,7 +11109,7 @@ async fn handle_fabric_request_inner(
         mcp_metadata_context,
         mcp_verified_binding,
         mcp_classification,
-        subscription_lifetime,
+        mut subscription_lifetime,
         mcp_continuations,
         payment,
     } = request;
@@ -12083,6 +12163,7 @@ async fn handle_fabric_request_inner(
                     peer_did: remote_gateway_did.clone(),
                 },
                 payment.is_some_and(agent_pay_gate::Intake::is_unpaid),
+                subscription_lifetime.as_mut(),
             )
             .await
             {
@@ -14934,16 +15015,18 @@ fn extended_agent_card_refusal(rpc_request_id: Option<&serde_json::Value>) -> Re
     crate::a2a::url_rewriter::extended_agent_card_refusal(rpc_request_id)
 }
 
-/// A redirect-disabled client pinned to the vetted address of `target_url`, or
-/// the 403 to answer when egress policy blocks it. Pinning stops DNS rebinding
-/// between vetting and connect; disabling redirects stops a 3xx from sending
-/// the request, and any credential on it, to an unvetted host. A block is
-/// recorded as a refusal; a vetting task that did not run is a gateway fault.
+/// A redirect-disabled client pinned to the vetted address of `target_url`,
+/// speaking TLS with `tls` when given, or the 403 to answer when egress policy
+/// blocks it. Pinning stops DNS rebinding between vetting and connect;
+/// disabling redirects stops a 3xx from sending the request, and any credential
+/// on it, to an unvetted host. A block is recorded as a refusal; a vetting task
+/// that did not run is a gateway fault.
 async fn pinned_target_client(
     state: &ProxyState,
     channel_name: &str,
     target_url: &str,
     facts: &crate::audit::request_events::RequestFacts<'_>,
+    tls: Option<Arc<rustls::ClientConfig>>,
 ) -> Result<reqwest::Client, Response> {
     let candidate = target_url.to_string();
     let timeout = std::time::Duration::from_secs(
@@ -14952,7 +15035,11 @@ async fn pinned_target_client(
             .a2a
             .timeout_seconds,
     );
-    match tokio::task::spawn_blocking(move || crate::egress::pinned_forward_client(&candidate, timeout)).await {
+    match tokio::task::spawn_blocking(move || {
+        crate::egress::pinned_forward_client_with_tls(&candidate, timeout, tls.as_deref())
+    })
+    .await
+    {
         Ok(Ok((client, _target))) => Ok(client),
         Ok(Err(e)) => {
             warn!(channel = channel_name, target = %loggable::url(target_url), "SSRF blocked by egress policy: {}", e);
@@ -16716,6 +16803,8 @@ pub(crate) fn compute_transit_token_caller_context(
 
 #[cfg(test)]
 mod fabric_send_policy_tests;
+#[cfg(test)]
+mod response_auth_tests;
 #[cfg(test)]
 mod target_auth_audit_tests;
 #[cfg(test)]

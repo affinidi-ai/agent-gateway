@@ -1,19 +1,11 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { apiClient } from '../../api';
-
-interface SimulateResult {
-  allow: boolean;
-  reason?: string;
-  policy_type: string;
-  version?: number;
-  content_hash: string;
-  query: string;
-}
+import { simulatePolicy, type SimulateResult } from './simulatePolicy';
+import type { PolicyType } from './policyTemplates/types';
 
 interface PolicySimulatePanelProps {
   policyId: string;
   /** The policy type currently selected in the editor (may be unsaved). */
-  policyType: 'gateway' | 'agent_surface';
+  policyType: PolicyType;
   /** The current editor Rego — evaluated as a draft so unsaved edits are tested. */
   draftPolicy: string;
   /** Saved sample input, owned by the editor form so it persists on save. */
@@ -24,20 +16,14 @@ interface PolicySimulatePanelProps {
 }
 
 export const POLICY_SIMULATE_DEFAULT_INPUT = `{
-  "jwt": { "sub": "user@example.com", "role": "admin" },
+  "source_auth": {
+    "method": "jwt_bearer",
+    "subject": "user@example.com",
+    "claims": { "sub": "user@example.com", "role": "admin" }
+  },
   "http": { "method": "POST", "path": "/", "headers": {} },
   "gateway": { "direction": "inbound" }
 }`;
-
-/** Pull the `error` field out of a JSON error body; falls back to the raw text. */
-const extractErrorMessage = (body: string): string => {
-  try {
-    const parsed = JSON.parse(body) as { error?: string };
-    return parsed.error ?? body;
-  } catch {
-    return body;
-  }
-};
 
 /**
  * Dry-run the policy currently in the editor against a sample input, without
@@ -85,19 +71,7 @@ const PolicySimulatePanel: React.FC<PolicySimulatePanelProps> = ({
     }
     try {
       setRunning(true);
-      const resp = await apiClient.fetch(
-        `/api/v1/policy-definitions/${encodeURIComponent(policyId)}/simulate`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ input, policy: draftPolicy, policy_type: policyType }),
-        }
-      );
-      if (!resp.ok) {
-        const detail = await resp.text().catch(() => '');
-        throw new Error(extractErrorMessage(detail) || `Dry-run failed: ${resp.statusText}`);
-      }
-      setResult((await resp.json()) as SimulateResult);
+      setResult(await simulatePolicy(policyId, policyType, draftPolicy, input));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Dry-run failed');
@@ -152,7 +126,6 @@ const PolicySimulatePanel: React.FC<PolicySimulatePanelProps> = ({
                 type="button"
                 className="btn btn-sm btn-outline-primary"
                 style={{
-                  width: '13rem',
                   whiteSpace: 'nowrap',
                   pointerEvents: disabled || autoRun ? 'none' : undefined,
                 }}
@@ -170,7 +143,7 @@ const PolicySimulatePanel: React.FC<PolicySimulatePanelProps> = ({
           Evaluates the Rego currently in the editor (unsaved) against the sample <code>input</code>{' '}
           below. Nothing is enforced — no engine or live traffic is touched.
         </p>
-        <label className="font-weight-bold">
+        <label>
           Sample input JSON
           {sampleInput.trim() && !sampleInputError && (
             <span className="ms-2 text-success small">
@@ -197,13 +170,7 @@ const PolicySimulatePanel: React.FC<PolicySimulatePanelProps> = ({
             data-testid="policy-simulate-input-error"
           >
             <i className="fas fa-exclamation-triangle me-2"></i>
-            <span
-              style={{
-                whiteSpace: 'pre-wrap',
-                fontFamily: 'Monaco, Consolas, "Courier New", monospace',
-                fontSize: '0.8rem',
-              }}
-            >
+            <span className="policy-error-text">
               {`Sample input is not valid JSON: ${sampleInputError}`}
             </span>
           </div>
@@ -211,15 +178,7 @@ const PolicySimulatePanel: React.FC<PolicySimulatePanelProps> = ({
         {error && (
           <div className="alert alert-danger compile-error-alert py-2 px-3 mb-0">
             <i className="fas fa-exclamation-triangle me-2"></i>
-            <span
-              style={{
-                whiteSpace: 'pre-wrap',
-                fontFamily: 'Monaco, Consolas, "Courier New", monospace',
-                fontSize: '0.8rem',
-              }}
-            >
-              {error}
-            </span>
+            <span className="policy-error-text">{error}</span>
           </div>
         )}
         {result && (

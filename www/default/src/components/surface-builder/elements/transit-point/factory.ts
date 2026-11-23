@@ -11,7 +11,7 @@ import TransitPointPanel, {
   transitPointGatewayRoute,
 } from './TransitPointPanel';
 import { transitCredentialsToApi } from '../_shared/TransitCredentialBindingSection';
-import { providerTargetAuthToApi } from '../_shared/providerTargetAuth';
+import { transitPointTargetAuth, transitPointTargetAuthProblems } from './targetAuth';
 import { identityConfigToWire } from '../identity/definition';
 import { workloadBindingFormToApi } from '../workload-binding/config';
 import { getCachedOutboundListenAddresses } from '../access-point/defaults';
@@ -79,6 +79,15 @@ export function newTransitPointId(): string {
   return `${hex(8)}-${hex(4)}-4${hex(3)}-${(8 + Math.floor(Math.random() * 4)).toString(16)}${hex(3)}-${hex(12)}`;
 }
 
+const STATIC_SECRET_AUTH_TYPES = ['bearer', 'api_key', 'custom_header'];
+
+/** Why a static-secret target authentication can't be saved, or null; an empty secret would drop it silently. */
+function targetAuthSecretProblem(config: Record<string, unknown>): string | null {
+  if (!STATIC_SECRET_AUTH_TYPES.includes(String(config.auth_type))) return null;
+  const secret = typeof config.auth_secret === 'string' ? config.auth_secret.trim() : '';
+  return secret ? null : 'Pick the secret whose value authenticates this Transit Point.';
+}
+
 interface TransitPointVariantOpts {
   type: SurfaceNodeType;
   protocol: Protocol;
@@ -102,6 +111,8 @@ interface TransitPointVariantOpts {
    * for new drops). See `NodeDefinition.hiddenFromPalette`.
    */
   hiddenFromPalette?: boolean;
+  /** Surface protocols whose palette offers this variant. See `NodeDefinition.protocols`. */
+  protocols?: Protocol[];
 }
 
 /**
@@ -111,8 +122,16 @@ interface TransitPointVariantOpts {
  * and bound protocol differ.
  */
 export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeDefinition {
-  const { type, protocol, label, color, paletteOrder, isPayloadCoordinator, hiddenFromPalette } =
-    opts;
+  const {
+    type,
+    protocol,
+    label,
+    color,
+    paletteOrder,
+    isPayloadCoordinator,
+    hiddenFromPalette,
+    protocols,
+  } = opts;
   return {
     type,
     label: `Transit Point (${label})`,
@@ -135,6 +154,7 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
     dropMode: 'canvas',
     isTransitPoint: true,
     ...(hiddenFromPalette ? { hiddenFromPalette: true } : {}),
+    ...(protocols ? { protocols } : {}),
     getProtocol: () => protocol,
     help: {
       title: `Transit Point (${label})`,
@@ -211,6 +231,11 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
       for (const message of callerAuthProblems(c)) {
         errs.push({ field: 'caller_authentication', message });
       }
+      for (const [field, message] of Object.entries(transitPointTargetAuthProblems(c).errors)) {
+        errs.push({ field, message });
+      }
+      const secretMessage = targetAuthSecretProblem(c);
+      if (secretMessage) errs.push({ field: 'auth_secret', message: secretMessage });
       return errs;
     },
     // A transit point's listen address must be an actual outbound listener
@@ -422,75 +447,8 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                     ? { fabric_delegated_credentials: true }
                     : {}),
                   ...(() => {
-                    // Project the panel's auth_* fields onto the
-                    // backend `TargetAuthConfig` shape (externally-tagged
-                    // method enum). Empty / "none" auth is omitted so
-                    // the surface JSON stays clean. A credential provider
-                    // maps to `credential_provider`; the bearer / api_key /
-                    // custom_header presets map to `static_secret` with
-                    // header_name + header_format pairs that the proxy
-                    // injects verbatim.
-                    const t = c.auth_type;
-                    if (!t || t === 'none') return {};
-                    if (t === 'credential_provider') {
-                      const auth = providerTargetAuthToApi({
-                        providerId:
-                          typeof c.auth_provider_id === 'string' ? c.auth_provider_id : '',
-                        headerName:
-                          typeof c.auth_header_name === 'string' ? c.auth_header_name : '',
-                        headerFormat:
-                          typeof c.auth_header_format === 'string' ? c.auth_header_format : '',
-                        fallback: c.auth_fallback,
-                      });
-                      return auth ? { target_auth: auth } : {};
-                    }
-                    const secretId = typeof c.auth_secret === 'string' ? c.auth_secret.trim() : '';
-                    if (!secretId) return {};
-                    let headerName: string;
-                    let headerFormat: string;
-                    switch (t) {
-                      case 'bearer':
-                        headerName = 'Authorization';
-                        headerFormat =
-                          (typeof c.auth_header_format === 'string' &&
-                            c.auth_header_format.trim()) ||
-                          'Bearer {value}';
-                        break;
-                      case 'api_key':
-                        headerName =
-                          (typeof c.auth_header_name === 'string' && c.auth_header_name.trim()) ||
-                          'X-API-Key';
-                        headerFormat =
-                          (typeof c.auth_header_format === 'string' &&
-                            c.auth_header_format.trim()) ||
-                          '{value}';
-                        break;
-                      case 'custom_header':
-                        headerName =
-                          (typeof c.auth_header_name === 'string' && c.auth_header_name.trim()) ||
-                          'X-Auth';
-                        headerFormat =
-                          (typeof c.auth_header_format === 'string' &&
-                            c.auth_header_format.trim()) ||
-                          '{value}';
-                        break;
-                      default:
-                        // An unknown preset is dropped here rather than
-                        // emitting an invalid wire shape.
-                        return {};
-                    }
-                    return {
-                      target_auth: {
-                        method: {
-                          static_secret: {
-                            secret_id: secretId,
-                            header_name: headerName,
-                            header_format: headerFormat,
-                          },
-                        },
-                        fallback: c.auth_fallback === 'passthrough' ? 'passthrough' : 'reject',
-                      },
-                    };
+                    const targetAuth = transitPointTargetAuth(c);
+                    return targetAuth ? { target_auth: targetAuth } : {};
                   })(),
                   ...(reqPolicyId
                     ? {

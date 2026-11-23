@@ -24,11 +24,6 @@ use super::{IdentityStore, VpChallengeStore};
 
 const IS_VP_CHALLENGE_REQUIRED_DEFAULT: bool = false;
 
-/// Longest wait for a gateway DID log version's `versionTime` to pass before a new version is
-/// appended after it.
-#[cfg(feature = "didwebvh")]
-const MAX_VERSION_TIME_WAIT_SECS: i64 = 2;
-
 /// Lock file in the issuer storage directory that serializes creating, upgrading and repairing
 /// the gateway DID between gateways sharing the directory.
 const GATEWAY_DID_LOCK_FILE: &str = ".gateway_did.lock";
@@ -61,71 +56,10 @@ pub(crate) fn public_key_agreement_jwk(
     Ok(public_jwk)
 }
 
-/// How long to wait before appending a log version after one dated `previous_time`: a
-/// version's `versionTime`, in whole seconds, must be later than the previous one's, which a
-/// log published earlier in the same startup can share. A `versionTime` further ahead comes
-/// from a clock that is off and is refused rather than waited out.
 #[cfg(feature = "didwebvh")]
-pub(crate) fn wait_before_next_version(
-    previous_time: chrono::DateTime<chrono::Utc>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<std::time::Duration>> {
-    let wait = (previous_time + chrono::Duration::seconds(1)).signed_duration_since(now);
-    if wait > chrono::Duration::seconds(MAX_VERSION_TIME_WAIT_SECS) {
-        anyhow::bail!("the latest DID log version is dated {previous_time}, ahead of this node's clock");
-    }
-    Ok(wait.to_std().ok())
-}
-
-/// Verification relationships the gateway signing key is listed under: credentials and
-/// presentations it signs claim one of them as their proof purpose.
-#[cfg(feature = "didwebvh")]
-const SIGNING_KEY_RELATIONSHIPS: [&str; 2] = ["assertionMethod", "authentication"];
-
-/// Adds `multikey_id` to each of [`SIGNING_KEY_RELATIONSHIPS`] that does not list it yet;
-/// returns false when all of them already do. Refuses, changing nothing, a document that does
-/// not publish `multikey_id` as the Multikey of `signing_key`, so only the gateway's own signing
-/// key is ever authorized, or that lacks one of those relationships.
-#[cfg(feature = "didwebvh")]
-fn add_signing_key_to_relationships(
-    document: &mut serde_json::Value,
-    multikey_id: &str,
-    signing_key: &JWK,
-) -> Result<bool> {
-    let expected_key = crate::identity::ssi::did_utils::jwk_to_multibase_ed25519(signing_key)?;
-    let mut matching = document["verificationMethod"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|method| method["id"] == multikey_id);
-    let published = matching
-        .next()
-        .with_context(|| format!("DID document does not publish {multikey_id}"))?;
-    anyhow::ensure!(matching.next().is_none(), "DID document publishes {multikey_id} more than once");
-    anyhow::ensure!(
-        published["type"] == "Multikey" && published["publicKeyMultibase"] == expected_key.as_str(),
-        "DID document publishes a key other than the gateway signing key as {multikey_id}"
-    );
-    for relationship in SIGNING_KEY_RELATIONSHIPS {
-        anyhow::ensure!(document[relationship].is_array(), "DID document has no {relationship}");
-    }
-
-    let mut changed = false;
-    for relationship in SIGNING_KEY_RELATIONSHIPS {
-        let ids = document
-            .get_mut(relationship)
-            .and_then(serde_json::Value::as_array_mut)
-            .with_context(|| format!("DID document has no {relationship}"))?;
-        if !ids
-            .iter()
-            .any(|id| *id == multikey_id)
-        {
-            ids.push(json!(multikey_id));
-            changed = true;
-        }
-    }
-    Ok(changed)
-}
+use crate::identity::didwebvh::signing_key_repair::{
+    Repair, add_signing_key_to_relationships, append_signing_key_version as append_version,
+};
 
 /// The parallel `did:web` document of a `did:webvh` log state, encoded as the gateway serves it
 /// at `/.well-known/did.json`, which reads the state as a typed DID document.
@@ -153,7 +87,7 @@ pub(crate) fn gateway_did_document(
 ) -> Result<serde_json::Value> {
     let public_key_multibase = crate::identity::ssi::did_utils::jwk_to_multibase_ed25519(signing_key)?;
     let jwk_key_id = format!("{}#key-1", proxy_did);
-    let multikey_id = format!("{}#{}", proxy_did, DEFAULT_SIGNING_KEY_ID);
+    let multikey_id = format!("{proxy_did}#{DEFAULT_SIGNING_KEY_ID}");
     let domain = extract_domain_from_proxy_did(proxy_did);
 
     Ok(json!({
@@ -310,6 +244,35 @@ pub struct VCIssuer {
     tr_listener_manager: Arc<RwLock<Option<Arc<crate::trust_registries::TrustRegistryListenerManager>>>>,
     surface_store: std::sync::OnceLock<Arc<dyn crate::surfaces::AgentSurfaceStore>>,
     surfaces_by_did: SurfacesByDidCache,
+    /// Per agent DID: listed (`None`) when its DID document lists the signing key under
+    /// `authentication`, or the time it was last found not listing it.
+    #[cfg(feature = "didwebvh")]
+    authentication_holders: dashmap::DashMap<String, Option<std::time::Instant>>,
+}
+
+/// Added to the DID resolver cache lifetime before a repaired holder claims `authentication`, for
+/// the time between a version's `versionTime` and its write, and for clocks that differ between
+/// nodes.
+#[cfg(feature = "didwebvh")]
+const AUTHENTICATION_GRACE_MARGIN: chrono::Duration = chrono::Duration::minutes(5);
+
+/// How long a holder whose DID document does not list its signing key under `authentication` is
+/// taken as not listing it before its DID log is read again.
+#[cfg(feature = "didwebvh")]
+const HOLDER_MISS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What a sweep of the local agent DIDs found.
+#[cfg(feature = "didwebvh")]
+#[derive(Debug, Default)]
+pub struct AgentDidSweep {
+    /// The DIDs that got a new log version.
+    pub repaired: Vec<String>,
+    /// How many DIDs' latest log version lists the signing key, repaired or not.
+    pub listed: usize,
+    /// How many DIDs still do not list it: not repaired, or refused.
+    pub unlisted: usize,
+    /// How many local agent DIDs have no DID log to repair or to serve.
+    pub without_log: usize,
 }
 
 impl VCIssuer {
@@ -362,6 +325,8 @@ impl VCIssuer {
             tr_listener_manager: Arc::new(RwLock::new(None)),
             surface_store: std::sync::OnceLock::new(),
             surfaces_by_did: SurfacesByDidCache::default(),
+            #[cfg(feature = "didwebvh")]
+            authentication_holders: dashmap::DashMap::new(),
         })
     }
 
@@ -592,8 +557,7 @@ impl VCIssuer {
             .proxy_did
             .starts_with("did:webvh:")
         {
-            let multikey_id = format!("{}#{}", config.proxy_did, DEFAULT_SIGNING_KEY_ID);
-            return Self::append_signing_key_version(&config, &multikey_id, &still_active).await;
+            return Self::append_signing_key_version(&config, &still_active).await;
         }
 
         let changed = Self::authorize_signing_key_in_did_document(&config, None).await?;
@@ -627,7 +591,7 @@ impl VCIssuer {
 
         let lists = |document: &serde_json::Value, document_id: &str| -> Result<bool> {
             let mut document = document.clone();
-            let multikey_id = format!("{document_id}#{DEFAULT_SIGNING_KEY_ID}");
+            let multikey_id = crate::identity::didwebvh::signing_key_repair::signing_key_id(document_id);
             Ok(!add_signing_key_to_relationships(&mut document, &multikey_id, &config.signing_key)?)
         };
         if config
@@ -637,12 +601,7 @@ impl VCIssuer {
             let Some(log) = read_did_log_raw(&config.storage_path).await? else {
                 return Ok(false);
             };
-            let latest: serde_json::Value = serde_json::from_str(
-                log.lines()
-                    .map(str::trim)
-                    .rfind(|line| !line.is_empty())
-                    .context("Gateway DID log has no entries")?,
-            )?;
+            let latest = crate::identity::didwebvh::signing_key_repair::latest_entry(&log)?;
             if !lists(&latest["state"], &config.proxy_did)? {
                 return Ok(false);
             }
@@ -669,76 +628,250 @@ impl VCIssuer {
     #[cfg(feature = "didwebvh")]
     async fn append_signing_key_version(
         config: &VCIssuerConfig,
-        multikey_id: &str,
         still_active: &(dyn Fn() -> bool + Sync),
     ) -> Result<bool> {
-        use crate::identity::didwebvh::handlers::{build_signing_secret, build_webvh_state};
-        use crate::storage::did_artifacts::{append_did_log_raw, read_did_log_raw};
+        use crate::storage::did_artifacts::read_did_log_raw;
 
         let Some(log) = read_did_log_raw(&config.storage_path).await? else {
             warn!("Gateway DID {} has no did.jsonl; repairing its did.json only", config.proxy_did);
             return Self::authorize_signing_key_in_did_document(config, None).await;
         };
-        let entries: Vec<String> = log
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect();
-        let state = build_webvh_state(&config.proxy_did, &entries)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let latest: serde_json::Value = serde_json::from_str(
-            entries
-                .last()
-                .context("Gateway DID log has no entries")?,
-        )?;
-        let mut document = latest
-            .get("state")
-            .cloned()
-            .context("Gateway DID log entry has no state")?;
-        if !add_signing_key_to_relationships(&mut document, multikey_id, &config.signing_key)? {
-            let caught_up = Self::authorize_signing_key_in_did_document(config, Some(&latest["state"])).await?;
-            if caught_up {
-                info!("Gateway DID document {} now lists its signing key like its DID log", config.proxy_did);
-            }
-            return Ok(caught_up);
-        }
-
-        let previous_time = chrono::DateTime::parse_from_rfc3339(
-            latest["versionTime"]
-                .as_str()
-                .context("Gateway DID log entry has no versionTime")?,
-        )?;
-        if let Some(wait) = wait_before_next_version(previous_time.to_utc(), chrono::Utc::now())
-            .context("the gateway DID repair runs again on the next start")?
+        match append_version(&config.storage_path, &log, &config.proxy_did, &config.signing_key, false, still_active)
+            .await?
         {
-            tokio::time::sleep(wait).await;
+            Repair::Unchanged { state } => {
+                let caught_up = Self::authorize_signing_key_in_did_document(config, Some(&state)).await?;
+                if caught_up {
+                    info!("Gateway DID document {} now lists its signing key like its DID log", config.proxy_did);
+                }
+                Ok(caught_up)
+            }
+            Repair::SteppedDown => {
+                info!("Gateway DID repair left to the Active node: this node stepped down to Standby");
+                Ok(false)
+            }
+            Repair::Appended { state } => {
+                if let Err(e) = Self::authorize_signing_key_in_did_document(config, Some(&state)).await {
+                    warn!("Gateway DID log repaired, but its did.json was left as it is: {e:#}");
+                }
+                info!(
+                    "Gateway DID {} now lists its signing key under assertionMethod and authentication",
+                    config.proxy_did
+                );
+                Ok(true)
+            }
         }
+    }
 
-        let signing_key =
-            build_signing_secret(&serde_json::to_value(&config.signing_key)?).map_err(|e| anyhow::anyhow!(e))?;
-        let update = didwebvh_rs::prelude::update_did(
-            didwebvh_rs::prelude::UpdateDIDConfig::builder()
-                .state(state)
-                .signing_key(signing_key)
-                .document(document)
-                .build()?,
-        )
-        .await?;
-        let entry_json = serde_json::to_string(update.log_entry())?;
-        if !still_active() {
-            info!("Gateway DID repair left to the Active node: this node stepped down to Standby");
-            return Ok(false);
-        }
-        append_did_log_raw(&config.storage_path, &log, &entry_json).await?;
-        let entry: serde_json::Value = serde_json::from_str(&entry_json)?;
-        if let Err(e) = Self::authorize_signing_key_in_did_document(config, Some(&entry["state"])).await {
-            warn!("Gateway DID log repaired, but its did.json was left as it is: {e:#}");
-        }
+    /// The folder holding an agent DID's `did.jsonl`: the identity store folder named by the DID's
+    /// last segment. None for a store without folders or a segment that is not a storage id.
+    #[cfg(feature = "didwebvh")]
+    pub(crate) fn agent_did_log_dir(
+        &self,
+        did: &str,
+    ) -> Option<PathBuf> {
+        let base = self
+            .identity_store
+            .base_path()?;
+        crate::storage::did_artifacts::identity_did_dir(&base, did.rsplit(':').next()?).ok()
+    }
 
-        info!("Gateway DID {} now lists its signing key under assertionMethod and authentication", config.proxy_did);
-        Ok(true)
+    /// Whether `did`'s latest published DID document publishes `key` as its signing Multikey and
+    /// lists it under `assertionMethod` and `authentication`, since its first version or for at
+    /// least a DID resolver cache lifetime, so the presentations it holds may claim
+    /// authentication. A DID without a
+    /// local `did:webvh` log, such as an external, `did:web` or `did:peer` holder, does not. A listed key stays
+    /// listed, so a yes is remembered; a no is remembered for [`HOLDER_MISS_TTL`], since another
+    /// node may repair the DID meanwhile.
+    #[cfg(feature = "didwebvh")]
+    pub(crate) async fn holder_signs_for_authentication(
+        &self,
+        did: &str,
+        key: &JWK,
+    ) -> bool {
+        if !did.starts_with("did:webvh:") {
+            return false;
+        }
+        match self
+            .authentication_holders
+            .get(did)
+            .map(|entry| *entry)
+        {
+            Some(None) => return true,
+            Some(Some(missed_at)) if missed_at.elapsed() < HOLDER_MISS_TTL => return false,
+            _ => {}
+        }
+        let grace = chrono::Duration::seconds(crate::gateways::did_cache::SHARED_RESOLVER_TTL_SECS.into())
+            + AUTHENTICATION_GRACE_MARGIN;
+        let listed = match self.agent_did_log_dir(did) {
+            Some(dir) => matches!(
+                crate::storage::did_artifacts::read_did_log_raw(&dir).await,
+                Ok(Some(log)) if crate::identity::didwebvh::signing_key_repair::signs_for_authentication(
+                    &log, did, key, grace, chrono::Utc::now()
+                )
+            ),
+            None => false,
+        };
+        self.authentication_holders
+            .insert(did.to_string(), (!listed).then(std::time::Instant::now));
+        listed
+    }
+
+    #[cfg(not(feature = "didwebvh"))]
+    pub(crate) async fn holder_signs_for_authentication(
+        &self,
+        _did: &str,
+        _key: &JWK,
+    ) -> bool {
+        false
+    }
+
+    /// Reads each local agent DID log, without writing, and reports which already list the
+    /// agent's signing Multikey under `assertionMethod` and `authentication`.
+    #[cfg(feature = "didwebvh")]
+    pub async fn check_agent_dids(&self) -> AgentDidSweep {
+        self.sweep_agent_dids(false, &|| true)
+            .await
+    }
+
+    /// Lists each local agent DID's signing Multikey under `assertionMethod` and `authentication`
+    /// where its latest `did:webvh` log version does not, publishing the key first when the
+    /// document has none, by appending a version signed with the agent's own key; the DID does
+    /// not change. Stops once `still_active` no longer holds. A DID whose log cannot be repaired
+    /// is logged and left as it is.
+    #[cfg(feature = "didwebvh")]
+    pub async fn repair_agent_dids_while(
+        &self,
+        still_active: impl Fn() -> bool + Sync,
+    ) -> AgentDidSweep {
+        let sweep = self
+            .sweep_agent_dids(true, &still_active)
+            .await;
+        info!(
+            repaired = sweep.repaired.len(),
+            listed = sweep.listed,
+            unlisted = sweep.unlisted,
+            without_log = sweep.without_log,
+            "Agent DIDs list their signing key under assertionMethod and authentication"
+        );
+        sweep
+    }
+
+    #[cfg(feature = "didwebvh")]
+    async fn sweep_agent_dids(
+        &self,
+        repair: bool,
+        still_active: &(dyn Fn() -> bool + Sync),
+    ) -> AgentDidSweep {
+        use crate::identity::didwebvh::signing_key_repair::lists_signing_key;
+
+        let mut sweep = AgentDidSweep::default();
+        let records = match self
+            .identity_store
+            .list_all()
+            .await
+        {
+            Ok(records) => records,
+            Err(e) => {
+                warn!("Could not list the agent identities to check their DIDs: {e:#}");
+                return sweep;
+            }
+        };
+        let mut listed_dids = std::collections::HashSet::new();
+        let mut unlisted_dids = std::collections::HashSet::new();
+        let mut without_log = std::collections::HashSet::new();
+        for record in records {
+            if !still_active() {
+                break;
+            }
+            let Some(private_key) = record.private_key.as_ref() else {
+                continue;
+            };
+            if !record
+                .did
+                .starts_with("did:webvh:")
+            {
+                continue;
+            }
+            let Some(dir) = self.agent_did_log_dir(&record.did) else {
+                continue;
+            };
+            if listed_dids.contains(&record.did) {
+                continue;
+            }
+            let log = match crate::storage::did_artifacts::read_did_log_raw(&dir).await {
+                Ok(Some(log)) => log,
+                Ok(None) => {
+                    if !without_log.insert(record.did.clone()) {
+                        continue;
+                    }
+                    warn!("Agent DID {} has no DID log, so peers cannot resolve it", record.did);
+                    continue;
+                }
+                Err(e) => {
+                    unlisted_dids.insert(record.did.clone());
+                    warn!("Could not read the DID log of agent DID {}: {e:#}", record.did);
+                    continue;
+                }
+            };
+            let key: JWK = match serde_json::from_value(private_key.clone()) {
+                Ok(key) => key,
+                Err(_) => {
+                    unlisted_dids.insert(record.did.clone());
+                    warn!("The key of agent DID {} is not a JWK; its DID is left as it is", record.did);
+                    continue;
+                }
+            };
+            if lists_signing_key(&log, &record.did, &key) {
+                sweep.listed += 1;
+                listed_dids.insert(record.did);
+                continue;
+            }
+            if !repair {
+                unlisted_dids.insert(record.did.clone());
+                continue;
+            }
+            match append_version(&dir, &log, &record.did, &key, true, still_active).await {
+                Ok(Repair::Appended { .. }) => {
+                    sweep
+                        .repaired
+                        .push(record.did.clone());
+                    sweep.listed += 1;
+                    listed_dids.insert(record.did);
+                }
+                Ok(Repair::Unchanged { .. }) => {
+                    sweep.listed += 1;
+                    listed_dids.insert(record.did);
+                }
+                Ok(Repair::SteppedDown) => break,
+                Err(e) => {
+                    unlisted_dids.insert(record.did.clone());
+                    warn!(
+                        "Could not list the signing key of agent DID {} under assertionMethod and authentication: {e:#}",
+                        record.did
+                    );
+                }
+            }
+        }
+        sweep.unlisted = unlisted_dids
+            .difference(&listed_dids)
+            .count();
+        sweep.without_log = without_log.len();
+        sweep
+    }
+
+    /// The gateway DID, followed by the parallel `did:web` DID of a `did:webvh` gateway when it can
+    /// be derived.
+    #[cfg(feature = "didwebvh")]
+    pub async fn gateway_did_ids(&self) -> Vec<String> {
+        let config = self.config.read().await;
+        let mut ids = vec![config.proxy_did.clone()];
+        match Self::did_document_id(&config) {
+            Ok(document_id) if document_id != config.proxy_did => ids.push(document_id),
+            Ok(_) => {}
+            Err(e) => warn!("Could not derive the did:web DID of gateway DID {}: {e:#}", config.proxy_did),
+        }
+        ids
     }
 
     /// The DID the stored `did.json` describes: the gateway DID, or for a `did:webvh` DID its
@@ -818,20 +951,11 @@ impl VCIssuer {
         let Some(log) = read_did_log_raw(storage_path).await? else {
             return Ok(false);
         };
-        let entries: Vec<String> = log
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect();
+        let entries = crate::identity::didwebvh::signing_key_repair::log_entries(&log);
         build_webvh_state(proxy_did, &entries)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
-        let latest: serde_json::Value = serde_json::from_str(
-            entries
-                .last()
-                .context("Gateway DID log has no entries")?,
-        )?;
+        let latest = crate::identity::didwebvh::signing_key_repair::latest_entry(&log)?;
         let state = latest
             .get("state")
             .filter(|state| state.is_object())
@@ -1757,6 +1881,14 @@ impl VCIssuer {
         let mut credentials_list: Vec<serde_json::Value> = Vec::with_capacity(1 + chained_credentials.len());
         credentials_list.push(vc);
         credentials_list.extend(chained_credentials);
+        let proof_purpose = if self
+            .holder_signs_for_authentication(agent_did, &agent_key)
+            .await
+        {
+            ssi::verification_methods::ProofPurpose::Authentication
+        } else {
+            ssi::verification_methods::ProofPurpose::Assertion
+        };
 
         let presentation_creds = Credentials {
             holder_key: Cow::Owned(agent_key),
@@ -1764,6 +1896,7 @@ impl VCIssuer {
             verifiable_credentials: Cow::Owned(credentials_list),
             challenge: challenge.map(Cow::Borrowed),
             domain: domain.map(Cow::Borrowed),
+            proof_purpose,
         };
 
         let vp = self
@@ -1904,6 +2037,8 @@ pub struct VerifiedAgentPresentation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "didwebvh")]
+    use crate::identity::didwebvh::signing_key_repair::{SIGNING_KEY_RELATIONSHIPS, wait_before_next_version};
     use crate::identity::test_helpers::{MockIdentityStore, MockVpChallengeStore};
     use crate::identity::{IdentityStore, VpChallengeStore};
     use serde_json::json;
@@ -3673,7 +3808,7 @@ mod tests {
                     .remove("verificationMethod");
             }),
             ("does not publish", |document| document["verificationMethod"] = json!([])),
-            ("a key other than the gateway signing key", |document| {
+            ("a key other than the signing key", |document| {
                 document["verificationMethod"][1]["type"] = json!("JsonWebKey2020");
             }),
         ];
@@ -3874,7 +4009,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("a key other than the gateway signing key"),
+                .contains("a key other than the signing key"),
             "unexpected error: {err}"
         );
         assert_eq!(document, before);
@@ -5430,6 +5565,329 @@ mod tests {
                 assert_eq!(records[0].usage_count, CALLERS as u64, "round {round}");
             }
             assert_eq!(birth_logs(f.store_dir.path()), ROUNDS, "a discarded DID leaves no birth log");
+        }
+    }
+
+    #[cfg(feature = "didwebvh")]
+    mod agent_did_repair {
+        use super::*;
+        use crate::identity::didwebvh::signing_key_repair::test_support::seed_agent_identity;
+        use crate::identity::didwebvh::signing_key_repair::{lists_signing_key, log_entries};
+        use crate::identity::filesystem::FilesystemIdentityStore;
+        use crate::storage::did_artifacts::read_did_log_raw;
+
+        struct Fixture {
+            issuer: VCIssuer,
+            store: Arc<dyn IdentityStore>,
+            _issuer_dir: tempfile::TempDir,
+            _store_dir: tempfile::TempDir,
+        }
+
+        async fn fixture() -> Fixture {
+            let store_dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                FilesystemIdentityStore::new(store_dir.path())
+                    .await
+                    .unwrap(),
+            ) as Arc<dyn IdentityStore>;
+            let (issuer, issuer_dir) = crate::identity::test_helpers::test_vc_issuer_with(store.clone()).await;
+            Fixture {
+                issuer,
+                store,
+                _issuer_dir: issuer_dir,
+                _store_dir: store_dir,
+            }
+        }
+
+        async fn log_of(
+            f: &Fixture,
+            did: &str,
+        ) -> String {
+            read_did_log_raw(
+                &f.issuer
+                    .agent_did_log_dir(did)
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+
+        async fn store_record(
+            f: &Fixture,
+            did: &str,
+            private_key: Option<&JWK>,
+        ) {
+            let record = serde_json::from_value(json!({
+                "did": did,
+                "identity_hash": format!("hash-{}", uuid::Uuid::new_v4()),
+                "created_at": chrono::Utc::now(),
+                "identity_fields": {},
+                "private_key": private_key,
+            }))
+            .unwrap();
+            f.store
+                .create(record)
+                .await
+                .unwrap();
+        }
+
+        async fn proof_purpose_of_presentation(
+            f: &Fixture,
+            did: &str,
+        ) -> serde_json::Value {
+            let vp = f
+                .issuer
+                .create_agent_identity_presentation(did, &HashMap::new(), None, None)
+                .await
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&vp).unwrap()["proof"]["proofPurpose"].clone()
+        }
+
+        #[tokio::test]
+        async fn every_local_agent_did_gets_its_signing_key_listed_once() {
+            let f = fixture().await;
+            let (listed_for_assertion, key_a) = seed_agent_identity(f.store.as_ref(), true).await;
+            let (without_key_2, key_b) = seed_agent_identity(f.store.as_ref(), false).await;
+            store_record(&f, "did:webvh:QmExternal:example.com:surface:external", None).await;
+            store_record(&f, "did:web:example.com:surface:legacy", Some(&JWK::generate_ed25519().unwrap())).await;
+            store_record(&f, "did:webvh:QmNoLog:example.com:surface:no-log", Some(&JWK::generate_ed25519().unwrap()))
+                .await;
+
+            let mut repaired = f
+                .issuer
+                .repair_agent_dids_while(|| true)
+                .await
+                .repaired;
+
+            repaired.sort();
+            let mut expected = vec![listed_for_assertion.clone(), without_key_2.clone()];
+            expected.sort();
+            assert_eq!(repaired, expected);
+            for (did, key) in [(&listed_for_assertion, &key_a), (&without_key_2, &key_b)] {
+                let log = log_of(&f, did).await;
+                assert_eq!(log_entries(&log).len(), 2, "{did}");
+                assert!(lists_signing_key(&log, did, key), "{did}");
+            }
+            let again = f
+                .issuer
+                .repair_agent_dids_while(|| true)
+                .await;
+            assert!(again.repaired.is_empty(), "a second sweep finds nothing left to do");
+            assert_eq!(again.listed, 2);
+            assert_eq!(log_entries(&log_of(&f, &listed_for_assertion).await).len(), 2);
+        }
+
+        #[tokio::test]
+        async fn the_sweep_keeps_each_agent_identity_record_and_its_key() {
+            let f = fixture().await;
+            let (did, _) = seed_agent_identity(f.store.as_ref(), false).await;
+            let before = f
+                .store
+                .find_by_did(&did)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let sweep = f
+                .issuer
+                .repair_agent_dids_while(|| true)
+                .await;
+
+            assert_eq!(sweep.repaired, vec![did.clone()]);
+            let after = f
+                .store
+                .find_by_did(&did)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.did, before.did);
+            assert_eq!(after.identity_hash, before.identity_hash);
+            assert_eq!(after.private_key, before.private_key);
+            assert_eq!(
+                f.store
+                    .list_all()
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "no identity is created"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_did_several_records_share_is_repaired_and_counted_once() {
+            let f = fixture().await;
+            let (did, key) = seed_agent_identity(f.store.as_ref(), true).await;
+            store_record(&f, &did, None).await;
+            store_record(&f, &did, Some(&key)).await;
+
+            let checked = f
+                .issuer
+                .check_agent_dids()
+                .await;
+            let sweep = f
+                .issuer
+                .repair_agent_dids_while(|| true)
+                .await;
+
+            assert_eq!(checked.unlisted, 1);
+            assert_eq!((sweep.repaired, sweep.listed), (vec![did.clone()], 1));
+            assert_eq!(log_entries(&log_of(&f, &did).await).len(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_log_that_cannot_be_repaired_does_not_stop_the_others() {
+            let f = fixture().await;
+            let (broken, _) = seed_agent_identity(f.store.as_ref(), true).await;
+            let dir = f
+                .issuer
+                .agent_did_log_dir(&broken)
+                .unwrap();
+            let mut entry: serde_json::Value = serde_json::from_str(&log_of(&f, &broken).await).unwrap();
+            entry["state"]["service"] = json!([]);
+            crate::storage::did_artifacts::write_did_log_raw(&dir, &entry.to_string())
+                .await
+                .unwrap();
+            let (healthy, _) = seed_agent_identity(f.store.as_ref(), true).await;
+
+            let sweep = f
+                .issuer
+                .repair_agent_dids_while(|| true)
+                .await;
+
+            assert_eq!(sweep.repaired, vec![healthy]);
+            assert_eq!(sweep.unlisted, 1);
+            assert_eq!(log_entries(&log_of(&f, &broken).await).len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_node_that_is_no_longer_active_writes_nothing() {
+            let f = fixture().await;
+            let (did, _) = seed_agent_identity(f.store.as_ref(), true).await;
+
+            let sweep = f
+                .issuer
+                .repair_agent_dids_while(|| false)
+                .await;
+
+            assert!(sweep.repaired.is_empty());
+            assert_eq!(log_entries(&log_of(&f, &did).await).len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_repaired_agent_keeps_claiming_assertion_method_while_peers_may_cache_its_old_document() {
+            let f = fixture().await;
+            let (did, _) = seed_agent_identity(f.store.as_ref(), true).await;
+            assert_eq!(proof_purpose_of_presentation(&f, &did).await, "assertionMethod");
+
+            f.issuer
+                .repair_agent_dids_while(|| true)
+                .await;
+            f.issuer
+                .authentication_holders
+                .clear();
+
+            assert_eq!(proof_purpose_of_presentation(&f, &did).await, "assertionMethod");
+        }
+
+        #[tokio::test]
+        async fn a_new_agent_did_lists_its_signing_key_under_both_relationships() {
+            let f = fixture().await;
+            let mut fields = HashMap::new();
+            fields.insert("agentIdentity".to_string(), json!({ "softwareInfo": { "name": "new-agent" } }));
+            let did = f
+                .issuer
+                .issue_or_get_credential(fields, None, None, None)
+                .await
+                .unwrap()
+                .did;
+            let record = f
+                .store
+                .find_by_did(&did)
+                .await
+                .unwrap()
+                .unwrap();
+            let key: JWK = serde_json::from_value(record.private_key.unwrap()).unwrap();
+
+            assert!(lists_signing_key(&log_of(&f, &did).await, &did, &key));
+            assert_eq!(proof_purpose_of_presentation(&f, &did).await, "authentication");
+            assert!(
+                f.issuer
+                    .repair_agent_dids_while(|| true)
+                    .await
+                    .repaired
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn checking_the_agent_dids_writes_nothing() {
+            let f = fixture().await;
+            let (did, _) = seed_agent_identity(f.store.as_ref(), true).await;
+
+            let checked = f
+                .issuer
+                .check_agent_dids()
+                .await;
+
+            assert_eq!((checked.listed, checked.unlisted), (0, 1));
+            assert_eq!(log_entries(&log_of(&f, &did).await).len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_holder_whose_log_was_missing_is_read_again_once_its_miss_expires() {
+            let f = fixture().await;
+            let mut fields = HashMap::new();
+            fields.insert("agentIdentity".to_string(), json!({ "softwareInfo": { "name": "late-log" } }));
+            let did = f
+                .issuer
+                .issue_or_get_credential(fields, None, None, None)
+                .await
+                .unwrap()
+                .did;
+            let key: JWK = serde_json::from_value(
+                f.store
+                    .find_by_did(&did)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .private_key
+                    .unwrap(),
+            )
+            .unwrap();
+            let log = f
+                .issuer
+                .agent_did_log_dir(&did)
+                .unwrap()
+                .join("did.jsonl");
+            let moved = log.with_extension("moved");
+            std::fs::rename(&log, &moved).unwrap();
+            assert!(
+                !f.issuer
+                    .holder_signs_for_authentication(&did, &key)
+                    .await
+            );
+            std::fs::rename(&moved, &log).unwrap();
+
+            assert!(
+                !f.issuer
+                    .holder_signs_for_authentication(&did, &key)
+                    .await,
+                "a recent miss is reused"
+            );
+            let expired = std::time::Instant::now()
+                .checked_sub(HOLDER_MISS_TTL + std::time::Duration::from_secs(1))
+                .unwrap();
+            f.issuer
+                .authentication_holders
+                .insert(did.clone(), Some(expired));
+            assert!(
+                f.issuer
+                    .holder_signs_for_authentication(&did, &key)
+                    .await,
+                "an expired miss is read again"
+            );
         }
     }
 }

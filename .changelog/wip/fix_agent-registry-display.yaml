@@ -1,0 +1,41 @@
+branch: fix/agent-registry-display
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-19T15:20:05Z'
+      title: Make the Agents list match the rest of the dashboard's tables
+      description: >-
+        The Agents list mixed text sizes and greys, cut off DIDs, surface names and hosts, and
+        styled a valid state such as No identity like an error. Names are now plain bold dark
+        text, with "Unnamed agent" for a missing or empty name and the endpoint host under it.
+        The Identities column shows a count with every DID in the tooltip, or No identity in
+        muted text. The route is its icon and label as plain text. Not recorded uses the same
+        badge as Recorded. Count badges match the Surfaces page, every value uses the table's
+        normal size, surface names and hosts use the whole column, and the row chevron meets 3:1
+        contrast in the light theme.
+    - timestamp: '2026-11-20T00:00:00Z'
+      title: Use one style on an agent's details page and list its DIDs there
+      description: >-
+        The details page showed "Unnamed agent" in muted italics, styled each tab's headings
+        differently, mixed greys and sizes for secondary text, and showed Agent Card change values
+        in bold. Unnamed agents now look like named ones, every tab shares one heading and one
+        muted text style, and change values use the regular weight. With the DID gone from the
+        Agents list, the Connection tab now lists every DID of the agent with a copy button.
+    - timestamp: '2026-11-20T00:00:00Z'
+      title: Show the same protocol badge on the Agents, Surfaces and template pages
+      description: >-
+        The Agents and Surfaces pages and the template picker each defined their own protocol
+        badge, so they could drift apart. All three now use one shared badge, with DIDComm in
+        green as the template picker showed it. An agent with any other protocol shows it
+        upper-cased, as the Surfaces page does, instead of "Other protocol".
+    - timestamp: '2026-11-19T15:20:05Z'
+      title: Focus Cancel as soon as a delete confirmation opens
+      description: >-
+        A delete confirmation, such as Delete Surface, waited one animation frame to position
+        itself before moving focus to Cancel, so a key pressed right after opening it could go to
+        the page instead. It now positions itself before it is first drawn and focuses Cancel
+        straight away, while still following its button as the page moves.
+  removed: []
+  security: []
+  breaking: []

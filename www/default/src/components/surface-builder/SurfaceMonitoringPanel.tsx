@@ -265,7 +265,7 @@ const SurfaceMonitoringPanel: React.FC<SurfaceMonitoringPanelProps> = ({
           type="button"
           className="btn btn-sm btn-primary ms-auto"
           onClick={() => setCaptureMode(true)}
-          title="Live payload capture for this surface"
+          title="Live payload and policy input capture for this surface"
         >
           <i className="fas fa-eye me-1"></i> Capture
         </button>

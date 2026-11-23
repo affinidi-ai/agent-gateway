@@ -59,6 +59,7 @@ const TARGET_FIELDS = [
   'fabric_target_name',
   'fabric_delegated_credentials',
   'delegated_credentials_for_fabric_callers',
+  'response_auth',
 ] as const;
 
 const SHARED_TRANSIT_FIELDS = [
@@ -220,7 +221,12 @@ export function computeOverridesFromPayload(payload: any): SurfaceOverrides {
   const ap = pickFields(payload?.access_point, ACCESS_POINT_FIELDS);
   if (ap) out.access_point = ap;
   const tg = pickFields(payload?.target, TARGET_FIELDS);
-  if (tg) out.target = tg;
+  // The gateway keeps a variant's stored `response_auth` override that a save leaves out.
+  if (payload?.target?.response_auth === null) {
+    out.target = { ...tg, response_auth: null };
+  } else if (tg) {
+    out.target = tg;
+  }
   const transit = payload?.transit;
   if (transit && typeof transit === 'object') {
     const transitOverride: NonNullable<SurfaceOverrides['transit']> = {};

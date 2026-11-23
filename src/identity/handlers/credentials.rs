@@ -686,12 +686,8 @@ fn channel_did_log_path(
     base_path: &std::path::Path,
     channel_id: &str,
 ) -> Result<std::path::PathBuf, AppError> {
-    crate::storage::validate_storage_id(channel_id)
-        .and_then(|()| {
-            let identity_dir = base_path.join(channel_id);
-            crate::storage::assert_within_storage_dir(base_path, &identity_dir)?;
-            Ok(identity_dir.join("did.jsonl"))
-        })
+    crate::storage::did_artifacts::identity_did_dir(base_path, channel_id)
+        .map(|identity_dir| identity_dir.join("did.jsonl"))
         .map_err(|e| {
             warn!(error = %e, surface_id = %channel_id, "Rejected surface DID log path");
             AppError::BadRequest("Invalid surface id".to_string())
@@ -881,7 +877,6 @@ pub async fn serve_agent_did_document(
     axum::extract::Path(channel_id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::identity::ssi::did_utils::jwk_to_multibase_ed25519;
-    use serde_json::json;
 
     info!("Serving channel DID document for channel ID: {}", channel_id);
 
@@ -957,10 +952,23 @@ pub async fn serve_agent_did_document(
         AppError::InternalError("Failed to convert JWK to multibase".to_string())
     })?;
 
-    // Build DID document following W3C DID Core specification
-    // Include both JsonWebKey2020 (#key-1) and Multikey (#key-2) formats
-    // VP signatures use EdDsaRdfc2022 cryptosuite which expects Multikey format
-    let did_document = json!({
+    let did_document = agent_did_document(&agent_did, public_jwk, &public_key_multibase);
+
+    info!("Successfully generated DID document for agent: {}", agent_did);
+    Ok(Json(did_document))
+}
+
+/// An agent's DID document. The Ed25519 key is published as `#key-1` (JsonWebKey2020) and as the
+/// Multikey `#key-2` its `eddsa-rdfc-2022` presentations reference; both are listed under
+/// `assertionMethod` and `authentication`.
+fn agent_did_document(
+    agent_did: &str,
+    public_jwk: serde_json::Value,
+    public_key_multibase: &str,
+) -> serde_json::Value {
+    let key_1 = format!("{agent_did}#key-1");
+    let key_2 = format!("{agent_did}#key-2");
+    serde_json::json!({
         "@context": [
             "https://www.w3.org/ns/did/v1",
             "https://w3id.org/security/suites/jws-2020/v1",
@@ -969,29 +977,21 @@ pub async fn serve_agent_did_document(
         "id": agent_did,
         "verificationMethod": [
             {
-                "id": format!("{}#key-1", agent_did),
+                "id": key_1,
                 "type": "JsonWebKey2020",
                 "controller": agent_did,
                 "publicKeyJwk": public_jwk
             },
             {
-                "id": format!("{}#key-2", agent_did),
+                "id": key_2,
                 "type": "Multikey",
                 "controller": agent_did,
                 "publicKeyMultibase": public_key_multibase
             }
         ],
-        "authentication": [
-            format!("{}#key-1", agent_did)
-        ],
-        "assertionMethod": [
-            format!("{}#key-1", agent_did),
-            format!("{}#key-2", agent_did)
-        ]
-    });
-
-    info!("Successfully generated DID document for agent: {}", agent_did);
-    Ok(Json(did_document))
+        "authentication": [key_1, key_2],
+        "assertionMethod": [key_1, key_2]
+    })
 }
 
 // ─── did.jsonl serving helpers ────────────────────────────────────────────────
@@ -1144,6 +1144,17 @@ pub async fn serve_surface_did_witness(axum::extract::Path(_surface_id): axum::e
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_did_document_lists_the_signing_key_under_both_relationships() {
+        let did = "did:web:example.com:surface:a";
+
+        let document = super::agent_did_document(did, serde_json::json!({}), "z6Mk");
+
+        for relationship in ["assertionMethod", "authentication"] {
+            assert_eq!(document[relationship], serde_json::json!([format!("{did}#key-1"), format!("{did}#key-2")]));
+        }
+    }
+
     use crate::identity::FilesystemIdentityStore;
     use crate::identity::didwebvh::types::{LogEntry, LogParameters};
     use crate::identity::{

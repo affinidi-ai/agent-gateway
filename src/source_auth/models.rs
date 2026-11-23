@@ -196,7 +196,7 @@ fn default_true() -> bool {
 }
 
 /// How to verify trust in an inbound client certificate.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MtlsTrust {
     /// Accept only these exact certificates, matched by SHA-256

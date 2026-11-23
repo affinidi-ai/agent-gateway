@@ -325,8 +325,8 @@ export function consentLimitSeconds(
 
 /**
  * Whether saving `limitSecs` can end consents already given: a limit shorter than the stored
- * one or set where none was, or the stored one removed, since the gateway's default may then
- * be the shorter. A longer limit never extends a consent, so it ends none.
+ * one or set where none was, or the stored one removed, since the gateway's default or ceiling
+ * may then be the shorter. A longer limit never extends a consent, so it ends none.
  */
 export function shortensConsentLimit(
   limitSecs: number | null,
@@ -379,6 +379,12 @@ export function externalProviderUpdate(form: {
       .filter(Boolean),
     token_refresh_enabled: form.token_refresh_enabled,
   };
+}
+
+/** The page title: a user without the edit permission views, anyone else adds or edits. */
+export function providerPageTitle(readOnly: boolean, isNew: boolean): string {
+  if (readOnly) return 'Credential Provider';
+  return isNew ? 'New Credential Provider' : 'Edit Credential Provider';
 }
 
 /** Whether `host` is an https address, the only kind the gateway takes in a callback URL. */

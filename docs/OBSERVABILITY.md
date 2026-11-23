@@ -9,8 +9,13 @@ for the checked-out source revision.
 
 [`WsState`](../src/server/websocket.rs) wraps a Tokio broadcast sender. Each connected dashboard
 WebSocket subscribes independently after any configured authentication check; a slow receiver that
-lags is disconnected rather than blocking producers. `websocket_broadcast_buffer` controls the
-channel capacity and defaults to `500`.
+lags skips the updates it missed and keeps reading rather than blocking producers. At its next
+keep-alive it is sent one `{"type": "refresh_dashboard"}`, however often it lagged since the last
+one, so the page reloads its dashboard stats; missed log lines and payload captures are not
+recovered. A connection
+whose client has not read a message within 10 seconds is closed, so a client that stops reading
+cannot hold back the keep-alive access checks.
+`websocket_broadcast_buffer` controls the channel capacity and defaults to `500`.
 
 `WsUpdate` currently defines these event shapes:
 
@@ -25,6 +30,7 @@ channel capacity and defaults to `500`.
 | `OnboardingAttempt` | Defined for wire compatibility but not emitted; onboarding uses `PayloadCaptured`. |
 | `RefreshDashboard` | Requests a complete dashboard refetch after settings updates, policy-definition create/update/delete, or Trust Registry connection-state changes. |
 | `DashboardDelta` | Carries a pre-serialized periodic dashboard delta in `Arc<String>`. |
+| `PolicyInputCaptured` | Emitted after each request and response policy evaluation on a surface that a dashboard connection listens to; MCP tool policies are not captured. It never goes through the broadcast: it is serialized once and queued only for the listening connections. Carries the input with credentials masked, the policies the slot ran and the decision (see [`POLICY.md`](POLICY.md#policy-input-capture)). |
 
 Configuration reload does **not** emit `RefreshDashboard`. A dashboard observes reloaded state
 through periodic `DashboardDelta` broadcasts or an explicit refetch.
@@ -61,8 +67,23 @@ of dashboard sections included in subsequent `DashboardDelta` events. A connecti
 has ended, or whose user lacks `logs.view` or is not Approved, also loses the `logs` section and
 every `LogEntry` update; it checks the session and the user's role and status on connect and on
 each keep-alive ping, and an unauthenticated connection never gets log lines. The two dashboard
-routes that return log lines give them only to an appliance-wide caller (see [`RBAC.md`](RBAC.md#dashboard-log-lines)). Any broadcast
-receive error, including lag, ends the connection; socket closure does likewise.
+routes that return log lines give them only to an appliance-wide caller (see [`RBAC.md`](RBAC.md#dashboard-log-lines)).
+
+A connection listens to a surface's policy input with a `capture_policy_input` command and stops
+with `stop_capturing_policy_input`, each naming the `surface_id`; the gateway answers each with a
+`policy_input_capture` message saying whether the connection now listens, and why not when it
+refuses. Listening needs the `policy_input_capture` feature flag on and a session whose user holds
+`surfaces.edit` and `policies.edit`. The flag and the permissions are checked again on each
+keep-alive ping, and a connection that loses either stops listening to every surface and is told
+so, and the captures still queued for it are dropped. Each
+listening connection has its own queue of at most 64 `PolicyInputCaptured` updates; a capture that
+finds it full is dropped for that connection only, so a busy listened surface never reaches the
+broadcast or another connection. The connection is told how many it missed with a
+`{"type": "policy_input_skipped", "config_id", "skipped"}` message queued before its next capture. At most 32 answers wait to be sent before the connection stops
+reading the client's commands, and closing the connection ends its listening (see
+[`POLICY.md`](POLICY.md#policy-input-capture)). A connection that falls more than
+`websocket_broadcast_buffer` broadcast updates behind skips the ones it missed, keeps reading and
+is sent `refresh_dashboard` at its next keep-alive; only a closed broadcast channel or socket ends it.
 
 `DashboardDelta` is already serialized before broadcast and held in `Arc<String>`, reducing clone
 cost across subscribers. Other variants are serialized per connection.
@@ -384,6 +405,23 @@ The values are the preview's wire spellings, empty when absent. The event never 
 a credential, a secret or provider id, or card content. A preview records no connection, gateway
 fault, rejected request or Trust Recorder write, so it leaves the dashboard metrics as they were.
 
+## Proof purpose metric
+
+`agent_gateway_proof_purpose_mismatch_total{role,reason}` is a Prometheus counter incremented
+once for each presentation rejected because a proof fails the proof purpose check. `reason` says why:
+`purpose_not_allowed` (a credential declares anything but `assertionMethod`, a presentation
+anything but `assertionMethod` or `authentication`), `not_listed` (the signer's DID document does
+not list the key under the declared purpose) or `unresolvable` (the signer's DID document could not
+be read to check; the reason is logged as a `WARN`). `role` is `vp` for the presentation proof and
+`vc` for a credential proof. Each rejection is also logged as a `WARN` naming the proof key and the
+signer DID. A proof whose signature does not verify is refused before this check and is not
+counted, except when the gateway dropped the signer's cached document to fetch it again (see
+[Peer issuer DIDs](FABRIC.md#peer-issuer-dids)) and could not: that refusal is counted as
+`unresolvable`. A
+`not_listed` increase usually means a peer or agent DID that lists its signing key under the wrong
+relationship; an `unresolvable` one, a DID host the gateway cannot reach. See
+[Peer issuer DIDs](FABRIC.md#peer-issuer-dids).
+
 ## Credential policy report
 
 At startup and on every configuration reload (including the reload that follows a surface
@@ -499,6 +537,14 @@ nor removes by age. So how long these events are kept is the deployment's log re
 gateway's: ship the log, or export the `credential_delegation` target over OTLP
 ([`opentelemetry.logs.targets`](CONFIGURATION_REFERENCE.md#metricsjson)), where they are
 needed for longer.
+
+One line is written for every delegated call, so on a busy gateway these events are most of
+what the log grows by. A deployment that does not want them sets
+`[logging] delegation_events = false` in `config.toml`, which is read at startup: the gateway
+then writes none of the ten events anywhere, not to stderr, the log file or OTLP. The audited
+delegation events are unaffected, and so are the other lines of the `credential_delegation`
+target, its warnings among them. A gateway started this way says so: its startup configuration
+line reads `delegation_events=off`, and a `WARN` follows it.
 
 A selection made before may still name one of these events, and the name selects nothing: the gateway drops it from the stored `audit_events` when it loads its settings
 and from any `audit_events` or event set it is asked to save, where any other unknown name is
@@ -796,6 +842,15 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     pass 8 Fabric crossings, recorded against its surface with the call's trace id, and on Fabric
     receive `transit_token_unavailable` (the peer is answered `503`): the managed agent should
     get a transit token for the request and it could not be issued.
+    `target_response_auth_failed` (`502`, with `rpc_error_code` `-32603` for a JSON-RPC
+    request): the Target's response failed the surface's Response authentication
+    (`target.response_auth`), or the request could not be checked and was not sent, so it was
+    refused before anything used it. Recorded on the Access Point's direct forward and its
+    Legacy SSE fallback, on Fabric receive (`via_fabric` set) and on the served agent card
+    route; the card preview, the policy card read and MCP tool discovery record nothing.
+    The record names no key, and the cause (`key_missing`, `key_mismatch`, `server_untrusted`
+    when the server certificate failed the mTLS trust, or `unverifiable`) is only logged; see
+    [`SOURCE_AUTH.md`](SOURCE_AUTH.md#response-authentication).
     `target_auth_failed`: the Target credential (`target.auth`, or a Transit Point's
     `target_auth`) was not sent, because it could not be obtained (a secret or provider that
     cannot be read, a token request that failed), a `[credential_policy]` rule in `enforce`
@@ -985,6 +1040,25 @@ for when a save changes a pin.
   carries `surface_id` and `channel_name`. A save that leaves the list as it was, a new surface
   without origins, and the load-time normalisation of a stored surface record none. Each is also
   logged at info.
+
+**Policy input capture events.** Raised by the dashboard WebSocket when a user starts or stops
+listening to a surface's policy input (group Policies); see
+[`POLICY.md`](POLICY.md#policy-input-capture).
+
+- `policy_input_capture_started`: a user started listening to a surface's policy input. `actor`
+  names the user, and the top level carries `surface_id`. A refused listen records nothing.
+- `policy_input_capture_stopped`: a listen ended. `reason` is `stopped` (the user stopped it),
+  `connection_closed` (the dashboard connection closed), `session_ended` (the session is no
+  longer live: it expired or was signed out, or the user's role or status changed, which ends
+  their sessions), `permission_missing` (an RBAC configuration change removed
+  `surfaces.edit` or `policies.edit` from the user's role) or `turned_off` (the
+  `policy_input_capture` feature flag was turned off), the last three found at a keep-alive check.
+  `actor` and `surface_id` are as on the start.
+
+Each is recorded wherever the other is selected, whether or not it is selected itself
+(`RECEIVED_WITH` in `src/audit/catalog.rs`), so a sink that selects either holds both for every
+listen that ends while the gateway runs. A gateway restart or crash can end a listen without a
+stop record. Each is also logged at info.
 
 A `2026-07-28` MCP proxy tool call whose path parameter makes a URL segment `.` or `..` (or an ambiguous one above a non-root `base_url` path) is answered `400` with `-32602` "Invalid tool arguments" before anything is sent, and writes no request event.
 

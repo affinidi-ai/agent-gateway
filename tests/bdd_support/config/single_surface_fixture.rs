@@ -126,6 +126,12 @@ pub struct SurfaceConfigBuilder {
     pub max_consent_age_ceiling_secs: Option<u64>,
     /// The gateway logs warnings and keeps its log for the scenario to read.
     pub keeps_gateway_log: bool,
+    /// `[logging] delegation_events = false`: the gateway writes no per-call delegation event
+    /// to its log.
+    pub logs_no_delegation_events: bool,
+    /// The delegation vault holds, before the gateway starts, a consent to the surface's OAuth
+    /// provider given this many seconds ago, with no end stored.
+    pub stored_consent_age_secs: Option<i64>,
     /// The gateway writes its log files to `_storage/logs`, the directory the log routes act on.
     pub writes_log_directory: bool,
     /// The gateway serves a dashboard build from `www/` at `/`, falling back to its
@@ -151,8 +157,13 @@ pub struct SurfaceConfigBuilder {
     pub streams_sign_in_records: bool,
     /// Console users sign in with SAML rather than passkeys.
     pub signs_in_with_saml: bool,
+    /// `rbac.json` permissions the gateway starts with, feature name to required role,
+    /// on top of the defaults.
+    pub rbac_permissions: Vec<(String, String)>,
     /// The surface's `caller_key`, and the secret it names when that is stored.
     pub caller_key: Option<CallerKeyFixture>,
+    /// The surface's `target.response_auth` by API key, and the secret it names.
+    pub response_auth: Option<ResponseAuthFixture>,
 }
 
 /// A surface's `caller_key`: the secret its keys are derived from, stored with `secret_value`
@@ -162,6 +173,22 @@ pub struct CallerKeyFixture {
     pub secret_id: String,
     pub secret_value: Option<String>,
     pub header: Option<String>,
+}
+
+/// A surface's Target answers with a key of secret `secret_id`, stored with `secret_value`, in
+/// header `header_name`.
+#[derive(Debug, Clone)]
+pub struct ResponseAuthFixture {
+    pub secret_id: String,
+    pub secret_value: String,
+    pub header_name: String,
+}
+
+impl ResponseAuthFixture {
+    /// The surface's `target.response_auth`.
+    pub fn setting(&self) -> serde_json::Value {
+        serde_json::json!({ "api_key": { "header_name": self.header_name, "secret_id": self.secret_id } })
+    }
 }
 
 /// Where the gateway sends a person to sign in at the callers' identity provider, and
@@ -297,6 +324,8 @@ impl Default for SurfaceConfigBuilder {
             default_max_consent_age_secs: None,
             max_consent_age_ceiling_secs: None,
             keeps_gateway_log: false,
+            logs_no_delegation_events: false,
+            stored_consent_age_secs: None,
             writes_log_directory: false,
             serves_dashboard: false,
             gateway_prefixes: Vec::new(),
@@ -309,7 +338,9 @@ impl Default for SurfaceConfigBuilder {
             sign_in_event_stream: None,
             streams_sign_in_records: false,
             signs_in_with_saml: false,
+            rbac_permissions: Vec::new(),
             caller_key: None,
+            response_auth: None,
         }
     }
 }
