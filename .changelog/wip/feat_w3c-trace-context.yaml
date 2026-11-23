@@ -40,6 +40,13 @@ changes:
         the caller's own traceparent or appends its X-Gateway-Trace-Id beside the caller's. The
         caller's tracestate goes on only when the caller's traceparent is continued. A Target
         bound by external consent still receives X-Gateway-Trace-Id alone.
+    - timestamp: '2026-11-23T16:00:00Z'
+      title: Pay under the request's own traceparent
+      description: >-
+        The agent-pay payment call of an Access Point request now carries the traceparent the
+        request is forwarded with: the Access Point's span, sampled only when the caller's
+        continued trace was. It carried a fresh span, always sampled. A payment made by a
+        gateway that received the request over the Fabric is unchanged.
   fixed: []
   removed: []
   security:

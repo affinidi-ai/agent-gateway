@@ -3188,7 +3188,13 @@ async fn exchange(
         }
     }
     let egress_trace_id = hop.call.onward.trace_id();
-    let traceparent = traceparent(egress_trace_id);
+    // An Access Point request pays under the `traceparent` it is forwarded
+    // with; a Fabric receive, which has no span of its own, continues the
+    // trace id it was sent under a fresh span.
+    let traceparent = match hop.call.onward {
+        crate::proxy::trace::PaymentTrace::Onward(trace) => trace.traceparent(crate::proxy::trace::SpanExport::Off),
+        crate::proxy::trace::PaymentTrace::Received(trace_id) => traceparent(trace_id),
+    };
     let intake = hop.intake;
     let wire = GateWireRequest {
         fabric_target,
@@ -5888,6 +5894,33 @@ pub(crate) mod tests {
         assert_eq!((parts[0], parts[1], parts[3]), ("00", hashed.as_str(), "01"), "{traceparent}");
         assert_eq!(parts[2].len(), 16, "{traceparent}");
         assert_eq!(sent.trace_id, "trace-from-the-peer");
+        assert_eq!(sent.payment_context["correlation"]["trace_context"], sent.headers["traceparent"]);
+    }
+
+    /// An Access Point pays under the request's onward trace: the payment call
+    /// carries the `traceparent` the request is forwarded with, naming the
+    /// Access Point's span and the flags the caller's trace had.
+    #[tokio::test]
+    async fn an_access_point_payment_call_carries_the_requests_onward_traceparent() {
+        let gate = paid_gate();
+        install_test_transport("gw-onward", gate.clone());
+        let surface = mcp_surface("gw-onward", json!({"require_all": true}));
+        let fabric = no_fabric();
+        let intake = read(&surface, &x402_headers(&unique("proof")), &tool_call("t", json!({})));
+        let request = crate::proxy::trace::RequestTrace::from_headers(
+            &["00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00"],
+            &[],
+            crate::proxy::trace::SpanId::parse("1111111111111111").unwrap(),
+        )
+        .0;
+        let onward = request.outgoing();
+        let access_point = GateCall {
+            onward: crate::proxy::trace::PaymentTrace::Onward(&onward),
+            ..call(&surface, &fabric)
+        };
+        assert!(matches!(charge(&intake, access_point).await, GateOutcome::Paid(_)));
+        let sent = gate.last();
+        assert_eq!(sent.headers["traceparent"], "00-0af7651916cd43dd8448eb211c80319c-1111111111111111-00");
         assert_eq!(sent.payment_context["correlation"]["trace_context"], sent.headers["traceparent"]);
     }
 
