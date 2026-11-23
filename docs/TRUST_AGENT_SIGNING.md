@@ -104,8 +104,11 @@ oracle. A scope nobody chose a trust agent for issues under the gateway-wide sig
 | Agents that already exist | Unchanged: they keep their gateway-held keys, since moving them would change their DIDs |
 | TLS, SAML, x402 and DIDComm keys | Unchanged; `vta::key_surfaces` computes which keys stay local and why |
 
-`GET /v1/key-management/inventory` lists, per record, which keys still live on the gateway's disk.
-The dashboard shows it on Secrets → Key Management.
+`GET /v1/key-management/inventory` lists, per kind of key, which stay on the gateway's disk and why
+(`key_surfaces`), with `migrated` set when one answer holds for the whole deployment. For agent
+holder keys it is `null`: the answer differs per agent and the inventory does not list agents, so
+it does not say which existing agents still keep their key on this disk. The dashboard shows it on
+Secrets → Key Management.
 
 ## Issuer DIDs
 

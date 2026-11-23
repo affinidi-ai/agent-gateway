@@ -119,7 +119,7 @@ changes:
         Secrets has a Key Management tab, and GET /v1/key-management/inventory
         the same data, listing each trust agent connection's keys, which backend,
         context and key each surface the user may see signs with, contexts no
-        surface claims any more, and which keys still live on the gateway's disk. Users
+        surface claims any more, and which kinds of key stay on the gateway's disk and why. Users
         with key management rights can provision a connection's signing key and
         rotate to a new one, keeping the old one published.
     - timestamp: '2026-11-16T12:20:00Z'
