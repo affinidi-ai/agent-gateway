@@ -2861,20 +2861,19 @@ async fn transit_request_headers(
     Ok(headers)
 }
 
-/// The trace headers the Transit Point sends its target, by the class of its
-/// target ([`crate::proxy::trace::TargetClass::of_transit_target`]): the
-/// request's trace toward a `fabric://` target, none toward any other.
+/// The trace headers the Transit Point sends its target
+/// ([`crate::proxy::trace::OutgoingTrace::transit_headers`]): the request's
+/// trace in a Fabric message toward a `fabric://` target, none toward any
+/// other.
 fn transit_trace_headers(ctx: &OutboundPipelineContext) -> Vec<(&'static str, String)> {
     ctx.trace
         .as_ref()
         .map(|trace| {
             trace
                 .outgoing()
-                .headers_toward(
-                    crate::proxy::trace::TargetClass::of_transit_target(
-                        &ctx.virtual_channel
-                            .target_endpoint,
-                    ),
+                .transit_headers(
+                    &ctx.virtual_channel
+                        .target_endpoint,
                     crate::proxy::trace::SpanExport::Off,
                     &ctx.original_headers,
                 )
@@ -10812,9 +10811,10 @@ mod tests {
     }
 
     /// A Transit Point request over the Fabric continues the trace of its
-    /// verified transit token: the Fabric message names it, and so do the
-    /// `traceparent` and `X-Gateway-Trace-Id` it carries, with the managed
-    /// agent's `tracestate`.
+    /// verified transit token: the Fabric message names it, and so does the
+    /// `traceparent` it carries, with the managed agent's `tracestate`. It
+    /// carries no `X-Gateway-Trace-Id`: the receiving gateway writes that one
+    /// from the message's trace id.
     #[tokio::test]
     async fn a_transit_point_request_over_the_fabric_continues_its_trace() {
         let (state, issuer) = traced_transit_state(true);
@@ -10848,10 +10848,9 @@ mod tests {
             "{sent:?}"
         );
         assert_eq!(
-            sent.get("X-GATEWAY-TRACE-ID")
-                .map(String::as_str),
-            Some(TOKEN_TRACE_ID),
-            "{sent:?}"
+            sent.get("X-GATEWAY-TRACE-ID"),
+            None,
+            "the receiving gateway writes X-Gateway-Trace-Id from the message's trace id"
         );
         assert_eq!(
             sent.get("TRACESTATE")

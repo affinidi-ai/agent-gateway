@@ -61,9 +61,10 @@ changes:
       title: Send a Transit Point's target its trace by the target's class
       description: >-
         A Transit Point no longer passes the managed agent's traceparent, tracestate and
-        X-Gateway-Trace-Id on. A fabric:// target receives the Transit Point's own traceparent and
-        X-Gateway-Trace-Id of the request's trace, with tracestate only when the agent's
-        traceparent was continued, and an MCP body's params._meta traceparent is replaced by it.
+        X-Gateway-Trace-Id on. A fabric:// target's gateway receives the Transit Point's own
+        traceparent of the request's trace, with tracestate only when the agent's traceparent was
+        continued, and the trace id in the Fabric message, from which it writes X-Gateway-Trace-Id
+        for its Managed Agent; an MCP body's params._meta traceparent is replaced by the one sent.
         Any other target, a third party, receives no trace header, and traceparent and tracestate
         are removed from an MCP body's params._meta, so a vendor never learns the trace.
   fixed: []

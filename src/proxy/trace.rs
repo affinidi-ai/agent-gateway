@@ -450,7 +450,7 @@ impl OutgoingTrace {
         let mut headers = vec![
             ("traceparent", self.traceparent(export)),
             (
-                "x-gateway-trace-id",
+                X_GATEWAY_TRACE_ID,
                 self.trace_id
                     .as_str()
                     .to_string(),
@@ -461,7 +461,64 @@ impl OutgoingTrace {
         }
         headers
     }
+
+    /// The trace headers a request that arrived with `received` headers is
+    /// sent with toward a target of `class`, each once: [`Self::headers`]
+    /// toward a Fabric target, the trace id in `X-Gateway-Trace-Id` alone
+    /// toward a Target bound by external consent, and none toward a third
+    /// party.
+    pub fn headers_toward(
+        &self,
+        class: TargetClass,
+        export: SpanExport,
+        received: &axum::http::HeaderMap,
+    ) -> Vec<(&'static str, String)> {
+        match class {
+            TargetClass::Fabric => self.headers(export, received_tracestate(received).as_deref()),
+            TargetClass::ExternalConsent => vec![(
+                X_GATEWAY_TRACE_ID,
+                self.trace_id
+                    .as_str()
+                    .to_string(),
+            )],
+            TargetClass::ThirdParty => Vec::new(),
+        }
+    }
+
+    /// The trace headers a Fabric message carries: those toward a Fabric
+    /// target but `X-Gateway-Trace-Id`. The message names the trace id itself,
+    /// and the receiving gateway writes `X-Gateway-Trace-Id` from it, so its
+    /// Managed Agent receives that header once.
+    pub fn fabric_message_headers(
+        &self,
+        export: SpanExport,
+        received: &axum::http::HeaderMap,
+    ) -> Vec<(&'static str, String)> {
+        self.headers_toward(TargetClass::Fabric, export, received)
+            .into_iter()
+            .filter(|(name, _)| *name != X_GATEWAY_TRACE_ID)
+            .collect()
+    }
+
+    /// The trace headers a Transit Point sends its target at `endpoint`: a
+    /// `fabric://` target is reached by a Fabric message
+    /// ([`Self::fabric_message_headers`]), every other target is a third party
+    /// ([`Self::headers_toward`]).
+    pub fn transit_headers(
+        &self,
+        endpoint: &str,
+        export: SpanExport,
+        received: &axum::http::HeaderMap,
+    ) -> Vec<(&'static str, String)> {
+        match TargetClass::of_transit_target(endpoint) {
+            TargetClass::Fabric => self.fabric_message_headers(export, received),
+            class => self.headers_toward(class, export, received),
+        }
+    }
 }
+
+/// The header that names a request's trace id.
+const X_GATEWAY_TRACE_ID: &str = "x-gateway-trace-id";
 
 /// The class of the target a request is sent to, by the route it takes, which
 /// decides the trace it is sent.
@@ -484,31 +541,6 @@ impl TargetClass {
             Self::Fabric
         } else {
             Self::ThirdParty
-        }
-    }
-}
-
-impl OutgoingTrace {
-    /// The trace headers a request that arrived with `received` headers is
-    /// sent with toward a target of `class`, each once: [`Self::headers`]
-    /// toward a Fabric target, the trace id in `X-Gateway-Trace-Id` alone
-    /// toward a Target bound by external consent, and none toward a third
-    /// party.
-    pub fn headers_toward(
-        &self,
-        class: TargetClass,
-        export: SpanExport,
-        received: &axum::http::HeaderMap,
-    ) -> Vec<(&'static str, String)> {
-        match class {
-            TargetClass::Fabric => self.headers(export, received_tracestate(received).as_deref()),
-            TargetClass::ExternalConsent => vec![(
-                "x-gateway-trace-id",
-                self.trace_id
-                    .as_str()
-                    .to_string(),
-            )],
-            TargetClass::ThirdParty => Vec::new(),
         }
     }
 }
@@ -1114,10 +1146,26 @@ mod tests {
             );
             assert_eq!(disagreement, None, "{name}");
             assert_eq!(expected["warning"], Value::Null, "{name}");
-            let headers = trace
-                .outgoing()
-                .headers_toward(class_of(input), SpanExport::Off, &received_headers(input));
-            assert_eq!(sent(&headers), expected["sent"], "{name}");
+            let outgoing = trace.outgoing();
+            let sent = match class_of(input) {
+                TargetClass::Fabric => {
+                    let carried = outgoing.transit_headers(
+                        "fabric://peer-gateway/peer-surface",
+                        SpanExport::Off,
+                        &received_headers(input),
+                    );
+                    let mut sent = sent(&carried);
+                    assert_eq!(sent["x_gateway_trace_id"], Value::Null, "{name}: the message carries no header");
+                    sent["x_gateway_trace_id"] = json!(outgoing.trace_id().as_str());
+                    sent
+                }
+                _ => sent(&outgoing.transit_headers(
+                    "https://tools.example/mcp",
+                    SpanExport::Off,
+                    &received_headers(input),
+                )),
+            };
+            assert_eq!(sent, expected["sent"], "{name}");
         }
         assert_eq!(refused, REFUSED_AT_THE_TRANSIT_POINT);
     }

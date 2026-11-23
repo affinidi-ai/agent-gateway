@@ -370,9 +370,11 @@ last time, so the records a Transit Point writes before that (a refused caller, 
 refused body) carry the request's `span_id` and no `trace_id`.
 
 What a Transit Point sends its target follows the target's class, never the managed agent's own
-trace headers. A `fabric://` target is a Fabric target: it is sent exactly one `traceparent`,
-naming the trace and the Transit Point's span, one `X-Gateway-Trace-Id` with the trace id, and the
-agent's `tracestate` only when the agent's `traceparent` was continued; a `traceparent` in an MCP
+trace headers. A `fabric://` target is a Fabric target: its gateway receives exactly one
+`traceparent`, naming the trace and the Transit Point's span, and the agent's `tracestate` only
+when the agent's `traceparent` was continued, and the trace id in the Fabric message itself, from
+which it writes `X-Gateway-Trace-Id` for its Managed Agent (the message carries no
+`X-Gateway-Trace-Id` header, so that agent receives one); a `traceparent` in an MCP
 request's `params._meta` is replaced by the one sent in the header, and none is added. Every other
 target, an `http`, `https` or `proxy://` one, is a third party: it is sent no `traceparent`,
 `tracestate` or `X-Gateway-Trace-Id`, and `traceparent` and `tracestate` are removed from an MCP
