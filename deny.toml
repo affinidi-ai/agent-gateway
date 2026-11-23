@@ -130,5 +130,3 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# vta-signing, pinned by commit in Cargo.toml until it is published.
-allow-git = ["https://github.com/OpenVTC/verifiable-trust-infrastructure"]

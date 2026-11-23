@@ -120,8 +120,7 @@ sha256 = "1.6"
 hmac = "0.12"
 hex = "0.4"
 zeroize = { version = "1.8", features = ["derive"] }
-# Not on crates.io yet: pinned to the upstream main commit that added the crate.
-vta-signing = { git = "https://github.com/OpenVTC/verifiable-trust-infrastructure", rev = "672428d9729d46b118128311f8baa024b1fc5ed5" }
+vta-signing = "0.1"
 affinidi-did-resolver-cache-sdk = { version = "0.8.57", features = [
     "agent-names",
 ] }

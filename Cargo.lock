@@ -16012,7 +16012,8 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 [[package]]
 name = "vta-signing"
 version = "0.1.0"
-source = "git+https://github.com/OpenVTC/verifiable-trust-infrastructure?rev=672428d9729d46b118128311f8baa024b1fc5ed5#672428d9729d46b118128311f8baa024b1fc5ed5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97cb0d61ce4e3c329660514335c2d50277e94f8d616ef36e6b7c2be560868096"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek 3.0.0",
