@@ -12,6 +12,11 @@
  * UI. `error` severity should block save; `warning` should inform.
  */
 
+import {
+  getCachedRoutingConfig,
+  listenPathProblem,
+  type RoutingConfig,
+} from './access-point/defaults';
 import { registry } from './registry';
 import { targetAuthBreaches } from './targetAuthRules';
 
@@ -40,6 +45,12 @@ export interface ValidateSurfaceOptions {
    * already had it.
    */
   stored?: unknown;
+  /**
+   * The routing config the Listen Path rules are read against. Defaults to the cached one,
+   * which `SurfaceFormShell` warms; `null` while it has not loaded, and then no Listen Path
+   * is judged, so a slow fetch never blocks a save.
+   */
+  routing?: RoutingConfig | null;
 }
 
 /**
@@ -178,7 +189,62 @@ export function validateSurfacePayload(
     }
   }
 
+  // What the stored surface's Transit Points already claim, so a save that keeps a
+  // claim is told apart from one that introduces or changes it. Empty on a create.
+  const storedPoints: any[] = Array.isArray((options.stored as any)?.transit?.points)
+    ? (options.stored as any).transit.points
+    : [];
+
+  // A Listen Path the gateway will not serve, refused here before the round trip, and
+  // only when this save introduces or changes it. That is what the admin API refuses:
+  // the same point keeping the same path is exempt, so a surface stored with such a
+  // path stays editable and its save is answered with a `Warning` header instead.
+  // Variant overrides are left to the gateway's own refusal.
+  const routing = options.routing === undefined ? getCachedRoutingConfig() : options.routing;
+  if (routing) {
+    tps.forEach((tp, idx) => {
+      const path = typeof tp?.listen_path === 'string' ? tp.listen_path.trim() : '';
+      if (!path) return;
+      const alias = typeof tp?.alias === 'string' ? tp.alias : '';
+      const before = storedPoints.find(
+        stored => (alias && stored?.alias === alias) || (tp?.id && stored?.id === tp.id)
+      );
+      const kept = typeof before?.listen_path === 'string' ? before.listen_path.trim() : '';
+      if (kept === path) return;
+      const problem = listenPathProblem(tp, routing);
+      if (problem) {
+        issues.push({
+          severity: 'error',
+          message: problem,
+          path: `transit.points.${idx}.listen_path`,
+        });
+      }
+    });
+  }
+
   if (options.stored !== undefined) {
+    // A Transit Point that loses its stored `listen_path` stops answering there and
+    // falls back to the route the gateway derives from its alias. Clearing the field
+    // is the only way to ask for that, so this informs rather than blocks: what the
+    // save gate refuses is a path the gateway would not serve (`listenPathProblem`),
+    // not the absence of one.
+    for (const stored of storedPoints) {
+      const was = typeof stored?.listen_path === 'string' ? stored.listen_path.trim() : '';
+      if (!was) continue;
+      const alias = typeof stored?.alias === 'string' ? stored.alias : '';
+      const now = tps.find(
+        tp => (alias && tp?.alias === alias) || (stored?.id && tp?.id === stored.id)
+      );
+      // The point itself being gone is a removal the operator can see on the canvas.
+      if (!now) continue;
+      const kept = typeof now.listen_path === 'string' ? now.listen_path.trim() : '';
+      if (kept) continue;
+      issues.push({
+        severity: 'warning',
+        message: `Transit point "${alias}" no longer has a Listen Path, so "${was}" stops answering and callers reach it at its derived /outbound route.`,
+        path: 'transit.points',
+      });
+    }
     for (const { rule, message, nodeId } of targetAuthBreaches(payload, options.stored)) {
       issues.push({
         severity: rule === 'callers' ? 'warning' : 'error',

@@ -546,6 +546,19 @@ pub struct ChannelRoutingConfigResponse {
     /// The TP panel uses count comparison with `available_listen_addresses` (which
     /// now only contains inbound URLs) to detect shared-domain addresses.
     pub available_outbound_listen_addresses: Vec<String>,
+    /// Every entry of `available_outbound_listen_addresses` whose listener
+    /// shares a hostname with an inbound listener, so that the inbound listener
+    /// forwards the outbound prefix and nothing else and a `listen_path`
+    /// outside it is refused with `listen_path_not_served`.
+    ///
+    /// The save gate answers this question per Transit Point with the same
+    /// function, so a client that offers the `/outbound` prefixes for exactly
+    /// these addresses offers what a save accepts. It cannot be derived from
+    /// the two address lists: a listener answers on every one of its
+    /// `external_urls`, so an alias URL that appears in no inbound list is
+    /// still its listener's, and the same hostname on another port is the same
+    /// hostname.
+    pub shared_hostname_outbound_addresses: Vec<String>,
     /// The prefixes a Transit Point's `listen_path` sits under to be reachable
     /// from every address in `available_outbound_listen_addresses`: each entry
     /// of `channel_path_prefix` under the gateway's outbound prefix, and so the
@@ -623,6 +636,13 @@ pub async fn get_surface_routing_config(
     let config = ChannelRoutingConfigResponse {
         available_listen_addresses: network_config.get_inbound_external_urls(),
         available_outbound_listen_addresses: network_config.get_outbound_external_urls(),
+        shared_hostname_outbound_addresses: network_config
+            .get_outbound_external_urls()
+            .into_iter()
+            .filter(|address| {
+                crate::proxy::server::outbound_address_shares_an_inbound_hostname(&network_config, Some(address))
+            })
+            .collect(),
         outbound_channel_path_prefix: outbound_prefixes(network_config.get_channel_prefix_configs()),
         channel_path_prefix: served_prefixes(network_config.get_channel_prefix_configs()),
         mcp_proxy_path_prefix: served_prefixes(

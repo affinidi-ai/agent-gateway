@@ -4,6 +4,7 @@ import {
   computeSharedOutboundAddresses,
   fetchRoutingConfig,
   meaningfulListenerAddresses,
+  offeredChannelPrefixes,
   shouldHideListenerPicker,
   type RoutingConfig,
 } from '../access-point/defaults';
@@ -201,19 +202,13 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
 
   const isSharedDomain = selectedHostPort ? sharedOutboundAddresses.has(selectedHostPort) : false;
 
-  const channelPrefixes = useMemo(() => {
-    if (!routingConfig) return [];
-    if (addressSource !== 'outbound') return routingConfig.channel_path_prefix;
-    const plain = routingConfig.channel_path_prefix;
-    const outbound = plain.map(c => ({
-      id: `outbound-${c.id}`,
-      name: `outbound \u2192 ${c.name}`,
-      prefix: `${OUTBOUND}${c.prefix.replace(/\/$/, '')}`,
-    }));
-    // On a shared-domain address the inbound pipeline owns all non-/outbound paths,
-    // so only the /outbound/… prefixes are reachable via the outbound pipeline.
-    return isSharedDomain ? outbound : plain;
-  }, [routingConfig, addressSource, isSharedDomain]);
+  // The one implementation of which prefixes are on offer here, shared with the save
+  // gate (`listenPathProblem`), so the picker cannot offer a path the gateway refuses.
+  const channelPrefixes = useMemo(
+    () =>
+      routingConfig ? offeredChannelPrefixes(routingConfig, addressSource, selectedHostPort) : [],
+    [routingConfig, addressSource, selectedHostPort]
+  );
 
   const composedRoute: string = config[routeFieldName] || '';
 
@@ -327,7 +322,14 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
   // so a new node is not red before it has been touched.
   const prefixMissing = !selectedPrefix;
   const pathMissing = !customPath.trim();
-  const showErrors = !!hasAttemptedSave;
+  // A Transit Point with no Listen Path at all is not missing one: it answers at the
+  // route the gateway derives from its alias, and clearing both fields is how the
+  // dashboard goes back to that. So the pair is required only once something is set,
+  // which is also where `listenPathProblem` blocks the save. An Access Point has no
+  // such fallback, and its own `incompleteReason` blocks an empty route.
+  const routeOptional = routeFieldName === 'listen_path';
+  const routeUnset = !composedRoute && prefixMissing && pathMissing;
+  const showErrors = !!hasAttemptedSave && !(routeOptional && routeUnset);
 
   const fullRouteDisplay = useMemo(() => {
     if (!selectedHostPort || !selectedPrefix) return '';

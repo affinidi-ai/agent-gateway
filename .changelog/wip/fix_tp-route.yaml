@@ -81,17 +81,37 @@ changes:
         a stored prefix the picker no longer offers is re-derived from the route instead of shown
         as selected, so a surface stored before this reads correctly without being rewritten. A
         new Transit Point seeds an offered prefix as well.
+    - timestamp: '2026-11-23T16:20:00Z'
+      title: Tell the dashboard which outbound addresses share an inbound hostname
+      description: >-
+        Whether a listen_path outside /outbound is served depends on the point's outbound
+        listener sharing a hostname with an inbound one. The gateway decides that per listener,
+        across every external URL it answers on; the dashboard guessed it by looking for the
+        same URL string in both address lists, which answers neither an outbound
+        https://host:9443 beside an inbound https://host nor an alias URL of a shared listener.
+        Both looked unshared, so the picker offered the plain prefixes and the save refused the
+        path with listen_path_not_served. GET /v1/config/surface-routing now returns
+        shared_hostname_outbound_addresses, the outbound addresses the gateway classifies as
+        sharing, from the same function the save gate calls, and the dashboard offers the
+        /outbound prefixes for exactly those.
     - timestamp: '2026-11-20T18:10:00Z'
-      title: Refuse a Surface Builder save with an empty surface prefix or path
+      title: Block a Surface Builder save of a Listen Path the gateway will not serve
       description: >-
         Both route fields carry a required marker and neither could act on it: the path's validator
         returns no error for an empty value, and the prefix had no error binding at all. A node
         whose stored route the builder could not place under an offered prefix therefore rendered
         as two blank fields, indistinguishable from one nobody had filled in, and saving it composed
         an empty route out of them without a word, replacing a route the gateway was still serving.
-        A save attempt now refuses both, the prefix naming the route as stored and saying it is
-        under none of the prefixes on offer. On a save attempt, as the path's own error already
-        was, so a node is never marked before it has been touched.
+        A save attempt now marks both, the prefix naming the route as stored and saying it is under
+        none of the prefixes on offer, and the save itself is blocked while a Transit Point's
+        Listen Path is one the admin API would refuse with 400: claiming no segment of its own
+        under a configured surface prefix, in either form, or sitting outside /outbound on an
+        address whose listener shares an inbound hostname. As with the gateway's own refusal,
+        only a path the save introduces or changes is blocked, so a surface already stored with
+        such a path stays editable and is answered with a Warning header. A Transit Point with no Listen Path at all is not marked and not blocked:
+        it answers at the route the gateway derives from its alias, and clearing the fields is how
+        the dashboard asks for that, which the save now reports as a warning naming the path that
+        stops answering.
   removed: []
   security:
     - timestamp: '2026-11-20T12:40:00Z'

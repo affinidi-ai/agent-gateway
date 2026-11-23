@@ -341,19 +341,35 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   **Custom Path** input, which compose the node's route, helped by
   `field-help-route-listener-section-surface-prefix` and `-custom-path`. The prefixes come from
   `GET /config/surface-routing`. An inbound node offers `channel_path_prefix` as it stands. An
-  outbound one offers those prefixes with `/outbound` in front when the selected address is also
-  reachable on an inbound listener (`computeSharedOutboundAddresses`), since the inbound pipeline
-  owns every non-`/outbound` path there, and the plain prefixes on an outbound address of its own.
-  Everything reads that offered list, never the raw `channel_path_prefix`: a stored `route_prefix`
-  shows as selected only while it is still offered, and one that is not (a Transit Point recorded
-  as `/agents` whose path begins `/outbound/`) is dropped, both fields being re-derived from the
-  stored route instead. Seeding writes a prefix only when the route starts with one that is
-  offered, so a route under none of them is left unresolved rather than relabelled, and a brand-new
-  node seeds the first offered prefix with a two-word random path. After a save attempt
-  (`hasAttemptedSave`) an empty prefix and an empty path are each marked invalid, the prefix with
-  "Pick a surface prefix." naming the stored route as under none of those offered and the path with
-  "Enter a path."; `validatePath`'s own message still wins over the latter. What the gateway stores
-  and what it refuses is in
+  outbound one offers those prefixes with `/outbound` in front when the gateway lists the selected
+  address in `shared_hostname_outbound_addresses` (`computeSharedOutboundAddresses`), since the
+  inbound pipeline owns every non-`/outbound` path there, and the plain prefixes on an outbound
+  address of its own. That classification comes from the gateway, which decides it per listener
+  with the same function its save gate uses; comparing the two address lists for equal strings
+  missed an outbound `https://host:9443` beside an inbound `https://host`, and an alias URL of a
+  shared listener, and the save then refused what the picker had offered.
+  `offeredChannelPrefixes` is the one implementation of the offered list, read by the picker, by
+  the errors beside it and by the save gate. A stored `route_prefix` shows as selected only while
+  it is still offered, and one that is not (a Transit Point recorded as `/agents` whose path begins
+  `/outbound/`) is dropped, both fields being re-derived from the stored route instead. Seeding
+  writes a prefix only when the route starts with one that is offered, so a route under none of
+  them is left unresolved rather than relabelled, and a brand-new node seeds the first offered
+  prefix with a two-word random path. After a save attempt (`hasAttemptedSave`) an empty prefix and
+  an empty path are each marked invalid, the prefix with "Pick a surface prefix." naming the stored
+  route as under none of those offered and the path with "Enter a path."; `validatePath`'s own
+  message still wins over the latter. A Transit Point with no Listen Path at all is exempt from
+  both marks, since it answers at its derived `/outbound` route. `listenPathProblem` carries the
+  gateway's own two refusals into `validateSurfacePayload`, which blocks the save while a Listen
+  Path claims no segment under a configured surface prefix (either form, with or without
+  `/outbound`, since the admin API takes both) or sits outside `/outbound` on a shared-hostname
+  address. Checking it against the narrower offered list instead would block a good `/outbound`
+  path on an address with a hostname of its own. It runs only on a path the save introduces or
+  changes, compared with `options.stored`, because that is what the admin API refuses: a surface
+  already stored with such a path stays editable and its save is answered with a `Warning` header.
+  That comparison is why the rule cannot live in the node's `incompleteReason`, which sees no
+  stored surface. Clearing the path saves, and `validateSurfacePayload` warns that the stored path
+  stops answering. What the gateway
+  stores and what it refuses is in
   [`docs/CONFIGURATION_REFERENCE.md`](../../docs/CONFIGURATION_REFERENCE.md#transit-point-listen-paths).
 - **Entry point URL** is the label for an Access Point's composed URL, with "The URL used to
   access this gateway" behind its `FieldHelp`. It shows at the top of the Access Point panel

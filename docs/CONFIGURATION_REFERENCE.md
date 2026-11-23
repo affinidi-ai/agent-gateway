@@ -137,6 +137,14 @@ disabled surface reserves no route, so saving one is never refused and, claiming
 disabled, enabling it introduces every path it names: a surface disabled with a refused path
 cannot be enabled until the path changes.
 
+`shared_hostname_outbound_addresses` of `GET /v1/config/surface-routing` names every outbound
+address whose listener shares a hostname with an inbound listener, which is where the fourth
+refusal applies. The gateway answers that question with the same function on both sides, so a
+client offering the `/outbound` prefixes for exactly these addresses offers what a save accepts.
+The two address lists cannot be compared for it: a listener answers on every one of its
+`external_urls`, so an alias URL in no inbound list is still its listener's, and the same
+hostname on another port is the same hostname.
+
 `outbound_channel_path_prefix` of `GET /v1/config/surface-routing` names each surface prefix
 under `/outbound`: prefixes to build a `listen_path` under, never values to set, since a surface
 prefix of `/` leaves the bare `/outbound` there. A path built under any of them is accepted,

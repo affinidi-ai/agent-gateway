@@ -678,6 +678,27 @@ fn point_listener_shares_an_inbound_hostname(
                         .as_deref()
                 })
         });
+    outbound_address_shares_an_inbound_hostname(network_config, address)
+}
+
+/// Whether the outbound listener that answers on `address` shares a hostname
+/// with an inbound listener, by the one definition this gate and the Surface
+/// Builder both use.
+///
+/// The listener is found by the port `address` resolves to, and the answer is
+/// about that listener, not that URL: a listener answers on every one of its
+/// `external_urls`, and the same hostname on another port is the same hostname.
+/// So an outbound `https://gateway.example.com:9443` beside an inbound
+/// `https://gateway.example.com` shares it, and so does an alias URL of a
+/// listener one of whose URLs an inbound listener answers on. The dashboard
+/// cannot derive either from a URL list, so
+/// `shared_hostname_outbound_addresses` of `GET /v1/config/surface-routing`
+/// carries this answer per address and the picker offers the prefixes this gate
+/// holds a path to.
+pub(crate) fn outbound_address_shares_an_inbound_hostname(
+    network_config: &crate::config::NetworkConfig,
+    address: Option<&str>,
+) -> bool {
     let Some(port) = address.and_then(|address| network_config.map_url_to_port_for_type(address, Some("outbound")))
     else {
         return shares_an_outbound_hostname(network_config);
@@ -3784,6 +3805,45 @@ mod tests {
         let config =
             make_network_config_with_listeners(vec!["https://Shared.Example.COM"], vec!["https://shared.example.com"]);
         assert!(find_shared_outbound_listener(&config, 8080).is_some());
+    }
+
+    /// What the save gate and the Surface Builder's prefix picker both read:
+    /// the answer belongs to the listener, so it is the same for every URL that
+    /// listener answers on, whatever the port. Comparing the two address lists
+    /// for equal strings, as the dashboard once did, answers neither case.
+    #[test]
+    fn an_outbound_address_shares_an_inbound_hostname_by_listener_not_by_url() {
+        let other_port = make_network_config_with_listeners(
+            vec!["https://gateway.example.com"],
+            vec!["https://gateway.example.com:9443"],
+        );
+        assert!(
+            outbound_address_shares_an_inbound_hostname(&other_port, Some("https://gateway.example.com:9443")),
+            "the same hostname on another port is the same hostname"
+        );
+
+        let aliased = make_network_config_with_listeners(
+            vec!["https://gateway.example.com"],
+            vec!["https://gateway.example.com:9443", "https://alias.example.net"],
+        );
+        assert!(
+            outbound_address_shares_an_inbound_hostname(&aliased, Some("https://alias.example.net")),
+            "an alias URL belongs to a listener an inbound listener shares a hostname with"
+        );
+
+        let own_hostname = make_network_config_with_listeners(
+            vec!["https://gateway.example.com"],
+            vec!["https://outbound.example.net"],
+        );
+        assert!(
+            !outbound_address_shares_an_inbound_hostname(&own_hostname, Some("https://outbound.example.net")),
+            "a listener with a hostname of its own shares none"
+        );
+
+        assert!(
+            !outbound_address_shares_an_inbound_hostname(&own_hostname, Some("https://unknown.example.org")),
+            "an address of no configured outbound listener falls back to the appliance-wide answer"
+        );
     }
 
     #[test]
