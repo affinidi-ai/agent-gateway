@@ -9,6 +9,7 @@ pub mod collaborators;
 pub mod config;
 pub mod dashboard_socket;
 pub mod debug;
+pub mod forwarded_requests;
 pub mod gateway_process;
 pub mod http;
 pub mod json_rpc;

@@ -4,9 +4,9 @@
 use cucumber::{then, when};
 use serde_json::Value;
 
-use crate::steps::request_forwarded::{generated_traceparent, sent_header, the_forwarded_record};
+use crate::bdd_support::forwarded_requests::{generated_traceparent, sent_header, the_forwarded_record};
 use crate::steps::then::{gateway_log, get_mcp_request_for_actor};
-use crate::steps::when::send_request_and_record;
+use crate::steps::when::{ensure_admin_session, send_request_and_record};
 use crate::world::SurfaceWorld;
 
 const TRACEPARENT: &str = "traceparent";
@@ -38,9 +38,21 @@ fn sent(
     world: &SurfaceWorld,
     name: &str,
 ) -> String {
-    sent_header(world, name)
+    sent_header(&world.sent_headers, name)
         .unwrap_or_else(|| panic!("the scenario's request must carry {name}"))
         .to_string()
+}
+
+/// The one `request_forwarded` record of the scenario's request.
+async fn forwarded_record(world: &mut SurfaceWorld) -> Value {
+    ensure_admin_session(world).await;
+    the_forwarded_record(
+        world
+            .admin_client
+            .as_ref()
+            .expect("admin client must exist"),
+    )
+    .await
 }
 
 /// The trace ids, in their written form, that the scenario's request named in
@@ -121,7 +133,7 @@ async fn vp_audit_log_records_the_forwarded_request_under_the_callers_trace_in_i
     world: &mut SurfaceWorld
 ) {
     let caller = sent(world, X_GATEWAY_TRACE_ID);
-    let record = the_forwarded_record(world).await;
+    let record = forwarded_record(world).await;
     assert_eq!(
         record["trace_id"],
         written_form(&caller),
@@ -132,7 +144,7 @@ async fn vp_audit_log_records_the_forwarded_request_under_the_callers_trace_in_i
 #[then("the VP Audit Log records the forwarded request under the X-Gateway-Trace-Id trace")]
 async fn vp_audit_log_records_the_forwarded_request_under_the_x_gateway_trace_id_trace(world: &mut SurfaceWorld) {
     let named = sent(world, X_GATEWAY_TRACE_ID);
-    let record = the_forwarded_record(world).await;
+    let record = forwarded_record(world).await;
     assert_eq!(
         record["trace_id"],
         written_form(&named),
@@ -143,7 +155,7 @@ async fn vp_audit_log_records_the_forwarded_request_under_the_x_gateway_trace_id
 #[then("the VP Audit Log records the forwarded request under a newly minted trace")]
 async fn vp_audit_log_records_the_forwarded_request_under_a_newly_minted_trace(world: &mut SurfaceWorld) {
     let sent_ids = sent_trace_ids(world);
-    let record = the_forwarded_record(world).await;
+    let record = forwarded_record(world).await;
     let trace_id = record["trace_id"]
         .as_str()
         .unwrap_or_default();
@@ -162,7 +174,7 @@ async fn vp_audit_log_records_the_forwarded_request_under_a_newly_minted_trace(w
 
 #[then("the VP Audit Log records the forwarded request with no parent span")]
 async fn vp_audit_log_records_the_forwarded_request_with_no_parent_span(world: &mut SurfaceWorld) {
-    let record = the_forwarded_record(world).await;
+    let record = forwarded_record(world).await;
     assert!(
         record
             .get("parent_span_id")
@@ -177,7 +189,7 @@ async fn vp_audit_log_records_the_forwarded_request_with_trace_source(
     world: &mut SurfaceWorld,
     trace_source: String,
 ) {
-    let record = the_forwarded_record(world).await;
+    let record = forwarded_record(world).await;
     assert_eq!(
         record["trace_source"],
         trace_source.as_str(),
