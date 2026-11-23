@@ -2620,6 +2620,72 @@ mod tests {
             .status()
     }
 
+    async fn status_body(router: &Router) -> serde_json::Value {
+        use tower::ServiceExt;
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/vta/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn a_tenant_token_sees_only_the_trust_agent_addresses_of_connections_it_may_see() {
+        let _guard = crate::vta::isolation::TEST_LOCK
+            .lock()
+            .unwrap();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tenant_status_scenario());
+    }
+
+    async fn tenant_status_scenario() {
+        crate::vta::isolation::clear_reservations();
+        let (state, _dir) = admin_state(None).await;
+        for (id, tenant_id, endpoint) in [
+            ("appliance", None, "https://shared.example"),
+            ("own", Some("tenant-a"), "https://own.example:8443"),
+            ("other", Some("tenant-b"), "https://other.example"),
+        ] {
+            let mut connection = new_connection();
+            connection.id = id.to_string();
+            connection.tenant_id = tenant_id.map(str::to_string);
+            connection.endpoint = endpoint.to_string();
+            connection.pairing.state = crate::vta::pairing::PairingState::Connected;
+            state
+                .store
+                .create(connection)
+                .await
+                .unwrap();
+        }
+        crate::vta::isolation::reserve("https://vta-block.example");
+        crate::vta::isolation::sync_connection_reservations(state.store.as_ref()).await;
+
+        let (tenant, _users) = admin_router(state.clone(), Some("tenant-a")).await;
+        let seen = status_body(&tenant).await;
+        assert_eq!(seen["reserved_origins"], serde_json::json!(["own.example:8443", "shared.example:443"]));
+        assert!(seen["control_did"].is_null(), "{seen}");
+        assert!(seen["control_key"].is_null(), "{seen}");
+
+        let (admin, _admin_users) = admin_router(state, None).await;
+        assert_eq!(
+            status_body(&admin).await["reserved_origins"],
+            serde_json::json!(["other.example:443", "own.example:8443", "shared.example:443", "vta-block.example:443"]),
+            "an appliance administrator sees every reserved address"
+        );
+        crate::vta::isolation::clear_reservations();
+    }
+
     #[test]
     fn a_tenant_token_can_see_an_appliance_connection_but_not_act_on_it() {
         let _guard = crate::vta::isolation::TEST_LOCK
