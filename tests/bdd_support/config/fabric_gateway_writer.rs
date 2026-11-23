@@ -102,7 +102,6 @@ fn secret_fixtures(surface: &SurfaceSpec) -> Vec<SecretFixture> {
     for source_auth in surface
         .source_auth
         .iter()
-        .chain(surface.partner_api_key.iter())
         .chain(transit_source_auth)
     {
         let SourceAuthSpec::ApiKey { secret_id, valid_key, .. } = source_auth;
@@ -174,15 +173,7 @@ fn build_surface_fixture(
 
     if let Some(source_auth) = &surface.source_auth {
         let SourceAuthSpec::ApiKey { header_name, secret_id, .. } = source_auth;
-        let method = api_key_source_auth_method_json(header_name, secret_id);
-        fixture = fixture.with_caller_auth_method(method);
-    }
-    if let Some(SourceAuthSpec::ApiKey { header_name, secret_id, .. }) = &surface.partner_api_key {
-        let mut method = api_key_source_auth_method_json(header_name, secret_id);
-        method["identity"] = serde_json::json!({ "type": "from_api_key" });
-        fixture = fixture
-            .with_caller_auth_method(method)
-            .with_identity_slot("inbound", serde_json::json!({ "type": "from_jwt_claim", "claim": "sub" }));
+        fixture = fixture.with_caller_auth_method(api_key_source_auth_method_json(header_name, secret_id));
     }
     if surface.legacy_access_point {
         fixture = fixture.with_legacy_access_point();

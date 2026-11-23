@@ -267,10 +267,8 @@ fn fabric_route_probe_stage(
 
 /// A route that never answers `200`, so no probe can show it ready: the target's mock
 /// answers another status, the sending surface's Target credential goes in the header the
-/// receiving surface checks with a value it does not accept or to a method whose callers the
-/// receiving surface refuses (beside a partner API key method, the plain API key method sets no
-/// identity its inbound `from_jwt_claim` can read), or the receiving surface authenticates its
-/// Target's responses, which the mock proves only once the scenario says so.
+/// receiving surface checks with a value it does not accept, or the receiving surface
+/// authenticates its Target's responses, which the mock proves only once the scenario says so.
 fn route_refuses_by_design(
     topology: &TopologyBuilder,
     link: &FabricLink,
@@ -290,13 +288,10 @@ fn route_refuses_by_design(
             target_auth
                 .header_name
                 .eq_ignore_ascii_case(header_name)
-                && (target_auth
+                && target_auth
                     .secret_value
                     .as_deref()
                     != Some(valid_key.as_str())
-                    || target
-                        .partner_api_key
-                        .is_some())
         }
         _ => false,
     };
@@ -319,11 +314,7 @@ fn surface_spec<'a>(
 }
 
 fn source_auth_headers(surface: &SurfaceSpec) -> Vec<(String, String)> {
-    match surface
-        .partner_api_key
-        .as_ref()
-        .or(surface.source_auth.as_ref())
-    {
+    match &surface.source_auth {
         Some(SourceAuthSpec::ApiKey { header_name, valid_key, .. }) => {
             vec![(header_name.clone(), valid_key.clone())]
         }

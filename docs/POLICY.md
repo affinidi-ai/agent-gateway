@@ -700,11 +700,7 @@ surface it creates unless it is public), a legacy one stored without `public`, a
 `caller_authentication.on_failure` is `reject`, see
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#closed-and-public-access-points). An Access Point whose
 inbound identity is `from_jwt_claim`, public or not, direct or over fabric, refuses one the
-same way, because no caller identity can be derived without a valid JWT, and so does one where
-a caller authentication method sets its own identity or whose callers of a method are refused for
-their valid credential. Each also refuses a caller whose method
-sets no identity of its own and whose valid credential the inbound identity cannot read
-(`source_method_mismatch`). These refusals run
+same way, because no caller identity can be derived without a valid JWT. These refusals run
 before gateway policy, so a gateway deny does not apply to them, and surface policy never sees
 the request. Their body is the generic `Caller credential missing or invalid`; the reason is
 logged. Only on any other public Access Point (`public: true`) does source auth hand a request
@@ -760,23 +756,21 @@ gateway established.
 
 On a direct request to a surface whose inbound identity is `from_api_key`, the
 caller is the API key it presents (see
-[`SOURCE_AUTH.md`](SOURCE_AUTH.md#from_api_key-on-the-inbound-slot)); with
-`from_jwt_claim`, on the surface or on the caller's method, it is the claim of
-its verified token. Fabric
-receive does not read these modes; the request body sets the caller there (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#from_api_key-on-the-inbound-slot)). Fabric
+receive does not read this mode; the request body sets the caller there (see
 [`FABRIC.md`](FABRIC.md)). On a direct request:
 
 - `input.extension_identity` and `input.agent.did`, `did_verified` and
-  `did_verification` are the DID of the key or the claim, replacing any DID or
-  identity presentation in the request body.
-- When the body does not assert that DID, including when it names no DID,
+  `did_verification` are the key's DID, replacing any DID or identity
+  presentation in the request body.
+- When the body does not assert the key's own DID, including when it names no DID,
   the trust-registry claims it made are dropped: `provider_did`, `trust_registry_did`,
   `authority_did`, `identity_issuer_did`, `agent_dna` and the trust verifications. A Trust Check
   preset that reads `input.agent.provider_did` therefore denies unless the body
-  asserts that DID.
-- With no caller identity, such as after a failed credential, `input.agent.did` is absent and
+  asserts the key's own DID.
+- With no caller identity, such as after a failed key, `input.agent.did` is absent and
   those trust-registry claims are always dropped.
-- Gateway-plane policy, including its global policy, runs before the identity resolves, so it
+- Gateway-plane policy, including its global policy, runs before the key resolves, so it
   sees no `input.agent.did` and none of those claims on these surfaces.
 - On a `fabric://` target only `access_point.inbound_policy` sees the key's DID, in
   `input.extension_identity` (and `input.agent` when the Access Point has a Trust Check).

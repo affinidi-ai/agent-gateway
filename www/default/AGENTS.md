@@ -571,8 +571,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   "This surface is refusing requests" (`surface-refusing-requests`, `alert-warning`,
   `role="status"`); `serving` and `not_judged` show nothing. The gateway gives no reason, so the
   notice names none. An error-level dependency blocks
-  Save unless a Caller Context method is API Key or API Key Provider, or a method sets its own
-  identity, with the gateway's own message. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
+  Save unless a Caller Context method is API Key or API Key Provider, with the gateway's own
+  message; an inbound From JWT Claims likewise needs a JWT Bearer method, while on the protected
+  or external Identity or a Transit Point every method must be JWT Bearer. Callers of the other
+  methods get no identity. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
   apart. Rules only the gateway enforces (an MCP `proxy://` target, `mcp_http.authorization`)
   and rules on inactive variants show as the save-error banner.
 - **Caller Context methods**: the caller-auth element's config holds `methods`, saved as
@@ -594,30 +596,6 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   is on, JWT Bearer only as the first method), shown on each row and on the canvas. Removing the
   primary method also turns discovery off, since discovery belongs to it. With several methods an incomplete one marks the element
   unconfigured as `Method <n>: <reason>`.
-- **Caller identity per method**: methods have no id; rows are keyed by position and the
-  dashboard never sends an `id` on a method. Each method may carry `identity`
-  (`MethodIdentity`): From JWT Claims (`claim`, default `oid`; `namespace_claims` is `["iss"]` on
-  one the panel creates (`newMethodIdentity`), so two JWT Bearer methods trusting different
-  identity providers never share a DID, and a stored list is saved unchanged) on a
-  JWT Bearer method, From API Key on an API Key or API Key Provider method, saved as the method's
-  `identity` (`buildMethod`); one its credential cannot supply is not saved, and changing a
-  method's type drops it. With more than one Caller Context method (and an extraction type other
-  than From Payload), or while any method sets its own identity, the inbound Identity panel shows
-  **Caller identity per method** (`identity-panel-method-identities`,
-  `MethodIdentityList.tsx`): one row per method, "Method <n>: <kind>, reads <location>"
-  (`identity-panel-method-identity-<n>`), with a select (`-select`) of **This Identity** or the
-  method's own type, a claim input (`-claim`) for From JWT Claims, and a status line (`-status`):
-  "Uses this Identity", or, in red, that the method's callers are refused because this Identity
-  cannot read its credential. The panel writes the rows to the Caller Context element through
-  `updateNodeFields`, since the identity lives on the method. The inbound From JWT Claims and
-  From API Key rules need only one method that gets an identity (`methodGetsIdentity` in
-  `sourceMethods.ts`). Loading a surface replaces `methods`, so a stale canvas copy never brings
-  a removed method identity back, and a template keeps the methods' identities. A method
-  identity beside an inbound From Payload Identity is a Save error (`METHOD_IDENTITY_BESIDE_PAYLOAD`),
-  since callers assert that identity in the body. Each Caller Context row with its own identity says
-  so under its location (`<area>-method-<index>-identity`, "Identifies its callers From JWT Claims" or
-  "From API Key"), so an identity set while the Identity panel is not shown stays visible. The list
-  never shows on the protected, external or a Transit Point Identity.
 - **JWT Bearer audiences**: Accepted Audiences is required; with none listed, discovery off and
   Audience Claim `aud`, the method shows `caller-auth-audiences-missing-warning`. Save is not
   blocked for it, since the gateway keeps a method stored without audiences unchanged and refuses
@@ -828,7 +806,6 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
 | ----------------------------------- | --------------------------------------------------------------------------------------- |
 | Method list, one method row         | `<area>-methods`, `<area>-method-<index>`                                               |
 | A row's status icon and Configure   | `<area>-method-<index>-status`, `<area>-method-<index>-configure-button`                |
-| A row's own caller identity note     | `<area>-method-<index>-identity`                                                         |
 | A row's Make primary and remove     | `<area>-method-<index>-make-primary-button`, `-remove-button` (editor)                  |
 | Add method button, menu, menu entry | `<area>-add-method-button`, `<area>-add-method-menu`, `<area>-add-method-<method type>` |
 | Selected method's settings (editor) | `caller-auth-editor-method-settings`                                                    |

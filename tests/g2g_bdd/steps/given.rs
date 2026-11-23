@@ -683,19 +683,6 @@ pub async fn surface_requires_api_key(
     });
 }
 
-#[given(expr = "surface {string} identifies partner API key callers by their key and other callers from a JWT claim")]
-fn surface_identifies_partner_api_key_callers_by_their_key(
-    world: &mut G2gWorld,
-    surface_name: String,
-) {
-    let (_, surface_id) = world.surface(&surface_name);
-    surface_spec_mut(world, &surface_name).partner_api_key = Some(SourceAuthSpec::ApiKey {
-        header_name: "x-partner-key".to_string(),
-        secret_id: format!("{surface_id}-partner-key"),
-        valid_key: "bdd-partner-api-key".to_string(),
-    });
-}
-
 #[given(expr = "surface {string} is stored as a legacy surface")]
 fn surface_is_stored_as_a_legacy_surface(
     world: &mut G2gWorld,

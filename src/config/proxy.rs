@@ -394,67 +394,32 @@ impl GatewayConfig {
 
 /// Validate a loaded surface's `source_auth` at boot: every rule of a save but
 /// the DID Auth session TTL bound, which a stored value is held to at runtime
-/// (see [`GatewayConfig::did_auth_session_ttl_adjustments`]). The identity
-/// rules (`from_jwt_claim` and `from_api_key` without a method to read, a
-/// method's own identity that cannot read its credential) are only warned
-/// about here: stored surfaces predating a rule booted with them, and saving
-/// them enforces it.
+/// (see [`GatewayConfig::did_auth_session_ttl_adjustments`]). A
+/// `from_jwt_claim` identity without a `jwt_bearer` method to read (on the
+/// protected or external slot or a Transit Point, without `jwt_bearer` as its
+/// only method), and an inbound `from_api_key` identity without an API key
+/// method to read, are only warned about here: stored surfaces predating the
+/// rule booted with them, and saving them enforces it.
 fn validate_source_auth_surface(surface: &crate::config::agent_surface::AgentSurface) -> anyhow::Result<()> {
+    use crate::source_auth::SourceAuthConfig;
+
     validate_stored_source_auth_methods(surface)?;
     if let Err(error) = validate_jwt_claim_identity(surface) {
-        warn!("{error}; callers that authenticate with another method are refused until the surface is fixed");
+        warn!("{error}; it is refused on the next save");
     }
-    for warning in refused_method_warnings(surface) {
-        warn!("{warning}");
-    }
-    if surface.inbound_identity_from_api_key() && !surface.some_method_gets_an_identity() {
+    if surface.inbound_identity_from_api_key()
+        && !surface
+            .source_auth_methods()
+            .iter()
+            .any(|method| matches!(method, SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_)))
+    {
         warn!(
             "Channel '{}': inbound identity from_api_key needs an api_key or api_key_provider source authentication \
-             method; its callers are refused until the surface is fixed",
+             method; no caller gets an identity until the surface is fixed",
             surface.name
         );
     }
     Ok(())
-}
-
-/// One line for each source authentication method whose callers `surface`, or
-/// an enabled variant as resolved, refuses for their valid credential (see
-/// [`AgentSurface::inbound_identity_for`](crate::config::agent_surface::AgentSurface::inbound_identity_for)),
-/// naming the method and why.
-fn refused_method_warnings(surface: &crate::config::agent_surface::AgentSurface) -> Vec<String> {
-    let variants = surface
-        .variants
-        .iter()
-        .filter(|variant| variant.enabled)
-        .map(|variant| {
-            (
-                format!(" variant '{}'", variant.alias),
-                surface
-                    .serve_selected(Some(variant))
-                    .surface,
-            )
-        });
-    std::iter::once((String::new(), surface.clone()))
-        .chain(variants)
-        .flat_map(|(place, view)| {
-            view.source_auth_methods()
-                .iter()
-                .enumerate()
-                .filter_map(|(position, method)| {
-                    let reason = view
-                        .inbound_identity_for(Some(method))
-                        .err()?;
-                    Some(format!(
-                        "Channel '{}'{place}: callers of source authentication method {} ({}) are refused with 401 \
-                         source_method_mismatch until the surface is fixed: {reason}",
-                        surface.name,
-                        position + 1,
-                        method.method_tag()
-                    ))
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
 }
 
 /// The methods the source authentication fallback dropped from one place of a
@@ -751,7 +716,6 @@ pub fn validate_source_auth_config(
     }
     validate_method_selection(methods, &surface.name)?;
     validate_jwt_bearer_audiences(surface, stored)?;
-    validate_method_identities(surface)?;
     validate_jwt_claim_identity(surface)
 }
 
@@ -816,11 +780,7 @@ fn validate_jwt_bearer_audiences(
                         .is_none()
                         && view
                             .source_auth_methods()
-                            .iter()
-                            .any(|stored_method| {
-                                matches!(stored_method, SourceAuthConfig::JwtBearer(stored)
-                                    if stored.accepts_the_tokens_of(config))
-                            })
+                            .contains(method)
                 });
         if !kept {
             anyhow::bail!(
@@ -1011,57 +971,30 @@ fn validate_method_selection(
     Ok(())
 }
 
-/// A caller-authentication method's own identity reads the credential that method
-/// verifies: `from_jwt_claim` with a claim on a `jwt_bearer` method, `from_api_key`
-/// without an `api_key_id` on an `api_key` or `api_key_provider` method. A method
-/// of another kind sets none. No method sets one beside an inbound
-/// `payload_extraction` identity, which a caller asserts in the body.
-fn validate_method_identities(surface: &crate::config::agent_surface::AgentSurface) -> anyhow::Result<()> {
-    use crate::source_auth::SourceAuthConfig;
-
-    if surface.some_method_sets_its_own_identity() && surface.inbound_identity_requires_payload() {
-        anyhow::bail!(
-            "Channel '{}': a source authentication method cannot set its own identity beside an inbound \
-             payload_extraction identity, which callers assert in the request body",
-            surface.name
-        );
-    }
-    for (position, method) in surface
-        .source_auth_methods()
-        .iter()
-        .enumerate()
-    {
-        if !method.identity_reads_its_credential() {
-            anyhow::bail!(
-                "Channel '{}': source authentication method {} ({}) can only set {} as its identity",
-                surface.name,
-                position + 1,
-                method.method_tag(),
-                match method {
-                    SourceAuthConfig::JwtBearer(_) => "from_jwt_claim with a non-empty claim",
-                    SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_) =>
-                        "from_api_key without an api_key_id",
-                    SourceAuthConfig::DidAuth(_) | SourceAuthConfig::Mtls(_) => "nothing",
-                }
-            );
-        }
-    }
-    Ok(())
-}
-
 /// `from_jwt_claim` derives a DID from the caller's verified JWT. On the
-/// protected, external or a Transit Point slot every caller must authenticate
-/// with a JWT; an inbound one needs a `jwt_bearer` method to read, and the
-/// callers of the other methods that set no identity of their own are refused.
+/// inbound slot it needs a `jwt_bearer` method to read, and callers of the
+/// other methods get no identity; on the protected or external slot or a
+/// Transit Point every caller must authenticate with a JWT.
 fn validate_jwt_claim_identity(surface: &crate::config::agent_surface::AgentSurface) -> anyhow::Result<()> {
     use crate::source_auth::{ManagedIdentityConfig, SourceAuthConfig};
 
+    let methods = surface.source_auth_methods();
+    if matches!(surface.inbound_identity(), Some(ManagedIdentityConfig::FromJwtClaim { .. }))
+        && !methods
+            .iter()
+            .any(|method| matches!(method, SourceAuthConfig::JwtBearer(_)))
+    {
+        anyhow::bail!(
+            "Channel '{}': inbound from_jwt_claim identity needs a jwt_bearer source authentication method",
+            surface.name
+        );
+    }
     let transit_identities = surface
         .transit
         .iter()
         .flat_map(|transit| transit.points.iter())
         .filter_map(|point| point.managed_identity.clone());
-    let other_slot_uses_jwt_claim = [
+    let uses_jwt_claim = [
         surface
             .external_identity()
             .cloned(),
@@ -1071,22 +1004,13 @@ fn validate_jwt_claim_identity(surface: &crate::config::agent_surface::AgentSurf
     .flatten()
     .chain(transit_identities)
     .any(|identity| matches!(identity, ManagedIdentityConfig::FromJwtClaim { .. }));
-    let methods = surface.source_auth_methods();
     let jwt_bearer_only = !methods.is_empty()
         && methods
             .iter()
             .all(|method| matches!(method, SourceAuthConfig::JwtBearer(_)));
-    if other_slot_uses_jwt_claim && !jwt_bearer_only {
+    if uses_jwt_claim && !jwt_bearer_only {
         anyhow::bail!(
             "Channel '{}': from_jwt_claim identity requires jwt_bearer as the only source authentication method",
-            surface.name
-        );
-    }
-    if matches!(surface.inbound_identity(), Some(ManagedIdentityConfig::FromJwtClaim { .. }))
-        && !surface.some_method_gets_an_identity()
-    {
-        anyhow::bail!(
-            "Channel '{}': inbound from_jwt_claim identity needs a jwt_bearer source authentication method",
             surface.name
         );
     }
@@ -1326,18 +1250,6 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_method_without_an_audience_keeps_its_exemption_when_it_gets_an_identity() {
-        let stored = jwt_with(serde_json::json!([]), serde_json::json!({}));
-        let with_identity = jwt_with(
-            serde_json::json!([]),
-            serde_json::json!({"identity": {"type": "from_jwt_claim", "claim": "oid", "namespace_claims": ["iss"]}}),
-        );
-
-        validate_source_auth_config(&with_identity, Some(&stored))
-            .expect("an identity changes no token the method accepts");
-    }
-
-    #[test]
     fn a_stored_method_without_an_audience_is_kept_only_unchanged() {
         let stored = jwt_with(serde_json::json!([]), serde_json::json!({}));
         let other_strategy = surface_with_caller_auth(
@@ -1550,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    fn inbound_from_jwt_claim_needs_a_jwt_bearer_method_to_read() {
+    fn inbound_from_jwt_claim_identity_needs_a_jwt_bearer_method_to_read() {
         let inbound = serde_json::json!({"identity_slots": {"inbound": {"type": "from_jwt_claim"}}});
         for methods in
             [serde_json::json!([jwt_method()]), serde_json::json!([jwt_method(), api_key_method("X-API-Key")])]
@@ -1559,183 +1471,15 @@ mod tests {
             validate_source_auth_config(&surface, None).unwrap_or_else(|error| panic!("{methods}: {error}"));
         }
         for methods in [serde_json::json!([]), serde_json::json!([api_key_method("X-API-Key")])] {
-            let surface = surface_with_caller_auth(methods, inbound.clone());
+            let surface = surface_with_caller_auth(methods.clone(), inbound.clone());
             assert_eq!(
-                save_error(&surface),
-                "Channel 'multi': inbound from_jwt_claim identity needs a jwt_bearer source authentication method"
+                validate_source_auth_config(&surface, None)
+                    .unwrap_err()
+                    .to_string(),
+                "Channel 'multi': inbound from_jwt_claim identity needs a jwt_bearer source authentication method",
+                "{methods}"
             );
         }
-        let own_identity = surface_with_caller_auth(
-            serde_json::json!([with_identity(
-                api_key_method("X-API-Key"),
-                serde_json::json!({"type": "from_api_key"})
-            )]),
-            inbound,
-        );
-        validate_source_auth_config(&own_identity, None).unwrap();
-    }
-
-    #[test]
-    fn boot_names_each_method_whose_callers_a_surface_or_variant_refuses() {
-        let mut surface = surface_with_caller_auth(
-            serde_json::json!([jwt_method(), api_key_method("X-API-Key")]),
-            serde_json::json!({"identity_slots": {"inbound": {"type": "from_jwt_claim"}}}),
-        );
-        assert_eq!(
-            refused_method_warnings(&surface),
-            vec![
-                "Channel 'multi': callers of source authentication method 2 (api_key) are refused with 401 \
-                 source_method_mismatch until the surface is fixed: inbound from_jwt_claim identity needs a \
-                 jwt_bearer method, but the caller authenticated with an api_key method that has no identity of \
-                 its own"
-                    .to_string()
-            ]
-        );
-
-        surface.variants = serde_json::from_value(serde_json::json!([{
-            "id": "v-beta", "alias": "beta", "name": "Beta", "enabled": true,
-            "overrides": {"access_point": {"caller_authentication": {"methods": [
-                api_key_method("X-Partner-Key"),
-                with_identity(api_key_method("X-API-Key"), serde_json::json!({"type": "from_api_key"}))
-            ]}}}
-        }]))
-        .unwrap();
-        let warnings = refused_method_warnings(&surface);
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(
-            warnings[1]
-                .starts_with("Channel 'multi' variant 'beta': callers of source authentication method 1 (api_key)"),
-            "{warnings:?}"
-        );
-
-        let served = surface_with_caller_auth(
-            serde_json::json!([
-                jwt_method(),
-                with_identity(api_key_method("X-API-Key"), serde_json::json!({"type": "from_api_key"}))
-            ]),
-            serde_json::json!({"identity_slots": {"inbound": {"type": "from_jwt_claim"}}}),
-        );
-        assert!(refused_method_warnings(&served).is_empty());
-    }
-
-    fn with_identity(
-        mut method: serde_json::Value,
-        identity: serde_json::Value,
-    ) -> serde_json::Value {
-        method["identity"] = identity;
-        method
-    }
-
-    fn save_error(surface: &crate::config::agent_surface::AgentSurface) -> String {
-        validate_source_auth_config(surface, None)
-            .unwrap_err()
-            .to_string()
-    }
-
-    #[test]
-    fn a_mixed_surface_saves_with_an_identity_per_method() {
-        let surface = surface_with_caller_auth(
-            serde_json::json!([
-                with_identity(jwt_method(), serde_json::json!({"type": "from_jwt_claim", "claim": "oid"})),
-                with_identity(api_key_method("X-API-Key"), serde_json::json!({"type": "from_api_key"}))
-            ]),
-            serde_json::json!({}),
-        );
-        validate_source_auth_config(&surface, None).unwrap();
-    }
-
-    #[test]
-    fn a_method_identity_that_cannot_read_the_method_credential_is_refused() {
-        for (method, identity, expected) in [
-            (
-                jwt_method(),
-                serde_json::json!({"type": "from_api_key"}),
-                "Channel 'multi': source authentication method 1 (jwt_bearer) can only set from_jwt_claim with a non-empty claim as its identity",
-            ),
-            (
-                jwt_method(),
-                serde_json::json!({"type": "from_jwt_claim", "claim": " "}),
-                "Channel 'multi': source authentication method 1 (jwt_bearer) can only set from_jwt_claim with a non-empty claim as its identity",
-            ),
-            (
-                api_key_method("X-API-Key"),
-                serde_json::json!({"type": "from_jwt_claim"}),
-                "Channel 'multi': source authentication method 1 (api_key) can only set from_api_key without an api_key_id as its identity",
-            ),
-            (
-                api_key_method("X-API-Key"),
-                serde_json::json!({"type": "from_api_key", "api_key_id": "stored"}),
-                "Channel 'multi': source authentication method 1 (api_key) can only set from_api_key without an api_key_id as its identity",
-            ),
-            (
-                api_key_method("X-API-Key"),
-                serde_json::json!({"type": "static", "did": "did:web:agent.example"}),
-                "Channel 'multi': source authentication method 1 (api_key) can only set from_api_key without an api_key_id as its identity",
-            ),
-        ] {
-            let surface =
-                surface_with_caller_auth(serde_json::json!([with_identity(method, identity)]), serde_json::json!({}));
-            assert_eq!(save_error(&surface), expected);
-        }
-    }
-
-    #[test]
-    fn a_method_identity_beside_an_inbound_identity_read_from_the_body_is_refused() {
-        let surface = surface_with_caller_auth(
-            serde_json::json!([with_identity(
-                api_key_method("X-API-Key"),
-                serde_json::json!({"type": "from_api_key"})
-            )]),
-            serde_json::json!({"identity_slots": {"inbound":
-                {"type": "payload_extraction", "meta_field": "agent", "fields": ["id"]}}}),
-        );
-        assert_eq!(
-            save_error(&surface),
-            "Channel 'multi': a source authentication method cannot set its own identity beside an inbound \
-             payload_extraction identity, which callers assert in the request body"
-        );
-    }
-
-    #[test]
-    fn a_method_identity_does_not_excuse_from_jwt_claim_on_another_slot_beside_other_methods() {
-        let surface = surface_with_caller_auth(
-            serde_json::json!([
-                with_identity(jwt_method(), serde_json::json!({"type": "from_jwt_claim"})),
-                with_identity(api_key_method("X-API-Key"), serde_json::json!({"type": "from_api_key"}))
-            ]),
-            serde_json::json!({"identity_slots": {"protected": {"type": "from_jwt_claim"}}}),
-        );
-        assert!(save_error(&surface).contains("from_jwt_claim identity requires"));
-    }
-
-    #[test]
-    fn boot_keeps_a_method_identity_that_cannot_read_its_credential_and_only_warns() {
-        let surface = surface_with_caller_auth(
-            serde_json::json!([with_identity(jwt_method(), serde_json::json!({"type": "from_api_key"}))]),
-            serde_json::json!({}),
-        );
-        validate_source_auth_surface(&surface).unwrap();
-        assert!(validate_source_auth_config(&surface, None).is_err(), "saving still refuses it");
-    }
-
-    #[test]
-    fn a_method_identity_round_trips_on_its_method_and_is_omitted_when_unset() {
-        let surface = surface_with_caller_auth(
-            serde_json::json!([
-                with_identity(jwt_method(), serde_json::json!({"type": "from_jwt_claim", "claim": "oid"})),
-                api_key_method("X-API-Key")
-            ]),
-            serde_json::json!({}),
-        );
-        let wire = serde_json::to_value(&surface).unwrap();
-        let methods = &wire["access_point"]["caller_authentication"]["methods"];
-        assert_eq!(methods[0]["identity"]["type"], "from_jwt_claim");
-        assert_eq!(methods[0]["identity"]["claim"], "oid");
-        assert!(
-            methods[1]
-                .get("identity")
-                .is_none()
-        );
     }
 
     #[test]

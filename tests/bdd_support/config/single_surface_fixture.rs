@@ -34,11 +34,8 @@ pub struct SurfaceConfigBuilder {
     pub mcp_inbound_identity_strip_raw: bool,
     /// The inbound identity is the `sub` claim of the caller's JWT (`from_jwt_claim`).
     pub jwt_claim_inbound_identity: bool,
-    /// The inbound identity is derived from the API key the caller presents (`from_api_key`).
+    /// The inbound identity is the API key the caller presents (`from_api_key`).
     pub api_key_inbound_identity: bool,
-    /// Source authentication methods (by type) that set their callers' own identity,
-    /// with the identity kind: `jwt_claim` or `api_key`.
-    pub method_identities: Vec<(String, String)>,
     pub target_auth: Option<SurfaceTargetAuthConfig>,
     pub target_auth_provider: Option<SurfaceTargetAuthProviderConfig>,
     pub mcp_tool_policy: Option<McpToolPolicyFixture>,
@@ -274,7 +271,6 @@ impl Default for SurfaceConfigBuilder {
             mcp_inbound_identity_strip_raw: false,
             jwt_claim_inbound_identity: false,
             api_key_inbound_identity: false,
-            method_identities: Vec::new(),
             target_auth: None,
             target_auth_provider: None,
             mcp_tool_policy: None,

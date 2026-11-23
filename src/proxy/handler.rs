@@ -2383,297 +2383,272 @@ async fn proxy_charged_request(
             req.extensions()
                 .get::<crate::source_auth::models::PeerCertInfo>(),
         );
-    let authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity> = if let Some(authorization) =
-        &resource_authorization
-    {
-        let Some((profile, issuer, middleware)) = state
-            .network_config
-            .sts
-            .mcp_issuer
-            .as_ref()
-            .zip(state.vc_issuer.as_deref())
-            .zip(
-                state
-                    .source_auth_middleware
-                    .as_ref(),
-            )
-            .map(|((profile, issuer), middleware)| (profile, issuer, middleware))
-        else {
-            let error = crate::protocols::protected_resource::ResourceTokenError::Unavailable;
-            crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
-            return Ok(authorization.challenge(error));
-        };
-        let public_origins = state
-            .network_config
-            .map_url_to_port(
-                &state
-                    .surface
-                    .access_point
-                    .listen_address,
-            )
-            .and_then(|port| {
-                state
-                    .network_config
-                    .get_listener_by_port(port)
-            })
-            .map(|listener| listener.external_urls.clone())
-            .unwrap_or_default();
-        let expected_path = match state
-            .active_variant_alias
-            .as_deref()
-        {
-            Some(alias) => format!(
-                "{}${alias}",
-                state
+    let authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity> =
+        if let Some(authorization) = &resource_authorization {
+            let Some((profile, issuer, middleware)) = state
+                .network_config
+                .sts
+                .mcp_issuer
+                .as_ref()
+                .zip(state.vc_issuer.as_deref())
+                .zip(
+                    state
+                        .source_auth_middleware
+                        .as_ref(),
+                )
+                .map(|((profile, issuer), middleware)| (profile, issuer, middleware))
+            else {
+                let error = crate::protocols::protected_resource::ResourceTokenError::Unavailable;
+                crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
+                return Ok(authorization.challenge(error));
+            };
+            let public_origins = state
+                .network_config
+                .map_url_to_port(
+                    &state
+                        .surface
+                        .access_point
+                        .listen_address,
+                )
+                .and_then(|port| {
+                    state
+                        .network_config
+                        .get_listener_by_port(port)
+                })
+                .map(|listener| listener.external_urls.clone())
+                .unwrap_or_default();
+            let expected_path = match state
+                .active_variant_alias
+                .as_deref()
+            {
+                Some(alias) => format!(
+                    "{}${alias}",
+                    state
+                        .surface
+                        .access_point
+                        .route
+                ),
+                None => state
                     .surface
                     .access_point
                     .route
-            ),
-            None => state
+                    .clone(),
+            };
+            if state
                 .surface
                 .access_point
-                .route
-                .clone(),
-        };
-        if state
-            .surface
-            .access_point
-            .protocol
-            != crate::config::agent_surface::SurfaceProtocol::Mcp
-            || state
-                .surface
-                .has_source_auth()
-            || authorization
-                .validate_endpoint(&public_origins, &expected_path)
-                .is_err()
-            || profile
-                .validate_network(&state.network_config)
-                .is_err()
-        {
-            let error = crate::protocols::protected_resource::ResourceTokenError::Unavailable;
-            crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
-            return Ok(authorization.challenge(error));
-        }
-        match authorization
-            .authenticate(
-                &headers,
-                profile,
-                issuer,
-                middleware.jwks_client(),
-                middleware.token_reach(
-                    &channel_name,
-                    state
-                        .surface
-                        .tenant_id
-                        .as_deref(),
-                ),
-            )
-            .await
-        {
-            Ok(identity) => Some(identity),
-            Err(error) => {
+                .protocol
+                != crate::config::agent_surface::SurfaceProtocol::Mcp
+                || state
+                    .surface
+                    .has_source_auth()
+                || authorization
+                    .validate_endpoint(&public_origins, &expected_path)
+                    .is_err()
+                || profile
+                    .validate_network(&state.network_config)
+                    .is_err()
+            {
+                let error = crate::protocols::protected_resource::ResourceTokenError::Unavailable;
                 crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
                 return Ok(authorization.challenge(error));
             }
-        }
-    } else if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
-        && let (Some(selection), installed_middleware) = (selected_source_auth, &state.source_auth_middleware)
-    {
-        let auth_config = selection.method;
-        let sa_middleware = match crate::source_auth::middleware::require_installed(installed_middleware.clone()) {
-            Ok(middleware) => middleware,
-            Err(e) => {
-                channel_warn!(config_id, "Source authentication unavailable (reason={}) — blocking", e);
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(crate::source_auth::errors::deny_response(
-                    &state
-                        .surface
-                        .access_point
-                        .protocol,
-                    auth_config,
-                    &e,
-                ));
-            }
-        };
-        let resolved_auth_config = match resolve_direct_surface_auth_config(
-            auth_config,
-            protected_resource.as_ref(),
-            state.vc_issuer.as_deref(),
-            &state.surface.surface_id,
-        )
-        .await
-        {
-            Ok(config) => config,
-            Err(e) => {
-                // Setup/config-resolution failure is a server-side problem,
-                // not a caller decision — keep blocking.
-                channel_warn!(config_id, "Source authentication setup failed (reason={}) — blocking", e);
-                crate::audit::request_events::auth_failed(
-                    &audit_facts,
-                    crate::audit::request_events::source_auth_scheme(auth_config),
-                    "setup_failed",
-                    true,
-                    client_ip,
-                );
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(crate::source_auth::errors::deny_response(
-                    &state
-                        .surface
-                        .access_point
-                        .protocol,
-                    auth_config,
-                    &e,
-                ));
-            }
-        };
-        let peer_cert = req
-            .extensions()
-            .get::<crate::source_auth::models::PeerCertInfo>();
-        let view = crate::didauth::sessions::SessionView {
-            surface_id: &state.surface.surface_id,
-            variant_id: state
-                .active_variant_id
-                .as_deref(),
-            tenant_id: state
-                .surface
-                .tenant_id
-                .as_deref(),
-        };
-        let verified = if selection.ambiguous {
-            Err(crate::source_auth::errors::SourceAuthError::AmbiguousCredentials)
-        } else {
-            sa_middleware
-                .authenticate(&resolved_auth_config, &headers, &channel_name, view, peer_cert)
+            match authorization
+                .authenticate(
+                    &headers,
+                    profile,
+                    issuer,
+                    middleware.jwks_client(),
+                    middleware.token_reach(
+                        &channel_name,
+                        state
+                            .surface
+                            .tenant_id
+                            .as_deref(),
+                    ),
+                )
                 .await
-        };
-        match verified {
-            Ok(identity) => {
-                if let Err(reason) = state
-                    .surface
-                    .inbound_identity_for(Some(auth_config))
-                {
-                    crate::source_auth::errors::record_mismatched_caller(
-                        &state.surface,
+            {
+                Ok(identity) => Some(identity),
+                Err(error) => {
+                    crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
+                    return Ok(authorization.challenge(error));
+                }
+            }
+        } else if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+            && let (Some(selection), installed_middleware) = (selected_source_auth, &state.source_auth_middleware)
+        {
+            let auth_config = selection.method;
+            let sa_middleware = match crate::source_auth::middleware::require_installed(installed_middleware.clone()) {
+                Ok(middleware) => middleware,
+                Err(e) => {
+                    channel_warn!(config_id, "Source authentication unavailable (reason={}) — blocking", e);
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Err(crate::source_auth::errors::deny_response(
+                        &state
+                            .surface
+                            .access_point
+                            .protocol,
                         auth_config,
-                        &resolved_auth_config,
-                        &reason,
+                        &e,
+                    ));
+                }
+            };
+            let resolved_auth_config = match resolve_direct_surface_auth_config(
+                auth_config,
+                protected_resource.as_ref(),
+                state.vc_issuer.as_deref(),
+                &state.surface.surface_id,
+            )
+            .await
+            {
+                Ok(config) => config,
+                Err(e) => {
+                    // Setup/config-resolution failure is a server-side problem,
+                    // not a caller decision — keep blocking.
+                    channel_warn!(config_id, "Source authentication setup failed (reason={}) — blocking", e);
+                    crate::audit::request_events::auth_failed(
                         &audit_facts,
+                        crate::audit::request_events::source_auth_scheme(auth_config),
+                        "setup_failed",
+                        true,
                         client_ip,
                     );
                     connection_guard
                         .decrement()
                         .await;
-                    return Ok(refuse_mismatched_caller(&state.surface, &state.network_config, mcp_versions, req).await);
-                }
-                Some(identity)
-            }
-            // Caller-attributable failure (missing/invalid credential). An
-            // Access Point that publishes protected resource metadata answers
-            // it with its challenge, so the caller can fetch a token and
-            // retry. Every other Access Point that is not public refuses it
-            // here, before policy, and so does a public one whose inbound
-            // identity is `from_jwt_claim` or whose `on_failure` is
-            // `reject`. Any other public one records the outcome for the
-            // policy layer and continues with no asserted caller identity.
-            Err(e) if e.is_caller_attributable() => {
-                // On an Access Point that publishes protected resource
-                // metadata a failed JWT gets the discovery challenge, and a
-                // failure of any other method a plain refusal, so a bad
-                // credential never gets further than none.
-                let challenged = protected_resource.is_some()
-                    && matches!(auth_config, crate::source_auth::SourceAuthConfig::JwtBearer(_));
-                let refused = !challenged
-                    && (protected_resource.is_some()
-                        || state
+                    return Err(crate::source_auth::errors::deny_response(
+                        &state
                             .surface
-                            .rejects_failed_caller_authentication());
-                channel_warn!(
-                    config_id,
-                    "Source authentication failed (reason={}) — {}",
-                    e,
-                    if challenged {
-                        "sending the discovery challenge"
-                    } else if refused {
-                        "refusing the caller"
-                    } else {
-                        "deferring to policy"
+                            .access_point
+                            .protocol,
+                        auth_config,
+                        &e,
+                    ));
+                }
+            };
+            let peer_cert = req
+                .extensions()
+                .get::<crate::source_auth::models::PeerCertInfo>();
+            let view = crate::didauth::sessions::SessionView {
+                surface_id: &state.surface.surface_id,
+                variant_id: state
+                    .active_variant_id
+                    .as_deref(),
+                tenant_id: state
+                    .surface
+                    .tenant_id
+                    .as_deref(),
+            };
+            let verified = if selection.ambiguous {
+                Err(crate::source_auth::errors::SourceAuthError::AmbiguousCredentials)
+            } else {
+                sa_middleware
+                    .authenticate(&resolved_auth_config, &headers, &channel_name, view, peer_cert)
+                    .await
+            };
+            match verified {
+                Ok(identity) => Some(identity),
+                // Caller-attributable failure (missing/invalid credential). An
+                // Access Point that publishes protected resource metadata answers
+                // it with its challenge, so the caller can fetch a token and
+                // retry. Every other Access Point that is not public refuses it
+                // here, before policy, and so does a public one whose inbound
+                // identity is `from_jwt_claim` or whose `on_failure` is
+                // `reject`. Any other public one records the outcome for the
+                // policy layer and continues with no asserted caller identity.
+                Err(e) if e.is_caller_attributable() => {
+                    // On an Access Point that publishes protected resource
+                    // metadata a failed JWT gets the discovery challenge, and a
+                    // failure of any other method a plain refusal, so a bad
+                    // credential never gets further than none.
+                    let challenged = protected_resource.is_some()
+                        && matches!(auth_config, crate::source_auth::SourceAuthConfig::JwtBearer(_));
+                    let refused = !challenged
+                        && (protected_resource.is_some()
+                            || state
+                                .surface
+                                .rejects_failed_caller_authentication());
+                    channel_warn!(
+                        config_id,
+                        "Source authentication failed (reason={}) — {}",
+                        e,
+                        if challenged {
+                            "sending the discovery challenge"
+                        } else if refused {
+                            "refusing the caller"
+                        } else {
+                            "deferring to policy"
+                        }
+                    );
+                    crate::audit::request_events::auth_failed(
+                        &audit_facts,
+                        crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
+                        crate::audit::request_events::source_auth_reason(&e),
+                        challenged || refused,
+                        client_ip,
+                    );
+                    if challenged && let Some(protected_resource) = &protected_resource {
+                        connection_guard
+                            .decrement()
+                            .await;
+                        return Ok(protected_resource.caller_challenge(&e));
                     }
-                );
-                crate::audit::request_events::auth_failed(
-                    &audit_facts,
-                    crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
-                    crate::audit::request_events::source_auth_reason(&e),
-                    challenged || refused,
-                    client_ip,
-                );
-                if challenged && let Some(protected_resource) = &protected_resource {
-                    connection_guard
-                        .decrement()
-                        .await;
-                    return Ok(protected_resource.caller_challenge(&e));
+                    if refused {
+                        connection_guard
+                            .decrement()
+                            .await;
+                        return Ok(refuse_failed_caller(
+                            &state.surface,
+                            &state.network_config,
+                            mcp_versions,
+                            &resolved_auth_config,
+                            req,
+                        )
+                        .await);
+                    }
+                    source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
+                        attempted_method: resolved_auth_config
+                            .method_tag()
+                            .to_string(),
+                        reason: e.to_string(),
+                    });
+                    None
                 }
-                if refused {
+                // Server-side failure (config not found, internal) — keep
+                // blocking (500).
+                Err(e) => {
+                    channel_warn!(config_id, "Source authentication error (reason={}) — blocking", e);
+                    crate::audit::request_events::auth_failed(
+                        &audit_facts,
+                        crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
+                        crate::audit::request_events::source_auth_reason(&e),
+                        true,
+                        client_ip,
+                    );
                     connection_guard
                         .decrement()
                         .await;
-                    return Ok(refuse_failed_caller(
-                        &state.surface,
-                        &state.network_config,
-                        mcp_versions,
+                    return Err(crate::source_auth::errors::deny_response(
+                        &state
+                            .surface
+                            .access_point
+                            .protocol,
                         &resolved_auth_config,
-                        req,
-                    )
-                    .await);
+                        &e,
+                    ));
                 }
-                source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
-                    attempted_method: resolved_auth_config
-                        .method_tag()
-                        .to_string(),
-                    reason: e.to_string(),
-                });
-                None
             }
-            // Server-side failure (config not found, internal) — keep
-            // blocking (500).
-            Err(e) => {
-                channel_warn!(config_id, "Source authentication error (reason={}) — blocking", e);
-                crate::audit::request_events::auth_failed(
-                    &audit_facts,
-                    crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
-                    crate::audit::request_events::source_auth_reason(&e),
-                    true,
-                    client_ip,
-                );
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(crate::source_auth::errors::deny_response(
-                    &state
-                        .surface
-                        .access_point
-                        .protocol,
-                    &resolved_auth_config,
-                    &e,
-                ));
-            }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // Merged source-auth context for policy inputs: the verified identity on
     // success, or a `Failed` marker on a non-blocking caller-attributable
     // failure. `None` when no source auth is configured.
     let source_auth_failed = source_auth_failure.is_some();
-    let caller_inbound_identity = caller_inbound_identity(
-        &state.surface,
-        selected_source_auth,
-        authenticated_identity.is_some() && !source_auth_failed,
-    );
 
     let source_auth_context: Option<crate::surface_context::SourceAuthContext> = authenticated_identity
         .as_ref()
@@ -3417,13 +3392,7 @@ async fn proxy_charged_request(
             None
         };
     let mut pre_identity_agent_context = agent_context.clone();
-    bind_credential_caller_did(
-        caller_inbound_identity.as_ref(),
-        method.as_str(),
-        uri.path(),
-        pre_identity_agent_context.as_mut(),
-        None,
-    );
+    bind_api_key_caller_did(&state.surface, method.as_str(), uri.path(), pre_identity_agent_context.as_mut(), None);
 
     // ── Trust Check stage placeholder ───────────────────────────────────────
     // The caller-leg Trust Check stage runs at the single post-identity seam
@@ -3989,7 +3958,6 @@ async fn proxy_charged_request(
                     trace_id: trace_id.clone(),
                     ucp_operation: ucp_operation.clone(),
                     authenticated_identity: authenticated_identity.clone(),
-                    inbound_identity: caller_inbound_identity.clone(),
                     source_auth_context: source_auth_context.clone(),
                     payment_context: payment_context.clone(),
                     mcp_metadata_context,
@@ -4257,7 +4225,6 @@ async fn proxy_charged_request(
                 trace_id,
                 ucp_operation,
                 authenticated_identity,
-                inbound_identity: caller_inbound_identity.clone(),
                 source_auth_context: source_auth_context.clone(),
                 payment_context,
                 mcp_metadata_context,
@@ -4569,7 +4536,6 @@ async fn proxy_charged_request(
                 &headers,
                 &body_bytes,
                 authenticated_identity.as_ref(),
-                caller_inbound_identity.as_ref(),
                 source_auth_context.as_ref(),
                 mcp_context.as_ref(),
                 payment_context.as_ref(),
@@ -4629,7 +4595,6 @@ async fn proxy_charged_request(
                 &headers,
                 &body_bytes,
                 authenticated_identity.as_ref(),
-                caller_inbound_identity.as_ref(),
                 source_auth_context.as_ref(),
                 mcp_context.as_ref(),
                 payment_context.as_ref(),
@@ -4752,7 +4717,6 @@ async fn proxy_charged_request(
                 &headers,
                 &body_bytes,
                 authenticated_identity.as_ref(),
-                caller_inbound_identity.as_ref(),
                 source_auth_context.as_ref(),
                 mcp_context.as_ref(),
                 payment_context.as_ref(),
@@ -4882,7 +4846,6 @@ async fn proxy_charged_request(
                 &headers,
                 &body_bytes,
                 authenticated_identity.as_ref(),
-                caller_inbound_identity.as_ref(),
                 source_auth_context.as_ref(),
                 mcp_context.as_ref(),
                 payment_context.as_ref(),
@@ -5271,15 +5234,24 @@ async fn proxy_charged_request(
     };
 
     // ── Configured caller identity (FromMtls / FromApiKey / Static) ─────────
-    if configured_caller_identity_applies(
-        caller_inbound_identity.as_ref(),
-        identity_result.is_some(),
-        method.as_str(),
-        uri.path(),
-    ) {
+    // A caller verified by a method the inbound identity does not read (an API
+    // key beside `from_jwt_claim`, a token beside `from_api_key`) gets no
+    // inbound identity, not even one its request body asserts.
+    let caller_identified = authenticated_identity
+        .as_ref()
+        .is_none_or(|caller| {
+            state
+                .surface
+                .inbound_identity_reads(caller)
+        });
+    if !caller_identified {
+        identity_result = None;
+    }
+    if caller_identified
+        && configured_caller_identity_applies(&state.surface, identity_result.is_some(), method.as_str(), uri.path())
+    {
         match resolve_configured_caller_identity(
             &state,
-            caller_inbound_identity.as_ref(),
             method.as_str(),
             uri.path(),
             &channel_name,
@@ -5301,21 +5273,22 @@ async fn proxy_charged_request(
 
     // ── Request-bound identity resolution (FromJwtClaim) ──────────────────
     //
-    // `from_jwt_claim`, on the inbound slot or the caller's method, derives the
-    // *caller* agent's DID from a validated JWT claim (e.g. the Entra Agent ID
-    // `oid`) produced by `jwt_bearer` source auth, then feeds the same
-    // `identity_result` / VP-inject path so the caller's identity VP is
-    // forwarded upstream to the target. It replaces any identity the body
-    // asserts, as `from_api_key` does. This is the request leg — distinct from
-    // the protected slot, which stamps the managed agent's DID on the response
-    // back to the caller.
+    // `from_jwt_claim` on the inbound slot derives the *caller* agent's DID
+    // from a validated JWT claim (e.g. the Entra Agent ID `oid`) produced by
+    // `jwt_bearer` source auth, then feeds the same `identity_result` /
+    // VP-inject path so the caller's identity VP is forwarded upstream to the
+    // target. This is the request leg — distinct from the protected slot,
+    // which stamps the managed agent's DID on the response back to the caller.
     //
     // Skipped on public/discovery paths (`is_public_path`): source auth is
     // bypassed there, so no JWT claims exist and there is no caller identity to
     // resolve — mirrors the Trust Check and surface OPA discovery bypasses.
-    if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
-        && let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) =
-            caller_inbound_identity.as_ref()
+    if caller_identified
+        && !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+        && identity_result.is_none()
+        && let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) = state
+            .surface
+            .inbound_identity()
     {
         let mode_label = "from_jwt_claim";
         let started = std::time::Instant::now();
@@ -5342,7 +5315,11 @@ async fn proxy_charged_request(
                 identity_hash,
                 ..
             }) => {
-                let vc_issuer_opt = state.caller_vc_issuer();
+                let vc_issuer_opt = state
+                    .identity_selector
+                    .as_ref()
+                    .map(|s| s.get_vc_issuer())
+                    .or_else(|| state.vc_issuer.clone());
                 let Some(issuer) = vc_issuer_opt else {
                     crate::metrics::backends::prometheus::track_managed_identity_resolve(
                         &channel_name,
@@ -5475,8 +5452,8 @@ async fn proxy_charged_request(
             did: Some(result.did.clone()),
             identity_hash: Some(result.hash.clone()),
         });
-    bind_credential_caller_did(
-        caller_inbound_identity.as_ref(),
+    bind_api_key_caller_did(
+        &state.surface,
         method.as_str(),
         uri.path(),
         agent_context.as_mut(),
@@ -7205,8 +7182,14 @@ async fn proxy_charged_request(
                 // `workloadBinding.delegationAction`; otherwise it uses the
                 // legacy `identityFields` shape. The VP itself is NEVER returned
                 // to the caller — it lives only in the audit trail.
-                if let (Some(vc_issuer), Some(result)) = (state.caller_vc_issuer(), identity_result.as_ref()) {
+                if let (Some(selector), Some(result)) = (
+                    state
+                        .identity_selector
+                        .as_ref(),
+                    identity_result.as_ref(),
+                ) {
                     let wb: Option<serde_json::Value> = None;
+                    let vc_issuer = selector.get_vc_issuer();
                     match vc_issuer
                         .create_agent_identity_presentation_with_binding(
                             &result.did,
@@ -7449,7 +7432,11 @@ async fn proxy_charged_request(
             "inject_vp is enabled but no identity binding VP was produced on the protected path — no inbound agent identity was resolved (configure managed_identity / protected_identity, or have the caller send an identity VP); toggle has no effect for this request"
         );
     }
-    let vc_issuer_for_vp = state.caller_vc_issuer();
+    let vc_issuer_for_vp = state
+        .identity_selector
+        .as_ref()
+        .map(|s| s.get_vc_issuer())
+        .or_else(|| state.vc_issuer.clone());
     if let (Some(vc_issuer), Some(result)) = (vc_issuer_for_vp, identity_result.as_ref()) {
         let wb = build_target_request_workload_binding(
             &state.surface,
@@ -10022,19 +10009,6 @@ async fn refuse_failed_caller(
     crate::source_auth::errors::caller_refusal(&surface.access_point.protocol, auth_config, mcp_request_id)
 }
 
-/// Refuses a caller whose credential verified but belongs to a method other
-/// than the one the inbound identity reads; no challenge, since another token
-/// of the same method would be refused again.
-async fn refuse_mismatched_caller(
-    surface: &crate::config::agent_surface::AgentSurface,
-    network_config: &crate::config::NetworkConfig,
-    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
-    req: Request,
-) -> Response {
-    let mcp_request_id = refused_mcp_request_id(surface, network_config, versions, req).await;
-    crate::source_auth::errors::mismatched_caller_refusal(&surface.access_point.protocol, mcp_request_id)
-}
-
 /// Refuses a request to an Access Point that is not ready, recording the
 /// refusal once.
 async fn refuse_not_ready_access_point(
@@ -10669,7 +10643,6 @@ async fn handle_onboarding_request(
 /// which is a fixed `500` counted as `api_key_id_missing`.
 async fn resolve_configured_caller_identity(
     state: &ProxyState,
-    inbound_identity: Option<&crate::source_auth::ManagedIdentityConfig>,
     method: &str,
     path: &str,
     channel_name: &str,
@@ -10683,7 +10656,10 @@ async fn resolve_configured_caller_identity(
     if crate::proxy::paths::is_public_request(method, path) {
         return Ok(None);
     }
-    if matches!(inbound_identity, Some(ManagedIdentityConfig::FromApiKey { .. })) {
+    if state
+        .surface
+        .inbound_identity_from_api_key()
+    {
         return resolve_presented_api_key_identity(
             state,
             channel_name,
@@ -10693,7 +10669,10 @@ async fn resolve_configured_caller_identity(
         )
         .await;
     }
-    let (mi, from_managed_slot) = match inbound_identity {
+    let (mi, from_managed_slot) = match state
+        .surface
+        .inbound_identity()
+    {
         Some(inbound) => (inbound.clone(), false),
         None => match state
             .surface
@@ -10737,7 +10716,12 @@ async fn resolve_configured_caller_identity(
             identity_hash,
             credential_updated_at,
         })) => {
-            let Some(issuer) = state.caller_vc_issuer() else {
+            let Some(issuer) = state
+                .identity_selector
+                .as_ref()
+                .map(|s| s.get_vc_issuer())
+                .or_else(|| state.vc_issuer.clone())
+            else {
                 debug!(
                     channel = channel_name,
                     leg, "Inbound credential identity: VCIssuer not configured — DID issuance skipped"
@@ -10819,64 +10803,30 @@ async fn resolve_configured_caller_identity(
 const CALLER_IDENTITY_UNRESOLVED: &str = "Caller identity could not be resolved";
 
 /// Whether the configured caller identity runs on this request. It fills in
-/// when the body carried no identity; an inbound `from_api_key` identity
+/// when the body carried no identity; on an inbound `from_api_key` slot it
 /// replaces any body identity, so a presented key cannot be traded for a VP's
 /// DID.
 fn configured_caller_identity_applies(
-    inbound_identity: Option<&crate::source_auth::ManagedIdentityConfig>,
+    surface: &crate::config::agent_surface::AgentSurface,
     body_identity_resolved: bool,
     method: &str,
     path: &str,
 ) -> bool {
     !body_identity_resolved
-        || (matches!(inbound_identity, Some(crate::source_auth::ManagedIdentityConfig::FromApiKey { .. }))
-            && !crate::proxy::paths::is_public_request(method, path))
+        || (surface.inbound_identity_from_api_key() && !crate::proxy::paths::is_public_request(method, path))
 }
 
-/// Whether the caller's inbound identity is read from the credential it
-/// presented: the API key (`from_api_key`) or a claim of its JWT
-/// (`from_jwt_claim`).
-fn identifies_by_presented_credential(inbound_identity: Option<&crate::source_auth::ManagedIdentityConfig>) -> bool {
-    matches!(
-        inbound_identity,
-        Some(
-            crate::source_auth::ManagedIdentityConfig::FromApiKey { .. }
-                | crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. }
-        )
-    )
-}
-
-/// The inbound identity of this request's caller: the identity of the method that
-/// verified it (see [`crate::config::agent_surface::AgentSurface::inbound_identity_for`]),
-/// or the surface's when no method verified the caller. A caller the method's
-/// identity refuses never gets here.
-fn caller_inbound_identity(
+/// On an inbound `from_api_key` surface the caller is the presented key, so
+/// `input.agent.did` is the key's DID (or absent when none was resolved), never
+/// a DID the request body asserts. Other surfaces keep the body DID.
+fn bind_api_key_caller_did(
     surface: &crate::config::agent_surface::AgentSurface,
-    selection: Option<crate::source_auth::models::SourceAuthSelection<'_>>,
-    verified: bool,
-) -> Option<crate::source_auth::ManagedIdentityConfig> {
-    let method = selection
-        .filter(|_| verified)
-        .map(|selection| selection.method);
-    surface
-        .inbound_identity_for(method)
-        .ok()
-        .flatten()
-        .cloned()
-}
-
-/// When the caller's inbound identity is read from its credential
-/// (`from_api_key`, `from_jwt_claim`), `input.agent.did` is that identity's DID
-/// (or absent when none was resolved), never a DID the request body asserts.
-/// Other callers keep the body DID.
-fn bind_credential_caller_did(
-    inbound_identity: Option<&crate::source_auth::ManagedIdentityConfig>,
     method: &str,
     path: &str,
     agent: Option<&mut crate::surface_context::AgentContext>,
     extension_identity: Option<&crate::surface_context::ExtensionIdentityContext>,
 ) {
-    if identifies_by_presented_credential(inbound_identity)
+    if surface.inbound_identity_from_api_key()
         && !crate::proxy::paths::is_public_request(method, path)
         && let Some(agent) = agent
     {
@@ -10884,8 +10834,10 @@ fn bind_credential_caller_did(
     }
 }
 
-/// Reaching this means the verified credential carries no JWT claims, for
-/// example an API key accepted on a stored surface that also lists `jwt_bearer`.
+/// Reaching this means no credential was verified on a `from_jwt_claim`
+/// surface that serves the caller anyway, such as a stored surface without
+/// caller authentication: a caller verified by another method gets no identity
+/// instead (see [`crate::config::agent_surface::AgentSurface::inbound_identity_reads`]).
 fn from_jwt_claim_without_claims() -> Response {
     create_error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -10898,8 +10850,10 @@ fn from_jwt_claim_without_claims() -> Response {
 /// identified by its key id and reports `source_auth`; a plain API Key by its
 /// `secret_id`, shared by every value in the secret, and reports `unverified`.
 /// A caller-attributable auth failure resolves no identity, leaving the
-/// decision to policy, as does a VC issuer that is missing or fails. Any other
-/// source auth or an unusable key refuses the request with a fixed body.
+/// decision to policy, as does a VC issuer that is missing or fails. A caller
+/// verified by another method never gets here (see
+/// [`crate::config::agent_surface::AgentSurface::inbound_identity_reads`]); no
+/// verified API key, or an unusable one, refuses the request with a fixed body.
 async fn resolve_presented_api_key_identity(
     state: &ProxyState,
     channel_name: &str,
@@ -10951,7 +10905,12 @@ async fn resolve_presented_api_key_identity(
         }
     };
 
-    let Some(issuer) = state.caller_vc_issuer() else {
+    let Some(issuer) = state
+        .identity_selector
+        .as_ref()
+        .map(|s| s.get_vc_issuer())
+        .or_else(|| state.vc_issuer.clone())
+    else {
         warn!(channel = channel_name, leg, "Inbound from_api_key identity without a VC issuer — DID issuance skipped");
         track("vc_issuer_missing");
         return Ok(None);
@@ -11116,8 +11075,6 @@ struct FabricSend<'a> {
     trace_id: String,
     ucp_operation: Option<String>,
     authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity>,
-    /// The caller's inbound identity: its method's own, else the surface's.
-    inbound_identity: Option<crate::source_auth::ManagedIdentityConfig>,
     source_auth_context: Option<crate::surface_context::SourceAuthContext>,
     payment_context: Option<crate::surface_context::PaymentContext>,
     mcp_metadata_context: crate::mcp::meta::McpMetadataContext,
@@ -11167,7 +11124,6 @@ async fn handle_fabric_request_inner(
         trace_id,
         ucp_operation,
         authenticated_identity,
-        inbound_identity: caller_inbound_identity,
         source_auth_context,
         payment_context,
         mcp_metadata_context,
@@ -11396,15 +11352,24 @@ async fn handle_fabric_request_inner(
     }
 
     // ── Configured caller identity (FromMtls / FromApiKey / Static) ─────────
-    if configured_caller_identity_applies(
-        caller_inbound_identity.as_ref(),
-        identity_result.is_some(),
-        method.as_str(),
-        uri.path(),
-    ) {
+    // A caller verified by a method the inbound identity does not read (an API
+    // key beside `from_jwt_claim`, a token beside `from_api_key`) gets no
+    // inbound identity, not even one its request body asserts.
+    let caller_identified = authenticated_identity
+        .as_ref()
+        .is_none_or(|caller| {
+            state
+                .surface
+                .inbound_identity_reads(caller)
+        });
+    if !caller_identified {
+        identity_result = None;
+    }
+    if caller_identified
+        && configured_caller_identity_applies(&state.surface, identity_result.is_some(), method.as_str(), uri.path())
+    {
         match resolve_configured_caller_identity(
             &state,
-            caller_inbound_identity.as_ref(),
             method.as_str(),
             uri.path(),
             channel_name,
@@ -11426,19 +11391,21 @@ async fn handle_fabric_request_inner(
 
     // ── Request-bound identity resolution (FromJwtClaim) — fabric path ────
     //
-    // `from_jwt_claim`, on the inbound slot or the caller's method, derives the
-    // *caller* agent's DID from a validated JWT claim (e.g. the Entra Agent ID
-    // `oid`) produced by `jwt_bearer` source auth, replacing any identity the
-    // body asserts, then feeds the same `identity_result` so the caller's
-    // identity VP is forwarded across the fabric hop to the remote gateway
-    // (mirrors the direct path).
+    // `from_jwt_claim` on the inbound slot derives the *caller* agent's DID
+    // from a validated JWT claim (e.g. the Entra Agent ID `oid`) produced by
+    // `jwt_bearer` source auth, then feeds the same `identity_result` so the
+    // caller's identity VP is forwarded across the fabric hop to the remote
+    // gateway (mirrors the direct path).
     //
     // Skipped on public/discovery paths (`is_public_path`): source auth is
     // bypassed there, so no JWT claims exist and there is no caller identity to
     // resolve — mirrors the Trust Check and surface OPA discovery bypasses.
-    if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
-        && let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) =
-            caller_inbound_identity.as_ref()
+    if caller_identified
+        && !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+        && identity_result.is_none()
+        && let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) = state
+            .surface
+            .inbound_identity()
     {
         let mode_label = "from_jwt_claim";
         let started = std::time::Instant::now();
@@ -11465,7 +11432,11 @@ async fn handle_fabric_request_inner(
                 identity_hash,
                 ..
             }) => {
-                let vc_issuer_opt = state.caller_vc_issuer();
+                let vc_issuer_opt = state
+                    .identity_selector
+                    .as_ref()
+                    .map(|s| s.get_vc_issuer())
+                    .or_else(|| state.vc_issuer.clone());
                 let Some(issuer) = vc_issuer_opt else {
                     crate::metrics::backends::prometheus::track_managed_identity_resolve(
                         channel_name,
@@ -11657,8 +11628,8 @@ async fn handle_fabric_request_inner(
         } else {
             None
         };
-        bind_credential_caller_did(
-            caller_inbound_identity.as_ref(),
+        bind_api_key_caller_did(
+            &state.surface,
             method.as_str(),
             uri.path(),
             agent_ctx.as_mut(),
@@ -12523,7 +12494,11 @@ async fn handle_fabric_request_inner(
 
     // ── Create identity binding VP for fabric forwarding (audit + optional injection) ─────
     let fabric_binding_vp_jwt = if let Some(ref result) = identity_result {
-        if let Some(vc_issuer) = state.caller_vc_issuer() {
+        let selector = state
+            .identity_selector
+            .as_ref();
+        if let Some(selector) = selector {
+            let vc_issuer = selector.get_vc_issuer();
             let chained_credentials = identity_binding
                 .as_ref()
                 .map(|b| b.inbound_credentials.clone())
@@ -15246,8 +15221,6 @@ pub(crate) fn a2a_proxy_connection_status(
 /// Evaluate inbound OPA + surface OPA policies for a `proxy://` MCP request.
 /// Returns the evaluated `PolicyInput` when both policies allow, so MCP tool
 /// gating decides on the same context, or `Err(Response)` with a 403 deny.
-/// `caller_inbound_identity` is the caller's inbound identity: its method's own,
-/// else the surface's (see [`caller_inbound_identity`]).
 async fn evaluate_mcp_proxy_opa_policies(
     state: &ProxyState,
     method: &str,
@@ -15255,7 +15228,6 @@ async fn evaluate_mcp_proxy_opa_policies(
     headers: &HeaderMap,
     body_bytes: &[u8],
     authenticated_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
-    caller_inbound_identity: Option<&crate::source_auth::ManagedIdentityConfig>,
     source_auth_context: Option<&crate::surface_context::SourceAuthContext>,
     mcp_context: Option<&crate::surface_context::McpContext>,
     payment_context: Option<&crate::surface_context::PaymentContext>,
@@ -15319,7 +15291,7 @@ async fn evaluate_mcp_proxy_opa_policies(
             .await,
         );
     }
-    bind_credential_caller_did(caller_inbound_identity, method, uri.path(), policy_input.agent.as_mut(), None);
+    bind_api_key_caller_did(&state.surface, method, uri.path(), policy_input.agent.as_mut(), None);
     policy_input.normalize_caller_did();
 
     // ── Trust Check stage (caller leg) ─────────────────────────────────────
@@ -23180,9 +23152,6 @@ allow if {
                 .clone();
             super::super::resolve_configured_caller_identity(
                 state,
-                state
-                    .surface
-                    .inbound_identity(),
                 "POST",
                 "/mcp",
                 &channel,
@@ -23384,9 +23353,6 @@ allow if {
 
             let result = super::super::resolve_configured_caller_identity(
                 &state,
-                state
-                    .surface
-                    .inbound_identity(),
                 "GET",
                 "/.well-known/agent-card.json",
                 &channel,
@@ -23625,21 +23591,16 @@ allow if {
                 None,
             );
 
-            assert!(super::super::configured_caller_identity_applies(api_key.inbound_identity(), true, "POST", "/mcp"));
-            assert!(super::super::configured_caller_identity_applies(
-                api_key.inbound_identity(),
-                false,
-                "POST",
-                "/mcp"
-            ));
+            assert!(super::super::configured_caller_identity_applies(&api_key, true, "POST", "/mcp"));
+            assert!(super::super::configured_caller_identity_applies(&api_key, false, "POST", "/mcp"));
             assert!(!super::super::configured_caller_identity_applies(
-                api_key.inbound_identity(),
+                &api_key,
                 true,
                 "GET",
                 "/.well-known/agent-card.json"
             ));
-            assert!(!super::super::configured_caller_identity_applies(mtls.inbound_identity(), true, "POST", "/mcp"));
-            assert!(super::super::configured_caller_identity_applies(mtls.inbound_identity(), false, "POST", "/mcp"));
+            assert!(!super::super::configured_caller_identity_applies(&mtls, true, "POST", "/mcp"));
+            assert!(super::super::configured_caller_identity_applies(&mtls, false, "POST", "/mcp"));
         }
 
         fn asserted_agent() -> crate::surface_context::AgentContext {
@@ -23669,42 +23630,24 @@ allow if {
             };
 
             let mut agent = asserted_agent();
-            super::super::bind_credential_caller_did(
-                api_key.inbound_identity(),
-                "POST",
-                "/mcp",
-                Some(&mut agent),
-                Some(&key),
-            );
+            super::super::bind_api_key_caller_did(&api_key, "POST", "/mcp", Some(&mut agent), Some(&key));
             assert_eq!(agent.did.as_deref(), Some("did:webvh:key"));
             assert_eq!(agent.did_verification, Some(IdentityVerification::SourceAuth));
 
             let mut agent = asserted_agent();
-            super::super::bind_credential_caller_did(
-                api_key.inbound_identity(),
-                "POST",
-                "/mcp",
-                Some(&mut agent),
-                None,
-            );
+            super::super::bind_api_key_caller_did(&api_key, "POST", "/mcp", Some(&mut agent), None);
             assert_eq!(agent.did, None);
 
             let mut agent = asserted_agent();
             agent.did = None;
             agent.provider_did = Some("did:web:provider.example".into());
-            super::super::bind_credential_caller_did(
-                api_key.inbound_identity(),
-                "POST",
-                "/mcp",
-                Some(&mut agent),
-                None,
-            );
+            super::super::bind_api_key_caller_did(&api_key, "POST", "/mcp", Some(&mut agent), None);
             assert_eq!(agent.did, None);
             assert_eq!(agent.provider_did, None);
 
             let mut agent = asserted_agent();
-            super::super::bind_credential_caller_did(
-                api_key.inbound_identity(),
+            super::super::bind_api_key_caller_did(
+                &api_key,
                 "GET",
                 "/.well-known/agent-card.json",
                 Some(&mut agent),
@@ -23713,37 +23656,11 @@ allow if {
             assert_eq!(agent.did.as_deref(), Some("did:web:asserted.example"));
         }
 
-        #[test]
-        fn a_jwt_claim_did_replaces_a_body_asserted_agent_did() {
-            let claim = ManagedIdentityConfig::FromJwtClaim {
-                claim: "oid".into(),
-                namespace_claims: vec!["iss".into()],
-            };
-            let derived = crate::surface_context::ExtensionIdentityContext {
-                did: Some("did:webvh:claim".into()),
-                identity_hash: Some("hash-claim".into()),
-                verification: IdentityVerification::SourceAuth,
-            };
-
-            let mut agent = asserted_agent();
-            super::super::bind_credential_caller_did(Some(&claim), "POST", "/mcp", Some(&mut agent), Some(&derived));
-
-            assert_eq!(agent.did.as_deref(), Some("did:webvh:claim"));
-            assert_eq!(agent.did_verification, Some(IdentityVerification::SourceAuth));
-        }
-
         async fn mcp_proxy_policy_agent(
             inbound: Option<ManagedIdentityConfig>
         ) -> Option<crate::surface_context::AgentContext> {
-            mcp_proxy_policy_agent_of(inbound.clone(), inbound).await
-        }
-
-        async fn mcp_proxy_policy_agent_of(
-            slot: Option<ManagedIdentityConfig>,
-            caller: Option<ManagedIdentityConfig>,
-        ) -> Option<crate::surface_context::AgentContext> {
             let mut surface = mcp_surface("pak-mcp-proxy", "proxy://pak-mcp-proxy", None);
-            surface.identity_slots.inbound = slot;
+            surface.identity_slots.inbound = inbound;
             let state = bare_proxy_state(surface, None);
             let body = serde_json::to_vec(&serde_json::json!({
                 "jsonrpc": "2.0",
@@ -23764,7 +23681,6 @@ allow if {
                 &axum::http::HeaderMap::new(),
                 &body,
                 None,
-                caller.as_ref(),
                 None,
                 None,
                 None,
@@ -23783,24 +23699,6 @@ allow if {
 
             assert_eq!(agent.did, None);
             assert_eq!(agent.provider_did, None);
-        }
-
-        #[tokio::test]
-        async fn mcp_proxy_policy_input_has_no_body_asserted_did_for_a_method_identity() {
-            for method_identity in [
-                ManagedIdentityConfig::FromApiKey { api_key_id: None },
-                ManagedIdentityConfig::FromJwtClaim {
-                    claim: "oid".into(),
-                    namespace_claims: vec!["iss".into()],
-                },
-            ] {
-                let agent = mcp_proxy_policy_agent_of(None, Some(method_identity.clone()))
-                    .await
-                    .unwrap();
-
-                assert_eq!(agent.did, None, "{method_identity:?}");
-                assert_eq!(agent.provider_did, None, "{method_identity:?}");
-            }
         }
 
         #[tokio::test]
@@ -23832,13 +23730,7 @@ allow if {
             ];
             for surface in &surfaces {
                 let mut agent = asserted_agent();
-                super::super::bind_credential_caller_did(
-                    surface.inbound_identity(),
-                    "POST",
-                    "/mcp",
-                    Some(&mut agent),
-                    Some(&key),
-                );
+                super::super::bind_api_key_caller_did(surface, "POST", "/mcp", Some(&mut agent), Some(&key));
                 assert_eq!(agent.did.as_deref(), Some("did:web:asserted.example"));
                 assert_eq!(agent.did_verification, None);
             }
@@ -24811,11 +24703,6 @@ mod fabric_send_tests {
                 trace_id: "trace-1".to_string(),
                 ucp_operation: None,
                 authenticated_identity: Some(caller),
-                inbound_identity: peer
-                    .state
-                    .surface
-                    .inbound_identity()
-                    .cloned(),
                 source_auth_context: None,
                 payment_context: None,
                 mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
@@ -24884,11 +24771,6 @@ mod fabric_send_tests {
                 trace_id: "trace-1".to_string(),
                 ucp_operation: None,
                 authenticated_identity: None,
-                inbound_identity: peer
-                    .state
-                    .surface
-                    .inbound_identity()
-                    .cloned(),
                 source_auth_context: None,
                 payment_context: None,
                 mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
@@ -24963,11 +24845,6 @@ mod fabric_send_tests {
                 trace_id: "trace-1".to_string(),
                 ucp_operation: None,
                 authenticated_identity: None,
-                inbound_identity: peer
-                    .state
-                    .surface
-                    .inbound_identity()
-                    .cloned(),
                 source_auth_context: None,
                 payment_context: None,
                 mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
@@ -25078,11 +24955,6 @@ mod fabric_send_tests {
                 trace_id: "trace-1".to_string(),
                 ucp_operation: None,
                 authenticated_identity: None,
-                inbound_identity: peer
-                    .state
-                    .surface
-                    .inbound_identity()
-                    .cloned(),
                 source_auth_context: None,
                 payment_context: None,
                 mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
@@ -25934,11 +25806,6 @@ mod fabric_send_tests {
                 trace_id: "trace-1".to_string(),
                 ucp_operation: None,
                 authenticated_identity: None,
-                inbound_identity: peer
-                    .state
-                    .surface
-                    .inbound_identity()
-                    .cloned(),
                 source_auth_context: None,
                 payment_context: None,
                 mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
@@ -25993,10 +25860,6 @@ mod fabric_send_tests {
         setup.state.surface = Arc::new(key_surface(&mut setup));
         let key_did = super::resolve_configured_caller_identity(
             &setup.state,
-            setup
-                .state
-                .surface
-                .inbound_identity(),
             "POST",
             "/a2a",
             "Fabric A2A",
@@ -26121,11 +25984,6 @@ mod fabric_send_tests {
                     trace_id: "trace-1".to_string(),
                     ucp_operation: None,
                     authenticated_identity: (!case.key_failed).then(|| key.clone()),
-                    inbound_identity: peer
-                        .state
-                        .surface
-                        .inbound_identity()
-                        .cloned(),
                     source_auth_context: Some(if case.key_failed {
                         crate::surface_context::SourceAuthContext::Failed {
                             attempted_method: "api_key_provider".to_string(),

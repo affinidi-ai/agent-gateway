@@ -157,38 +157,3 @@ Feature: Source authentication and target authentication over fabric
     And MCP server "bravo" did not receive header "x-target-api-key"
     And the MCP response id matches MCP server "bravo" forwarded request id
     And the MCP response result matches MCP server "bravo" response result
-
-  Scenario: gateway 2 refuses a caller whose API key method sets no identity the surface can derive
-    Given a fabric with 2 gateways
-    And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
-    And surface "alpha" requires "API Key" source authentication
-    And surface "alpha" identifies partner API key callers by their key and other callers from a JWT claim
-    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
-    When the caller asks gateway 1 MCP surface "charlie" for available tools with a valid API key
-    Then the response status is 401
-    And the MCP response is a JSON-RPC error with code -32603
-    And MCP server "bravo" was not called
-
-  Scenario: gateway 1 reports a Target credential whose method gateway 2 refuses
-    Given a fabric with 2 gateways
-    And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
-    And surface "alpha" requires "API Key" source authentication
-    And surface "alpha" identifies partner API key callers by their key and other callers from a JWT claim
-    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
-    And surface "charlie" injects target authentication from secret "bdd-gateway-1-key" with value "bdd-source-api-key" as header "x-api-key"
-    And the VP Audit Log of gateway 1 keeps every audit event
-    When the caller asks gateway 1 MCP surface "charlie" for available tools
-    Then the response status is 500
-    And the response says "target_auth_rejected"
-    And MCP server "bravo" was not called
-    And the VP Audit Log of gateway 1 records the Target credential as refused by the target
-
-  Scenario: gateway 2 serves a caller whose API key method identifies its callers
-    Given a fabric with 2 gateways
-    And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
-    And surface "alpha" requires "API Key" source authentication
-    And surface "alpha" identifies partner API key callers by their key and other callers from a JWT claim
-    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
-    When the caller asks gateway 1 MCP surface "charlie" for available tools with a valid partner API key
-    Then MCP server "bravo" received the forwarded MCP request
-    And the response status is 200

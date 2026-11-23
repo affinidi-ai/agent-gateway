@@ -726,14 +726,7 @@ pub(crate) async fn build_new_surface_payload(
                     .surface_config
                     .additional_source_auth,
             )
-            .map(|auth| {
-                config::source_auth::with_method_identity(
-                    config::source_auth::caller_authentication_method_json(auth),
-                    &world
-                        .surface_config
-                        .method_identities,
-                )
-            })
+            .map(config::source_auth::caller_authentication_method_json)
             .collect();
         access_point.insert("caller_authentication".to_string(), serde_json::json!({ "methods": methods }));
     }
@@ -2016,6 +2009,15 @@ async fn send_preflight_for_post(
         headers: collect_headers(response.headers()),
         body: serde_json::Value::Null,
     });
+}
+
+#[when(expr = "the operator tries to create the surface for route {string}")]
+async fn operator_tries_to_create_the_surface(
+    world: &mut SurfaceWorld,
+    route: String,
+) {
+    let payload = build_new_surface_payload(world, &route, false).await;
+    create_surface(world, payload).await;
 }
 
 #[when(expr = "the operator attempts to create a surface for route {string} with invalid configuration")]
@@ -5222,13 +5224,4 @@ fn caller_closes_mcp_response_stream(world: &mut SurfaceWorld) {
         .take()
         .expect("setup failed: the caller has no open MCP response stream to close");
     drop(stream);
-}
-
-#[when(expr = "the operator tries to create the surface for route {string}")]
-async fn operator_tries_to_create_the_surface(
-    world: &mut SurfaceWorld,
-    route: String,
-) {
-    let payload = build_new_surface_payload(world, &route, false).await;
-    create_surface(world, payload).await;
 }

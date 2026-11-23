@@ -611,11 +611,10 @@ allow if {
     }
 }
 
-/// A JWT Bearer method that sets no identity of its own, beside an inbound
-/// From API Key identity, has its authenticated callers refused with the generic
-/// `401` instead of resolving a caller DID.
+/// A JWT Bearer caller beside an inbound `from_api_key` identity, which reads
+/// only API keys, is served with no caller identity.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stored_surface_with_a_jwt_method_refuses_the_jwt_caller() {
+async fn a_jwt_caller_beside_an_api_key_identity_is_served_with_no_identity() {
     use helpers::jwt::{JwksFixture, now_secs, setup_jwt_claim_inbound_identity, sign_jwt};
     const SURFACE: &str = "jwt-method-api-key-identity";
 
@@ -648,7 +647,7 @@ async fn a_stored_surface_with_a_jwt_method_refuses_the_jwt_caller() {
         }),
         "e2e-test-key",
     );
-    let before = resolve_count(SURFACE, "source_method_mismatch");
+    let before = resolve_count(SURFACE, "api_key_unavailable");
 
     let response = reqwest::Client::new()
         .post(&h.gateway_url)
@@ -658,11 +657,9 @@ async fn a_stored_surface_with_a_jwt_method_refuses_the_jwt_caller() {
         .await
         .expect("inbound request failed");
 
-    assert_eq!(response.status(), 401);
-    let body = response.text().await.unwrap();
-    assert!(body.contains("Caller credential missing or invalid"), "{body}");
-    assert_eq!(resolve_count(SURFACE, "source_method_mismatch") - before, 1);
-    assert_eq!(forwarded(&h), 0);
+    assert_eq!(response.status(), 200);
+    assert_eq!(resolve_count(SURFACE, "api_key_unavailable") - before, 0);
+    assert_eq!(forwarded(&h), 1);
 }
 
 /// Every value of a plain API Key secret is one caller: the secret's DID,

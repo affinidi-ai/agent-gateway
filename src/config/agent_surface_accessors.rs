@@ -21,14 +21,6 @@ use super::types::{
     TimeoutConfig,
 };
 
-/// The kind of Caller Context method an inbound identity reads, and how it
-/// is named in messages.
-pub struct InboundCredentialRule {
-    pub identity: &'static str,
-    pub accepts: fn(&crate::source_auth::SourceAuthConfig) -> bool,
-    pub needed: &'static str,
-}
-
 impl AgentSurface {
     // ── Identity / addressing ───────────────────────────────────────────────
 
@@ -111,107 +103,6 @@ impl AgentSurface {
             && methods.iter().all(
                 |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
             )
-    }
-
-    /// The `mode` label of the identity-resolution metric for a caller verified by
-    /// `method`: its own identity's, else the inbound slot's.
-    pub fn inbound_identity_mode_label(
-        &self,
-        method: &crate::source_auth::SourceAuthConfig,
-    ) -> &'static str {
-        match method
-            .identity()
-            .or(self.inbound_identity())
-        {
-            Some(crate::source_auth::ManagedIdentityConfig::FromApiKey { .. }) => "from_api_key",
-            _ => "from_jwt_claim",
-        }
-    }
-
-    /// Whether some caller-authentication method sets its own caller identity.
-    pub fn some_method_sets_its_own_identity(&self) -> bool {
-        self.source_auth_methods()
-            .iter()
-            .any(|method| method.identity().is_some())
-    }
-
-    /// Whether the callers of some caller-authentication method get an inbound
-    /// identity: the method's own, or the surface's.
-    pub fn some_method_gets_an_identity(&self) -> bool {
-        self.source_auth_methods()
-            .iter()
-            .any(|method| matches!(self.inbound_identity_for(Some(method)), Ok(Some(_))))
-    }
-
-    /// Whether the callers of some caller-authentication method are refused for
-    /// their valid credential (see [`Self::inbound_identity_for`]).
-    pub fn refuses_the_callers_of_a_method(&self) -> bool {
-        self.source_auth_methods()
-            .iter()
-            .any(|method| {
-                self.inbound_identity_for(Some(method))
-                    .is_err()
-            })
-    }
-
-    /// The kind of Caller Context method the inbound identity reads, when it
-    /// reads a caller credential (`from_jwt_claim` or `from_api_key`).
-    pub fn inbound_credential_rule(&self) -> Option<InboundCredentialRule> {
-        use crate::source_auth::{ManagedIdentityConfig, SourceAuthConfig};
-
-        match self.inbound_identity()? {
-            ManagedIdentityConfig::FromJwtClaim { .. } => Some(InboundCredentialRule {
-                identity: "from_jwt_claim",
-                accepts: |method| matches!(method, SourceAuthConfig::JwtBearer(_)),
-                needed: "a jwt_bearer method",
-            }),
-            ManagedIdentityConfig::FromApiKey { .. } => Some(InboundCredentialRule {
-                identity: "from_api_key",
-                accepts: |method| matches!(method, SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_)),
-                needed: "an api_key or api_key_provider method",
-            }),
-            _ => None,
-        }
-    }
-
-    /// The inbound identity of a caller verified by `method` (`None`: no source
-    /// authentication). A method that sets its own identity gives it, unless that
-    /// identity cannot read the method's credential or the surface's inbound
-    /// identity is read from the request body, which a caller could assert instead
-    /// of its credential; otherwise the surface's inbound identity applies, unless it reads a caller credential this method does not
-    /// carry. A caller is refused, with the reason, rather than given an identity
-    /// from a credential it did not present.
-    pub fn inbound_identity_for<'a>(
-        &'a self,
-        method: Option<&'a crate::source_auth::SourceAuthConfig>,
-    ) -> Result<Option<&'a crate::source_auth::ManagedIdentityConfig>, String> {
-        let Some(method) = method else {
-            return Ok(self.inbound_identity());
-        };
-        if let Some(identity) = method.identity() {
-            if !method.identity_reads_its_credential() {
-                return Err(format!(
-                    "{} method sets an identity that cannot read its credential",
-                    method.method_tag_with_article()
-                ));
-            }
-            if self.inbound_identity_requires_payload() {
-                return Err(format!(
-                    "{} method sets its own identity beside an inbound identity read from the request body",
-                    method.method_tag_with_article()
-                ));
-            }
-            return Ok(Some(identity));
-        }
-        match self.inbound_credential_rule() {
-            Some(rule) if !(rule.accepts)(method) => Err(format!(
-                "inbound {} identity needs {}, but the caller authenticated with {} method that has no identity of its own",
-                rule.identity,
-                rule.needed,
-                method.method_tag_with_article()
-            )),
-            _ => Ok(self.inbound_identity()),
-        }
     }
 
     #[inline]
@@ -612,6 +503,23 @@ impl AgentSurface {
     #[inline]
     pub fn inbound_identity_from_api_key(&self) -> bool {
         matches!(self.identity_slots.inbound, Some(crate::source_auth::ManagedIdentityConfig::FromApiKey { .. }))
+    }
+
+    /// Whether the inbound identity can be derived for `caller`. An identity
+    /// read from a credential reads one kind: `from_jwt_claim` a JWT Bearer
+    /// token, `from_api_key` an API key. A caller verified by a method of
+    /// another kind gets no inbound identity and is served without one.
+    pub fn inbound_identity_reads(
+        &self,
+        caller: &crate::source_auth::AuthenticatedIdentity,
+    ) -> bool {
+        use crate::source_auth::{AuthenticatedIdentity, ManagedIdentityConfig};
+
+        match self.inbound_identity() {
+            Some(ManagedIdentityConfig::FromJwtClaim { .. }) => caller.jwt_claims().is_some(),
+            Some(ManagedIdentityConfig::FromApiKey { .. }) => matches!(caller, AuthenticatedIdentity::ApiKey { .. }),
+            _ => true,
+        }
     }
 
     /// Slot 2 — protected agent identity extracted from response (MA → AP).
@@ -1106,9 +1014,7 @@ impl AgentSurface {
     ///   Identity element on the inbound (CA→AP) edge is treated as an
     ///   explicit signal that the caller identity should travel onwards —
     ///   otherwise the user has no way to enable VP injection through the
-    ///   surface builder, which doesn't expose a separate toggle, or
-    /// - a caller-authentication method sets its own caller identity, which
-    ///   stands in for the inbound slot for that method's callers.
+    ///   surface builder, which doesn't expose a separate toggle.
     #[inline]
     pub fn inject_identity_vp(&self) -> bool {
         self.target
@@ -1118,7 +1024,6 @@ impl AgentSurface {
                 .identity_slots
                 .inbound
                 .is_some()
-            || self.some_method_sets_its_own_identity()
     }
 
     /// The primary target's Workload Binding config, when set and enabled.
@@ -1418,6 +1323,71 @@ impl super::agent_surface::CredentialInjection {
 mod tests {
     use super::*;
     use crate::config::agent_surface::{AccessPoint, IdentityInjectionConfig, SurfaceStatus};
+
+    mod inbound_identity_reads {
+        use crate::source_auth::{AuthenticatedIdentity, ManagedIdentityConfig};
+
+        fn surface(inbound: Option<ManagedIdentityConfig>) -> crate::config::agent_surface::AgentSurface {
+            let mut surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+                "surface_id": "s1", "name": "mixed",
+                "access_point": {"listen_address": "0.0.0.0:8443", "route": "/mixed", "protocol": "a2a"},
+                "target": {"endpoint": "https://agent.internal"}
+            }))
+            .unwrap();
+            surface.identity_slots.inbound = inbound;
+            surface
+        }
+
+        fn jwt_caller() -> AuthenticatedIdentity {
+            AuthenticatedIdentity::JwtBearer {
+                subject: "alice".to_string(),
+                principal_claim: "sub".to_string(),
+                claims: serde_json::json!({"iss": "https://idp.example", "sub": "alice"}),
+                strategy_id: None,
+                verification: Default::default(),
+            }
+        }
+
+        fn api_key_caller() -> AuthenticatedIdentity {
+            AuthenticatedIdentity::ApiKey {
+                key_name: "partner-keys".to_string(),
+                provider_agent_id: None,
+            }
+        }
+
+        #[test]
+        fn a_jwt_claim_identity_reads_only_jwt_callers() {
+            let surface = surface(Some(ManagedIdentityConfig::FromJwtClaim {
+                claim: "oid".to_string(),
+                namespace_claims: Vec::new(),
+            }));
+
+            assert!(surface.inbound_identity_reads(&jwt_caller()));
+            assert!(!surface.inbound_identity_reads(&api_key_caller()));
+        }
+
+        #[test]
+        fn an_api_key_identity_reads_only_api_key_callers() {
+            let surface = surface(Some(ManagedIdentityConfig::FromApiKey { api_key_id: None }));
+
+            assert!(surface.inbound_identity_reads(&api_key_caller()));
+            assert!(!surface.inbound_identity_reads(&jwt_caller()));
+        }
+
+        #[test]
+        fn an_identity_read_from_no_credential_reads_every_caller() {
+            for inbound in [
+                None,
+                Some(ManagedIdentityConfig::Static {
+                    did: "did:web:caller.example".to_string(),
+                }),
+            ] {
+                let surface = surface(inbound);
+                assert!(surface.inbound_identity_reads(&jwt_caller()));
+                assert!(surface.inbound_identity_reads(&api_key_caller()));
+            }
+        }
+    }
 
     fn agent_pay(gateway_id: &str) -> crate::config::agent_surface::PaymentPolicy {
         serde_json::from_value(serde_json::json!({
@@ -1802,14 +1772,6 @@ mod tests {
     }
 
     #[test]
-    fn inject_identity_vp_true_when_a_method_identifies_its_callers() {
-        let s = surface_with_methods(serde_json::json!([{ "type": "api_key",
-            "extraction": { "source": "http_header", "field": "X-API-Key" }, "secret_id": "keys",
-            "identity": { "type": "from_api_key" } }]));
-        assert!(s.inject_identity_vp(), "a method's own caller identity travels onwards as the slot's does");
-    }
-
-    #[test]
     fn has_managed_identity_reads_the_target_and_every_transit_point() {
         let mut point: crate::config::agent_surface::TransitPoint =
             serde_json::from_value(serde_json::json!({"alias": "out", "target_endpoint": "https://out.example"}))
@@ -2069,139 +2031,5 @@ mod tests {
             "did:web:planner.example",
             "a view that cannot release grants to partners keeps them per agent"
         );
-    }
-
-    fn mixed_surface(inbound: Option<serde_json::Value>) -> AgentSurface {
-        let mut surface = surface_with_methods(serde_json::json!([
-            {"type": "jwt_bearer", "jwt_verification_strategy_id": "st", "audiences": ["a"]},
-            {"type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "keys",
-             "identity": {"type": "from_api_key"}},
-            {"type": "api_key", "extraction": {"source": "http_header", "field": "X-Legacy"}, "secret_id": "old"}
-        ]));
-        surface.identity_slots.inbound = inbound.map(|value| serde_json::from_value(value).unwrap());
-        surface
-    }
-
-    fn identity_type(identity: Option<&crate::source_auth::ManagedIdentityConfig>) -> Option<String> {
-        identity.map(|identity| {
-            serde_json::to_value(identity).unwrap()["type"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        })
-    }
-
-    #[test]
-    fn a_method_with_its_own_identity_derives_it_whatever_the_surface_identity_is() {
-        for inbound in [None, Some(serde_json::json!({"type": "from_jwt_claim"}))] {
-            let surface = mixed_surface(inbound);
-            let method = &surface.source_auth_methods()[1];
-            assert_eq!(
-                surface
-                    .inbound_identity_for(Some(method))
-                    .map(identity_type),
-                Ok(Some("from_api_key".to_string()))
-            );
-        }
-    }
-
-    #[test]
-    fn a_method_without_its_own_identity_derives_the_surface_identity_it_can_read() {
-        let surface = mixed_surface(Some(serde_json::json!({"type": "from_jwt_claim", "claim": "oid"})));
-        let jwt = &surface.source_auth_methods()[0];
-        assert_eq!(
-            surface
-                .inbound_identity_for(Some(jwt))
-                .map(identity_type),
-            Ok(Some("from_jwt_claim".to_string()))
-        );
-    }
-
-    #[test]
-    fn a_method_the_surface_credential_identity_cannot_read_is_refused() {
-        for (inbound, position, expected) in [
-            (
-                "from_jwt_claim",
-                2,
-                "inbound from_jwt_claim identity needs a jwt_bearer method, but the caller authenticated with an api_key method that has no identity of its own",
-            ),
-            (
-                "from_api_key",
-                0,
-                "inbound from_api_key identity needs an api_key or api_key_provider method, but the caller authenticated with a jwt_bearer method that has no identity of its own",
-            ),
-        ] {
-            let surface = mixed_surface(Some(serde_json::json!({"type": inbound})));
-            let method = &surface.source_auth_methods()[position];
-            assert_eq!(
-                surface
-                    .inbound_identity_for(Some(method))
-                    .map(identity_type),
-                Err(expected.to_string()),
-                "{inbound}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_surface_identity_that_reads_no_credential_applies_to_every_method() {
-        let payload = serde_json::json!({"type": "payload_extraction", "meta_field": "agent", "fields": ["id"]});
-        for inbound in [None, Some(payload)] {
-            let expected = inbound
-                .as_ref()
-                .map(|_| "payload_extraction".to_string());
-            let surface = mixed_surface(inbound);
-            for position in [0, 2] {
-                let method = &surface.source_auth_methods()[position];
-                assert_eq!(
-                    surface
-                        .inbound_identity_for(Some(method))
-                        .map(identity_type),
-                    Ok(expected.clone())
-                );
-            }
-            assert_eq!(
-                surface
-                    .inbound_identity_for(None)
-                    .map(identity_type),
-                Ok(expected)
-            );
-        }
-    }
-
-    #[test]
-    fn a_method_identity_that_cannot_read_its_credential_refuses_its_callers() {
-        let surface = surface_with_methods(serde_json::json!([{ "type": "jwt_bearer",
-            "jwt_verification_strategy_id": "st", "audiences": ["a"], "identity": { "type": "from_api_key" } }]));
-        let method = &surface.source_auth_methods()[0];
-        assert_eq!(
-            surface
-                .inbound_identity_for(Some(method))
-                .map(identity_type),
-            Err("a jwt_bearer method sets an identity that cannot read its credential".to_string())
-        );
-    }
-
-    #[test]
-    fn a_method_identity_beside_an_inbound_identity_read_from_the_body_refuses_its_callers() {
-        let surface = mixed_surface(Some(
-            serde_json::json!({"type": "payload_extraction", "meta_field": "agent", "fields": ["id"]}),
-        ));
-        let method = &surface.source_auth_methods()[1];
-        assert_eq!(
-            surface
-                .inbound_identity_for(Some(method))
-                .map(identity_type),
-            Err("an api_key method sets its own identity beside an inbound identity read from the request body"
-                .to_string())
-        );
-    }
-
-    #[test]
-    fn the_mode_label_follows_the_method_identity_before_the_slot() {
-        let surface = mixed_surface(Some(serde_json::json!({"type": "from_jwt_claim"})));
-        let methods = surface.source_auth_methods();
-        assert_eq!(surface.inbound_identity_mode_label(&methods[0]), "from_jwt_claim");
-        assert_eq!(surface.inbound_identity_mode_label(&methods[1]), "from_api_key");
     }
 }

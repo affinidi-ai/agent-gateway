@@ -16,30 +16,6 @@ pub fn api_key_source_auth_method_json(
     })
 }
 
-/// Give a caller authentication method its callers' own identity when `method_identities`
-/// lists its type: `jwt_claim` (the `sub` claim, namespaced by `iss`) or `api_key` (the key
-/// the caller presents).
-pub fn with_method_identity(
-    mut method: Value,
-    method_identities: &[(String, String)],
-) -> Value {
-    let method_type = method["type"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    if let Some((_, kind)) = method_identities
-        .iter()
-        .find(|(listed, _)| *listed == method_type)
-    {
-        method["identity"] = match kind.as_str() {
-            "jwt_claim" => json!({ "type": "from_jwt_claim", "claim": "sub", "namespace_claims": ["iss"] }),
-            "api_key" => json!({ "type": "from_api_key" }),
-            other => panic!("unsupported method identity: {other}"),
-        };
-    }
-    method
-}
-
 pub fn caller_authentication_method_json(config: &SurfaceSourceAuthConfig) -> Value {
     match config {
         SurfaceSourceAuthConfig::JwtBearer(cfg) => {

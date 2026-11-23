@@ -159,12 +159,18 @@ describe('identity From API Key — Caller Context dependency', () => {
     expect(fromApiKeyErrors([accessPoint, callerAuth(method), inbound], inbound)).toEqual([]);
   });
 
-  it('passes beside a further method that is not an API key, whose callers are refused', () => {
+  it('passes beside a Caller Context method that is not an API key', () => {
     const mixed = {
-      ...callerAuth('api_key'),
-      config: { methods: [{ method_type: 'api_key' }, { method_type: 'jwt_bearer' }] },
+      ...callerAuth('jwt_bearer'),
+      config: { methods: [{ method_type: 'jwt_bearer' }, { method_type: 'api_key' }] },
     };
     expect(fromApiKeyErrors([accessPoint, mixed, inbound], inbound)).toEqual([]);
+  });
+
+  it('is an error when no Caller Context method is an API key', () => {
+    expect(fromApiKeyErrors([accessPoint, callerAuth('jwt_bearer'), inbound], inbound)).toEqual([
+      INBOUND_API_KEY_NEEDS_API_KEY_CALLER,
+    ]);
   });
 
   it('does not apply to the protected node', () => {

@@ -921,7 +921,6 @@ fn audited_auth_failure_reason(failure: &str) -> &'static str {
     match failure {
         "a missing credential" => "missing_credential",
         "an invalid credential" => "invalid_credential",
-        "a valid credential of a method the inbound identity does not read" => "source_method_mismatch",
         other => panic!("no audited reason for the source authentication failure '{other}'"),
     }
 }
@@ -3154,6 +3153,33 @@ fn named_managed_agent_received_two_binding_vps_for_different_dids(
     let first = get_did_from_a2a_binding_request(&observations.requests[0], "first managed agent request");
     let second = get_did_from_a2a_binding_request(&observations.requests[1], "second managed agent request");
     assert_ne!(first, second, "identity-binding VP holder DIDs should differ");
+}
+
+#[then(expr = "managed agent {string} received the forwarded request with a VP proving the caller Agent DID")]
+fn named_managed_agent_received_a_binding_vp_for_the_caller(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    let request = get_observed_request_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
+    let did = get_did_from_a2a_binding_request(request, &format!("managed agent '{agent_name}'"));
+    assert!(did.starts_with("did:"), "the identity-binding VP should prove a caller Agent DID, got {did}");
+}
+
+#[then(expr = "managed agent {string} received the forwarded request with no caller identity")]
+fn named_managed_agent_received_no_caller_identity(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    let request = get_observed_request_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
+    let body = request.json_body();
+    for uri in [AGENT_IDENTITY_BINDING_URI, AGENT_IDENTITY_CREDENTIAL_URI] {
+        let pointer = format!("/params/message/metadata/{}", uri.replace('/', "~1"));
+        assert!(
+            body.pointer(&pointer)
+                .is_none(),
+            "managed agent '{agent_name}' should receive no caller identity proof '{uri}', got body: {body}"
+        );
+    }
 }
 
 #[then(expr = "managed agent {string} received two forwarded requests with VPs proving the same caller Agent DID")]

@@ -73,9 +73,7 @@ pub struct CompiledIdentityEngines {
 /// the three identity slots straight off `AgentSurface.identity_slots`. The surface has
 /// no top-level `managed_identity` field — that was a `ChannelMapping`-only
 /// legacy slot — so the channel-wide engine here falls back through
-/// `inbound → protected → external` only. A caller-authentication method's
-/// own identity builds none: its callers' identity is read from their
-/// credential, never from an identity the request body asserts.
+/// `inbound → protected → external` only.
 ///
 /// Per-slot engines (`protected_*`, `external_*`) are compiled independently
 /// so each slot keeps its own schema and rules.
@@ -325,27 +323,6 @@ mod tests {
             selector
                 .validate(&json!({}))
                 .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn compile_builds_no_selector_from_a_method_that_identifies_its_callers() {
-        let (vc_issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
-        let issuer = Arc::new(vc_issuer);
-        let mut surface = base_test_surface();
-        surface
-            .access_point
-            .caller_authentication = Some(
-            serde_json::from_value(json!({"methods": [{"type": "api_key",
-                "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "keys",
-                "identity": {"type": "from_api_key"}}]}))
-            .unwrap(),
-        );
-
-        let engines = compile_identity_engines_from_surface(&surface, Some(&issuer)).expect("compile should succeed");
-        assert!(
-            engines.selector.is_none(),
-            "a body identity must not resolve for the callers of a method that reads theirs from the credential"
         );
     }
 

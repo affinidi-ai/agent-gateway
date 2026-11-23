@@ -2222,8 +2222,8 @@ fn collect_identity_injection_references(
 }
 
 /// The API Key Provider key ids a surface, or one of its views, derives a DID from (`keys`),
-/// and the Caller Context API Key `secret_id`s shaped like a key id of a method whose callers
-/// are identified From API Key (`legacy_secrets`), which a secret stored before the prefix was
+/// and the Caller Context API Key `secret_id`s shaped like a key id on a view whose inbound
+/// Identity is From API Key (`legacy_secrets`), which a secret stored before the prefix was
 /// reserved can still carry. Both sorted and without duplicates.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProviderKeyIds {
@@ -2281,20 +2281,21 @@ impl ProviderKeyIds {
                     .as_ref(),
             );
         }
-        for method in view
-            .access_point
-            .caller_authentication
-            .iter()
-            .flat_map(|authentication| &authentication.methods)
-        {
-            if let SourceAuthConfig::ApiKey(config) = method
-                && matches!(view.inbound_identity_for(Some(method)), Ok(Some(ManagedIdentityConfig::FromApiKey { .. })))
-                && config
-                    .secret_id
-                    .starts_with(crate::api_keys::KEY_ID_PREFIX)
+        if matches!(view.inbound_identity(), Some(ManagedIdentityConfig::FromApiKey { .. })) {
+            for method in view
+                .access_point
+                .caller_authentication
+                .iter()
+                .flat_map(|authentication| &authentication.methods)
             {
-                self.legacy_secrets
-                    .push(config.secret_id.clone());
+                if let SourceAuthConfig::ApiKey(config) = method
+                    && config
+                        .secret_id
+                        .starts_with(crate::api_keys::KEY_ID_PREFIX)
+                {
+                    self.legacy_secrets
+                        .push(config.secret_id.clone());
+                }
             }
         }
     }
@@ -3779,36 +3780,6 @@ mod tests {
             provider_key_ids(&untyped)
                 .unwrap()
                 .is_empty()
-        );
-    }
-
-    #[test]
-    fn a_caller_secret_shaped_like_a_key_counts_when_its_method_identifies_callers_from_api_key() {
-        let with_methods = |methods: serde_json::Value| {
-            let mut surface = AgentSurface::default();
-            surface
-                .access_point
-                .caller_authentication = Some(serde_json::from_value(serde_json::json!({"methods": methods})).unwrap());
-            surface
-        };
-        let key_method = |secret_id: &str, identity: bool| {
-            let mut method = serde_json::json!({"type": "api_key",
-                "extraction": {"source": "http_header", "field": secret_id}, "secret_id": secret_id});
-            if identity {
-                method["identity"] = serde_json::json!({"type": "from_api_key"});
-            }
-            method
-        };
-
-        let surface = with_methods(serde_json::json!([
-            key_method("atgk_own_identity", true),
-            key_method("atgk_no_identity", false)
-        ]));
-        assert_eq!(
-            provider_key_ids(&surface)
-                .unwrap()
-                .legacy_secrets,
-            ["atgk_own_identity"]
         );
     }
 

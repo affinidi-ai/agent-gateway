@@ -10,9 +10,7 @@ import { deepLinks } from '../../../../utils/deepLinks';
 import { HEADER_METADATA_EXTENSION_URI } from '../_shared/headerMetadataMapping';
 import { transitPointProtocol } from '../transit-point/TransitPointPanel';
 import FieldHelp from '../../../shared/FieldHelp';
-import { callerAuthNode as findCallerAuthNode, isInboundIdentity } from './placement';
-import { readMethods } from '../caller-auth/methods';
-import MethodIdentityList from './MethodIdentityList';
+import { isInboundIdentity } from './placement';
 import {
   apiKeyReferenceWarningText,
   storedApiKeyProblem,
@@ -162,7 +160,6 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
   node,
   config,
   updateField,
-  updateNodeFields,
   protocol,
   openFullscreenEditor,
   allNodes,
@@ -236,13 +233,6 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
     (node.slotId === 'request:identity-managed_identity' ||
       node.slotId === 'response:identity-managed_identity') &&
     (parentTransitProtocol === 'a2a' || parentTransitProtocol === 'ap2');
-  const callerAuthNode = findCallerAuthNode(allNodes ?? []);
-  const callerMethods = callerAuthNode ? readMethods(callerAuthNode.config) : [];
-  const listsMethodIdentities =
-    isInbound &&
-    !!callerAuthNode &&
-    ((callerMethods.length > 1 && extractionType !== 'from_payload') ||
-      callerMethods.some(method => method.identity));
   const canUseHeaderMetadata =
     extractionType === 'from_payload' && (isInboundA2aIdentity || isTransitPointA2aIdentity);
 
@@ -272,10 +262,9 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
           value={extractionType}
           onChange={e => {
             const nextType = e.target.value as ExtractionType;
-            if (nextType !== '' && !isSelectableExtractionType(nextType, extractionTypeOptions)) {
-              return;
+            if (nextType === '' || isSelectableExtractionType(nextType, extractionTypeOptions)) {
+              updateField('type', nextType);
             }
-            updateField('type', nextType);
           }}
         >
           <option value="">Select an identity extraction type…</option>
@@ -307,14 +296,6 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
           </ul>
         </Form.Text>
       </div>
-
-      {listsMethodIdentities && updateNodeFields && (
-        <MethodIdentityList
-          surfaceType={extractionType}
-          methods={callerMethods}
-          onChange={methods => updateNodeFields(callerAuthNode.id, { methods })}
-        />
-      )}
 
       {extractionType === 'from_payload' && (
         <>

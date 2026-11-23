@@ -1,8 +1,8 @@
 Feature: Inbound identity derived from a JWT claim
   An Access Point whose inbound identity comes from a JWT claim cannot derive a
   caller identity without a valid JWT, so it refuses the caller before policy.
-  Beside other methods it reads the JWT Bearer method, and refuses the callers of
-  the methods that set no identity of their own.
+  A caller authenticated by another Caller Context method is served with no
+  identity.
 
   Scenario Outline: An Access Point deriving the inbound identity from a JWT claim refuses a caller whose token is missing or invalid
     Given an A2A surface targeting managed agent "bravo"
@@ -49,9 +49,9 @@ Feature: Inbound identity derived from a JWT claim
     And the operator has created the surface for route "/example"
     When the caller sends a request to the surface with a valid token
     Then the response status is 200
-    And managed agent "bravo" received a forwarded request
+    And managed agent "bravo" received the forwarded request with a VP proving the caller Agent DID
 
-  Scenario: A surface mixing JWT Bearer and API Key serves a caller whose token supplies the inbound identity
+  Scenario: A surface deriving the inbound identity from a JWT claim gives a token caller beside an API key method its identity
     Given an A2A surface targeting managed agent "bravo"
     And the surface accepts "JWT Bearer" and "API Key" source authentication
     And the surface derives the inbound identity from a JWT claim
@@ -59,23 +59,19 @@ Feature: Inbound identity derived from a JWT claim
     And the operator has created the surface for route "/example"
     When the caller sends a request to the surface with a valid token
     Then the response status is 200
-    And managed agent "bravo" received a forwarded request
+    And managed agent "bravo" received the forwarded request with a VP proving the caller Agent DID
 
-  Scenario: A surface mixing JWT Bearer and API Key refuses a caller whose API key is not the source of the inbound identity
+  Scenario: A surface deriving the inbound identity from a JWT claim serves an API key caller with no identity
     Given an A2A surface targeting managed agent "bravo"
-    And the VP Audit Log keeps every audit event
     And the surface accepts "JWT Bearer" and "API Key" source authentication
     And the surface derives the inbound identity from a JWT claim
     And the surface accepts JWT audience "bdd-test-audience"
     And the operator has created the surface for route "/example"
     When the caller sends a request to the surface with a valid API key
-    Then the response status is 401
-    And managed agent "bravo" was not called
-    And the response content type is "application/problem+json"
-    And the response says only that the caller credential is missing or invalid
-    And the VP Audit Log records a blocking "API Key" source authentication failure for "a valid credential of a method the inbound identity does not read"
+    Then the response status is 200
+    And managed agent "bravo" received the forwarded request with no caller identity
 
-  Scenario: A surface with no JWT Bearer method is refused an inbound identity from a JWT claim
+  Scenario: A surface deriving the inbound identity from a JWT claim without a JWT Bearer method is refused at save
     Given an A2A surface targeting managed agent "bravo"
     And the surface requires "API Key" source authentication
     And the surface derives the inbound identity from a JWT claim
