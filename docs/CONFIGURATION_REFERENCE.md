@@ -627,8 +627,8 @@ unexpected identity-provider role to `administrator` grants full management acce
 treat it as a security-relevant setting rather than a convenience.
 
 A role comes only from an explicit `role_mapping` entry. The identity provider may send several
-role values; the highest role any of them maps to wins, whatever their order, and values with no
-entry are ignored. When no value has an entry, or the sign-in has no role value, the sign-in gets
+role values, in one attribute, in repeated attributes or in several attribute statements; the highest
+role any of them maps to wins, whatever their order, and values with no entry are ignored. When no value has an entry, or the sign-in has no role value, the sign-in gets
 `default_role` when it is set and is otherwise refused: the browser gets a `403` page, no user is
 created or updated and a stored role is left as it was, so an existing session or token keeps its
 rights until it is revoked by hand. A value that merely looks like a gateway role, such as `admin`,

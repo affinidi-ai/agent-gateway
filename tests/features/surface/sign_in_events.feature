@@ -80,6 +80,24 @@ Feature: Sign-in integration events
     And that event reports the user role "poweruser"
     And the integration receives no other sign-in event besides the first user's
 
+  Scenario: A SAML sign-in whose role is in a second attribute statement gets the mapped role
+    Given human users sign in with SAML
+    And "alpha" has signed in with SAML as the first user and that event was received
+    When "mallory" signs in with SAML carrying the identity provider roles "gw-admins" in a second attribute statement
+    Then the response status is 200
+    And the integration receives a "user.login" event with login method "saml" for user "mallory"
+    And that event reports the user role "administrator"
+    And the integration receives no other sign-in event besides the first user's
+
+  Scenario: A SAML sign-in whose roles come as repeated attributes gets the highest mapped one
+    Given human users sign in with SAML
+    And "alpha" has signed in with SAML as the first user and that event was received
+    When "mallory" signs in with SAML carrying the identity provider roles "gw-admins,contractors" as repeated attributes
+    Then the response status is 200
+    And the integration receives a "user.login" event with login method "saml" for user "mallory"
+    And that event reports the user role "administrator"
+    And the integration receives no other sign-in event besides the first user's
+
   Scenario: A SAML sign-in whose role is named like a gateway role but not mapped is refused
     Given human users sign in with SAML
     And "alpha" has signed in with SAML as the first user and that event was received

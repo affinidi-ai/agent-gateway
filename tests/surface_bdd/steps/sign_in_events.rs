@@ -9,6 +9,7 @@ use crate::bdd_support::admin_client::{AdminApiClient, recorded_response};
 use crate::bdd_support::gateway_process::SURFACE_TEST_AUTH_TOKEN;
 use crate::bdd_support::passkey::SoftPasskey;
 use crate::bdd_support::redis_stream::RedisStreamStandIn;
+use crate::bdd_support::saml_idp::RoleLayout;
 use crate::bdd_support::sign_in_events::{
     ACCOUNT_DATA_FIELDS, APPLIANCE_ID, ENVELOPE_FIELDS, EVENT_TOPIC, NO_ACCOUNT_DATA_FIELDS, RECORD_FIELDS,
     RECORD_TOPIC, STATE_FIELDS, golden, golden_path, keys, names, normalise, updates_golden, write_golden,
@@ -344,6 +345,35 @@ async fn sign_in_with_saml_roles(
     subject: String,
     roles: String,
 ) {
+    sign_in_with_saml_layout(world, subject, roles, RoleLayout::SameStatement).await;
+}
+
+#[when(
+    expr = "{string} signs in with SAML carrying the identity provider roles {string} in a second attribute statement"
+)]
+async fn sign_in_with_saml_roles_in_a_second_statement(
+    world: &mut SurfaceWorld,
+    subject: String,
+    roles: String,
+) {
+    sign_in_with_saml_layout(world, subject, roles, RoleLayout::SecondStatement).await;
+}
+
+#[when(expr = "{string} signs in with SAML carrying the identity provider roles {string} as repeated attributes")]
+async fn sign_in_with_saml_roles_as_repeated_attributes(
+    world: &mut SurfaceWorld,
+    subject: String,
+    roles: String,
+) {
+    sign_in_with_saml_layout(world, subject, roles, RoleLayout::RepeatedAttribute).await;
+}
+
+async fn sign_in_with_saml_layout(
+    world: &mut SurfaceWorld,
+    subject: String,
+    roles: String,
+    layout: RoleLayout,
+) {
     ensure_gateway_running(world).await;
     let roles: Vec<String> = roles
         .split(',')
@@ -356,7 +386,8 @@ async fn sign_in_with_saml_roles(
         .as_ref()
         .expect("the gateway runs");
     let answer =
-        crate::bdd_support::saml_idp::sign_in(infra._temp_dir.path(), infra.gateway_port, &subject, &roles).await;
+        crate::bdd_support::saml_idp::sign_in(infra._temp_dir.path(), infra.gateway_port, &subject, &roles, layout)
+            .await;
     world.caller_response = Some(crate::bdd_support::admin_client::RecordedResponse {
         status: answer.status,
         headers: Default::default(),

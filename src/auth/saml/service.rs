@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use openssl::pkey::PKey;
 use openssl::x509::X509;
-use samael::schema::{Assertion, Conditions, Response};
+use samael::schema::{Assertion, AttributeStatement, Conditions, Response};
 use std::collections::HashMap;
 use std::fs;
 use tracing::{info, warn};
@@ -439,26 +439,11 @@ impl SamlService {
         &self,
         assertion: &Assertion,
     ) -> Result<SamlAttributes> {
-        let mut attributes = SamlAttributes::new();
-
-        // attribute_statements is Option<Vec<AttributeStatement>>
-        if let Some(statements) = &assertion.attribute_statements
-            && let Some(attribute_statement) = statements.first()
-        {
-            for attr in &attribute_statement.attributes {
-                // Use 'values' instead of 'attribute_values' per samael API
-                if let Some(name) = &attr.name {
-                    let values: Vec<String> = attr
-                        .values
-                        .iter()
-                        .filter_map(|attr_value| attr_value.value.clone())
-                        .collect();
-                    if !values.is_empty() {
-                        attributes.insert(name.clone(), values);
-                    }
-                }
-            }
-        }
+        let mut attributes = assertion
+            .attribute_statements
+            .as_deref()
+            .map(collect_attributes)
+            .unwrap_or_default();
 
         // Also extract NameID if present
         if let Some(subject) = &assertion.subject
@@ -474,6 +459,32 @@ impl SamlService {
     pub fn config(&self) -> &SamlConfig {
         &self.config
     }
+}
+
+/// Gather every value of every attribute across all attribute statements, appending the values of
+/// an attribute that appears more than once, in document order.
+fn collect_attributes(statements: &[AttributeStatement]) -> SamlAttributes {
+    let mut attributes = SamlAttributes::new();
+    for attribute in statements
+        .iter()
+        .flat_map(|statement| &statement.attributes)
+    {
+        let Some(name) = &attribute.name else {
+            continue;
+        };
+        let values = attribute
+            .values
+            .iter()
+            .filter_map(|value| value.value.clone());
+        let collected = attributes
+            .entry(name.clone())
+            .or_default();
+        collected.extend(values);
+        if collected.is_empty() {
+            attributes.remove(name);
+        }
+    }
+    attributes
 }
 
 /// Reject a SAML response that carries an `EncryptedAssertion` element or
@@ -712,6 +723,63 @@ mod tests {
             one_time_use: None,
             proxy_restriction: None,
         }
+    }
+
+    fn attribute(
+        name: &str,
+        values: &[&str],
+    ) -> samael::attribute::Attribute {
+        samael::attribute::Attribute {
+            friendly_name: None,
+            name: Some(name.to_string()),
+            name_format: None,
+            values: values
+                .iter()
+                .map(|value| samael::attribute::AttributeValue {
+                    attribute_type: None,
+                    value: Some(value.to_string()),
+                })
+                .collect(),
+        }
+    }
+
+    fn statement(attributes: Vec<samael::attribute::Attribute>) -> AttributeStatement {
+        AttributeStatement { attributes }
+    }
+
+    #[test]
+    fn a_repeated_attribute_keeps_the_values_of_every_occurrence_in_order() {
+        let collected = collect_attributes(&[statement(vec![
+            attribute("role", &["gw-admins"]),
+            attribute("role", &["contractors"]),
+        ])]);
+        assert_eq!(collected["role"], vec!["gw-admins", "contractors"]);
+    }
+
+    #[test]
+    fn attributes_of_a_later_statement_are_collected() {
+        let collected = collect_attributes(&[
+            statement(vec![attribute("email", &["a@example.test"])]),
+            statement(vec![attribute("role", &["gw-admins"])]),
+        ]);
+        assert_eq!(collected["email"], vec!["a@example.test"]);
+        assert_eq!(collected["role"], vec!["gw-admins"]);
+    }
+
+    #[test]
+    fn the_same_attribute_across_statements_is_joined_whatever_the_statement_order() {
+        let first = statement(vec![attribute("role", &["gw-admins"])]);
+        let second = statement(vec![attribute("role", &["contractors"])]);
+        let forward = collect_attributes(&[first.clone(), second.clone()]);
+        let reversed = collect_attributes(&[second, first]);
+        assert_eq!(forward["role"], vec!["gw-admins", "contractors"]);
+        assert_eq!(reversed["role"], vec!["contractors", "gw-admins"]);
+    }
+
+    #[test]
+    fn an_attribute_with_no_values_is_left_out() {
+        let collected = collect_attributes(&[statement(vec![attribute("role", &[])])]);
+        assert!(!collected.contains_key("role"));
     }
 
     #[test]

@@ -77,11 +77,19 @@ fn attribute(
     format!("<saml:Attribute Name=\"{name}\">{values}</saml:Attribute>")
 }
 
+#[derive(Clone, Copy)]
+pub enum RoleLayout {
+    SameStatement,
+    SecondStatement,
+    RepeatedAttribute,
+}
+
 fn template(
     port: u16,
     in_response_to: &str,
     subject: &str,
     roles: &[String],
+    layout: RoleLayout,
 ) -> String {
     let now = chrono::Utc::now();
     let issued = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -92,12 +100,26 @@ fn template(
         attribute(NAME_CLAIM, &[subject.to_string()]),
         attribute(EMAIL_CLAIM, &[format!("{subject}@example.test")]),
     ];
+    let mut second_statement = String::new();
     if !roles.is_empty() {
-        attributes.push(attribute(ROLE_CLAIM, roles));
+        match layout {
+            RoleLayout::SameStatement => attributes.push(attribute(ROLE_CLAIM, roles)),
+            RoleLayout::SecondStatement => {
+                second_statement =
+                    format!("<saml:AttributeStatement>{}</saml:AttributeStatement>", attribute(ROLE_CLAIM, roles));
+            }
+            RoleLayout::RepeatedAttribute => {
+                attributes.extend(
+                    roles
+                        .iter()
+                        .map(|role| attribute(ROLE_CLAIM, std::slice::from_ref(role))),
+                );
+            }
+        }
     }
     let attributes: String = attributes.concat();
     format!(
-        r##"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_response" Version="2.0" IssueInstant="{issued}" Destination="http://localhost:{port}/api/saml/acs" InResponseTo="{in_response_to}"><saml:Issuer>https://idp.example.test</saml:Issuer><samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status><saml:Assertion ID="_assertion" Version="2.0" IssueInstant="{issued}"><saml:Issuer>https://idp.example.test</saml:Issuer><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"/><ds:Reference URI="#_assertion"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue></ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue></ds:SignatureValue><ds:KeyInfo><ds:X509Data/></ds:KeyInfo></ds:Signature><saml:Subject><saml:NameID>{subject}</saml:NameID></saml:Subject><saml:Conditions NotBefore="{not_before}" NotOnOrAfter="{expires}"><saml:AudienceRestriction><saml:Audience>http://localhost:{port}</saml:Audience></saml:AudienceRestriction></saml:Conditions><saml:AttributeStatement>{attributes}</saml:AttributeStatement></saml:Assertion></samlp:Response>"##,
+        r##"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_response" Version="2.0" IssueInstant="{issued}" Destination="http://localhost:{port}/api/saml/acs" InResponseTo="{in_response_to}"><saml:Issuer>https://idp.example.test</saml:Issuer><samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status><saml:Assertion ID="_assertion" Version="2.0" IssueInstant="{issued}"><saml:Issuer>https://idp.example.test</saml:Issuer><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"/><ds:Reference URI="#_assertion"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue></ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue></ds:SignatureValue><ds:KeyInfo><ds:X509Data/></ds:KeyInfo></ds:Signature><saml:Subject><saml:NameID>{subject}</saml:NameID></saml:Subject><saml:Conditions NotBefore="{not_before}" NotOnOrAfter="{expires}"><saml:AudienceRestriction><saml:Audience>http://localhost:{port}</saml:Audience></saml:AudienceRestriction></saml:Conditions><saml:AttributeStatement>{attributes}</saml:AttributeStatement>{second_statement}</saml:Assertion></samlp:Response>"##,
         subject = escape(subject),
     )
 }
@@ -142,13 +164,14 @@ pub async fn sign_in(
     port: u16,
     subject: &str,
     roles: &[String],
+    layout: RoleLayout,
 ) -> AcsAnswer {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("an HTTP client");
     let request_id = start_sign_in(&client, port).await;
-    let signed = sign(base_dir, &template(port, &request_id, subject, roles));
+    let signed = sign(base_dir, &template(port, &request_id, subject, roles, layout));
     let form =
         format!("SAMLResponse={}", urlencoding::encode(&base64::engine::general_purpose::STANDARD.encode(signed)));
     let response = client

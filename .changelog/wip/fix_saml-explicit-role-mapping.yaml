@@ -25,7 +25,8 @@ changes:
         Previously a SAML role value with no role_mapping entry was matched by name, so an identity-provider
         group or role called admin or administrator signed users in as Gateway administrator, and a power-user
         spelling as power user, without anyone mapping it. A role now comes only from role_mapping, taking the
-        highest role any of the sent role values maps to. A sign-in whose values have no entry, or with no role
+        highest role any of the sent role values maps to, whether they come in one attribute, in repeated
+        attributes or in several attribute statements. A sign-in whose values have no entry, or with no role
         value, gets default_role or is refused with a 403 page and no user created or updated. Before
         upgrading, add a role_mapping entry for every identity-provider role that should sign in, or set
         default_role to user to keep admitting the rest. A role_mapping value or default_role that is not
