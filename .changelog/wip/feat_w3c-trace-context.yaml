@@ -31,7 +31,15 @@ changes:
         Audit integration templates can now use AUDIT_SPAN_ID, AUDIT_PARENT_SPAN_ID and
         AUDIT_TRACE_SOURCE for every audit record, so a receiver such as Agent Watch can follow a
         request across appliances without parsing the whole record.
-  changed: []
+  changed:
+    - timestamp: '2026-11-23T14:00:00Z'
+      title: Send the Managed Agent one set of trace headers
+      description: >-
+        An Access Point now sends its Managed Agent exactly one traceparent, naming the trace and
+        the Access Point's own span, and exactly one X-Gateway-Trace-Id. It no longer passes on
+        the caller's own traceparent or appends its X-Gateway-Trace-Id beside the caller's. The
+        caller's tracestate goes on only when the caller's traceparent is continued. A Target
+        bound by external consent still receives X-Gateway-Trace-Id alone.
   fixed: []
   removed: []
   security: []

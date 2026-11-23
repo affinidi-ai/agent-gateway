@@ -331,6 +331,19 @@ impl RequestTrace {
         }
     }
 
+    /// The trace the request is sent onward with: its own, or a freshly minted
+    /// one when the surface terminates trace ids.
+    pub fn onward(
+        &self,
+        terminate: bool,
+    ) -> OutgoingTrace {
+        if terminate {
+            self.terminated(TraceId::mint())
+        } else {
+            self.outgoing()
+        }
+    }
+
     /// The trace `fresh`, sent onward in place of the request's own under this
     /// gateway's span. It continues no `traceparent`.
     pub fn terminated(
@@ -384,6 +397,37 @@ impl OutgoingTrace {
     ) -> Option<T> {
         received.filter(|_| self.continued_flags.is_some())
     }
+
+    /// The trace headers to send onward, each once: `traceparent`,
+    /// `X-Gateway-Trace-Id`, and the `received` `tracestate` when
+    /// [`Self::tracestate`] keeps it.
+    pub fn headers(
+        &self,
+        export: SpanExport,
+        received_tracestate: Option<&str>,
+    ) -> Vec<(&'static str, String)> {
+        let mut headers = vec![
+            ("traceparent", self.traceparent(export)),
+            (
+                "x-gateway-trace-id",
+                self.trace_id
+                    .as_str()
+                    .to_string(),
+            ),
+        ];
+        if let Some(tracestate) = self.tracestate(received_tracestate) {
+            headers.push(("tracestate", tracestate.to_string()));
+        }
+        headers
+    }
+}
+
+/// Whether `name` is a trace header this gateway writes itself, so a caller's
+/// copy of it is never passed on.
+pub fn is_trace_header(name: &str) -> bool {
+    ["traceparent", "tracestate", "x-gateway-trace-id"]
+        .iter()
+        .any(|header| name.eq_ignore_ascii_case(header))
 }
 
 /// Every field of header `name`, in the order received. A value that is not

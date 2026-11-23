@@ -62,7 +62,7 @@ fn get_observed_target_for_actor<'a>(
     world.collaborator_target(collaborator_key)
 }
 
-fn get_observed_request_for_actor<'a>(
+pub(crate) fn get_observed_request_for_actor<'a>(
     world: &'a SurfaceWorld,
     actor_name: &str,
     expected_kind: TargetActorKind,

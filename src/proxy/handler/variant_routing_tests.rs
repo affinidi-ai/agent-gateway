@@ -197,6 +197,15 @@ pub(super) async fn send_method(
         .header("content-type", "application/json")
         .body(body)
         .unwrap();
+    dispatch(router, request).await
+}
+
+/// Sends `request` through the Access Point and returns the status with every
+/// audit record the request wrote.
+pub(super) async fn dispatch(
+    router: crate::state::MultiSurfaceProxyState,
+    request: axum::http::Request<axum::body::Body>,
+) -> (axum::http::StatusCode, Vec<DelegationAuditEvent>) {
     let (response, events) =
         crate::audit::producer::capture(Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
             "127.0.0.1:12345"

@@ -1416,6 +1416,33 @@ pub(crate) fn replace_request_header(
     }
 }
 
+/// `request` with the trace headers of `trace`, each once. The caller's
+/// `tracestate` fields (`caller_headers`) pass on, joined, only when `trace`
+/// continues the caller's `traceparent`. Gateway does not export the request's
+/// span yet, so the sampled flag follows [`crate::proxy::trace::SpanExport::Off`].
+/// A Target bound by external consent (`bound_target`) is sent the trace id
+/// alone, as before W3C trace context.
+fn with_onward_trace_headers(
+    mut request: reqwest::RequestBuilder,
+    trace: &crate::proxy::trace::OutgoingTrace,
+    caller_headers: &HeaderMap,
+    bound_target: bool,
+) -> reqwest::RequestBuilder {
+    if bound_target {
+        return request.header("x-gateway-trace-id", trace.trace_id().as_str());
+    }
+    let tracestate: Vec<&str> = caller_headers
+        .get_all("tracestate")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    let tracestate = (!tracestate.is_empty()).then(|| tracestate.join(","));
+    for (name, value) in trace.headers(crate::proxy::trace::SpanExport::Off, tracestate.as_deref()) {
+        request = request.header(name, value);
+    }
+    request
+}
+
 /// Load and prepare DID:webvh identity context for a channel request
 #[cfg(feature = "didwebvh")]
 async fn load_did_identity_context(state: &ProxyState) -> Option<crate::identity::didwebvh::SurfaceDidContext> {
@@ -2132,13 +2159,16 @@ async fn proxy_charged_request(
     // this boundary. `egress_trace_id` is what gets stamped on the onward hop
     // (`X-Gateway-Trace-Id`, the transit token, the fabric message); it equals
     // `trace_id` unless the surface opts into termination.
-    let egress_trace_id = crate::proxy::trace::egress_trace_id(
+    let outgoing_trace = request_trace.onward(
         state
             .surface
             .access_point
             .terminate_trace_id,
-        &trace_id,
     );
+    let egress_trace_id = outgoing_trace
+        .trace_id()
+        .as_str()
+        .to_string();
 
     // Bridge for this gateway's operator on the non-fabric (direct / transit-point)
     // egress: record the own → downstream mapping locally so a terminated trace can
@@ -6595,15 +6625,18 @@ async fn proxy_charged_request(
     // is asked for an answer the gateway can read as it is sent.
     let bound_target = crate::proxy::target_grant::binds_the_target(&state.surface);
     let credential_headers = target_credential_header_names(&state.surface);
+    // The caller's trace headers never pass on: the gateway writes its own
+    // ([`with_onward_trace_headers`]).
     let forwards_header = |name: &str| {
-        forwards_target_header(
-            name,
-            bound_target,
-            &source_cred_headers,
-            header_metadata_mapping,
-            forwarded_source_auth_header,
-            &credential_headers,
-        )
+        !crate::proxy::trace::is_trace_header(name)
+            && forwards_target_header(
+                name,
+                bound_target,
+                &source_cred_headers,
+                header_metadata_mapping,
+                forwarded_source_auth_header,
+                &credential_headers,
+            )
     };
 
     // Build upstream request. The forward send uses the per-request pinned,
@@ -6643,8 +6676,7 @@ async fn proxy_charged_request(
         upstream_req = upstream_req.header(reqwest::header::ACCEPT, "text/event-stream, application/json");
     }
 
-    // Inject trace ID as standard header for correlation
-    upstream_req = upstream_req.header("X-Gateway-Trace-Id", egress_trace_id.clone());
+    upstream_req = with_onward_trace_headers(upstream_req, &outgoing_trace, &headers, bound_target);
 
     // Inject DID:webvh identity into HTTP headers (Header and SignedHeader modes)
     #[cfg(feature = "didwebvh")]
@@ -6847,7 +6879,7 @@ async fn proxy_charged_request(
                             upstream_req = upstream_req.header(key.as_str(), value.as_bytes());
                         }
                     }
-                    upstream_req = upstream_req.header("X-Gateway-Trace-Id", egress_trace_id.clone());
+                    upstream_req = with_onward_trace_headers(upstream_req, &outgoing_trace, &headers, bound_target);
                 }
                 Err(e) => {
                     warn!(channel = channel_name, error = %e, "Failed to inject DID:webvh identity into MCP _meta, using original body");

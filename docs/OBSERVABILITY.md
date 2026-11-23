@@ -347,7 +347,16 @@ they name:
 `X-Gateway-Trace-Id` is valid as 32 hexadecimal digits or the hyphenated 8-4-4-4-12 form, in any
 case and not all zero; `traceparent` as W3C Trace Context defines it, with lowercase digits. A
 header that is not valid, or that arrived more than once, is ignored, and no part of it is
-recorded or logged. A Transit Point request
+recorded or logged.
+
+The Access Point sends its Managed Agent the trace it continues or starts, never the caller's own
+trace headers: exactly one `traceparent`, naming the trace and the Access Point's span (the
+record's `span_id`), and exactly one `X-Gateway-Trace-Id` with the trace id. The `traceparent`
+is sampled when the caller's continued `traceparent` was, and unsampled when the gateway started
+the trace. The caller's `tracestate` goes on unchanged only when its `traceparent` is continued.
+A surface with `terminate_trace_id` sends the fresh trace in both headers, with no `tracestate`.
+A Target bound by external consent is sent the trace id in `X-Gateway-Trace-Id` alone. A
+request to a `fabric://` Target carries the caller's trace headers as before. A Transit Point request
 that carries neither a transit token nor such a header starts a hyphenated UUID. A request sent
 over a Fabric stream carries its trace id as a hyphenated UUID, and the receiving gateway records
 that form.

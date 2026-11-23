@@ -4,8 +4,10 @@
 use cucumber::{then, when};
 use serde_json::Value;
 
+use crate::bdd_support::actors::TargetActorKind;
 use crate::bdd_support::forwarded_requests::{generated_traceparent, sent_header, the_forwarded_record};
-use crate::steps::then::{gateway_log, get_mcp_request_for_actor};
+use crate::bdd_support::mock_server::ReceivedRequest;
+use crate::steps::then::{gateway_log, get_mcp_request_for_actor, get_observed_request_for_actor};
 use crate::steps::when::{ensure_admin_session, send_request_and_record};
 use crate::world::SurfaceWorld;
 
@@ -105,14 +107,14 @@ async fn request_with_disagreeing_trace_headers(world: &mut SurfaceWorld) {
         .await;
 }
 
-#[then(expr = "MCP server {string} received a traceparent that continues the caller's trace")]
-fn mcp_server_received_a_traceparent_continuing_the_callers_trace(
-    world: &mut SurfaceWorld,
-    server_name: String,
+/// Asserts `request` carries exactly one `traceparent`, of the trace the
+/// caller's `traceparent` named, under a span other than the caller's.
+fn assert_continues_the_callers_trace(
+    world: &SurfaceWorld,
+    request: &ReceivedRequest,
+    who: &str,
 ) {
-    let who = format!("MCP server '{server_name}'");
     let caller = sent(world, TRACEPARENT);
-    let request = get_mcp_request_for_actor(world, &server_name);
     let [received] = request.values_of_header(TRACEPARENT) else {
         panic!("{who} expected exactly one traceparent, received {:?}", request.values_of_header(TRACEPARENT));
     };
@@ -125,6 +127,39 @@ fn mcp_server_received_a_traceparent_continuing_the_callers_trace(
         span_id_of(received),
         span_id_of(&caller),
         "{who} received the caller's own span, not the gateway's: the caller sent {caller}, {who} received {received}"
+    );
+}
+
+#[then(expr = "MCP server {string} received a traceparent that continues the caller's trace")]
+fn mcp_server_received_a_traceparent_continuing_the_callers_trace(
+    world: &mut SurfaceWorld,
+    server_name: String,
+) {
+    let request = get_mcp_request_for_actor(world, &server_name);
+    assert_continues_the_callers_trace(world, request, &format!("MCP server '{server_name}'"));
+}
+
+#[then(expr = "managed agent {string} received a traceparent that continues the caller's trace")]
+fn managed_agent_received_a_traceparent_continuing_the_callers_trace(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    let request = get_observed_request_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
+    assert_continues_the_callers_trace(world, request, &format!("managed agent '{agent_name}'"));
+}
+
+#[then(expr = "managed agent {string} received the caller's trace in X-Gateway-Trace-Id")]
+fn managed_agent_received_the_callers_trace_in_x_gateway_trace_id(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    let who = format!("managed agent '{agent_name}'");
+    let callers_trace = trace_id_of(&sent(world, TRACEPARENT)).to_string();
+    let request = get_observed_request_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
+    assert_eq!(
+        request.values_of_header(X_GATEWAY_TRACE_ID),
+        [callers_trace.as_str()],
+        "{who} expected exactly one X-Gateway-Trace-Id, the caller's trace {callers_trace}"
     );
 }
 

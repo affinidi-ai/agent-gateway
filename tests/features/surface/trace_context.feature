@@ -13,7 +13,6 @@ Feature: Trace context at an Access Point
     And the gateway keeps its log of warnings
     And the VP Audit Log keeps only audit events "request_forwarded"
 
-  @wip
   Scenario: An Access Point continues a valid caller trace
     When the caller sends a request to the surface with a traceparent set
     Then the response status is 200
