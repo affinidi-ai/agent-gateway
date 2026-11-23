@@ -61,7 +61,11 @@ changes:
         /outbound/<surface route>/<alias> for every Transit Point, including one a variant defines,
         which is the base point's route: an operator who followed it reached the base Target, or a
         404 for an alias only the variant has. Such a Transit Point is now named at the route its
-        variant serves, /outbound/<surface route>$<variant>/<alias>.
+        variant serves, /outbound/<surface route>$<variant>/<alias>. An alias only a variant
+        defines has no route at all, and no listen_path gives it one, since the outbound listener
+        registers routes for the base surface's Transit Points alone and builds a variant's routes
+        from a base point's alias and path; the message says so and asks for the alias in the base
+        surface, rather than naming a path to set.
     - timestamp: '2026-11-20T16:40:00Z'
       title: The Surface Builder reads a Transit Point's prefix from the list it offers
       description: >-

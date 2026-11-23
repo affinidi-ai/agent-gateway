@@ -336,6 +336,25 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   external slots still offer it. A protected
   identity already set to From API Key keeps showing its key selector. Transit Point
   identities offer only From Payload.
+- **Listen Path** is the shared routing editor of Access Points and Transit Points
+  (`_shared/RouteListenerSection.tsx`): a required **Surface Prefix** select and a required
+  **Custom Path** input, which compose the node's route, helped by
+  `field-help-route-listener-section-surface-prefix` and `-custom-path`. The prefixes come from
+  `GET /config/surface-routing`. An inbound node offers `channel_path_prefix` as it stands. An
+  outbound one offers those prefixes with `/outbound` in front when the selected address is also
+  reachable on an inbound listener (`computeSharedOutboundAddresses`), since the inbound pipeline
+  owns every non-`/outbound` path there, and the plain prefixes on an outbound address of its own.
+  Everything reads that offered list, never the raw `channel_path_prefix`: a stored `route_prefix`
+  shows as selected only while it is still offered, and one that is not (a Transit Point recorded
+  as `/agents` whose path begins `/outbound/`) is dropped, both fields being re-derived from the
+  stored route instead. Seeding writes a prefix only when the route starts with one that is
+  offered, so a route under none of them is left unresolved rather than relabelled, and a brand-new
+  node seeds the first offered prefix with a two-word random path. After a save attempt
+  (`hasAttemptedSave`) an empty prefix and an empty path are each marked invalid, the prefix with
+  "Pick a surface prefix." naming the stored route as under none of those offered and the path with
+  "Enter a path."; `validatePath`'s own message still wins over the latter. What the gateway stores
+  and what it refuses is in
+  [`docs/CONFIGURATION_REFERENCE.md`](../../docs/CONFIGURATION_REFERENCE.md#transit-point-listen-paths).
 - **Entry point URL** is the label for an Access Point's composed URL, with "The URL used to
   access this gateway" behind its `FieldHelp`. It shows at the top of the Access Point panel
   and as a banner along the top of the canvas, both rendered by `RouteListenerBanner`

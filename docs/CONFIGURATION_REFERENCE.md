@@ -147,9 +147,11 @@ under.
 
 A Transit Point that sets no `listen_path` is unaffected, except for one case: the outbound
 listener registers routes for the base surface's Transit Points, and builds each variant's `$`
-route from a base point's alias, so **an alias only a variant defines has no route of its own**.
-Such a point is reachable at its `listen_path` or not at all, and a refusal or warning about it
-says so rather than naming a route that does not exist.
+route from a base point's alias and path, so **an alias only a variant defines has no route of
+its own, and a `listen_path` on it installs none either**. Nothing reaches such a point until the
+base surface defines the alias too, after which the variant answers at that point's routes with
+`$<variant>` in them. A refusal or warning about it says that, rather than naming a route, or a
+path to set, that would not reach it.
 
 Known limitation: a `listen_path` already on disk is served as stored. One the router cannot
 register still panics the outbound listener build, and a stored `/outbound` still answers every

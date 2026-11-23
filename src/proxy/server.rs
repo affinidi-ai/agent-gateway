@@ -854,9 +854,10 @@ pub(crate) struct ListenPathProblem<'a> {
 /// `None` for an alias only a variant defines. The router registers routes from
 /// the base surface's Transit Points alone (`group_outbound_vcs_by_port` reads
 /// `surface.transit.points`) and builds each variant route from a base point's
-/// alias, so a variant-only alias has no route of its own and is reachable at
-/// its `listen_path` or not at all. Nothing may recommend a route for it:
-/// following that advice would reach another point's Target, or nothing.
+/// alias and path, so a variant-only alias has no route of its own, and a
+/// `listen_path` on it installs none either: a custom route is registered from
+/// the base point's path alone. Nothing may recommend a route, or a path, for
+/// it: following that advice would reach another point's Target, or nothing.
 fn derived_outbound_route(
     surface: &crate::config::agent_surface::AgentSurface,
     variant: Option<&str>,
@@ -874,22 +875,31 @@ fn derived_outbound_route(
         .then(|| crate::proxy::outbound_handler::transit_point_variant_outbound_path(surface.route(), variant, alias))
 }
 
-/// How a refusal or a warning tells the operator to reach this Transit Point
-/// without a `listen_path` of its own: the route the gateway derives, or, for
-/// an alias only a variant defines, that there is none
-/// ([`derived_outbound_route`]).
-fn derived_route_advice(
+/// How a refusal or a warning tells the operator to reach this Transit Point:
+/// `set_a_path`, the paths it may be set under, beside the route the gateway
+/// derives from the alias; or, for an alias only a variant defines, that no
+/// path reaches it at all until the base surface defines that alias too
+/// ([`derived_outbound_route`]). Ends the message it closes, punctuation and
+/// all, so a caller joins it with a space and adds nothing after it.
+fn listen_path_remedy(
     surface: &crate::config::agent_surface::AgentSurface,
     variant: Option<&str>,
     alias: &str,
+    set_a_path: &str,
 ) -> String {
     match derived_outbound_route(surface, variant, alias) {
-        Some(route) => format!("or leave it unset to take '{route}'"),
-        None => "and keep it: the outbound listener registers no route of its own for a Transit Point only a \
-                 variant defines, so a listen_path is the only way to reach this one"
-            .to_string(),
+        Some(route) => format!("{set_a_path}, or leave it unset to take '{route}'."),
+        None => VARIANT_ONLY_REMEDY.to_string(),
     }
 }
+
+/// What every refusal and warning says instead of naming a route, or a path to
+/// set, for an alias only a variant defines: neither would reach it
+/// ([`derived_outbound_route`]). Closes a message after any of them.
+const VARIANT_ONLY_REMEDY: &str = "No listen_path reaches this Transit Point at all: the outbound listener registers routes for the base \
+     surface's Transit Points alone, and builds a variant's routes from a base point's alias and path. Define \
+     the alias in the base surface too, and this variant answers at that point's routes with '$<variant>' in \
+     them.";
 
 /// A Transit Point as every refusal and warning names it.
 fn named_transit_point(
@@ -938,10 +948,16 @@ pub(crate) fn listen_path_problems<'a>(
                 });
             }
             if let Err(refusal) = crate::config::types::refuse_outbound_prefix_as_listen_path(path) {
+                // That refusal names the derived route to take instead, which an
+                // alias only a variant defines has none of.
+                let message = match derived_outbound_route(surface, variant, &point.alias) {
+                    Some(_) => format!("{named}: {refusal}"),
+                    None => format!("{named}: {refusal}. {VARIANT_ONLY_REMEDY}"),
+                };
                 return Some(ListenPathProblem {
                     claim,
                     code: LISTEN_PATH_IS_OUTBOUND_PREFIX,
-                    message: format!("{named}: {refusal}"),
+                    message,
                 });
             }
             if !claims_a_channel_prefix(path, &prefixes) {
@@ -950,8 +966,13 @@ pub(crate) fn listen_path_problems<'a>(
                     code: LISTEN_PATH_NOT_A_CHANNEL_PREFIX,
                     message: format!(
                         "{named} has listen_path '{path}', under no surface prefix this gateway serves Transit \
-                         Points on. Set a listen_path with a segment of its own under one of {offered}, {}.",
-                        derived_route_advice(surface, variant, &point.alias)
+                         Points on. {}",
+                        listen_path_remedy(
+                            surface,
+                            variant,
+                            &point.alias,
+                            &format!("Set a listen_path with a segment of its own under one of {offered}")
+                        )
                     ),
                 });
             }
@@ -972,8 +993,8 @@ pub(crate) fn listen_path_problems<'a>(
                 message: format!(
                     "{named} has listen_path '{path}', outside '{prefix}'. It answers on the outbound listener \
                      alone, and an inbound listener shares that listener's hostname, so it is not reached there. \
-                     Set a listen_path under '{prefix}', {}.",
-                    derived_route_advice(surface, variant, &point.alias)
+                     {}",
+                    listen_path_remedy(surface, variant, &point.alias, &format!("Set a listen_path under '{prefix}'"))
                 ),
             })
         })
@@ -4064,14 +4085,39 @@ mod tests {
                     LISTEN_PATH_NOT_SERVED,
                     "Transit Point 'variant-outside' in variant 'candidate' has listen_path '/transit/variant-hook', \
                      outside '/outbound'. It answers on the outbound listener alone, and an inbound listener \
-                     shares that listener's hostname, so it is not reached there. Set a listen_path under \
-                     '/outbound', and keep it: the outbound listener registers no route of its own for a Transit \
-                     Point only a variant defines, so a listen_path is the only way to reach this one."
+                     shares that listener's hostname, so it is not reached there. No listen_path reaches this \
+                     Transit Point at all: the outbound listener registers routes for the base surface's Transit \
+                     Points alone, and builds a variant's routes from a base point's alias and path. Define the \
+                     alias in the base surface too, and this variant answers at that point's routes with \
+                     '$<variant>' in them."
                 ),
             ]
         );
         assert_eq!(problems[0].claim, (None, "outside", "/transit/outside"));
         assert_eq!(problems[5].claim, (Some("candidate"), "variant-outside", "/transit/variant-hook"));
+    }
+
+    /// Every refusal about an alias only a variant defines ends the same way,
+    /// the outbound-prefix one included: it names the derived route to take
+    /// instead, which such an alias has none of, and a `listen_path` of its own
+    /// would register no route either.
+    #[test]
+    fn a_variant_only_alias_is_told_to_take_no_route_and_no_path() {
+        let surface = surface_with_points(
+            serde_json::json!([{ "alias": "pa", "target_endpoint": "https://a.example" }]),
+            serde_json::json!([{ "alias": "pb", "target_endpoint": "https://b.example", "listen_path": "/outbound" }]),
+        );
+
+        let problems = listen_path_problems(&surface, &channel_config());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].code, LISTEN_PATH_IS_OUTBOUND_PREFIX);
+        assert!(
+            problems[0]
+                .message
+                .ends_with(VARIANT_ONLY_REMEDY),
+            "{}",
+            problems[0].message
+        );
     }
 
     #[test]
