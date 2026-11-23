@@ -635,7 +635,29 @@ pub async fn discover_mcp_tools<S: McpProxyStore>(
                 "Tool discovery is not supported for fabric:// MCP targets".to_string(),
             ));
         } else {
-            let pinned_client = pin_discovery_client(endpoint, crate::egress::pinned_forward_client).await?;
+            let unbuilt = crate::mcp::sse_transport::ResponseCheck {
+                surface: &surface,
+                secrets: secrets_store.as_ref(),
+                stamp: None,
+            };
+            let tls = crate::proxy::response_auth::hop_tls(
+                &surface,
+                endpoint,
+                crate::proxy::server::get_certificates_store().as_ref(),
+            )
+            .await
+            .map_err(|failure| refused_discovery(Some(unbuilt), failure))?;
+            let check = crate::mcp::sse_transport::ResponseCheck {
+                stamp: tls
+                    .as_ref()
+                    .map(|tls| tls.stamp),
+                ..unbuilt
+            };
+            let tls = tls.map(|tls| tls.config);
+            let pinned_client = pin_discovery_client(endpoint, move |url, timeout| {
+                crate::egress::pinned_forward_client_with_tls(url, timeout, tls.as_deref())
+            })
+            .await?;
             discover_remote_tools(
                 &pinned_client,
                 endpoint,
@@ -643,6 +665,7 @@ pub async fn discover_mcp_tools<S: McpProxyStore>(
                 &secrets_store,
                 tenant_context(&context),
                 resource_scope(&scope),
+                Some(check),
             )
             .await?
         }
@@ -688,6 +711,7 @@ pub async fn discover_mcp_tools<S: McpProxyStore>(
             &secrets_store,
             tenant_context(&context),
             resource_scope(&scope),
+            None,
         )
         .await?
     };
@@ -730,21 +754,44 @@ async fn authorized_mcp_surface(
     Ok(surface)
 }
 
-type PinDiscoveryTarget =
-    fn(&str, std::time::Duration) -> Result<(reqwest::Client, crate::egress::PinnedTarget), crate::egress::EgressError>;
+/// The answer to a tool discovery whose Target response failed the surface's Response
+/// authentication with `failure`. The reason is logged, never sent.
+fn refused_discovery(
+    check: Option<crate::mcp::sse_transport::ResponseCheck<'_>>,
+    failure: crate::proxy::response_auth::ResponseAuthFailure,
+) -> (StatusCode, String) {
+    warn!(
+        surface = check.map_or("", |check| check
+            .surface
+            .surface_id
+            .as_str()),
+        reason = failure.reason(),
+        "MCP tool discovery refused a Target response that failed Response authentication"
+    );
+    (StatusCode::BAD_GATEWAY, DISCOVERY_REFUSED_MESSAGE.to_string())
+}
+
+const DISCOVERY_REFUSED_MESSAGE: &str =
+    "The Target's response was refused: it failed the surface's Response authentication";
 
 /// Build a per-request pinned, redirect-disabled client for MCP tool discovery.
 ///
 /// A caller-supplied `target_endpoint` is pinned with the Strict policy; a
-/// saved surface's Target with the forward step's policy, so discovery reaches
-/// exactly what the surface forwards to. Resolves DNS once and pins the
+/// saved surface's Target with the forward step's policy and the TLS settings of
+/// its Response authentication, so discovery reaches exactly what the surface
+/// forwards to. Resolves DNS once and pins the
 /// connection to the vetted address so the host cannot rebind to an
 /// internal/metadata IP between validation and connect (SSRF rebinding TOCTOU).
 /// The resolved IP stays log-only; the caller-facing error keeps the generic
 /// "Invalid MCP target endpoint" message.
 async fn pin_discovery_client(
     target_endpoint: &str,
-    pin: PinDiscoveryTarget,
+    pin: impl FnOnce(
+        &str,
+        std::time::Duration,
+    ) -> Result<(reqwest::Client, crate::egress::PinnedTarget), crate::egress::EgressError>
+    + Send
+    + 'static,
 ) -> Result<reqwest::Client, (StatusCode, String)> {
     let raw = target_endpoint.to_string();
     let pinned = tokio::task::spawn_blocking(move || {
@@ -844,9 +891,12 @@ async fn discover_remote_tools(
     secrets_store: &Option<Arc<dyn crate::secrets::SecretsStore>>,
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
+    check: Option<crate::mcp::sse_transport::ResponseCheck<'_>>,
 ) -> Result<Vec<DiscoverMcpTool>, (StatusCode, String)> {
     let channel_name = "mcp-tool-discovery";
     let extra_headers = build_discovery_headers(target_auth, secrets_store, context, scope, channel_name).await?;
+    let send =
+        |request| send_discovery_request(client, target_endpoint, request, channel_name, extra_headers.as_ref(), check);
 
     let initialize_request = serde_json::json!({
         "jsonrpc": "2.0",
@@ -861,31 +911,23 @@ async fn discover_remote_tools(
             }
         }
     });
-    let initialize_response =
-        send_discovery_request(client, target_endpoint, initialize_request, channel_name, extra_headers.as_ref())
-            .await?;
+    let initialize_response = send(initialize_request).await?;
     ensure_jsonrpc_success(&initialize_response)?;
 
     let initialized_notification = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "notifications/initialized"
     });
-    let _ =
-        send_discovery_request(client, target_endpoint, initialized_notification, channel_name, extra_headers.as_ref())
-            .await;
+    if let Err(refused @ DiscoveryError::Refused(..)) = send(initialized_notification).await {
+        return Err(refused.into());
+    }
 
-    let tool_list_response = send_discovery_request(
-        client,
-        target_endpoint,
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": "tools-list",
-            "method": "tools/list",
-            "params": {}
-        }),
-        channel_name,
-        extra_headers.as_ref(),
-    )
+    let tool_list_response = send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "tools-list",
+        "method": "tools/list",
+        "params": {}
+    }))
     .await?;
     tools_from_list_response(&ensure_jsonrpc_success(&tool_list_response)?)
 }
@@ -917,13 +959,38 @@ fn tools_from_list_response(response: &serde_json::Value) -> Result<Vec<Discover
     Ok(tools)
 }
 
+/// Why one discovery request got no answer: the Target's response failed the surface's Response
+/// authentication, or the exchange failed otherwise. Each carries the answer to the management
+/// caller.
+enum DiscoveryError {
+    Refused(StatusCode, String),
+    Failed(StatusCode, String),
+}
+
+impl From<DiscoveryError> for (StatusCode, String) {
+    fn from(error: DiscoveryError) -> Self {
+        match error {
+            DiscoveryError::Refused(status, message) | DiscoveryError::Failed(status, message) => (status, message),
+        }
+    }
+}
+
+fn refused(
+    check: Option<crate::mcp::sse_transport::ResponseCheck<'_>>,
+    failure: crate::proxy::response_auth::ResponseAuthFailure,
+) -> DiscoveryError {
+    let (status, message) = refused_discovery(check, failure);
+    DiscoveryError::Refused(status, message)
+}
+
 async fn send_discovery_request(
     client: &reqwest::Client,
     target_endpoint: &str,
     request: serde_json::Value,
     channel_name: &str,
     extra_headers: Option<&ReqwestHeaderMap>,
-) -> Result<String, (StatusCode, String)> {
+    check: Option<crate::mcp::sse_transport::ResponseCheck<'_>>,
+) -> Result<String, DiscoveryError> {
     let request_body = Bytes::from(request.to_string());
     // Discovery has no surface timeouts; the pinned client's
     // EXTERNAL_TIMEOUT_SECS already bounds the whole exchange.
@@ -939,6 +1006,7 @@ async fn send_discovery_request(
         request_body.clone(),
         extra_headers,
         limits,
+        check,
     )
     .await
     {
@@ -954,18 +1022,23 @@ async fn send_discovery_request(
                     request_body.as_ref(),
                     channel_name,
                     crate::config::A2aConfig::default().max_body_size,
+                    check,
                 )
                 .await
-                .map_err(|e| {
-                    (StatusCode::BAD_GATEWAY, format!("Failed to communicate with MCP server over SSE: {}", e))
+                .map_err(|e| match e {
+                    crate::mcp::sse_transport::LegacySseError::Unauthenticated(failure) => refused(check, failure),
+                    e => DiscoveryError::Failed(
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to communicate with MCP server over SSE: {}", e),
+                    ),
                 });
             }
 
-            Err((StatusCode::BAD_GATEWAY, format!("MCP server returned {}", status)))
+            Err(DiscoveryError::Failed(StatusCode::BAD_GATEWAY, format!("MCP server returned {}", status)))
         }
         Ok(crate::mcp::sse_transport::UpstreamMcpResponse::SseStream { status, response, .. }) => {
             if !status.is_success() {
-                return Err((StatusCode::BAD_GATEWAY, format!("MCP server returned {}", status)));
+                return Err(DiscoveryError::Failed(StatusCode::BAD_GATEWAY, format!("MCP server returned {}", status)));
             }
 
             crate::mcp::sse_transport::consume_sse_response(response, &request_body, limits)
@@ -979,10 +1052,13 @@ async fn send_discovery_request(
                         }
                         crate::mcp::sse_transport::SseConsumeError::NoResponse => StatusCode::BAD_GATEWAY,
                     };
-                    (status, format!("Failed to read MCP SSE response: {}", e))
+                    DiscoveryError::Failed(status, format!("Failed to read MCP SSE response: {}", e))
                 })
         }
-        Err(e) => Err((e.status_and_message().0, format!("Failed to reach MCP server: {}", e))),
+        Err(crate::mcp::sse_transport::McpRequestError::Unauthenticated(failure)) => Err(refused(check, failure)),
+        Err(crate::mcp::sse_transport::McpRequestError::Body(e)) => {
+            Err(DiscoveryError::Failed(e.status_and_message().0, format!("Failed to reach MCP server: {}", e)))
+        }
     }
 }
 
@@ -1978,7 +2054,7 @@ async fn process_modern_mcp_request_with_headers(
                 "Tool arguments must be an object",
             ));
         }
-        let (tool, arguments, content_type) = {
+        let (tool, file, arguments, content_type) = {
             let server = server.read().await;
             let mut tool = server
                 .get_tool(name)
@@ -2027,7 +2103,7 @@ async fn process_modern_mcp_request_with_headers(
                         "Tool request body cannot be safely encoded",
                     )
                 })?;
-            tool.metadata.output_schema = super::modern_rest::output_schema(&server.openapi_spec, &tool.metadata)
+            let (output_schema, file) = super::modern_rest::answer_contract(&server.openapi_spec, &tool.metadata)
                 .map_err(|_| {
                     failure(
                         StatusCode::BAD_REQUEST,
@@ -2035,7 +2111,8 @@ async fn process_modern_mcp_request_with_headers(
                         "Tool output schema cannot be validated offline",
                     )
                 })?;
-            (tool, arguments, content_type)
+            tool.metadata.output_schema = output_schema;
+            (tool, file, arguments, content_type)
         };
         crate::url_validation::reject_cloud_metadata_url(&proxy.base_url).map_err(|_| {
             failure(StatusCode::BAD_GATEWAY, error_codes::INTERNAL_ERROR, "MCP proxy target is not permitted")
@@ -2071,6 +2148,7 @@ async fn process_modern_mcp_request_with_headers(
             super::modern_rest::call(
                 &proxy.base_url,
                 &tool.metadata,
+                file.as_ref(),
                 &arguments,
                 &target_headers,
                 &config,
@@ -2697,10 +2775,12 @@ fn tool_call_leaves_base(
 
 /// What a credentialed legacy tool call sends through the gateway's REST client, worked out once
 /// per call rather than per retry: the [`legacy_base_directory`] of the proxy's `base_url`, the tool with its
-/// output schema, the request content type, and the egress allow-list its backend is vetted with.
+/// output schema, the file its answer carries, the request content type, and the egress allow-list its
+/// backend is vetted with.
 struct StoredToolCall {
     directory: Url,
     metadata: rmcp_openapi::ToolMetadata,
+    file: Option<super::modern_rest::FileAnswers>,
     content_type: String,
     egress_allowlist: Option<String>,
 }
@@ -2715,13 +2795,15 @@ impl StoredToolCall {
             .and_then(|base_url| legacy_base_directory(&base_url))
             .map_err(|_| super::modern_rest::RestError::Target.to_string())?;
         let mut metadata = tool.metadata.clone();
-        metadata.output_schema =
-            super::modern_rest::output_schema(spec, &metadata).map_err(|error| error.to_string())?;
+        let (output_schema, file) =
+            super::modern_rest::answer_contract(spec, &metadata).map_err(|error| error.to_string())?;
+        metadata.output_schema = output_schema;
         let content_type =
             super::modern_rest::request_content_type(spec, &metadata).map_err(|error| error.to_string())?;
         Ok(Self {
             directory,
             metadata,
+            file,
             content_type,
             egress_allowlist: rest_egress_allowlist(proxy),
         })
@@ -2754,6 +2836,7 @@ async fn call_legacy_tool(
     super::modern_rest::call(
         stored.directory.as_str(),
         &stored.metadata,
+        stored.file.as_ref(),
         arguments,
         credential_headers,
         limits,
@@ -2990,6 +3073,14 @@ pub fn prepare_mcp_request(
                     "Refusing a tool call outside the MCP proxy base path: it would carry the Target credential"
                 );
                 return Err(McpProxyCallError::OutsideTargetBase);
+            }
+            // A call sent by `rmcp_openapi`, without the Target credential,
+            // prepares no answer contract, so the file declarations of a tool
+            // the catalog leaves out are read here instead: such a tool is
+            // refused whichever client the call would go out through.
+            if default_headers.is_none() {
+                super::modern_rest::file_answers(&server.openapi_spec, &tool.metadata)
+                    .map_err(|error| format!("Tool execution failed: {error}"))?;
             }
             let stored_call = default_headers
                 .as_ref()
@@ -3249,7 +3340,8 @@ fn initialize_result(proxy: &McpProxy) -> serde_json::Value {
 }
 
 /// The `tools/list` result of a legacy MCP Proxy: every tool `server` loaded
-/// from its spec.
+/// from its spec, apart from one whose answer declares a file the gateway
+/// cannot read, which a call to it is refused for.
 fn tools_list_result(
     proxy: &McpProxy,
     server: &McpServer,
@@ -3259,6 +3351,15 @@ fn tools_list_result(
     let tools: Vec<serde_json::Value> = tool_names
         .iter()
         .filter_map(|tool_name| server.get_tool_metadata(tool_name))
+        .filter(|metadata| {
+            match super::modern_rest::file_answers(&server.openapi_spec, metadata) {
+                Ok(_) => true,
+                Err(error) => {
+                    warn!(proxy_id = %proxy.id, tool = %metadata.name, error = %error, "Exclude tool with an unusable file answer");
+                    false
+                }
+            }
+        })
         .map(|metadata| {
             let input_schema = if proxy.flatten_post_params {
                 flatten_input_schema(&metadata.parameters)
@@ -3404,6 +3505,7 @@ pub async fn serve_through_transit_point(
             match super::modern_rest::call_through_transit_point(
                 stored.directory.as_str(),
                 &stored.metadata,
+                stored.file.as_ref(),
                 &arguments,
                 &headers,
                 limits,
@@ -4842,6 +4944,56 @@ mod tests {
         assert!(matches!(&refused, Err(error) if *error == expected), "{refused:?}");
     }
 
+    /// A legacy tool call without a Target credential is sent by
+    /// `rmcp_openapi`, which prepares no answer contract, so the file
+    /// declarations are read while the call is prepared: a tool the catalog
+    /// leaves out is refused on that path too, before its backend is called.
+    #[tokio::test]
+    async fn a_legacy_tool_call_without_a_target_credential_is_refused_a_file_it_cannot_read() {
+        use serde_json::json;
+
+        let target =
+            crate::component_tests::helpers::MockServer::start_with_response(json!({"data": "AAECAw"}).to_string())
+                .await;
+        let mut proxy = owned("attachments", None);
+        proxy.base_url = target.url();
+        proxy.openapi_spec = json!({
+            "openapi": "3.0.0", "info": {"title": "Attachments", "version": "1"}, "paths": {
+                "/broken": {"get": {"operationId": "broken_attachment", "responses": {"200": {
+                    "description": "OK", "content": {
+                        "application/json": {"schema": {"type": "object"}},
+                        "application/vnd.example+json": {"x-gateway-file": {"pointer": "/data", "encoding": "hex"}}
+                    }
+                }}}},
+                "/items": {"get": {"operationId": "list_items", "responses": {"200": {
+                    "description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}
+                }}}}
+            }
+        })
+        .to_string();
+        let call = |tool: &str| json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": {}}});
+
+        let Err(refused) = super::prepare_mcp_request(&proxy, call("broken_attachment"), None, "legacy-files") else {
+            panic!("a malformed file declaration refuses an uncredentialed legacy call");
+        };
+
+        assert!(
+            matches!(&refused, super::McpProxyCallError::Failed(message) if message.contains("Tool execution failed")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            target
+                .request_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the backend is never called for a tool whose declared file the gateway cannot read"
+        );
+        assert!(
+            super::prepare_mcp_request(&proxy, call("list_items"), None, "legacy-files").is_ok(),
+            "a tool whose answers declare no file still prepares without a Target credential"
+        );
+    }
+
     #[tokio::test]
     async fn owned_modern_dispatch_surface_uses_target_headers_and_surface_limits() {
         use serde_json::json;
@@ -5012,6 +5164,187 @@ mod tests {
         let error = call(3073).await.unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
         assert_eq!(error.message, "MCP tool result exceeds the configured limit");
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn owned_modern_file_answers_arrive_decoded_and_advertise_no_output_schema() {
+        use axum::response::IntoResponse;
+        use serde_json::json;
+
+        let app = axum::Router::new()
+            .route(
+                "/attachments/{id}",
+                axum::routing::get(|| async { axum::Json(json!({"size": 4, "data": "AAECAw"})) }),
+            )
+            .route(
+                "/vendor/{id}",
+                axum::routing::get(|axum::extract::Path(id): axum::extract::Path<String>| async move {
+                    let content_type = if id == "json" {
+                        "application/json"
+                    } else {
+                        "application/vnd.example+json"
+                    };
+                    ([("content-type", content_type)], json!({"size": 4, "data": "AAECAw"}).to_string()).into_response()
+                }),
+            )
+            .route("/items", axum::routing::get(|| async { axum::Json(json!({"items": []})) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let answer = |declared: serde_json::Value| {
+            json!({"200": {"description": "OK", "content": {"application/json": {
+                "schema": {"type": "object"}, "x-gateway-file": declared
+            }}}})
+        };
+        let vendor_answer = |declared: serde_json::Value| {
+            json!({"200": {"description": "OK", "content": {
+                "application/json": {"schema": {"type": "object"}},
+                "application/vnd.example+json": {"x-gateway-file": declared}
+            }}})
+        };
+        let by_id = json!([{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}]);
+        let proxy = McpProxy::new(
+            "File tools".into(),
+            String::new(),
+            base,
+            json!({
+                "openapi": "3.0.0", "info": {"title": "Tools", "version": "1.0"}, "paths": {
+                    "/attachments/{id}": {"get": {
+                        "operationId": "read_attachment",
+                        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                        "responses": answer(json!({"pointer": "/data", "encoding": "base64url"}))
+                    }},
+                    "/broken/{id}": {"get": {
+                        "operationId": "broken_attachment",
+                        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                        "responses": answer(json!({"pointer": "/data", "encoding": "hex"}))
+                    }},
+                    "/vendor/{id}": {"get": {
+                        "operationId": "read_vendor_attachment",
+                        "parameters": by_id.clone(),
+                        "responses": vendor_answer(json!({"pointer": "/data", "encoding": "base64url"}))
+                    }},
+                    "/broken-vendor/{id}": {"get": {
+                        "operationId": "broken_vendor_attachment",
+                        "parameters": by_id,
+                        "responses": vendor_answer(json!({"pointer": "/data", "encoding": "hex"}))
+                    }},
+                    "/items": {"get": {
+                        "operationId": "list_items",
+                        "responses": {"200": {"description": "OK", "content": {"application/json": {
+                            "schema": {"type": "object"}
+                        }}}}
+                    }}
+                }
+            })
+            .to_string(),
+            "/mcp".into(),
+            "/file-tools".into(),
+        );
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "surface-file-tools", "name": "Surface file tools",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/file-tools", "protocol": "mcp"},
+            "target": {"endpoint": format!("proxy://{}", proxy.id)}
+        }))
+        .unwrap();
+        let manager = super::McpServerManager::new();
+        manager
+            .create_server(&proxy)
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+        let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
+        let send = |method: &str, params: Option<serde_json::Value>| {
+            let mut request = owned_modern_request("tools/list");
+            request.method = method.to_string();
+            if params.is_some() {
+                request.params = params;
+            }
+            let prepared = client
+                .post(format!("proxy://{}", proxy.id))
+                .body("{}")
+                .build()
+                .unwrap();
+            let (proxy, surface, client) = (&proxy, &surface, &client);
+            async move {
+                super::handle_modern_surface_request(proxy, surface, &request, prepared, client, versions, None).await
+            }
+        };
+        let listed = send("tools/list", None)
+            .await
+            .unwrap();
+        let tools = listed["result"]["tools"]
+            .as_array()
+            .unwrap();
+        let tool = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+        };
+        assert!(tool("list_items").unwrap()["outputSchema"].is_object());
+        assert!(
+            tool("read_attachment")
+                .unwrap()
+                .get("outputSchema")
+                .is_none(),
+            "a tool answering a file advertises no output schema"
+        );
+        assert!(tool("broken_attachment").is_none(), "a malformed file declaration drops the tool: {tools:?}");
+        assert!(
+            tool("read_vendor_attachment")
+                .unwrap()
+                .get("outputSchema")
+                .is_none(),
+            "a tool whose second media type declares a file advertises no output schema"
+        );
+        assert!(
+            tool("broken_vendor_attachment").is_none(),
+            "a malformed declaration on a second media type drops the tool: {tools:?}"
+        );
+        let read = send("tools/call", Some(json!({"name": "read_attachment", "arguments": {"id": "a1"}})))
+            .await
+            .unwrap();
+        assert_eq!(read["result"]["isError"], false, "{read}");
+        assert!(
+            read["result"]
+                .get("structuredContent")
+                .is_none(),
+            "{read}"
+        );
+        assert_eq!(read["result"]["content"][0]["type"], "resource", "{read}");
+        assert_eq!(read["result"]["content"][0]["resource"]["blob"], "AAECAw==", "{read}");
+        assert_eq!(read["result"]["content"][0]["resource"]["mimeType"], "application/octet-stream", "{read}");
+        let refused = send("tools/call", Some(json!({"name": "broken_attachment", "arguments": {"id": "a1"}})))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+        let vendor = send("tools/call", Some(json!({"name": "read_vendor_attachment", "arguments": {"id": "v1"}})))
+            .await
+            .unwrap();
+        assert_eq!(vendor["result"]["isError"], false, "{vendor}");
+        assert_eq!(vendor["result"]["content"][0]["type"], "resource", "{vendor}");
+        assert_eq!(vendor["result"]["content"][0]["resource"]["blob"], "AAECAw==", "{vendor}");
+        let as_json = send("tools/call", Some(json!({"name": "read_vendor_attachment", "arguments": {"id": "json"}})))
+            .await
+            .unwrap();
+        assert_eq!(as_json["result"]["isError"], false, "{as_json}");
+        assert_eq!(
+            as_json["result"]["content"][0]["type"], "text",
+            "the media type the answer declares without a file is answered as its JSON: {as_json}"
+        );
+        let refused_vendor =
+            send("tools/call", Some(json!({"name": "broken_vendor_attachment", "arguments": {"id": "v1"}})))
+                .await
+                .unwrap_err();
+        assert_eq!(refused_vendor.status, StatusCode::BAD_REQUEST);
         tasks.shutdown().await;
     }
 
@@ -7021,6 +7354,123 @@ mod tests {
                 (status, message.to_string())
             );
         }
+    }
+
+    /// An MCP server on 127.0.0.1 answering every POST with [`LOCAL_TOOLS`], with `key` in the
+    /// key header of Response authentication when given, counting every request.
+    async fn keyed_tools_server(key: Option<&'static str>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        keyed_tools_server_with_notification_key(key, key).await
+    }
+
+    /// [`keyed_tools_server`] whose answer to `notifications/initialized` carries
+    /// `notification_key` instead.
+    async fn keyed_tools_server_with_notification_key(
+        key: Option<&'static str>,
+        notification_key: Option<&'static str>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::response::IntoResponse;
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        let app = axum::Router::new().fallback(move |body: String| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let key = if body.contains("notifications/initialized") {
+                notification_key
+            } else {
+                key
+            };
+            async move {
+                let mut response =
+                    ([(axum::http::header::CONTENT_TYPE, "application/json")], LOCAL_TOOLS).into_response();
+                if let Some(key) = key {
+                    response.headers_mut().insert(
+                        axum::http::HeaderName::from_static("x-agent-key"),
+                        axum::http::HeaderValue::from_static(key),
+                    );
+                }
+                response
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (url, requests)
+    }
+
+    /// Discovers the tools of the saved surface `local-mcp` on `endpoint` with `response_auth`,
+    /// whose secrets hold the key of [`crate::proxy::response_auth::api_key_bravo`].
+    async fn discover_with_response_auth(
+        endpoint: &str,
+        response_auth: serde_json::Value,
+    ) -> Result<Vec<String>, (StatusCode, String)> {
+        let mut surface = saved_surface("mcp", endpoint, None);
+        surface.target.response_auth = serde_json::from_value(response_auth).unwrap();
+        let surface_store: Arc<dyn crate::surfaces::AgentSurfaceStore> = Arc::new(SurfaceStore(vec![surface]));
+        let (_dir, secrets) = crate::proxy::response_auth::bravo_key_store().await;
+        let Json(response) = super::discover_mcp_tools(
+            Extension(store_with(vec![])),
+            Extension(Arc::new(super::McpServerManager::new())),
+            Extension(Some(secrets)),
+            Extension(Some(surface_store)),
+            None,
+            None,
+            Json(serde_json::from_value(serde_json::json!({"surface_id": "local-mcp"})).unwrap()),
+        )
+        .await?;
+        Ok(response
+            .tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect())
+    }
+
+    const DISCOVERY_REFUSED: &str =
+        "The Target's response was refused: it failed the surface's Response authentication";
+
+    #[tokio::test]
+    async fn tool_discovery_by_surface_lists_the_tools_of_a_target_whose_responses_carry_the_key() {
+        let (endpoint, _) = keyed_tools_server(Some(crate::proxy::response_auth::BRAVO_KEY)).await;
+        assert_eq!(
+            discover_with_response_auth(&endpoint, crate::proxy::response_auth::api_key_bravo()).await,
+            Ok(vec!["local_tool".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_by_surface_refuses_a_target_response_without_the_key() {
+        for key in [None, Some("another-key")] {
+            let (endpoint, _) = keyed_tools_server(key).await;
+            assert_eq!(
+                discover_with_response_auth(&endpoint, crate::proxy::response_auth::api_key_bravo()).await,
+                Err((StatusCode::BAD_GATEWAY, DISCOVERY_REFUSED.to_string())),
+                "{key:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_by_surface_refuses_a_target_whose_initialized_notification_answer_lacks_the_key() {
+        let (endpoint, _) =
+            keyed_tools_server_with_notification_key(Some(crate::proxy::response_auth::BRAVO_KEY), None).await;
+        assert_eq!(
+            discover_with_response_auth(&endpoint, crate::proxy::response_auth::api_key_bravo()).await,
+            Err((StatusCode::BAD_GATEWAY, DISCOVERY_REFUSED.to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_by_surface_refuses_mtls_it_cannot_use_without_dialing_the_target() {
+        let (endpoint, requests) = keyed_tools_server(None).await;
+        let https = endpoint.replacen("http://", "https://", 1);
+        for target in [endpoint.as_str(), https.as_str()] {
+            assert_eq!(
+                discover_with_response_auth(target, crate::proxy::response_auth::pinned_bravo()).await,
+                Err((StatusCode::BAD_GATEWAY, DISCOVERY_REFUSED.to_string())),
+                "{target}"
+            );
+        }
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

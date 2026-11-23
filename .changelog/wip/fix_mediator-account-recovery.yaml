@@ -1,0 +1,35 @@
+branch: fix/mediator-account-recovery
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-18T10:00:00Z'
+      title: ⭐ Recover a Connection Point whose account a mediator v0.52+ no longer holds
+      description: >-
+        From v0.52 a mediator refuses a Trust Task with a trust-task-error document under a
+        renamed code, so the gateway no longer recognised the refusal that says its own account
+        is gone: a Connection Point that only receives stayed unreachable after the mediator's
+        store was flushed or failed over, because the listener was never restarted to
+        re-authenticate and re-register. The gateway now reads the refusal in either form, so
+        the repair runs against both a mediator that answers with a problem report and one that
+        answers with a trust-task-error. Upgrades affinidi-messaging-sdk 0.30.1 to 0.47.2, which
+        parses the new document, together with affinidi-messaging-didcomm 0.15.16,
+        affinidi-tdk-common 0.7.3, affinidi-did-common 0.4.10,
+        affinidi-did-resolver-cache-sdk 0.8.57 and didwebvh-rs 0.8.2. Trust Task types now come
+        from the SDK's own generated module, so the direct trust-tasks-rs dependency is gone.
+    - timestamp: '2026-11-18T12:30:00Z'
+      title: Restart a Connection Point whose mediator stops answering for its account
+      description: >-
+        A mediator that has lost an account cannot deliver its own answer to that account
+        either, so the gateway's account probe went unanswered instead of being refused, and an
+        unanswered probe left the listener alone: the Connection Point stayed unreachable until
+        a later probe happened to be answered. A second unanswered probe in a row now restarts
+        the listener, the same repair a missing account gets, and then the fourth, eighth and so
+        on, so a mediator that stays silent is retried ever more slowly. Only the Connection
+        Points whose probe went unanswered are re-probed after five seconds, while every
+        Connection Point is still visited at least every thirty seconds, so a mediator silent for
+        one of them cannot keep the others from being checked. A probe the mediator answered,
+        even with a refusal, still changes nothing: the socket is carrying traffic.
+  removed: []
+  security: []
+  breaking: []

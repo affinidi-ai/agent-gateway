@@ -1,0 +1,1748 @@
+[
+  {
+    "id": "deny-by-default",
+    "name": "Deny by default",
+    "summary": "Nothing is allowed until a rule allows it.",
+    "description": "Denies every request. Start here and insert or write the rules that allow what you need. Assigned appliance-wide, it also decides public discovery reads such as /discovery and /.well-known/ucp.",
+    "category": "baseline",
+    "policy_types": ["gateway", "agent_surface"],
+    "standalone": true,
+    "rules": "default allow := false",
+    "parameters": [],
+    "reads": [],
+    "examples": [
+      {
+        "name": "Any request",
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/"
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "opaPoliciesConceptPage",
+      "anchor": "default-allow-vs-default-deny",
+      "label": "Concept: default allow vs default deny"
+    }
+  },
+  {
+    "id": "require-authentication",
+    "name": "Require authenticated caller",
+    "summary": "Allow only callers that authenticated.",
+    "description": "Allows a request only when the caller authenticated with one of the surface's Caller Context methods. Denies callers whose credential was missing or invalid, and requests on a surface without caller authentication. It decides on the Access Point and Target request policies: on a Transit Point input.source_auth is the client the Transit Point authenticated, not the caller, and an inbound response policy has no input.source_auth.",
+    "category": "authentication",
+    "policy_types": ["agent_surface"],
+    "rules": "default allow := false\n\nallow if {\n  input.source_auth.method\n  input.source_auth.method != \"failed\"\n}",
+    "parameters": [],
+    "reads": ["source_auth.method"],
+    "examples": [
+      {
+        "name": "Verified JWT caller",
+        "input": {
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "user@example.com",
+            "claims": {
+              "sub": "user@example.com"
+            }
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Failed API key",
+        "input": {
+          "source_auth": {
+            "method": "failed",
+            "attempted_method": "api_key",
+            "reason": "unknown key"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "No caller authentication",
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/"
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "applyOpaPoliciesGuide",
+      "anchor": "steps",
+      "label": "Guide: Apply OPA policies"
+    }
+  },
+  {
+    "id": "allow-by-jwt-claim",
+    "name": "Allow by JWT claim or role",
+    "summary": "Allow only JWT callers whose claim has one of the listed values.",
+    "description": "Allows a request when the caller authenticated with a JWT and the chosen claim, such as role, holds one of the listed values. A claim that is a list matches when any of its values is listed. Denies every other caller. It decides on the Access Point and Target request policies: on a Transit Point input.source_auth is the client the Transit Point authenticated, not the caller, and an inbound response policy has no input.source_auth.",
+    "category": "authentication",
+    "policy_types": ["agent_surface"],
+    "rules": "default allow := false\n\njwt_claim_values(v) := [v] if is_string(v)\n\njwt_claim_values(v) := v if is_array(v)\n\nallow if {\n  input.source_auth.method == \"jwt_bearer\"\n  some v in jwt_claim_values(input.source_auth.claims[{{claim}}])\n  v in {{values}}\n}",
+    "parameters": [
+      {
+        "key": "claim",
+        "label": "Claim",
+        "kind": "string",
+        "default": "role",
+        "help": "The JWT claim to check, for example role, roles or groups."
+      },
+      {
+        "key": "values",
+        "label": "Allowed values",
+        "kind": "string_list",
+        "default": [],
+        "sample": ["admin"],
+        "help": "Separate values with commas."
+      }
+    ],
+    "reads": ["source_auth.claims"],
+    "examples": [
+      {
+        "name": "Role admin",
+        "input": {
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "ops@example.com",
+            "claims": {
+              "sub": "ops@example.com",
+              "role": "admin"
+            }
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Role viewer",
+        "input": {
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "guest@example.com",
+            "claims": {
+              "sub": "guest@example.com",
+              "role": "viewer"
+            }
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Roles list with admin",
+        "input": {
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "lead@example.com",
+            "claims": {
+              "sub": "lead@example.com",
+              "role": ["viewer", "admin"]
+            }
+          }
+        },
+        "expected": "allow"
+      }
+    ],
+    "docs": {
+      "page": "jwtClaimsGuide",
+      "anchor": "steps",
+      "label": "Guide: Use JWT claims to control access"
+    }
+  },
+  {
+    "id": "allow-by-jwt-issuer-audience",
+    "name": "Allow by JWT issuer and audience",
+    "summary": "Allow only tokens from listed issuers for listed audiences.",
+    "description": "Allows a request only when the caller's JWT was issued by one of the listed issuers and names one of the listed audiences. Denies every other caller. A token without an aud claim, as from an identity provider whose JWT Bearer method checks client_id or azp instead, is denied. It decides on the Access Point and Target request policies: on a Transit Point input.source_auth is the client the Transit Point authenticated, not the caller, and an inbound response policy has no input.source_auth.",
+    "category": "authentication",
+    "policy_types": ["agent_surface"],
+    "rules": "default allow := false\n\njwt_audiences contains a if {\n  a := input.source_auth.claims.aud\n  is_string(a)\n}\n\njwt_audiences contains a if {\n  is_array(input.source_auth.claims.aud)\n  some a in input.source_auth.claims.aud\n}\n\nallow if {\n  input.source_auth.method == \"jwt_bearer\"\n  input.source_auth.claims.iss in {{issuers}}\n  some a in jwt_audiences\n  a in {{audiences}}\n}",
+    "parameters": [
+      {
+        "key": "issuers",
+        "label": "Allowed issuers",
+        "kind": "string_list",
+        "default": [],
+        "sample": ["https://login.example.com"],
+        "help": "Exact iss values, separated by commas."
+      },
+      {
+        "key": "audiences",
+        "label": "Allowed audiences",
+        "kind": "string_list",
+        "default": [],
+        "sample": ["https://gateway.example.com"],
+        "help": "Exact aud values, separated by commas."
+      }
+    ],
+    "reads": ["source_auth.claims.iss", "source_auth.claims.aud"],
+    "examples": [
+      {
+        "name": "Listed issuer and audience",
+        "input": {
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "user@example.com",
+            "claims": {
+              "sub": "user@example.com",
+              "iss": "https://login.example.com",
+              "aud": ["https://gateway.example.com"]
+            }
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Other issuer",
+        "input": {
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "user@example.com",
+            "claims": {
+              "sub": "user@example.com",
+              "iss": "https://other.example.com",
+              "aud": "https://gateway.example.com"
+            }
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Other audience",
+        "input": {
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "user@example.com",
+            "claims": {
+              "sub": "user@example.com",
+              "iss": "https://login.example.com",
+              "aud": "https://other.example.com"
+            }
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "opaPoliciesReferencePage",
+      "anchor": "inputsource_auth",
+      "label": "Reference: input.source_auth"
+    }
+  },
+  {
+    "id": "restrict-mcp-tools-by-role",
+    "name": "Restrict MCP tools by role",
+    "summary": "Admins call any tool; other callers only the safe tools.",
+    "description": "Allows callers whose JWT role claim, a single value or a list, holds an admin role to call any MCP tool, other authenticated callers to call only the listed safe tools, and authenticated callers to use other MCP methods such as tools/list. Denies a request without input.mcp, such as a JSON-RPC message without an id. A caller is authenticated when it passed one of the surface's Caller Context methods, such as JWT Bearer or API Key. It decides on the Access Point and Target request policies: on a Transit Point input.source_auth is the client the Transit Point authenticated, not the caller, and an inbound response policy has no input.source_auth. Use it as the whole policy: inserted into another policy it would allow requests that policy denies.",
+    "category": "allow_deny_lists",
+    "policy_types": ["agent_surface"],
+    "standalone": true,
+    "rules": "default allow := false\n\nrole_claim_values(v) := [v] if is_string(v)\n\nrole_claim_values(v) := v if is_array(v)\n\nauthenticated_caller if {\n  input.source_auth.method\n  input.source_auth.method != \"failed\"\n}\n\nallow if {\n  input.source_auth.method == \"jwt_bearer\"\n  some role in role_claim_values(input.source_auth.claims.role)\n  role in {{admin_roles}}\n  input.mcp.method == \"tools/call\"\n}\n\nallow if {\n  authenticated_caller\n  input.mcp.method == \"tools/call\"\n  input.mcp.tool_name in {{safe_tools}}\n}\n\nallow if {\n  authenticated_caller\n  input.mcp.method != \"tools/call\"\n}",
+    "parameters": [
+      {
+        "key": "admin_roles",
+        "label": "Admin roles",
+        "kind": "string_list",
+        "default": [],
+        "sample": ["admin"],
+        "help": "Values of the JWT role claim that may call any tool, separated by commas. A role claim that is a list matches when any of its values is listed."
+      },
+      {
+        "key": "safe_tools",
+        "label": "Safe tools",
+        "kind": "string_list",
+        "default": [],
+        "sample": ["search", "summarise", "translate"],
+        "help": "MCP tools every authenticated caller may call, separated by commas."
+      }
+    ],
+    "reads": ["source_auth.method", "source_auth.claims.role", "mcp.method", "mcp.tool_name"],
+    "examples": [
+      {
+        "name": "Admin calls any tool",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "tool_name": "delete_record"
+          },
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "ops@example.com",
+            "claims": {
+              "sub": "ops@example.com",
+              "role": "admin"
+            }
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Roles list with admin calls any tool",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "tool_name": "delete_record"
+          },
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "lead@example.com",
+            "claims": {
+              "sub": "lead@example.com",
+              "role": ["viewer", "admin"]
+            }
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Viewer calls a safe tool",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "tool_name": "search"
+          },
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "guest@example.com",
+            "claims": {
+              "sub": "guest@example.com",
+              "role": "viewer"
+            }
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Viewer calls another tool",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "tool_name": "delete_record"
+          },
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "guest@example.com",
+            "claims": {
+              "sub": "guest@example.com",
+              "role": "viewer"
+            }
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Viewer lists the tools",
+        "input": {
+          "mcp": {
+            "method": "tools/list"
+          },
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "guest@example.com",
+            "claims": {
+              "sub": "guest@example.com",
+              "role": "viewer"
+            }
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Unauthenticated caller lists the tools",
+        "input": {
+          "mcp": {
+            "method": "tools/list"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "API key caller lists the tools",
+        "input": {
+          "mcp": {
+            "method": "tools/list"
+          },
+          "source_auth": {
+            "method": "api_key",
+            "key_name": "partner-key"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "API key caller calls another tool",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "tool_name": "delete_record"
+          },
+          "source_auth": {
+            "method": "api_key",
+            "key_name": "partner-key"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Notification without input.mcp",
+        "input": {
+          "http": {
+            "method": "POST",
+            "path": "/mcp"
+          },
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "guest@example.com",
+            "claims": {
+              "sub": "guest@example.com",
+              "role": "viewer"
+            }
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Id-less tools/call from an API key caller",
+        "input": {
+          "http": {
+            "method": "POST",
+            "path": "/mcp"
+          },
+          "source_auth": {
+            "method": "api_key",
+            "key_name": "partner-key"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Failed caller lists the tools",
+        "input": {
+          "mcp": {
+            "method": "tools/list"
+          },
+          "source_auth": {
+            "method": "failed",
+            "attempted_method": "jwt_bearer",
+            "reason": "expired token"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Failed caller sends a notification",
+        "input": {
+          "http": {
+            "method": "POST",
+            "path": "/mcp"
+          },
+          "source_auth": {
+            "method": "failed",
+            "attempted_method": "jwt_bearer",
+            "reason": "expired token"
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "opaPoliciesConceptPage",
+      "anchor": "mcp-surface-restrict-tool-access-by-role",
+      "label": "Concept: restrict tool access by role"
+    }
+  },
+  {
+    "id": "require-trust-registry-recognition",
+    "name": "Require Trust Registry recognition",
+    "summary": "Allow only agents the Trust Registry recognises.",
+    "description": "Allows a request only when the calling agent's DID is verified as the caller's identity and the Trust Registry recognised it. A DID is verified when it is the caller identity the gateway established (input.agent.did_verified), not only a DID the request names. Needs Extract Trust Registry Data on the surface; without it input.agent has no trust_verification and every request is denied. It decides on the Access Point and Target request policies: on a Transit Point input.agent describes the destination, not the caller, and a response policy has no input.agent. As the Target request policy of a fabric:// Target, input.agent describes this Access Point's own card, so it denies every request there.",
+    "category": "trust_checks",
+    "policy_types": ["agent_surface"],
+    "rules": "default allow := false\n\nallow if {\n  input.agent.did\n  input.agent.did_verified == true\n  input.agent.trust_verification == true\n}",
+    "parameters": [],
+    "reads": ["agent.did", "agent.did_verified", "agent.trust_verification"],
+    "examples": [
+      {
+        "name": "Recognised agent, DID verified",
+        "input": {
+          "agent": {
+            "did": "did:web:agent.example.com",
+            "did_verified": true,
+            "trust_verification": true
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Recognised agent, DID not verified",
+        "input": {
+          "agent": {
+            "did": "did:web:agent.example.com",
+            "did_verified": false,
+            "trust_verification": true
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Agent not recognised",
+        "input": {
+          "agent": {
+            "did": "did:web:agent.example.com",
+            "did_verified": true,
+            "trust_verification": false
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "No Trust Registry data",
+        "input": {
+          "agent": {
+            "did": "did:web:agent.example.com",
+            "did_verified": true
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "opaPoliciesConceptPage",
+      "anchor": "a2a-surface-require-trusted-agents",
+      "label": "Concept: require trusted agents"
+    }
+  },
+  {
+    "id": "require-verified-credential-subject",
+    "name": "Require verified credential subject",
+    "summary": "Allow only listed caller DIDs the gateway verified.",
+    "description": "Allows a request only when the gateway verified the caller's DID, from an identity presentation or a bound source credential, and that DID is on the list. Denies unverified and unlisted callers. It decides on the Access Point and Target request policies: a Transit Point or response policy, and the Target request policy of a fabric:// Target, have no input.extension_identity, so it denies every request there.",
+    "category": "trust_checks",
+    "policy_types": ["agent_surface"],
+    "rules": "default allow := false\n\nallow if {\n  input.extension_identity.verified == true\n  input.extension_identity.did in {{dids}}\n}",
+    "parameters": [
+      {
+        "key": "dids",
+        "label": "Allowed DIDs",
+        "kind": "string_list",
+        "default": [],
+        "sample": ["did:web:agent.example.com"],
+        "help": "Caller DIDs, separated by commas."
+      }
+    ],
+    "reads": ["extension_identity.did", "extension_identity.verified"],
+    "examples": [
+      {
+        "name": "Verified listed DID",
+        "input": {
+          "extension_identity": {
+            "did": "did:web:agent.example.com",
+            "verification": "vp",
+            "verified": true
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Unverified listed DID",
+        "input": {
+          "extension_identity": {
+            "did": "did:web:agent.example.com",
+            "verification": "unverified",
+            "verified": false
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Verified other DID",
+        "input": {
+          "extension_identity": {
+            "did": "did:web:other.example.com",
+            "verification": "vp",
+            "verified": true
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "opaPoliciesReferencePage",
+      "anchor": "inputextension_identity",
+      "label": "Reference: input.extension_identity"
+    }
+  },
+  {
+    "id": "allowlist-outbound-destinations",
+    "name": "Allowlist outbound destinations",
+    "summary": "Allow Transit Point calls only to the listed destinations.",
+    "description": "Allows a request through a Transit Point only when the Transit Point's configured endpoint (input.gateway.target_id) is one of the listed destinations or a path under one. It decides only where the gateway sets input.transit: as a Transit Point policy or the shared Transit Point policy. As the surface's Access Point or Target policy it allows every request, including the request a fabric:// Target sends, whose direction is also outbound but whose target_id is the peer gateway's DID. Use it as the whole policy: inserted into another policy it would allow requests that policy denies.",
+    "category": "routing_paths",
+    "policy_types": ["agent_surface"],
+    "standalone": true,
+    "rules": "default allow := false\n\nallow if not input.transit\n\nallow if {\n  input.transit\n  some destination in {{destinations}}\n  startswith(concat(\"\", [input.gateway.target_id, \"/\"]), concat(\"\", [trim_suffix(destination, \"/\"), \"/\"]))\n}",
+    "parameters": [
+      {
+        "key": "destinations",
+        "label": "Allowed destinations",
+        "kind": "string_list",
+        "default": [],
+        "sample": ["https://api.example.com", "fabric://partner-gateway"],
+        "help": "Separate destinations with commas: an endpoint URL such as https://api.example.com, or fabric://<gateway id> for a Fabric route. A Transit Point matches when its endpoint is a listed destination or a path under it, never a longer host name."
+      }
+    ],
+    "reads": ["transit", "gateway.target_id"],
+    "examples": [
+      {
+        "name": "Transit Point to a listed endpoint",
+        "input": {
+          "gateway": {
+            "direction": "outbound",
+            "target_id": "https://api.example.com"
+          },
+          "transit": {
+            "caller": {
+              "verification": "anonymous",
+              "verified": false
+            }
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Transit Point to a path under a listed endpoint",
+        "input": {
+          "gateway": {
+            "direction": "outbound",
+            "target_id": "https://api.example.com/mcp"
+          },
+          "transit": {
+            "caller": {
+              "verification": "anonymous",
+              "verified": false
+            }
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Transit Point to a host that starts with a listed one",
+        "input": {
+          "gateway": {
+            "direction": "outbound",
+            "target_id": "https://api.example.com.example.net/mcp"
+          },
+          "transit": {
+            "caller": {
+              "verification": "anonymous",
+              "verified": false
+            }
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Transit Point to a longer host name",
+        "input": {
+          "gateway": {
+            "direction": "outbound",
+            "target_id": "https://api.example.com.example.net/x"
+          },
+          "transit": {
+            "caller": {
+              "verification": "anonymous",
+              "verified": false
+            }
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Transit Point to another endpoint",
+        "input": {
+          "gateway": {
+            "direction": "outbound",
+            "target_id": "https://unknown.example.net"
+          },
+          "transit": {
+            "caller": {
+              "verification": "anonymous",
+              "verified": false
+            }
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Fabric route to a listed gateway",
+        "input": {
+          "gateway": {
+            "direction": "outbound",
+            "target_id": "fabric://partner-gateway/orders"
+          },
+          "transit": {
+            "caller": {
+              "verification": "anonymous",
+              "verified": false
+            }
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Fabric route to another gateway",
+        "input": {
+          "gateway": {
+            "direction": "outbound",
+            "target_id": "fabric://other-gateway/orders"
+          },
+          "transit": {
+            "caller": {
+              "verification": "anonymous",
+              "verified": false
+            }
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Request on the Access Point",
+        "input": {
+          "gateway": {
+            "direction": "inbound"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Request a fabric:// Target sends to the peer gateway",
+        "input": {
+          "gateway": {
+            "direction": "outbound",
+            "target_id": "did:web:peer.example"
+          }
+        },
+        "expected": "allow"
+      }
+    ],
+    "docs": {
+      "page": "opaPoliciesReferencePage",
+      "anchor": "inputgateway",
+      "label": "Reference: input.gateway"
+    }
+  },
+  {
+    "id": "business-hours-access-window",
+    "name": "Business-hours access window",
+    "summary": "Allow or deny requests by time of day, day of week and time zone.",
+    "description": "Allows, or denies, requests made inside a daily time window on the listed days, in the chosen time zone; requests outside the window get the opposite decision. A window whose end is earlier than its start crosses midnight, and each listed day gets the hours after midnight and the hours before it on that day's own date. A request whose time the policy can't read in the chosen time zone is denied in both modes. Rate limits are set on the surface's Rate Limit panel, not in policy.",
+    "category": "time",
+    "policy_types": ["gateway", "agent_surface"],
+    "standalone": true,
+    "rules": "default allow := false\n\nallow if {\n  access_minute\n  {{mode}}in_access_window\n}\n\nin_access_window if {\n  access_day\n  access_minute >= {{start_time}}\n  access_minute < {{end_time}}\n}\n\nin_access_window if {\n  {{start_time}} > {{end_time}}\n  access_day\n  access_minute >= {{start_time}}\n}\n\nin_access_window if {\n  {{start_time}} > {{end_time}}\n  access_day\n  access_minute < {{end_time}}\n}\n\naccess_minute := (hour * 60) + minute if {\n  [hour, minute, _] := time.clock([time.now_ns(), {{time_zone}}])\n}\n\naccess_day if count({{days}}) == 0\n\naccess_day if time.weekday([time.now_ns(), {{time_zone}}]) in {{days}}",
+    "parameters": [
+      {
+        "key": "mode",
+        "label": "Inside the window",
+        "kind": "choice",
+        "default": "allow",
+        "options": [
+          {
+            "value": "allow",
+            "label": "Allow requests",
+            "rego": ""
+          },
+          {
+            "value": "deny",
+            "label": "Deny requests",
+            "rego": "not "
+          }
+        ],
+        "help": "Allow lets requests through only inside the window. Deny refuses requests inside the window and lets every other request through."
+      },
+      {
+        "key": "days",
+        "label": "Days",
+        "kind": "string_list",
+        "default": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+        "allowed": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+        "help": "English day names, separated by commas. Leave empty for every day. A day is the request's date in the time zone below.",
+        "optional": true
+      },
+      {
+        "key": "start_time",
+        "label": "From",
+        "kind": "time_of_day",
+        "default": "09:00",
+        "help": "Start of the window, as HH:MM."
+      },
+      {
+        "key": "end_time",
+        "label": "Until",
+        "kind": "time_of_day",
+        "default": "17:00",
+        "differs_from": "start_time",
+        "help": "End of the window, as HH:MM; requests from this time on are outside it. A time earlier than From makes the window cross midnight, for example 22:00 to 06:00. Each part counts on its own date: with Days Monday to Friday, 22:00 to 06:00 covers 00:00 to 06:00 and 22:00 to midnight on Monday to Friday, so Monday 01:00 is inside and Saturday 01:00 is outside."
+      },
+      {
+        "key": "time_zone",
+        "label": "Time zone",
+        "kind": "string",
+        "default": "UTC",
+        "format": "time_zone",
+        "help": "An IANA time zone, for example Europe/Berlin or Asia/Singapore."
+      }
+    ],
+    "reads": [],
+    "examples": [],
+    "docs": {
+      "page": "opaPoliciesReferencePage",
+      "anchor": "policy-input-reference",
+      "label": "Reference: policy input"
+    }
+  },
+  {
+    "id": "all-trust-checks-pass",
+    "name": "All trust checks pass",
+    "summary": "Allow only if every target trust check passed.",
+    "description": "Allows a request only if at least one Trust Check ran on the target leg (input.trust_check_results.target: the Managed Agent's Target, or the Transit Point the request goes through) and every one passed. A check that queries several authorities passes when any of them recognises the entity. Denies when any check failed or none ran. Trust Checks on the Access Point are not read.",
+    "category": "trust_checks",
+    "policy_types": ["agent_surface"],
+    "rules": "default allow := false\n\ntarget_check_ids contains r.id if {\n  some r in input.trust_check_results.target\n}\n\ntarget_checks_passed contains r.id if {\n  some r in input.trust_check_results.target\n  r.ok == true\n}\n\nallow if {\n  count(target_check_ids) > 0\n  count(target_check_ids - target_checks_passed) == 0\n}",
+    "parameters": [],
+    "reads": ["trust_check_results.target"],
+    "examples": [
+      {
+        "name": "2 checks, both pass",
+        "input": {
+          "trust_check_results": {
+            "target": [
+              {
+                "id": "registry",
+                "ok": true
+              },
+              {
+                "id": "credential",
+                "ok": true
+              }
+            ]
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "2 checks, 1 fails",
+        "input": {
+          "trust_check_results": {
+            "target": [
+              {
+                "id": "registry",
+                "ok": true
+              },
+              {
+                "id": "credential",
+                "ok": false
+              }
+            ]
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "1 check with 2 authorities, 1 recognises",
+        "input": {
+          "trust_check_results": {
+            "target": [
+              {
+                "id": "registry",
+                "authority_id": "did:web:authority-a.example.com",
+                "ok": true
+              },
+              {
+                "id": "registry",
+                "authority_id": "did:web:authority-b.example.com",
+                "ok": false
+              }
+            ]
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "2 checks, 1 with no authority recognising",
+        "input": {
+          "trust_check_results": {
+            "target": [
+              {
+                "id": "registry",
+                "ok": true
+              },
+              {
+                "id": "credential",
+                "authority_id": "did:web:authority-a.example.com",
+                "ok": false
+              },
+              {
+                "id": "credential",
+                "authority_id": "did:web:authority-b.example.com",
+                "ok": false
+              }
+            ]
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "No checks ran",
+        "input": {
+          "trust_check_results": {
+            "target": []
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "opaPoliciesReferencePage",
+      "anchor": "inputtrust_check_results",
+      "label": "Reference: input.trust_check_results"
+    }
+  },
+  {
+    "id": "at-least-n-trust-checks-pass",
+    "name": "At least N trust checks pass",
+    "summary": "Threshold instead of all-or-nothing. Has a setting.",
+    "description": "Allows a request when the number of Trust Checks that passed on the target leg (input.trust_check_results.target: the Managed Agent's Target, or the Transit Point the request goes through) reaches your threshold. A check that queries several authorities counts once, and passes when any of them recognises the entity. Denies when fewer pass, or when no checks ran. Trust Checks on the Access Point are not counted.",
+    "category": "trust_checks",
+    "policy_types": ["agent_surface"],
+    "rules": "default allow := false\n\ntarget_checks_passing contains r.id if {\n  some r in input.trust_check_results.target\n  r.ok == true\n}\n\nallow if count(target_checks_passing) >= {{min_passing}}",
+    "parameters": [
+      {
+        "key": "min_passing",
+        "label": "Minimum passing checks",
+        "kind": "integer",
+        "default": 2,
+        "min": 1,
+        "max": 20,
+        "help": "Updates the Rego below. You can still edit the code after using the template."
+      }
+    ],
+    "reads": ["trust_check_results.target"],
+    "examples": [
+      {
+        "name": "3 checks, 2 pass",
+        "input": {
+          "trust_check_results": {
+            "target": [
+              {
+                "id": "a",
+                "ok": true
+              },
+              {
+                "id": "b",
+                "ok": true
+              },
+              {
+                "id": "c",
+                "ok": false
+              }
+            ]
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "3 checks, 1 passes",
+        "input": {
+          "trust_check_results": {
+            "target": [
+              {
+                "id": "a",
+                "ok": true
+              },
+              {
+                "id": "b",
+                "ok": false
+              },
+              {
+                "id": "c",
+                "ok": false
+              }
+            ]
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "1 check with 2 authorities, both recognise",
+        "input": {
+          "trust_check_results": {
+            "target": [
+              {
+                "id": "a",
+                "authority_id": "did:web:authority-a.example.com",
+                "ok": true
+              },
+              {
+                "id": "a",
+                "authority_id": "did:web:authority-b.example.com",
+                "ok": true
+              }
+            ]
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "2 checks, each with 1 of 2 authorities recognising",
+        "input": {
+          "trust_check_results": {
+            "target": [
+              {
+                "id": "a",
+                "authority_id": "did:web:authority-a.example.com",
+                "ok": true
+              },
+              {
+                "id": "a",
+                "authority_id": "did:web:authority-b.example.com",
+                "ok": false
+              },
+              {
+                "id": "b",
+                "authority_id": "did:web:authority-a.example.com",
+                "ok": false
+              },
+              {
+                "id": "b",
+                "authority_id": "did:web:authority-b.example.com",
+                "ok": true
+              }
+            ]
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "No checks ran",
+        "input": {
+          "trust_check_results": {
+            "target": []
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "opaPoliciesReferencePage",
+      "anchor": "inputtrust_check_results",
+      "label": "Reference: input.trust_check_results"
+    }
+  },
+  {
+    "id": "allow-http-methods",
+    "name": "Allow listed HTTP methods",
+    "summary": "Allow only the listed HTTP methods.",
+    "description": "Allows a request only when its HTTP method is on the list, for example to keep a surface read-only. Assigned appliance-wide, it also decides public discovery reads such as /discovery and /.well-known/ucp.",
+    "category": "routing_paths",
+    "policy_types": ["gateway", "agent_surface"],
+    "rules": "default allow := false\n\nallow if input.http.method in {{methods}}",
+    "parameters": [
+      {
+        "key": "methods",
+        "label": "Allowed methods",
+        "kind": "string_list",
+        "default": ["GET"],
+        "help": "Upper case, separated by commas."
+      }
+    ],
+    "reads": ["http.method"],
+    "examples": [
+      {
+        "name": "GET request",
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "POST request",
+        "input": {
+          "http": {
+            "method": "POST",
+            "path": "/"
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "applyOpaPoliciesGuide",
+      "anchor": "common-policy-patterns",
+      "label": "Guide: common policy patterns"
+    }
+  },
+  {
+    "id": "allow-path-prefixes",
+    "name": "Allow listed paths",
+    "summary": "Allow only requests under the listed path prefixes.",
+    "description": "Allows a request only when its path is one of the listed prefixes or a path under one, never a longer segment: /my-surface/public allows /my-surface/public/docs, not /my-surface/public-admin. The path is the whole request path, so a prefix starts with the surface's Access Point route, such as /my-surface/public/ for a route /my-surface; on a Transit Point it starts with /outbound, the route and the Transit Point's alias, or the Transit Point's own listen path. Denies a path that contains .., %2e, %25, a backslash or %5c. Assigned appliance-wide, it also decides public discovery reads such as /discovery and /.well-known/ucp.",
+    "category": "routing_paths",
+    "policy_types": ["gateway", "agent_surface"],
+    "rules": "default allow := false\n\nallow if {\n  some prefix in {{prefixes}}\n  startswith(concat(\"\", [input.http.path, \"/\"]), concat(\"\", [trim_suffix(prefix, \"/\"), \"/\"]))\n  not contains(input.http.path, \"..\")\n  not contains(lower(input.http.path), \"%2e\")\n  not contains(input.http.path, \"%25\")\n  not contains(input.http.path, \"\\\\\")\n  not contains(lower(input.http.path), \"%5c\")\n}",
+    "parameters": [
+      {
+        "key": "prefixes",
+        "label": "Allowed path prefixes",
+        "kind": "string_list",
+        "default": [],
+        "sample": ["/my-surface/public/"],
+        "help": "Whole path prefixes, each starting with the Access Point route, such as /my-surface/public/, separated by commas."
+      }
+    ],
+    "reads": ["http.path"],
+    "examples": [
+      {
+        "name": "Path /my-surface/public/docs",
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/my-surface/public/docs"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Path /public/docs without the route",
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/public/docs"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Path /my-surface/admin",
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/my-surface/admin"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Path /my-surface/public-admin/users",
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/my-surface/public-admin/users"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Path with ..",
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/my-surface/public/../admin"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Path with %2E%2E",
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/my-surface/public/%2E%2E/admin"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Path with %252e%252e",
+        "input": {
+          "http": {
+            "method": "GET",
+            "path": "/my-surface/public/%252e%252e/admin"
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "opaPoliciesReferencePage",
+      "anchor": "inputhttp",
+      "label": "Reference: input.http"
+    }
+  },
+  {
+    "id": "allow-listed-surfaces",
+    "name": "Allow listed surfaces",
+    "summary": "Allow only requests to the listed surfaces.",
+    "description": "Allows a request only when it is for one of the listed surfaces, by surface ID. Useful for a policy enforced across every surface. Assigned appliance-wide, it also decides public discovery reads such as /discovery and /.well-known/ucp.",
+    "category": "routing_paths",
+    "policy_types": ["gateway", "agent_surface"],
+    "rules": "default allow := false\n\nallow if input.channel.config_id in {{surfaces}}",
+    "parameters": [
+      {
+        "key": "surfaces",
+        "label": "Surface IDs",
+        "kind": "string_list",
+        "default": [],
+        "sample": ["3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40"],
+        "help": "Each surface's ID, shown in the read-only Surface ID field of the Surface Builder's surface panel and at the end of the surface page's address (/surfaces/<id>), separated by commas."
+      }
+    ],
+    "reads": ["channel.config_id"],
+    "examples": [
+      {
+        "name": "Listed surface",
+        "input": {
+          "channel": {
+            "config_id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
+            "name": "public-mcp"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Listed surface, renamed",
+        "input": {
+          "channel": {
+            "config_id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
+            "name": "partner-mcp"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Other surface with the same name",
+        "input": {
+          "channel": {
+            "config_id": "9a7d5e31-0c4b-4f8e-b2a6-7e1d3c5f9b82",
+            "name": "public-mcp"
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "applyOpaPoliciesGuide",
+      "anchor": "common-policy-patterns",
+      "label": "Guide: common policy patterns"
+    }
+  },
+  {
+    "id": "allow-listed-subjects",
+    "name": "Allow listed subjects",
+    "summary": "Allow only the listed JWT callers, by principal.",
+    "description": "Allows a request only when the caller authenticated with a JWT and its subject is on the list. The subject is the value of the principal claim the JWT verification strategy names, sub unless the strategy names another. Denies every other caller. It decides on the Access Point and Target request policies: on a Transit Point input.source_auth is the client the Transit Point authenticated, not the caller, and an inbound response policy has no input.source_auth.",
+    "category": "allow_deny_lists",
+    "policy_types": ["agent_surface"],
+    "rules": "default allow := false\n\nallow if {\n  input.source_auth.method == \"jwt_bearer\"\n  input.source_auth.subject in {{subjects}}\n}",
+    "parameters": [
+      {
+        "key": "subjects",
+        "label": "Allowed subjects",
+        "kind": "string_list",
+        "default": [],
+        "sample": ["user@example.com"],
+        "help": "Values of the strategy's principal claim, separated by commas."
+      }
+    ],
+    "reads": ["source_auth.subject"],
+    "examples": [
+      {
+        "name": "Listed subject",
+        "input": {
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "user@example.com",
+            "claims": {
+              "sub": "user@example.com"
+            }
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Other subject",
+        "input": {
+          "source_auth": {
+            "method": "jwt_bearer",
+            "subject": "someone@example.com",
+            "claims": {
+              "sub": "someone@example.com"
+            }
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "opaPoliciesReferencePage",
+      "anchor": "inputsource_auth",
+      "label": "Reference: input.source_auth"
+    }
+  },
+  {
+    "id": "allow-all-monitor",
+    "name": "Monitor-only baseline",
+    "summary": "Lets everything through. For observing traffic only.",
+    "description": "Allows every request, so you can watch traffic before writing a stricter policy: through the Audit Log when policy decisions are audited, or through policy input capture. To try a stricter policy without blocking, use the Monitor option of global enforcement on the Policies list instead.",
+    "category": "baseline",
+    "policy_types": ["gateway", "agent_surface"],
+    "standalone": true,
+    "rules": "default allow := true",
+    "parameters": [],
+    "reads": [],
+    "examples": [
+      {
+        "name": "Any request",
+        "input": {
+          "http": {
+            "method": "POST",
+            "path": "/"
+          }
+        },
+        "expected": "allow"
+      }
+    ],
+    "docs": {
+      "page": "opaPoliciesConceptPage",
+      "anchor": "default-allow-vs-default-deny",
+      "label": "Concept: default allow vs default deny"
+    }
+  },
+  {
+    "category": "mcp_tool_policies",
+    "policy_types": ["agent_surface"],
+    "input": "mcp_tool",
+    "id": "tool-allow-authenticated",
+    "name": "Tool policy: allow authenticated callers",
+    "summary": "For a tool binding: allow any caller with a token.",
+    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows a call when the request's bearer token has a sub claim. It reads the claims of the bearer token in the request's Authorization header (input.jwt), which the gateway does not verify, so use it only on a closed Access Point whose Caller Context methods are all JWT Bearer reading the Authorization header with the Bearer scheme.",
+    "rules": "default allow := false\n\nallow if input.jwt.sub",
+    "parameters": [],
+    "reads": ["jwt.sub"],
+    "examples": [
+      {
+        "name": "Bearer token with a subject",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "params": {
+              "name": "search",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
+          },
+          "channel": {
+            "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
+            "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
+          },
+          "jwt": {
+            "sub": "user@example.com"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "No bearer token",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "params": {
+              "name": "search",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
+          },
+          "channel": {
+            "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
+            "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "mcpToolPoliciesGuide",
+      "anchor": "example-policies",
+      "label": "Guide: per-tool MCP policies"
+    }
+  },
+  {
+    "category": "mcp_tool_policies",
+    "policy_types": ["agent_surface"],
+    "input": "mcp_tool",
+    "id": "tool-allow-by-jwt-claim",
+    "name": "Tool policy: allow by JWT claim",
+    "summary": "For a tool binding: allow callers whose claim has a listed value.",
+    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows a call when a claim of the request's bearer token, a single value or a list, has one of the listed values. Covers admin-only and subscription-based access. It reads the claims of the bearer token in the request's Authorization header (input.jwt), which the gateway does not verify, so use it only on a closed Access Point whose Caller Context methods are all JWT Bearer reading the Authorization header with the Bearer scheme.",
+    "rules": "default allow := false\n\ntool_claim_values(v) := [v] if is_string(v)\n\ntool_claim_values(v) := v if is_array(v)\n\nallow if {\n  some v in tool_claim_values(input.jwt[{{claim}}])\n  v in {{values}}\n}",
+    "parameters": [
+      {
+        "key": "claim",
+        "label": "Claim",
+        "kind": "string",
+        "default": "role",
+        "help": "The token claim to read, for example role or subscription."
+      },
+      {
+        "key": "values",
+        "label": "Allowed values",
+        "kind": "string_list",
+        "default": [],
+        "sample": ["admin"],
+        "help": "Values of the claim, separated by commas."
+      }
+    ],
+    "reads": ["jwt"],
+    "examples": [
+      {
+        "name": "Role admin",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "params": {
+              "name": "search",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
+          },
+          "channel": {
+            "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
+            "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
+          },
+          "jwt": {
+            "sub": "ops@example.com",
+            "role": "admin"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Role viewer",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "params": {
+              "name": "search",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
+          },
+          "channel": {
+            "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
+            "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
+          },
+          "jwt": {
+            "sub": "guest@example.com",
+            "role": "viewer"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "Roles list with admin",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "params": {
+              "name": "search",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
+          },
+          "channel": {
+            "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
+            "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
+          },
+          "jwt": {
+            "sub": "lead@example.com",
+            "role": ["viewer", "admin"]
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "No bearer token",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "params": {
+              "name": "search",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
+          },
+          "channel": {
+            "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
+            "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "mcpToolPoliciesGuide",
+      "anchor": "example-policies",
+      "label": "Guide: per-tool MCP policies"
+    }
+  },
+  {
+    "category": "mcp_tool_policies",
+    "policy_types": ["agent_surface"],
+    "input": "mcp_tool",
+    "id": "tool-role-with-deny-reason",
+    "name": "Tool policy: admin role with a deny reason",
+    "summary": "For a tool binding: allow one role and record why others were denied.",
+    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows callers whose bearer token has the admin role, as a single value or in a list, and sets deny_reason when the token has no role or not that one. The reason is written to the audit log only, not the response. It reads the claims of the bearer token in the request's Authorization header (input.jwt), which the gateway does not verify, so use it only on a closed Access Point whose Caller Context methods are all JWT Bearer reading the Authorization header with the Bearer scheme.",
+    "rules": "default allow := false\n\ntool_claim_values(v) := [v] if is_string(v)\n\ntool_claim_values(v) := v if is_array(v)\n\nallow if {{admin_role}} in tool_claim_values(input.jwt.role)\n\ndeny_reason := \"The caller's token has no role\" if not input.jwt.role\n\ndeny_reason := sprintf(\"Role %v may not call this tool\", [input.jwt.role]) if {\n  input.jwt.role\n  not allow\n}",
+    "parameters": [
+      {
+        "key": "admin_role",
+        "label": "Allowed role",
+        "kind": "string",
+        "default": "",
+        "sample": "admin",
+        "help": "The role claim value that may call the tool. A role claim that is a list matches when it holds this value."
+      }
+    ],
+    "reads": ["jwt.role"],
+    "examples": [
+      {
+        "name": "Role admin",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "params": {
+              "name": "delete_record",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
+          },
+          "channel": {
+            "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
+            "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
+          },
+          "jwt": {
+            "sub": "ops@example.com",
+            "role": "admin"
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Roles list with admin",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "params": {
+              "name": "delete_record",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
+          },
+          "channel": {
+            "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
+            "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
+          },
+          "jwt": {
+            "sub": "lead@example.com",
+            "role": ["viewer", "admin"]
+          }
+        },
+        "expected": "allow"
+      },
+      {
+        "name": "Role viewer",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "params": {
+              "name": "delete_record",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
+          },
+          "channel": {
+            "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
+            "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
+          },
+          "jwt": {
+            "sub": "guest@example.com",
+            "role": "viewer"
+          }
+        },
+        "expected": "deny"
+      },
+      {
+        "name": "No role",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "params": {
+              "name": "delete_record",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
+          },
+          "channel": {
+            "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
+            "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
+          },
+          "jwt": {
+            "sub": "guest@example.com"
+          }
+        },
+        "expected": "deny"
+      }
+    ],
+    "docs": {
+      "page": "mcpToolPoliciesGuide",
+      "anchor": "example-policies",
+      "label": "Guide: per-tool MCP policies"
+    }
+  },
+  {
+    "category": "mcp_tool_policies",
+    "policy_types": ["agent_surface"],
+    "input": "mcp_tool",
+    "id": "tool-allow-every-caller",
+    "name": "Tool policy: allow every caller",
+    "summary": "For a tool binding: the tool entry list is the only control.",
+    "description": "For a policy bound to MCP tools, which decides each tools/call to the surface's MCP Target: allows every call, so only the tools listed on the binding decide what can be called.",
+    "rules": "default allow := true",
+    "parameters": [],
+    "reads": [],
+    "examples": [
+      {
+        "name": "No bearer token",
+        "input": {
+          "mcp": {
+            "method": "tools/call",
+            "params": {
+              "name": "search",
+              "arguments": {
+                "query": "open invoices"
+              }
+            },
+            "protocol": "json-rpc-2.0"
+          },
+          "channel": {
+            "name": "tools",
+            "id": "3f2b8c1e-6d4a-4b7e-9c2f-1a5e8d7b6c40",
+            "protocol": "mcp"
+          },
+          "request": {
+            "source_ip": "203.0.113.10",
+            "method": "POST",
+            "path": "/mcp"
+          }
+        },
+        "expected": "allow"
+      }
+    ],
+    "docs": {
+      "page": "mcpToolPoliciesGuide",
+      "anchor": "example-policies",
+      "label": "Guide: per-tool MCP policies"
+    }
+  }
+]

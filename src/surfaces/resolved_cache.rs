@@ -299,6 +299,7 @@ mod tests {
             target: Target {
                 endpoint: "http://upstream.example/".to_string(),
                 auth: None,
+                response_auth: None,
                 policy: None,
                 response_policy: None,
                 payment_policy: None,

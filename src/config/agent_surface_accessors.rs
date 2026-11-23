@@ -1506,6 +1506,7 @@ mod tests {
             target: Target {
                 endpoint: "https://upstream:9000".to_string(),
                 auth: None,
+                response_auth: None,
                 policy: None,
                 response_policy: None,
                 payment_policy: None,

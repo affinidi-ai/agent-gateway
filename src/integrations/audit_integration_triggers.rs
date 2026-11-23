@@ -208,7 +208,8 @@ mod tests {
     };
     use crate::delegation_vault::audit::{
         AuthorityForceDeleteDetails, BrowserOriginsChangeDetails, McpProxyPinChangeDetails, PaymentEventDetails,
-        PaymentRail, PaymentStage, PolicyChangeDetails, SecretForceDeleteDetails, TargetAuthChangeDetails, audit_event,
+        PaymentRail, PaymentStage, PolicyChangeDetails, PolicyInputCaptureDetails, PolicyInputCaptureStop,
+        SecretForceDeleteDetails, TargetAuthChangeDetails, audit_event,
     };
     use std::collections::HashSet;
 
@@ -585,7 +586,9 @@ mod tests {
             | DelegationAuditAction::TrustAgentSigningKeyRotated(_)
             | DelegationAuditAction::TrustAgentControlKeyRotated(_)
             | DelegationAuditAction::TrustAgentChangeRefused(_)
-            | DelegationAuditAction::SigningChangeRefused(_) => {}
+            | DelegationAuditAction::SigningChangeRefused(_)
+            | DelegationAuditAction::PolicyInputCaptureStarted(_)
+            | DelegationAuditAction::PolicyInputCaptureStopped(_) => {}
         }
     }
 
@@ -760,6 +763,14 @@ mod tests {
                     chain: None,
                 },
             )),
+            DelegationAuditAction::PolicyInputCaptureStarted(Box::new(PolicyInputCaptureDetails {
+                actor: Actor::user("u-1"),
+                reason: None,
+            })),
+            DelegationAuditAction::PolicyInputCaptureStopped(Box::new(PolicyInputCaptureDetails {
+                actor: Actor::user("u-1"),
+                reason: Some(PolicyInputCaptureStop::Stopped),
+            })),
         ]
     }
 

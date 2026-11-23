@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { apiClient } from '../api';
 import { DeleteButton } from '../components/shared/DeleteButton';
@@ -58,6 +58,8 @@ const EditTrustRegistryPage: React.FC = () => {
   const [error, setError] = useState<string>('');
   const [success, setSuccess] = useState<string>('');
   const [copiedField, setCopiedField] = useState<string>('');
+  // The values last loaded, so a refresh replaces only the fields the user hasn't edited.
+  const loaded = useRef({ name: '', description: '' });
 
   useEffect(() => {
     if (id) {
@@ -78,11 +80,15 @@ const EditTrustRegistryPage: React.FC = () => {
 
   const fetchTrustRegistry = async () => {
     try {
-      setLoading(true);
       const response = await apiClient.get(`/trust-registries/${id}`);
+      const loadedBefore = loaded.current;
+      const next = { name: response.data.name, description: response.data.description || '' };
+      loaded.current = next;
       setRegistry(response.data);
-      setName(response.data.name);
-      setDescription(response.data.description || '');
+      setName(current => (current === loadedBefore.name ? next.name : current));
+      setDescription(current =>
+        current === loadedBefore.description ? next.description : current
+      );
     } catch (err: any) {
       setError(err.message || 'Failed to load trust registry');
     } finally {

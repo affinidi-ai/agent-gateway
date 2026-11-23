@@ -84,13 +84,14 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
   const [providers, setProviders] = useState<CredentialProviderListItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [internalSearchTerm, setInternalSearchTerm] = useState('');
   const externalProvided = externalSearchTerm !== undefined;
   const searchTerm = externalProvided ? externalSearchTerm! : internalSearchTerm;
   const setSearchTerm = setInternalSearchTerm;
 
-  const canEdit = hasPermission('settings.edit');
-  const canChangeActivation = hasPermission('credential_providers.edit');
+  const canEdit = hasPermission('credential_providers.edit');
+  const canDelete = hasPermission('credential_providers.delete');
 
   useEffect(() => {
     loadProviders();
@@ -114,6 +115,7 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
   };
 
   const handleDelete = async (provider: CredentialProviderListItem) => {
+    setDeleteError(null);
     try {
       const response = await apiClient.fetch(
         `/api/v1/credential-providers/${encodeURIComponent(provider.id)}`,
@@ -121,12 +123,13 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
       );
       if (!response.ok) {
         const body = await response.text();
-        throw new Error(providerDeleteError(response.status, body, response.statusText));
+        setDeleteError(providerDeleteError(response.status, body, response.statusText));
+        return;
       }
       setProviders(prev => prev.filter(p => p.id !== provider.id));
       onProvidersChange?.();
     } catch (e: any) {
-      alert(`Failed to delete provider: ${e.message}`);
+      setDeleteError(`Failed to delete provider: ${e.message}`);
     }
   };
 
@@ -217,6 +220,22 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
         </div>
       </div>
       <div className="card-body">
+        {deleteError && (
+          <div
+            className="alert alert-danger alert-dismissible"
+            role="alert"
+            data-testid="credential-providers-delete-error"
+          >
+            <div>{deleteError}</div>
+            <button
+              type="button"
+              className="btn-close"
+              aria-label="Dismiss"
+              onClick={() => setDeleteError(null)}
+            ></button>
+          </div>
+        )}
+
         {loading && (
           <div className="text-center py-4">
             <div className="spinner-border text-primary" role="status" />
@@ -270,7 +289,9 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                     data-testid={`credential-provider-row-${provider.id}`}
                     key={provider.id}
                     style={{ cursor: 'pointer' }}
-                    onClick={() => navigate(`/credential-providers/${provider.id}`)}
+                    onClick={() =>
+                      navigate(`/credential-providers/${encodeURIComponent(provider.id)}`)
+                    }
                   >
                     <td>
                       <strong>{provider.name}</strong>
@@ -353,7 +374,7 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                     </td>
                     <td onClick={e => e.stopPropagation()}>
                       {!takesConsent(provider.provider_type)
-                        ? canEdit && (
+                        ? canDelete && (
                             <DeleteButton
                               data-testid={`credential-provider-delete-button-${provider.id}`}
                               onDelete={() => handleDelete(provider)}
@@ -361,7 +382,7 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                               title={`Delete "${provider.name}"`}
                             />
                           )
-                        : canChangeActivation &&
+                        : canEdit &&
                           (provider.deactivated_at ? (
                             <AppButton
                               variant="outline-secondary"

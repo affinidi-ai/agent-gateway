@@ -146,7 +146,7 @@ mod tests {
 
         let jwk = serde_json::to_value(JWK::generate_ed25519().expect("key")).expect("jwk");
         let signer = VtaDiSigner::from_jwk(&jwk).expect("signer");
-        let secret = Secret::from_str("did:key:temp#temp", &jwk).expect("secret");
+        let secret = Secret::from_jwk_value("did:key:temp#temp", &jwk).expect("secret");
 
         let expected_multibase = secret
             .get_public_keymultibase()

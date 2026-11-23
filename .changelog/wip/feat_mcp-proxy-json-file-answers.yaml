@@ -1,0 +1,24 @@
+branch: feat/mcp-proxy-json-file-answers
+changes:
+  added:
+    - timestamp: '2026-11-18T09:00:00Z'
+      title: Return a file a REST API answers inside its JSON as an embedded resource
+      description: >-
+        Some REST APIs answer a file only inside JSON, as a base64 string (Gmail's message attachments
+        answer {"size", "data"} in base64url, with no endpoint for the raw bytes). An MCP Proxy's
+        OpenAPI spec can now declare that with x-gateway-file on the JSON media type of a success
+        answer of an operation, {"pointer": "/data", "encoding": "base64url"}: that answer of the
+        tool is the decoded file as an embedded resource (application/octet-stream), as a binary
+        body already is, and the tool advertises no output schema. The declaration is read whether
+        or not the media type also has a schema, and on any success answer, not only the one the
+        output schema is taken from. That answer without a string at the pointer, or with one not
+        in the declared encoding, is the tool error "REST response does not carry the file its tool
+        declares", never the JSON; another success answer is its JSON and a failure status is
+        answered as before. A malformed declaration drops the tool from tools/list and refuses its
+        calls. It applies to calls sent by the gateway's own REST client: 2026-07-28 calls, calls
+        carrying the Target credential and Transit Point calls.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

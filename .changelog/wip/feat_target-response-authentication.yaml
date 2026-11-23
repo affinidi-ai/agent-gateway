@@ -1,0 +1,47 @@
+branch: feat/target-response-authentication
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-17T00:00:00Z'
+      title: Authenticate the managed agent's responses with Response authentication
+      description: >-
+        The gateway trusted any server that answered at a surface's Target URL, resolved the
+        managed agent's identity from its answer and recorded it, so a server answering in the
+        managed agent's place got the managed agent's DID. A surface can now set
+        target.response_auth, which covers the Managed Agent's responses (the response leg; calls
+        through a Transit Point stay authenticated by its own source_auth), to accept a response
+        only when it carries one of the keys of a
+        registered secret in a response header, compared in constant time, with the header
+        removed before the caller sees the response, or, with mtls, only from an https server
+        whose certificate passes the configured pinned or CA trust, never the system's CAs,
+        optionally with the gateway presenting a stored client certificate. Any other response
+        is refused with 502 and a body that names no reason, a JSON-RPC error for a JSON-RPC
+        request, before identity resolution, response policy, payment capture or a grant refresh
+        use it, and the
+        VP Audit Log records a request_rejected with reason target_response_auth_failed. MCP tool
+        discovery of a saved surface runs the same check, and the dashboard reads a managed
+        agent's name from its Agent Card under it, showing no name when the check fails. A PUT
+        that leaves the setting out keeps
+        the stored one; null removes it. A save refuses the setting on a proxy://, a2a-proxy:// or
+        fabric:// Target, mtls on an http Target or on a Target bound by external consent, a header the Target authentication header rules refuse, certificates of the
+        wrong kind or without the client certificate's key, a secret or certificate of
+        another tenant, an inactive certificate, a key secret holding no non-blank key, and a key
+        secret the gateway also sends to the Target or a Transit Point (directly, in enabled
+        $SECRET: custom metadata or through a credential provider it sends) or accepts from
+        callers, and a credential provider update that would read a surface's key secret for a
+        provider that surface sends is refused. An API key on an http Target follows
+        credential_policy.target_https; there the key is sent unencrypted and gives no
+        protection on the network path, so use https, or mtls. Variants may set their own; the dashboard warns in the base view
+        about variants that keep none and can copy the base setting into them. A release without this setting does not load a surface that
+        sets it.
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Update lettre to 0.11.24 to fix SMTP injection and STARTTLS advisories
+      description: >-
+        lettre 0.11.22, which sends the gateway's email notifications, had advisories for SMTP
+        command injection through bare CR or LF, forged replies through STARTTLS response
+        injection, mail for a quoted local part sent to another address, and denial of service
+        from a panic or an unbounded SMTP reply. 0.11.24 fixes them.
+  breaking: []

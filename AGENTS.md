@@ -62,13 +62,13 @@ changes:
 
 ## Tests
 
-- **Unit**: `#[cfg(test)] mod tests` inline in each module.
+- **Unit**: `#[cfg(test)] mod tests` inline in each module; one function or type, or an in-process seam where real collaborators meet.
 - **Behaviour**: the acceptance layer. Gherkin scenarios under `tests/features/surface/` (`surface_bdd`, one gateway) and `tests/features/g2g/` (`g2g_bdd`, two gateways over the fabric). Every new behaviour an operator or caller can observe gets a scenario here; behaviour seen in the dashboard goes to Playwright in `ui-tests/`. After adding or changing a `.feature` file or a step binding, run `python3 scripts/bdd-gherkin.py --lint`; errors block, and CI runs the same check.
   - One behaviour per scenario, in the vocabulary of [`CONTEXT.md`](CONTEXT.md).
   - Exercise the real gateway through its public interfaces.
   - Assert what the caller or operator observes, not internal state.
   - Fixtures store an Access Point as the admin API creates it: closed when it authenticates callers, public when it does not. Test a caller whose credential fails on that protected flow (refused with `401`, the Target never called). Only a scenario about what a public Access Point still guarantees (the failed caller reaches policy, gets no Target credential and no caller identity, and a policy can deny it) says `the surface is stored with a public Access Point`, and only one about a legacy surface says `the surface is stored as a legacy surface`.
-- **Legacy component**: `src/component_tests/` is frozen. No new files, test functions or helpers; existing tests may be fixed or deleted. The `freeze` tests in `src/component_tests/mod.rs` pin each file's test count in `FROZEN_FILES` and fail on a new file or a count that moves without its pin. Pins only go down. New helpers are a review rule; the tests do not catch them.
+- **Legacy component**: `src/component_tests/` is frozen. No new files, test functions or helpers; existing tests may be fixed or deleted. The `freeze` tests in `src/component_tests/mod.rs` pin each file's test count in `FROZEN_FILES` and fail on a new file or a count that moves without its pin. Pins only go down; a raise needs a reason stated in the pull request, usually matching main's count after a `FROZEN_FILES` merge conflict or when main itself fails the guard (see [`docs/development/TESTING.md`](docs/development/TESTING.md#legacy-component-tests)). New helpers are a review rule; the tests do not catch them.
 - **MCP conformance**: `make mcp-conformance` (`scripts/mcp-conformance/`) runs the published MCP suite and the legacy compatibility checks against the ordinary gateway binary; `ARGS=--unit-tests` adds the full binary test suite.
 
 ## Frontend conventions
@@ -141,6 +141,10 @@ A Transit Point's Rate Limit panel has a **Per caller** section that writes
 `transit.points[].per_caller_rate_limit` beside the point's shared `rate_limit`; see _Surface
 Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+The Surface Builder palette offers the A2A Transit Point only on A2A and AP2 surfaces and the MCP
+Transit Point only on MCP surfaces; existing Transit Points stay editable; see _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
 The Surface Builder labels an Access Point's URL **Entry point URL**, with a copy button in the
 Access Point panel and on the canvas, and names a new surface `<protocol>_surface_<n>`; see
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
@@ -203,7 +207,8 @@ with `send_resource: false`, and tell an external consent provider that sends it
 re-created with `send_resource: false`; see _Credential provider editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 
-The secret editor has one save button and never shows a stored secret value; see
+The secret editor has one save button and never shows a stored secret value, and deleting a
+secret that other resources use asks first and can force the delete; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 
 Deleting an API key on the Secrets page or the API key page opens a confirmation dialog that
@@ -300,7 +305,13 @@ Callback URL in a second request once the gateway returns the path it built from
 generated for the provider, then opens that provider, also when the second request fails; a
 stored provider without a Callback URL shows the gateway's own one), and target
 authentication on a Managed Agent or Transit
-Point can take its credential from a credential provider; see _Credential provider editor_ and
+Point can take its credential from a credential provider, with optional scopes. The Surface
+Builder shows header name and format problems next to the fields, which block Save in a stored
+setting too, blocks Save while a Managed Agent's secret method has no secret picked, shows a
+Target that is not https and a leg that authenticates no caller as advisories that allow Save
+(the gateway refuses them only when `target_https` or `target_source_auth` is `enforce`), advises
+on a passthrough fallback, keeps a stored `target_auth` it did not edit, and keeps Target
+authentication settings out of the canvas data; see _Credential provider editor_ and
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 
 A Transit Point's static-secret target authentication picks its secret from a tenant-aware list
@@ -380,7 +391,11 @@ agent, built by the gateway from the surfaces that target it; MCP surfaces are l
 status is shown. Its empty state offers a **Create a surface** link, which opens `/surfaces/new`,
 to users with `surfaces.edit` only. Its Agent Card tab shows the card the gateway serves for
 Direct, Proxied and Fabric routes with a **Card source** row, and keeps the surface picker, with a
-Retry, when the card can't be read through the chosen surface; see _Agents page_ in
+Retry, when the card can't be read through the chosen surface. Its list shows the protocol with the
+shared `ProtocolBadge` (`components/shared/ProtocolBadge.tsx`) the Surfaces page and the template
+picker use, never restyled per page, the Identities and Used by surfaces counts as the Surfaces page's square count
+badge, and every row value at the table's body size. Its Connection tab lists each of the agent's
+DIDs with a copy button; see _Agents page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#agents-page).
 
 The Identities page shows one row per surface Managed Agent, with its earlier DIDs (from its
@@ -389,6 +404,13 @@ versions in the expanded row, each earlier DID with its own actions; rows carry 
 `rotation_count`, and Version History loads the rotations when opened; see _Identities page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page) and
 [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#identity-versions).
+
+The Managed Agent panel's **Response Authentication** section writes `target.response_auth`
+(Off, API key or mTLS), is shown only for an HTTP or HTTPS Target, offers mTLS only on an
+`https://` one, keeps a stored setting the operator did not edit and sends `null` once it is
+switched off. In the base view it names the variants that keep no setting of their own and
+offers **Copy to variants**, which never saves by itself; see _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Agent Identity panel doesn't offer From API Key on the Managed Agent's response identity,
 and a stored one keeps working; see _Surface Builder_ in
@@ -414,6 +436,59 @@ or has an `a2a-proxy://` Target, while `credential_policy.target_source_auth` is
 which refuses the save), shown as "Not ready for external access" under the Access Point URL
 with a **Configure Authentication** action; see
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+A surface's Capture view has a **Policy Input** card listing, live, the input and decision of each
+request and response policy evaluation (not MCP tool policies) while the user listens with its **Listen to policy input** button (users with
+both `surfaces.edit` and `policies.edit`; leaving the view or reloading stops it), and says a
+request policy must be added first while the surface has none. It offers listening only while the
+`policy_input_capture` feature flag is on (default off), and otherwise says capture is turned off,
+or that the gateway settings could not be read, with a Retry, when loading them failed;
+see _Policy input capture_ and _Feature flags_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#policy-input-capture).
+
+The Capture view's **Clear** button clears captured payloads and policy inputs, its **Pause**
+holds the payload stream only (the Policy Input card says so while a listen is on), and its card
+titles share one style; see _Policy input capture_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#policy-input-capture).
+
+The policy editor's create and edit pages share Start from (create only), Details and Policy
+sections built from the shared dashboard components, and are read-only without
+`policies.edit`; see _Policy definition editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#policy-definition-editor). Templates need no
+gateway API and link to their Apply Policies docs section. A new policy shows only the
+**Start from** gallery, with no card selected, until a template is used; Details and the
+Policy section, on the Rules view, appear after that. The gallery lists only the built-in
+templates of the policy's Type, so **Define Gateway Policy** and **Define Agent
+Surface Policy** each start from their own templates, the Type set by that button and never
+changeable, with a **Create custom policy** button
+under the list that starts a custom policy (allow-all Rego, Name and Description emptied) at
+once, or shows it in the templates column first when it would replace rules or edits. It has no search or category
+filters, its cards carry no role or default decision badges, and on an Agent Surface policy a
+template that serves surfaces only has a muted "Agent surface only" note. A setting that
+depends on the deployment (issuers, audiences, DIDs, destinations, paths, surface IDs,
+subjects, role and claim values) starts empty with a sample as its placeholder, and Use this
+template and Add to policy stay disabled until it is filled; previews use the sample, labelled
+as one. A gallery card shows its settings, How it decides, its Rego and docs link in the templates column, and **Use this template** fills the
+Rego and an empty or template-filled Description, never the Name, asking in place first (focus on Cancel) unless the Rego is an untouched
+start. **Add rules from a template** lists only templates that add rules, each marked **Adds
+rules**; a whole-policy template is used from Start from. The Policy section's
+**Rules | Rego** toggle lists the rules grouped by
+template, states above them what the policy decides (or that it can't, pointing to the Rego),
+marks each rule other than `allow` and `deny_reason` "Used by allow" or "Not used by allow",
+shows a plain allow rule's conditions one per line, joined by a muted "and", when it has
+several and splits cleanly (otherwise the rule stays on one line), with Remove per group and
+per rule, disabled while `allow` reads the rule, with a reason that names the rule reading
+it, and on an `allow` definition that is not a plain allow (badged "Sets allow"), with a
+reason that points to the Rego view; under Default ALLOW each group with allow rules is marked as having no effect, and on a
+new policy a group written for the other Type is marked and blocks Create until it is
+removed. Once rules are added the gallery still names the template the policy started from
+and counts the templates added. **Add rules from a template** lists only templates that add
+rules, so several combine in a new or saved policy, and counts the
+whole policies and other-Type templates it leaves out. Once rules are added to a saved policy
+a Template examples card runs their examples through the existing simulate endpoint, says why
+a row differs and loads its input in Test (dry-run). Templates are the built-in catalogue that
+ships with the dashboard only; nothing saves, stores or shares a template; see
+_Policy templates_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-templates).
 
 The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see
 _Maintenance actions_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#maintenance-actions).

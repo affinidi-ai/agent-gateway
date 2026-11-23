@@ -155,17 +155,18 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
             .await
         }
     } else {
-        MockServer::start_with_extra_headers(
-            world
-                .collaborator_target(PRIMARY_COLLABORATOR_KEY)
-                .configured_response
-                .clone(),
-            world
-                .surface_config
-                .custom_response_headers
-                .clone(),
-        )
-        .await
+        let response = world
+            .collaborator_target(PRIMARY_COLLABORATOR_KEY)
+            .configured_response
+            .clone();
+        let headers = world
+            .surface_config
+            .custom_response_headers
+            .clone();
+        match &world.managed_agent_tls {
+            Some(tls) => MockServer::start_tls(response, headers, tls).await,
+            None => MockServer::start_with_extra_headers(response, headers).await,
+        }
     };
     let affinidi_well = if world.terms_enabled {
         let mut response = crate::bdd_support::mock_server::MockResponse::json(
@@ -412,6 +413,18 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         );
     }
 
+    if let Some(seed) = world.agent_did_seed {
+        world.seeded_agent_did = Some(
+            crate::steps::agent_did::seed_agent_did(
+                &temp_dir
+                    .path()
+                    .join("_storage/identities"),
+                seed,
+            )
+            .await,
+        );
+    }
+
     if world.affinidi_cache_seeded {
         let cache_dir = temp_dir
             .path()
@@ -520,6 +533,25 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     });
 }
 
+/// The port of the scenario's one gateway declared with `Given gateway "<name>"`.
+fn only_gateway_instance_port(world: &SurfaceWorld) -> u16 {
+    let mut ports = world
+        .actors
+        .gateway_instances()
+        .values()
+        .filter_map(|gateway| {
+            gateway
+                .fixture
+                .as_ref()
+                .map(|fixture| fixture.gateway_port)
+        });
+    let port = ports
+        .next()
+        .expect("the scenario must start a gateway");
+    assert!(ports.next().is_none(), "the operator's session needs a scenario with one gateway");
+    port
+}
+
 pub async fn ensure_admin_session(world: &mut SurfaceWorld) {
     if world.admin_client.is_some() {
         return;
@@ -527,16 +559,26 @@ pub async fn ensure_admin_session(world: &mut SurfaceWorld) {
 
     ensure_gateway_running(world).await;
 
-    let gateway_port = world
-        .infra
-        .as_ref()
-        .expect("scenario infra must exist")
-        .gateway_port;
+    let gateway_port = match world.infra.as_ref() {
+        Some(infra) => infra.gateway_port,
+        None => only_gateway_instance_port(world),
+    };
     let client = AdminApiClient::new(gateway_port, TEST_AUTH_TOKEN, "surface-bdd-admin");
     client
         .bootstrap_test_session()
         .await
         .expect("test-support auth login should succeed");
+    let pending: Vec<(String, bool)> = std::mem::take(&mut world.pending_feature_flags);
+    if !pending.is_empty() {
+        let flags: Vec<(&str, bool)> = pending
+            .iter()
+            .map(|(flag, on)| (flag.as_str(), *on))
+            .collect();
+        client
+            .set_feature_flags(&flags)
+            .await
+            .expect("set the feature flags a step chose before the gateway started");
+    }
     world.admin_client = Some(client);
 }
 
@@ -864,7 +906,7 @@ async fn send_request_to_path_and_record(
     send_json_request_to_path_and_record(world, path_and_query, body, headers).await;
 }
 
-async fn send_json_request_and_record(
+pub(crate) async fn send_json_request_and_record(
     world: &mut SurfaceWorld,
     body: serde_json::Value,
     headers: Vec<(String, String)>,

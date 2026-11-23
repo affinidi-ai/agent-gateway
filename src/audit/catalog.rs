@@ -280,6 +280,18 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         "A surface, issuer or settings save that changed a signing choice was refused for lack of key_management.edit",
         KeyManagement,
     ),
+    event(
+        "policy_input_capture_started",
+        "Policy Input Capture Started",
+        "A dashboard user started watching the live, masked policy input of a surface; also recorded wherever Policy Input Capture Stopped is selected",
+        Policies,
+    ),
+    event(
+        "policy_input_capture_stopped",
+        "Policy Input Capture Stopped",
+        "A dashboard user's policy input capture on a surface ended, with why; also recorded wherever Policy Input Capture Started is selected",
+        Policies,
+    ),
 ];
 
 /// The delegation events that are written to the gateway log and offered to
@@ -303,9 +315,14 @@ pub const LOGGED_EVENTS: &[&str] = &[
 /// the second, so a selection made before the second existed still records
 /// it. An operator's limit on a consent ends access sooner, as a revocation
 /// does, and a consent that ends at its time limit is the end of one that was
-/// granted.
-pub const RECEIVED_WITH: &[(&str, &str)] =
-    &[("token_revoked", "consent_limited"), ("consent_granted", "consent_expired")];
+/// granted. A policy input capture's start and end are recorded together, so a
+/// sink never holds one without the other.
+pub const RECEIVED_WITH: &[(&str, &str)] = &[
+    ("token_revoked", "consent_limited"),
+    ("consent_granted", "consent_expired"),
+    ("policy_input_capture_started", "policy_input_capture_stopped"),
+    ("policy_input_capture_stopped", "policy_input_capture_started"),
+];
 
 /// Warns that `selection` names `dropped`, events the gateway no longer
 /// audits: it is used without them, and they are no longer delivered. Each
@@ -445,6 +462,8 @@ mod tests {
             "policy_detached",
             "policy_attachment_changed",
             "policy_change_refused",
+            "policy_input_capture_started",
+            "policy_input_capture_stopped",
         ] {
             assert_eq!(group_of(policies), Some(AuditEventGroup::Policies), "{policies}");
         }

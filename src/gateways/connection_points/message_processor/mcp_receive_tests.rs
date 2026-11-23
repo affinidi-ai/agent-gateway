@@ -1299,6 +1299,7 @@ async fn fabric_consent_flow() {
             verifiable_credentials: Cow::Owned(vec![credential]),
             challenge: None,
             domain: None,
+            proof_purpose: ssi::verification_methods::ProofPurpose::Assertion,
         }))
         .await
         .unwrap();

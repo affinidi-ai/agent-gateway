@@ -10,6 +10,7 @@
 //! src/gateways/connection_points/ but with trust-registry-specific types.
 
 use affinidi_messaging_didcomm::Message as DIDCommMessage;
+use affinidi_messaging_sdk::errors::TrustTaskRefusal;
 use affinidi_tdk_common::secrets_resolver::secrets::Secret;
 use reqwest::Method;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue};
@@ -408,6 +409,62 @@ fn problem_report_error(body: serde_json::Value) -> TrustRegistryError {
         Ok(problem) => TrustRegistryError::ProblemReport(problem.code, problem.comment),
         Err(e) => TrustRegistryError::ParseError(format!("Failed to parse problem report: {}", e)),
     }
+}
+
+/// How much of a refusal's code and message reach an error string. The SDK
+/// caps a refusal's `code` and `message` but keeps `details`, which is where
+/// `mediator_code` reads from, exactly as the peer sent it, so this path caps
+/// what it takes rather than resting on the SDK's own limits.
+const MAX_REFUSAL_CODE_CHARS: usize = 256;
+const MAX_REFUSAL_MESSAGE_CHARS: usize = 2048;
+
+/// Peer-chosen text cut to `max_chars`, so no field of a refusal can fill an
+/// error string that is logged and recorded.
+fn capped(
+    value: &str,
+    max_chars: usize,
+) -> String {
+    value
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
+/// The error a refusal produces when it arrives as the `trust-task-error`
+/// document a mediator from v0.52 sends, rather than as a problem report. The
+/// code is the one the mediator gives the same refusal in a problem report
+/// (`details.mediatorCode`) when it translated one, so a code
+/// [`TrustRegistryError::is_conflict`] knows is read the same in either form;
+/// otherwise it is the Trust Tasks code as it arrived. A registry answering
+/// with its own [`TR_CONFLICT_CODE`] in the new form would carry no mediator
+/// code and would not be read as a conflict; none sends that form today.
+fn refusal_error(refusal: &TrustTaskRefusal) -> TrustRegistryError {
+    TrustRegistryError::ProblemReport(
+        capped(refusal.mediator_code(), MAX_REFUSAL_CODE_CHARS),
+        refusal
+            .message
+            .as_deref()
+            .map(|message| capped(message, MAX_REFUSAL_MESSAGE_CHARS))
+            .unwrap_or_default(),
+    )
+}
+
+/// A query to a trust registry and the thread it opens. The query's id is
+/// that thread, so a refusal naming the refused request by its id
+/// (`inResponseTo`) names a thread the reader recognises as the gateway's.
+pub(crate) fn query_message(
+    from: &str,
+    to: &str,
+    message_type: &str,
+    body: serde_json::Value,
+) -> (DIDCommMessage, String) {
+    let thread_id = format!("{REQUEST_THREAD_PREFIX}{}", uuid::Uuid::new_v4());
+    let message = DIDCommMessage::build(thread_id.clone(), message_type.to_string(), body)
+        .from(from.to_string())
+        .to(to.to_string())
+        .thid(thread_id.clone())
+        .finalize();
+    (message, thread_id)
 }
 
 /// Deserialise a registry response into the expected typed shape, returning
@@ -2413,16 +2470,7 @@ impl TrustRegistryListenerManager {
         if remaining.is_zero() {
             return Err(TrustRegistryError::Timeout("no time left to send to the trust registry".to_string()));
         }
-        let message_id = uuid::Uuid::new_v4().to_string();
-        let thread_id = format!("{REQUEST_THREAD_PREFIX}{}", uuid::Uuid::new_v4());
-
-        let message = DIDCommMessage::build(message_id.clone(), message_type.to_string(), body)
-            .from(connection.our_did.clone())
-            .to(connection
-                .registry_did
-                .clone())
-            .thid(thread_id.clone())
-            .finalize();
+        let (message, thread_id) = query_message(&connection.our_did, &connection.registry_did, message_type, body);
 
         debug!("Sending {} to trust registry {} (thid: {})", message_type, connection.registry_did, thread_id);
 
@@ -2471,6 +2519,9 @@ impl TrustRegistryListenerManager {
                 pending.answered = true;
                 if result.msg_type == MSG_TYPE_PROBLEM_REPORT {
                     return Err(problem_report_error(result.body));
+                }
+                if let Some(refusal) = TrustTaskRefusal::from_document(&result.body) {
+                    return Err(refusal_error(&refusal));
                 }
                 info!("Received response: {}", result.msg_type);
                 Ok(result.body)
@@ -4256,6 +4307,131 @@ mod tests {
             TrustRegistryError::ProblemReport(code, comment) => {
                 assert_eq!(code, TR_CONFLICT_CODE);
                 assert_eq!(comment, "Reference field already exists");
+            }
+            other => panic!("Expected ProblemReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_trust_task_refusal_becomes_the_same_error_a_problem_report_does() {
+        let refusal = TrustTaskRefusal::from_document(&json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000001",
+            "type": "https://trusttasks.org/spec/trust-task-error/0.6",
+            "payload": { "code": "messaging/account/get:unknownAccount", "message": "account not found", "retryable": false },
+        }))
+        .expect("a trust-task-error");
+
+        let error = refusal_error(&refusal);
+
+        match &error {
+            TrustRegistryError::ProblemReport(code, comment) => {
+                assert_eq!(code, "messaging/account/get:unknownAccount", "the Trust Tasks code is kept as it arrived");
+                assert_eq!(comment, "account not found");
+            }
+            other => panic!("Expected ProblemReport, got {other:?}"),
+        }
+        assert!(!error.is_conflict(), "a mediator refusal is not a registry write conflict");
+    }
+
+    #[test]
+    fn a_refusal_the_mediator_translated_is_read_as_the_conflict_it_answers() {
+        let refusal = TrustTaskRefusal::from_document(&json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000003",
+            "type": "https://trusttasks.org/spec/trust-task-error/0.6",
+            "payload": {
+                "code": "registry/record/create:conflict",
+                "message": "Reference field already exists",
+                "retryable": false,
+                "details": { "mediatorCode": TR_CONFLICT_CODE },
+            },
+        }))
+        .expect("a trust-task-error");
+
+        let error = refusal_error(&refusal);
+
+        assert!(error.is_conflict(), "the code the same refusal carries as a problem report decides");
+        match error {
+            TrustRegistryError::ProblemReport(code, comment) => {
+                assert_eq!(code, TR_CONFLICT_CODE);
+                assert_eq!(comment, "Reference field already exists");
+            }
+            other => panic!("Expected ProblemReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refusals_code_is_capped_before_it_reaches_an_error_string() {
+        let refusal = TrustTaskRefusal::from_document(&json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000004",
+            "type": "https://trusttasks.org/spec/trust-task-error/0.6",
+            "payload": {
+                "code": "messaging/account/get:unknownAccount",
+                "retryable": false,
+                "details": { "mediatorCode": "e".repeat(10_000) },
+            },
+        }))
+        .expect("a trust-task-error");
+
+        match refusal_error(&refusal) {
+            TrustRegistryError::ProblemReport(code, _) => {
+                assert_eq!(
+                    code.chars().count(),
+                    MAX_REFUSAL_CODE_CHARS,
+                    "the SDK leaves details uncapped, so this path must cap it"
+                );
+            }
+            other => panic!("Expected ProblemReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refusals_message_is_capped_before_it_reaches_an_error_string() {
+        let refusal = TrustTaskRefusal::from_document(&json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000005",
+            "type": "https://trusttasks.org/spec/trust-task-error/0.6",
+            "payload": {
+                "code": "messaging/account/get:unknownAccount",
+                "message": "m".repeat(10_000),
+                "retryable": false,
+            },
+        }))
+        .expect("a trust-task-error");
+
+        match refusal_error(&refusal) {
+            TrustRegistryError::ProblemReport(_, message) => {
+                assert!(
+                    message.chars().count() <= MAX_REFUSAL_MESSAGE_CHARS,
+                    "the message reaches a Trust Check detail, so this path caps it: {} chars",
+                    message.chars().count()
+                );
+            }
+            other => panic!("Expected ProblemReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_query_is_identified_by_the_thread_it_opens() {
+        let (message, thread_id) =
+            query_message("did:example:gateway", "did:example:registry", "https://example.org/query", json!({}));
+
+        assert!(is_request_thread(&thread_id), "a query's thread marks it as the gateway's");
+        assert_eq!(message.thid.as_deref(), Some(thread_id.as_str()));
+        assert_eq!(message.id, thread_id, "a refusal naming the query by its id names the thread the reader knows");
+    }
+
+    #[test]
+    fn a_trust_task_refusal_without_a_message_keeps_its_code() {
+        let refusal = TrustTaskRefusal::from_document(&json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000002",
+            "type": "https://trusttasks.org/spec/trust-task-error/0.6",
+            "payload": { "code": "messaging/account/get:notAuthorised", "retryable": false },
+        }))
+        .expect("a trust-task-error");
+
+        match refusal_error(&refusal) {
+            TrustRegistryError::ProblemReport(code, comment) => {
+                assert_eq!(code, "messaging/account/get:notAuthorised");
+                assert_eq!(comment, "");
             }
             other => panic!("Expected ProblemReport, got {other:?}"),
         }

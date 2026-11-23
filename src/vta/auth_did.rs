@@ -1217,6 +1217,7 @@ mod live_tests {
                 verifiable_credentials: std::borrow::Cow::Owned(vec![credential]),
                 challenge: None,
                 domain: None,
+                proof_purpose: ssi::verification_methods::ProofPurpose::Authentication,
             }))
             .await
             .expect("the VTA signs the agent's presentation");

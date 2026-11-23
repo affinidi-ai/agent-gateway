@@ -415,6 +415,10 @@ pub(crate) enum TargetGrantRefusal {
     /// The request to the Target could not be built with the grant's headers.
     #[error("the request to the Target could not be built")]
     RequestNotBuilt,
+    /// The retry's answer failed Response authentication. The handler answers
+    /// it with [`crate::proxy::response_auth::refuse`].
+    #[error("the retried answer failed response authentication: {}", .0.reason())]
+    ResponseUnauthenticated(crate::proxy::response_auth::ResponseAuthFailure),
 }
 
 impl TargetGrantRefusal {
@@ -424,7 +428,7 @@ impl TargetGrantRefusal {
             Self::Method => StatusCode::METHOD_NOT_ALLOWED,
             Self::CallerNotIdentified => StatusCode::FORBIDDEN,
             Self::Grant(refused) => refused.refusal.status(),
-            Self::RetryNotSent => StatusCode::BAD_GATEWAY,
+            Self::RetryNotSent | Self::ResponseUnauthenticated(_) => StatusCode::BAD_GATEWAY,
             Self::RequestNotBuilt => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -444,7 +448,7 @@ impl TargetGrantRefusal {
                 ..
             }) => mcp.then_some(error_codes::INTERNAL_ERROR),
             Self::CallerNotIdentified | Self::Grant(_) => mcp.then_some(-32001),
-            Self::Method | Self::RetryNotSent | Self::RequestNotBuilt => None,
+            Self::Method | Self::RetryNotSent | Self::RequestNotBuilt | Self::ResponseUnauthenticated(_) => None,
         }
     }
 
@@ -467,6 +471,9 @@ impl TargetGrantRefusal {
             Self::RetryNotSent => crate::a2a::create_error_response(StatusCode::BAD_GATEWAY, "Upstream request failed"),
             Self::RequestNotBuilt => {
                 crate::a2a::create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid upstream request")
+            }
+            Self::ResponseUnauthenticated(_) => {
+                crate::a2a::create_error_response(StatusCode::BAD_GATEWAY, crate::proxy::response_auth::REFUSAL_MESSAGE)
             }
         }
     }
@@ -625,6 +632,7 @@ pub(crate) async fn route(
                 TargetGrantRefusal::Grant(_)
                 | TargetGrantRefusal::RetryNotSent
                 | TargetGrantRefusal::RequestNotBuilt => RejectionReason::ConnectorUnavailable,
+                TargetGrantRefusal::ResponseUnauthenticated(_) => RejectionReason::TargetResponseAuthFailed,
             };
             request_rejected(
                 request_facts,
@@ -1070,8 +1078,10 @@ impl TargetGrantRoute {
     /// `connector_unavailable`, and keeps the fresh grant. A `401` without
     /// such a challenge, a refresh that fails for a reason a new connect would
     /// not fix, and a body too large to send again (`retry` is `None`) keep
-    /// the grant and answer `connector_unavailable`. Any other answer passes
-    /// through.
+    /// the grant and answer `connector_unavailable`. A retried answer loses
+    /// its Response authentication key header, and one that fails the check
+    /// is refused ([`TargetGrantRefusal::ResponseUnauthenticated`]) before it
+    /// is read. Any other answer passes through.
     pub(crate) async fn answer(
         &self,
         state: &ProxyState,
@@ -1117,7 +1127,7 @@ impl TargetGrantRoute {
         }
         self.injected(surface, &release, &released, &fresh)
             .await;
-        let retried = match client.execute(request).await {
+        let mut retried = match client.execute(request).await {
             Ok(retried) => retried,
             Err(error) => {
                 warn!(
@@ -1129,6 +1139,16 @@ impl TargetGrantRoute {
                 return Err(TargetGrantRefusal::RetryNotSent);
             }
         };
+        if let Err(failure) = crate::proxy::response_auth::authenticate_response(
+            surface,
+            retried.headers_mut(),
+            state.secrets_store.as_ref(),
+        )
+        .await
+        {
+            drop(retried);
+            return Err(TargetGrantRefusal::ResponseUnauthenticated(failure));
+        }
         if let Err(refused) = vendor_answer_to_a_retry(retried.status(), retried.headers()) {
             drop(retried);
             return Err(refuse(surface, refused));

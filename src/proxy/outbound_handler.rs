@@ -3338,6 +3338,42 @@ pub(crate) async fn fetch_agent_card(
     timeout: std::time::Duration,
     limits: crate::proxy::upstream_body::UpstreamBodyLimits,
 ) -> Option<serde_json::Value> {
+    read_agent_card(target_url, agent_card_path, request_id, timeout, limits, None)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The Response authentication a card read by [`fetch_checked_agent_card`] is held to: that of
+/// `surface`'s Target, with the stores its key secret and certificates are read from.
+pub(crate) struct CardCheck<'a> {
+    pub surface: &'a crate::config::agent_surface::AgentSurface,
+    pub secrets: Option<&'a Arc<dyn crate::secrets::SecretsStore>>,
+    pub certificates: Option<&'a Arc<dyn crate::certificates::CertificateStore>>,
+}
+
+/// [`fetch_agent_card`] from the Target of `check.surface`, every URL dialled with the TLS
+/// settings of its Response authentication and every answer checked by it. `Err` when the
+/// setting cannot be checked on a URL or an answer fails it, without trying the next URL.
+pub(crate) async fn fetch_checked_agent_card(
+    target_url: &str,
+    agent_card_path: Option<&str>,
+    request_id: &str,
+    timeout: std::time::Duration,
+    limits: crate::proxy::upstream_body::UpstreamBodyLimits,
+    check: CardCheck<'_>,
+) -> Result<Option<serde_json::Value>, crate::proxy::response_auth::ResponseAuthFailure> {
+    read_agent_card(target_url, agent_card_path, request_id, timeout, limits, Some(check)).await
+}
+
+async fn read_agent_card(
+    target_url: &str,
+    agent_card_path: Option<&str>,
+    request_id: &str,
+    timeout: std::time::Duration,
+    limits: crate::proxy::upstream_body::UpstreamBodyLimits,
+    check: Option<CardCheck<'_>>,
+) -> Result<Option<serde_json::Value>, crate::proxy::response_auth::ResponseAuthFailure> {
     let urls: Vec<String> = match agent_card_path {
         Some(custom_path) => vec![agent_card_override_url(target_url, custom_path)],
         None => {
@@ -3349,8 +3385,14 @@ pub(crate) async fn fetch_agent_card(
     for card_url in &urls {
         let logged_url = loggable::url(card_url);
         let candidate = card_url.clone();
+        let tls = match &check {
+            Some(check) => crate::proxy::response_auth::hop_tls(check.surface, card_url, check.certificates)
+                .await?
+                .map(|tls| tls.config),
+            None => None,
+        };
         let client = match tokio::task::spawn_blocking(move || {
-            crate::egress::pinned_forward_client(&candidate, timeout)
+            crate::egress::pinned_forward_client_with_tls(&candidate, timeout, tls.as_deref())
         })
         .await
         {
@@ -3364,16 +3406,19 @@ pub(crate) async fn fetch_agent_card(
                 continue;
             }
         };
-        match client
+        let mut sent = client
             .get(card_url)
             .send()
-            .await
-        {
+            .await;
+        if let Some(check) = &check {
+            crate::proxy::response_auth::authenticate_sent(check.surface, &mut sent, check.secrets).await?;
+        }
+        match sent {
             Ok(resp) if resp.status().is_success() => {
                 match crate::proxy::upstream_body::read_bounded(resp, limits).await {
                     Ok(body) => {
                         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
-                            return Some(json);
+                            return Ok(Some(json));
                         }
                     }
                     Err(e) => {
@@ -3409,7 +3454,7 @@ pub(crate) async fn fetch_agent_card(
         request_id = %request_id,
         "Failed to fetch agent card from any well-known URL"
     );
-    None
+    Ok(None)
 }
 
 /// [8] Trust Context Collection — fetches target agent card and queries trust registry.

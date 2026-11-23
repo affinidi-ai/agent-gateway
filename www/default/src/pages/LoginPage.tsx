@@ -216,7 +216,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
     }
   };
 
-  const RightContent = () => {
+  const renderRightContent = () => {
     if (authMode === null || initializing) {
       return (
         <div className="text-center py-5">
@@ -380,7 +380,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
               className={styles.formLogoWordmark}
             />
           </div>
-          <RightContent />
+          {renderRightContent()}
         </div>
         <footer className={styles.formFooterBottom}>
           <p className={styles.formFooterText}>

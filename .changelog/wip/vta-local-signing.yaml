@@ -18,7 +18,9 @@ changes:
         keys/sign-document, every request carries a proof from the gateway's
         control key, and the gateway checks each answer against what it asked
         for (key, algorithm, signer, purpose, challenge, domain and document)
-        before using it. The signer is resolved on every call, the published key
+        before using it. A credential or presentation proof the trust agent made
+        is held to the same proof purpose rules as any other. The signer is
+        resolved on every call, the published key
         set and the gateway's own token checks follow it, and a choice that
         cannot sign refuses to sign rather than falling back to another key.
         Calls are bounded by a timeout, a concurrency limit, a circuit breaker

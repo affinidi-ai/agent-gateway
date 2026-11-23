@@ -207,6 +207,28 @@ impl AdminApiClient {
             .unwrap_or_default())
     }
 
+    /// The Managed Agent identities the Identities dashboard lists (`GET /v1/dashboard/stats`).
+    pub async fn managed_agent_identities(&self) -> Result<Vec<Value>> {
+        let response = self
+            .send_recorded_json::<Value>(Method::GET, "/v1/dashboard/stats", None)
+            .await?;
+        if response.status != 200 {
+            bail!("reading the Identities dashboard failed with status {}: {}", response.status, response.body);
+        }
+        let Some(identities) = response
+            .body
+            .get("identities")
+            .and_then(Value::as_array)
+        else {
+            bail!("the dashboard stats list no identities: {}", response.body);
+        };
+        Ok(identities
+            .iter()
+            .filter(|identity| identity["origin"] == "managed")
+            .cloned()
+            .collect())
+    }
+
     /// Reads the VP Audit Log until a record satisfies `matches`, for up to
     /// five seconds, since records reach the log shortly after the request that
     /// produced them. Returns whether one matched and the events last read.
@@ -225,6 +247,39 @@ impl AdminApiClient {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         Ok((false, events))
+    }
+
+    /// Set system feature flags (`POST /v1/settings`), keeping the flags already
+    /// set. The settings API replaces the whole map, so the current flags are
+    /// read first; `terms` is left out because the API reports it from the
+    /// network configuration rather than storing it.
+    pub async fn set_feature_flags(
+        &self,
+        flags: &[(&str, bool)],
+    ) -> Result<()> {
+        let current = self
+            .send_recorded_json::<Value>(Method::GET, "/v1/settings", None)
+            .await?;
+        if !(200..300).contains(&current.status) {
+            bail!("read settings failed with status {}: {}", current.status, current.body);
+        }
+        let mut merged: serde_json::Map<String, Value> = current
+            .body
+            .get("feature_flags")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        merged.remove("terms");
+        for (name, enabled) in flags {
+            merged.insert((*name).to_string(), Value::Bool(*enabled));
+        }
+        let response = self
+            .send_recorded_json(Method::POST, "/v1/settings", Some(&serde_json::json!({ "feature_flags": merged })))
+            .await?;
+        if !(200..300).contains(&response.status) {
+            bail!("set feature flags failed with status {}: {}", response.status, response.body);
+        }
+        Ok(())
     }
 
     pub async fn send_recorded_json<B>(
@@ -487,6 +542,23 @@ impl AdminApiClient {
         Ok((url, response))
     }
 
+    /// The dashboard WebSocket URL of this gateway.
+    pub fn dashboard_socket_url(&self) -> String {
+        format!(
+            "{}/api/ws",
+            self.root_url
+                .replacen("http://", "ws://", 1)
+        )
+    }
+
+    /// The session token of the signed-in operator, if any.
+    pub fn session_token(&self) -> Option<String> {
+        self.session_token
+            .read()
+            .expect("session token read lock")
+            .clone()
+    }
+
     fn admin_url(
         &self,
         path: &str,
@@ -658,6 +730,17 @@ impl GatewayAdminClient {
             .await
     }
 
+    /// The dashboard WebSocket URL of this gateway.
+    pub fn dashboard_socket_url(&self) -> String {
+        self.client
+            .dashboard_socket_url()
+    }
+
+    /// The session token from [`Self::bootstrap_test_session`], if any.
+    pub fn session_token(&self) -> Option<String> {
+        self.client.session_token()
+    }
+
     /// PATCH a surface with `application/merge-patch+json`. Delegates to the
     /// inner `AdminApiClient` (which already has the session token from
     /// [`Self::bootstrap_test_session`]).
@@ -671,39 +754,14 @@ impl GatewayAdminClient {
             .await
     }
 
-    /// Set system feature flags (`POST /v1/settings`), keeping the flags already
-    /// set. The settings API replaces the whole map, so the current flags are
-    /// read first; `terms` is left out because the API reports it from the
-    /// network configuration rather than storing it.
+    /// Set system feature flags; see [`AdminApiClient::set_feature_flags`].
     pub async fn set_feature_flags(
         &self,
         flags: &[(&str, bool)],
     ) -> Result<()> {
-        let current = self
-            .client
-            .send_recorded_json::<Value>(Method::GET, "/v1/settings", None)
-            .await?;
-        if !(200..300).contains(&current.status) {
-            bail!("read settings failed with status {}: {}", current.status, current.body);
-        }
-        let mut merged: serde_json::Map<String, Value> = current
-            .body
-            .get("feature_flags")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        merged.remove("terms");
-        for (name, enabled) in flags {
-            merged.insert((*name).to_string(), Value::Bool(*enabled));
-        }
-        let response = self
-            .client
-            .send_recorded_json(Method::POST, "/v1/settings", Some(&serde_json::json!({ "feature_flags": merged })))
-            .await?;
-        if !(200..300).contains(&response.status) {
-            bail!("set feature flags failed with status {}: {}", response.status, response.body);
-        }
-        Ok(())
+        self.client
+            .set_feature_flags(flags)
+            .await
     }
 
     /// Read the most recent audit events (`GET /v1/audit?limit=200`), returning
@@ -728,6 +786,13 @@ impl GatewayAdminClient {
     ) -> Result<(bool, Vec<Value>)> {
         self.client
             .wait_for_audit_event(matches)
+            .await
+    }
+
+    /// See [`AdminApiClient::managed_agent_identities`].
+    pub async fn managed_agent_identities(&self) -> Result<Vec<Value>> {
+        self.client
+            .managed_agent_identities()
             .await
     }
 

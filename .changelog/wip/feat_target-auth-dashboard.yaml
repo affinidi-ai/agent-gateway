@@ -1,0 +1,108 @@
+branch: feat/target-auth-dashboard
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-02T11:45:37Z'
+      title: Gate credential provider pages on credential provider permissions
+      description: >-
+        The dashboard uses credential_providers.view, .edit and .delete for credential
+        providers, as the Admin API already did. A user with view but not edit sees a read-only
+        provider editor, in which the Callback URL can still be copied, and Add and Delete need
+        .edit and .delete. The Credentials page opens with settings.view,
+        credential_providers.view or delegation_vault.view. Its JWT Verification tab needs
+        settings.view, and its Credential Tokens and Delegated Access tabs need
+        delegation_vault.view, which the vault API already asked for. Upgrade note: a user who
+        only had settings.edit now needs credential_providers.edit to add or edit providers and
+        credential_providers.delete to delete one in the dashboard, and a user with
+        settings.view but not delegation_vault.view no longer sees the two vault tabs, whose
+        lists the gateway already refused to give them.
+    - timestamp: '2026-11-02T11:45:39Z'
+      title: Validate Target authentication in the Surface Builder and save it unchanged
+      description: >-
+        The Surface Builder applies the gateway's Target authentication rules while editing and
+        shows each problem next to its field. A header name, header format or header clash
+        problem blocks Save, in a stored setting the operator did not edit and in a variant
+        that is not on screen too, since the gateway refuses it on every save. A Managed Agent
+        whose secret method has no secret picked blocks Save as well, since saving it would
+        remove the stored credential. Spaces and tabs typed around a header name or format are
+        dropped in every editor. A stored name or
+        format that ends in a line break, or is blank, is reported as well, not trimmed away or
+        replaced with a default, and the Managed Agent editor shows the format field whenever
+        the format has a problem. The toast of a
+        header clash offers Show me, which opens the Managed Agent or the Transit Point that has
+        it. A Target that is not https, a leg that authenticates
+        no caller and a fallback that passes a request through without the credential show an
+        advisory and do not block Save: the gateway refuses the first two only when their rule
+        is enforce, and a save in warn shows the gateway's warning. The Managed Agent editor
+        shows the caller advisory as the Transit Point panel does, and every message opens with
+        Error or Advisory. Saving keeps stored fields the editor does not show, and an unopened
+        Transit Point keeps its Target authentication. The credential provider method gains an
+        optional Scopes input.
+    - timestamp: '2026-11-02T11:45:40Z'
+      title: Warn before deleting a secret that other resources use
+      description: >-
+        When the gateway refuses a secret delete because a surface, credential provider, A2A
+        proxy or STS client uses it, the dashboard names them, says how many more the user
+        cannot view, and offers Delete secret anyway in the same warning dialog an API key
+        delete uses. Refused deletes and retypes show the
+        server message and the references inline instead of an alert or toast.
+    - timestamp: '2026-11-02T12:28:32Z'
+      title: Show Target credential failures in the Audit Log
+      description: >-
+        Audit Log records of a Target credential failure show the credential outcome and the
+        token endpoint's OAuth error code. A request forwarded without the credential because
+        the fallback is passthrough is titled Forwarded without Target credential in the warning
+        tone instead of Request refused. A credential the Target refused is titled Target
+        refused the credential and shows the status the Target answered with. When the failing
+        credential belongs to a Transit Point, the record names that Transit Point.
+  fixed:
+    - timestamp: '2026-11-03T12:30:00Z'
+      title: Stop the dashboard bringing back a Target credential removed through the API
+      description: >-
+        The Surface Builder kept a copy of the Target authentication form fields in the canvas
+        data of a surface, and a later dashboard save rebuilt a credential that had been removed
+        through the API, sending it to a Target that had since changed. The form fields now come
+        only from the stored Target authentication.
+    - timestamp: '2026-11-18T08:00:02Z'
+      title: Keep a stored Target authentication the Managed Agent editor cannot show
+      description: >-
+        A Managed Agent whose stored Target authentication uses a method the editor has no form
+        for lost it on the next dashboard save. It is now saved unchanged until the operator
+        chooses a secret or a provider, as on a Transit Point, and the editor says so.
+    - timestamp: '2026-11-18T08:00:03Z'
+      title: Compare Target authentication header names as the gateway does
+      description: >-
+        The reserved name check and the header clash check ignore letter case and read an
+        underscore as a hyphen, and the clash check counts the token header of every JWT Bearer
+        caller method that forwards it. The dashboard no longer accepts a header name the
+        gateway then refuses on save.
+    - timestamp: '2026-11-18T08:00:04Z'
+      title: Stop the false https advisory on an MCP proxy Target
+      description: >-
+        A Managed Agent's proxy:// Target no longer shows the not https advisory. The gateway
+        decides that rule from the MCP proxy's base URL, which the editor does not see. A
+        Transit Point's proxy:// target endpoint still shows it, as the gateway checks it as
+        written.
+    - timestamp: '2026-11-18T08:00:05Z'
+      title: Announce Target authentication messages to screen readers
+      description: >-
+        Target authentication messages sit in live regions that stay on the page, the missing
+        provider message and the Transit Point header errors are tied to their inputs, and the
+        secret delete dialog keeps focus on its buttons while the delete runs.
+  removed:
+    - timestamp: '2026-11-02T11:45:38Z'
+      title: Remove the OIDC Providers dashboard pages
+      description: >-
+        The OIDC Providers list and editor called an API the gateway does not serve. The pages
+        are removed, and /oidc-providers and every path under it redirect to the Credential
+        providers tab.
+  security:
+    - timestamp: '2026-11-18T08:00:06Z'
+      title: Keep Target authentication settings out of the saved canvas data
+      description: >-
+        The Target authentication form fields are no longer written to a surface's canvas data,
+        and a Managed Agent or Transit Point restored from canvas data comes back without a
+        Target authentication. Stored fields the editor does not show are dropped when the
+        operator picks another secret or provider, so they cannot follow a credential they were
+        not set for.
+  breaking: []

@@ -345,6 +345,9 @@ fn write_single_surface_config_inner(
         }
         surface_fixture = surface_fixture.with_caller_key(setting);
     }
+    if let Some(response_auth) = &surface_config.response_auth {
+        surface_fixture = surface_fixture.with_target_response_auth(response_auth.setting());
+    }
     if !surface_config
         .browser_origins
         .is_empty()
@@ -674,6 +677,12 @@ fn write_single_surface_config_inner(
     if surface_config.signs_in_with_saml {
         crate::bdd_support::config::sign_in::sign_in_with_saml(base_dir, gateway_port);
     }
+    if !surface_config
+        .rbac_permissions
+        .is_empty()
+    {
+        write_rbac_permissions(base_dir, &surface_config.rbac_permissions);
+    }
     if surface_config.starts_standby {
         start_standby(base_dir);
     }
@@ -900,6 +909,27 @@ pub fn write_second_node_config(
 }
 
 /// Starts the gateway in Standby mode.
+/// Writes `rbac.json` with `permissions` and points the gateway config at it.
+fn write_rbac_permissions(
+    base_dir: &Path,
+    permissions: &[(String, String)],
+) {
+    let rbac_path = base_dir.join("rbac.json");
+    let permissions: serde_json::Map<String, serde_json::Value> = permissions
+        .iter()
+        .map(|(feature, role)| (feature.clone(), serde_json::json!(role)))
+        .collect();
+    std::fs::write(&rbac_path, serde_json::json!({ "permissions": permissions }).to_string()).unwrap();
+    let config_path = base_dir.join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    assert!(config.contains("[config_files]\n"), "the gateway config must list its config files");
+    std::fs::write(
+        &config_path,
+        config.replacen("[config_files]\n", &format!("[config_files]\nrbac = \"{}\"\n", rbac_path.display()), 1),
+    )
+    .unwrap();
+}
+
 fn start_standby(base_dir: &Path) {
     let path = base_dir.join("config.toml");
     let config = std::fs::read_to_string(&path).unwrap();
@@ -1084,6 +1114,9 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
         && let Some(secret_value) = &caller_key.secret_value
     {
         secrets.push(SecretFixture::new(&caller_key.secret_id, secret_value));
+    }
+    if let Some(response_auth) = &surface_config.response_auth {
+        secrets.push(SecretFixture::new(&response_auth.secret_id, &response_auth.secret_value));
     }
     if let Some(provider) = &surface_config.target_auth_provider {
         secrets.extend(target_auth_provider_secrets(provider));

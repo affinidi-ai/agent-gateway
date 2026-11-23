@@ -13,7 +13,7 @@ use ssi::dids::DIDKey;
 use ssi::jwk::JWK;
 use ssi::prelude::{AnyMethod, AnySuite, CryptographicSuite, ProofOptions};
 use ssi::verification_methods::LocalSigner as SsiLocalSigner;
-use ssi::verification_methods::{Multikey, ReferenceOrOwned};
+use ssi::verification_methods::{Multikey, ProofPurpose, ReferenceOrOwned};
 use ssi_json_ld::IriBuf;
 
 use crate::identity::ssi::context::create_signature_environment;
@@ -39,6 +39,8 @@ pub struct Credentials<'a> {
     pub challenge: Option<Cow<'a, str>>,
     /// Optional domain for the presentation
     pub domain: Option<Cow<'a, str>>,
+    /// The proof purpose the presentation's proof declares
+    pub proof_purpose: ProofPurpose,
 }
 
 /// The unsigned presentation both signing paths put a proof on.
@@ -77,6 +79,7 @@ pub trait VpSigner: Send + Sync {
         holder_did: &str,
         challenge: Option<String>,
         domain: Option<String>,
+        proof_purpose: ProofPurpose,
     ) -> Result<Value>;
 }
 
@@ -124,8 +127,9 @@ impl VpSigner for LocalVpSigner {
         holder_did: &str,
         challenge: Option<String>,
         domain: Option<String>,
+        proof_purpose: ProofPurpose,
     ) -> Result<Value> {
-        self.sign_w3c_ldv2(payload.clone(), holder_key, holder_did, challenge, domain)
+        self.sign_w3c_ldv2(payload.clone(), holder_key, holder_did, challenge, domain, proof_purpose)
             .await
     }
 }
@@ -138,6 +142,7 @@ impl LocalVpSigner {
         holder_did: &str,
         challenge: Option<String>,
         domain: Option<String>,
+        proof_purpose: ProofPurpose,
     ) -> Result<Value> {
         let vp: vc::v2::syntax::JsonPresentation =
             serde_json::from_value(presentation).context("Failed to parse as v2 presentation")?;
@@ -187,6 +192,7 @@ impl LocalVpSigner {
         let signer = SsiLocalSigner(crate::vta::local::VtaSsiSigner::new(crate::vta::local::secret_of(holder_key)?));
 
         let mut options = ProofOptions::from_method_and_options(verification_method, Default::default());
+        options.proof_purpose = proof_purpose;
 
         if let Some(c) = challenge {
             options.challenge = Some(c);
@@ -257,7 +263,7 @@ impl VpIssuer for LocalVpIssuer {
             .map(|d| d.as_ref().to_string());
 
         self.signer
-            .sign(presentation, &holder_key, holder_did, challenge, domain)
+            .sign(presentation, &holder_key, holder_did, challenge, domain, pc.proof_purpose)
             .await
     }
 }
@@ -340,6 +346,7 @@ mod tests {
             verifiable_credentials: Cow::Owned(vec![vc]),
             challenge: Some(Cow::Borrowed("test-challenge-123")),
             domain: Some(Cow::Borrowed("https://example.com")),
+            proof_purpose: ProofPurpose::Assertion,
         }
     }
 
@@ -415,6 +422,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn presentation_declares_the_proof_purpose_it_is_given() {
+        let config = Arc::new(RwLock::new(create_test_config()));
+        let holder_key = create_test_holder_key();
+        let holder_did = create_did_peer_from_ed25519_jwk(&holder_key).unwrap();
+        let signed_vc = issue_real_test_vc(config, holder_did.clone()).await;
+        let mut presentation_creds = create_test_presentation_credentials_with_vc(signed_vc, holder_key, holder_did);
+        presentation_creds.proof_purpose = ProofPurpose::Authentication;
+
+        let vp = LocalVpIssuer::new(Arc::new(LocalVpSigner::new()))
+            .issue(VpIssuerPayload::Credentials(presentation_creds))
+            .await
+            .unwrap();
+
+        assert_eq!(vp["proof"]["proofPurpose"], json!("authentication"));
+    }
+
+    #[tokio::test]
     async fn test_issue_vp_without_challenge_and_domain() {
         let config = create_test_config();
         let config = Arc::new(RwLock::new(config));
@@ -433,6 +457,7 @@ mod tests {
             verifiable_credentials: Cow::Owned(vec![signed_vc]),
             challenge: None,
             domain: None,
+            proof_purpose: ProofPurpose::Assertion,
         };
         let payload = VpIssuerPayload::Credentials(presentation_creds);
 
@@ -476,6 +501,7 @@ mod tests {
             verifiable_credentials: Cow::Owned(vec![signed_vc1, signed_vc2]),
             challenge: None,
             domain: None,
+            proof_purpose: ProofPurpose::Assertion,
         };
         let payload = VpIssuerPayload::Credentials(presentation_creds);
 
@@ -515,6 +541,7 @@ mod tests {
             verifiable_credentials: Cow::Owned(vec![signed_vc]),
             challenge: None,
             domain: None,
+            proof_purpose: ProofPurpose::Assertion,
         };
         let payload = VpIssuerPayload::Credentials(presentation_creds);
 

@@ -19,6 +19,7 @@ pub mod settings;
 pub(crate) mod signing_choice;
 mod surface_caller_key;
 pub(crate) mod surface_grants;
+pub(crate) mod surface_response_auth;
 mod surface_target_auth;
 pub(crate) mod surface_tenancy;
 pub mod surfaces;

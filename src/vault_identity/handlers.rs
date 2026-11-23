@@ -77,7 +77,7 @@ pub async fn generate_did_webvh_identity(
     // (publicKeyJwk) and `#key-2` as Multikey (publicKeyMultibase). Agent VP/VC
     // proofs use the `eddsa-rdfc-2022` cryptosuite, whose verifier requires a
     // Multikey verification method — so `#key-2` must be present and referenced
-    // by assertionMethod, mirroring `serve_agent_did_document`.
+    // by assertionMethod and authentication, mirroring `serve_agent_did_document`.
     let did_document_json = serde_json::json!({
         "id": placeholder_did,
         "@context": [
@@ -99,7 +99,10 @@ pub async fn generate_did_webvh_identity(
                 "publicKeyMultibase": multibase_pubkey.clone()
             }
         ],
-        "authentication": [format!("{}#key-1", placeholder_did)],
+        "authentication": [
+            format!("{}#key-1", placeholder_did),
+            format!("{}#key-2", placeholder_did)
+        ],
         "assertionMethod": [
             format!("{}#key-1", placeholder_did),
             format!("{}#key-2", placeholder_did)
@@ -435,6 +438,15 @@ mod tests {
             .as_str()
             .unwrap_or("");
         assert!(state_id.contains("apikey"), "state.id must contain the 'apikey' path segment, got: {}", state_id);
-        let _ = did; // used for context
+        let signing_key = format!("{did}#key-2");
+        for relationship in ["assertionMethod", "authentication"] {
+            assert!(
+                entry["state"][relationship]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!(signing_key)),
+                "{relationship} must list the signing key"
+            );
+        }
     }
 }

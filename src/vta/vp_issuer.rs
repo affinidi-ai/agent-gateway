@@ -345,6 +345,7 @@ mod tests {
             verifiable_credentials: Cow::Owned(vec![json!({ "type": "VerifiableCredential" })]),
             challenge: challenge.map(Cow::Borrowed),
             domain: domain.map(Cow::Borrowed),
+            proof_purpose: ssi::verification_methods::ProofPurpose::Authentication,
         })
     }
 

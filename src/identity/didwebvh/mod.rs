@@ -12,6 +12,7 @@ pub mod identity_manager;
 pub mod log;
 pub mod resolver;
 pub mod scid;
+pub(crate) mod signing_key_repair;
 pub mod surface_integration;
 pub mod trust_computer;
 pub mod types;

@@ -29,6 +29,9 @@ pub mod prom {
     // Caller keys: requests forwarded without one because the surface's secret could not be read.
     pub const CALLER_KEY_SECRET_UNREADABLE_TOTAL: &str = "agent_gateway_caller_key_secret_unreadable_total";
 
+    // Verified credentials and presentations whose signing key is not listed under the proof purpose.
+    pub const PROOF_PURPOSE_MISMATCH_TOTAL: &str = "agent_gateway_proof_purpose_mismatch_total";
+
     // Managed identity resolution (FromMtls / FromApiKey / Static / PayloadExtraction)
     pub const MANAGED_IDENTITY_RESOLVE_TOTAL: &str = "agent_gateway_managed_identity_resolve_total";
     pub const MANAGED_IDENTITY_RESOLVE_DURATION_SECONDS: &str =

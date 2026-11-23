@@ -9,11 +9,13 @@ use crate::bdd_support::actors::{
     ActorRegistry, PRIMARY_COLLABORATOR_KEY, RuntimeRegistry, SECONDARY_COLLABORATOR_KEY, TargetActorKind,
 };
 use crate::bdd_support::config::api_keys::UnreadableKeyFolders;
+use crate::bdd_support::dashboard_socket::DashboardSocket;
 use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::jwt::JwksServer;
-use crate::bdd_support::mock_server::{MockResponse, MockServer, ReceivedRequest};
+use crate::bdd_support::mock_server::{MockResponse, MockServer, MockTls, ReceivedRequest};
 use crate::bdd_support::oidc::OidcProvider;
 use crate::bdd_support::passkey::SoftPasskey;
+use crate::bdd_support::presentation_signer::PresentationSigner;
 use crate::bdd_support::redis_stream::RedisStreamStandIn;
 use crate::bdd_support::temp::TempDirGuard;
 
@@ -138,10 +140,20 @@ pub struct SurfaceWorld {
     pub gateway_issuer_did: Option<String>,
     pub operator_roles: HashMap<String, String>,
     pub operator_clients: HashMap<String, AdminApiClient>,
+    /// Each operator's open dashboard WebSocket, by operator.
+    pub dashboard_sockets: HashMap<String, DashboardSocket>,
+    /// The answer each operator got to its last request to listen to policy input.
+    pub dashboard_listen_answers: HashMap<String, serde_json::Value>,
+    /// System feature flags a step set before the gateway started, set through the admin API
+    /// once the admin session opens.
+    pub pending_feature_flags: Vec<(String, bool)>,
     pub human_clients: HashMap<String, Vec<AdminApiClient>>,
     pub terms_enabled: bool,
     pub affinidi_cache_seeded: bool,
     pub gateway_did_without_assertion_multikey: bool,
+    pub agent_did_seed: Option<crate::steps::agent_did::AgentDidSeed>,
+    pub seeded_agent_did: Option<String>,
+    pub agent_did_log: Option<String>,
     pub affinidi_well_available: bool,
     pub affinidi_terms_manifest: serde_json::Value,
     pub caller_did: Option<String>,
@@ -190,6 +202,8 @@ pub struct SurfaceWorld {
     pub api_keys: HashMap<String, (String, String)>,
     /// The Redis stream an integration delivers sign-in events to.
     pub sign_in_stream: Option<RedisStreamStandIn>,
+    /// The caller that signs the presentations the scenario sends.
+    pub presentation_signer: Option<PresentationSigner>,
     /// The passkeys console users registered in the scenario, by username.
     pub passkeys: HashMap<String, SoftPasskey>,
     /// The passkey sign-in started last and not yet finished.
@@ -207,6 +221,10 @@ pub struct SurfaceWorld {
     /// Client certificates the scenario stored through the admin API, by scenario name: the
     /// stored certificate id.
     pub client_certificates: HashMap<String, String>,
+    /// Certificates the scenario generated, with their keys, by scenario name.
+    pub tls_certificates: HashMap<String, MockTls>,
+    /// The certificate the managed agent serves https with, when it does.
+    pub managed_agent_tls: Option<MockTls>,
     pub temp_dir: TempDir,
     pub debug: bool,
     pub runtimes: RuntimeRegistry,
@@ -248,10 +266,16 @@ impl SurfaceWorld {
             gateway_issuer_did: None,
             operator_roles: HashMap::new(),
             operator_clients: HashMap::new(),
+            dashboard_sockets: HashMap::new(),
+            dashboard_listen_answers: HashMap::new(),
+            pending_feature_flags: Vec::new(),
             human_clients: HashMap::new(),
             terms_enabled: false,
             affinidi_cache_seeded: false,
             gateway_did_without_assertion_multikey: false,
+            agent_did_seed: None,
+            seeded_agent_did: None,
+            agent_did_log: None,
             affinidi_well_available: true,
             affinidi_terms_manifest: serde_json::json!({
                 "schema_version": 1,
@@ -290,6 +314,7 @@ impl SurfaceWorld {
             surface_agent_id: None,
             api_keys: HashMap::new(),
             sign_in_stream: None,
+            presentation_signer: None,
             passkeys: HashMap::new(),
             started_sign_in: None,
             sign_in_challenge_credentials: Vec::new(),
@@ -298,6 +323,8 @@ impl SurfaceWorld {
             sign_in_event: None,
             sign_in_record: None,
             client_certificates: HashMap::new(),
+            tls_certificates: HashMap::new(),
+            managed_agent_tls: None,
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
             runtimes: RuntimeRegistry::default(),

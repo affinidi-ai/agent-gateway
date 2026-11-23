@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 
 interface CopyButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
-  text: string;
+  /** The text to copy, or a function that builds it when the button is clicked. */
+  text: string | (() => string);
   size?: 'sm' | 'xs' | 'md';
   variant?: 'link' | 'outline-primary';
   label?: string;
@@ -38,7 +39,7 @@ export const CopyButton: React.FC<CopyButtonProps> = ({
     async (e: React.MouseEvent) => {
       e.stopPropagation();
       try {
-        await navigator.clipboard.writeText(text);
+        await navigator.clipboard.writeText(typeof text === 'function' ? text() : text);
         setCopied(true);
         if (resetTimer.current) clearTimeout(resetTimer.current);
         resetTimer.current = setTimeout(() => setCopied(false), 2000);

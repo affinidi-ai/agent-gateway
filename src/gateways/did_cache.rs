@@ -89,7 +89,7 @@ pub async fn init_shared_resolver() -> Result<()> {
 
     let config = DIDCacheConfigBuilder::default()
         .with_cache_capacity(100)
-        .with_cache_ttl(3600) // 1 hour
+        .with_cache_ttl(SHARED_RESOLVER_TTL_SECS)
         .with_host_policy(did_host_policy())
         .build();
 
@@ -109,9 +109,14 @@ pub async fn init_shared_resolver() -> Result<()> {
 /// Panics if [`init_shared_resolver`] has not been called yet (programming
 /// error — should always be initialised during startup).
 pub fn shared_resolver() -> &'static Arc<affinidi_did_resolver_cache_sdk::DIDCacheClient> {
-    SHARED_DID_RESOLVER
-        .get()
-        .expect("shared DID resolver not initialised — call init_shared_resolver() at startup")
+    try_shared_resolver().expect("shared DID resolver not initialised — call init_shared_resolver() at startup")
+}
+
+/// How long the shared DID resolver keeps a resolved document, in seconds.
+pub const SHARED_RESOLVER_TTL_SECS: u32 = 3600;
+
+pub fn try_shared_resolver() -> Option<&'static Arc<affinidi_did_resolver_cache_sdk::DIDCacheClient>> {
+    SHARED_DID_RESOLVER.get()
 }
 
 /// Serializable version of a cached DID document for persistence

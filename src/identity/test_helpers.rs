@@ -576,6 +576,7 @@ async fn signed_agent_presentation_about(subject_did: Option<&str>) -> SignedAge
             verifiable_credentials: Cow::Owned(vec![credential]),
             challenge: None,
             domain: None,
+            proof_purpose: ssi::verification_methods::ProofPurpose::Assertion,
         }))
         .await
         .unwrap();

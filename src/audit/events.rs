@@ -77,6 +77,8 @@ pub enum RejectionReason {
     /// The Target credential was not sent: it could not be obtained, or a
     /// `[credential_policy]` rule in `enforce` withheld it.
     TargetAuthFailed,
+    /// The Target's response failed `target.response_auth`, so nothing used it.
+    TargetResponseAuthFailed,
 }
 
 /// What `target.auth.fallback` did with a request whose Target credential was not sent.

@@ -801,6 +801,7 @@ mod live_tests {
                 })]),
                 challenge: Some(std::borrow::Cow::Borrowed("live-nonce")),
                 domain: Some(std::borrow::Cow::Borrowed("verifier.example")),
+                proof_purpose: ssi::verification_methods::ProofPurpose::Authentication,
             }))
             .await
             .expect("the agent's own trust agent signs its presentation");

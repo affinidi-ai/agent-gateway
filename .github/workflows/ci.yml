@@ -41,6 +41,9 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'Makefile'
+              - '.github/workflows/ci.yml'
+              - 'www/default/src/pages/SettingsPage/policyTemplates/builtinPolicyTemplates.json'
+              - 'www/default/src/pages/SettingsPage/policyTemplates/__fixtures__/**'
             frontend:
               - 'www/default/**'
             mcp:
@@ -126,7 +129,7 @@ jobs:
           python-version: '3.x'
 
       - name: Install validator dependencies
-        run: python3 -m pip install PyYAML
+        run: python3 -m pip install PyYAML==6.0.2
 
       - name: Test changelog fragment validation
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
@@ -211,6 +214,9 @@ jobs:
     env:
       # The required line-coverage floor for this service.
       COVERAGE_THRESHOLD: "37"
+      # With the default four jobs the runner was shut down part way through the
+      # instrumented build (exit 143), most likely out of memory.
+      CARGO_BUILD_JOBS: "2"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 

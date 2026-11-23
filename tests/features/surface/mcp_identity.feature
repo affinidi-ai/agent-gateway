@@ -91,6 +91,13 @@ Feature: MCP identity handling
     And the MCP response id matches MCP server "bravo" forwarded request id
     And the MCP response result matches MCP server "bravo" response result
 
+  Scenario: The VP forwarded to the MCP server claims authentication for the caller Agent DID
+    Given the surface has an explicit inbound identity slot for MCP
+    And MCP server "bravo" supports tool invocation
+    When the caller invokes MCP tool "get_news" with a valid inbound identity payload
+    Then the response status is 200
+    And MCP server "bravo" received the forwarded MCP request with a VP whose proof claims "authentication"
+
   Scenario: Inbound identity injection removes the raw identity payload before reaching the MCP server
     Given the surface has an explicit inbound identity slot for MCP with strip raw metadata enabled
     And MCP server "bravo" supports tool invocation

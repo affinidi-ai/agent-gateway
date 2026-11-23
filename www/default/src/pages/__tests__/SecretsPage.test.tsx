@@ -172,35 +172,113 @@ describe('SecretsPage secret timestamps', () => {
 });
 
 describe('SecretsPage secret delete', () => {
+  let deleted = false;
+  let deleteReplies: Array<{ status: number; body: unknown }>;
+
   beforeEach(() => {
     jest.clearAllMocks();
     mockFetchByUrl();
+    deleted = false;
+    deleteReplies = [];
+    const listing = (apiClient.fetch as jest.Mock).getMockImplementation()!;
+    (apiClient.fetch as jest.Mock).mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === 'DELETE') {
+        const reply = deleteReplies.shift() ?? { status: 204, body: null };
+        deleted = reply.status < 300;
+        return {
+          ok: reply.status < 300,
+          status: reply.status,
+          statusText: reply.status === 409 ? 'Conflict' : 'OK',
+          text: () => Promise.resolve(reply.body ? JSON.stringify(reply.body) : ''),
+        };
+      }
+      const response = await listing(url, init);
+      if (deleted && url === '/api/v1/secrets/') {
+        const rows = await response.json();
+        return { ...response, json: () => Promise.resolve(rows.slice(1)) };
+      }
+      return response;
+    });
   });
 
-  it('shows why a secret was not deleted', async () => {
-    const message = 'The secret is used by these integration endpoints: Ops webhook';
-    const listing = (apiClient.fetch as jest.Mock).getMockImplementation()!;
-    (apiClient.fetch as jest.Mock).mockImplementation((url: string, init?: RequestInit) =>
-      init?.method === 'DELETE'
-        ? Promise.resolve({
-            ok: false,
-            status: 409,
-            statusText: 'Conflict',
-            text: () => Promise.resolve(JSON.stringify({ message })),
-          })
-        : listing(url, init)
-    );
-    renderAt('/secrets?tab=secrets');
-
+  const clickDelete = async () => {
     const remove = await screen.findByTitle('Delete secret');
     await userEvent.click(remove);
     await userEvent.click(remove);
+  };
+
+  const inUse = {
+    message: 'The secret is in use; remove its references first, or delete it with force=true',
+    references: [
+      { kind: 'surface', id: 's1', name: 'Billing surface' },
+      { kind: 'credential_provider', id: 'p1', name: 'Calendar provider' },
+    ],
+    hidden_references: 2,
+  };
+
+  it('deletes an unreferenced secret directly', async () => {
+    renderAt('/secrets?tab=secrets');
+    await clickDelete();
+
+    await waitFor(() => expect(screen.queryByText('Gateway Secret')).not.toBeInTheDocument());
+    expect(apiClient.fetch).toHaveBeenCalledWith('/api/v1/secrets/secret-1', { method: 'DELETE' });
+    expect(screen.queryByTestId('confirm-delete-secret-modal')).not.toBeInTheDocument();
+  });
+
+  it('names the references and the hidden count before deleting a secret in use', async () => {
+    deleteReplies = [{ status: 409, body: inUse }];
+    renderAt('/secrets?tab=secrets');
+    await clickDelete();
+
+    const references = await screen.findByTestId('confirm-delete-secret-references');
+    expect(references).toHaveTextContent('Surface: Billing surface');
+    expect(references).toHaveTextContent('Credential provider: Calendar provider');
+    expect(screen.getByTestId('confirm-delete-secret-references-hidden')).toHaveTextContent(
+      'and 2 more you cannot view'
+    );
+    expect(screen.getByRole('button', { name: 'Delete secret anyway' })).toBeInTheDocument();
+  });
+
+  it('sends nothing more when the dialog is cancelled', async () => {
+    deleteReplies = [{ status: 409, body: inUse }];
+    renderAt('/secrets?tab=secrets');
+    await clickDelete();
+    await userEvent.click(await screen.findByTestId('confirm-delete-secret-cancel'));
 
     await waitFor(() =>
-      expect(showToast).toHaveBeenCalledWith('error', `Delete failed: ${message} (409)`, {
-        autoRemove: false,
-      })
+      expect(screen.queryByTestId('confirm-delete-secret-modal')).not.toBeInTheDocument()
     );
+    const deletes = (apiClient.fetch as jest.Mock).mock.calls.filter(
+      ([, init]) => init?.method === 'DELETE'
+    );
+    expect(deletes).toEqual([['/api/v1/secrets/secret-1', { method: 'DELETE' }]]);
+    expect(screen.getByText('Gateway Secret')).toBeInTheDocument();
+  });
+
+  it('deletes with force=true after Delete secret anyway and removes the row', async () => {
+    deleteReplies = [{ status: 409, body: inUse }];
+    renderAt('/secrets?tab=secrets');
+    await clickDelete();
+    await userEvent.click(await screen.findByRole('button', { name: 'Delete secret anyway' }));
+
+    await waitFor(() => expect(screen.queryByText('Gateway Secret')).not.toBeInTheDocument());
+    expect(apiClient.fetch).toHaveBeenCalledWith('/api/v1/secrets/secret-1?force=true', {
+      method: 'DELETE',
+    });
+    expect(screen.queryByTestId('confirm-delete-secret-modal')).not.toBeInTheDocument();
+  });
+
+  it('shows an integration endpoint refusal inline with no override', async () => {
+    const message = 'The secret is used by these integration endpoints: Ops webhook';
+    deleteReplies = [{ status: 409, body: { message } }];
+    renderAt('/secrets?tab=secrets');
+    await clickDelete();
+
+    expect(await screen.findByTestId('secrets-delete-error')).toHaveTextContent(
+      `Delete failed: ${message} (409)`
+    );
+    expect(screen.queryByRole('button', { name: 'Delete secret anyway' })).not.toBeInTheDocument();
+    expect(showToast).not.toHaveBeenCalled();
     expect(apiClient.fetch).toHaveBeenCalledWith('/api/v1/secrets/secret-1', { method: 'DELETE' });
   });
 });

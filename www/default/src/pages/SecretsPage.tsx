@@ -20,6 +20,8 @@ import { showToast } from '../utils/toaster';
 import { usePermissions } from '../context/PermissionsContext';
 import AccessTokensTab from './SecretsPage/AccessTokensTab';
 import KeyManagementTab from './SecretsPage/KeyManagementTab';
+import ConfirmDeleteSecretModal from '../components/shared/ConfirmDeleteSecretModal';
+import { ReferenceConflict, parseReferenceConflict } from '../utils/referenceConflict';
 
 interface Secret {
   id: string;
@@ -63,6 +65,12 @@ const SecretsPage: React.FC = () => {
   const [certificates, setCertificates] = useState<Certificate[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [pendingForce, setPendingForce] = useState<{
+    secret: Secret;
+    conflict: ReferenceConflict;
+  } | null>(null);
+  const [forcing, setForcing] = useState(false);
 
   // Pagination state
   const [secretsPage, setSecretsPage] = useState(1);
@@ -161,21 +169,43 @@ const SecretsPage: React.FC = () => {
     }
   };
 
-  const handleDelete = async (secretId: string) => {
+  const handleDelete = async (secret: Secret, force = false) => {
+    setDeleteError(null);
     try {
-      const response = await apiClient.fetch(`/api/v1/secrets/${secretId}`, {
-        method: 'DELETE',
-      });
+      const response = await apiClient.fetch(
+        `/api/v1/secrets/${encodeURIComponent(secret.id)}${force ? '?force=true' : ''}`,
+        { method: 'DELETE' }
+      );
 
       if (response.ok) {
+        setPendingForce(null);
         loadSecrets();
-      } else {
-        // A secret an integration endpoint references answers 409 naming the endpoints.
-        const reason = formatApiError(response.status, await response.text(), response.statusText);
-        showToast('error', `Delete failed: ${reason}`, { autoRemove: false });
+        return;
       }
+      const body = await response.text();
+      const conflict = force ? null : parseReferenceConflict(response.status, body);
+      if (conflict) {
+        setPendingForce({ secret, conflict });
+        return;
+      }
+      setPendingForce(null);
+      setDeleteError(
+        `Delete failed: ${formatApiError(response.status, body, response.statusText)}`
+      );
     } catch (error) {
       console.error('Failed to delete secret:', error);
+      setPendingForce(null);
+      setDeleteError('Delete failed: the gateway could not be reached');
+    }
+  };
+
+  const confirmForcedDelete = async () => {
+    if (!pendingForce) return;
+    setForcing(true);
+    try {
+      await handleDelete(pendingForce.secret, true);
+    } finally {
+      setForcing(false);
     }
   };
 
@@ -354,6 +384,21 @@ const SecretsPage: React.FC = () => {
               {balloonNode}
             </div>
             <div className="card-body">
+              {deleteError && (
+                <div
+                  className="alert alert-danger alert-dismissible"
+                  role="alert"
+                  data-testid="secrets-delete-error"
+                >
+                  {deleteError}
+                  <button
+                    type="button"
+                    className="btn-close"
+                    aria-label="Dismiss"
+                    onClick={() => setDeleteError(null)}
+                  ></button>
+                </div>
+              )}
               {loading ? (
                 <div
                   style={{
@@ -441,7 +486,7 @@ const SecretsPage: React.FC = () => {
                           <td>
                             <DeleteButton
                               data-testid={`secrets-delete-button-${secret.id}`}
-                              onDelete={() => handleDelete(secret.id)}
+                              onDelete={() => handleDelete(secret)}
                               className="btn-sm"
                               title="Delete secret"
                             />
@@ -460,6 +505,16 @@ const SecretsPage: React.FC = () => {
               )}
             </div>
           </div>
+
+          {pendingForce && (
+            <ConfirmDeleteSecretModal
+              secretName={pendingForce.secret.name}
+              conflict={pendingForce.conflict}
+              busy={forcing}
+              onCancel={() => setPendingForce(null)}
+              onConfirm={confirmForcedDelete}
+            />
+          )}
         </Tab>
 
         <Tab

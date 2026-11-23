@@ -366,6 +366,11 @@ also copy any built-in rules you still want from
 | No `rules` | The built-in rules below apply. |
 | `rules` | Your rules replace the built-in rules and run in order. An empty list applies no pattern. |
 
+A rule's match that lies inside a UUID without covering all of it is left as it is, so a
+broad pattern such as the example phone number rule does not mangle surface ids and the
+`[CHANNEL:<id>]` prefix a surface's Monitoring log filters on. A rule that matches a whole
+UUID still masks it.
+
 A rule whose pattern does not compile is skipped with a warning on stderr. At startup
 stderr reports the number of rules in use, or a warning when redaction is off, and the
 `Startup configuration` log line shows `log_redaction=on` or `off`.
@@ -397,9 +402,13 @@ In OTLP exports, an attribute whose name is a credential name is replaced with
 attribute by its name. The names, ignoring case, are `authorization`, `cookie`, `token`,
 `session_id`, `sessionid`, `jsessionid`, `password`, `passwd`, `secret`, `secret_key`,
 `api_key`, `apikey`, `caller_key`, `private_key`, `credential` and `credentials`, alone or after
-a `.`, `_` or `-`: `http.request.header.authorization`, `x-api-key`, `x-caller-key` and
-`mcp_session_id` match,
-`token_count` and `secret_id` do not. Fields named like a credential lose the
+a `.`, `_`, `-` or space, or after a camelCase word break (a lowercase letter or digit followed
+by an uppercase letter), and `key`, `auth` and `pat` as the whole name only:
+`http.request.header.authorization`, `x-api-key`, `x-caller-key`, `mcp_session_id`,
+`accessToken`, `clientSecret`, `API Key` and `key` match,
+`token_count`, `secret_id`, `maxTokens`, `apiKeyId`, `primary_key` and `oauth` do not. The same
+names mark credential-named keys in captured [policy input](POLICY.md#policy-input-capture), and
+these rules apply to captures too. Fields named like a credential lose the
 8-character prefix the gateway logs for correlation, in local logs as well as in OTLP
 exports.
 
@@ -658,7 +667,7 @@ neither lists them nor acts on them.
   `403`; payment gateways already connected keep taking payments and every read route still
   works. The dashboard hides its agent-pay UI while it is off, except the Payments page, which
   needs only `payments.view`. A user's own settings cannot
-  override this flag or `mediator_federation`
+  override this flag, `mediator_federation` or `policy_input_capture`
   ([`SYSTEM_ONLY_FLAGS`](../src/storage/settings_store.rs)). At startup the gateway turns it on
   when a payment gateway already exists and the flag has not been set either way, so an upgrade
   never hides a payment gateway that is taking payments.
@@ -1106,6 +1115,61 @@ credential, which an enforced rule refuses at save, a `caller_key` on an `http` 
 `enforce` saves with that `Warning`, and its requests are forwarded without the key. A PUT that leaves
 `caller_key` out keeps the stored one, so a Surface Builder save keeps it; `null` removes it. See
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#caller-keys).
+
+## Surface response authentication
+
+A surface's optional `target.response_auth` makes the gateway accept a response from an http or
+https Target only when it proves it comes from the registered managed agent, by a key it returns
+(`api_key`) or by its server certificate (`mtls`, https only); any other response is refused
+with `502` before anything uses it, and one with a status in
+`networking.retry.retryable_status_codes` that fails is never retried. It is a Target field, set
+through the admin API; a variant may set its own, as with `target.auth`, and a variant saved
+from the dashboard is complete and carries its own, so each such variant needs its own setting.
+A `PUT` that leaves it out keeps the stored one, and
+`null` removes it, for the surface's `target` and for a stored variant's `overrides.target`.
+
+It covers the response leg only, the Managed Agent's answers to the gateway; a call the managed
+agent makes through a Transit Point is authenticated by that Transit Point's own `source_auth`
+(see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-source-authentication)), and responses from
+a Transit Point's destination are not checked. An `api_key` check
+runs after the request was sent, so a server answering at the Target URL has already received
+the request, the transit token, the Target credential and the forwarded caller headers when its
+answer is refused; only `mtls` stops such a server before anything is sent.
+
+```json
+"target": {
+  "endpoint": "https://bravo.example/a2a",
+  "response_auth": { "api_key": { "header_name": "X-Agent-Key", "secret_id": "bravo-response-key" } }
+}
+```
+
+| Field | Default | Behaviour |
+| --- | --- | --- |
+| `api_key.header_name` | Required | The response header the managed agent returns its key in, compared ignoring case. Removed from every response, so the caller never receives it. A save refuses a name that is not an HTTP field name, a reserved header, or one Target authentication, a credential binding, a forwarded caller token, header metadata mapping or `caller_key` already sends to the Target. It also refuses a header the gateway reads or sets on the Target's response, such as `Content-Type`, `Location`, `Set-Cookie`, `Cache-Control` or a payment header (`Payment-Response`, `Payment-Receipt`, `X-Payment-Response`…); [`SOURCE_AUTH.md`](SOURCE_AUTH.md#response-authentication) lists them. |
+| `api_key.secret_id` | Required | The `secret_id` of a secret holding the accepted keys, comma-separated, so a key can be rotated. A save refuses a secret that does not exist, belongs to another tenant (an appliance-wide one is accepted) or holds no non-blank key, and one the gateway sends out or accepts from callers: the `secret_id` of a `static_secret` Target authentication, of a Transit Point's `static_secret` `target_auth`, of `caller_key`, of an Access Point `api_key` caller authentication method, or of an enabled `$SECRET:<id>` value in the Target's or the shared transit custom metadata, or a secret read for the service token of a credential provider the surface sends to its Target or a Transit Point (`credential_provider` Target authentication, `outbound_credentials` or `transit_credentials`). A credential provider update that would read such a secret is refused too. On an `http://` Target the key is sent unencrypted and gives no protection on the network path, so use an `https://` Target, or `mtls`. |
+| `mtls.server_trust` | Required | The trust the Target's server certificate must pass in the TLS handshake, the caller mTLS `MtlsTrust` shape: `{"type": "pinned", "certificate_ids": [...]}`, stored `client_leaf` certificates matched by SHA-256 leaf fingerprint only, with neither expiry nor host name checked, so removing a certificate from the list is the only way to stop trusting it, or `{"type": "ca", "ca_certificate_ids": [...]}`, stored `ca` certificates the chain must end at, with the Target's host checked against the certificate. Only these certificates are trusted, never the system's or public CAs. A save refuses an empty list, a certificate of the wrong kind, one that does not exist, is inactive or belongs to another tenant, and `check_crl` or `require_ocsp` set to `true`. |
+| `mtls.client_certificate_id` | None | A stored `client_leaf` certificate, with its private key, the gateway presents to the managed agent. A save refuses another kind, an inactive one, one stored without its key, and, while `credential_policy.tenant_credential_isolation` is `enforce`, one that is not the surface's own tenant's. |
+
+```json
+"response_auth": { "mtls": {
+  "server_trust": { "type": "pinned", "certificate_ids": ["bravo-server-cert"] },
+  "client_certificate_id": "gateway-client-cert"
+} }
+```
+
+A save refuses `response_auth` on a `proxy://`, `a2a-proxy://` or `fabric://` Target, `mtls` on
+an `http://` Target or on a Target bound by external consent, and `api_key` on an `http://` Target while `credential_policy.target_https`
+is `enforce` (in `warn` it saves with a `Warning` header). The mTLS settings are built once per
+surface and setting, again when a certificate the setting names changes, and dropped when the
+surface is saved or deleted, on configuration reload and on the periodic disk refresh; a
+handshake whose server
+certificate fails the trust is refused like any other failed response. No other key is read: the
+object takes no other field, and the Target refuses
+unknown fields, so a release without Response authentication does not load a surface that sets
+it; where several nodes share `_storage/`, set it only once every node runs a release with it.
+So that callers never see the key, set `api_key` before the managed agent starts sending the
+header, and stop the agent sending it before removing the setting, since without it the header
+passes through. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#response-authentication).
 
 ## Remote gateway records
 

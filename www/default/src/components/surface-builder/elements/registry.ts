@@ -19,6 +19,9 @@ import { isInboundIdentity } from './identity/placement';
 import { queriesFromWire, STORED_TRUST_CHECK_LIST_KEY } from './trust-check/definition';
 import { TRANSIT_POINT_FIELDS } from './agentSurfaceSchema';
 import { isSigningEmpty } from './types';
+import { STORED_TARGET_AUTH_KEY, storedTargetAuth } from './_shared/providerTargetAuth';
+import { MANAGED_AGENT_TARGET_AUTH_FORM_KEYS } from './managed-agent/targetAuth';
+import { TRANSIT_POINT_TARGET_AUTH_FORM_KEYS } from './transit-point/targetAuth';
 import { transitConfigConfigFromPayload } from './transit-config/definition';
 import { RATE_LIMIT_FIELDS, carriesRateLimit, rateLimitConfigFromWire } from './rate-limit/wire';
 import { workloadBindingApiToForm } from './workload-binding/config';
@@ -370,8 +373,9 @@ class ElementRegistry {
     const nodes: N[] = [];
 
     // IDs are deterministic everywhere: singletons use their bare type
-    // name (`access-point`, `target`, …), transit points use a 1-based
-    // counter (`transit-point-1`, …). The canvas blob layered on top
+    // name (`access-point`, `target`, …), transit points use their type
+    // and a 1-based counter (`transit-point-a2a-1`, …), or the id the
+    // canvas saved with their own `id`. The canvas blob layered on top
     // uses the same scheme, so a node and its layout always merge into
     // a single record.
     const apConfig = payload?.access_point ?? {};
@@ -780,6 +784,7 @@ class ElementRegistry {
         delete tpConfig.header_metadata_mapping;
         delete tpConfig.trust_check_list;
         delete tpConfig.trust_check_migrated;
+        tpConfig[STORED_TARGET_AUTH_KEY] = storedTargetAuth(tp.target_auth);
       }
       nodes.push({
         id: tpId,
@@ -1124,7 +1129,9 @@ class ElementRegistry {
           // `incompleteReason`. The canvas badge then disagrees with
           // the panel — exactly the "shows invalid on canvas, ok in
           // panel" symptom users report.
-          const blobCfg = bn.config ?? {};
+          // A node the stored surface no longer has comes back from the canvas data without
+          // a Target authentication, so it cannot send a credential the stored surface dropped.
+          const blobCfg = withoutTargetAuth(bn.config ?? {});
           target = {
             id: bn.id,
             type: bn.type as SurfaceNodeType,
@@ -1162,17 +1169,18 @@ class ElementRegistry {
           // A Transit Point's stored fields, and the limits of a rate-limit
           // node on one, come only from the stored surface, so one removed
           // through the API stays removed.
+          // The Target authentication form fields come only from the stored surface too, so a
+          // credential removed through the API is not brought back by an older blob.
           const storedFields: ReadonlySet<string> | null = this.isTransitPointType(target.type)
             ? TRANSIT_POINT_FIELDS
             : target.type === 'rate-limit' &&
                 this.isTransitPointType(byId.get(target.parentId ?? '')?.type)
               ? TRANSIT_POINT_RATE_LIMIT_FIELDS
               : null;
+          const blobFill = withoutTargetAuth(blobConfig);
           const fill = storedFields
-            ? Object.fromEntries(
-                Object.entries(blobConfig).filter(([key]) => !storedFields.has(key))
-              )
-            : blobConfig;
+            ? Object.fromEntries(Object.entries(blobFill).filter(([key]) => !storedFields.has(key)))
+            : blobFill;
           target.config = { ...fill, ...(target.config ?? {}) };
           // Recompute `configured` after the merge — UI-only fields
           // pulled from the blob can flip validity (e.g. an element
@@ -1291,6 +1299,24 @@ export interface CanvasBlob {
 const CANVAS_BLOB_VERSION = 1;
 
 /**
+ * Every node config key that holds a Target authentication: both editors' form fields, the
+ * stored copy and a Transit Point's wire `target_auth`. None of them is written to the canvas
+ * data or read back from it; they come only from the stored surface.
+ */
+const TARGET_AUTH_CONFIG_KEYS: ReadonlySet<string> = new Set<string>([
+  STORED_TARGET_AUTH_KEY,
+  'target_auth',
+  ...(MANAGED_AGENT_TARGET_AUTH_FORM_KEYS as readonly string[]),
+  ...(TRANSIT_POINT_TARGET_AUTH_FORM_KEYS as readonly string[]),
+]);
+
+function withoutTargetAuth(config: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(config).filter(([key]) => !TARGET_AUTH_CONFIG_KEYS.has(key))
+  );
+}
+
+/**
  * Build the `canvas` blob from the live wizard nodes. Always emits layout
  * hints; emits config only for canvas-only node types so we don't duplicate
  * data that already lives in the runtime payload.
@@ -1341,7 +1367,7 @@ export function buildCanvasBlob(
       // pre-canvas-split schema doesn't ride the blob forward forever
       // (removing the trust-check node from the canvas must remove the
       // config).
-      let configToPersist = persistConfig ? (n.config ?? {}) : undefined;
+      let configToPersist = persistConfig ? withoutTargetAuth(n.config ?? {}) : undefined;
       if (
         configToPersist &&
         n.type !== 'trust-check' &&

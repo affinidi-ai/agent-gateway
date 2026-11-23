@@ -18,6 +18,17 @@ export const DOCS_URL = {
   // Direct doc-site links (no catalog redirect exists yet for these pages).
   proxies:
     'https://docs.affinidi.com/products/affinidi-trust-fabric/agent-gateway/reference/proxies/',
+  // Policy pages linked with a #section, which the catalog redirect may not keep.
+  opaPoliciesConceptPage:
+    'https://docs.affinidi.com/products/affinidi-trust-fabric/agent-gateway/concepts/opa-policies/',
+  opaPoliciesReferencePage:
+    'https://docs.affinidi.com/products/affinidi-trust-fabric/agent-gateway/reference/surfaces/opa-policies/',
+  applyOpaPoliciesGuide:
+    'https://docs.affinidi.com/products/affinidi-trust-fabric/agent-gateway/how-to-guides/policies/apply-opa-policies/',
+  jwtClaimsGuide:
+    'https://docs.affinidi.com/products/affinidi-trust-fabric/agent-gateway/how-to-guides/policies/use-jwt-claims-to-control-access-to-a-surface/',
+  mcpToolPoliciesGuide:
+    'https://docs.affinidi.com/products/affinidi-trust-fabric/agent-gateway/how-to-guides/policies/control-mcp-tool-access-with-per-tool-policies/',
   // Surface Builder canvas element reference pages (docs.affinidi.com/catalog/ "Reference > Surfaces").
   accessPointElement: catalogUrl('1131'),
   callerContextElement: catalogUrl('1144'),

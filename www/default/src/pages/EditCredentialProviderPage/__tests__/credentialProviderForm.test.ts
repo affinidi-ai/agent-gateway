@@ -24,6 +24,7 @@ import {
   jwtKeyUnidentified,
   missingProviderField,
   providerCredentialFields,
+  providerPageTitle,
   providerTypeFields,
 } from '../credentialProviderForm';
 
@@ -545,5 +546,14 @@ describe('consent confirmation', () => {
       'https://gw.example/prefix/callback/cp-1/confirm'
     );
     expect(consentConfirmationRedirectUri('')).toBe('');
+  });
+});
+
+describe('credential provider page title', () => {
+  it('names viewing, adding and editing', () => {
+    expect(providerPageTitle(true, false)).toBe('Credential Provider');
+    expect(providerPageTitle(true, true)).toBe('Credential Provider');
+    expect(providerPageTitle(false, true)).toBe('New Credential Provider');
+    expect(providerPageTitle(false, false)).toBe('Edit Credential Provider');
   });
 });
