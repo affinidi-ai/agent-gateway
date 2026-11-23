@@ -1,14 +1,12 @@
 {
   "idp_entity_id": "https://sts.windows.net/$AZURE_TENANT/",
   "idp_sso_url": "https://login.microsoftonline.com/$AZURE_TENANT/saml2",
-  "idp_slo_url": "https://login.microsoftonline.com/$AZURE_TENANT/saml2",
   "sp_entity_id": "https://agent-gateway-1.example.com/api/saml/metadata",
   "sp_acs_url": "https://agent-gateway-1.example.com/api/saml/acs",
   "idp_cert_path": "certs/affinidi-trust-fabric-sso.cer",
   "sp_key_path": "certs/saml-sp-key.pem",
   "sp_cert_path": "certs/saml-sp-cert.pem",
   "sign_requests": true,
-  "require_encrypted_assertions": false,
   "login_throttle": {
     "enabled": false,
     "per_ip": {

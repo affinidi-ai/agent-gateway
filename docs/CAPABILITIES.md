@@ -440,7 +440,8 @@ five minutes and is accepted once. The gateway holds at most 100,000 unfinished 
 past that, `/api/saml/login` answers 503 until older ones expire. An optional per-client-IP
 limit on `/api/saml/login` is off by default: set `login_throttle.enabled` to `true` in
 `saml.json` for 20 sign-ins per client IP per minute (the default `per_ip`), with 429 and
-`Retry-After` past that.
+`Retry-After` past that. With SAML sign-in, signing out leaves the identity provider session
+in place ([`saml.json`](CONFIGURATION_REFERENCE.md#samljson)).
 
 The SAML login and CLI login limits count by client IP, taken from the TCP connection.
 `X-Forwarded-For` is only read when the connection comes from an address in

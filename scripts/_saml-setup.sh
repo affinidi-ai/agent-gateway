@@ -2,7 +2,8 @@
 # Apply SAML authentication configuration to a target env directory.
 # Downloads the IdP certificate once into envs/certs/ (shared), copies it to
 # the target env, switches auth_mode to "saml" in config.toml, and substitutes
-# $AZURE_TENANT and the SP domain placeholders in config/saml.json.
+# $AZURE_TENANT and the SP domain placeholders in config/saml.json, removing a
+# non-null idp_slo_url. A true require_encrypted_assertions stops the script.
 #
 # Usage:
 #   ./scripts/_saml-setup.sh <target_dir> <azure_tenant>
@@ -27,6 +28,36 @@ domain_host=""
 if [[ -n "${domain_url}" && "${domain_url}" != "null" ]]; then
   domain_host="${domain_url#*://}"   # strip scheme
   domain_host="${domain_host%%/*}"   # strip path and trailing slash
+fi
+
+saml_json="${target_dir}/config/saml.json"
+
+# Apply a jq filter to saml.json in place (rewrites contents, keeps file mode).
+saml_json_set() {
+  local tmp
+  tmp="$(mktemp)"
+  if ! jq "$@" "${saml_json}" > "${tmp}"; then
+    rm -f "${tmp}"
+    echo "❌ Failed to update ${saml_json}" >&2
+    exit 1
+  fi
+  cat "${tmp}" > "${saml_json}"
+  rm -f "${tmp}"
+}
+
+# A non-null idp_slo_url refuses startup (SAML single logout is not supported),
+# and _prepare.sh never overwrites an existing saml.json, so remove it here.
+if jq -e '.idp_slo_url != null' "${saml_json}" > /dev/null; then
+  saml_json_set 'del(.idp_slo_url)'
+  echo "✅ Removed idp_slo_url (SAML single logout is not supported)"
+fi
+# "require_encrypted_assertions": true refuses startup (encrypted assertions are
+# not supported). Changing it needs a matching IdP change, so refuse here.
+if jq -e '.require_encrypted_assertions == true' "${saml_json}" > /dev/null; then
+  echo "❌ ${saml_json} sets require_encrypted_assertions to true; encrypted SAML assertions are not supported." >&2
+  echo "   Set it to false or remove it, and configure the identity provider to send" >&2
+  echo "   unencrypted signed assertions." >&2
+  exit 1
 fi
 
 # 1. Copy the IdP cert into the shared envs/certs/ directory on every
@@ -97,6 +128,8 @@ if [[ ! -f "${_entra_notice_marker}" ]]; then
   fi
   echo "${_YELLOW}  └────────────────────────────────────────────────────────────────${_NC}"
   echo ""
-  read -r -p "Press Enter once your identity administrator has registered the URLs..." _
+  if [[ -t 0 ]]; then
+    read -r -p "Press Enter once your identity administrator has registered the URLs..." _
+  fi
   touch "${_entra_notice_marker}"
 fi

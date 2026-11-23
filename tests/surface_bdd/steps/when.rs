@@ -506,10 +506,23 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     gateway = gateway
         .with_port(gateway_port)
         .with_port_reservation(port_reservation);
-    gateway
-        .wait_until_ready()
-        .await;
-    if has_outbound_listener {
+    let startup_exit = if world
+        .surface_config
+        .refuses_to_start
+    {
+        Some(
+            gateway
+                .wait_for_exit(std::time::Duration::from_secs(60))
+                .await
+                .unwrap_or_else(|error| panic!("the gateway did not refuse to start: {error}")),
+        )
+    } else {
+        gateway
+            .wait_until_ready()
+            .await;
+        None
+    };
+    if has_outbound_listener && startup_exit.is_none() {
         gateway
             .wait_for_secondary_port(outbound_port, std::time::Duration::from_secs(15))
             .await
@@ -530,6 +543,7 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         identity_provider,
         gateway_port,
         outbound_port,
+        startup_exit,
     });
 }
 
