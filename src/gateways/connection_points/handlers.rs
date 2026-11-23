@@ -606,6 +606,25 @@ async fn load_accessible_connection_point<S: ConnectionPointStore>(
     Ok((connection_point, gateway))
 }
 
+/// Loads a User connection point for the by-id routes that return or change the record.
+/// System points are the gateway's own, as in the lists: a paused acceptance's point holds
+/// the inviter's invitation secret, which a caller must not read and redeem first.
+async fn load_user_connection_point<S: ConnectionPointStore>(
+    store: &S,
+    gateway_store: &crate::gateways::FileSystemGatewayStore,
+    id: &str,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+    mutation: bool,
+) -> Result<(GatewayConnectionPoint, Gateway), (StatusCode, String)> {
+    let (connection_point, gateway) =
+        load_accessible_connection_point(store, gateway_store, id, context, scope, mutation).await?;
+    if connection_point.cp_type != super::types::ConnectionPointType::User {
+        return Err((StatusCode::NOT_FOUND, "Connection point not found".to_string()));
+    }
+    Ok((connection_point, gateway))
+}
+
 /// List all connection points
 pub async fn list_connection_points<S: ConnectionPointStore>(
     Extension(store): Extension<std::sync::Arc<S>>,
@@ -682,12 +701,7 @@ pub async fn get_connection_point<S: ConnectionPointStore>(
     scope: Option<Extension<PatResourceScope>>,
 ) -> Result<Json<GatewayConnectionPoint>, (StatusCode, String)> {
     let (connection_point, _) =
-        load_accessible_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, false).await?;
-    // System points are the gateway's own, as in the lists: a paused acceptance's point holds
-    // the inviter's invitation secret, which a viewer must not read and redeem first.
-    if connection_point.cp_type != super::types::ConnectionPointType::User {
-        return Err((StatusCode::NOT_FOUND, "Connection point not found".to_string()));
-    }
+        load_user_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, false).await?;
 
     Ok(Json(connection_point))
 }
@@ -1621,7 +1635,7 @@ pub async fn use_connection_point<S: ConnectionPointStore>(
     scope: Option<Extension<PatResourceScope>>,
 ) -> Result<Json<GatewayConnectionPoint>, (StatusCode, String)> {
     let (mut connection_point, _) =
-        load_accessible_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, true).await?;
+        load_user_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, true).await?;
 
     connection_point.use_count += 1;
     connection_point.last_used_at = Some(chrono::Utc::now());
@@ -1655,7 +1669,7 @@ pub async fn update_connection_point<S: ConnectionPointStore>(
     info!("Updating connection point: {}", id);
 
     let (old_connection_point, _gateway) =
-        load_accessible_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, true).await?;
+        load_user_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, true).await?;
 
     let mut connection_point = old_connection_point.clone();
 
@@ -1718,7 +1732,7 @@ pub async fn update_connection_point_exposed_channels<S: ConnectionPointStore>(
     info!("Updating exposed channels for connection point: {}", id);
 
     let (mut connection_point, gateway) =
-        load_accessible_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, true).await?;
+        load_user_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, true).await?;
 
     if !req
         .exposed_channels
@@ -2701,7 +2715,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_system_connection_point_is_not_found_by_id_as_in_the_lists() {
+    async fn the_by_id_routes_neither_return_nor_change_a_system_connection_point() {
         use crate::gateways::connection_points::ConnectionPointStore;
         use crate::gateways::connection_points::types::{ConnectionPointType, GatewayConnectionPoint};
         use crate::gateways::store::GatewayStore;
@@ -2773,6 +2787,52 @@ mod tests {
                 .id,
             user.id
         );
+
+        let (listener_manager, _listener_dir) = crate::gateways::test_helpers::test_listener_manager(dir.path()).await;
+        let used = super::use_connection_point(
+            Extension(points.clone()),
+            Extension(gateways.clone()),
+            Path(system.id.clone()),
+            None,
+            None,
+        )
+        .await
+        .expect_err("use");
+        let updated = super::update_connection_point(
+            Extension(points.clone()),
+            Extension(gateways.clone()),
+            Extension(Arc::new(listener_manager)),
+            Path(system.id.clone()),
+            None,
+            None,
+            axum::Json(super::UpdateConnectionPointRequest {
+                name: Some("Renamed".into()),
+                description: None,
+                enabled: None,
+            }),
+        )
+        .await
+        .expect_err("update");
+        let exposed = super::update_connection_point_exposed_channels(
+            Extension(points.clone()),
+            Extension(gateways.clone()),
+            Extension(None),
+            Path(system.id.clone()),
+            None,
+            None,
+            axum::Json(super::UpdateExposedChannelsRequest { exposed_channels: Vec::new() }),
+        )
+        .await
+        .expect_err("exposed surfaces");
+        for err in [used, updated, exposed] {
+            assert_eq!(err.0, StatusCode::NOT_FOUND);
+        }
+        let stored = points
+            .get(&system.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((stored.name.as_str(), stored.use_count), ("Point", 0));
     }
 
     #[tokio::test]
