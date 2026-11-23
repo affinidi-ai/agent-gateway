@@ -298,13 +298,24 @@ pub fn canonical_https_url(value: &str) -> Result<Url, StsError> {
         || parsed.password().is_some()
         || parsed.query().is_some()
         || parsed.fragment().is_some()
-        || parsed.as_str() != value
+        || !is_canonical_text(&parsed, value)
     {
         return Err(StsError::InvalidRequest(
             "Expected a canonical HTTPS URI without credentials, query or fragment".into(),
         ));
     }
     Ok(parsed)
+}
+
+/// `value` is the parser's own text, or, for a URL with no path, that text
+/// without the `/` the parser adds (`https://mcp.example.com`, the form MCP
+/// prefers). Either is kept and compared as given, never rewritten to the other.
+fn is_canonical_text(
+    parsed: &Url,
+    value: &str,
+) -> bool {
+    let printed = parsed.as_str();
+    printed == value || (parsed.path() == "/" && printed.strip_suffix('/') == Some(value))
 }
 
 #[cfg(test)]
@@ -573,5 +584,40 @@ mod tests {
                 .get("mcp_issuer")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn canonical_https_urls_take_a_bare_host_as_given_and_refuse_rewritten_forms() {
+        for accepted in [
+            "https://mcp.slack.com",
+            "https://mcp.slack.com/",
+            "https://mcp.example.com:8443",
+            "https://mcp.example.com/mcp",
+            "https://mcp.example.com/mcp/",
+        ] {
+            assert!(canonical_https_url(accepted).is_ok(), "{accepted}");
+        }
+        for refused in [
+            "mcp.slack.com",
+            "http://mcp.slack.com",
+            "HTTPS://mcp.slack.com",
+            "https://MCP.slack.com",
+            "https://mcp.slack.com:443",
+            "https://mcp.slack.com:443/",
+            "https://user@mcp.slack.com",
+            "https://user:secret@mcp.slack.com",
+            "https://mcp.slack.com?",
+            "https://mcp.slack.com?team=1",
+            "https://mcp.slack.com#",
+            "https://mcp.slack.com/#top",
+            "https://mcp.slack.com/.",
+            "https://mcp.example.com/a/../mcp",
+            "https:///mcp.slack.com",
+            "https://mcp.slack.com ",
+        ] {
+            assert!(canonical_https_url(refused).is_err(), "{refused}");
+        }
+        let long = format!("https://mcp.example.com/{}", "a".repeat(4096));
+        assert!(canonical_https_url(&long).is_err());
     }
 }

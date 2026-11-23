@@ -1384,6 +1384,17 @@ mod tests {
         provider
             .additional_params
             .clear();
+        provider.resource = Some("https://provider.example".into());
+        let bare = authorization_url(&provider, &ticket, "client", "opaque").unwrap();
+        assert_eq!(
+            bare.query_pairs()
+                .find(|(name, _)| name == "resource")
+                .map(|(_, value)| value.into_owned())
+                .as_deref(),
+            Some("https://provider.example")
+        );
+        provider.resource = Some("https://provider.example:443".into());
+        assert!(authorization_url(&provider, &ticket, "client", "opaque").is_err());
         provider.resource = None;
         assert!(authorization_url(&provider, &ticket, "client", "opaque").is_err());
     }

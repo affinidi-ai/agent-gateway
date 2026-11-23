@@ -6627,6 +6627,52 @@ mod external_provider_tests {
         assert!(!entra.send_resource);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bare_host_resource_is_kept_as_given_and_a_rewritten_one_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(&directory, Ok(metadata())).await;
+        for refused in ["https://203.0.113.10:443", "https://203.0.113.10?team=1"] {
+            let (status, body) =
+                create(&state, "tenant-a", create_request(|body| body["resource"] = json!(refused))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}: {body}");
+            assert_eq!(body["error"], "resource must be a canonical HTTPS URI", "{refused}");
+        }
+        assert!(
+            stored(&state)
+                .await
+                .is_empty()
+        );
+
+        let (status, created) =
+            create(&state, "tenant-a", create_request(|body| body["resource"] = json!("https://203.0.113.10"))).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["resource"], "https://203.0.113.10");
+        let id = created["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let response = update_provider(
+            State(state.clone()),
+            Path(id.clone()),
+            tenant("tenant-a"),
+            None,
+            None,
+            None,
+            Json(serde_json::from_value(json!({"name": "Slack", "resource": "https://203.0.113.10"})).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let kept = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.name, "Slack");
+        assert_eq!(kept.resource.as_deref(), Some("https://203.0.113.10"));
+    }
+
     fn bound_surface(binding: serde_json::Value) -> crate::config::agent_surface::AgentSurface {
         serde_json::from_value(json!({
             "surface_id": "surface", "name": "surface", "tenant_id": "tenant-a",

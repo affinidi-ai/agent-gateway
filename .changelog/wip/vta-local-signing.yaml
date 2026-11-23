@@ -153,12 +153,6 @@ changes:
         session, and otherwise forgets the stale token and shows the sign-in form.
   removed: []
   security:
-    - timestamp: '2026-11-23T12:00:00Z'
-      title: Update cookie to 0.18.3 for RUSTSEC-2026-0594
-      description: >-
-        cookie 0.18.1 could repeat a private cookie's nonce in a process that
-        forks. The gateway uses no private cookies, so it was not affected; the
-        update clears the advisory from the dependency audit.
     - timestamp: '2026-11-19T16:30:00Z'
       title: Record trust agent changes and refusals as tamper-evident security records
       description: >-
