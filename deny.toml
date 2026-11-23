@@ -94,6 +94,10 @@ exceptions = [
     { allow = [
         "Unicode-3.0",
     ], crate = "unicode-ident" },
+    # Unicode-3.0 — via rmcp, not the ICU family above
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "unicode-normalization" },
     { allow = [
         "Unicode-3.0",
     ], crate = "writeable" },
@@ -118,6 +122,12 @@ exceptions = [
     { allow = [
         "Unicode-3.0",
     ], crate = "zerovec-derive" },
+    # BSD-2-Clause-pos-unchanged — via ssi-ssh → ssi. Two-clause BSD whose first
+    # clause reads "in this position and unchanged"; no license field in the
+    # manifest, so the terms come from the crate's LICENSE file.
+    { allow = [
+        "BSD-2-Clause-pos-unchanged",
+    ], crate = "sshkeys" },
 ]
 
 [[licenses.clarify]]
