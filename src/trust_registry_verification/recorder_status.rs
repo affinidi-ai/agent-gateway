@@ -226,6 +226,8 @@ pub struct TrustRecorderStatusStore {
     backend: Box<dyn StorageBackend<StatusRecord>>,
     last_attempts: DashMap<String, DateTime<Utc>>,
     cleared_surfaces: DashMap<String, DateTime<Utc>>,
+    /// Serialises read-merge-save per status key, so two runs for the same DID keep both outcomes.
+    write_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl TrustRecorderStatusStore {
@@ -234,6 +236,7 @@ impl TrustRecorderStatusStore {
             backend: cached_storage(dir, "trust recorder status").await?,
             last_attempts: DashMap::new(),
             cleared_surfaces: DashMap::new(),
+            write_locks: DashMap::new(),
         })
     }
 
@@ -243,6 +246,7 @@ impl TrustRecorderStatusStore {
             backend: crate::storage::filesystem::in_memory_storage(),
             last_attempts: DashMap::new(),
             cleared_surfaces: DashMap::new(),
+            write_locks: DashMap::new(),
         }
     }
 
@@ -252,6 +256,7 @@ impl TrustRecorderStatusStore {
             backend,
             last_attempts: DashMap::new(),
             cleared_surfaces: DashMap::new(),
+            write_locks: DashMap::new(),
         }
     }
 
@@ -273,6 +278,12 @@ impl TrustRecorderStatusStore {
         let key = record_key(surface_id, agent_did);
         self.last_attempts
             .insert(key.clone(), now);
+        let lock = self
+            .write_locks
+            .entry(key.clone())
+            .or_default()
+            .clone();
+        let _write = lock.lock().await;
         let stored = self.backend.get(&key).await?;
         let status = RecorderStatus::from_entries(
             merge_entries(
@@ -990,6 +1001,46 @@ mod tests {
                 .status_for("s1", "did:a")
                 .await
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn recorders_saving_the_same_did_at_once_keep_each_outcome() {
+        let saving = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        let mut backend = ScriptedBackend::new();
+        backend.pause_save = Some((saving.clone(), proceed.clone()));
+        let store = Arc::new(TrustRecorderStatusStore::with_backend(Box::new(backend)));
+
+        let run = |entry: EntryStatus| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .record("s1", "did:a", vec![entry], at(0), at(0))
+                    .await
+            })
+        };
+        let a = run(failed("tr-a", RecorderReason::Rejected));
+        saving.notified().await;
+        let b = run(written("tr-b", 1, 0));
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), saving.notified()).await;
+        proceed.notify_one();
+        proceed.notify_one();
+        a.await.unwrap().unwrap();
+        b.await.unwrap().unwrap();
+
+        let status = store
+            .status_for("s1", "did:a")
+            .await
+            .unwrap();
+        assert_eq!(
+            status
+                .entries
+                .iter()
+                .map(|e| e.trust_registry_id.as_str())
+                .collect::<Vec<_>>(),
+            ["tr-a", "tr-b"],
+            "neither run's outcome is lost"
         );
     }
 
