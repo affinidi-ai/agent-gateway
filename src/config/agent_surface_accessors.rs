@@ -926,15 +926,27 @@ impl AgentSurface {
     }
 
     /// Whether the surface records any agent: its own Trust Recorder, or one of
-    /// its Transit Points', has an entry.
+    /// its Transit Points', on the surface or in a variant, has an entry.
     pub fn has_trust_recorder_entries(&self) -> bool {
         let has_entries = |recorder: Option<&crate::config::types::TrustRecorderConfig>| {
             recorder.is_some_and(|r| !r.entries.is_empty())
         };
+        let variant_points = self
+            .variants
+            .iter()
+            .filter_map(|variant| {
+                variant
+                    .overrides
+                    .transit
+                    .as_ref()
+                    .and_then(|transit| transit.points.as_deref())
+            })
+            .flatten();
         has_entries(self.trust_recorder())
             || self
                 .transit_points()
                 .iter()
+                .chain(variant_points)
                 .any(|point| has_entries(point.trust_recorder.as_ref()))
     }
 

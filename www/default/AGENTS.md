@@ -1042,7 +1042,9 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   ordered before that Transit Point's Trust Check, node `trust-recorder-<transit point node id>`,
   parented to the Transit Point). The Transit Point factory writes the second as
   `transit.points[i].trust_recorder` and the element's own `buildPayload` skips it; removing the
-  node removes the Transit Point's recorder. The element is `directionality: 'either'` and snaps
+  node removes the Transit Point's recorder. The stored surface owns both recorders' entries
+  (`payloadOwnsConfig`): the canvas layout restores a recorder only while the payload has it, or
+  as a placeholder with no entries. The element is `directionality: 'either'` and snaps
   only to an arrow and direction with a slot for it (`archetypeHasSlotFor`). The panels name the
   leg through `TrustRecorderLeg` (`isTransitPointTrustRecorder`); the Last outcome row is the
   surface's, which Transit Point recorders also update.

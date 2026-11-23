@@ -233,6 +233,8 @@ export const trustRecorderDefinition: NodeDefinition = {
     if (entries.length === 1) return '1 registry';
     return `${entries.length} registries`;
   },
+  payloadOwnsConfig: true,
+  isBlobPlaceholder: c => readEntries(c).length === 0,
   buildPayload: ctx => {
     // A Transit Point's recorder is written by the Transit Point factory.
     const nodes = ctx.nodesOfType('trust-recorder').filter(n => !isTransitPointTrustRecorder(n));

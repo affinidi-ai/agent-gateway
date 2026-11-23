@@ -8326,6 +8326,31 @@ mod tests {
     }
 
     #[test]
+    fn a_trust_recorder_only_on_a_variants_transit_point_counts() {
+        let base = surface_with_transit_points(serde_json::json!([transit_point_json("partner", "a2a", Vec::new())]));
+        let with_variant_recorder = |entries: serde_json::Value| {
+            let mut point = transit_point_json("partner", "a2a", Vec::new());
+            point["trust_recorder"] = serde_json::json!({ "entries": entries });
+            let mut surface = serde_json::to_value(&base).expect("serialize");
+            surface["variants"] = serde_json::json!([{
+                "id": "variant-dev", "alias": "dev", "name": "Development", "enabled": true,
+                "overrides": {"transit": {"points": [point]}}
+            }]);
+            serde_json::from_value::<AgentSurface>(surface).expect("deserialize")
+        };
+        let entry = serde_json::json!({
+            "trust_registry_id": "tr-1",
+            "issuer_did": "did:example:issuer",
+            "authority_did": "did:example:authority",
+            "include_owned_agent": true
+        });
+
+        assert!(!base.has_trust_recorder_entries());
+        assert!(with_variant_recorder(serde_json::json!([entry])).has_trust_recorder_entries());
+        assert!(!with_variant_recorder(serde_json::json!([])).has_trust_recorder_entries());
+    }
+
+    #[test]
     fn validate_variant_with_none_override_inherits_base_and_passes() {
         use crate::config::agent_surface_variants::{SurfaceOverrides, SurfaceVariant};
         let s_base = surface_with_lists(vec![elem("tc-ok")], Vec::new());

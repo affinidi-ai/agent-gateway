@@ -694,6 +694,91 @@ describe('ElementRegistry', () => {
         );
       });
 
+      describe('against the stored canvas layout', () => {
+        const staleEntry = { ...trustRecorder.entries[0], trust_registry_id: 'tr-stale' };
+        const withLayout = (recorder: unknown, layoutConfig: unknown) => {
+          const point: Record<string, unknown> = {
+            id: 'uuid-partner',
+            alias: 'partner',
+            protocol: 'a2a',
+            target_endpoint: 'https://p.example',
+          };
+          if (recorder) point.trust_recorder = recorder;
+          return registry.nodesFromPayload({
+            access_point: { route: '/a2a', protocol: 'a2a' },
+            target: { endpoint: 'https://upstream.example.com' },
+            transit: { points: [point] },
+            canvas: {
+              version: 1,
+              nodes: [
+                {
+                  id: 'transit-point-a2a-1',
+                  type: 'transit-point-a2a',
+                  label: '',
+                  parentId: 'access-point',
+                  config: { id: 'uuid-partner' },
+                },
+                {
+                  id: 'trust-recorder-transit-point-a2a-1',
+                  type: 'trust-recorder',
+                  label: '',
+                  parentId: 'transit-point-a2a-1',
+                  slotId: 'request:trust-recorder',
+                  config: layoutConfig,
+                },
+              ],
+            },
+          });
+        };
+
+        it('does not bring back a recorder removed from the Transit Point', () => {
+          const nodes = withLayout(undefined, { entries: [staleEntry] });
+          expect(nodes.filter(n => n.type === 'trust-recorder')).toEqual([]);
+          expect(registry.buildPayload(makeCtx(nodes)).transit.points[0]).not.toHaveProperty(
+            'trust_recorder'
+          );
+        });
+
+        it('takes the stored entries over the ones in the layout', () => {
+          const out = registry.buildPayload(
+            makeCtx(withLayout(trustRecorder, { entries: [staleEntry] }))
+          );
+          expect(out.transit.points[0].trust_recorder).toEqual(trustRecorder);
+        });
+
+        it('keeps a dropped recorder that has no entries yet', () => {
+          const nodes = withLayout(undefined, { entries: [] });
+          expect(nodes.filter(n => n.type === 'trust-recorder')).toEqual([
+            expect.objectContaining({ id: 'trust-recorder-transit-point-a2a-1' }),
+          ]);
+        });
+
+        it("does not bring back the surface's own recorder removed from the surface", () => {
+          const nodes = registry.nodesFromPayload({
+            access_point: { route: '/a2a', protocol: 'a2a' },
+            target: { endpoint: 'https://upstream.example.com' },
+            canvas: {
+              version: 1,
+              nodes: [
+                {
+                  id: 'trust-recorder-target-response',
+                  type: 'trust-recorder',
+                  label: '',
+                  parentId: 'target',
+                  slotId: 'response:trust-recorder',
+                  direction: 'response',
+                  config: { entries: [staleEntry] },
+                },
+              ],
+            },
+          });
+          expect(nodes.filter(n => n.type === 'trust-recorder')).toEqual([]);
+          expect(registry.buildPayload(makeCtx(nodes)).access_point).not.toHaveProperty(
+            'trust_recorder'
+          );
+        });
+      });
+
       it('writes nothing for a recorder with no entries yet', () => {
         const nodes = hydrate().map(n =>
           n.type === 'trust-recorder' ? { ...n, config: { entries: [] } } : n
