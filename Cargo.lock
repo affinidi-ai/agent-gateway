@@ -841,7 +841,7 @@ dependencies = [
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp 0.31.1",
  "opentelemetry_sdk 0.31.0",
- "p256 0.13.2",
+ "p256 0.14.0",
  "parking_lot",
  "pem 3.0.6",
  "prometheus",
@@ -4662,7 +4662,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.10",
+ "syn 1.0.109",
 ]
 
 [[package]]
