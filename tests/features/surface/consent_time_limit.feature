@@ -103,7 +103,7 @@ Feature: Consent time limit
     And caller "alice" has started OAuth consent for provider "calendar"
     And caller "alice" has completed OAuth consent for provider "calendar"
     And the caller's consent was given 3600 seconds ago
-    And the VP Audit Log keeps only audit event "token_revoked"
+    And the VP Audit Log keeps only audit events "token_revoked"
     When the operator limits the caller's consent to 7200 seconds
     Then the admin API response status is 200
     And the delegation audit trail contains event "consent_limited" for OAuth provider "calendar"
@@ -235,7 +235,7 @@ Feature: Consent time limit
     And caller "alice" has started OAuth consent for provider "calendar"
     And caller "alice" has completed OAuth consent for provider "calendar"
     And the caller's consent was given 7200 seconds ago
-    And the VP Audit Log keeps only audit event "consent_granted"
+    And the VP Audit Log keeps only audit events "consent_granted"
     When caller "alice" invokes MCP tool "schedule_meeting" with a valid token
     Then the response status is 401
     And the delegation audit trail contains event "consent_expired" for OAuth provider "calendar"

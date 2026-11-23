@@ -3489,19 +3489,24 @@ async fn vp_audit_log_keeps_every_audit_event(world: &mut SurfaceWorld) {
     }
 }
 
-#[given(expr = "the VP Audit Log keeps only audit event {string}")]
-async fn vp_audit_log_keeps_only_audit_event(
+/// `events` is a comma-separated list of audit event names.
+#[given(expr = "the VP Audit Log keeps only audit events {string}")]
+async fn vp_audit_log_keeps_only_audit_events(
     world: &mut SurfaceWorld,
-    event: String,
+    events: String,
 ) {
+    let names: Vec<&str> = events
+        .split(',')
+        .map(str::trim)
+        .collect();
     crate::steps::when::ensure_admin_session(world).await;
     world
         .admin_client
         .as_ref()
         .expect("admin client must exist")
-        .keep_only_audit_events(&[event.as_str()])
+        .keep_only_audit_events(&names)
         .await
-        .unwrap_or_else(|error| panic!("the VP Audit Log must keep only {event}: {error:#}"));
+        .unwrap_or_else(|error| panic!("the VP Audit Log must keep only {names:?}: {error:#}"));
 }
 
 /// The live VP Audit Log of the running gateway: beside its logs when the

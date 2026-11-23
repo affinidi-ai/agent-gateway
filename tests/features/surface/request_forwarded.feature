@@ -10,7 +10,7 @@ Feature: Forwarded requests in the VP Audit Log
 
   Scenario: A forwarded request is recorded once with its caller
     Given the surface requires "API Key" source authentication
-    And the VP Audit Log keeps only audit event "request_forwarded"
+    And the VP Audit Log keeps only audit events "request_forwarded"
     When the caller sends a request to the surface with a valid API key and a traceparent set
     Then the response status is 200
     And MCP server "bravo" received the forwarded MCP request
@@ -19,7 +19,7 @@ Feature: Forwarded requests in the VP Audit Log
 
   Scenario: A refused request is not recorded as forwarded
     Given the MCP surface has a request policy that denies all requests
-    And the VP Audit Log keeps only audit event "request_forwarded"
+    And the VP Audit Log keeps only audit events "request_forwarded"
     When the caller sends a request to the surface with a traceparent set
     Then the response status is 403
     And MCP server "bravo" was not called
