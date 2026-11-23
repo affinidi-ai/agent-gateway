@@ -78,7 +78,7 @@ changes:
         as selected, so a surface stored before this reads correctly without being rewritten. A
         new Transit Point seeds an offered prefix as well.
     - timestamp: '2026-11-20T18:10:00Z'
-      title: The Surface Builder holds the surface prefix and path to the required fields they are
+      title: Refuse a Surface Builder save with an empty surface prefix or path
       description: >-
         Both route fields carry a required marker and neither could act on it: the path's validator
         returns no error for an empty value, and the prefix had no error binding at all. A node
