@@ -208,8 +208,8 @@ context whose record names no DID signs as its `did:webvh` only when that is the
 holds.
 
 The setting applies to contexts created after it is set: existing contexts and agents keep their
-DID, because changing an agent's DID would invalidate credentials already issued to it. The
-Verifiable Trust Agent tab, `GET /v1/vta/status` and the key inventory say which method is in use.
+DID, because changing an agent's DID would invalidate credentials already issued to it.
+`GET /v1/vta/status` and the key inventory say which method is in use.
 
 A VTA-built `did:webvh` uses one key as its signing key and its log's update key, so a trust
 agent whose `keys/sign-document` signed a caller's document as that key's `did:key` would let

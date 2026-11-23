@@ -2659,27 +2659,22 @@ Gateway signing**, not on Connections.
 ### Verifiable Trust Agent tab
 
 `pages/TrustAgentsPage.tsx` (`data-testid="page-trust-agents"`) lists the connections the way the
-other tabs list theirs, reports its counts (`onCountChange`) and portals **Add VTA**
-(`trust-agents-connect-button`, shown only with `vta_connections.edit`) into the tab banner
-through `actionsContainer`. The Connections filter box is not shown on this tab. The tab opens with
-this text (`trust-agents-intro`), which the empty state also uses with the same **Add VTA**
-action (`trust-agents-empty-connect-button`):
-
-> Connect a Verifiable Trust Agent to sign audit records with a key the gateway doesn't hold. A
-> compromised gateway can't take the signing key with it, and its access can be revoked from the
-> trust agent. You keep full control of the agent.
+other tabs list theirs and reports its counts (`onCountChange`). It follows the Registries and
+Gateways tabs: no text above the card and no button in the tab banner (it takes no
+`actionsContainer`). The card header holds the title, the count and **Add VTA**
+(`trust-agents-connect-button`, primary, `size="md"`, shown only with `vta_connections.edit`),
+which opens the wizard; it has no Refresh. **Add VTA** is the tab's only call to action. With no
+connection the card shows the shared `EmptyState` titled "Add your first Verifiable Trust Agent",
+a sentence on what a trust agent is for and **View Docs** (`DOCS_URL.connections`), with no button
+of its own. A failed read shows an error with **Retry**. The Connections filter box is not shown on
+this tab.
 
 The tab never claims a compromised gateway cannot sign: it still holds the control key and can
-ask the trust agent to sign within its grant until that access is revoked.
+ask the trust agent to sign within its grant until that access is revoked. Which DID new contexts
+sign as (`[vta] context_did_method`) is not shown on the tab; `GET /v1/vta/status` and the key
+inventory report it.
 
-Below it, while `GET /v1/vta/status` reports `context_did_method`, one line
-(`trust-agents-context-did`) says which DID new contexts sign as: a `did:key` ("the context's key
-itself, with nothing to host. Rotating that key changes the DID.") or a `did:webvh` hosted by this
-gateway or on the trust agent's webvh server (`context_did_hosting`), whose key the trust agent's
-operator can rotate without changing its DID. It is set by the deployment's configuration and
-cannot be changed here.
-
-The tab shows no signing tier banner. Under the text, while `control_key` of `GET /v1/vta/status`
+The tab shows no signing tier banner. Above the card, while `control_key` of `GET /v1/vta/status`
 is present (the gateway holds a rotatable `did:key` control key for a `[vta]` connection), the
 **Control key** card (`ControlKeyCard`, `data-testid="vta-control-key"`) shows the key this
 gateway signs in to its trust agent with (shortened, full value in the `title`, with a copy
@@ -2801,7 +2796,8 @@ _Feature flags_), **Mediators** `mediators.view`, **Registries** `trust_registri
 _Verifiable Trust Agent tab and Gateway signing_. One filter box serves every tab but the
 Verifiable Trust Agent one, which shows none; each tab reports its
 filtered and total counts (`onCountChange`) for the badge, and a tab given `actionsContainer`
-portals its add button into the tab banner.
+portals its add button into the tab banner; the Verifiable Trust Agent tab is given none and keeps
+**Add VTA** in its card header.
 
 ### Payment Gateways tab
 

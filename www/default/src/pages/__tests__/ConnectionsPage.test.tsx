@@ -25,7 +25,10 @@ jest.mock(
   '../TrustAgentsPage',
   () =>
     ({ actionsContainer }: { actionsContainer?: HTMLElement | null }) => (
-      <div data-testid="stub-trust-agents" data-has-actions={String(!!actionsContainer)} />
+      <div
+        data-testid="stub-trust-agents"
+        data-has-actions={String(actionsContainer !== undefined)}
+      />
     )
 );
 
@@ -145,12 +148,12 @@ describe('ConnectionsPage', () => {
       expect(screen.queryByTestId('connections-tab-trust-agents')).not.toBeInTheDocument();
     });
 
-    it('opens from ?tab= and hands the tab the actions banner', () => {
+    it('opens from ?tab= and gives the tab no actions banner, so its Add VTA sits in its card', () => {
       mockPermissions = { 'vta_connections.view': true };
       renderPage('/connections?tab=trust-agents');
 
       expect(activeTab()).toContain('Verifiable Trust Agent');
-      expect(screen.getByTestId('stub-trust-agents')).toHaveAttribute('data-has-actions', 'true');
+      expect(screen.getByTestId('stub-trust-agents')).toHaveAttribute('data-has-actions', 'false');
     });
 
     it('shows no filter box on the Verifiable Trust Agent tab, and the box on the others', () => {

@@ -1,5 +1,4 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import { usePermissions } from '../context/PermissionsContext';
 import { AppButton } from '../components/shared/AppButton';
@@ -7,45 +6,27 @@ import { Badge } from '../components/shared/Badge';
 import { EmptyState } from '../components/shared/EmptyState';
 import { ROUTES, trustAgentResumePath } from '../routes';
 import { showToast } from '../utils/toaster';
+import { DOCS_URL } from '../config/docs';
 import { VtaConnectionsList } from './VtaConnectionsPage/VtaConnectionsList';
 import { ControlKeyCard } from './VtaConnectionsPage/ControlKeyCard';
 import { StrandedAgentsError, useVtaConnections } from './VtaConnectionsPage/useVtaConnections';
 import type { VtaConnection } from './VtaConnectionsPage/types';
 
-/** What connecting a Verifiable Trust Agent gives, shown at the top of the tab. */
-const INTRO =
-  "Connect a Verifiable Trust Agent to sign audit records with a key the gateway doesn't hold. A compromised gateway can't take the signing key with it, and its access can be revoked from the trust agent. You keep full control of the agent.";
-
-/** Which DID the contexts this gateway creates sign as, set by the deployment's configuration. */
-const contextDidNote = (method: string | undefined, hosting: string | undefined): string | null => {
-  if (method === 'did_webvh') {
-    const where =
-      hosting === 'vta_server' ? "on the trust agent's webvh server" : 'by this gateway';
-    return `New contexts sign as a did:webvh, hosted ${where}. The trust agent's operator can rotate a context's key without changing its DID.`;
-  }
-  if (method === 'did_key') {
-    return "New contexts sign as a did:key: the context's key itself, with nothing to host. Rotating that key changes the DID.";
-  }
-  return null;
-};
+/** What a Verifiable Trust Agent is for, shown while none is connected. */
+const EMPTY_BODY =
+  'A Verifiable Trust Agent holds the keys the gateway signs tokens and credentials with, so they never sit on the gateway. Add one to choose it as the signing key source for the gateway, an issuer or a surface.';
 
 interface TrustAgentsPageProps {
   /** The Connections page's shared filter; the tab then shows no filter of its own. */
   externalSearchTerm?: string;
   onCountChange?: (filtered: number, total: number) => void;
-  /** The Connections tab banner, where the Connect button is rendered. */
-  actionsContainer?: HTMLElement | null;
 }
 
 /**
  * The Verifiable Trust Agent tab of Connections — the agents this gateway
  * can sign through, and what state each connection's pairing is in.
  */
-const TrustAgentsPage: React.FC<TrustAgentsPageProps> = ({
-  externalSearchTerm,
-  onCountChange,
-  actionsContainer,
-}) => {
+const TrustAgentsPage: React.FC<TrustAgentsPageProps> = ({ externalSearchTerm, onCountChange }) => {
   const navigate = useNavigate();
   const { hasPermission } = usePermissions();
   const {
@@ -66,10 +47,6 @@ const TrustAgentsPage: React.FC<TrustAgentsPageProps> = ({
   const [confirmRevoke, setConfirmRevoke] = useState<string | null>(null);
   const [strandedConfirm, setStrandedConfirm] = useState<string | null>(null);
 
-  const contextDid = contextDidNote(
-    deployment?.context_did_method,
-    deployment?.context_did_hosting
-  );
   const canEdit = hasPermission('vta_connections.edit');
   const canRotateKeys = hasPermission('key_management.edit');
   const canDelete = hasPermission('vta_connections.delete');
@@ -183,10 +160,10 @@ const TrustAgentsPage: React.FC<TrustAgentsPageProps> = ({
   const connectButton = canEdit ? (
     <AppButton
       variant="primary"
-      size="sm"
+      size="md"
       data-testid="trust-agents-connect-button"
       onClick={() => navigate(ROUTES.TRUST_AGENT_CONNECT)}
-      iconStart={<i className="fas fa-plus me-1" aria-hidden="true" />}
+      iconStart={<i className="fas fa-plus fa-sm me-1" aria-hidden="true" />}
     >
       Add VTA
     </AppButton>
@@ -194,18 +171,6 @@ const TrustAgentsPage: React.FC<TrustAgentsPageProps> = ({
 
   return (
     <div className={isEmbedded ? '' : 'container-fluid'} data-testid="page-trust-agents">
-      {actionsContainer && connectButton && createPortal(connectButton, actionsContainer)}
-
-      <p className="text-muted mb-2" data-testid="trust-agents-intro">
-        {INTRO}
-      </p>
-      {contextDid && (
-        <p className="small text-muted mb-4" data-testid="trust-agents-context-did">
-          <i className="fas fa-fingerprint me-1" aria-hidden="true" />
-          {contextDid}
-        </p>
-      )}
-
       {deployment?.control_key && (
         <ControlKeyCard
           controlKey={deployment.control_key}
@@ -226,12 +191,7 @@ const TrustAgentsPage: React.FC<TrustAgentsPageProps> = ({
               ariaLabel={`${filtered.length} VTA connections`}
             />
           </h6>
-          <div className="d-flex align-items-center gap-2">
-            {!actionsContainer && connectButton}
-            <AppButton variant="outline-secondary" size="sm" onClick={() => void reload()}>
-              Refresh
-            </AppButton>
-          </div>
+          {connectButton}
         </div>
 
         <div className="card-body">
@@ -259,12 +219,9 @@ const TrustAgentsPage: React.FC<TrustAgentsPageProps> = ({
           {!loading && !error && connections.length === 0 && (
             <EmptyState
               icon="fa-robot"
-              title="No Verifiable Trust Agent connected"
-              body={INTRO}
-              ctaLabel={canEdit ? 'Add VTA' : undefined}
-              ctaIcon="fa-plus"
-              onCtaClick={canEdit ? () => navigate(ROUTES.TRUST_AGENT_CONNECT) : undefined}
-              ctaTestId="trust-agents-empty-connect-button"
+              title="Add your first Verifiable Trust Agent"
+              body={EMPTY_BODY}
+              docsHref={DOCS_URL.connections}
             />
           )}
 

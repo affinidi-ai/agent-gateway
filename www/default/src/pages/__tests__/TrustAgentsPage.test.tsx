@@ -7,8 +7,11 @@ import TrustAgentsPage from '../TrustAgentsPage';
 import { apiClient } from '../../api';
 
 jest.mock('../../api', () => ({ apiClient: { fetch: jest.fn() } }));
+let mockCanEdit = true;
 jest.mock('../../context/PermissionsContext', () => ({
-  usePermissions: () => ({ hasPermission: () => true }),
+  usePermissions: () => ({
+    hasPermission: (permission: string) => permission !== 'vta_connections.edit' || mockCanEdit,
+  }),
 }));
 
 const mockFetch = apiClient.fetch as jest.Mock;
@@ -66,40 +69,55 @@ const mountTab = () =>
     </MemoryRouter>
   );
 
-const INTRO =
-  "Connect a Verifiable Trust Agent to sign audit records with a key the gateway doesn't hold. A compromised gateway can't take the signing key with it, and its access can be revoked from the trust agent. You keep full control of the agent.";
+const OLD_INTRO = 'Connect a Verifiable Trust Agent to sign audit records';
 
-beforeEach(() => mockFetch.mockReset());
+beforeEach(() => {
+  mockFetch.mockReset();
+  mockCanEdit = true;
+});
 
 describe('TrustAgentsPage', () => {
-  it('opens with what connecting an agent gives, and no signing banner', async () => {
-    respond([agent]);
+  it('lists the agents with no intro, no context DID note and no Refresh', async () => {
+    respond([agent], { context_did_method: 'did_key', context_did_hosting: 'gateway' });
     mountTab();
 
     expect(await screen.findByText('Production agent')).toBeInTheDocument();
-    expect(screen.getByTestId('trust-agents-intro')).toHaveTextContent(INTRO);
+    expect(screen.queryByText(new RegExp(OLD_INTRO))).not.toBeInTheDocument();
+    expect(screen.queryByText(/New contexts sign as/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Refresh' })).not.toBeInTheDocument();
     expect(screen.queryByText(/Signing locally/)).not.toBeInTheDocument();
   });
 
-  it('has Add VTA, which opens the wizard', async () => {
+  it('has one Add VTA, which opens the wizard', async () => {
     respond([agent]);
     mountTab();
 
-    await userEvent.click(await screen.findByTestId('trust-agents-connect-button'));
-
-    expect(screen.getByTestId('trust-agents-connect-button')).toHaveTextContent('Add VTA');
+    const connect = await screen.findByTestId('trust-agents-connect-button');
+    expect(connect).toHaveTextContent('Add VTA');
+    expect(screen.getAllByRole('button', { name: /Add VTA/ })).toHaveLength(1);
+    await userEvent.click(connect);
     await waitFor(() =>
       expect(screen.getByTestId('where')).toHaveTextContent('/connections/trust-agents/connect')
     );
   });
 
-  it('offers Add VTA when there is no agent yet', async () => {
+  it('with no agent yet, says to add the first one, links the docs and offers no Add VTA of its own', async () => {
     respond([]);
     mountTab();
 
-    expect(await screen.findByTestId('trust-agents-empty-connect-button')).toHaveTextContent(
-      'Add VTA'
-    );
+    expect(await screen.findByText('Add your first Verifiable Trust Agent')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /View Docs/ })).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: /Add VTA/ })).toHaveLength(1);
+    expect(screen.queryByText(new RegExp(OLD_INTRO))).not.toBeInTheDocument();
+  });
+
+  it('offers no Add VTA to a user who cannot add connections', async () => {
+    mockCanEdit = false;
+    respond([]);
+    mountTab();
+
+    await screen.findByText('Add your first Verifiable Trust Agent');
+    expect(screen.queryByRole('button', { name: /Add VTA/ })).not.toBeInTheDocument();
   });
 
   it("shows the gateway's control key while it holds a rotatable one", async () => {
@@ -112,36 +130,6 @@ describe('TrustAgentsPage', () => {
     mountTab();
 
     expect(await screen.findByTestId('vta-control-key')).toBeInTheDocument();
-  });
-
-  it('says new contexts sign as a did:key when the deployment does', async () => {
-    respond([], { context_did_method: 'did_key', context_did_hosting: 'gateway' });
-    mountTab();
-    expect(await screen.findByTestId('trust-agents-context-did')).toHaveTextContent(
-      'New contexts sign as a did:key'
-    );
-  });
-
-  it('says where a did:webvh is hosted when contexts sign as one', async () => {
-    respond([], { context_did_method: 'did_webvh', context_did_hosting: 'gateway' });
-    const { unmount } = mountTab();
-    const note = await screen.findByTestId('trust-agents-context-did');
-    expect(note).toHaveTextContent('did:webvh, hosted by this gateway');
-    expect(note).toHaveTextContent('without changing its DID');
-    unmount();
-
-    respond([], { context_did_method: 'did_webvh', context_did_hosting: 'vta_server' });
-    mountTab();
-    expect(await screen.findByTestId('trust-agents-context-did')).toHaveTextContent(
-      "on the trust agent's webvh server"
-    );
-  });
-
-  it('says nothing about context DIDs when the status does not', async () => {
-    respond([]);
-    mountTab();
-    await screen.findByTestId('trust-agents-intro');
-    expect(screen.queryByTestId('trust-agents-context-did')).not.toBeInTheDocument();
   });
 
   it('shows no control key card without one', async () => {

@@ -73,14 +73,17 @@ async function mockTrustAgents(
   );
 }
 
-const INTRO =
-  "Connect a Verifiable Trust Agent to sign audit records with a key the gateway doesn't hold. A compromised gateway can't take the signing key with it, and its access can be revoked from the trust agent. You keep full control of the agent.";
+const OLD_INTRO = /Connect a Verifiable Trust Agent to sign audit records/;
 
 test.describe("Connections: Verifiable Trust Agent tab", () => {
-  test("lists the agents beside the other connections, with what connecting one gives", async ({
+  test("lists the agents beside the other connections, with no intro or context DID note", async ({
     page,
   }) => {
-    await mockTrustAgents(page, [agent()]);
+    await mockTrustAgents(
+      page,
+      [agent()],
+      status({ context_did_method: "did_key", context_did_hosting: "gateway" }),
+    );
 
     await page.goto(`${BASE_URL}/connections`);
     await expect(page.getByTestId("connections-tab-trust-agents")).toHaveText(
@@ -93,85 +96,55 @@ test.describe("Connections: Verifiable Trust Agent tab", () => {
     await page.getByTestId("connections-tab-trust-agents").click();
     await expect(page).toHaveURL(/tab=trust-agents/);
     await expect(page.getByTestId("page-trust-agents")).toBeVisible();
-    await expect(page.getByTestId("trust-agents-intro")).toHaveText(INTRO);
     await expect(page.getByText("Production agent")).toBeVisible();
+    await expect(page.getByText(OLD_INTRO)).toHaveCount(0);
+    await expect(page.getByText(/New contexts sign as/)).toHaveCount(0);
     await expect(page.getByText(/Signing locally/)).toHaveCount(0);
   });
 
-  test("says which DID new contexts sign as, from the deployment", async ({
+  test("has Add VTA in the card header in place of Refresh, like Add Trust Registry, and no filter box", async ({
     page,
   }) => {
-    await mockTrustAgents(
-      page,
-      [agent()],
-      status({
-        context_did_method: "did_webvh",
-        context_did_hosting: "gateway",
-      }),
-    );
-
-    await page.goto(`${BASE_URL}/connections?tab=trust-agents`);
-    await expect(page.getByTestId("trust-agents-context-did")).toHaveText(
-      "New contexts sign as a did:webvh, hosted by this gateway. The trust agent's operator can rotate a context's key without changing its DID.",
-    );
-  });
-
-  test("says a did:webvh is hosted on the trust agent's webvh server", async ({
-    page,
-  }) => {
-    await mockTrustAgents(
-      page,
-      [agent()],
-      status({
-        context_did_method: "did_webvh",
-        context_did_hosting: "vta_server",
-      }),
-    );
-
-    await page.goto(`${BASE_URL}/connections?tab=trust-agents`);
-    await expect(page.getByTestId("trust-agents-context-did")).toContainText(
-      "on the trust agent's webvh server",
-    );
-  });
-
-  test("says new contexts sign as a did:key by default", async ({ page }) => {
-    await mockTrustAgents(
-      page,
-      [agent()],
-      status({ context_did_method: "did_key", context_did_hosting: "gateway" }),
-    );
-
-    await page.goto(`${BASE_URL}/connections?tab=trust-agents`);
-    await expect(page.getByTestId("trust-agents-context-did")).toContainText(
-      "New contexts sign as a did:key",
-    );
-  });
-
-  test("has Add VTA and no filter box beside it", async ({ page }) => {
     await mockTrustAgents(page, [agent()]);
     await page.goto(`${BASE_URL}/connections?tab=trust-agents`);
 
-    await expect(page.getByTestId("trust-agents-connect-button")).toHaveText(
-      /Add VTA/,
+    const header = page
+      .getByTestId("page-trust-agents")
+      .locator(".card-header")
+      .filter({ hasText: "Verifiable Trust Agents" });
+    const add = header.getByTestId("trust-agents-connect-button");
+    await expect(add).toHaveText(/Add VTA/);
+    await expect(add).toHaveClass(/btn-primary/);
+    await expect(header.getByRole("button", { name: "Refresh" })).toHaveCount(
+      0,
     );
+    await expect(page.getByRole("button", { name: /Add VTA/ })).toHaveCount(1);
     await expect(page.getByTestId("connections-search-input")).toHaveCount(0);
+
+    await add.click();
+    await expect(page).toHaveURL(/\/connections\/trust-agents\/connect$/);
+    await expect(page.getByTestId("wizard-add-trust-agent")).toBeVisible();
 
     await page.goto(`${BASE_URL}/connections?tab=trust-registries`);
     await expect(page.getByTestId("connections-search-input")).toBeVisible();
   });
 
-  test("says so when there is no agent, and offers Add VTA", async ({
+  test("with no agent, says to add the first one and links the docs, with Add VTA only in the card header", async ({
     page,
   }) => {
     await mockTrustAgents(page, []);
     await page.goto(`${BASE_URL}/connections?tab=trust-agents`);
 
-    const add = page.getByTestId("trust-agents-empty-connect-button");
-    await expect(add).toHaveText(/Add VTA/);
-    await add.click();
-
-    await expect(page).toHaveURL(/\/connections\/trust-agents\/connect$/);
-    await expect(page.getByTestId("wizard-add-trust-agent")).toBeVisible();
+    const tab = page.getByTestId("page-trust-agents");
+    await expect(
+      tab.getByText("Add your first Verifiable Trust Agent"),
+    ).toBeVisible();
+    await expect(tab.getByRole("link", { name: /View Docs/ })).toBeVisible();
+    await expect(page.getByRole("button", { name: /Add VTA/ })).toHaveCount(1);
+    await expect(
+      tab.locator(".card-header").getByTestId("trust-agents-connect-button"),
+    ).toBeVisible();
+    await expect(page.getByText(OLD_INTRO)).toHaveCount(0);
   });
 
   test("has no sidebar entry of its own", async ({ page }) => {

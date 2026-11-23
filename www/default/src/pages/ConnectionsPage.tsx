@@ -223,11 +223,7 @@ const ConnectionsPage: React.FC = () => {
                 </>
               }
             >
-              <TrustAgentsPage
-                externalSearchTerm=""
-                onCountChange={setTrustAgentsCount}
-                actionsContainer={activeTab === 'trust-agents' ? actionsContainer : null}
-              />
+              <TrustAgentsPage externalSearchTerm="" onCountChange={setTrustAgentsCount} />
             </Tab>
           )}
         </Tabs>

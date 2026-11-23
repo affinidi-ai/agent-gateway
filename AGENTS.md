@@ -168,10 +168,11 @@ key of a deleted surface is no longer in use. See _Surface Builder_ and
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 Verifiable Trust Agents are connections: they live on the Connections page's **Verifiable Trust
-Agent** tab, which opens with what connecting one gives, has **Add VTA** and no filter box, and
-opens a full-page wizard (`/connections/trust-agents/connect`), never a pop-up. There is no Trust
-Agent page and no signing tier banner. The tab says which DID new contexts sign as (`[vta] context_did_method`: `did:key`, or a
-`did:webvh` whose key the trust agent's operator can rotate without changing it). The tab's Control key card, shown while `GET /v1/vta/status`
+Agent** tab, laid out like Registries: no text above its card, **Add VTA** in the card header as
+its only call to action (no Refresh, nothing in the tab banner, none in the empty state, which says
+"Add your first Verifiable Trust Agent" with View Docs), no filter box, and a full-page wizard
+(`/connections/trust-agents/connect`), never a pop-up. There is no Trust Agent page and no signing
+tier banner. The tab's Control key card, shown while `GET /v1/vta/status`
 reports a `control_key`, shows the key the gateway signs in to its trust agent with, when it was
 last rotated and when it is next due, and a Rotate control key button for key management editors.
 A connection added by hand with a `did:webvh` identity has a Rotate control key action on its

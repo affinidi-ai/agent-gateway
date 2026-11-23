@@ -31,9 +31,9 @@ changes:
     - timestamp: '2026-11-16T12:05:00Z'
       title: Add Verifiable Trust Agents on Connections with a full-page connect wizard
       description: >-
-        Connections has a Verifiable Trust Agent tab that says what connecting
-        one gives and lists the connections, with Add VTA opening a full-page
-        wizard that creates the connection, prints the grant to run on the
+        Connections has a Verifiable Trust Agent tab laid out like Registries:
+        it lists the connections, and Add VTA in its card header, its only call
+        to action, opens a full-page wizard that creates the connection, prints the grant to run on the
         trust agent (the initiator role in one context with context-create,
         key-mint, sign-jws and sign-document, never admin), verifies it and
         provisions a signing key. Each connection authenticates with its own
@@ -82,8 +82,8 @@ changes:
         Fabric peers and verifiers keep working; the gateway re-reads the log
         when it grows and republishes it. Existing contexts and agents keep
         their DID. The gateway works with trust agent releases that serve either
-        the newer or the older context tasks. The Verifiable Trust Agent tab,
-        GET /v1/vta/status and the key inventory say which method is in use.
+        the newer or the older context tasks. GET /v1/vta/status and the key
+        inventory say which method is in use.
     - timestamp: '2026-11-10T10:00:00Z'
       title: Rotate the gateway's trust agent control key on demand or on a schedule
       description: >-
