@@ -24718,8 +24718,8 @@ mod fabric_send_tests {
                 start_time: std::time::Instant::now(),
                 connection_guard: super::ConnectionGuard::new(None, None),
                 body_bytes: axum::body::Bytes::from(body.to_string()),
-                trace_id: "trace-1".to_string(),
-                egress_trace_id: "trace-1".to_string(),
+                trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
+                egress_trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
                 ucp_operation: None,
                 authenticated_identity: Some(caller),
                 source_auth_context: None,
@@ -24903,7 +24903,7 @@ mod fabric_send_tests {
 
     #[tokio::test]
     async fn an_access_points_fabric_send_carries_its_trace_id() {
-        let own = "0af76519-16cd-43dd-8448-eb211c80319c";
+        let own = "0af7651916cd43dd8448eb211c80319c";
         let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
 
         let (sent, terminated) = fabric_send_trace_ids(&peer, own).await;
@@ -24975,8 +24975,8 @@ mod fabric_send_tests {
                 body_bytes: axum::body::Bytes::from(
                     json!({"jsonrpc": "2.0", "id": "m-1", "method": "message/send"}).to_string(),
                 ),
-                trace_id: "trace-1".to_string(),
-                egress_trace_id: "trace-1".to_string(),
+                trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
+                egress_trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
                 ucp_operation: None,
                 authenticated_identity: None,
                 source_auth_context: None,
@@ -25050,8 +25050,8 @@ mod fabric_send_tests {
                 start_time: std::time::Instant::now(),
                 connection_guard: super::ConnectionGuard::new(None, None),
                 body_bytes: axum::body::Bytes::from(body.to_string()),
-                trace_id: "trace-1".to_string(),
-                egress_trace_id: "trace-1".to_string(),
+                trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
+                egress_trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
                 ucp_operation: None,
                 authenticated_identity: None,
                 source_auth_context: None,
@@ -25161,8 +25161,8 @@ mod fabric_send_tests {
                 start_time: std::time::Instant::now(),
                 connection_guard: super::ConnectionGuard::new(None, None),
                 body_bytes: axum::body::Bytes::from(body.to_string()),
-                trace_id: "trace-1".to_string(),
-                egress_trace_id: "trace-1".to_string(),
+                trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
+                egress_trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
                 ucp_operation: None,
                 authenticated_identity: None,
                 source_auth_context: None,
@@ -26013,8 +26013,8 @@ mod fabric_send_tests {
                 start_time: std::time::Instant::now(),
                 connection_guard: super::ConnectionGuard::new(None, None),
                 body_bytes: axum::body::Bytes::from(body.to_string()),
-                trace_id: "trace-1".to_string(),
-                egress_trace_id: "trace-1".to_string(),
+                trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
+                egress_trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
                 ucp_operation: None,
                 authenticated_identity: None,
                 source_auth_context: None,
@@ -26192,8 +26192,8 @@ mod fabric_send_tests {
                     start_time: std::time::Instant::now(),
                     connection_guard: super::ConnectionGuard::new(None, None),
                     body_bytes: axum::body::Bytes::from(body.to_string()),
-                    trace_id: "trace-1".to_string(),
-                    egress_trace_id: "trace-1".to_string(),
+                    trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
+                    egress_trace_id: "0af7651916cd43dd8448eb211c80319c".to_string(),
                     ucp_operation: None,
                     authenticated_identity: (!case.key_failed).then(|| key.clone()),
                     source_auth_context: Some(if case.key_failed {

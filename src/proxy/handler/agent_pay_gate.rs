@@ -3822,7 +3822,7 @@ pub(crate) mod tests {
             surface,
             caller: Caller::default(),
             trace_id: "ingress-trace",
-            egress_trace_id: "0af76519-16cd-43dd-8448-eb211c80319c",
+            egress_trace_id: "0af7651916cd43dd8448eb211c80319c",
             deadline_ms: None,
             evidence: None,
             fabric,
@@ -5849,7 +5849,7 @@ pub(crate) mod tests {
                 .headers
                 .contains_key("cookie")
         );
-        assert_eq!(sent.trace_id, "0af76519-16cd-43dd-8448-eb211c80319c");
+        assert_eq!(sent.trace_id, "0af7651916cd43dd8448eb211c80319c");
         assert_eq!(sent.payment_context["correlation"]["idempotency_key"], Value::String(paid.key.clone().unwrap()));
         assert_eq!(sent.payment_context["correlation"]["trace_context"], sent.headers["traceparent"]);
         assert_eq!(sent.payment_context["intent"]["resource_id"], "paid_tool");
@@ -5906,8 +5906,8 @@ pub(crate) mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].1.as_deref(), Some("ingress-trace"), "the audit trail follows this request's own trace");
         let sent = gate.last();
-        assert_eq!(sent.trace_id, "0af76519-16cd-43dd-8448-eb211c80319c");
-        assert_eq!(sent.payment_context["correlation"]["thid"], "0af76519-16cd-43dd-8448-eb211c80319c");
+        assert_eq!(sent.trace_id, "0af7651916cd43dd8448eb211c80319c");
+        assert_eq!(sent.payment_context["correlation"]["thid"], "0af7651916cd43dd8448eb211c80319c");
         assert!(sent.headers["traceparent"].contains("0af7651916cd43dd8448eb211c80319c"));
         assert!(
             !sent
