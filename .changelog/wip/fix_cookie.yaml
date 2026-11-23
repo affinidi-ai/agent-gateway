@@ -1,0 +1,17 @@
+branch: fix/cookie
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-23T11:00:00Z'
+      title: Upgrade the cookie crate to 0.18.3 for RUSTSEC-2026-0594
+      description: >-
+        cookie 0.18.1 could repeat the AES-GCM nonce for the first private cookies written in a
+        process that forks without exec, and a repeated nonce lets an attacker recover the
+        plaintext and forge those cookies. The lockfile now pins cookie 0.18.3, the patched
+        release, so cargo audit passes again. The gateway never built a private cookie: its
+        session cookie is a plain __Host-session_token header, so no deployment was exposed and
+        no session needs re-issuing.
+  breaking: []
