@@ -11,7 +11,7 @@ pub async fn build_dynamodb_client(
     region: Option<&str>,
     profile: Option<&str>,
 ) -> Result<DynamoDbClient> {
-    let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+    let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::v2026_11_17())
         .sleep_impl(std::sync::Arc::new(aws_smithy_async::rt::sleep::TokioSleep::new()));
 
     if let Some(profile_name) = profile {
