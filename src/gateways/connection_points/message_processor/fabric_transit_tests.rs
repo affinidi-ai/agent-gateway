@@ -785,6 +785,343 @@ async fn a_modern_mcp_stream_continues_the_trace_the_peer_named() {
     assert_eq!(header_values(&received[0], "x-gateway-trace-id"), [PEER_TRACE_ID]);
 }
 
+const REFUSED_KEY: &str = "a-key-the-surface-refuses";
+
+/// A public surface on `target` with a Transit Point: a request whose key it
+/// refuses is recorded and still reaches the agent with a transit token.
+fn recording_surface(
+    protocol: &str,
+    target: &str,
+) -> AgentSurface {
+    let mut public = surface(protocol, target, &["crm"]);
+    public.access_point.public = Some(true);
+    public
+}
+
+/// A forward-request with a key the surface refuses, naming `trace_id`, or no
+/// trace id at all.
+fn naming_trace(
+    root: &std::path::Path,
+    trace_id: Option<&str>,
+) -> ReceivedMessage {
+    let mut message = forward_request(
+        root,
+        json!({ "content-type": "application/json", "x-api-key": REFUSED_KEY }),
+        a2a_body(),
+    );
+    match trace_id {
+        Some(trace_id) => message.message_body["trace_id"] = json!(trace_id),
+        None => {
+            message
+                .message_body
+                .as_object_mut()
+                .unwrap()
+                .remove("trace_id");
+        }
+    }
+    message
+}
+
+/// The trace ids one receive carried: on each record it wrote, in the agent's
+/// transit token and in the agent's `X-Gateway-Trace-Id`, and the text of
+/// those records and of the request the agent received.
+struct ReceivedTrace {
+    records: Vec<Option<String>>,
+    token: Option<String>,
+    header: Vec<String>,
+    written: String,
+}
+
+impl ReceivedTrace {
+    fn of(
+        events: &[crate::delegation_vault::audit::DelegationAuditEvent],
+        received: &axum::http::HeaderMap,
+    ) -> Self {
+        let claims = test_issuer()
+            .validate(header_values(received, "x-transit-token")[0], 300)
+            .unwrap();
+        Self {
+            records: events
+                .iter()
+                .map(|event| event.trace_id.clone())
+                .collect(),
+            token: claims.trace_id,
+            header: header_values(received, "x-gateway-trace-id")
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            written: format!("{events:?}\n{received:?}"),
+        }
+    }
+
+    /// Asserts that every record, the transit token and the header carry
+    /// `expected`.
+    fn assert_carried(
+        &self,
+        expected: &str,
+        case: &str,
+    ) {
+        assert!(!self.records.is_empty(), "{case}: the receive wrote no record");
+        for record in &self.records {
+            assert_eq!(record.as_deref(), Some(expected), "{case}: a record");
+        }
+        assert_eq!(self.token.as_deref(), Some(expected), "{case}: the transit token");
+        assert_eq!(self.header, [expected], "{case}: X-Gateway-Trace-Id");
+    }
+
+    /// Asserts that the receive started its own trace: one new trace id in the
+    /// written form on every record, in the transit token and in the header,
+    /// and no text of `sent` anywhere.
+    fn assert_fresh(
+        &self,
+        sent: Option<&str>,
+        case: &str,
+    ) {
+        let fresh = self
+            .records
+            .first()
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| panic!("{case}: a record without a trace id: {:?}", self.records));
+        assert!(
+            crate::proxy::trace::TraceId::from_written(&fresh).is_ok(),
+            "{case}: {fresh} is not a trace id in the written form"
+        );
+        self.assert_carried(&fresh, case);
+        if let Some(sent) = sent {
+            assert!(!self.written.contains(sent), "{case}: {}", self.written);
+        }
+    }
+}
+
+/// The trace one buffered receive of `message` carried.
+async fn buffered_trace(
+    target: &RecordingTarget,
+    message: &ReceivedMessage,
+) -> ReceivedTrace {
+    let (response, events) = crate::audit::producer::capture(forward_response(message)).await;
+    assert_eq!(response["status"], 200, "{response}");
+    let received = target
+        .received()
+        .pop()
+        .expect("the request reached the agent");
+    ReceivedTrace::of(&events, &received)
+}
+
+/// A Fabric receive continues a trace id the peer names in the hyphenated
+/// form in its written form: 32 lowercase hexadecimal digits.
+#[tokio::test]
+async fn a_fabric_receive_continues_a_hyphenated_trace_id_in_its_written_form() {
+    if ran_in_child("ATG_FABRIC_HYPHENATED_TRACE_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &recording_surface("a2a", &target.url)).await;
+
+    let sent = "4bf92f35-77b3-4da6-a3ce-929d0e0e4736";
+    buffered_trace(&target, &naming_trace(root.path(), Some(sent)))
+        .await
+        .assert_carried(PEER_TRACE_ID, sent);
+}
+
+/// A Fabric receive continues a trace id the peer names in upper case, in
+/// either accepted form, lower-cased.
+#[tokio::test]
+async fn a_fabric_receive_continues_an_upper_case_trace_id_lower_cased() {
+    if ran_in_child("ATG_FABRIC_UPPER_CASE_TRACE_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &recording_surface("a2a", &target.url)).await;
+
+    for sent in ["4BF92F3577B34DA6A3CE929D0E0E4736", "4BF92F35-77B3-4DA6-A3CE-929D0E0E4736"] {
+        buffered_trace(&target, &naming_trace(root.path(), Some(sent)))
+            .await
+            .assert_carried(PEER_TRACE_ID, sent);
+    }
+}
+
+/// A trace id the peer names that is not valid, including one of all zeros,
+/// is treated as absent: the receive starts its own trace, and the text the
+/// peer sent reaches no record and not the agent.
+#[tokio::test]
+async fn a_fabric_receive_starts_its_own_trace_for_a_trace_id_that_is_not_valid() {
+    if ran_in_child("ATG_FABRIC_INVALID_TRACE_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &recording_surface("a2a", &target.url)).await;
+
+    for sent in ["trace-from-the-peer", "00000000000000000000000000000000", "00000000-0000-0000-0000-000000000000"] {
+        buffered_trace(&target, &naming_trace(root.path(), Some(sent)))
+            .await
+            .assert_fresh(Some(sent), sent);
+    }
+}
+
+/// A Fabric message that names no trace id starts a trace of the receive's
+/// own.
+#[tokio::test]
+async fn a_fabric_receive_starts_its_own_trace_when_the_peer_names_none() {
+    if ran_in_child("ATG_FABRIC_MISSING_TRACE_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &recording_surface("a2a", &target.url)).await;
+
+    buffered_trace(&target, &naming_trace(root.path(), None))
+        .await
+        .assert_fresh(None, "no trace id named");
+}
+
+/// A Fabric receive's records carry the trace id the message names, never the
+/// trace of the span the sending gateway exports, which the message carries
+/// beside it.
+#[tokio::test]
+async fn a_fabric_receive_records_the_trace_the_message_names_not_the_senders_exported_span() {
+    if ran_in_child("ATG_FABRIC_EXPORTED_SPAN_TRACE_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &recording_surface("a2a", &target.url)).await;
+
+    let mut message = naming_trace(root.path(), Some(PEER_TRACE_ID));
+    message.message_body["otel_context"] =
+        json!({ "trace_id": "0af7651916cd43dd8448eb211c80319c", "span_id": "b7ad6b7169203331", "trace_flags": 1 });
+    buffered_trace(&target, &message)
+        .await
+        .assert_carried(PEER_TRACE_ID, "an exported span named beside the trace id");
+}
+
+/// A receive on a surface that terminates traces keeps the peer's trace on its
+/// own records and sends its agent a fresh trace id in the written form.
+#[tokio::test]
+async fn a_terminating_fabric_receive_sends_a_fresh_written_form_trace_onward() {
+    if ran_in_child("ATG_FABRIC_TERMINATED_TRACE_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let mut terminating = recording_surface("a2a", &target.url);
+    terminating
+        .access_point
+        .terminate_trace_id = true;
+    let _receiver = receiver(root.path(), &terminating).await;
+
+    let trace = buffered_trace(&target, &naming_trace(root.path(), Some(PEER_TRACE_ID))).await;
+    assert!(!trace.records.is_empty(), "the receive wrote no record");
+    for record in &trace.records {
+        assert_eq!(record.as_deref(), Some(PEER_TRACE_ID), "its own records keep the trace it continued");
+    }
+    let onward = trace
+        .token
+        .clone()
+        .expect("the transit token carries the onward trace");
+    assert!(
+        crate::proxy::trace::TraceId::from_written(&onward).is_ok(),
+        "{onward} is not a trace id in the written form"
+    );
+    assert_ne!(onward, PEER_TRACE_ID);
+    assert_eq!(trace.header, [onward]);
+}
+
+/// A framed stream's Open names its trace as a hyphenated UUID, and the
+/// receive continues it in the written form on its records, in the agent's
+/// transit token and in `X-Gateway-Trace-Id`.
+#[tokio::test]
+async fn a_modern_mcp_stream_continues_its_hyphenated_trace_in_the_written_form() {
+    if ran_in_child("ATG_FABRIC_STREAM_WRITTEN_TRACE_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let surface = recording_surface("mcp", &target.url);
+    let _receiver = receiver(root.path(), &surface).await;
+
+    let headers = json!({ "content-type": "application/json", "accept": "application/json, text/event-stream",
+        "mcp-protocol-version": crate::mcp::MCP_MODERN_VERSION, "mcp-method": "tools/list", "x-api-key": REFUSED_KEY });
+    let body = json!({ "jsonrpc": "2.0", "id": "stream", "method": "tools/list", "params": { "_meta": {
+        "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
+        "io.modelcontextprotocol/clientCapabilities": {}
+    } } });
+    let mut message = forward_request(root.path(), headers.clone(), Value::Null);
+    message.message_body["trace_id"] = json!(uuid::Uuid::parse_str(PEER_TRACE_ID).unwrap());
+    assert_eq!(message.message_body["trace_id"], "4bf92f35-77b3-4da6-a3ce-929d0e0e4736", "as the stream's Open names it");
+    let (result, events) = crate::audit::producer::capture(tokio::time::timeout(
+        Duration::from_secs(10),
+        Box::pin(super::process_stream_forward_request(
+            &message,
+            super::FabricStreamRequest {
+                headers: crate::proxy::fabric_stream::wire::headers_from_json(Some(&headers)).unwrap(),
+                body: serde_json::to_vec(&body)
+                    .unwrap()
+                    .into(),
+                surface,
+                variant: crate::config::agent_surface_variants::ForwardedVariant {
+                    id: None,
+                    recorded: "_base_".into(),
+                },
+                capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities::local(true, true),
+                scope: crate::observability::policy_audit::RequestScope::fresh(),
+            },
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            None,
+        )),
+    ))
+    .await;
+    let result = result.expect("Fabric stream receive timed out");
+    let received = target.received();
+    assert_eq!(received.len(), 1, "the request reaches the agent: {result:?}");
+    ReceivedTrace::of(&events, &received[0]).assert_carried(PEER_TRACE_ID, "a framed stream");
+}
+
+/// A framed stream refused because the variant its Open names can't be
+/// served records its trace in the written form, not as the hyphenated UUID
+/// the Open carries.
+#[tokio::test]
+async fn a_framed_stream_refused_for_its_variant_records_its_trace_in_the_written_form() {
+    if ran_in_child("ATG_FABRIC_STREAM_VARIANT_TRACE_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &surface("mcp", &target.url, &[])).await;
+    let open = crate::proxy::fabric_stream::wire::OpenRequest {
+        capability_nonce: uuid::Uuid::new_v4(),
+        channel_id: SURFACE_ID.to_string(),
+        variant_alias: Some("missing".to_string()),
+        path: "/mcp".to_string(),
+        headers: Default::default(),
+        body_bytes: 0,
+        response_window_bytes: 65_536,
+        deadline_ms: 1,
+        trace_id: uuid::Uuid::parse_str(PEER_TRACE_ID).unwrap(),
+    };
+
+    let (result, events) = crate::audit::producer::capture(super::resolve_stream_surface(
+        &forward_request(root.path(), json!({}), Value::Null),
+        &open,
+        None,
+    ))
+    .await;
+    assert_eq!(
+        result
+            .err()
+            .as_deref(),
+        Some("Fabric stream variant is unavailable")
+    );
+    let recorded: Vec<_> = events
+        .iter()
+        .map(|event| event.trace_id.clone())
+        .collect();
+    assert_eq!(recorded, [Some(PEER_TRACE_ID.to_string())]);
+}
+
 fn caller(
     caller_identity: Option<&str>,
     verification: IdentityVerification,
