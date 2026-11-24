@@ -688,6 +688,8 @@ fn point_listener_shares_an_inbound_hostname(
 /// The listener is found by the port `address` resolves to, and the answer is
 /// about that listener, not that URL: a listener answers on every one of its
 /// `external_urls`, and the same hostname on another port is the same hostname.
+/// It is the listener the inbound `/outbound` proxy forwards to, not any
+/// listener carrying an inbound hostname, so the gate and that proxy agree.
 /// So an outbound `https://gateway.example.com:9443` beside an inbound
 /// `https://gateway.example.com` shares it, and so does an alias URL of a
 /// listener one of whose URLs an inbound listener answers on. The dashboard
@@ -703,23 +705,20 @@ pub(crate) fn outbound_address_shares_an_inbound_hostname(
     else {
         return shares_an_outbound_hostname(network_config);
     };
-    let listener_hostnames: std::collections::HashSet<String> = network_config
-        .listeners
-        .iter()
-        .filter(|listener| listener.listener_type == "outbound" && listener.port == port)
-        .flat_map(|listener| listener.external_urls.iter())
-        .filter_map(|url| extract_hostname(url))
-        .collect();
-    if listener_hostnames.is_empty() {
-        return shares_an_outbound_hostname(network_config);
-    }
+    // The listener this one is asked about has to be the listener an inbound
+    // one actually forwards to, which is the first match
+    // ([`find_shared_outbound_listener`], as `build_port_router` picks it).
+    // Sharing the hostname is not enough: where two outbound listeners carry
+    // the inbound hostname, only the first is reached through the inbound
+    // address, and a path on the second is as unreachable there as one on a
+    // listener with a hostname of its own.
     network_config
         .listeners
         .iter()
         .filter(|listener| listener.listener_type == "inbound")
-        .flat_map(|listener| listener.external_urls.iter())
-        .filter_map(|url| extract_hostname(url))
-        .any(|hostname| listener_hostnames.contains(&hostname))
+        .any(|inbound| {
+            find_shared_outbound_listener(network_config, inbound.port).is_some_and(|outbound| outbound.port == port)
+        })
 }
 
 /// What an operator is told on a save about each `listen_path` the gateway
@@ -3843,6 +3842,43 @@ mod tests {
         assert!(
             !outbound_address_shares_an_inbound_hostname(&own_hostname, Some("https://unknown.example.org")),
             "an address of no configured outbound listener falls back to the appliance-wide answer"
+        );
+    }
+
+    /// The inbound listener forwards `/outbound` to one outbound listener, the
+    /// first whose hostname it shares, so a second listener carrying that same
+    /// hostname is not reached through the inbound address at all. The gate has
+    /// to read it the way the proxy does, or it holds a path to the outbound
+    /// prefix on a listener nothing forwards to.
+    #[test]
+    fn only_the_outbound_listener_the_inbound_proxy_forwards_to_counts_as_shared() {
+        let config: crate::config::NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.example.com" },
+            "webauthn": { "rp_id": "test", "external_origin": "https://test.example.com" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [
+                { "id": "in", "name": "Inbound", "bind_address": "0.0.0.0", "port": 8080, "protocol": "http",
+                  "external_urls": ["https://gateway.example.com"], "listener_type": "inbound" },
+                { "id": "out-first", "name": "Outbound", "bind_address": "0.0.0.0", "port": 9000, "protocol": "http",
+                  "external_urls": ["https://gateway.example.com:9000"], "listener_type": "outbound" },
+                { "id": "out-second", "name": "Outbound 2", "bind_address": "0.0.0.0", "port": 9100,
+                  "protocol": "http", "external_urls": ["https://gateway.example.com:9100"],
+                  "listener_type": "outbound" }
+            ],
+            "channels": [{ "id": "example", "name": "Example", "prefix": "/example" }],
+            "routes": {}
+        }))
+        .expect("two outbound listeners on the inbound hostname");
+
+        assert_eq!(
+            find_shared_outbound_listener(&config, 8080).map(|listener| listener.port),
+            Some(9000),
+            "the proxy forwards to the first match"
+        );
+        assert!(outbound_address_shares_an_inbound_hostname(&config, Some("https://gateway.example.com:9000")));
+        assert!(
+            !outbound_address_shares_an_inbound_hostname(&config, Some("https://gateway.example.com:9100")),
+            "nothing forwards to the second listener, so its paths are not hidden by the inbound one"
         );
     }
 

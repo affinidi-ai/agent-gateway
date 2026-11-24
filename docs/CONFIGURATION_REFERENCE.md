@@ -137,9 +137,18 @@ disabled surface reserves no route, so saving one is never refused and, claiming
 disabled, enabling it introduces every path it names: a surface disabled with a refused path
 cannot be enabled until the path changes.
 
+A `listen_path` is also refused when it is the derived route another Transit Point answers on,
+`/outbound/<surface route>/<alias>`, on the same outbound listener, whether that point belongs to
+this surface or another. The two register the same route, and the listener build keeps whichever
+came first and skips the other with an error log, so one point's callers would reach the other's
+Target. A point whose `listen_path` is its own derived route is left alone, and, as with the other
+refusals, only a path a save introduces or changes is refused.
+
 `shared_hostname_outbound_addresses` of `GET /v1/config/surface-routing` names every outbound
-address whose listener shares a hostname with an inbound listener, which is where the fourth
-refusal applies. The gateway answers that question with the same function on both sides, so a
+address whose listener the inbound `/outbound` proxy forwards to, which is where the fourth
+refusal applies. An inbound listener forwards to the first outbound listener whose hostname it
+shares, so a second outbound listener carrying that same hostname is not reached through the
+inbound address at all and is treated as having a hostname of its own. The gateway answers that question with the same function on both sides, so a
 client offering the `/outbound` prefixes for exactly these addresses offers what a save accepts.
 The two address lists cannot be compared for it: a listener answers on every one of its
 `external_urls`, so an alias URL in no inbound list is still its listener's, and the same

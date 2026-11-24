@@ -97,6 +97,30 @@ changes:
         shared_hostname_outbound_addresses, the outbound addresses the gateway classifies as
         sharing, from the same function the save gate calls, and the dashboard offers the
         /outbound prefixes for exactly those.
+    - timestamp: '2026-11-24T09:30:00Z'
+      title: Refuse a listen_path that is another Transit Point's derived route
+      description: >-
+        A listen_path now sits in the same namespace as the routes the outbound listener derives,
+        /outbound/<surface route>/<alias>, so a point could claim the route another point answers
+        on, within the surface or across surfaces on the same listener. The save was stored, and
+        the listener build then registered whichever route came first and skipped the other with
+        an error log: one point's callers reached the other's Target, or the custom path never
+        answered, with nothing said at save time and the winner decided by registration order.
+        Such a save is now refused with 400, naming the Transit Point and the surface whose route
+        it claims. A point whose listen_path is its own derived route is unaffected, and, as with
+        the other listen_path refusals, only a path a save introduces or changes is refused, so a
+        surface already stored with such a clash stays editable.
+    - timestamp: '2026-11-24T09:35:00Z'
+      title: Read a shared outbound hostname as the inbound proxy does
+      description: >-
+        An inbound listener forwards /outbound to the first outbound listener whose hostname it
+        shares, so where two outbound listeners carry that hostname only the first is reached
+        through the inbound address. The listen_path gate called both shared and held a path on
+        the second to the outbound prefix, although the inbound listener never forwards to it and
+        hides nothing there. It now asks the same question the proxy answers, so a listener
+        nothing forwards to is treated as having a hostname of its own, and
+        shared_hostname_outbound_addresses, which the dashboard's prefix picker reads, lists only
+        the listeners that really are reached through an inbound address.
     - timestamp: '2026-11-20T18:10:00Z'
       title: Block a Surface Builder save of a Listen Path the gateway will not serve
       description: >-
