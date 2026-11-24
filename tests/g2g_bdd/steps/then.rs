@@ -681,7 +681,9 @@ async fn vp_audit_log_records_answer_identity_under_request_trace_id(
     );
 }
 
-#[then(expr = "the VP Audit Log of gateway {int} records its policy decision on the Fabric request under the trace id the request carried")]
+#[then(
+    expr = "the VP Audit Log of gateway {int} records its policy decision on the Fabric request under the trace id the request carried"
+)]
 async fn vp_audit_log_records_fabric_policy_decision_under_request_trace_id(
     world: &mut G2gWorld,
     gateway: usize,
