@@ -4257,7 +4257,7 @@ pub(crate) async fn resolve_stream_surface(
                 &crate::audit::request_events::RequestFacts {
                     surface_id: &surface.surface_id,
                     channel_name: &surface.name,
-                    trace_id: Some(&request.trace_id.to_string()),
+                    trace_id: Some(&fabric_receive_trace_id(Some(&request.trace_id.to_string()))),
                     via_fabric: true,
                 },
                 &error,
@@ -4289,14 +4289,30 @@ pub(crate) async fn process_stream_forward_request(
         .await
 }
 
-/// The trace the peer named in its forward-request or framed stream Open,
-/// empty when it named none.
+/// The trace a Fabric receive runs in, from the trace id the peer named in its
+/// forward-request or framed stream Open.
 fn peer_trace_id(message: &ReceivedMessage) -> String {
-    message
-        .message_body
-        .get("trace_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
+    fabric_receive_trace_id(
+        message
+            .message_body
+            .get("trace_id")
+            .and_then(Value::as_str),
+    )
+}
+
+/// The trace id `named` in its written form, or a new trace id when the peer
+/// named none or one that is not valid.
+fn fabric_receive_trace_id(named: Option<&str>) -> String {
+    let trace_id = match named.map(crate::proxy::trace::TraceId::parse) {
+        Some(Ok(trace_id)) => trace_id,
+        Some(Err(error)) => {
+            debug!("The peer named a trace id on a Fabric receive that is not used ({error}); starting a new trace");
+            crate::proxy::trace::TraceId::mint()
+        }
+        None => crate::proxy::trace::TraceId::mint(),
+    };
+    trace_id
+        .as_str()
         .to_string()
 }
 
@@ -4628,10 +4644,9 @@ async fn process_charged_forward_request(
     // authoritative observation point for "this gateway received a fabric forward request".
     crate::metrics::backends::prometheus::track_fabric_forward_received(channel_id);
 
-    let trace_id_field = message
-        .message_body
-        .get("trace_id")
-        .and_then(|v| v.as_str())
+    let request_trace_id = crate::observability::policy_audit::current_span_trace_id();
+    let trace_id_field = request_trace_id
+        .as_deref()
         .unwrap_or("");
 
     // Extract and parse OpenTelemetry parent context from GW1 BEFORE creating the span
@@ -4772,12 +4787,7 @@ async fn process_charged_forward_request(
         .get("headers")
         .and_then(|v| v.as_object())
         .cloned();
-    let audit_trace_id = message
-        .message_body
-        .get("otel_context")
-        .and_then(|ctx| ctx.get("trace_id"))
-        .and_then(|value| value.as_str())
-        .or_else(|| (!trace_id_field.is_empty()).then_some(trace_id_field));
+    let audit_trace_id = (!trace_id_field.is_empty()).then_some(trace_id_field);
 
     // The hop count and any transit token the peer sent never reach the agent;
     // this gateway issues the agent's token itself.
@@ -6489,7 +6499,11 @@ async fn process_charged_forward_request(
     let onward_trace_id = if credentialed_card_fetch {
         None
     } else if surface.access_point.terminate_trace_id {
-        Some(uuid::Uuid::new_v4().to_string())
+        Some(
+            crate::proxy::trace::TraceId::mint()
+                .as_str()
+                .to_string(),
+        )
     } else {
         crate::observability::policy_audit::current_span_trace_id()
     };
