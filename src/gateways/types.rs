@@ -124,20 +124,28 @@ impl PeerIssuers {
                 .any(|trusted| trusted == issuer_did)
     }
 
-    /// Whether a presentation from `issuer_did` may arrive over this connection
-    /// addressed to another recipient, as one the peer relays: the issuer is one
-    /// an operator trusts for the connection, not the peer's own, and the
-    /// connection does not require addressed presentations.
-    pub fn admits_relayed_presentation(
+    /// Whether `issuer_did` is one the peer relays for: an issuer an operator
+    /// trusts for the connection that is not the peer's own attested issuer.
+    pub fn is_relay_issuer(
         &self,
         issuer_did: &str,
     ) -> bool {
-        !self.require_addressed_presentations
-            && self.attested.as_deref() != Some(issuer_did)
+        self.attested.as_deref() != Some(issuer_did)
             && self
                 .trusted
                 .iter()
                 .any(|trusted| trusted == issuer_did)
+    }
+
+    /// Whether a presentation from `issuer_did` may arrive over this connection
+    /// addressed to another recipient, as one the peer relays: the issuer is a
+    /// relay issuer (see [`Self::is_relay_issuer`]) and the connection does not
+    /// require addressed presentations.
+    pub fn admits_relayed_presentation(
+        &self,
+        issuer_did: &str,
+    ) -> bool {
+        !self.require_addressed_presentations && self.is_relay_issuer(issuer_did)
     }
 }
 
@@ -589,6 +597,22 @@ mod tests {
 
         issuers.require_addressed_presentations = true;
         assert!(!issuers.admits_relayed_presentation("did:web:relay.example"));
+    }
+
+    #[test]
+    fn a_relay_issuer_is_trusted_and_not_the_peers_own() {
+        let issuers = PeerIssuers {
+            attested: Some("did:web:peer.example".to_string()),
+            trusted: vec!["did:web:relay.example".to_string(), "did:web:peer.example".to_string()],
+            require_addressed_presentations: true,
+        };
+
+        assert!(issuers.is_relay_issuer("did:web:relay.example"));
+        assert!(!issuers.is_relay_issuer("did:web:peer.example"));
+        assert!(!issuers.is_relay_issuer("did:web:other.example"));
+
+        let unattested = PeerIssuers { attested: None, ..issuers };
+        assert!(unattested.is_relay_issuer("did:web:peer.example"));
     }
 
     #[test]

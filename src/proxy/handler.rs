@@ -7432,29 +7432,32 @@ async fn proxy_charged_request(
             delegation_actions_for_vp.clone(),
             authenticated_identity.as_ref(),
         );
-        let target_domain = crate::identity::vc_issuer::vp_domain_for_endpoint(&state.surface.target.endpoint);
+        // Decided before minting: a presentation that is not injected is only
+        // the audit copy, so it is bound to `AUDIT_ONLY_VP_DOMAIN`, which no
+        // verifier accepts, rather than to the Target.
+        let inject_vp = (state
+            .surface
+            .inject_identity_vp()
+            || state
+                .surface
+                .target_workload_binding()
+                .is_some())
+            && method == "POST"
+            && !body_bytes.is_empty();
+        let vp_domain = crate::identity::vc_issuer::request_vp_domain(inject_vp, &state.surface.target.endpoint);
         match vc_issuer
             .create_agent_identity_presentation_with_binding(
                 &result.did,
                 &result.identity_fields,
                 wb,
                 None,
-                target_domain.as_deref(),
+                vp_domain.as_deref(),
             )
             .await
         {
             Ok(final_vp_jwt) => {
                 // 1. inject into outbound body (replaces the slot if any existed)
-                if (state
-                    .surface
-                    .inject_identity_vp()
-                    || state
-                        .surface
-                        .target_workload_binding()
-                        .is_some())
-                    && method == "POST"
-                    && !body_bytes.is_empty()
-                {
+                if inject_vp {
                     let inbound_meta_field_to_strip: Option<String> = state
                         .surface
                         .inbound_identity()

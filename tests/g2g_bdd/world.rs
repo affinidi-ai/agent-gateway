@@ -47,9 +47,10 @@ pub struct FabricLink {
 
 /// A Transit Point of `from_gw`'s `from_surface` and what it reaches: over
 /// Fabric, `to_gw`'s `to_surface`; directly, the managed agent behind
-/// `to_surface` on the same gateway (`to_gw == from_gw`).
+/// `to_surface` on the same gateway. `to_gw == from_gw` means a direct,
+/// same-gateway link.
 #[derive(Debug, Clone)]
-pub struct TransitPointFabricLink {
+pub struct TransitPointLink {
     pub from_gw: usize,
     pub from_surface: String,
     pub transit_point: String,
@@ -71,9 +72,9 @@ pub struct TopologyBuilder {
     pub gateway_count: usize,
     pub plans: HashMap<usize, GatewayPlan>,
     pub fabric_links: Vec<FabricLink>,
-    pub transit_point_fabric_links: Vec<TransitPointFabricLink>,
+    pub transit_point_fabric_links: Vec<TransitPointLink>,
     /// Transit Points that reach a managed agent of their own gateway directly.
-    pub transit_point_direct_links: Vec<TransitPointFabricLink>,
+    pub transit_point_direct_links: Vec<TransitPointLink>,
     pub gateway_policies: HashMap<usize, String>,
     /// gw_index -> the own mediator alias declared by `gateway N uses
     /// mediator "M"`. Gateways with no entry share one default mediator;
@@ -99,6 +100,11 @@ pub struct TopologyBuilder {
     pub fabric_delegated_credentials: Vec<(usize, String)>,
     /// Transit Points given a target-leg Trust Check once the fabric routes are ready.
     pub transit_point_trust_checks: Vec<String>,
+    /// `(gw_index, issuer_did, connection_gw)`: `gw_index` trusts `issuer_did`
+    /// on its connection with `connection_gw`. Applied after federation and
+    /// before the fabric route probes, whose answers may carry a presentation
+    /// from that issuer.
+    pub connection_trusted_issuers: Vec<(usize, String, usize)>,
 }
 
 impl TopologyBuilder {
@@ -506,6 +512,13 @@ impl G2gWorld {
             .await
             .expect("federate declared gateway pairs");
 
+        for (gw_index, issuer_did, connection_gw) in &self
+            .topology
+            .connection_trusted_issuers
+        {
+            trust_issuer_on_connection(&harness, *gw_index, issuer_did, *connection_gw).await;
+        }
+
         for (gw_index, surface_id, origin_gw) in &self
             .topology
             .mcp_origin_grants
@@ -737,7 +750,7 @@ impl G2gWorld {
     }
 
     /// Every Transit Point link, over Fabric or direct.
-    fn transit_point_links(&self) -> impl Iterator<Item = &TransitPointFabricLink> {
+    fn transit_point_links(&self) -> impl Iterator<Item = &TransitPointLink> {
         self.topology
             .transit_point_fabric_links
             .iter()
@@ -752,7 +765,7 @@ impl G2gWorld {
     pub fn transit_point_link(
         &self,
         transit_point: &str,
-    ) -> &TransitPointFabricLink {
+    ) -> &TransitPointLink {
         self.transit_point_links()
             .find(|link| link.transit_point == transit_point)
             .unwrap_or_else(|| panic!("Transit Point '{transit_point}' is not configured"))
@@ -762,7 +775,7 @@ impl G2gWorld {
     pub fn transit_point_of_managed_agent(
         &self,
         agent_name: &str,
-    ) -> &TransitPointFabricLink {
+    ) -> &TransitPointLink {
         let (gw_index, surface_id) = self.target(agent_name);
         self.transit_point_links()
             .find(|link| link.from_gw == gw_index && link.from_surface == surface_id)
@@ -925,13 +938,43 @@ fn agent_of_surface<'a>(
         .as_str()
 }
 
+/// Adds `issuer_did` to the issuers `gw_index` trusts on its connection with
+/// `connection_gw`.
+pub async fn trust_issuer_on_connection(
+    harness: &MultiGatewayHarness,
+    gw_index: usize,
+    issuer_did: &str,
+    connection_gw: usize,
+) {
+    let remote_id = harness
+        .remote_id(gw_index, connection_gw)
+        .unwrap_or_else(|| panic!("gateway {gw_index} holds no Remote record for gateway {connection_gw}"))
+        .to_string();
+    let updated = harness
+        .gw(gw_index)
+        .admin
+        .add_trusted_issuer_did(&remote_id, issuer_did)
+        .await
+        .unwrap_or_else(|error| {
+            panic!("trust {issuer_did} on gateway {gw_index}'s connection with gateway {connection_gw}: {error:#}")
+        });
+    assert!(
+        updated
+            .trusted_issuer_dids
+            .iter()
+            .any(|trusted| trusted == issuer_did),
+        "gateway {gw_index}'s record for gateway {connection_gw} should list {issuer_did} as a trusted issuer, got {:?}",
+        updated.trusted_issuer_dids
+    );
+}
+
 /// Gives a Transit Point a target-leg Trust Check naming a trust registry stored
 /// through the admin API. The registry never connects, so only the stages before
 /// its query run. The partner's managed agent then forgets the requests it has
 /// served, so a later agent card fetch is the Trust Check's own.
 async fn add_target_trust_check(
     harness: &MultiGatewayHarness,
-    link: &TransitPointFabricLink,
+    link: &TransitPointLink,
     transit_point: &str,
 ) {
     let admin = &harness.gw(link.from_gw).admin;

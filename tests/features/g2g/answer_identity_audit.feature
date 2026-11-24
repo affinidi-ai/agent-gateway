@@ -30,6 +30,20 @@ Feature: The identity on a Fabric answer is audited by the calling gateway
     Then the response status is 200
     And the VP Audit Log of gateway 1 records the identity presentation received on the answer addressed to gateway 1
 
+  Scenario: An answer whose identity presentation is addressed to another Connection Point is refused
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And managed agent "bravo" response contains an identity presentation addressed to another Connection Point
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And gateway 1 surface "charlie" has managed identity enabled
+    And gateway 1 trusts the issuer of the identity presentation of managed agent "bravo" on its connection with gateway 2
+    And gateway 1 requires presentations addressed to it on its connection with gateway 2
+    And the VP Audit Log of gateway 1 keeps every audit event
+    When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
+    Then the response status is 502
+    And the response does not say "agent output"
+    And the VP Audit Log of gateway 1 records a failed identity binding because "its identity presentation is addressed to another Connection Point"
+
   Scenario: A legacy pairing obtains the answering gateway's issuer DID on the first answer
     Given a fabric with 2 gateways
     And gateway 1 has an A2A surface "alpha" targeting managed agent "bravo"

@@ -111,7 +111,6 @@ pub async fn check_answer_identity(
         ResponseConnection {
             listener_manager: check.listener_manager,
             gateway_id: check.gateway_id,
-            vc_issuer: check.vc_issuer,
             recipient_did: check.recipient_did,
         },
         check.surface,
@@ -390,7 +389,6 @@ async fn record_response_presentation(
     let ResponseConnection {
         listener_manager,
         gateway_id,
-        vc_issuer,
         recipient_did,
     } = connection;
     let (peer_issuers, unresolved) = match listener_manager {
@@ -415,21 +413,17 @@ async fn record_response_presentation(
         ),
     };
     let mut attribution = attribute_response_presentation(presentation, &peer_issuers, facts.channel_name);
-    if attribution == ResponseAttribution::Verified {
-        let addressed = match vc_issuer {
-            Some(vc_issuer) => vc_issuer.check_presentation_audience(
-                &presentation.domains,
-                Some(&presentation.issuer_did),
-                recipient_did,
-                Some(&peer_issuers),
-            ),
-            None => Err(anyhow::anyhow!("no VC issuer to check the presentation's audience")),
-        };
-        if let Err(error) = addressed {
-            warn!(channel = facts.channel_name, error = %error, "✗ Fabric: response VP is addressed to another recipient");
-            attribution =
-                ResponseAttribution::Unaddressed(format!("VP verification failed for server agent identity: {error}"));
-        }
+    if attribution == ResponseAttribution::Verified
+        && let Err(error) = crate::identity::vc_issuer::check_presentation_audience(
+            &presentation.domains,
+            Some(&presentation.issuer_did),
+            recipient_did,
+            Some(&peer_issuers),
+        )
+    {
+        warn!(channel = facts.channel_name, error = %error, "✗ Fabric: response VP is addressed to another recipient");
+        attribution =
+            ResponseAttribution::Unaddressed(format!("VP verification failed for server agent identity: {error}"));
     }
 
     match &attribution {
@@ -474,7 +468,6 @@ async fn record_response_presentation(
 struct ResponseConnection<'a> {
     listener_manager: Option<Arc<crate::gateways::ConnectionPointListenerManager>>,
     gateway_id: &'a str,
-    vc_issuer: Option<&'a Arc<crate::identity::VCIssuer>>,
     recipient_did: Option<&'a str>,
 }
 
@@ -699,7 +692,7 @@ mod tests {
 
         let (attribution, events) = crate::audit::producer::capture(record_response_presentation(
             &presentation,
-            connection(Some(manager), &gateway_id, selector, None),
+            connection(Some(manager), &gateway_id, None),
             &surface(),
             &facts(),
             Some(caller()),
@@ -755,7 +748,7 @@ mod tests {
 
         let (attribution, events) = crate::audit::producer::capture(record_response_presentation(
             &presentation,
-            connection(Some(manager), &gateway_id, selector, None),
+            connection(Some(manager), &gateway_id, None),
             &surface(),
             &facts(),
             Some(caller()),
@@ -789,7 +782,7 @@ mod tests {
 
         let (attribution, _events) = crate::audit::producer::capture(record_response_presentation(
             &presentation,
-            connection(None, "gw-b", selector, None),
+            connection(None, "gw-b", None),
             &surface(),
             &facts(),
             None,
@@ -802,13 +795,11 @@ mod tests {
     fn connection<'a>(
         listener_manager: Option<Arc<crate::gateways::ConnectionPointListenerManager>>,
         gateway_id: &'a str,
-        vc_issuer: Option<&'a Arc<crate::identity::VCIssuer>>,
         recipient_did: Option<&'a str>,
     ) -> ResponseConnection<'a> {
         ResponseConnection {
             listener_manager,
             gateway_id,
-            vc_issuer,
             recipient_did,
         }
     }
@@ -823,7 +814,7 @@ mod tests {
 
         let (attribution, _events) = crate::audit::producer::capture(record_response_presentation(
             &presentation,
-            connection(Some(manager), &gateway_id, selector, Some("did:example:local-cp")),
+            connection(Some(manager), &gateway_id, Some("did:example:local-cp")),
             &surface(),
             &facts(),
             None,
@@ -844,7 +835,7 @@ mod tests {
 
         let (attribution, events) = crate::audit::producer::capture(record_response_presentation(
             &presentation,
-            connection(Some(manager), &gateway_id, selector, Some("did:example:local-cp")),
+            connection(Some(manager), &gateway_id, Some("did:example:local-cp")),
             &surface(),
             &facts(),
             None,
@@ -1081,7 +1072,7 @@ mod tests {
 
         let (attribution, events) = crate::audit::producer::capture(record_response_presentation(
             &presentation,
-            connection(Some(manager), "unknown-gateway", selector, None),
+            connection(Some(manager), "unknown-gateway", None),
             &surface(),
             &facts(),
             None,

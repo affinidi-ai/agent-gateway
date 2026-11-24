@@ -1550,14 +1550,15 @@ on a direct request to an inbound `from_api_key` surface, where the key's DID re
 ### Who an identity presentation is for
 
 An identity presentation the gateway signs for a known recipient names it in the proof's
-`domain`, so a copy taken from a peer or the audit log cannot be presented to another gateway:
+`domain`, so a copy taken from a peer or the audit log cannot be presented over Fabric to another
+gateway:
 
 | Presentation | `domain` |
 | ------------ | -------- |
 | Sent over Fabric to a paired gateway, by an Access Point or a `fabric://` Transit Point | The peer's DID, as its Remote gateway record holds it |
 | On an answer sent back over Fabric | The calling gateway's Connection Point DID the request came from |
 | Sent to an `http` or `https` Target, by an Access Point or a Transit Point | The Target's origin (`scheme://host[:port]`) |
-| Minted only for the audit log (`consent_required`, `consent_granted`) | `urn:affinidi:audit-only`, which no gateway accepts |
+| Minted only for the audit log (`consent_required`, `consent_granted`, and a direct request's presentation the surface does not inject) | `urn:affinidi:audit-only`, which no gateway accepts |
 | On a public agent card, in a direct answer, or to any other Target | None |
 
 Every verifier refuses a presentation whose `domain` is `urn:affinidi:audit-only`. Over Fabric,
@@ -1587,7 +1588,12 @@ Accepted risk: binding is partial. A presentation with no `domain` is accepted e
 the gateway itself mints such presentations on public agent cards and direct answers, so a copy
 of one can be presented to any gateway within its lifetime. Direct paths and the STS token
 endpoint accept any `domain` but the audit-only one, so a copy a Target received can be
-presented to them. With `require_addressed_presentations` off, the default, a Fabric connection
+presented to them, and so can the copy the audit log keeps of a presentation injected into a
+request to an `http` or `https` Target, which is bound to that Target. The audit log keeps that
+Target-bound copy even when a surface that injects finds no place for it in the request, such as
+an A2A `tasks/get` with no message. A request to a Target that is not `http` or `https` (for
+example `proxy://`) carries a presentation with no `domain`. With
+`require_addressed_presentations` off, the default, a Fabric connection
 admits a presentation from an issuer trusted for it that is addressed to another gateway. There
 is no replay cache: any presentation can be presented again to its own audience until it
 expires.

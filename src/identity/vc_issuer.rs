@@ -28,21 +28,30 @@ const IS_VP_CHALLENGE_REQUIRED_DEFAULT: bool = false;
 /// accepts it, so a copy read from the audit log cannot be presented anywhere.
 pub const AUDIT_ONLY_VP_DOMAIN: &str = "urn:affinidi:audit-only";
 
-/// The origin (`scheme://host[:port]`, default port dropped, host lowercased)
-/// of an `http` or `https` URL; `None` for anything else.
-fn http_origin(value: &str) -> Option<String> {
-    let url = url::Url::parse(value.trim()).ok()?;
+/// The `domain` a presentation sent to `endpoint` is bound to: the endpoint's
+/// origin (`scheme://host[:port]`, default port dropped, host lowercased), or
+/// `None` (unbound) for an endpoint that is not an `http` or `https` URL.
+pub fn vp_domain_for_endpoint(endpoint: &str) -> Option<String> {
+    let url = url::Url::parse(endpoint.trim()).ok()?;
     matches!(url.scheme(), "http" | "https").then(|| {
         url.origin()
             .ascii_serialization()
     })
 }
 
-/// The `domain` a presentation sent to `endpoint` is bound to: the endpoint's
-/// origin, or `None` (unbound) for an endpoint that is not an `http` or
-/// `https` URL.
-pub fn vp_domain_for_endpoint(endpoint: &str) -> Option<String> {
-    http_origin(endpoint)
+/// The `domain` of a request-path presentation for `endpoint`: the endpoint's
+/// (see [`vp_domain_for_endpoint`]) when the presentation is `injected` into
+/// the request sent there, [`AUDIT_ONLY_VP_DOMAIN`] when it is minted only for
+/// the audit trail.
+pub fn request_vp_domain(
+    injected: bool,
+    endpoint: &str,
+) -> Option<String> {
+    if injected {
+        vp_domain_for_endpoint(endpoint)
+    } else {
+        Some(AUDIT_ONLY_VP_DOMAIN.to_string())
+    }
 }
 
 /// The error a presentation addressed to another recipient is refused with. It
@@ -99,6 +108,39 @@ fn ensure_vp_audience(
         "Refusing an identity presentation that is not addressed to this gateway"
     );
     anyhow::bail!(VP_NOT_ADDRESSED_ERROR)
+}
+
+/// Accepts a presentation whose `domains` address this gateway. Every
+/// verifier refuses [`AUDIT_ONLY_VP_DOMAIN`]. With a `recipient_did` a
+/// `domain` must name it; without one any other `domain` is accepted. A
+/// presentation from an issuer `connection` admits as relayed (see
+/// [`crate::gateways::types::PeerIssuers::admits_relayed_presentation`]) may
+/// name another recipient. A connection that requires addressed
+/// presentations refuses one with no `domain` from a relay issuer (see
+/// [`crate::gateways::types::PeerIssuers::is_relay_issuer`]); the peer's own
+/// may still name none.
+pub fn check_presentation_audience(
+    domains: &[String],
+    issuer_did: Option<&str>,
+    recipient_did: Option<&str>,
+    connection: Option<&crate::gateways::types::PeerIssuers>,
+) -> Result<()> {
+    let relayed = connection
+        .zip(issuer_did)
+        .is_some_and(|(connection, issuer)| connection.admits_relayed_presentation(issuer));
+    if relayed
+        && !domains
+            .iter()
+            .any(|domain| domain == AUDIT_ONLY_VP_DOMAIN)
+    {
+        return Ok(());
+    }
+    let require_domain = connection
+        .zip(issuer_did)
+        .is_some_and(|(connection, issuer)| {
+            connection.require_addressed_presentations && connection.is_relay_issuer(issuer)
+        });
+    ensure_vp_audience(domains, recipient_did, require_domain)
 }
 
 /// Lock file in the issuer storage directory that serializes creating, upgrading and repairing
@@ -2037,7 +2079,7 @@ impl VCIssuer {
     /// [`Self::verify_agent_presentation_full`] for a presentation that came in
     /// a fabric message received on the Connection Point `recipient_did` over
     /// the connection whose issuers are `connection`: a `domain` must name
-    /// `recipient_did` (see [`Self::check_presentation_audience`]).
+    /// `recipient_did` (see [`check_presentation_audience`]).
     pub async fn verify_agent_presentation_for(
         &self,
         vp_input: &str,
@@ -2047,48 +2089,13 @@ impl VCIssuer {
         let verified = self
             .verify_agent_presentation_unaddressed(vp_input)
             .await?;
-        self.check_presentation_audience(&verified.domains, verified.issuer_did.as_deref(), recipient_did, connection)?;
+        check_presentation_audience(&verified.domains, verified.issuer_did.as_deref(), recipient_did, connection)?;
         Ok(verified)
-    }
-
-    /// Accepts a presentation whose `domains` address this gateway. Every
-    /// verifier refuses [`AUDIT_ONLY_VP_DOMAIN`]. With a `recipient_did` a
-    /// `domain` must name it; without one any other `domain` is accepted. A
-    /// presentation from an issuer `connection` admits as relayed (see
-    /// [`crate::gateways::types::PeerIssuers::admits_relayed_presentation`]) may
-    /// name another recipient. A connection that requires addressed
-    /// presentations refuses one with no `domain` from a trusted issuer that is
-    /// not the peer's own; the peer's own may still name none.
-    pub fn check_presentation_audience(
-        &self,
-        domains: &[String],
-        issuer_did: Option<&str>,
-        recipient_did: Option<&str>,
-        connection: Option<&crate::gateways::types::PeerIssuers>,
-    ) -> Result<()> {
-        let relayed = connection
-            .zip(issuer_did)
-            .is_some_and(|(connection, issuer)| connection.admits_relayed_presentation(issuer));
-        if relayed
-            && !domains
-                .iter()
-                .any(|domain| domain == AUDIT_ONLY_VP_DOMAIN)
-        {
-            return Ok(());
-        }
-        let require_domain = connection
-            .zip(issuer_did)
-            .is_some_and(|(connection, issuer)| {
-                connection.require_addressed_presentations
-                    && connection.attested.as_deref() != Some(issuer)
-                    && connection.accepts(issuer)
-            });
-        ensure_vp_audience(domains, recipient_did, require_domain)
     }
 
     /// Verifies a presentation's signatures, lifetime and challenge without
     /// checking who it is addressed to; the caller must call
-    /// [`Self::check_presentation_audience`] before relying on it.
+    /// [`check_presentation_audience`] before relying on it.
     pub async fn verify_agent_presentation_unaddressed(
         &self,
         vp_input: &str,
@@ -4948,6 +4955,13 @@ mod tests {
         assert_eq!(vp_domain_for_endpoint("http://gw2:8080/mcp").as_deref(), Some("http://gw2:8080"));
         assert_eq!(vp_domain_for_endpoint("fabric://gateway-1/surface"), None);
         assert_eq!(vp_domain_for_endpoint("not a url"), None);
+    }
+
+    #[test]
+    fn a_request_presentation_is_bound_to_the_target_only_when_injected() {
+        assert_eq!(request_vp_domain(true, "https://target.example/a2a").as_deref(), Some("https://target.example"));
+        assert_eq!(request_vp_domain(false, "https://target.example/a2a").as_deref(), Some(AUDIT_ONLY_VP_DOMAIN));
+        assert_eq!(request_vp_domain(false, "not a url").as_deref(), Some(AUDIT_ONLY_VP_DOMAIN));
     }
 
     #[tokio::test]
