@@ -40,12 +40,11 @@ export const OUTBOUND_PREFIX = '/outbound';
  * Returns the set of outbound listener URLs that are also reachable on an inbound listener
  * (shared domain), as the gateway classifies them.
  *
- * The classification has to come from the gateway, because two address lists cannot express
- * it: a listener answers on every one of its `external_urls`, so an alias URL in no inbound
- * list still belongs to a shared listener, and `https://host:9443` beside an inbound
- * `https://host` is the same hostname. Comparing the lists for equal strings called both
- * "not shared", offered the plain prefixes, and the save then failed with
- * `listen_path_not_served`.
+ * The classification comes from the gateway, which decides it per listener with the same
+ * function its save gate uses. Two address lists cannot express it: a listener answers on
+ * every one of its `external_urls`, so an alias URL in no inbound list still belongs to a
+ * shared listener, and `https://host:9443` beside an inbound `https://host` is the same
+ * hostname.
  *
  * The result is used to:
  * - Label shared addresses in the TP "Listen Address" dropdown.
@@ -63,10 +62,14 @@ export function computeSharedOutboundAddresses(config: RoutingConfig): Set<strin
 }
 
 /**
- * The prefixes the Listen Path picker offers for one node: `channel_path_prefix` as it
- * stands for an inbound address, and for an outbound one the same prefixes under
- * `/outbound` when that address's listener shares a hostname with an inbound listener,
- * since the inbound pipeline owns every other path there.
+ * The prefixes the Listen Path picker offers for one node.
+ *
+ * An inbound address offers `channel_path_prefix` as it stands. An outbound address whose
+ * listener shares a hostname with an inbound listener offers the `/outbound` forms alone,
+ * since the inbound pipeline owns every other path there and the save refuses one. An
+ * outbound address with a hostname of its own offers both forms, which the save accepts
+ * both of, so a path stored in either form resolves in the picker; a root channel has no
+ * usable plain form, because that is the whole listener.
  *
  * One implementation, read by the picker, by the required-field errors beside it and by the
  * save gate, so none of the three can offer what the others refuse.
@@ -80,12 +83,9 @@ export function offeredChannelPrefixes(
   if (addressSource !== 'outbound') return plain;
   const outbound = outboundChannelPrefixes(routing);
   if (computeSharedOutboundAddresses(routing).has(address)) return outbound;
-  // An outbound listener with a hostname of its own serves the plain prefixes as well,
-  // except a root channel: its plain form is the whole listener, which the gateway does
-  // not accept as a prefix, so only its `/outbound` form is usable there. Without this,
-  // a gateway whose only surface prefix is `/` offered a picker that could compose
-  // nothing the save would take.
-  return plain.map((c, idx) => (isRootPrefix(c.prefix) ? (outbound[idx] ?? c) : c));
+  return plain.flatMap((c, idx) =>
+    isRootPrefix(c.prefix) ? [outbound[idx] ?? c] : [c, outbound[idx]].filter(Boolean)
+  );
 }
 
 /** A surface prefix that is the whole listener, so nothing can be set directly under it. */

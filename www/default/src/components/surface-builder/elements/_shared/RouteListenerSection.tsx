@@ -257,18 +257,21 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
       if (!config.listen_address && availableAddresses[0]) {
         patch.listen_address = meaningfulAddresses[0] ?? availableAddresses[0];
       }
-      // Against the prefixes the selector OFFERS, not the plain inbound list: on an
-      // outbound address that shares the inbound hostname those are the /outbound/…
-      // forms, and a Transit Point's route starts there. Matching the raw list could
-      // never match such a route, and the old fallback to the first channel then wrote
-      // /agents onto every Transit Point Boris creates.
-      if (!config.route_prefix && channelPrefixes[0]) {
-        const matched = channelPrefixes.find(
+      // Matched against the prefixes offered for the address this node will hold,
+      // which the memo above cannot give while that address is still being written.
+      const seedPrefixes = routingConfig
+        ? offeredChannelPrefixes(
+            routingConfig,
+            addressSource,
+            patch.listen_address ?? config.listen_address ?? ''
+          )
+        : [];
+      if (!config.route_prefix && seedPrefixes[0]) {
+        const matched = seedPrefixes.find(
           p => composedRoute === p.prefix || composedRoute.startsWith(p.prefix + '/')
         );
-        // Only a prefix the route actually starts with is persisted. A route under none
-        // of them leaves the field unset, so the selector shows it unresolved rather
-        // than claiming a prefix that does not belong to it.
+        // Only a prefix the route starts with is persisted; a route under none of them
+        // leaves the field unset, so the selector shows it unresolved.
         if (matched) {
           const derivedSuffix = composedRoute.substring(matched.prefix.length);
           const suffix = config.route_suffix || derivedSuffix || '';
@@ -287,10 +290,13 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
     seededRef.current = true;
     const suffix = generateRandomPath();
     const path = suffix.startsWith('/') ? suffix : `/${suffix}`;
-    // The offered list again, so a brand-new Transit Point on a shared-hostname
-    // outbound address seeds /outbound/<channel> rather than the inbound /<channel>.
-    const prefix = channelPrefixes[0]?.prefix ?? '';
     const listen = meaningfulAddresses[0] ?? availableAddresses[0] ?? '';
+    // Offered for the address seeded in this same update, not for the empty one the
+    // node still holds: on a shared-hostname address that is the /outbound form, and
+    // a plain prefix there would be refused by the save as soon as it rendered.
+    const prefix = routingConfig
+      ? (offeredChannelPrefixes(routingConfig, addressSource, listen)[0]?.prefix ?? '')
+      : '';
     updateFields({
       listen_address: listen,
       route_prefix: prefix,
@@ -305,20 +311,20 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
     const trimmed = suffix.trim();
     const path = trimmed ? (trimmed.startsWith('/') ? trimmed : `/${trimmed}`) : '';
     const composed = prefix && path ? `${prefix}${path}` : '';
-    updateFields({
-      route_prefix: prefix,
-      route_suffix: suffix,
-      [routeFieldName]: composed,
-    });
+    // An incomplete pair composes nothing, which must not wipe a route the node
+    // already holds: a stored path the picker cannot place leaves the prefix
+    // unresolved, and typing in the other field would otherwise clear it. The
+    // required-field errors and the save gate report the incomplete pair.
+    const fields: Record<string, any> = { route_prefix: prefix, route_suffix: suffix };
+    if (composed || !composedRoute) fields[routeFieldName] = composed;
+    updateFields(fields);
   };
 
   const pathError = useMemo(() => validatePath(customPath), [customPath]);
 
-  // Both fields are marked required and until now neither could say so: validatePath
-  // returns null for an empty path, and the prefix had no error binding at all. A node
-  // whose route the editor could not resolve therefore rendered as two blank fields,
-  // indistinguishable from one nobody had filled in, and a save composed an empty route
-  // from them without complaint. Gated on hasAttemptedSave like the existing path error,
+  // Both fields are required, and a node whose route the editor cannot place under an
+  // offered prefix renders blank, which is indistinguishable from one nobody filled in.
+  // Gated on hasAttemptedSave like the existing path error,
   // so a new node is not red before it has been touched.
   const prefixMissing = !selectedPrefix;
   const pathMissing = !customPath.trim();

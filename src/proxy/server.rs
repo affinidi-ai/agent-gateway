@@ -853,16 +853,41 @@ pub(crate) type ListenPathClaim<'a> = (Option<&'a str>, &'a str, &'a str);
 pub(crate) fn kept_listen_path_claims(
     stored: Option<&crate::config::agent_surface::AgentSurface>
 ) -> std::collections::HashSet<ListenPathClaim<'_>> {
-    stored
-        .into_iter()
-        .flat_map(transit_points_with_variant)
+    let Some(stored) = stored else {
+        return std::collections::HashSet::new();
+    };
+    let mut claims: std::collections::HashSet<ListenPathClaim<'_>> = transit_points_with_variant(stored)
         .filter_map(|(variant, point)| Some((variant, point.alias.as_str(), point.listen_path.as_deref()?)))
-        .collect()
+        .collect();
+    // A variant that overrides no Transit Point of its own answers at the base
+    // surface's, and a dashboard save writes that inherited copy into the
+    // variant's `overrides.transit.points`. The copy registers no route the
+    // base point did not, so it keeps the base claim rather than introducing
+    // one: without this, saving an unrelated field on a surface holding a path
+    // from before these rules is refused for a path nobody touched.
+    let base: Vec<(&str, &str)> = stored
+        .transit
+        .iter()
+        .flat_map(|transit| transit.points.iter())
+        .filter_map(|point| Some((point.alias.as_str(), point.listen_path.as_deref()?)))
+        .collect();
+    for variant in &stored.variants {
+        for (alias, path) in &base {
+            claims.insert((Some(variant.alias.as_str()), alias, path));
+        }
+    }
+    claims
 }
 
 /// The codes that tell the four cases of [`listen_path_problems`] apart. The
 /// admin API refuses a save that introduces one of the first three; the last
 /// is a `Warning` on a save it stores.
+/// The code of the fifth refusal, which [`listen_path_problems`] does not
+/// decide: a `listen_path` that is a route another Transit Point already
+/// answers on (`check_listen_path_shadowing`), which needs every surface on
+/// the listener to see.
+pub(crate) const LISTEN_PATH_ROUTE_CLASH: &str = "listen_path_route_clash";
+
 pub(crate) const LISTEN_PATH_INVALID: &str = "listen_path_invalid";
 pub(crate) const LISTEN_PATH_IS_OUTBOUND_PREFIX: &str = "listen_path_is_outbound_prefix";
 pub(crate) const LISTEN_PATH_NOT_A_CHANNEL_PREFIX: &str = "listen_path_not_a_channel_prefix";

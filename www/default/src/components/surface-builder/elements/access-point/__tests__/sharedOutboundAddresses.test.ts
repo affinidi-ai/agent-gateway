@@ -87,9 +87,8 @@ describe('computeSharedOutboundAddresses', () => {
   });
 
   // The gateway classifies by listener, which no comparison of the two address
-  // lists can reproduce. Both of these were called "not shared", so the picker
-  // offered the plain prefixes and the save then failed with
-  // listen_path_not_served.
+  // lists can reproduce: neither a differing port nor an alias URL shows up in
+  // both lists.
   it('takes the gateway classification over equal URLs, across ports', () => {
     const config = makeConfig(
       ['https://gateway.example.com'],
@@ -151,7 +150,9 @@ describe('offeredChannelPrefixes', () => {
     ).toEqual(['/outbound/agents']);
   });
 
-  it('offers the plain prefixes on an outbound address of its own', () => {
+  // The admin API accepts both forms wherever the path is reachable, so both are
+  // offered there and a path stored in either resolves in the picker.
+  it('offers both forms on an outbound address of its own', () => {
     const config = makeConfig(
       ['https://gateway.example.com'],
       ['https://own.example.net'],
@@ -160,7 +161,7 @@ describe('offeredChannelPrefixes', () => {
     config.shared_hostname_outbound_addresses = [];
     expect(
       offeredChannelPrefixes(config, 'outbound', 'https://own.example.net').map(p => p.prefix)
-    ).toEqual(['/agents']);
+    ).toEqual(['/agents', '/outbound/agents']);
   });
 
   // A root surface prefix has no usable plain form: it is the whole listener, which the

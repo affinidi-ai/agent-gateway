@@ -62,6 +62,17 @@ Feature: A Transit Point's listen_path is held to the routes the gateway serves
     Then the admin API response status is 400
     And the admin API error response mentions "must not contain a segment starting with ':' or '*'"
 
+  Scenario: A listen_path whose only segment is trailing slashes is refused
+    When the operator sets Transit Point "alpha" listen_path to "/outbound/example//"
+    Then the admin API response status is 400
+    And the admin API error response mentions "under no surface prefix this gateway serves Transit Points on"
+
+  Scenario: A listen_path that is another Transit Point's route is refused
+    Given Transit Point "charlie" routes to MCP server "delta"
+    When the operator sets Transit Point "alpha" listen_path to "/outbound/example/charlie"
+    Then the admin API response status is 400
+    And the admin API error response mentions "Transit Point 'charlie'"
+
   Scenario: The surface routing settings name the prefixes a Transit Point may listen under
     When the operator reads the surface routing settings
     Then the admin API response status is 200

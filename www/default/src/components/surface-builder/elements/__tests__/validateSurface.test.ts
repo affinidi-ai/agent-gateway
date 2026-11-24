@@ -155,7 +155,7 @@ describe('validateSurfacePayload', () => {
           i.path?.endsWith('listen_path')
         )
       ).toBeUndefined();
-      // The two readings the page used to pass for that same view.
+      // The base surface, and nothing, are the wrong views to compare against.
       for (const stored of [base, null]) {
         expect(
           validateSurfacePayload(variantView, { stored, routing }).find(i =>

@@ -2195,8 +2195,21 @@ fn outbound_listen_path_claims(
     resolve_port: &impl Fn(&str) -> Option<u16>,
 ) -> Vec<(ListenerKey, String)> {
     transit_point_listeners(surface, resolve_port)
-        .filter_map(|(key, tp)| Some((key, tp.listen_path.clone()?)))
+        .filter_map(|(key, tp)| Some((key, registered_path(tp.listen_path.as_deref()?))))
         .collect()
+}
+
+/// A `listen_path` as the outbound listener registers it, which trims every
+/// trailing slash (a path of only slashes becoming `/`). Two paths that differ
+/// in nothing else register one route, so the checks compare them this way or
+/// miss the clash.
+fn registered_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// The separators the outbound listener registers a variant route under, in
@@ -2318,7 +2331,14 @@ async fn validate_listen_paths(
     check_listen_paths(surface, stored, network_config)?;
 
     let resolve_port = |addr: &str| network_config.map_url_to_port_for_type(addr, Some("outbound"));
-    if outbound_listen_path_claims(surface, &resolve_port).is_empty() {
+    // Every save of a surface with Transit Points is checked, not only one that
+    // sets a `listen_path`: a new point, a new variant or a changed surface
+    // route adds routes of its own, and one of those can land on a path another
+    // surface already holds.
+    if transit_point_listeners(surface, &resolve_port)
+        .next()
+        .is_none()
+    {
         return Ok(());
     }
 
@@ -2377,10 +2397,13 @@ fn check_listen_path_shadowing(
     // its own routes win over another surface's identical entry and the
     // exemption below still applies.
     let mut derived: std::collections::HashMap<(ListenerKey, String), RouteOwner> = std::collections::HashMap::new();
-    let others = others.iter().filter(|other| {
-        other.surface_id != surface.surface_id && other.status != crate::config::agent_surface::SurfaceStatus::Disabled
-    });
-    for owner in others {
+    let active_others = || {
+        others.iter().filter(|other| {
+            other.surface_id != surface.surface_id
+                && other.status != crate::config::agent_surface::SurfaceStatus::Disabled
+        })
+    };
+    for owner in active_others() {
         for (key, route, alias) in outbound_derived_route_claims(owner, resolve_port) {
             derived.insert(
                 (key, route),
@@ -2395,10 +2418,64 @@ fn check_listen_path_shadowing(
         derived.insert((key, route), RouteOwner::Mine { alias });
     }
 
+    // The other direction: a route this save introduces, from a new point, a
+    // new variant or a changed surface route, landing on a `listen_path`
+    // another surface already holds. The clash is the same one, and the save
+    // that introduces it is this one, so it is refused here rather than left
+    // to the listener build.
+    let kept_routes: std::collections::HashSet<(ListenerKey, String)> = claiming_stored_surface(stored)
+        .map(|stored| {
+            outbound_derived_route_claims(stored, resolve_port)
+                .into_iter()
+                .map(|(key, route, _)| (key, route))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut claimed_paths: std::collections::HashMap<(ListenerKey, String), (String, String)> =
+        std::collections::HashMap::new();
+    for other in active_others() {
+        for (key, path) in outbound_listen_path_claims(other, resolve_port) {
+            for (_, point) in transit_point_listeners(other, resolve_port) {
+                if point
+                    .listen_path
+                    .as_deref()
+                    .map(registered_path)
+                    .as_deref()
+                    == Some(path.as_str())
+                {
+                    claimed_paths.insert((key.clone(), path.clone()), (other.name.clone(), point.alias.clone()));
+                    break;
+                }
+            }
+        }
+    }
+    for (key, route, alias) in outbound_derived_route_claims(surface, resolve_port) {
+        let claim = (key.clone(), route.clone());
+        if kept_routes.contains(&claim) {
+            continue;
+        }
+        if let Some((owner, owner_alias)) = claimed_paths.get(&claim) {
+            return Err(SurfaceApiError::BadRequestCode(
+                crate::proxy::server::LISTEN_PATH_ROUTE_CLASH,
+                format!(
+                    "Transit Point '{alias}' answers on {route} on {}, which is the listen_path of Transit Point \
+                     '{owner_alias}' of surface '{owner}'; the listener would register one of the two and skip the \
+                     other, so change one of them",
+                    key.label("outbound")
+                ),
+            ));
+        }
+    }
+
     for (key, tp) in transit_point_listeners(surface, resolve_port) {
-        let Some(path) = tp.listen_path.as_ref() else {
+        let Some(path) = tp
+            .listen_path
+            .as_deref()
+            .map(registered_path)
+        else {
             continue;
         };
+        let path = &path;
         let claim = (key.clone(), path.clone());
         if kept.contains(&claim) {
             continue;
@@ -2434,11 +2511,14 @@ fn check_listen_path_shadowing(
                 )
             }
         };
-        return Err(SurfaceApiError::BadRequest(format!(
-            "listen_path '{}' on {} is {reason}; choose a different listener path",
-            path,
-            key.label("outbound")
-        )));
+        return Err(SurfaceApiError::BadRequestCode(
+            crate::proxy::server::LISTEN_PATH_ROUTE_CLASH,
+            format!(
+                "listen_path '{}' on {} is {reason}; choose a different listener path",
+                path,
+                key.label("outbound")
+            ),
+        ));
     }
 
     Ok(())

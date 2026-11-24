@@ -351,16 +351,15 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `GET /config/surface-routing`. An inbound node offers `channel_path_prefix` as it stands. An
   outbound one offers those prefixes with `/outbound` in front when the gateway lists the selected
   address in `shared_hostname_outbound_addresses` (`computeSharedOutboundAddresses`), since the
-  inbound pipeline owns every non-`/outbound` path there, and the plain prefixes on an outbound
-  address of its own, except a root surface prefix, whose plain form is the whole listener and
-  which the gateway therefore offers only under `/outbound`. The `/outbound` forms come from the
-  response's `outbound_channel_path_prefix` when it carries them, and are derived by the same rule
-  when it does not. That classification comes from the gateway, which decides it per listener
-  with the same function its save gate uses; comparing the two address lists for equal strings
-  missed an outbound `https://host:9443` beside an inbound `https://host`, and an alias URL of a
-  shared listener, and the save then refused what the picker had offered.
+  inbound pipeline owns every non-`/outbound` path there. An outbound address with a hostname of
+  its own offers both forms, which the admin API both accept, except a root surface prefix, whose
+  plain form is the whole listener and which is therefore offered only under `/outbound`. The
+  `/outbound` forms come from the response's `outbound_channel_path_prefix` when it carries them,
+  and are derived by the same rule when it does not. The shared classification comes from the
+  gateway, which decides it per listener with the same function its save gate uses, since no
+  comparison of the two address lists can express it.
   `offeredChannelPrefixes` is the one implementation of the offered list, read by the picker, by
-  the errors beside it and by the save gate. A stored `route_prefix` shows as selected only while
+  the errors beside it and by the seed, which passes the address it is about to write. A stored `route_prefix` shows as selected only while
   it is still offered, and one that is not (a Transit Point recorded as `/agents` whose path begins
   `/outbound/`) is dropped, both fields being re-derived from the stored route instead. Seeding
   writes a prefix only when the route starts with one that is offered, so a route under none of
