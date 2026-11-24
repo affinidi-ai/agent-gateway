@@ -1394,15 +1394,143 @@ mod tests {
         ("link", "not Gateway's: Agent Watch follows links"),
         ("caller_identity_verified", "not Gateway's: Agent Stream writes it"),
         ("caller_key", "not Gateway's: Agent Watch builds caller keys"),
-        (
-            "delivery_event_id",
-            "Agent Watch's reading of deliveries; Gateway's delivered form is pinned in integrations::delivery::dispatch",
-        ),
-        (
-            "delivery_occurred_at",
-            "Agent Watch's reading of deliveries; Gateway's delivered form is pinned in integrations::delivery::dispatch",
-        ),
+        ("delivery_event_id", "run here, the conforming cases of Gateway and of any appliance"),
+        ("delivery_occurred_at", "run here, the conforming cases of Gateway and of any appliance"),
     ];
+
+    /// Agent Watch's template for audit records as it was saved before
+    /// deliveries carried `occurred_at`, and as an operator writes it now.
+    const AGENT_WATCH_TEMPLATES: [&str; 2] = [
+        r#"{"event_type": "${EVENT_TYPE}", "timestamp": "${TIMESTAMP}", "appliance_id": "${APPLIANCE_ID}", "record": "${EVENT_DATA}"}"#,
+        r#"{"event_type": "${EVENT_TYPE}", "appliance_id": "${APPLIANCE_ID}", "record": "${EVENT_DATA}"}"#,
+    ];
+
+    /// The values Gateway delivers for the event a delivery case describes: a
+    /// policy decision recorded with the case's id and time, or the catalogue
+    /// event the case names, with that id and time.
+    fn delivery_values(input: &Value) -> std::collections::HashMap<String, String> {
+        use crate::delegation_vault::audit::{DelegationAuditAction, audit_event};
+        use crate::integrations::audit_integration_triggers::AuditDelivery;
+        use crate::integrations::delivery::values::{Occurrence, event_values};
+        let event_type = input["event_type"]
+            .as_str()
+            .unwrap();
+        let event_id = input["event_id"]
+            .as_str()
+            .map(str::to_string);
+        let occurred_at = input["occurred_at"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        if event_type == "audit.policy_decision" {
+            let decision = DelegationAuditAction::PolicyDecision {
+                scope: "surface".to_string(),
+                flow: "access_point".to_string(),
+                policy_id: "surface.policy".to_string(),
+                policy_name: None,
+                policy_definition_id: None,
+                decision: "deny".to_string(),
+                deny_reason: None,
+                surface_id: None,
+                caller_did: None,
+                http_method: None,
+                http_path: None,
+                policy_version: None,
+                policy_content_hash: None,
+                removed_tools: None,
+            };
+            let mut record = audit_event(decision, None, None, None, None);
+            record.event_id = event_id;
+            record.occurred_at = occurred_at;
+            return AuditDelivery::from_event(&record)
+                .values()
+                .clone();
+        }
+        let event = crate::integrations::events::find_event(event_type)
+            .unwrap_or_else(|| panic!("no catalogue event {event_type}"));
+        event_values(event, &Occurrence::recorded(event_id, occurred_at), Default::default(), None)
+    }
+
+    /// The conforming delivery cases of Gateway and of any appliance, run
+    /// against what `prepare` delivers by webhook and by stream, with the
+    /// default envelope and with Agent Watch's template. Agent Stream's cases,
+    /// and the legacy and nonconforming ones, which fix how Agent Watch reads
+    /// a delivery, are not Gateway's.
+    #[tokio::test]
+    async fn gateway_delivers_events_as_the_conforming_delivery_vectors_say() {
+        use crate::integrations::definitions::{Endpoint, EndpointType, Integration};
+        use crate::integrations::delivery::dispatch::{Route, prepare};
+        let instant = |value: &Value| {
+            value
+                .as_str()
+                .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+        };
+        let mut run = Vec::new();
+        for (group, field) in [("delivery_event_id", "event_id"), ("delivery_occurred_at", "occurred_at")] {
+            for case in vector_cases(group) {
+                let shape = &case["shape"];
+                if shape["wire"] != json!("conforming")
+                    || !matches!(shape["appliance"].as_str(), Some("agent_gateway" | "any"))
+                {
+                    continue;
+                }
+                let name = case["name"].as_str().unwrap();
+                assert_eq!(case["accepted"], json!(true), "{name}");
+                let (input, expected) = (&case["input"], &case["expected"][field]);
+                let values = delivery_values(input);
+                let templates = std::iter::once(("data", json!({}))).chain(
+                    AGENT_WATCH_TEMPLATES.map(|template| ("record", serde_json::from_str::<Value>(template).unwrap())),
+                );
+                for (embedded, template) in templates {
+                    for endpoint_type in [EndpointType::Webhook, EndpointType::Stream] {
+                        let endpoint = Endpoint::new("Watch".to_string(), String::new(), endpoint_type, json!({}));
+                        let integration = Integration::new(
+                            "Watch".to_string(),
+                            String::new(),
+                            endpoint.id.clone(),
+                            String::new(),
+                            template.clone(),
+                        );
+                        let (_, message) = prepare(&Route { integration, endpoint }, &values, None)
+                            .await
+                            .expect("prepares");
+                        let delivered = message.content;
+                        let context = format!("{name}, {endpoint_type:?}, {template}: {delivered}");
+
+                        assert_eq!(delivered.get("timestamp"), None, "{context}");
+                        assert_eq!(
+                            (&delivered["event_id"], &delivered["occurred_at"]),
+                            (&input["event_id"], &input["occurred_at"]),
+                            "{context}"
+                        );
+                        if field == "event_id" {
+                            assert_eq!(&delivered["event_id"], expected, "{context}");
+                        } else {
+                            assert_eq!(instant(&delivered["occurred_at"]), instant(expected), "{context}");
+                        }
+                        if input.get("record").is_some() {
+                            let record = &delivered[embedded];
+                            assert_eq!(
+                                (&record["event_id"], &record["occurred_at"], record.get("timestamp")),
+                                (&delivered["event_id"], &delivered["occurred_at"], None),
+                                "{context}"
+                            );
+                        }
+                    }
+                }
+                run.push(name.to_string());
+            }
+        }
+        assert_eq!(
+            run,
+            [
+                "event_id_gateway_audit_conforming",
+                "event_id_event_without_record_conforming",
+                "occurred_at_gateway_audit_conforming",
+                "occurred_at_with_an_offset_conforming"
+            ]
+        );
+    }
 
     #[test]
     fn every_vector_group_is_run_or_named_and_the_version_is_pinned() {
