@@ -202,13 +202,13 @@ lock_holder_running() {
 }
 
 take_lock() {
-    local attempt holder
+    local holder
     mkdir -p "${WORK}"
     # ln would create its link inside a real directory instead of failing.
     if [[ -e "${LOCK}" && ! -L "${LOCK}" ]]; then
         fail 2 "preflight: $(relative "${LOCK}") is not a lock this harness created; remove it"
     fi
-    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
         if ln -sn "$$" "${LOCK}" 2>/dev/null; then
             OWN_LOCK=true
             return
