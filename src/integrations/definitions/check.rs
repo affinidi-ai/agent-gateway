@@ -141,8 +141,9 @@ fn finding(
     }
 }
 
-/// Checks the stored definitions and logs a warning for each finding, then a summary. Delivery
-/// already fails closed, so nothing is changed or disabled.
+/// Checks the stored definitions and logs a warning for each finding, then a summary, and a
+/// warning for each integration whose template still uses the deprecated timestamp. Nothing is
+/// changed or disabled.
 pub async fn report_stored_definitions(
     stores: &DefinitionStores,
     secrets: Option<&dyn SecretsStore>,
@@ -167,7 +168,17 @@ pub async fn report_stored_definitions(
             id = %finding.id,
             name = %finding.name,
             problem = %finding.problem,
-            "A stored integration definition does not pass its checks; its deliveries will fail"
+            "A stored integration definition does not pass the checks a save makes"
+        );
+    }
+    for integration in integrations
+        .iter()
+        .filter(|integration| integration.uses_deprecated_timestamp())
+    {
+        warn!(
+            event = "integrations.template.timestamp_deprecated",
+            id = %integration.id,
+            "An integration's template uses ${{TIMESTAMP}} or writes a top-level timestamp key: use ${{OCCURRED_AT}} instead. Webhook and stream deliveries carry the top-level event_id and occurred_at the gateway sets, and no top-level timestamp"
         );
     }
     let summary = format!(
@@ -391,6 +402,94 @@ mod tests {
                 .expect("list"),
             [orphan]
         );
+    }
+
+    async fn stores_with(integrations: &[Integration]) -> (DefinitionStores, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let stores = DefinitionStores::open(
+            &dir.path().join("endpoints"),
+            &dir.path().join("event_sets"),
+            &dir.path()
+                .join("integrations"),
+        )
+        .await
+        .expect("stores");
+        for integration in integrations {
+            stores
+                .integrations
+                .save(integration)
+                .await
+                .expect("save integration");
+        }
+        (stores, dir)
+    }
+
+    #[tokio::test]
+    async fn each_integration_whose_template_uses_the_deprecated_timestamp_is_warned_about_once() {
+        let endpoint = webhook("https://93.184.215.14/hook");
+        let events = gateway_events();
+        let both = integration(
+            "Both",
+            &endpoint,
+            &events.id,
+            json!({"timestamp": "${TIMESTAMP}", "meta": {"at": "${TIMESTAMP}"}}),
+        );
+        let key = integration("Key", &endpoint, &events.id, json!({"timestamp": "template-value-7"}));
+        let current = integration("Current", &endpoint, &events.id, json!({"at": "${OCCURRED_AT}"}));
+        let (stores, _dir) = stores_with(&[both.clone(), key.clone(), current.clone()]).await;
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        report_stored_definitions(&stores, None)
+            .await
+            .expect("report");
+
+        let text = logs.text();
+        let warnings: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("integrations.template.timestamp_deprecated"))
+            .collect();
+        assert_eq!(warnings.len(), 2, "{text}");
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains(&both.id)),
+            "{text}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains(&key.id)),
+            "{text}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|line| line.contains("OCCURRED_AT")),
+            "{text}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|line| line.contains(&current.id)),
+            "{text}"
+        );
+        assert!(!text.contains("template-value-7"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_finding_does_not_say_its_deliveries_will_fail() {
+        let endpoint = webhook("https://93.184.215.14/hook");
+        let unfilled = integration("Unfilled", &endpoint, "missing-set", json!({"text": "${USERNAME}"}));
+        let (stores, _dir) = stores_with(&[unfilled]).await;
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        report_stored_definitions(&stores, None)
+            .await
+            .expect("report");
+
+        let text = logs.text();
+        assert!(text.contains("integrations.definition.invalid"), "{text}");
+        assert!(!text.contains("will fail"), "{text}");
     }
 
     /// A stored set that names an event the gateway now only logs beside

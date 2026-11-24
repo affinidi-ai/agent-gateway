@@ -1,6 +1,9 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+use super::event_set::collect_template_variables;
 use super::{Definition, EventSet, Status, now};
 use crate::storage::filesystem::StorableEntity;
 
@@ -71,6 +74,18 @@ impl Integration {
             self.audit_max_attempts
                 .map(u64::from),
         )
+    }
+
+    /// Whether the template uses `${TIMESTAMP}`, the deprecated alias of `${OCCURRED_AT}`, or
+    /// writes a top-level `timestamp` key, which a webhook or stream delivery leaves out.
+    pub fn uses_deprecated_timestamp(&self) -> bool {
+        let mut used = BTreeSet::new();
+        collect_template_variables(&self.content, &mut used);
+        used.contains("TIMESTAMP")
+            || self
+                .content
+                .get("timestamp")
+                .is_some()
     }
 }
 
@@ -183,6 +198,24 @@ mod tests {
         deprecated.content = json!({"at": "${TIMESTAMP}", "occurred_at": "${OCCURRED_AT}", "id": "${EVENT_ID}"});
 
         assert_eq!(deprecated.check_against(&event_set(&["gateway.created", "audit.policy_decision"])), Ok(()));
+    }
+
+    #[test]
+    fn names_a_template_that_uses_the_deprecated_timestamp() {
+        for (content, deprecated) in [
+            (json!({"at": "${TIMESTAMP}"}), true),
+            (json!({"meta": {"at": "at ${ TIMESTAMP }"}}), true),
+            (json!({"timestamp": "fixed"}), true),
+            (json!({"timestamp": "${OCCURRED_AT}"}), true),
+            (json!({"meta": {"timestamp": "${OCCURRED_AT}"}}), false),
+            (json!({"at": "${OCCURRED_AT}", "id": "${EVENT_ID}"}), false),
+            (json!({}), false),
+        ] {
+            let mut template = integration();
+            template.content = content.clone();
+
+            assert_eq!(template.uses_deprecated_timestamp(), deprecated, "{content}");
+        }
     }
 
     #[test]

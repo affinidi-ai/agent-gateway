@@ -84,7 +84,7 @@ impl EventSet {
 
 const AUDIT_EVENT_PREFIX: &str = "audit.";
 
-fn collect_template_variables(
+pub(super) fn collect_template_variables(
     value: &JsonValue,
     used: &mut BTreeSet<String>,
 ) {
