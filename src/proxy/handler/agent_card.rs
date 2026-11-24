@@ -383,21 +383,27 @@ async fn inject_identity_credential(
     };
     let channel_name = state.surface.name.as_str();
     let vc_issuer = selector.get_vc_issuer();
-    crate::a2a::inject_credential_into_agent_card(agent_card, resolved_identity, &vc_issuer, channel_name)
-        .await
-        .map_err(|e| {
-            error!(channel = channel_name, error = %e, "Failed to inject identity credential into agent card");
-            CardFailure::new(
-                FetchFault::IdentityFailed {
-                    slot: crate::proxy::card_preview::CardIdentitySlot::ProtectedIdentity,
-                    error: crate::proxy::card_preview::CardIdentityError::CredentialInjectionFailed,
-                },
-                create_error_response(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("Agent card identity credential injection failed: {}", e),
-                ),
-            )
-        })
+    crate::a2a::inject_credential_into_agent_card(
+        agent_card,
+        resolved_identity,
+        &vc_issuer,
+        channel_name,
+        &state.key_scope(),
+    )
+    .await
+    .map_err(|e| {
+        error!(channel = channel_name, error = %e, "Failed to inject identity credential into agent card");
+        CardFailure::new(
+            FetchFault::IdentityFailed {
+                slot: crate::proxy::card_preview::CardIdentitySlot::ProtectedIdentity,
+                error: crate::proxy::card_preview::CardIdentityError::CredentialInjectionFailed,
+            },
+            create_error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("Agent card identity credential injection failed: {}", e),
+            ),
+        )
+    })
 }
 
 /// Put the Agent DNA and DID of the surface's did:webvh identity on the card, so

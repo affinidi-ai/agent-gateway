@@ -163,17 +163,6 @@ fn signing_users(
         if signs_through(surface.signing.as_ref(), connection_id) {
             users.add(visible, || format!("surface \"{}\"", surface.name));
         }
-        for variant in &surface.variants {
-            if signs_through(
-                variant
-                    .overrides
-                    .signing
-                    .as_ref(),
-                connection_id,
-            ) {
-                users.add(visible, || format!("surface \"{}\" variant \"{}\"", surface.name, variant.alias));
-            }
-        }
     }
     for issuer in issuers {
         if signs_through(issuer.signing.as_ref(), connection_id) {
@@ -1056,8 +1045,37 @@ async fn persist_pairing(
     connection: VtaConnection,
     pairing: crate::vta::pairing::PairingRecord,
 ) -> Result<VtaConnection, (StatusCode, Json<ErrorBody>)> {
+    save_pairing(state, connection, pairing, false).await
+}
+
+/// Saves a Verify result, unless the connection was revoked since it was read:
+/// only pairing again brings a revoked connection back.
+async fn persist_verification(
+    state: &VtaConnectionAdminState,
+    connection: VtaConnection,
+    pairing: crate::vta::pairing::PairingRecord,
+) -> Result<VtaConnection, (StatusCode, Json<ErrorBody>)> {
+    save_pairing(state, connection, pairing, true).await
+}
+
+/// The answer to a Verify of a revoked connection.
+fn revoked_connection() -> (StatusCode, Json<ErrorBody>) {
+    (StatusCode::CONFLICT, ErrorBody::json("this connection was revoked; pair it again first"))
+}
+
+async fn save_pairing(
+    state: &VtaConnectionAdminState,
+    connection: VtaConnection,
+    pairing: crate::vta::pairing::PairingRecord,
+    unless_revoked: bool,
+) -> Result<VtaConnection, (StatusCode, Json<ErrorBody>)> {
     let id = connection.id.clone();
+    let mut revoked = false;
     let updated = crate::vta::connections::modify(state.store.as_ref(), &id, |stored| {
+        if unless_revoked && stored.pairing.state == crate::vta::pairing::PairingState::Revoked {
+            revoked = true;
+            return;
+        }
         stored.status = pairing.state.into();
         stored.pairing = pairing;
     })
@@ -1066,6 +1084,9 @@ async fn persist_pairing(
         error!(id = %id, error = %e, "Failed to persist VTA pairing state");
         (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Internal server error"))
     })?;
+    if revoked {
+        return Err(revoked_connection());
+    }
     // Pairing changes whether the connection may sign, so the cached connector
     // must go: a revoke has to take effect on the very next request.
     invalidate(state, &id).await;
@@ -1190,6 +1211,10 @@ pub async fn verify_connection(
             .into_response();
     }
 
+    if connection.pairing.state == crate::vta::pairing::PairingState::Revoked {
+        return revoked_connection().into_response();
+    }
+
     let Some(registry) = state.registry.clone() else {
         return (StatusCode::SERVICE_UNAVAILABLE, ErrorBody::json("VTA connections are not active on this gateway"))
             .into_response();
@@ -1219,7 +1244,7 @@ pub async fn verify_connection(
             // Never a fallback to local signing — the connection stays
             // unusable and the operator is told why.
             let pairing = crate::vta::pairing::apply_failure(&previous, operator_message(&e));
-            return match persist_pairing(&state, connection, pairing).await {
+            return match persist_verification(&state, connection, pairing).await {
                 Ok(updated) => {
                     security_records::connection_verified(previous_state, &updated);
                     (StatusCode::BAD_GATEWAY, Json(updated)).into_response()
@@ -1237,7 +1262,7 @@ pub async fn verify_connection(
         "VTA pairing verified",
     );
     let connected = pairing.state.is_usable();
-    match persist_pairing(&state, connection, pairing).await {
+    match persist_verification(&state, connection, pairing).await {
         Ok(updated) => {
             security_records::connection_verified(previous_state, &updated);
             if connected {
@@ -1286,6 +1311,16 @@ pub async fn revoke_connection(
         Ok(connection) => connection,
         Err(e) => return e.into_response(),
     };
+
+    // The bootstrap record signs through the `[vta]` block whatever its pairing
+    // says, so recording it as revoked would claim something that is not true.
+    if connection.is_bootstrap() {
+        return (
+            StatusCode::CONFLICT,
+            ErrorBody::json("the bootstrap connection is managed by the [vta] configuration block"),
+        )
+            .into_response();
+    }
 
     if let Some(response) = guard_disconnect(
         &state,
@@ -3184,7 +3219,6 @@ mod tests {
             vec![
                 "the gateway default (Audit signing)".to_string(),
                 "surface \"surface s1\"".to_string(),
-                "surface \"surface s2\" variant \"beta\"".to_string(),
                 "surface \"surface s3\"".to_string(),
                 "issuer \"Issuer one\"".to_string(),
             ]
@@ -3203,6 +3237,84 @@ mod tests {
         );
 
         assert!(signing_users("unused", None, &surfaces, &[], None, None).is_empty());
+    }
+
+    /// Revoking the `[vta]` connection would record it revoked while it keeps
+    /// signing through the block, so it is refused like delete and Verify.
+    #[tokio::test]
+    async fn revoking_the_bootstrap_connection_is_refused() {
+        let (state, _dir) = admin_state(None).await;
+        let bootstrap = crate::vta::connections::BOOTSTRAP_CONNECTION_ID;
+        stored(&state, bootstrap, None).await;
+        let (router, _users) = admin_router(state.clone(), None).await;
+
+        assert_eq!(
+            call(&router, "POST", &format!("/v1/vta/connections/{bootstrap}/revoke")).await,
+            StatusCode::CONFLICT
+        );
+        let kept = state
+            .store
+            .get(bootstrap)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(kept.pairing.state, crate::vta::pairing::PairingState::Revoked);
+    }
+
+    /// Only pairing again brings a revoked connection back; Verify does not.
+    #[tokio::test]
+    async fn verifying_a_revoked_connection_is_refused_and_it_stays_revoked() {
+        let (state, _dir) = admin_state(None).await;
+        stored(&state, "conn", None).await;
+        crate::vta::connections::modify(state.store.as_ref(), "conn", |c| {
+            c.pairing = crate::vta::pairing::revoke(&c.pairing);
+        })
+        .await
+        .unwrap();
+        let (router, _users) = admin_router(state.clone(), None).await;
+
+        assert_eq!(call(&router, "POST", "/v1/vta/connections/conn/verify").await, StatusCode::CONFLICT);
+        let kept = state
+            .store
+            .get("conn")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.pairing.state, crate::vta::pairing::PairingState::Revoked);
+    }
+
+    /// A revoke that lands while Verify is talking to the agent is kept.
+    #[tokio::test]
+    async fn a_revoke_during_verify_is_kept() {
+        let (state, _dir) = admin_state(None).await;
+        stored(&state, "conn", None).await;
+        let read = state
+            .store
+            .get("conn")
+            .await
+            .unwrap()
+            .unwrap();
+        crate::vta::connections::modify(state.store.as_ref(), "conn", |c| {
+            c.pairing = crate::vta::pairing::revoke(&c.pairing);
+        })
+        .await
+        .unwrap();
+        let connected = crate::vta::pairing::PairingRecord {
+            state: crate::vta::pairing::PairingState::Connected,
+            ..read.pairing.clone()
+        };
+
+        let refused = persist_verification(&state, read, connected)
+            .await
+            .expect_err("the revoke wins");
+        assert_eq!(refused.0, StatusCode::CONFLICT);
+        let kept = state
+            .store
+            .get("conn")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.pairing.state, crate::vta::pairing::PairingState::Revoked);
     }
 
     #[test]

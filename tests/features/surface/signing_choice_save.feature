@@ -87,6 +87,29 @@ Feature: A signing choice is checked the same way wherever it is saved
     When the personal access token saves the surface with the description "Orders API"
     Then the admin API response status is 200
 
+  Scenario: An access token without key_management.edit cannot move a surface onto an issuer that signs elsewhere
+    Given the appliance holds the trust agent connection "shared-agent"
+    And the operator has created the issuer "Research"
+    And the operator has saved the issuer "Research" signing through the trust agent connection "shared-agent"
+    And the appliance holds the secret "orders-key"
+    And the operator has created the appliance-wide surface for route "/orders" authenticating its target with secret "orders-key"
+    And operator "ada" has the "administrator" role
+    And operator "ada" holds a personal access token with scopes "surfaces.view,surfaces.edit"
+    When the personal access token moves the surface to the issuer "Research"
+    Then the admin API response status is 403
+    And the admin API error response mentions "key_management.edit"
+
+  Scenario: An access token without key_management.edit can move a surface between issuers that sign alike
+    Given the operator has created the issuer "Research"
+    And the operator has created the issuer "Sales"
+    And the appliance holds the secret "orders-key"
+    And the operator has created the appliance-wide surface for route "/orders" authenticating its target with secret "orders-key"
+    And the operator has made the surface owned by the issuer "Research"
+    And operator "ada" has the "administrator" role
+    And operator "ada" holds a personal access token with scopes "surfaces.view,surfaces.edit"
+    When the personal access token moves the surface to the issuer "Sales"
+    Then the admin API response status is 200
+
   Scenario: A variant that sets its own signing is refused
     Given the appliance holds the trust agent connection "shared-agent"
     And the appliance holds the secret "orders-key"

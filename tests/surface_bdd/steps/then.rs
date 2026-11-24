@@ -224,7 +224,7 @@ fn get_response_headers_value(world: &SurfaceWorld) -> &HashMap<String, String> 
     &get_caller_response(world).headers
 }
 
-fn get_response_body_value(world: &SurfaceWorld) -> &serde_json::Value {
+pub(crate) fn get_response_body_value(world: &SurfaceWorld) -> &serde_json::Value {
     &get_caller_response(world).body
 }
 

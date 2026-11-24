@@ -1859,7 +1859,8 @@ Retry, never an exception that unmounts the other tabs. With `key_management.edi
 without a key offers **Provision a signing key** (`POST /v1/vta/connections/{id}/keys`, no
 confirmation) and one with keys offers **New key id** and **Rotate**
 (`POST /v1/vta/connections/{id}/rotate`), which needs a second click, prompted by a toast, before
-it sends.
+it sends. Each card keeps its own key id, and the second click counts only for the same card and
+the same key id: changing the field after the first click asks again.
 
 ## Surface delete
 
@@ -2776,9 +2777,11 @@ with the shared navigation test ids (`wizard-next`, `wizard-back`, `wizard-cance
    `409` or `502` whose body is the connection records it and shows its `pairing.last_error`,
    never the status text.
 4. **Complete** (`wizard-step-complete`) mints the connection's signing key and offers **Use this
-   agent for all signing**, pre-checked only when the gateway has no stored default yet
-   (`default_signing.connection_id` in `GET /v1/settings`): connecting a second agent must never
-   silently repoint signing away from one. **Done** returns to the tab.
+   agent for all signing**, shown only with both `settings.edit` and `key_management.edit` (what
+   the server needs to change Gateway signing) and pre-checked only when `GET /v1/settings` was
+   read and holds no `default_signing` at all: connecting a second agent must never silently
+   repoint signing away from one, a stored choice of the gateway's own key counts as a default,
+   and a failed read leaves it unchecked. **Done** returns to the tab.
 
 `?id=` resumes a created connection at the grant step, or at the last step when it is connected.
 A revoked or degraded one opens at the grant step showing its state and reason

@@ -229,14 +229,18 @@ impl KeyScope {
 /// order *is* the resolution order.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum MappingScope {
-    /// A specific variant of a specific surface.
-    Variant {
-        surface_id: String,
-        variant_id: String,
-    },
-    Surface {
-        surface_id: String,
-    },
+    Surface { surface_id: String },
+}
+
+/// What the stored surface says about the key that signs for it.
+#[derive(Debug)]
+enum LiveSigning {
+    /// The surface, or the issuer it follows, names this key.
+    Declared(KeyRef),
+    /// Neither names one, so the gateway-wide default signs.
+    FollowsDefault,
+    /// No store, or no such stored surface: the startup mappings decide.
+    Unknown,
 }
 
 /// Supplies the appliance-wide signing override, read fresh on every
@@ -572,7 +576,7 @@ impl KeyDirectory {
         // Reading it as "no opinion" let it fall through to the appliance
         // default, so a surface switched back to the gateway's own key carried
         // on issuing through the agent and the setting looked inert.
-        if let Ok(Some(declared)) = self
+        if let Ok(LiveSigning::Declared(declared)) = self
             .live_surface_ref(KeyPurpose::Credential, scope)
             .await
             && matches!(declared.backend, KeyBackend::Local)
@@ -755,9 +759,11 @@ impl KeyDirectory {
 
     /// The mapping a surface declares **right now**, if it declares one.
     ///
-    /// `Ok(None)` — no store, no such surface, or nothing declared — falls
-    /// through to the snapshot and then the appliance default, which is what an
-    /// unmapped surface has always resolved. A store that cannot be read, or a
+    /// Without a store or a stored surface the answer is
+    /// [`LiveSigning::Unknown`], and the mappings installed at startup decide.
+    /// A stored surface is the answer: what it or its issuer declares, or
+    /// [`LiveSigning::FollowsDefault`] when neither declares anything, so a
+    /// choice cleared since startup stops applying at once. A store that cannot be read, or a
     /// declared block this backend cannot serve for `purpose`, is an error: the
     /// surface may map a trust agent key, and reading either as "no mapping"
     /// would sign with the appliance key instead.
@@ -781,35 +787,24 @@ impl KeyDirectory {
         &self,
         purpose: KeyPurpose,
         scope: &KeyScope,
-    ) -> Result<Option<KeyRef>, VtaError> {
+    ) -> Result<LiveSigning, VtaError> {
         let (Some(store), Some(surface_id)) = (self.surfaces.as_ref(), scope.surface_id.as_deref()) else {
-            return Ok(None);
+            return Ok(LiveSigning::Unknown);
         };
         let Some(surface) = crate::surfaces::AgentSurfaceStore::get_checked(store.as_ref(), surface_id)
             .await
             .map_err(|e| VtaError::Config(format!("surface `{surface_id}` could not be read for its signing: {e}")))?
         else {
-            return Ok(None);
+            return Ok(LiveSigning::Unknown);
         };
 
-        // A variant override wins over its surface, matching `resolve`.
-        let variant_signing = scope
-            .variant_id
-            .as_deref()
-            .and_then(|variant_id| {
-                surface
-                    .variants
-                    .iter()
-                    .find(|v| v.id == variant_id)
-            })
-            .and_then(|v| v.overrides.signing.as_ref())
-            .filter(|s| !s.is_empty());
-        // A surface that sets nothing follows the issuer that owns it, before the appliance default.
+        // A variant signs with its surface's choice, and a surface that sets
+        // nothing follows the issuer that owns it, before the appliance default.
         let issuer_signing;
-        let signing = match variant_signing.or(surface
+        let signing = match surface
             .signing
             .as_ref()
-            .filter(|s| !s.is_empty()))
+            .filter(|s| !s.is_empty())
         {
             Some(own) => own,
             None => match self
@@ -820,12 +815,12 @@ impl KeyDirectory {
                     issuer_signing = signing;
                     &issuer_signing
                 }
-                None => return Ok(None),
+                None => return Ok(LiveSigning::FollowsDefault),
             },
         };
 
         signing_key_ref(signing, purpose)
-            .map(Some)
+            .map(LiveSigning::Declared)
             .map_err(|e| {
                 VtaError::Config(format!(
                     "surface `{surface_id}` declares a signing key it cannot use: {}",
@@ -846,31 +841,11 @@ impl KeyDirectory {
         self
     }
 
-    /// Install a scoped override, fed from per-surface and per-variant
-    /// `signing` config.
+    /// Install a surface-scoped override, fed from a surface's `signing`
+    /// config.
     ///
     /// Returns an error for a `KeyRef` the backend cannot honour, so a bad
     /// mapping is rejected when it is installed rather than when it first signs.
-    fn push_variant_mapping(
-        &mut self,
-        surface_id: impl Into<String>,
-        variant_id: impl Into<String>,
-        key_ref: KeyRef,
-    ) -> Result<(), VtaError> {
-        key_ref.validate()?;
-        self.mappings
-            .push(KeyMapping {
-                scope: MappingScope::Variant {
-                    surface_id: surface_id.into(),
-                    variant_id: variant_id.into(),
-                },
-                purpose: key_ref.purpose,
-                key_ref,
-            });
-        Ok(())
-    }
-
-    /// Install a surface-scoped override. See [`Self::push_variant_mapping`].
     fn push_surface_mapping(
         &mut self,
         surface_id: impl Into<String>,
@@ -886,16 +861,12 @@ impl KeyDirectory {
         Ok(())
     }
 
-    /// Install the mappings a surface and its variants declare.
+    /// Install the mappings a surface declares.
     ///
     /// A surface with no `signing` block installs nothing and therefore keeps
-    /// resolving the appliance default — exactly today's behaviour. A variant
-    /// with no override installs nothing either and so **inherits** its
-    /// surface's mapping, because a variant is a sparse delta everywhere else
-    /// in the system and signing follows the same rule.
-    ///
-    /// All-or-nothing: every mapping is validated before any is installed, so
-    /// a surface with one bad variant does not end up half-mapped.
+    /// resolving the appliance default. Its variants sign with its choice: a
+    /// save refuses a variant `signing` block, and one written to storage
+    /// directly is ignored.
     pub fn with_surface(
         &mut self,
         surface: &crate::config::agent_surface::AgentSurface,
@@ -932,27 +903,8 @@ impl KeyDirectory {
                 surface_refs.push(signing_key_ref(signing, purpose)?);
             }
         }
-        let mut variant_refs = Vec::new();
-        for variant in &surface.variants {
-            let Some(signing) = variant
-                .overrides
-                .signing
-                .as_ref()
-                .filter(|s| !s.is_empty())
-            else {
-                continue;
-            };
-            signing_key_ref(signing, KeyPurpose::Jwt)?;
-            for purpose in purposes_for(signing) {
-                variant_refs.push((variant.id.clone(), signing_key_ref(signing, purpose)?));
-            }
-        }
-
         for key_ref in surface_refs {
             self.push_surface_mapping(surface.surface_id.clone(), key_ref)?;
-        }
-        for (variant_id, key_ref) in variant_refs {
-            self.push_variant_mapping(surface.surface_id.clone(), variant_id, key_ref)?;
         }
         Ok(())
     }
@@ -969,24 +921,21 @@ impl KeyDirectory {
         purpose: KeyPurpose,
         scope: &KeyScope,
     ) -> Result<KeyRef, VtaError> {
-        if let (Some(surface_id), Some(variant_id)) = (
-            scope
-                .surface_id
-                .as_deref(),
-            scope
-                .variant_id
-                .as_deref(),
-        ) && let Some(m) = self.find(purpose, |s| {
-            matches!(s, MappingScope::Variant { surface_id: sid, variant_id: vid } if sid == surface_id && vid == variant_id)
-        }) {
-            return Ok(m);
-        }
         if let Some(surface_id) = scope.surface_id.as_deref()
             && let Some(m) =
                 self.find(purpose, |s| matches!(s, MappingScope::Surface { surface_id: sid } if sid == surface_id))
         {
             return Ok(m);
         }
+        self.resolve_default(purpose)
+    }
+
+    /// What every scope without a mapping of its own resolves: the gateway-wide
+    /// default, then the `[vta]` defaults, then the local key.
+    fn resolve_default(
+        &self,
+        purpose: KeyPurpose,
+    ) -> Result<KeyRef, VtaError> {
         // The dashboard override outranks the `[vta]` block: an operator who
         // points the appliance at a paired connection in the UI expects that
         // to win over a file they may not be able to edit. It is an explicit
@@ -1027,6 +976,27 @@ impl KeyDirectory {
     ///
     /// A surface whose mapping cannot be read counts as mapped, so its signing
     /// fails closed rather than falling back to the appliance key.
+    pub async fn has_explicit_mapping(
+        &self,
+        purpose: KeyPurpose,
+        scope: &KeyScope,
+    ) -> bool {
+        match self
+            .live_surface_ref(purpose, scope)
+            .await
+        {
+            Ok(LiveSigning::Declared(_)) | Err(_) => true,
+            Ok(LiveSigning::FollowsDefault) => false,
+            Ok(LiveSigning::Unknown) => self
+                .mappings
+                .iter()
+                .filter(|m| m.purpose == purpose)
+                .any(|m| match &m.scope {
+                    MappingScope::Surface { surface_id } => scope.surface_id.as_deref() == Some(surface_id),
+                }),
+        }
+    }
+
     /// Whether the managed connection `connection_id` was deleted, disabled or
     /// revoked, so keys it signed with are no longer this gateway's. A
     /// directory with no connection records retires nothing.
@@ -1042,29 +1012,6 @@ impl KeyDirectory {
             }
             None => false,
         }
-    }
-
-    pub async fn has_explicit_mapping(
-        &self,
-        purpose: KeyPurpose,
-        scope: &KeyScope,
-    ) -> bool {
-        if !matches!(
-            self.live_surface_ref(purpose, scope)
-                .await,
-            Ok(None)
-        ) {
-            return true;
-        }
-        self.mappings
-            .iter()
-            .filter(|m| m.purpose == purpose)
-            .any(|m| match &m.scope {
-                MappingScope::Variant { surface_id, variant_id } => {
-                    scope.surface_id.as_deref() == Some(surface_id) && scope.variant_id.as_deref() == Some(variant_id)
-                }
-                MappingScope::Surface { surface_id } => scope.surface_id.as_deref() == Some(surface_id),
-            })
     }
 
     /// [`Self::resolve`], plus **lazy context provisioning**.
@@ -1087,8 +1034,9 @@ impl KeyDirectory {
             .live_surface_ref(purpose, scope)
             .await?
         {
-            Some(live) => live,
-            None => self.resolve(purpose, scope)?,
+            LiveSigning::Declared(live) => live,
+            LiveSigning::FollowsDefault => self.resolve_default(purpose)?,
+            LiveSigning::Unknown => self.resolve(purpose, scope)?,
         };
         let KeyBackend::Vta { connection_id } = &key_ref.backend else {
             return Ok(key_ref);
@@ -1923,29 +1871,13 @@ mod tests {
     }
 
     #[test]
-    fn a_variant_mapping_beats_a_surface_mapping() {
+    fn a_variant_signs_with_its_surfaces_mapping() {
         let mut dir = directory_with(None);
         dir.push_surface_mapping("surface-a", vta_jwt_ref("surface-key"))
             .unwrap();
-        dir.push_variant_mapping("surface-a", "variant-a", vta_jwt_ref("variant-key"))
-            .unwrap();
 
-        let scope = KeyScope {
-            tenant_id: Some("tenant-a".to_string()),
-            surface_id: Some("surface-a".to_string()),
-            variant_id: Some("variant-a".to_string()),
-        };
         assert_eq!(
-            dir.resolve(KeyPurpose::Jwt, &scope)
-                .unwrap()
-                .key_id
-                .as_ref()
-                .map(KeyId::as_str),
-            Some("variant-key")
-        );
-        // An unmapped variant of the same surface falls back to the surface.
-        assert_eq!(
-            dir.resolve(KeyPurpose::Jwt, &KeyScope::variant("surface-a", "variant-z"))
+            dir.resolve(KeyPurpose::Jwt, &KeyScope::variant("surface-a", "variant-a"))
                 .unwrap()
                 .key_id
                 .as_ref()
@@ -2865,21 +2797,16 @@ mod tests {
             Some("key-surface")
         );
 
-        // Overrides — only when the operator deliberately asked.
+        // A variant `signing` block written to storage directly is ignored:
+        // a save refuses it, and the variant signs with its surface's choice.
         let own = dir
             .resolve(KeyPurpose::Jwt, &KeyScope::variant("s1", "v-own"))
             .unwrap();
         assert_eq!(
-            own.context
-                .as_ref()
-                .map(ContextId::as_str),
-            Some("ctx-variant")
-        );
-        assert_eq!(
             own.key_id
                 .as_ref()
                 .map(KeyId::as_str),
-            Some("key-variant")
+            Some("key-surface")
         );
     }
 
@@ -2906,14 +2833,11 @@ mod tests {
     }
 
     #[test]
-    fn a_surface_with_one_bad_variant_installs_nothing() {
+    fn a_variant_signing_block_is_ignored_even_when_it_could_not_sign() {
         use crate::config::agent_surface::{SigningBackendKind, SurfaceSigningConfig};
 
         let mut dir = directory_with(None);
-        dir.defaults
-            .insert(KeyPurpose::Jwt, vta_jwt_ref("appliance-key"));
         let bad = SurfaceSigningConfig {
-            // `local` cannot carry a context — contradictory, so rejected.
             backend: Some(SigningBackendKind::Local),
             connection_id: None,
             context_id: Some("ctx".to_string()),
@@ -2921,19 +2845,15 @@ mod tests {
         };
         let surface = surface_with("s1", Some(vta_signing("ctx-surface", "key-surface")), vec![("v", Some(bad))]);
 
-        assert!(
-            dir.with_surface(&surface)
-                .is_err()
-        );
-        // All-or-nothing: the valid surface-level mapping must not be left
-        // installed alongside a rejected variant.
+        dir.with_surface(&surface)
+            .expect("the variant's block is not the surface's to install");
         assert_eq!(
-            dir.resolve(KeyPurpose::Jwt, &KeyScope::surface("s1"))
+            dir.resolve(KeyPurpose::Jwt, &KeyScope::variant("s1", "v"))
                 .unwrap()
                 .key_id
                 .as_ref()
                 .map(KeyId::as_str),
-            Some("appliance-key")
+            Some("key-surface")
         );
     }
 
@@ -3062,6 +2982,49 @@ mod tests {
             !dir.has_explicit_mapping(KeyPurpose::Credential, &KeyScope::surface("surface-1"))
                 .await,
             "a mapping for one purpose says nothing about another"
+        );
+    }
+
+    /// A stored surface whose signing choice was cleared since startup follows
+    /// the gateway-wide default at once, and no longer counts as mapped.
+    #[tokio::test]
+    async fn a_signing_choice_cleared_since_startup_stops_applying_without_a_restart() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            crate::surfaces::FileSystemAgentSurfaceStore::new(tmp.path().to_path_buf())
+                .await
+                .expect("surface store"),
+        ) as Arc<dyn crate::surfaces::AgentSurfaceStore>;
+        let mut surface = crate::config::agent_surface::AgentSurface {
+            surface_id: "s1".to_string(),
+            signing: Some(vta_signing("ctx-surface", "key-surface")),
+            ..Default::default()
+        };
+        let mut dir = directory_with(None);
+        dir.defaults
+            .insert(KeyPurpose::Jwt, vta_jwt_ref("appliance-key"));
+        dir.with_surface(&surface)
+            .unwrap();
+        let dir = dir.with_surface_store(Arc::clone(&store));
+
+        surface.signing = None;
+        crate::surfaces::AgentSurfaceStore::save(store.as_ref(), &surface)
+            .await
+            .unwrap();
+
+        let scope = KeyScope::surface("s1");
+        assert_eq!(
+            dir.resolve_and_provision(KeyPurpose::Jwt, &scope)
+                .await
+                .unwrap()
+                .key_id
+                .as_ref()
+                .map(KeyId::as_str),
+            Some("appliance-key")
+        );
+        assert!(
+            !dir.has_explicit_mapping(KeyPurpose::Jwt, &scope)
+                .await
         );
     }
 

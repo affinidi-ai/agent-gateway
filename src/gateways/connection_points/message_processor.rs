@@ -7089,7 +7089,13 @@ async fn process_charged_forward_request(
                         && let Some(vc_issuer) = GLOBAL_VC_ISSUER.get()
                     {
                         card_changed |=
-                            crate::a2a::inject_credential_into_agent_card(&mut agent_card, &resolved_identity, vc_issuer, channel_id)
+                            crate::a2a::inject_credential_into_agent_card(
+                                &mut agent_card,
+                                &resolved_identity,
+                                vc_issuer,
+                                channel_id,
+                                &crate::vta::key_directory::KeyScope::serving(&resolved_surface, active_variant_id.as_deref()),
+                            )
                                 .await
                                 .inspect_err(|e| {
                                     channel_warn!(config_id, "GW2: Failed to inject identity credential into agent card: {}", e)

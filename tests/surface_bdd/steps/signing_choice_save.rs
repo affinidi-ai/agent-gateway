@@ -184,6 +184,17 @@ async fn token_saves_surface_signing(
     save_surface_with_token(world, &surface).await;
 }
 
+#[when(expr = "the personal access token moves the surface to the issuer {string}")]
+async fn token_moves_surface_to_issuer(
+    world: &mut SurfaceWorld,
+    issuer: String,
+) {
+    let id = issuer_id(world, &issuer);
+    let mut surface = stored_surface(world).await;
+    surface["issuer_id"] = json!(id);
+    save_surface_with_token(world, &surface).await;
+}
+
 #[when(expr = "the personal access token saves the surface with the description {string}")]
 async fn token_saves_surface_description(
     world: &mut SurfaceWorld,

@@ -3179,18 +3179,56 @@ fn refuse_variant_signing(surface: &AgentSurface) -> Result<(), SurfaceApiError>
     )))
 }
 
-/// A save that changes the surface's signing choice also needs `key_management.edit`.
+/// The signing choice a surface signs with: its own block, else its issuer's.
+async fn effective_signing(
+    state: &IdentityApiState,
+    surface: &AgentSurface,
+) -> Result<Option<crate::config::agent_surface::SurfaceSigningConfig>, SurfaceApiError> {
+    if let Some(own) = surface
+        .signing
+        .as_ref()
+        .filter(|signing| !signing.is_empty())
+    {
+        return Ok(Some(own.clone()));
+    }
+    let (Some(store), Some(issuer_id)) = (state.issuer_store.as_ref(), surface.issuer_id.as_deref()) else {
+        return Ok(None);
+    };
+    let issuer = crate::issuers::IssuerStore::get(store.as_ref(), issuer_id)
+        .await
+        .map_err(|e| SurfaceApiError::InternalError(format!("issuer `{issuer_id}` could not be read: {e}")))?;
+    Ok(issuer
+        .and_then(|issuer| issuer.signing)
+        .filter(|signing| !signing.is_empty()))
+}
+
+/// A save that changes which signing choice the surface signs with also needs
+/// `key_management.edit`: its own block, or the issuer it follows when it sets
+/// none, so moving `issuer_id` onto an issuer with another signer counts too.
 async fn require_signing_permission(
+    state: &IdentityApiState,
     stored: Option<&AgentSurface>,
     surface: &AgentSurface,
     editor: &super::signing_choice::SigningEditor,
 ) -> Result<(), SurfaceApiError> {
-    if super::signing_choice::signing_changed(
-        stored.and_then(|stored| stored.signing.as_ref()),
-        surface.signing.as_ref(),
-    ) && !editor
-        .may_change_signing()
-        .await
+    let same_issuer = stored.is_some_and(|stored| stored.issuer_id == surface.issuer_id);
+    let changed = if same_issuer {
+        super::signing_choice::signing_changed(
+            stored.and_then(|stored| stored.signing.as_ref()),
+            surface.signing.as_ref(),
+        )
+    } else {
+        let before = match stored {
+            Some(stored) => effective_signing(state, stored).await?,
+            None => None,
+        };
+        let after = effective_signing(state, surface).await?;
+        super::signing_choice::signing_changed(before.as_ref(), after.as_ref())
+    };
+    if changed
+        && !editor
+            .may_change_signing()
+            .await
     {
         crate::audit::trust_agent_changes::signing_change_refused(
             crate::audit::events::SigningOwnerKind::Surface,
@@ -3294,7 +3332,7 @@ pub async fn create_surface(
     refuse_a2a_settings_sent_on_other_protocols(&surface)?;
     convert_old_shape_body(&mut surface)?;
     drop_inbound_api_key_ids(&mut surface);
-    require_signing_permission(None, &surface, &signing_editor).await?;
+    require_signing_permission(&state, None, &surface, &signing_editor).await?;
 
     // Assign a new ID if not provided
     if surface.surface_id.is_empty() {
@@ -4347,7 +4385,7 @@ async fn validate_and_save_surface(
     signing_editor: &super::signing_choice::SigningEditor,
 ) -> Result<(AgentSurface, Vec<SurfaceWarning>), SurfaceApiError> {
     drop_inbound_api_key_ids(&mut surface);
-    require_signing_permission(existing, &surface, signing_editor).await?;
+    require_signing_permission(state, existing, &surface, signing_editor).await?;
     // Normalize the route BEFORE the shape check so the historical "missing
     // slash is auto-fixed" behaviour is preserved.
     normalize_saved_route(&mut surface, existing);

@@ -231,6 +231,21 @@ async fn mcp_server_received_credential_issued_by_the_context(
     assert_issued_by_the_trust_agent_context(world, &credential);
 }
 
+#[then("the agent card carries a presentation whose credential the trust agent context issued")]
+async fn agent_card_carries_credential_issued_by_the_context(world: &mut SurfaceWorld) {
+    let body = crate::steps::then::get_response_body_value(world).clone();
+    let extension = body["capabilities"]["extensions"]
+        .as_array()
+        .and_then(|extensions| {
+            extensions
+                .iter()
+                .find(|ext| ext["uri"] == AGENT_IDENTITY_CREDENTIAL_URI)
+        })
+        .unwrap_or_else(|| panic!("the agent card carries no credential extension: {body}"));
+    let credential = first_credential(&extension["params"]["verifiablePresentation"]);
+    assert_issued_by_the_trust_agent_context(world, &credential);
+}
+
 #[then("the MCP response carries a presentation whose credential the trust agent context issued")]
 async fn mcp_response_carries_credential_issued_by_the_context(world: &mut SurfaceWorld) {
     let body = world

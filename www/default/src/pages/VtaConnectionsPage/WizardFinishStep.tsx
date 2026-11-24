@@ -34,7 +34,8 @@ export const WizardFinishStep: React.FC<Props> = ({
 }) => {
   const { hasPermission } = usePermissions();
   const canProvision = hasPermission('key_management.edit');
-  const canSetDefault = hasPermission('settings.edit');
+  // The server needs both to change Gateway signing, as the Settings section does.
+  const canSetDefault = hasPermission('settings.edit') && hasPermission('key_management.edit');
 
   const [current, setCurrent] = useState(connection);
   const [minting, setMinting] = useState(false);
@@ -65,9 +66,10 @@ export const WizardFinishStep: React.FC<Props> = ({
     })();
   }, [activeKeyId, canProvision, current, onProvisionKey, onSettled]);
 
-  // Pre-check only when the appliance has no agent default yet. Connecting a
-  // second agent must never silently repoint signing for everything already
-  // running against the first.
+  // Pre-check only when the settings were read and hold no default at all.
+  // Connecting a second agent must never silently repoint signing for
+  // everything already running against the first, an explicit choice of the
+  // gateway's own key is a default too, and a failed read says nothing.
   useEffect(() => {
     void (async () => {
       try {
@@ -75,7 +77,9 @@ export const WizardFinishStep: React.FC<Props> = ({
         const settings = response.ok ? await response.json() : null;
         const existing = settings?.default_signing?.connection_id ?? null;
         setExistingDefault(existing);
-        const preCheck = canSetDefault && !existing;
+        const stored = settings?.default_signing;
+        const noDefault = response.ok && !stored?.backend && !stored?.connection_id;
+        const preCheck = canSetDefault && noDefault;
         setMakeDefault(preCheck);
         onDefaultChoice(preCheck);
       } catch {

@@ -219,6 +219,9 @@ pub fn apply_verification(
     outcome: &VerificationOutcome,
     now: DateTime<Utc>,
 ) -> PairingRecord {
+    if previous.state == PairingState::Revoked {
+        return previous.clone();
+    }
     let mut record = previous.clone();
     record.last_error = None;
 
@@ -658,6 +661,22 @@ mod tests {
             "unexpected error: {}",
             err.log_detail()
         );
+    }
+
+    #[test]
+    fn a_successful_verify_leaves_a_revoked_connection_revoked() {
+        let connection = connection(Some("ctx"));
+        let revoked = revoke(&paired(&connection));
+        let after = apply_verification(
+            &connection,
+            &revoked,
+            &VerificationOutcome {
+                observed_vta_did: connection.vta_did.clone(),
+                scope: scope(REQUESTED_ROLE, &["ctx"]),
+            },
+            Utc::now(),
+        );
+        assert_eq!(after, revoked, "only pairing again brings it back");
     }
 
     #[test]

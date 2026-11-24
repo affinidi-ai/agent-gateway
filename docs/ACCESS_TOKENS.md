@@ -308,7 +308,7 @@ mirrors the `[vta]` block is appliance-wide. A tenant PAT lists and reads its ow
 connections and appliance-wide ones; another tenant's answers `404`, and so does a connection
 outside the PAT's resource pattern on the pairing and rotation routes. A connection's
 `control_key_ref` must name a secret its tenant may reference. A surface's or issuer's
-`signing.connection_id`, in the base and in every variant, must name a connection of its own
+`signing.connection_id` (a variant sets none; it signs with its surface's) must name a connection of its own
 tenant or an appliance-wide one, and an unknown id is refused the same way, so a save never
 reveals whether another tenant's connection exists. The key inventory
 (`GET /v1/key-management/inventory`) lists only the connections the caller may read. The
@@ -381,7 +381,9 @@ trust-ping, Issuer Trust Registry retry, and Trust Registry record-list/reconnec
 enforce owning-record tenancy plus canonical scope; Trust Registry
 list/get/action routes also carry explicit feature guards. Tenant-ownership
 impact reads filter the root and every graph edge by tenant/scope, and
-resource-scoped PATs cannot reassign ownership. Surface reference validation
+resource-scoped PATs cannot reassign ownership. A surface that signs through the appliance's own
+trust agent without naming a context signs, once moved, in its new tenant's context and as a new
+DID (see [`TRUST_AGENT_SIGNING.md`](TRUST_AGENT_SIGNING.md)). Surface reference validation
 includes the caller Trust Check list, the Managed Agent target list, each Transit
 Point's Trust Check list and the secrets, JWT verification strategies, API-key
 parents and certificates its `source_auth` names, every Trust Recorder entry, and the

@@ -858,13 +858,6 @@ impl AgentSurface {
         if let Some(canvas) = overrides.canvas {
             resolved.canvas = Some(canvas);
         }
-        // Signing follows the same sparse-delta rule as everything else: a
-        // variant without an override inherits the surface's context rather
-        // than getting one of its own.
-        if let Some(signing) = overrides.signing {
-            resolved.signing = Some(signing);
-        }
-
         resolved
     }
 

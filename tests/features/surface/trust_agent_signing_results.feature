@@ -49,7 +49,7 @@ Feature: What the gateway signs through a trust agent verifies against the trust
     And the surface signs through that trust agent
     And the trust agent can no longer be reached
     When the caller invokes MCP tool "get_news" with a valid inbound identity payload
-    Then the response status is 422
+    Then the response status is 503
     And MCP server "bravo" was not called
 
   Scenario: The managed agent's identity on a surface that signs through a trust agent carries a credential its context issued
@@ -61,3 +61,13 @@ Feature: What the gateway signs through a trust agent verifies against the trust
     When the caller invokes MCP tool "get_news"
     Then the response status is 200
     And the MCP response carries a presentation whose credential the trust agent context issued
+
+  Scenario: The agent card a surface that signs through a trust agent serves carries a credential its context issued
+    Given A2A surface "orders" is defined for route "/orders" with managed agent "bravo" as its target
+    And the surface has managed identity enabled
+    And managed agent "bravo" publishes the agent-identity extension on its agent card
+    And the operator has connected a trust agent that signs as its context "orders" with key "orders-key"
+    And the surface signs through that trust agent
+    When the caller fetches the agent card for surface "orders"
+    Then the response status is 200
+    And the agent card carries a presentation whose credential the trust agent context issued

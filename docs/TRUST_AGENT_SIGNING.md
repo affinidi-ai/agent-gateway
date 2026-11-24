@@ -47,8 +47,9 @@ A signing key resolves in this order, first match wins:
 4. the `[vta]` block, when it is enabled;
 5. the gateway's own key.
 
-A surface variant cannot set `signing` (a save that does is refused with `400`); it signs with its
-surface's choice.
+A surface variant cannot set `signing` (a save that does is refused with `400`, and a block written
+to storage directly is ignored); it signs with its surface's choice. Signing follows the stored
+surface: a choice saved or cleared takes effect on the next signature, with no restart.
 
 A `signing` block names `backend` (`local` or `vta`) and, for a trust agent, `connection_id`,
 `context_id` and `key_id`. Surface, issuer and Gateway signing saves run one check: a trust agent
@@ -59,7 +60,9 @@ block and is refused while the
 block is off; a surface or issuer may sign only through its own tenant's connection or an
 appliance-wide one; Gateway signing must name an existing appliance-wide connection. Changing a surface's, an issuer's or the gateway-wide
 signing choice needs `key_management.edit` on top of the route's own permission; a save that sends
-the stored choice back unchanged does not. In the
+the stored choice back unchanged does not. For a surface the choice compared is the one it signs
+with: its own block, or else its issuer's, so moving a surface that sets none onto an issuer with
+another signer needs it too, and moving it between issuers that sign alike does not. In the
 dashboard this is the **Signing key source** field: **Gateway secret** or **Verifiable Trust
 Agent**, which picks one of the connected agents.
 
@@ -77,9 +80,11 @@ trust agent's token key does not make, still follow `[vta]`. The key inventory's
 `custody_claim` and key surfaces, and `GET /v1/vta/status`, follow the same effective default.
 
 The identity credential the gateway injects into a request, response, stream, Transit Point call,
-Fabric message or MCP exchange is issued under the signing of the surface serving it. When that
-surface's trust agent cannot be used, no credential is injected; one from the gateway's key is
-never substituted.
+Fabric message, MCP exchange or served agent card is issued under the signing of the surface
+serving it. When that surface's trust agent cannot be used, no credential is injected; one from
+the gateway's key is never substituted. A caller whose identity needs that credential is answered
+`503` (`identity_did_failed`), which is worth retrying; a payload the identity schema refuses is
+still `422`.
 
 When Gateway signing names a trust agent that cannot be used (no connection or context, or a
 connection that is disabled, unpaired, revoked or unreachable), the agent identity credential is
@@ -299,6 +304,10 @@ or when either cannot be checked. Repeating the request with `?acknowledge_signi
 and/or `?acknowledge_stranded_agents=true` proceeds; the dashboard asks for a second click on
 Revoke, naming what stops signing, and sends both.
 
+A revoked connection stays revoked until it is paired again: Verify answers `409` for it, and a
+revoke that lands while Verify is talking to the agent is kept. The `[vta]` block's own record
+(`vta-bootstrap`) cannot be revoked, deleted, edited or verified (`409`); it follows the block.
+
 ### A trust agent for one surface or issuer
 
 A surface's `signing.connection_id` (with its `context_id` and `key_id`) has its identity
@@ -321,7 +330,11 @@ appliance's own trust agent (no connection, `default` or `vta-bootstrap`) cannot
 the agent's grant covers every context, so the gateway creates the tenant's own. A surface's
 created context is named for its owner and id, `ctx:<tenant>/<surface id>` (`_global` for an
 appliance-wide surface), with the owner read from the stored surface, so a surface created under
-another tenant with a deleted surface's id never signs in that surface's context. For a tenant PAT,
+another tenant with a deleted surface's id never signs in that surface's context. The name is
+derived, not stored: within one owner, a surface created with a deleted surface's id signs in that
+surface's context and as its DID, and a surface moved to another tenant signs in the new tenant's
+context and as a new DID, never in the old tenant's. A surface that must keep its signing DID
+across a move names its `context_id`; a new identity needs a new id or a named context. For a tenant PAT,
 `GET /v1/vta/status` lists only the reserved addresses of the connections it may see, and leaves out
 the appliance control DID and control key. See
 [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#trust-agent-connections) and
@@ -569,8 +582,11 @@ staying scoped to one context, which each such test names.
   keys of the signer used before Gateway signing last changed, so a token a surface signs with
   another trust agent key may not verify through it; such a token verifies by resolving its
   `iss`. An earlier signer stays published, and token exchange accepts a token claiming its
-  issuer DID, until every token it signed has expired: 20 minutes after Gateway signing moved off
-  it (the 15-minute longest access token lifetime plus clock leeway). It is dropped at once when
+  issuer DID, for 20 minutes after Gateway signing moved off it (the 15-minute longest access
+  token lifetime plus clock leeway). That covers what is verified against this key set: access
+  tokens, ID-JAGs and MCP access tokens. Agent identity credentials and payment receipts, which
+  live longer, name the trust agent key's `did:key` or context DID as their issuer and verify by
+  resolving it, so they do not depend on the window. It is dropped at once when
   its connection is deleted, disabled or revoked, so retiring an agent (move Gateway signing off
   it, then revoke it) stops the gateway trusting its key. The current signer is recorded the first
   time it resolves, and with the earlier signers (the connection each signed through and when it

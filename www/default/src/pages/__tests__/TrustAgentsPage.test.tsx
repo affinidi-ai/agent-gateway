@@ -132,6 +132,74 @@ describe('TrustAgentsPage', () => {
     expect(await screen.findByTestId('vta-control-key')).toBeInTheDocument();
   });
 
+  describe('revoking a connection agents were onboarded through', () => {
+    const other = { ...agent, id: 'agent-2', name: 'Staging agent' };
+    const revokeCalls: string[] = [];
+
+    beforeEach(() => {
+      revokeCalls.length = 0;
+      mockFetch.mockImplementation((url: string) => {
+        if (url.includes('/revoke')) {
+          revokeCalls.push(url);
+          const acknowledged = url.includes('acknowledge_stranded_agents=true');
+          return Promise.resolve(
+            acknowledged
+              ? { ok: true, status: 200, json: () => Promise.resolve(agent) }
+              : {
+                  ok: false,
+                  status: 409,
+                  json: () => Promise.resolve({ error: 'Agents were onboarded through it.' }),
+                }
+          );
+        }
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve(
+              url.includes('/vta/status')
+                ? { enabled: false, tier: 'local', custody_claim: false, reserved_origins: [] }
+                : [agent, other]
+            ),
+        });
+      });
+    });
+
+    const revokeButtons = async () => {
+      await screen.findByText('Staging agent');
+      return screen.getAllByRole('button', { name: 'Revoke' });
+    };
+
+    it('acknowledges the stranded agents on the click right after the warning', async () => {
+      mountTab();
+      const [first] = await revokeButtons();
+
+      await userEvent.click(first);
+      await userEvent.click(first);
+      await waitFor(() => expect(revokeCalls).toHaveLength(1));
+      await userEvent.click(first);
+
+      await waitFor(() => expect(revokeCalls).toHaveLength(2));
+      expect(revokeCalls[0]).not.toContain('acknowledge');
+      expect(revokeCalls[1]).toContain('acknowledge_stranded_agents=true');
+    });
+
+    it('asks the server again once another row was armed in between', async () => {
+      mountTab();
+      const [first, second] = await revokeButtons();
+
+      await userEvent.click(first);
+      await userEvent.click(first);
+      await waitFor(() => expect(revokeCalls).toHaveLength(1));
+      await userEvent.click(second);
+      await userEvent.click(first);
+      await userEvent.click(first);
+
+      await waitFor(() => expect(revokeCalls).toHaveLength(2));
+      expect(revokeCalls[1]).toContain('agent-1');
+      expect(revokeCalls[1]).not.toContain('acknowledge');
+    });
+  });
+
   it('shows no control key card without one', async () => {
     respond([agent]);
     mountTab();

@@ -2,11 +2,13 @@ branch: vta-local-signing
 changes:
   added:
     - timestamp: '2026-10-23T07:00:00.000Z'
-      title: ⭐ Let the gateway sign through a Verifiable Trust Agent that holds its keys
+      title: ⭐ Let the gateway sign tokens and credentials through a Verifiable Trust Agent
       description: >-
         The gateway can be connected to a Verifiable Trust Agent (VTA) and sign
-        through it, so the private keys it signs with no longer sit on its own
-        disk. Once one is chosen, the gateway's STS access tokens, ID-JAGs, MCP
+        through it, so the keys its tokens and credentials are signed with stay
+        in the trust agent. The gateway still holds the control key it signs in
+        to the trust agent with, its own key for local signing, and the keys of
+        agents onboarded before connecting. Once one is chosen, the gateway's STS access tokens, ID-JAGs, MCP
         access tokens, payment receipts, agent identity credentials and the
         issuer attestation a peer gateway receives are signed by the trust
         agent, and agents onboarded from then on get their key inside it, so
@@ -63,7 +65,8 @@ changes:
         follows. A surface or issuer can name only a trust agent connection of
         its own tenant or an appliance-wide one, and Gateway signing only an
         appliance-wide one. Changing any of these choices needs key management
-        rights as well as the editor's own rights, and for Gateway signing the dashboard asks
+        rights as well as the editor's own rights, including moving a surface
+        onto an issuer that signs differently, and for Gateway signing the dashboard asks
         for confirmation first, listing that the issuer of what is issued from
         then on changes, that peers and verifiers must trust it, and that tokens
         already issued keep the key that signed them. With Verifiable Trust Agent
@@ -144,7 +147,10 @@ changes:
         lock and save only the fields they change, so concurrent changes do not
         overwrite each other. Verify keeps the stored state while the agent
         answers 408, 429 or a 5xx, and degrades the connection only on a
-        definite refusal. A Standby node leaves a pending [vta] control key to
+        definite refusal. A revoked connection stays revoked until it is paired
+        again: Verify refuses it, and a revoke made during a Verify is kept. The
+        [vta] block's own connection cannot be revoked, since it keeps signing
+        through the block. A Standby node leaves a pending [vta] control key to
         the Active node.
     - timestamp: '2026-11-24T10:05:00Z'
       title: Keep tokens signed before a Gateway signing change verifying for a while
@@ -182,6 +188,25 @@ changes:
         the wizard shows the reason the gateway recorded. Editors that follow
         the gateway-wide signing default name the default the dashboard set, or
         say it could not be read.
+        The connect wizard offers "Use this agent for all signing" only to users
+        who may change Gateway signing, and pre-checks it only when no default
+        is stored; Key Management rotates with the key id typed on that
+        connection's own card; and a revoke's acknowledgement of stranded agents
+        applies only to the click right after the warning.
+    - timestamp: '2026-11-19T16:30:00Z'
+      title: Record trust agent changes and refusals as tamper-evident security records
+      description: >-
+        Creating, updating, pairing, verifying, revoking or deleting a trust
+        agent connection, provisioning or rotating its signing key, and rotating
+        or cancelling a control key each emit a governance audit event in a new
+        Key management group. Refusals of those routes (401, 403, 409, and 404
+        for a connection the caller may not see) emit trust_agent_change_refused,
+        and a signing change refused for lack of key_management.edit emits
+        signing_change_refused. Each record names its actor, is appended to a
+        SHA-256 hash chain under the audit directory before the response is
+        sent, is logged on the security_audit target and reaches the VP Audit
+        Log and integrations that select it, so an edited, removed or reordered
+        record is detectable.
   changed:
     - timestamp: '2026-11-11T18:00:00Z'
       title: ⭐ Sign with the gateway's own keys through the VTA library
@@ -205,20 +230,6 @@ changes:
         session, and otherwise forgets the stale token and shows the sign-in form.
   removed: []
   security:
-    - timestamp: '2026-11-19T16:30:00Z'
-      title: Record trust agent changes and refusals as tamper-evident security records
-      description: >-
-        Creating, updating, pairing, verifying, revoking or deleting a trust
-        agent connection, provisioning or rotating its signing key, and rotating
-        or cancelling a control key each emit a governance audit event in a new
-        Key management group. Refusals of those routes (401, 403, 409, and 404
-        for a connection the caller may not see) emit trust_agent_change_refused,
-        and a signing change refused for lack of key_management.edit emits
-        signing_change_refused. Each record names its actor, is appended to a
-        SHA-256 hash chain under the audit directory before the response is
-        sent, is logged on the security_audit target and reaches the VP Audit
-        Log and integrations that select it, so an edited, removed or reordered
-        record is detectable.
     - timestamp: '2026-10-27T06:00:00Z'
       title: Stop a did:webvh log that contains a number from aborting the gateway
       description: >-

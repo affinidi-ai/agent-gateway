@@ -22,8 +22,18 @@ const KeyManagementTab: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [rotating, setRotating] = useState<string | null>(null);
   const [provisioning, setProvisioning] = useState<string | null>(null);
-  const [confirmRotate, setConfirmRotate] = useState<string | null>(null);
-  const [newKeyId, setNewKeyId] = useState('');
+  // Armed for one connection and the key id it would rotate to, so a second click
+  // after the field changed, or on another card, starts over.
+  const [confirmRotate, setConfirmRotate] = useState<{
+    connectionId: string;
+    keyId: string;
+  } | null>(null);
+  const [newKeyIds, setNewKeyIds] = useState<Record<string, string>>({});
+
+  const setNewKeyId = useCallback((connectionId: string, value: string) => {
+    setNewKeyIds(current => ({ ...current, [connectionId]: value }));
+    setConfirmRotate(armed => (armed?.connectionId === connectionId ? null : armed));
+  }, []);
 
   const canEdit = hasPermission('key_management.edit');
 
@@ -59,8 +69,12 @@ const KeyManagementTab: React.FC = () => {
     async (connection: ConnectionInventory) => {
       // Two-step: rotation changes which key signs from the next request on,
       // so it uses the shared destructive confirm even though nothing is lost.
-      if (confirmRotate !== connection.connection_id) {
-        setConfirmRotate(connection.connection_id);
+      const keyId = (newKeyIds[connection.connection_id] ?? '').trim();
+      if (
+        confirmRotate?.connectionId !== connection.connection_id ||
+        confirmRotate.keyId !== keyId
+      ) {
+        setConfirmRotate({ connectionId: connection.connection_id, keyId });
         showToast('error', 'Click Rotate again to start signing with the new key.');
         return;
       }
@@ -72,15 +86,15 @@ const KeyManagementTab: React.FC = () => {
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ key_id: newKeyId.trim() }),
+            body: JSON.stringify({ key_id: keyId }),
           }
         );
         if (!response.ok) {
           const body = await response.json().catch(() => null);
           throw new Error(body?.error ?? `Rotation failed: ${response.statusText}`);
         }
-        setNewKeyId('');
-        showToast('success', `${connection.name} now signs with ${newKeyId.trim()}.`);
+        setNewKeyIds(current => ({ ...current, [connection.connection_id]: '' }));
+        showToast('success', `${connection.name} now signs with ${keyId}.`);
         await load();
       } catch (e) {
         showToast('error', e instanceof Error ? e.message : 'Rotation failed.');
@@ -88,7 +102,7 @@ const KeyManagementTab: React.FC = () => {
         setRotating(null);
       }
     },
-    [confirmRotate, newKeyId, load]
+    [confirmRotate, newKeyIds, load]
   );
 
   const provision = useCallback(
@@ -195,9 +209,9 @@ const KeyManagementTab: React.FC = () => {
               {canEdit && connection.keys.length > 0 && (
                 <RotateKeyControl
                   connection={connection}
-                  keyId={newKeyId}
+                  keyId={newKeyIds[connection.connection_id] ?? ''}
                   rotating={rotating === connection.connection_id}
-                  onKeyIdChange={setNewKeyId}
+                  onKeyIdChange={value => setNewKeyId(connection.connection_id, value)}
                   onRotate={c => void rotate(c)}
                 />
               )}

@@ -127,16 +127,20 @@ const TrustAgentsPage: React.FC<TrustAgentsPageProps> = ({ externalSearchTerm, o
       // Two-step: the first click arms, the second commits — the shared
       // destructive pattern, because revoking stops every surface mapped to
       // this connection from signing immediately.
+      // The stranded-agents acknowledgement covers only the click right after the
+      // server's 409, so arming any row drops it and a later revoke asks again.
       if (confirmRevoke !== connection.id) {
         setConfirmRevoke(connection.id);
+        setStrandedConfirm(null);
         showToast('error', `Click Revoke again to stop ${connection.name} signing.`);
         return;
       }
+      const acknowledged = strandedConfirm === connection.id;
       setConfirmRevoke(null);
+      setStrandedConfirm(null);
       setBusyId(connection.id);
       try {
-        await revoke(connection, strandedConfirm === connection.id);
-        setStrandedConfirm(null);
+        await revoke(connection, acknowledged);
         showToast('success', `${connection.name} is revoked and can no longer sign.`);
       } catch (e) {
         if (e instanceof StrandedAgentsError) {

@@ -131,6 +131,80 @@ describe('WizardFinishStep', () => {
     expect(await screen.findByText(/already the appliance default/)).toBeInTheDocument();
   });
 
+  it('leaves the default unchecked when the settings could not be read', async () => {
+    mockFetch.mockResolvedValue({ ok: false, statusText: 'Service Unavailable' });
+    const onDefaultChoice = jest.fn();
+
+    render(
+      <WizardFinishStep
+        connection={connection({ keys: { active: { key_id: 'k' } } })}
+        onProvisionKey={jest.fn()}
+        onSettled={noop}
+        onDefaultChoice={onDefaultChoice}
+      />
+    );
+
+    const checkbox = await screen.findByLabelText(/Use this agent for all signing/);
+    await waitFor(() => expect(onDefaultChoice).toHaveBeenCalledWith(false));
+    expect(onDefaultChoice).not.toHaveBeenCalledWith(true);
+    expect(checkbox).not.toBeChecked();
+  });
+
+  it("leaves the default unchecked when the gateway's own key is the stored default", async () => {
+    settingsReturning({ backend: 'local' });
+    const onDefaultChoice = jest.fn();
+
+    render(
+      <WizardFinishStep
+        connection={connection({ keys: { active: { key_id: 'k' } } })}
+        onProvisionKey={jest.fn()}
+        onSettled={noop}
+        onDefaultChoice={onDefaultChoice}
+      />
+    );
+
+    const checkbox = await screen.findByLabelText(/Use this agent for all signing/);
+    await waitFor(() => expect(onDefaultChoice).toHaveBeenCalledWith(false));
+    expect(onDefaultChoice).not.toHaveBeenCalledWith(true);
+    expect(checkbox).not.toBeChecked();
+  });
+
+  it('does not offer the default without key_management.edit', async () => {
+    mockPermissions = ['settings.edit'];
+    settingsReturning(null);
+    const onDefaultChoice = jest.fn();
+
+    render(
+      <WizardFinishStep
+        connection={connection({ keys: { active: { key_id: 'k' } } })}
+        onProvisionKey={jest.fn()}
+        onSettled={noop}
+        onDefaultChoice={onDefaultChoice}
+      />
+    );
+
+    await waitFor(() => expect(onDefaultChoice).toHaveBeenCalledWith(false));
+    expect(screen.queryByLabelText(/Use this agent for all signing/)).not.toBeInTheDocument();
+    expect(onDefaultChoice).not.toHaveBeenCalledWith(true);
+  });
+
+  it('does not offer the default without settings.edit', async () => {
+    mockPermissions = ['key_management.edit'];
+    settingsReturning(null);
+
+    render(
+      <WizardFinishStep
+        connection={connection({ keys: { active: { key_id: 'k' } } })}
+        onProvisionKey={jest.fn()}
+        onSettled={noop}
+        onDefaultChoice={noop}
+      />
+    );
+
+    await screen.findByText('k');
+    expect(screen.queryByLabelText(/Use this agent for all signing/)).not.toBeInTheDocument();
+  });
+
   it('explains who to ask when the operator cannot provision keys', async () => {
     mockPermissions = ['settings.edit'];
     settingsReturning(null);
