@@ -47,8 +47,8 @@ intersection. A token created without feature scopes reports the owner's full ro
 handler authorizes on the owner's role only (user management (`/v1/users`), settings writes,
 `sign-jwt`, backup and restore, and storage export) also need the feature among the token's scopes,
 which the authentication middleware checks, so the map matches them too. A token with explicit
-scopes reaches this endpoint whatever its scopes. Resource patterns limit which resource ids a token can reach, not which features it
-holds, so they do not change the map: a resource-scoped token is still refused on unscoped writes
+scopes reaches this endpoint whatever its scopes. Resource patterns limit which resource ids a
+token can reach, not which features it holds, so they do not change the map: a resource-scoped token is still refused on unscoped writes
 even when the map says `true`. The response carries `Cache-Control: no-store` and
 `Vary: Authorization, Cookie` because its body depends on the caller's credential, which arrives in
 the `Authorization` header or the `__Host-session_token` cookie.
@@ -190,7 +190,8 @@ The built-in defaults grant `settings.edit` and `users.approve` to `administrato
 access token with feature scopes needs the permission among its scopes; one created without scopes
 follows its owner's role. The other `/v1/notifications` routes act on the caller's own
 notifications and need only a session (see
-[`INTEGRATIONS.md`](INTEGRATIONS.md#in-dashboard-notifications)).
+[`INTEGRATIONS.md`](INTEGRATIONS.md#in-dashboard-notifications)); a token with feature scopes is
+refused on them with `403` whatever its scopes.
 
 ## Dashboard log lines
 

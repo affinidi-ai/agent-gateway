@@ -2,7 +2,7 @@
 //! explicit scopes.
 //!
 //! An access token with explicit scopes reaches a route only when one of its scopes
-//! is a permission the route lists here, or the route is on the middleware's
+//! is a permission the route lists here, or the route is on
 //! `SCOPED_TOKEN_ALLOWED_ROUTES`. A route missing from both is refused, so a route
 //! added without an entry is closed to scoped tokens, not open to them. A session
 //! and a token without explicit scopes are not affected.
@@ -10,7 +10,8 @@
 //! Most entries repeat the permission the route already checks through
 //! `require_feature`, an `RbacGuard` or its handler. Routes that check no permission
 //! for a session list the permission that names their area, so a scoped token can
-//! still reach them; routes with no such permission are in `CLOSED_TO_SCOPED_TOKENS`.
+//! still reach them; routes with no such permission, and the caller's own
+//! notifications, which answer only a session, are in `CLOSED_TO_SCOPED_TOKENS`.
 
 use crate::rbac::Feature::{self, *};
 use axum::http::Method;
@@ -73,12 +74,6 @@ pub(crate) const ROUTE_SCOPES: &[RouteScope] = &[
     ("POST", "/v1/terms/customer/deactivate", &[TermsEdit]),
 
     // Notifications
-    ("GET", "/v1/notifications", &[NotificationsView]),
-    ("POST", "/v1/notifications", &[NotificationsEdit]),
-    ("GET", "/v1/notifications/{id}", &[NotificationsView]),
-    ("PUT", "/v1/notifications/{id}", &[NotificationsEdit]),
-    ("DELETE", "/v1/notifications/{id}", &[NotificationsDelete]),
-    ("GET", "/v1/notifications/unread/count", &[NotificationsView]),
     ("GET", "/v1/notifications/user-welcome-template", &[UsersApprove]),
     ("PUT", "/v1/notifications/user-welcome-template", &[UsersApprove]),
     ("POST", "/v1/notifications/send-welcome", &[UsersApprove]),
@@ -352,9 +347,14 @@ pub(crate) const ROUTE_SCOPES: &[RouteScope] = &[
     ("DELETE", "/v1/delegation-vault/grants/{grant_id}", &[DelegationVaultDelete]),
 ];
 
-/// Routes no scope covers: each checks no permission for a session (they serve the
-/// caller's own account, public data or a DID check) and no permission names their
-/// area, so a token with explicit scopes is always refused on them.
+/// Routes, by their path as registered, that an access token with explicit scopes
+/// reaches whatever its scopes: each describes only the calling token.
+pub(crate) const SCOPED_TOKEN_ALLOWED_ROUTES: &[&str] = &["/v1/token-info", "/v1/permissions"];
+
+/// Routes no scope covers, so a token with explicit scopes is always refused on them:
+/// the caller's own notifications, which answer only a session, and routes that check no
+/// permission for a session and whose area no permission names (the caller's own
+/// account, public data or a DID check).
 #[rustfmt::skip]
 pub(crate) const CLOSED_TO_SCOPED_TOKENS: &[(&str, &str)] = &[
     ("GET", "/v1/identity/did-document"),
@@ -369,6 +369,12 @@ pub(crate) const CLOSED_TO_SCOPED_TOKENS: &[(&str, &str)] = &[
     ("GET", "/v1/terms/status"),
     ("POST", "/v1/terms/acceptances"),
     ("POST", "/v1/verify/{did}"),
+    ("GET", "/v1/notifications"),
+    ("POST", "/v1/notifications"),
+    ("GET", "/v1/notifications/{id}"),
+    ("PUT", "/v1/notifications/{id}"),
+    ("DELETE", "/v1/notifications/{id}"),
+    ("GET", "/v1/notifications/unread/count"),
 ];
 
 /// The route a request matched, by its path as registered and without the prefix
@@ -405,6 +411,34 @@ pub fn route_permissions(
         .map(|(_, _, permissions)| *permissions)
 }
 
+/// The `Allow` header value of a `405` on `route`: the methods its entries list, in
+/// order, with `HEAD` after `GET` as axum answers it.
+pub fn allowed_methods(route: &str) -> String {
+    let listed = ROUTE_SCOPES
+        .iter()
+        .map(|(method, path, _)| (*method, *path))
+        .chain(
+            CLOSED_TO_SCOPED_TOKENS
+                .iter()
+                .copied(),
+        )
+        .filter(|(_, path)| *path == route)
+        .flat_map(|(method, _)| {
+            if method == "GET" {
+                vec!["GET", "HEAD"]
+            } else {
+                vec![method]
+            }
+        });
+    let mut methods: Vec<&str> = Vec::new();
+    for method in listed {
+        if !methods.contains(&method) {
+            methods.push(method);
+        }
+    }
+    methods.join(",")
+}
+
 /// What an access token with explicit scopes gets on a route.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ScopedAccess {
@@ -423,6 +457,9 @@ pub fn scoped_access(
     method: &Method,
     route: &str,
 ) -> ScopedAccess {
+    if SCOPED_TOKEN_ALLOWED_ROUTES.contains(&route) {
+        return ScopedAccess::Allowed;
+    }
     let method = if method == Method::HEAD {
         &Method::GET
     } else {
@@ -506,6 +543,13 @@ mod tests {
     }
 
     #[test]
+    fn the_allowed_methods_are_the_listed_ones_with_head_after_get() {
+        assert_eq!(allowed_methods("/v1/settings"), "GET,HEAD,POST,DELETE");
+        assert_eq!(allowed_methods("/v1/profile"), "GET,HEAD,PUT");
+        assert_eq!(allowed_methods("/v1/surfaces/validate-policy"), "POST");
+    }
+
+    #[test]
     fn a_method_a_closed_route_does_not_serve_is_not_allowed() {
         assert_eq!(access(&["settings.view"], Method::POST, "/v1/profile"), ScopedAccess::MethodNotAllowed);
         assert_eq!(access(&["settings.edit"], Method::PATCH, "/v1/user-settings"), ScopedAccess::MethodNotAllowed);
@@ -526,6 +570,25 @@ mod tests {
         assert_eq!(route_permissions(&Method::GET, "/v1/profile"), None);
         assert_eq!(access(&["settings.view", "users.view"], Method::GET, "/v1/profile"), ScopedAccess::Refused);
         assert_eq!(access(&["settings.view"], Method::GET, "/v1/unlisted"), ScopedAccess::Refused);
+    }
+
+    #[test]
+    fn a_route_that_describes_the_token_is_allowed_whatever_its_scopes() {
+        for route in ["/v1/token-info", "/v1/permissions"] {
+            assert_eq!(access(&["surfaces.view"], Method::GET, route), ScopedAccess::Allowed, "{route}");
+            assert_eq!(access(&[], Method::GET, route), ScopedAccess::Allowed, "{route}");
+        }
+    }
+
+    #[test]
+    fn a_notifications_scope_does_not_reach_the_callers_own_notifications() {
+        assert_eq!(access(&["notifications.view"], Method::GET, "/v1/notifications"), ScopedAccess::Refused);
+        assert_eq!(access(&["notifications.edit"], Method::PUT, "/v1/notifications/{id}"), ScopedAccess::Refused);
+        assert_eq!(access(&["notifications.delete"], Method::DELETE, "/v1/notifications/{id}"), ScopedAccess::Refused);
+        assert_eq!(
+            access(&["users.approve"], Method::GET, "/v1/notifications/user-welcome-template"),
+            ScopedAccess::Allowed
+        );
     }
 
     #[test]
@@ -561,8 +624,16 @@ mod tests {
 
     #[test]
     fn no_scope_covers_a_closed_route() {
-        let every_permission =
-            scopes(&["settings.view", "settings.edit", "users.view", "users.edit", "identity.issue"]);
+        let every_permission = scopes(&[
+            "settings.view",
+            "settings.edit",
+            "users.view",
+            "users.edit",
+            "identity.issue",
+            "notifications.view",
+            "notifications.edit",
+            "notifications.delete",
+        ]);
         for (method, path) in CLOSED_TO_SCOPED_TOKENS {
             let method = Method::from_bytes(method.as_bytes()).unwrap();
             assert_eq!(route_permissions(&method, path), None, "{method} {path} is also in ROUTE_SCOPES");

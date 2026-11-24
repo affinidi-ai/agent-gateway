@@ -9,7 +9,8 @@ Feature: Management route permissions
   token sees only the agents of its own surfaces. A tenant's token reads an agent card only
   through a surface of its own tenant. A personal access token with feature scopes reaches a
   route only when one of its scopes covers it, including a route a signed-in operator reaches
-  without any permission: reading the gateway settings needs settings.view.
+  without any permission: reading the gateway settings needs settings.view. Whatever its scopes,
+  such a token reads its own token info and never reads the operator profile.
 
   Scenario: An administrator downloads the server logs
     Given a log file "agent-gateway.log"
@@ -246,3 +247,16 @@ Feature: Management route permissions
     And operator "ada" holds a personal access token with scopes "settings.view"
     When the personal access token reads the gateway settings
     Then the admin API response status is 200
+
+  Scenario: A personal access token reads its own token info whatever its scopes
+    Given operator "ada" has the "administrator" role
+    And operator "ada" holds a personal access token with scopes "surfaces.view"
+    When the personal access token reads its own token info
+    Then the admin API response status is 200
+    And the token info lists the scopes "surfaces.view"
+
+  Scenario: A personal access token cannot read the operator profile whatever its scopes
+    Given operator "ada" has the "administrator" role
+    And operator "ada" holds a personal access token with scopes "settings.view, users.view, surfaces.view"
+    When the personal access token reads the operator profile
+    Then the admin API response status is 403

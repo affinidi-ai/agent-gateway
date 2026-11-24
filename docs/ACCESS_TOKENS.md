@@ -80,10 +80,10 @@ that cover each route behind the session guard are listed in
 refused to every token with explicit scopes. Most routes are covered by the permission they
 already check. Two routes describe only the calling token and are reached whatever its scopes:
 `GET /api/v1/token-info` and `GET /api/v1/permissions`. `HEAD` is answered like `GET`. A method
-the route does not serve is answered `405`, as for any caller. A request that matches no route is
-answered `404` by the middleware itself, so no fallback behind the guard runs for a token with
-explicit scopes. A token without explicit scopes and a dashboard session are not affected, and a
-token's resource pattern and required headers still apply as before.
+the route does not serve is answered `405` with an `Allow` header, as for any caller. A request
+that matches no route is answered `404` by the middleware itself, so no fallback behind the guard
+runs for a token with explicit scopes. A token without explicit scopes and a dashboard session are
+not affected, and a token's resource pattern and required headers still apply as before.
 
 Routes a signed-in operator reaches without any permission are covered for a scoped token by the
 permission that names their area:
@@ -95,9 +95,6 @@ permission that names their area:
 | `metrics.view` | `GET /api/v1/metrics/otlp-status` |
 | `surfaces.edit` | `POST /api/v1/surfaces/validate-policy` |
 | `surfaces.view` | `GET /api/v1/trust-check/predefined-queries` |
-| `notifications.view` | `GET /api/v1/notifications`, `/api/v1/notifications/{id}`, `/api/v1/notifications/unread/count` |
-| `notifications.edit` | `POST /api/v1/notifications`, `PUT /api/v1/notifications/{id}` |
-| `notifications.delete` | `DELETE /api/v1/notifications/{id}` |
 | `issuers.view`, `issuers.edit` or `issuers.delete` | any method on the legacy `/api/v1/departments` and `/api/v1/departments/{id}` redirects |
 | `issuers.edit` | any method on `/api/v1/departments/{id}/register-trust-registry` and `/api/v1/admin/departments/migrate-to-webvh` |
 | `trust_registries.view` | `GET /api/trust-registries/{tr_id}/did.json`, `/did.jsonl`, `/did-witness.json` |
@@ -107,7 +104,10 @@ scopes is always refused there: `GET /api/v1/identity/did-document`,
 `GET /api/v1/identities/by-hash/{identity_hash}/rotations`, `GET` and `PUT /api/v1/profile`,
 `POST /api/v1/profile/avatar`, `GET`, `POST` and `DELETE /api/v1/user-settings`,
 `GET /api/v1/user-settings/overrides`, `GET /api/v1/terms/status`,
-`POST /api/v1/terms/acceptances`, and `POST /api/v1/verify/{did}`.
+`POST /api/v1/terms/acceptances`, and `POST /api/v1/verify/{did}`. The routes on the caller's own
+notifications answer only a session, so no scope covers them either: `GET` and
+`POST /api/v1/notifications`, `GET`, `PUT` and `DELETE /api/v1/notifications/{id}`, and
+`GET /api/v1/notifications/unread/count`.
 
 Routes that authorize a session on its role only also need the permission among a scoped token's
 scopes: `users.view`, `users.edit` or `users.delete` for `/api/v1/users` and `/api/v1/users/{id}`,
@@ -115,12 +115,15 @@ scopes: `users.view`, `users.edit` or `users.delete` for `/api/v1/users` and `/a
 and `storage.admin` for backup, restore, and storage export.
 
 Each refusal is logged at `warn` as "Access token scopes do not cover the route" with the token id,
-the method, and the route as registered (such as `/v1/surfaces/{surface_id}`), never the token, and recorded like the middleware's other
-refusals. A new management route needs an entry in `route_scopes.rs`: covered by a permission,
-listed in `CLOSED_TO_SCOPED_TOKENS`, or added to the middleware's `SCOPED_TOKEN_ALLOWED_ROUTES`.
-A test reads every router's source and fails on a route behind the guard that has none of them, on
-an entry for a route no router registers, and on an entry whose permission is not the one its route
-names where it is registered.
+the method, and the route as registered (such as `/v1/surfaces/{surface_id}`), never the token,
+and recorded like the middleware's other refusals. A new management route needs an entry in
+`route_scopes.rs`: covered by a permission, listed in `CLOSED_TO_SCOPED_TOKENS`, or listed in
+`SCOPED_TOKEN_ALLOWED_ROUTES` when it describes only the calling token. A test reads every
+router's source and fails on a route behind the guard that has none of them, on an entry for a
+route no router registers, on an entry whose permission is not the one its route names where it is
+registered, and on a route registered with a path it cannot read from the source, such as a
+constant or a built string, unless that route is listed as public or mounted outside the guard.
+Register a guarded route with a string literal path.
 
 ## Resource patterns and required headers
 
@@ -409,9 +412,9 @@ scopes. For a session or a PAT without explicit scopes, the role-only routes lis
 signed-in caller, such as the caller's own profile and settings, need no feature. A PAT with
 explicit scopes also needs a scope that covers each of those routes, and is refused on the
 caller's own profile and settings whatever its scopes ([Feature scopes](#feature-scopes)). The
-routes on the caller's own notifications need a session sign-in, not a PAT: a scoped PAT without
-the matching `notifications.*` scope gets `403`, and any other PAT gets an empty notification
-list, an unread count of `0`, and `401` on reading, creating, updating or deleting a notification
+routes on the caller's own notifications need a session sign-in, not a PAT: a PAT with explicit
+scopes gets `403` whatever its scopes, and a PAT without them gets an empty notification list, an
+unread count of `0`, and `401` on reading, creating, updating or deleting a notification
 (see [`INTEGRATIONS.md`](INTEGRATIONS.md#in-dashboard-notifications)). A scoped PAT may create or
 update tokens only with a non-empty subset of its own scopes.
 

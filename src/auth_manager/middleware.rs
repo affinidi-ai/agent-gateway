@@ -36,11 +36,6 @@ const CONSENT_PENDING_PATHS: &[&str] = &[
 /// headers are not evaluated. Token authentication and revocation still apply.
 const TOKEN_SELF_INSPECTION_PATHS: &[&str] = &["/v1/token-info", "/api/v1/token-info"];
 
-/// Routes, by their path as registered, that an access token with explicit scopes
-/// reaches whatever its scopes: each describes only the calling token. Every other route needs a
-/// scope that `route_scopes` lists for it.
-const SCOPED_TOKEN_ALLOWED_ROUTES: &[&str] = &["/v1/token-info", "/v1/permissions"];
-
 const PUBLIC_PATH_PREFIXES: &[&str] = &[
     "/auth/",                    // Passkey auth flows
     "/saml/",                    // SAML auth flows
@@ -312,11 +307,7 @@ fn scoped_route_access(
         .map_or_else(|| request.uri().path(), |uri| uri.path());
     let route =
         crate::auth_manager::route_scopes::registered_route(matched.as_str(), original_path, request.uri().path());
-    let access = if SCOPED_TOKEN_ALLOWED_ROUTES.contains(&route) {
-        crate::auth_manager::route_scopes::ScopedAccess::Allowed
-    } else {
-        crate::auth_manager::route_scopes::scoped_access(scopes, request.method(), route)
-    };
+    let access = crate::auth_manager::route_scopes::scoped_access(scopes, request.method(), route);
     Some((route.to_string(), access))
 }
 
@@ -358,7 +349,10 @@ async fn access_token_request(
         use crate::auth_manager::route_scopes::ScopedAccess;
         match scoped_route_access(&request, scopes) {
             Some((_, ScopedAccess::Allowed)) => {}
-            Some((_, ScopedAccess::MethodNotAllowed)) => return StatusCode::METHOD_NOT_ALLOWED.into_response(),
+            Some((route, ScopedAccess::MethodNotAllowed)) => {
+                let allow = crate::auth_manager::route_scopes::allowed_methods(&route);
+                return (StatusCode::METHOD_NOT_ALLOWED, [(axum::http::header::ALLOW, allow)]).into_response();
+            }
             Some((route, ScopedAccess::Refused)) => {
                 warn!(
                     token_id = %principal.token_id,
@@ -1796,12 +1790,12 @@ mod tests {
         Router::new().nest("/api", routes)
     }
 
-    async fn status_with_bearer(
+    async fn response_with_bearer(
         app: &Router,
         method: Method,
         path: &str,
         token: &str,
-    ) -> u16 {
+    ) -> Response {
         app.clone()
             .oneshot(
                 axum::http::Request::builder()
@@ -1813,6 +1807,16 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    async fn status_with_bearer(
+        app: &Router,
+        method: Method,
+        path: &str,
+        token: &str,
+    ) -> u16 {
+        response_with_bearer(app, method, path, token)
+            .await
             .status()
             .as_u16()
     }
@@ -1864,8 +1868,21 @@ mod tests {
     async fn a_scoped_access_token_using_a_method_the_route_does_not_serve_is_not_allowed() {
         let app = scoped_token_app(Arc::new(SessionManager::new()));
 
-        assert_eq!(status_with_bearer(&app, Method::PATCH, "/api/v1/settings", SETTINGS_VIEW_TOKEN).await, 405);
-        assert_eq!(status_with_bearer(&app, Method::POST, "/api/v1/profile", SETTINGS_VIEW_TOKEN).await, 405);
+        for (method, path, allow) in [
+            (Method::PATCH, "/api/v1/settings", "GET,HEAD,POST,DELETE"),
+            (Method::POST, "/api/v1/profile", "GET,HEAD,PUT"),
+        ] {
+            let response = response_with_bearer(&app, method, path, SETTINGS_VIEW_TOKEN).await;
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::ALLOW)
+                    .unwrap(),
+                allow,
+                "{path}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1945,9 +1962,33 @@ mod tests {
         }
     }
 
-    fn call_arguments(
+    /// Registrations whose path the scan cannot read, by file and path argument: each is
+    /// public or mounted outside the guard.
+    const UNREADABLE_ROUTES_OUTSIDE_THE_GUARD: &[(&str, &str)] = &[
+        // Public `/auth/` path.
+        ("src/auth/cli_login.rs", "AUTHORIZE_ROUTE"),
+        // Registers each `policy_write` route, which the scan reads from its callers.
+        ("src/audit/policy_refusals.rs", "write.path()"),
+        // OAuth consent redirects, mounted outside the guard.
+        ("src/delegation_vault/modern_consent.rs", "&format!(\"{CONNECT_PATH}/{{provider_id}}\")"),
+        ("src/delegation_vault/modern_consent.rs", "&format!(\"{CALLBACK_PATH}/{{provider_id}}\")"),
+        ("src/delegation_vault/router.rs", "&callback_route"),
+        ("src/delegation_vault/router.rs", "&format!(\"{callback_route}/start\")"),
+        (
+            "src/delegation_vault/router.rs",
+            "&format!(\"{callback_route}{}\", crate::credential_providers::CONSENT_CONFIRMATION_PATH)",
+        ),
+        // Public `/.well-known/` authorization server metadata.
+        ("src/sts/mcp_profile.rs", "&self.metadata_path()?"),
+    ];
+
+    /// The text from `start` up to the `close` that balances an `open` just before it,
+    /// skipping strings, character literals and line comments.
+    fn enclosed(
         source: &str,
         start: usize,
+        open: u8,
+        close: u8,
     ) -> &str {
         let bytes = source.as_bytes();
         let (mut depth, mut index, mut in_string) = (1usize, start, false);
@@ -1955,13 +1996,75 @@ mod tests {
             match bytes[index] {
                 b'\\' if in_string => index += 1,
                 b'"' => in_string = !in_string,
-                b'(' if !in_string => depth += 1,
-                b')' if !in_string => depth -= 1,
+                b'/' if !in_string && bytes.get(index + 1) == Some(&b'/') => {
+                    while index < bytes.len() && bytes[index] != b'\n' {
+                        index += 1;
+                    }
+                }
+                b'\'' if !in_string && bytes.get(index + 2) == Some(&b'\'') => index += 2,
+                b'\'' if !in_string && bytes.get(index + 1) == Some(&b'\\') && bytes.get(index + 3) == Some(&b'\'') => {
+                    index += 3
+                }
+                byte if !in_string && byte == open => depth += 1,
+                byte if !in_string && byte == close => depth -= 1,
                 _ => {}
             }
             index += 1;
         }
-        &source[start..index.saturating_sub(1)]
+        &source[start
+            ..index
+                .min(bytes.len())
+                .saturating_sub(1)
+                .max(start)]
+    }
+
+    fn call_arguments(
+        source: &str,
+        start: usize,
+    ) -> &str {
+        enclosed(source, start, b'(', b')')
+    }
+
+    /// The first argument of a call, with its whitespace collapsed.
+    fn first_argument(arguments: &str) -> String {
+        let bytes = arguments.as_bytes();
+        let (mut depth, mut index, mut in_string) = (0usize, 0, false);
+        while index < bytes.len() {
+            match bytes[index] {
+                b'\\' if in_string => index += 1,
+                b'"' => in_string = !in_string,
+                b'(' | b'[' | b'{' if !in_string => depth += 1,
+                b')' | b']' | b'}' if !in_string => depth = depth.saturating_sub(1),
+                b',' if !in_string && depth == 0 => break,
+                _ => {}
+            }
+            index += 1;
+        }
+        arguments[..index.min(arguments.len())]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// `source` with each inline `#[cfg(test)] mod … { … }` blanked, keeping its lines.
+    fn without_test_modules(source: &str) -> String {
+        static INLINE_TEST_MODULE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"#\[cfg\(test\)\]\s*(pub(\([^)]*\))?\s+)?mod\s+\w+\s*\{").unwrap()
+        });
+        let mut kept = String::with_capacity(source.len());
+        let mut rest = source;
+        while let Some(module) = INLINE_TEST_MODULE.find(rest) {
+            let end = (module.end() + enclosed(rest, module.end(), b'{', b'}').len() + 1).min(rest.len());
+            kept.push_str(&rest[..module.start()]);
+            kept.extend(
+                rest[module.start()..end]
+                    .chars()
+                    .filter(|c| *c == '\n'),
+            );
+            rest = &rest[end..];
+        }
+        kept.push_str(rest);
+        kept
     }
 
     struct RegisteredRoute {
@@ -2018,14 +2121,91 @@ mod tests {
             .collect()
     }
 
-    fn registered_routes() -> Vec<RegisteredRoute> {
-        let method = regex::Regex::new(r"\b(get|post|put|patch|delete|head|any)\s*\(").unwrap();
-        let feature = regex::Regex::new(r"Feature::(\w+)").unwrap();
-        let policy_write = regex::Regex::new(r"^\s*PolicyWrite::(\w+)").unwrap();
-        let inline_test_module = regex::Regex::new(r"#\[cfg\(test\)\]\s*(pub(\([^)]*\))?\s+)?mod\s+\w+\s*\{").unwrap();
+    /// A route registration whose path is not a string literal.
+    #[derive(Debug, PartialEq)]
+    struct UnreadableRoute {
+        location: String,
+        file: String,
+        path_argument: String,
+    }
+
+    /// The routes `file` registers outside its test modules, and the registrations
+    /// whose path cannot be read from the source. A service mounted with
+    /// `nest_service` is registered for every path under its prefix.
+    fn routes_in(
+        file: &str,
+        source: &str,
+    ) -> (Vec<RegisteredRoute>, Vec<UnreadableRoute>) {
+        static METHOD: std::sync::LazyLock<regex::Regex> =
+            std::sync::LazyLock::new(|| regex::Regex::new(r"\b(get|post|put|patch|delete|head|any)\s*\(").unwrap());
+        static FEATURE: std::sync::LazyLock<regex::Regex> =
+            std::sync::LazyLock::new(|| regex::Regex::new(r"Feature::(\w+)").unwrap());
+        static POLICY_WRITE: std::sync::LazyLock<regex::Regex> =
+            std::sync::LazyLock::new(|| regex::Regex::new(r"^\s*PolicyWrite::(\w+)").unwrap());
+        let source = without_test_modules(source);
+        let (mut routes, mut unreadable) = (Vec::new(), Vec::new());
+        for call in [".route(", ".route_service(", ".nest_service(", ".policy_write("] {
+            for (at, _) in source.match_indices(call) {
+                let arguments = call_arguments(&source, at + call.len());
+                let location = format!("{file}:{}", source[..at].lines().count());
+                let (methods, route_path) = if call == ".policy_write(" {
+                    let name = &POLICY_WRITE
+                        .captures(arguments)
+                        .unwrap()[1];
+                    let write = crate::audit::policy_refusals::PolicyWrite::ALL
+                        .into_iter()
+                        .find(|write| format!("{write:?}") == name)
+                        .unwrap();
+                    (vec![write.method().to_string()], write.path().to_string())
+                } else {
+                    let path_argument = first_argument(arguments);
+                    if path_argument.is_empty() {
+                        continue;
+                    }
+                    let Some(path) = path_argument
+                        .strip_prefix('"')
+                        .and_then(|path| path.strip_suffix('"'))
+                    else {
+                        unreadable.push(UnreadableRoute {
+                            location,
+                            file: file.to_string(),
+                            path_argument,
+                        });
+                        continue;
+                    };
+                    match call {
+                        ".route(" => (
+                            METHOD
+                                .captures_iter(arguments)
+                                .map(|captures| captures[1].to_uppercase())
+                                .collect(),
+                            path.to_string(),
+                        ),
+                        ".nest_service(" => (Vec::new(), format!("{}/{{*rest}}", path.trim_end_matches('/'))),
+                        _ => (Vec::new(), path.to_string()),
+                    }
+                };
+                let full = format!("{}{route_path}", route_file_prefix(file));
+                routes.push(RegisteredRoute {
+                    location,
+                    methods,
+                    path: crate::auth_manager::route_scopes::registered_route(&full, &full, &full).to_string(),
+                    permissions: FEATURE
+                        .captures_iter(arguments)
+                        .map(|captures| captures[1].to_string())
+                        .collect(),
+                });
+            }
+        }
+        (routes, unreadable)
+    }
+
+    /// Every route registration in the crate's source outside test code and the data
+    /// plane, split as [`routes_in`] does.
+    fn scanned_routes() -> (Vec<RegisteredRoute>, Vec<UnreadableRoute>) {
         let sources = source_files();
         let test_only = test_only_modules(&sources);
-        let mut routes = Vec::new();
+        let (mut routes, mut unreadable) = (Vec::new(), Vec::new());
         for (file, source) in &sources {
             let module = file.trim_end_matches(".rs");
             if ROUTE_FILES_OUTSIDE_THE_GUARD.contains(&file.as_str())
@@ -2035,50 +2215,15 @@ mod tests {
             {
                 continue;
             }
-            {
-                let source = &source[..inline_test_module
-                    .find(source)
-                    .map_or(source.len(), |module| module.start())];
-                for call in [".route(", ".policy_write("] {
-                    for (at, _) in source.match_indices(call) {
-                        let arguments = call_arguments(source, at + call.len());
-                        let (methods, route_path) = if call == ".route(" {
-                            let Some(literal) = arguments
-                                .trim_start()
-                                .strip_prefix('"')
-                            else {
-                                continue;
-                            };
-                            let methods = method
-                                .captures_iter(arguments)
-                                .map(|captures| captures[1].to_uppercase())
-                                .collect();
-                            (methods, literal[..literal.find('"').unwrap()].to_string())
-                        } else {
-                            let name = &policy_write
-                                .captures(arguments)
-                                .unwrap()[1];
-                            let write = crate::audit::policy_refusals::PolicyWrite::ALL
-                                .into_iter()
-                                .find(|write| format!("{write:?}") == name)
-                                .unwrap();
-                            (vec![write.method().to_string()], write.path().to_string())
-                        };
-                        let full = format!("{}{route_path}", route_file_prefix(file));
-                        routes.push(RegisteredRoute {
-                            location: format!("{file}:{}", source[..at].lines().count()),
-                            methods,
-                            path: crate::auth_manager::route_scopes::registered_route(&full, &full, &full).to_string(),
-                            permissions: feature
-                                .captures_iter(arguments)
-                                .map(|captures| captures[1].to_string())
-                                .collect(),
-                        });
-                    }
-                }
-            }
+            let (file_routes, file_unreadable) = routes_in(file, source);
+            routes.extend(file_routes);
+            unreadable.extend(file_unreadable);
         }
-        routes
+        (routes, unreadable)
+    }
+
+    fn registered_routes() -> Vec<RegisteredRoute> {
+        scanned_routes().0
     }
 
     fn declared_routes() -> Vec<(&'static str, &'static str)> {
@@ -2094,8 +2239,9 @@ mod tests {
             .collect()
     }
 
-    /// Reads route paths from the source, so a path built at run time is not seen.
-    /// A route whose methods cannot be read there must be declared for every method.
+    /// Reads route paths from the source; a path it cannot read fails
+    /// `every_route_registration_has_a_readable_path` instead. A route whose methods
+    /// cannot be read there must be declared for every method.
     #[test]
     fn every_guarded_route_declares_what_covers_it_for_a_scoped_token() {
         let declared = declared_routes();
@@ -2104,7 +2250,7 @@ mod tests {
             .filter(|route| {
                 !is_public_path(&route.path)
                     && !is_public_path(&format!("/api{}", route.path))
-                    && !SCOPED_TOKEN_ALLOWED_ROUTES.contains(&route.path.as_str())
+                    && !crate::auth_manager::route_scopes::SCOPED_TOKEN_ALLOWED_ROUTES.contains(&route.path.as_str())
                     && !ROUTES_OUTSIDE_THE_GUARD.contains(&route.path.as_str())
             })
             .flat_map(|route| {
@@ -2128,9 +2274,111 @@ mod tests {
         assert!(
             undeclared.is_empty(),
             "add these routes to route_scopes::ROUTE_SCOPES with the permission that covers them, \
-             to route_scopes::CLOSED_TO_SCOPED_TOKENS, or to SCOPED_TOKEN_ALLOWED_ROUTES:\n{}",
+             to route_scopes::CLOSED_TO_SCOPED_TOKENS, or to route_scopes::SCOPED_TOKEN_ALLOWED_ROUTES:\n{}",
             undeclared.join("\n")
         );
+    }
+
+    #[test]
+    fn every_route_registration_has_a_readable_path() {
+        let unlisted: Vec<String> = scanned_routes()
+            .1
+            .into_iter()
+            .filter(|route| {
+                !UNREADABLE_ROUTES_OUTSIDE_THE_GUARD.contains(&(route.file.as_str(), route.path_argument.as_str()))
+            })
+            .map(|route| format!("{} ({})", route.path_argument, route.location))
+            .collect();
+
+        assert!(
+            unlisted.is_empty(),
+            "register these routes with a string literal path, or add them to \
+             UNREADABLE_ROUTES_OUTSIDE_THE_GUARD if they are public or mounted outside the guard:\n{}",
+            unlisted.join("\n")
+        );
+    }
+
+    #[test]
+    fn every_unreadable_route_listed_is_still_registered() {
+        let unreadable = scanned_routes().1;
+        let stale: Vec<String> = UNREADABLE_ROUTES_OUTSIDE_THE_GUARD
+            .iter()
+            .filter(|(file, path_argument)| {
+                !unreadable
+                    .iter()
+                    .any(|route| route.file == *file && route.path_argument == *path_argument)
+            })
+            .map(|(file, path_argument)| format!("{file}: {path_argument}"))
+            .collect();
+
+        assert!(
+            stale.is_empty(),
+            "UNREADABLE_ROUTES_OUTSIDE_THE_GUARD lists registrations that are gone:\n{}",
+            stale.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_route_scan_reports_a_path_it_cannot_read() {
+        let (routes, unreadable) = routes_in(
+            "src/example.rs",
+            "Router::new()\n    .route(SETTINGS, get(read))\n    .route(&format!(\"{BASE}/{{id}}\"), post(write));\n",
+        );
+
+        assert!(routes.is_empty());
+        assert_eq!(
+            unreadable,
+            [
+                UnreadableRoute {
+                    location: "src/example.rs:2".into(),
+                    file: "src/example.rs".into(),
+                    path_argument: "SETTINGS".into(),
+                },
+                UnreadableRoute {
+                    location: "src/example.rs:3".into(),
+                    file: "src/example.rs".into(),
+                    path_argument: "&format!(\"{BASE}/{{id}}\")".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_route_scan_reads_literal_routes_and_services() {
+        let (routes, unreadable) = routes_in(
+            "src/example.rs",
+            "let route = surface.route();\nRouter::new()\n    .route(\"/v1/things\", get(list).post(create))\n    \
+             .route_service(\"/v1/file\", service)\n    .nest_service(\"/files/\", files);\n",
+        );
+
+        assert!(unreadable.is_empty());
+        let found: Vec<(String, Vec<String>)> = routes
+            .into_iter()
+            .map(|route| (route.path, route.methods))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("/v1/things".to_string(), vec!["GET".to_string(), "POST".to_string()]),
+                ("/v1/file".to_string(), vec![]),
+                ("/files/{*rest}".to_string(), vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_route_scan_skips_test_modules_but_not_the_code_after_them() {
+        let (routes, _) = routes_in(
+            "src/example.rs",
+            "#[cfg(test)]\nmod tests {\n    fn app() { Router::new().route(\"/test-only\", get(ok)); }\n    \
+             const QUOTE: char = '\"';\n}\n\nfn router() -> Router { Router::new().route(\"/v1/after\", get(ok)) }\n",
+        );
+
+        let found: Vec<(String, String)> = routes
+            .into_iter()
+            .map(|route| (route.path, route.location))
+            .collect();
+        assert_eq!(found, [("/v1/after".to_string(), "src/example.rs:7".to_string())]);
     }
 
     #[test]
