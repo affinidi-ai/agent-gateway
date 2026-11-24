@@ -605,6 +605,189 @@ describe('ElementRegistry', () => {
       expect(out.target.networking).toBeUndefined();
       expect(out.transit).toBeUndefined();
     });
+
+    it("keeps a Transit Point's stored VP injection, so a save keeps the managed agent identity", () => {
+      const savedPoint = (identityInjection: Record<string, unknown>) =>
+        registry.buildPayload(
+          makeCtx(
+            registry.nodesFromPayload({
+              access_point: { route: '/a2a', protocol: 'a2a' },
+              target: { endpoint: 'https://upstream.example.com' },
+              transit: {
+                points: [
+                  {
+                    alias: 'partner',
+                    protocol: 'a2a',
+                    target_endpoint: 'https://p.example',
+                    identity_injection: identityInjection,
+                  },
+                ],
+              },
+            })
+          )
+        ).transit.points[0];
+      expect(savedPoint({ inject_vp: true }).identity_injection).toEqual({ inject_vp: true });
+      expect(savedPoint({ inject_vp: false })).not.toHaveProperty('identity_injection');
+    });
+
+    describe("a Transit Point's Trust Recorder", () => {
+      const trustRecorder = {
+        entries: [
+          {
+            trust_registry_id: 'tr-1',
+            issuer_did: 'did:web:issuer.example',
+            authority_did: 'did:web:authority.example',
+            authority_source: 'authority',
+            include_owned_agent: true,
+            custom_resources: [
+              {
+                action: 'can',
+                resource: 'pay',
+                entity_target: 'agent',
+                record_type: 'authorization',
+              },
+            ],
+          },
+        ],
+      };
+      const hydrate = () =>
+        registry.nodesFromPayload({
+          access_point: { route: '/a2a', protocol: 'a2a' },
+          target: { endpoint: 'https://upstream.example.com' },
+          transit: {
+            points: [
+              {
+                alias: 'partner',
+                protocol: 'a2a',
+                target_endpoint: 'https://p.example',
+                trust_recorder: trustRecorder,
+              },
+            ],
+          },
+        });
+
+      it('hydrates onto the Managed Agent → Transit Point request arrow', () => {
+        const nodes = hydrate();
+        const tp = nodes.find(n => n.type === 'transit-point-a2a')!;
+        expect(tp.config).not.toHaveProperty('trust_recorder');
+        expect(nodes.filter(n => n.type === 'trust-recorder')).toEqual([
+          expect.objectContaining({
+            id: `trust-recorder-${tp.id}`,
+            parentId: tp.id,
+            slotId: 'request:trust-recorder',
+            configured: true,
+            config: { entries: trustRecorder.entries },
+          }),
+        ]);
+      });
+
+      it('saves back to the Transit Point, not to the surface', () => {
+        const out = registry.buildPayload(makeCtx(hydrate()));
+        expect(out.transit.points[0].trust_recorder).toEqual(trustRecorder);
+        expect(out.access_point).not.toHaveProperty('trust_recorder');
+      });
+
+      it('is dropped from the Transit Point when its node is removed', () => {
+        const nodes = hydrate().filter(n => n.type !== 'trust-recorder');
+        expect(registry.buildPayload(makeCtx(nodes)).transit.points[0]).not.toHaveProperty(
+          'trust_recorder'
+        );
+      });
+
+      describe('against the stored canvas layout', () => {
+        const staleEntry = { ...trustRecorder.entries[0], trust_registry_id: 'tr-stale' };
+        const withLayout = (recorder: unknown, layoutConfig: unknown) => {
+          const point: Record<string, unknown> = {
+            id: 'uuid-partner',
+            alias: 'partner',
+            protocol: 'a2a',
+            target_endpoint: 'https://p.example',
+          };
+          if (recorder) point.trust_recorder = recorder;
+          return registry.nodesFromPayload({
+            access_point: { route: '/a2a', protocol: 'a2a' },
+            target: { endpoint: 'https://upstream.example.com' },
+            transit: { points: [point] },
+            canvas: {
+              version: 1,
+              nodes: [
+                {
+                  id: 'transit-point-a2a-1',
+                  type: 'transit-point-a2a',
+                  label: '',
+                  parentId: 'access-point',
+                  config: { id: 'uuid-partner' },
+                },
+                {
+                  id: 'trust-recorder-transit-point-a2a-1',
+                  type: 'trust-recorder',
+                  label: '',
+                  parentId: 'transit-point-a2a-1',
+                  slotId: 'request:trust-recorder',
+                  config: layoutConfig,
+                },
+              ],
+            },
+          });
+        };
+
+        it('does not bring back a recorder removed from the Transit Point', () => {
+          const nodes = withLayout(undefined, { entries: [staleEntry] });
+          expect(nodes.filter(n => n.type === 'trust-recorder')).toEqual([]);
+          expect(registry.buildPayload(makeCtx(nodes)).transit.points[0]).not.toHaveProperty(
+            'trust_recorder'
+          );
+        });
+
+        it('takes the stored entries over the ones in the layout', () => {
+          const out = registry.buildPayload(
+            makeCtx(withLayout(trustRecorder, { entries: [staleEntry] }))
+          );
+          expect(out.transit.points[0].trust_recorder).toEqual(trustRecorder);
+        });
+
+        it('keeps a dropped recorder that has no entries yet', () => {
+          const nodes = withLayout(undefined, { entries: [] });
+          expect(nodes.filter(n => n.type === 'trust-recorder')).toEqual([
+            expect.objectContaining({ id: 'trust-recorder-transit-point-a2a-1' }),
+          ]);
+        });
+
+        it("does not bring back the surface's own recorder removed from the surface", () => {
+          const nodes = registry.nodesFromPayload({
+            access_point: { route: '/a2a', protocol: 'a2a' },
+            target: { endpoint: 'https://upstream.example.com' },
+            canvas: {
+              version: 1,
+              nodes: [
+                {
+                  id: 'trust-recorder-target-response',
+                  type: 'trust-recorder',
+                  label: '',
+                  parentId: 'target',
+                  slotId: 'response:trust-recorder',
+                  direction: 'response',
+                  config: { entries: [staleEntry] },
+                },
+              ],
+            },
+          });
+          expect(nodes.filter(n => n.type === 'trust-recorder')).toEqual([]);
+          expect(registry.buildPayload(makeCtx(nodes)).access_point).not.toHaveProperty(
+            'trust_recorder'
+          );
+        });
+      });
+
+      it('writes nothing for a recorder with no entries yet', () => {
+        const nodes = hydrate().map(n =>
+          n.type === 'trust-recorder' ? { ...n, config: { entries: [] } } : n
+        );
+        expect(registry.buildPayload(makeCtx(nodes)).transit.points[0]).not.toHaveProperty(
+          'trust_recorder'
+        );
+      });
+    });
   });
 
   describe('deletable', () => {

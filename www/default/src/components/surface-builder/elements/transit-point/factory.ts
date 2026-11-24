@@ -22,6 +22,7 @@ import {
   readOnlyTrustCheckProtocol,
   transitPointTrustCheckListToWire,
 } from '../trust-check/definition';
+import { readEntries as readTrustRecorderEntries } from '../trust-recorder/definition';
 import { DOCS_URL } from '../../../../config/docs';
 import { callerAuthProblems, callerAuthToWire } from './callerAuth';
 
@@ -220,6 +221,10 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
         return null;
       }
       if (!config.target_endpoint) return 'Target endpoint URL is required';
+      // The Listen Path is not checked here: the gateway refuses only a path a
+      // save introduces or changes, so whether this one blocks depends on what
+      // the surface already holds, which this node cannot see. That check lives
+      // in `validateSurfacePayload`, which is given the stored surface.
       return null;
     },
     validate: c => {
@@ -384,10 +389,9 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                   n => n.type === 'mcp-tool-gating' && n.parentId === tp.id
                 );
                 const mcpToolGating = mcpToolGatingConfigToWire(mcpToolGatingNode?.config);
-                // Per-TP target-leg Trust Check (MA→TP request slot). New ones
-                // are dropped only on A2A/AP2 Transit Points; on other
-                // protocols the node is a read-only stored copy, saved back
-                // exactly as loaded.
+                // Per-TP Trust Check (MA→TP request slot). A read-only migrated
+                // destination copy on an MCP Transit Point is saved back exactly
+                // as loaded; every other list is rebuilt from its queries.
                 // The trust-check element's own buildPayload skips
                 // TP-parented nodes so this is the only writer.
                 const trustCheckNode = ctx.allNodes.find(
@@ -398,6 +402,13 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                   !!trustCheckNode &&
                     readOnlyTrustCheckProtocol(trustCheckNode, ctx.allNodes) !== null
                 );
+                // Per-TP Trust Recorder (MA→TP request slot). The
+                // trust-recorder element's own buildPayload skips TP-parented
+                // nodes so this is the only writer.
+                const recorderNode = ctx.allNodes.find(
+                  n => n.type === 'trust-recorder' && n.parentId === tp.id
+                );
+                const recorderEntries = readTrustRecorderEntries(recorderNode?.config);
                 const credentials = transitCredentialsToApi(c.transit_credentials);
                 const headerMetadataNode = ctx.allNodes.find(
                   n => n.type === 'metadata-extraction' && n.parentId === tp.id
@@ -445,6 +456,12 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                   c.target_endpoint.startsWith('fabric://') &&
                   c.fabric_delegated_credentials === true
                     ? { fabric_delegated_credentials: true }
+                    : {}),
+                  ...(c.identity_injection?.inject_vp === true
+                    ? { identity_injection: c.identity_injection }
+                    : {}),
+                  ...(recorderEntries.length > 0
+                    ? { trust_recorder: { entries: recorderEntries } }
                     : {}),
                   ...(() => {
                     const targetAuth = transitPointTargetAuth(c);

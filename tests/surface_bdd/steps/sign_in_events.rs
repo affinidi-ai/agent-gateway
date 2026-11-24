@@ -13,6 +13,7 @@ use crate::bdd_support::sign_in_events::{
     ACCOUNT_DATA_FIELDS, APPLIANCE_ID, ENVELOPE_FIELDS, EVENT_TOPIC, NO_ACCOUNT_DATA_FIELDS, RECORD_FIELDS,
     RECORD_TOPIC, STATE_FIELDS, golden, golden_path, keys, names, normalise, updates_golden, write_golden,
 };
+use crate::steps::then::gateway_log;
 use crate::steps::when::{ensure_admin_session, ensure_gateway_running};
 use crate::world::{StartedSignIn, SurfaceWorld};
 
@@ -121,6 +122,50 @@ fn console_users_sign_in_with_saml(world: &mut SurfaceWorld) {
     world
         .surface_config
         .signs_in_with_saml = true;
+}
+
+#[given(regex = r#"^saml\.json sets "([^"]+)" to (true|false|"[^"]*")$"#)]
+fn saml_json_sets(
+    world: &mut SurfaceWorld,
+    key: String,
+    value: String,
+) {
+    let value: Value =
+        serde_json::from_str(&value).unwrap_or_else(|error| panic!("the saml.json value {value} is JSON: {error}"));
+    world
+        .surface_config
+        .saml_settings
+        .insert(key, value);
+    world
+        .surface_config
+        .keeps_gateway_log = true;
+}
+
+#[when("the gateway tries to start")]
+async fn gateway_tries_to_start(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .refuses_to_start = true;
+    world
+        .surface_config
+        .keeps_gateway_log = true;
+    ensure_gateway_running(world).await;
+}
+
+#[then(expr = "the gateway refuses to start, naming {string}")]
+fn gateway_refuses_to_start_naming(
+    world: &mut SurfaceWorld,
+    text: String,
+) {
+    let exit = world
+        .infra
+        .as_ref()
+        .expect("the gateway was started")
+        .startup_exit
+        .expect("the gateway exited at startup");
+    assert!(!exit.success(), "the gateway exited successfully at startup: {exit}");
+    let log = gateway_log(world);
+    assert!(log.contains(&text), "the gateway's output does not name {text:?}:\n{log}");
 }
 
 #[given(expr = "human user {string} is approved")]

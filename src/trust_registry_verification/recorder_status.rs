@@ -188,6 +188,29 @@ impl StorableEntity for StatusRecord {
     }
 }
 
+/// The stored entries of a DID with a run's entries in place of those for the same trust
+/// registry. The surface's recorder and its Transit Points' can record one DID, each to its
+/// own registries, so one run never hides another registry's outcome.
+fn merge_entries(
+    stored: &[EntryStatus],
+    run: Vec<EntryStatus>,
+) -> Vec<EntryStatus> {
+    let mut merged: Vec<EntryStatus> = stored
+        .iter()
+        .filter(|entry| {
+            !run.iter()
+                .any(|new| new.trust_registry_id == entry.trust_registry_id)
+        })
+        .cloned()
+        .collect();
+    merged.extend(run);
+    merged.sort_by(|a, b| {
+        a.trust_registry_id
+            .cmp(&b.trust_registry_id)
+    });
+    merged
+}
+
 fn record_key(
     surface_id: &str,
     agent_did: &str,
@@ -203,6 +226,8 @@ pub struct TrustRecorderStatusStore {
     backend: Box<dyn StorageBackend<StatusRecord>>,
     last_attempts: DashMap<String, DateTime<Utc>>,
     cleared_surfaces: DashMap<String, DateTime<Utc>>,
+    /// Serialises read-merge-save per status key, so two runs for the same DID keep both outcomes.
+    write_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl TrustRecorderStatusStore {
@@ -211,6 +236,7 @@ impl TrustRecorderStatusStore {
             backend: cached_storage(dir, "trust recorder status").await?,
             last_attempts: DashMap::new(),
             cleared_surfaces: DashMap::new(),
+            write_locks: DashMap::new(),
         })
     }
 
@@ -220,6 +246,7 @@ impl TrustRecorderStatusStore {
             backend: crate::storage::filesystem::in_memory_storage(),
             last_attempts: DashMap::new(),
             cleared_surfaces: DashMap::new(),
+            write_locks: DashMap::new(),
         }
     }
 
@@ -229,6 +256,7 @@ impl TrustRecorderStatusStore {
             backend,
             last_attempts: DashMap::new(),
             cleared_surfaces: DashMap::new(),
+            write_locks: DashMap::new(),
         }
     }
 
@@ -250,12 +278,29 @@ impl TrustRecorderStatusStore {
         let key = record_key(surface_id, agent_did);
         self.last_attempts
             .insert(key.clone(), now);
-        let status = RecorderStatus::from_entries(entries, None);
-        let unchanged = self
-            .backend
-            .get(&key)
-            .await?
-            .is_some_and(|stored| stored.status == status);
+        let lock = self
+            .write_locks
+            .entry(key.clone())
+            .or_default()
+            .clone();
+        let _write = lock.lock().await;
+        let stored = self.backend.get(&key).await?;
+        let status = RecorderStatus::from_entries(
+            merge_entries(
+                stored
+                    .as_ref()
+                    .map(|stored| {
+                        stored
+                            .status
+                            .entries
+                            .as_slice()
+                    })
+                    .unwrap_or_default(),
+                entries,
+            ),
+            None,
+        );
+        let unchanged = stored.is_some_and(|stored| stored.status == status);
         if unchanged {
             return Ok(false);
         }
@@ -640,6 +685,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recorders_writing_the_same_did_to_different_registries_keep_each_outcome() {
+        let store = TrustRecorderStatusStore::in_memory();
+        store
+            .record("surface-1", "did:example:agent", vec![failed("tr-a", RecorderReason::Rejected)], at(0), at(0))
+            .await
+            .unwrap();
+        store
+            .record("surface-1", "did:example:agent", vec![written("tr-b", 1, 0)], at(10), at(10))
+            .await
+            .unwrap();
+
+        let status = store
+            .status_for("surface-1", "did:example:agent")
+            .await
+            .unwrap();
+        assert_eq!(status.state, RecorderState::Partial, "tr-a's failure is not hidden by tr-b's success");
+        assert_eq!(
+            status
+                .entries
+                .iter()
+                .map(|e| (e.trust_registry_id.as_str(), e.state))
+                .collect::<Vec<_>>(),
+            [("tr-a", RecorderState::Failed), ("tr-b", RecorderState::Recorded)]
+        );
+
+        store
+            .record("surface-1", "did:example:agent", vec![written("tr-a", 1, 0)], at(20), at(20))
+            .await
+            .unwrap();
+        let status = store
+            .status_for("surface-1", "did:example:agent")
+            .await
+            .unwrap();
+        assert_eq!(status.state, RecorderState::Recorded, "a later run of a registry replaces its own outcome");
+        assert_eq!(status.entries.len(), 2);
+    }
+
+    #[tokio::test]
     async fn recording_no_entries_stores_nothing() {
         let store = TrustRecorderStatusStore::in_memory();
         assert!(
@@ -918,6 +1001,46 @@ mod tests {
                 .status_for("s1", "did:a")
                 .await
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn recorders_saving_the_same_did_at_once_keep_each_outcome() {
+        let saving = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        let mut backend = ScriptedBackend::new();
+        backend.pause_save = Some((saving.clone(), proceed.clone()));
+        let store = Arc::new(TrustRecorderStatusStore::with_backend(Box::new(backend)));
+
+        let run = |entry: EntryStatus| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .record("s1", "did:a", vec![entry], at(0), at(0))
+                    .await
+            })
+        };
+        let a = run(failed("tr-a", RecorderReason::Rejected));
+        saving.notified().await;
+        let b = run(written("tr-b", 1, 0));
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), saving.notified()).await;
+        proceed.notify_one();
+        proceed.notify_one();
+        a.await.unwrap().unwrap();
+        b.await.unwrap().unwrap();
+
+        let status = store
+            .status_for("s1", "did:a")
+            .await
+            .unwrap();
+        assert_eq!(
+            status
+                .entries
+                .iter()
+                .map(|e| e.trust_registry_id.as_str())
+                .collect::<Vec<_>>(),
+            ["tr-a", "tr-b"],
+            "neither run's outcome is lost"
         );
     }
 

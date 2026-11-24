@@ -785,6 +785,46 @@ async fn vp_audit_log_records_answer_identity_under_request_trace_id(
     );
 }
 
+#[then(
+    expr = "the VP Audit Log of gateway {int} records its policy decision on the Fabric request under the trace id the request carried"
+)]
+async fn vp_audit_log_records_fabric_policy_decision_under_request_trace_id(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let is_fabric_decision = |event: &Value| event["event"]["policy_decision"]["flow"] == "fabric";
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(is_fabric_decision)
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
+    assert!(found, "expected gateway {gateway} to record a policy decision on the Fabric request, got {events:?}");
+    let request_trace = events
+        .iter()
+        .find(|event| {
+            event["via_fabric"] == true
+                && (event["event"]
+                    .get("identity_binding_failed")
+                    .is_some()
+                    || event["event"]
+                        .get("identity_binding_verified")
+                        .is_some())
+        })
+        .and_then(|event| event["trace_id"].as_str())
+        .unwrap_or_else(|| panic!("gateway {gateway} should record the Fabric request's trace id: {events:?}"));
+    let decision = events
+        .iter()
+        .find(|event| is_fabric_decision(event))
+        .unwrap();
+    assert_eq!(
+        decision["trace_id"].as_str(),
+        Some(request_trace),
+        "the policy decision on the Fabric request should carry the trace id the request carried, got {decision}"
+    );
+}
+
 /// The audit outcome for a failed identity binding, as the step names it, and
 /// the text its `error_detail` must contain when the outcome alone does not
 /// say which check refused it.

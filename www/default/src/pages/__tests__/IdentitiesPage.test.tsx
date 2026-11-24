@@ -1049,6 +1049,30 @@ describe('IdentitiesPage', () => {
       expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(2);
     });
 
+    it('shows the Trust Recorder status of an earlier Transit Point DID on its version', async () => {
+      const transitPoint = {
+        ...gpt4o,
+        slot: { kind: 'transit_point', alias: 'tp-1' },
+        trust_recorder: {
+          state: 'skipped',
+          reason: 'registry_not_connected',
+          last_attempt_at: null,
+          entries: [],
+        },
+      };
+      renderWithStats([transitPoint, gpt41]);
+
+      fireEvent.click(await screen.findByTestId(`identities-row-${gpt41.did}`));
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+
+      expect(
+        within(await screen.findByTestId('identities-version-1-recorder')).getByTestId(
+          'identities-recorder-chip-skipped'
+        )
+      ).toBeInTheDocument();
+      expect(screen.queryByTestId('identities-version-2-recorder')).not.toBeInTheDocument();
+    });
+
     it('opens the surface entry and marks the version for a deep link to an earlier DID', async () => {
       renderWithStats([gpt4o, gpt41], [], `/identities/${encodeURIComponent(gpt4o.did)}`);
 

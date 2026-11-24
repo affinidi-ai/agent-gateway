@@ -154,6 +154,11 @@ pub struct SurfaceConfigBuilder {
     pub streams_sign_in_records: bool,
     /// Console users sign in with SAML rather than passkeys.
     pub signs_in_with_saml: bool,
+    /// Further `saml.json` settings, key to JSON value, written over the SAML fixture's.
+    pub saml_settings: serde_json::Map<String, serde_json::Value>,
+    /// The gateway is expected to exit at startup, so the harness waits for it to exit
+    /// instead of waiting for it to serve.
+    pub refuses_to_start: bool,
     /// `rbac.json` permissions the gateway starts with, feature name to required role,
     /// on top of the defaults.
     pub rbac_permissions: Vec<(String, String)>,
@@ -334,6 +339,8 @@ impl Default for SurfaceConfigBuilder {
             sign_in_event_stream: None,
             streams_sign_in_records: false,
             signs_in_with_saml: false,
+            saml_settings: serde_json::Map::new(),
+            refuses_to_start: false,
             rbac_permissions: Vec::new(),
             caller_key: None,
             response_auth: None,
@@ -446,6 +453,8 @@ pub struct SurfaceTransitPointConfig {
     pub header_metadata_mapping: TransitPointHeaderMetadataMappingConfig,
     pub managed_identity: Option<TransitPointManagedIdentityConfig>,
     pub trust_check_list: Vec<serde_json::Value>,
+    /// The entries of the Transit Point's own `trust_recorder`.
+    pub trust_recorder_entries: Vec<serde_json::Value>,
     pub policy: Option<RequestPolicyFixture>,
     pub require_transit_token: bool,
     /// The Transit Point's own `source_auth`.
@@ -469,6 +478,9 @@ pub struct SurfaceTransitPointConfig {
     /// Requests per minute the Transit Point admits from each caller
     /// (`per_caller_rate_limit`).
     pub per_caller_rate_limit_per_minute: Option<u32>,
+    /// The Transit Point presents the surface's managed agent identity to its
+    /// destination (`identity_injection.inject_vp`) without an identity of its own.
+    pub inject_vp: bool,
 }
 
 impl SurfaceTransitPointConfig {
@@ -482,6 +494,7 @@ impl SurfaceTransitPointConfig {
             header_metadata_mapping: Default::default(),
             managed_identity: None,
             trust_check_list: Vec::new(),
+            trust_recorder_entries: Vec::new(),
             policy: None,
             require_transit_token: false,
             source_auth: None,
@@ -492,6 +505,7 @@ impl SurfaceTransitPointConfig {
             target_auth_secret: None,
             target_base_path: None,
             per_caller_rate_limit_per_minute: None,
+            inject_vp: false,
         }
     }
 }

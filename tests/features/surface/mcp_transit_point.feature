@@ -15,8 +15,8 @@ Feature: MCP Transit Point forwarding
     And the MCP surface returns MCP server "bravo" tool catalog unchanged
 
   Scenario: MCP tool discovery follows an updated Transit Point explicit path
-    Given the operator updates Transit Point "alpha" listen_path to "/transit/alpha-renamed"
-    When managed agent "example-agent" asks for available tools through Transit Point path "/transit/alpha-renamed"
+    Given the operator updates Transit Point "alpha" listen_path to "/outbound/example/alpha-renamed"
+    When managed agent "example-agent" asks for available tools through Transit Point path "/outbound/example/alpha-renamed"
     Then the response status is 200
     And MCP server "bravo" received the forwarded MCP request
     And MCP server "bravo" received MCP method "tools/list"
@@ -24,8 +24,9 @@ Feature: MCP Transit Point forwarding
     And the MCP surface returns MCP server "bravo" tool catalog unchanged
 
   Scenario: MCP tool discovery stops using the previous Transit Point path after it is renamed
-    Given the operator updates Transit Point "alpha" listen_path to "/transit/alpha-renamed"
-    When managed agent "example-agent" asks for available tools through Transit Point path "/transit/alpha"
+    Given the operator updates Transit Point "alpha" listen_path to "/outbound/example/alpha-first"
+    And the operator updates Transit Point "alpha" listen_path to "/outbound/example/alpha-renamed"
+    When managed agent "example-agent" asks for available tools through Transit Point path "/outbound/example/alpha-first"
     Then the response status is 404
     And MCP server "bravo" was not called
 

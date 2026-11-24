@@ -605,6 +605,8 @@ pub struct ScenarioInfra {
     pub identity_provider: Option<OidcProvider>,
     pub gateway_port: u16,
     pub outbound_port: u16,
+    /// How the gateway exited at startup, for a scenario whose gateway refuses to start.
+    pub startup_exit: Option<std::process::ExitStatus>,
 }
 
 impl std::fmt::Debug for ScenarioInfra {

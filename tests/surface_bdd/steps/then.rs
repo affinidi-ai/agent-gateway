@@ -344,6 +344,7 @@ fn agent_card_points_callers_at_transit_point(
     transit_point: String,
 ) {
     let url = served_card_url(world);
+    let path = crate::steps::when::transit_point_path(world, &transit_point);
     let outbound_port = world
         .infra
         .as_ref()
@@ -351,7 +352,7 @@ fn agent_card_points_callers_at_transit_point(
         .outbound_port;
     assert_eq!(
         url,
-        format!("http://localhost:{outbound_port}/transit/{transit_point}"),
+        format!("http://localhost:{outbound_port}{path}"),
         "agent card url should be Transit Point '{transit_point}'"
     );
 }
@@ -1293,12 +1294,13 @@ async fn caller_trust_check_reported_result(
     );
 }
 
-#[then(expr = "the target Trust Check reported error code {string}")]
-async fn target_trust_check_reported_error_code(
+#[then(regex = r#"^the (target|managed-agent) Trust Check reported error code "([^"]+)"$"#)]
+async fn trust_check_reported_error_code(
     world: &mut SurfaceWorld,
+    leg: String,
     expected_code: String,
 ) {
-    assert_trust_check_error_code(world, "target", &expected_code).await;
+    assert_trust_check_error_code(world, &leg.replace('-', "_"), &expected_code).await;
 }
 
 #[then(expr = "the target Trust Check reported error code {string} {int} times")]
@@ -1697,6 +1699,12 @@ fn response_body_is_error(
             "title": "Forbidden",
             "status": 403,
             "detail": "Request blocked by surface policy"
+        }),
+        "transit_point_request_policy_denied_not_recognised" => serde_json::json!({
+            "type": "https://a2a-protocol.org/errors/proxy-error",
+            "title": "Forbidden",
+            "status": 403,
+            "detail": "Request blocked by surface policy: Calling agent is not recognised"
         }),
         "agent_card_target_auth_misconfigured" => serde_json::json!({
             "type": "https://a2a-protocol.org/errors/proxy-error",

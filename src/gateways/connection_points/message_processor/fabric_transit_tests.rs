@@ -669,6 +669,58 @@ async fn a_modern_mcp_stream_reaches_the_agent_with_one_transit_token() {
     );
 }
 
+/// A framed stream continues the trace the peer named, as a buffered forward
+/// does: the agent's transit token and `X-Gateway-Trace-Id` carry it.
+#[tokio::test]
+async fn a_modern_mcp_stream_continues_the_trace_the_peer_named() {
+    if ran_in_child("ATG_FABRIC_STREAM_TRACE_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let surface = surface("mcp", &target.url, &["crm"]);
+    let _receiver = receiver(root.path(), &surface).await;
+
+    let headers = json!({ "content-type": "application/json", "accept": "application/json, text/event-stream",
+        "mcp-protocol-version": crate::mcp::MCP_MODERN_VERSION, "mcp-method": "tools/list", "x-api-key": CALLER_KEY });
+    let body = json!({ "jsonrpc": "2.0", "id": "stream", "method": "tools/list", "params": { "_meta": {
+        "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
+        "io.modelcontextprotocol/clientCapabilities": {}
+    } } });
+    let message = forward_request(root.path(), headers.clone(), Value::Null);
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        Box::pin(super::process_stream_forward_request(
+            &message,
+            super::FabricStreamRequest {
+                headers: crate::proxy::fabric_stream::wire::headers_from_json(Some(&headers)).unwrap(),
+                body: serde_json::to_vec(&body)
+                    .unwrap()
+                    .into(),
+                surface,
+                variant: crate::config::agent_surface_variants::ForwardedVariant {
+                    id: None,
+                    recorded: "_base_".into(),
+                },
+                capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities::local(true, true),
+                scope: crate::observability::policy_audit::RequestScope::fresh(),
+            },
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            None,
+        )),
+    )
+    .await
+    .expect("Fabric stream receive timed out");
+    let received = target.received();
+    assert_eq!(received.len(), 1, "the request reaches the agent: {result:?}");
+    let tokens = header_values(&received[0], "x-transit-token");
+    let claims = test_issuer()
+        .validate_for_transit_point(tokens[0], SURFACE_ID, "crm", 300)
+        .unwrap();
+    assert_eq!(claims.trace_id.as_deref(), Some("trace-from-the-peer"));
+    assert_eq!(header_values(&received[0], "x-gateway-trace-id"), ["trace-from-the-peer"]);
+}
+
 fn caller(
     caller_identity: Option<&str>,
     verification: IdentityVerification,

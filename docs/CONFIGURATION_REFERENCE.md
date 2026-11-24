@@ -82,7 +82,7 @@ Each of these behaves differently from the obvious reading of the field.
 | `server_mode` | Must be a top-level key, before any `[table]` header. Placed after one, TOML nests it under that table and the setting is silently ignored. |
 | `a2a.message_expires_seconds` | Should be strictly greater than `a2a.fabric_gateway_timeout_ms / 1000`. Nothing validates this. When it is not, a fabric message expires at the mediator while the sending gateway is still waiting, and the failure looks like a timeout with no cause. |
 | `backup_encryption_key` | Required. The service does not start without a resolvable value. |
-| Unknown top-level keys | Ignored, not rejected. A misspelled key takes no effect and produces no error. |
+| Unknown top-level keys | Ignored, not rejected. A misspelled key takes no effect and produces no error; in `saml.json` it logs a warning at startup ([`saml.json`](#samljson)). |
 | `encryption.key_source = "local"` | Does not encrypt. It writes plaintext `ENC[0::…]` envelopes and is for development only. It does not count as encryption at rest for delegated grants by binding, so with it, as with `[encryption]` off, a binding with `consent_mode: external`, a Transit Point's or the Access Point Target's, is refused. See [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#grants-by-binding). |
 | `encryption.enabled` | `--generate-bootstrap` writes `[encryption]` with `enabled = false`, and a `config.toml` without the table runs unencrypted. Deployment tooling that builds `config.toml` from `--generate-bootstrap` replaces that table, so its output keeps encryption off and the table's shape stable. The development setup turns encryption on for an environment it creates: a local one reads the master key from `envs/master_encryption_key` (`key_source = "file"`), a Docker one from `AG_MASTER_KEY`. When it regenerates an existing `config.toml`, it keeps that file's `[encryption]` table. An existing environment that runs unencrypted stays unencrypted. To opt in, set `[encryption]` by hand (`enabled = true`, `key_source = "file"`, `key_file` = the absolute path of `envs/master_encryption_key` or of another file holding a 64-hex or base64 32-byte key) and restart; plaintext records are rewritten as `.json.enc` when they are loaded. |
 | `encryption.field_encryption_enabled` | Reserved and not wired to any field. Leave it false. |
@@ -103,6 +103,97 @@ A Transit Point's rate limits are surface fields, not configuration files: `rate
 bucket for the point, and `per_caller_rate_limit` gives each caller the point identifies a bucket
 of their own. Both are counted on each gateway node. See
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point).
+
+An element of a Transit Point's `trust_check_list` with `"subject": "managed_agent"` asks a
+trust registry about the managed agent calling out through it, not the destination; its
+results reach policy at `input.trust_check_results.managed_agent`. Elements without `subject`
+check the destination. See [`POLICY.md`](POLICY.md#self-recognition-check).
+
+A Transit Point's `trust_recorder` (absent by default) has the shape of
+`access_point.trust_recorder` and writes, in the background on every request except a discovery read, the records of
+the managed agent calling out through it. See
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-trust-recorder).
+
+## Transit Point listen paths
+
+A Transit Point answers at the route the gateway derives,
+`/outbound/<surface route>/<alias>`, or `/outbound/<surface route>$<variant>/<alias>` for one a
+variant defines. That route is registered whatever the point's `listen_path` and is served at
+every address in `available_outbound_listen_addresses`, so a point that sets no `listen_path`
+needs nothing from this section.
+
+A `listen_path` adds a second route beside the derived one. It is set under one of the surface
+prefixes `gateway.json` configures in `channels`, with or without `/outbound` in front, and needs
+a segment of its own after that prefix: `/<channel>/<name>` or `/outbound/<channel>/<name>`.
+Those are the prefixes the Surface Builder's **Listen Path** picker offers, the plain ones on an
+outbound address of its own and the `/outbound` ones on an address shared with an inbound
+listener, so the admin API stores no Transit Point the dashboard could not have composed. Four
+paths it cannot serve as the Transit Point means it, on the base surface and in every variant
+alike:
+
+| Path | What happens | On save |
+| --- | --- | --- |
+| One the outbound router cannot register as written: no leading `/`, `/` or `//` alone, a `..` segment, `{` or `}` (axum reads a balanced pair as a path parameter, so the Transit Point silently answers every value in that position, and the listener build panics on a conflict there), or a segment starting with `:` or `*` (axum's pre-0.8 parameter syntax, which it refuses outright) | The outbound listener build panics, taking the gateway down, once the surface is stored | Refused, `400` with the code `listen_path_invalid` |
+| `/outbound` itself, bare or with a trailing slash | The point answers every `/outbound` request no more specific route matches, the derived routes of other Transit Points still winning | Refused, `400` with the code `listen_path_is_outbound_prefix` |
+| Under no configured surface prefix, or a bare prefix with no segment of its own: `/partner-a-webhook`, `/outbound/not-a-channel/x`, `/<channel>`, `/<channel>/`, `/<channel>//` (the listener trims every trailing slash, so slashes are no segment) | The dashboard cannot compose it, and it claims a route outside the space the gateway serves Transit Points on, or the whole prefix and its wildcard | Refused, `400` with the code `listen_path_not_a_channel_prefix`, naming the prefixes this gateway does offer |
+| A path on a Transit Point whose alias only a variant defines, wherever it sits | The outbound listener registers routes from the base surface's Transit Points alone, so nothing answers the path | Refused, `400` with the code `listen_path_variant_only`, asking for the alias in the base surface rather than naming a path to set |
+| A path outside `/outbound`, under a configured prefix: `/<channel>/<name>` | The point answers it on its outbound listener's own address. An inbound listener that shares a hostname with that listener forwards `/outbound` and nothing else, so the path is not reachable through the inbound address | Refused where **the point's own outbound listener** shares a hostname with an inbound listener, `400` with the code `listen_path_not_served`, which is also where the Surface Builder offers the `/outbound` prefixes alone. The listener is the point's `listen_address`, or the surface's `outbound_listen_address`, so one point may be held to the outbound prefix while another on a listener of its own is not. Where that listener has a hostname of its own the path is reachable, the picker offers it, and the save stores it; a path already stored gets a `Warning` header naming the point, its variant and the route it would otherwise answer on |
+
+Both refusals name the Transit Point, its variant and what to do instead, and apply only to a
+path the save introduces or changes. The same Transit Point, in the same variant, keeping the
+same path is exempt, so a surface stored with such a path before this release stays editable,
+while moving the path to another Transit Point, copying it into a variant, renaming the point, or
+renaming the variant (which re-introduces every path that variant holds) is a new claim. A
+disabled surface reserves no route, so saving one is never refused and, claiming nothing while
+disabled, enabling it introduces every path it names: a surface disabled with a refused path
+cannot be enabled until the path changes.
+
+A `listen_path` is also refused when it is a route another Transit Point already answers on,
+whether that point belongs to this surface or another on the same outbound listener. Those are
+the derived `/outbound/<surface route>/<alias>`, each variant's
+`/outbound/<surface route>$<variant>/<alias>`, and, for a point that sets a `listen_path` of its
+own, `<listen_path>$<variant>`; the listener registers the `$` forms with `%24` beside them, and
+both are refused. A variant route is a path the other checks accept wherever the surface route
+sits below its channel prefix, since the `$` then falls in a later segment: with the prefix
+`/agents` and the route `/agents/orders`, `/outbound/agents/orders$beta/alpha` claims a segment
+of its own under `/outbound/agents`. The two register the same route, and the listener build
+keeps whichever came first and skips the other with an error log, so one point's callers would
+reach the other's Target. A point whose `listen_path` is its **own derived route** is left alone,
+since that route reaches the Target it names either way; its own variant routes are not, because
+the `listen_path` registration wins over the variant one and the request is then read as the
+custom route, so a caller that named the variant is served by the default variant's Target. As
+with the other refusals, only a path a save introduces or changes is refused.
+
+`shared_hostname_outbound_addresses` of `GET /v1/config/surface-routing` names every outbound
+address whose listener the inbound `/outbound` proxy forwards to, which is where the fourth
+refusal applies. An inbound listener forwards to the first outbound listener whose hostname it
+shares, so a second outbound listener carrying that same hostname is not reached through the
+inbound address at all and is treated as having a hostname of its own. The gateway answers that question with the same function on both sides, so a
+client offering the `/outbound` prefixes for exactly these addresses offers what a save accepts.
+The two address lists cannot be compared for it: a listener answers on every one of its
+`external_urls`, so an alias URL in no inbound list is still its listener's, and the same
+hostname on another port is the same hostname.
+
+`outbound_channel_path_prefix` of `GET /v1/config/surface-routing` names each surface prefix
+under `/outbound`: prefixes to build a `listen_path` under, never values to set, since a surface
+prefix of `/` leaves the bare `/outbound` there. A path built under any of them is accepted,
+that root prefix included, so `/outbound/<name>` saves on a gateway whose only channel is `/`;
+the bare `/outbound` itself is still refused. A root channel has no usable plain form, since
+that would be the whole listener, so only its `/outbound` form is a prefix anything may be set
+under.
+
+A Transit Point that sets no `listen_path` is unaffected, except for one case: the outbound
+listener registers routes for the base surface's Transit Points, and builds each variant's `$`
+route from a base point's alias and path, so **an alias only a variant defines has no route of
+its own, and a `listen_path` on it installs none either**. Nothing reaches such a point until the
+base surface defines the alias too, after which the variant answers at that point's routes with
+`$<variant>` in them. A refusal or warning about it says that, rather than naming a route, or a
+path to set, that would not reach it.
+
+Known limitation: a `listen_path` already on disk is served as stored. One the router cannot
+register still panics the outbound listener build, and a stored `/outbound` still answers every
+outbound request no more specific route matches. Both are logged when the listener is built.
+Move any stored path the admin API would now refuse.
 
 ## Browser origins of a surface
 
@@ -222,7 +313,7 @@ description that exists today.
 | --- | --- |
 | `server_mode` | `active` serves traffic. `standby` drops listeners and returns 503 on `/api/v1/health` while `/api/v1/alive` stays 200. `SIGUSR1` promotes, `SIGUSR2` steps down. |
 | `cache_refresh_interval_secs` | Above 0, DashMap-backed stores reconcile with disk on that interval, so manual `_storage/` edits are picked up without a reload. Policy definitions and global policies do not participate. |
-| `auth_mode` | `passkey` uses WebAuthn. `saml` requires `saml.json` and a configured identity provider. |
+| `auth_mode` | `passkey` uses WebAuthn. `saml` requires `saml.json` and a configured identity provider; it reads `saml.json` and fails startup if it cannot be read or any of its settings is refused ([`saml.json`](#samljson)). |
 | `secrets_backend` | `filesystem` keeps secrets under `_storage/`. `aws` uses AWS. |
 | `encryption.enabled` | Writes whole storage files as `.json.enc`. Losing the master key loses the data. |
 | `metrics_retention_minutes` | Parsed but not used. Retention is the value in `_storage/settings/settings.json`, set from the dashboard, which defaults to 360 minutes whatever this field says. |
@@ -482,9 +573,9 @@ Read when `auth_mode = "saml"`. Ignored otherwise.
 
 | Group | Fields |
 | --- | --- |
-| Identity provider | `idp_entity_id`, `idp_sso_url`, `idp_slo_url`, `idp_cert_path` |
+| Identity provider | `idp_entity_id`, `idp_sso_url`, `idp_cert_path` |
 | Service provider | `sp_entity_id`, `sp_acs_url`, `sp_key_path`, `sp_cert_path` |
-| Security | `sign_requests`, `require_encrypted_assertions` |
+| Security | `sign_requests` |
 | Sign-in throttle | `login_throttle`: `enabled` (default `false`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds) per client IP for `/saml/login`. Behind a load balancer, set `client_ip.trusted_proxies` in `gateway.json` first. |
 | Claims | `attribute_mapping` from SAML claim URI to user field |
 | Roles | `role_mapping` from identity-provider role to gateway role |
@@ -499,6 +590,25 @@ first user to sign in becomes the primary administrator and keeps that role what
 identity provider sends later, so a missing or changed role claim cannot remove the only
 guaranteed administrator. A sign-in that would have changed it logs a warning instead
 ([`saml/user_provisioning.rs`](../src/auth/saml/user_provisioning.rs)).
+
+Encrypted assertions and SAML single logout are not supported. `"require_encrypted_assertions": true`
+refuses startup; set it to `false` or remove it, and configure the identity provider to send
+unencrypted signed assertions. A SAML response that carries an encrypted assertion is refused at
+sign-in, and the log says "encrypted SAML assertions are not supported". A non-null
+`"idp_slo_url"` refuses startup; remove it. `false` or absent `require_encrypted_assertions`, and
+`null` or absent `idp_slo_url`, are accepted. Signing out ends the dashboard session only; see the
+accepted risk below.
+
+Accepted risk: SAML single logout is not supported. Signing out ends the dashboard session only
+and does not sign out of the identity provider, so the next SAML sign-in in that browser can
+complete without asking for credentials. Sign out of the identity provider as well, or have it
+require re-authentication.
+
+Startup logs one warning that names up to 20 of the `saml.json` keys that are not read, and how
+many there are, at the top level and inside `attribute_mapping`, `graph_api` and `login_throttle`;
+keys set to `null` are not reported. Only key names are logged, each cut to 64 characters, and
+startup continues.
+`idp_metadata_url` and `graph_api.note` are ignored and not reported.
 
 ## `x402.json`
 

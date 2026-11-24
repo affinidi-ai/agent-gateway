@@ -2525,8 +2525,11 @@ pub(crate) async fn build_identity_list_with(
 }
 
 /// Managed identities on a surface with a Trust Recorder carry its last known outcome, or
-/// `not_attempted` before the first one. A DID managed on several such surfaces carries the
-/// worst of their outcomes, with the surface it came from. Every other identity carries none.
+/// `not_attempted` before the first one. On a surface whose only recorders are its Transit
+/// Points', an identity carries an outcome only once one was stored for it, since those
+/// recorders write only the DIDs their Transit Points call out under. A DID managed on several
+/// such surfaces carries the worst of their outcomes, with the surface it came from. Every
+/// other identity carries none.
 async fn recorder_status_for(
     identity: &IdentityInfo,
     surfaces_by_id: &std::collections::HashMap<&str, &crate::config::agent_surface::AgentSurface>,
@@ -2540,16 +2543,18 @@ async fn recorder_status_for(
         let Some(surface) = surfaces_by_id.get(managed.surface_id.as_str()) else {
             continue;
         };
-        if surface
-            .trust_recorder()
-            .is_none_or(|recorder| recorder.entries.is_empty())
-        {
+        if !surface.has_trust_recorder_entries() {
             continue;
         }
-        let status = recorder_status
+        let stored = recorder_status
             .status_for(&surface.surface_id, &identity.did)
-            .await
-            .unwrap_or_else(RecorderStatus::not_attempted);
+            .await;
+        let surface_records_it = surface
+            .trust_recorder()
+            .is_some_and(|recorder| !recorder.entries.is_empty());
+        let Some(status) = stored.or_else(|| surface_records_it.then(RecorderStatus::not_attempted)) else {
+            continue;
+        };
         if worst
             .as_ref()
             .is_none_or(|(w, _)| recorder_severity(status.state) > recorder_severity(w.state))

@@ -1,0 +1,17 @@
+branch: fix/saml-unread-settings
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-23T15:21:26Z'
+      title: Warn at startup about saml.json keys that are not read
+      description: 'With `auth_mode = "saml"`, startup logs one warning that names the saml.json keys Agent Gateway does not read, at the top level and inside `attribute_mapping`, `graph_api` and `login_throttle`, so a misspelt key no longer goes unnoticed. Only key names are logged, never values, and startup continues. `idp_metadata_url` and `graph_api.note`, which shipped saml.json templates set, are not reported.'
+  fixed: []
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-11-23T15:21:26Z'
+      title: Refuse to start when saml.json sets require_encrypted_assertions to true
+      description: 'With `auth_mode = "saml"`, Agent Gateway does not decrypt SAML assertions, so `"require_encrypted_assertions": true` in saml.json is not supported and the whole process refuses to start, Surface traffic included. Set it to `false` or remove it, and configure the identity provider to send unencrypted signed assertions. A SAML response that carries an encrypted assertion is refused at sign-in, and the log says "encrypted SAML assertions are not supported". A deployment whose cdk-atlas-lib `samlConfig` sets `require_encrypted_assertions` to `true` must remove it or set it to `false` before taking this release, whatever its cdk-atlas-lib version. In a source checkout, `make run-debug auth=saml` and `make run-watch auth=saml` stop with an error while the env''s saml.json sets it to `true`.'
+    - timestamp: '2026-11-23T15:21:26Z'
+      title: Refuse to start when saml.json sets idp_slo_url
+      description: 'With `auth_mode = "saml"`, SAML single logout is not supported, so a non-null `"idp_slo_url"` in saml.json now refuses startup of the whole process, Surface traffic included; a saml.json copied from the earlier example sets it. Remove the key; `null` is still accepted. A deployment whose cdk-atlas-lib `samlConfig` sets `idp_slo_url` must remove it before taking this release, whatever its cdk-atlas-lib version. In a source checkout, `make run-debug auth=saml` or `make run-watch auth=saml` removes it from the env''s saml.json. Signing out ends the dashboard session only; the identity provider session stays.'

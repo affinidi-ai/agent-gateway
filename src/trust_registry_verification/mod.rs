@@ -15,7 +15,8 @@ pub use stage::{run_caller_trust_check, run_trust_check_stage};
 pub use trqp_adapter::TrqpListenerClient;
 pub use trust_check_element::{TrustCheckElement, TrustCheckLeg, TrustCheckResultsContext};
 pub use trust_check_executor::{
-    AGENT_CARD_UNAVAILABLE, IDENTITY_VP_VERIFICATION_FAILED, TARGET_AGENT_IDENTITY_UNAVAILABLE,
-    TrustCheckIdentityVerificationFailure, synthesize_failure, synthesize_unavailable_target,
+    AGENT_CARD_UNAVAILABLE, IDENTITY_VP_VERIFICATION_FAILED, MANAGED_AGENT_IDENTITY_UNAVAILABLE,
+    TARGET_AGENT_IDENTITY_UNAVAILABLE, TrustCheckIdentityVerificationFailure, synthesize_failure,
+    synthesize_unavailable, synthesize_unavailable_target,
 };
-pub use trust_recorder::spawn_trust_recorder;
+pub use trust_recorder::{spawn_recorder, spawn_trust_recorder};
