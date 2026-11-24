@@ -16,7 +16,7 @@ type Json = Record<string, unknown>;
 function record(targetAuth: Json | null): Json {
     return {
         id: 'evt-1',
-        timestamp: '2026-11-02T10:00:00Z',
+        occurred_at: '2026-11-02T10:00:00Z',
         channel_name: 'Orders',
         surface_id: 'orders',
         event: {

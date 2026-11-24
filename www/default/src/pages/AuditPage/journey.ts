@@ -7,12 +7,12 @@ export interface JourneyStep {
   title: string;
   tone: EventTone;
   detail?: string;
-  timestamp: string;
+  occurred_at: string;
 }
 
 /**
  * Rough pipeline position of an event, so the journey reads in request order
- * even when timestamps collide. Lower = earlier in the request lifecycle.
+ * even when occurrence times collide. Lower = earlier in the request lifecycle.
  */
 function stageRank(entry: AuditEntry): number {
   const tc = trustCheck(entry);
@@ -54,15 +54,17 @@ function stageRank(entry: AuditEntry): number {
 
 /**
  * Orders a request's correlated events into a readable journey (pipeline stage,
- * then timestamp, then original index). Reuses {@link describeEntry} so titles,
- * tone, and the human summary stay consistent with the list. Pure.
+ * then occurrence time, then original index). Reuses {@link describeEntry} so
+ * titles, tone, and the human summary stay consistent with the list. Pure.
  */
 export function buildJourney(siblings: AuditEntry[]): JourneyStep[] {
   return siblings
     .map((entry, index) => ({ entry, index, rank: stageRank(entry) }))
     .sort(
       (a, b) =>
-        a.rank - b.rank || a.entry.timestamp.localeCompare(b.entry.timestamp) || a.index - b.index
+        a.rank - b.rank ||
+        a.entry.occurred_at.localeCompare(b.entry.occurred_at) ||
+        a.index - b.index
     )
     .map(({ entry, index }) => {
       const narrative = describeEntry(entry);
@@ -71,7 +73,7 @@ export function buildJourney(siblings: AuditEntry[]): JourneyStep[] {
         title: narrative.title,
         tone: narrative.tone,
         detail: narrative.summary,
-        timestamp: entry.timestamp,
+        occurred_at: entry.occurred_at,
       };
     });
 }

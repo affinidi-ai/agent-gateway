@@ -626,7 +626,7 @@ test.describe("Audit Log delegation records", () => {
   }) => {
     const record = (event: string, detail: string) => ({
       id: `audit-${event}`,
-      timestamp: fromNow(-HOUR),
+      occurred_at: fromNow(-HOUR),
       event,
       provider_id: "github",
       provider_name: "GitHub",

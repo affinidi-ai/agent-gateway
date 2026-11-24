@@ -705,7 +705,7 @@ function auditEntry(i: number): AuditEntry {
     const allow = i % 3 !== 0;
     return {
         id: `layout-audit-${i}`,
-        timestamp: iso(i),
+        occurred_at: iso(i),
         event: {
             policy_decision: {
                 scope: i % 2 === 0 ? 'gateway' : 'surface',

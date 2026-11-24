@@ -21,7 +21,7 @@ const AuditJourney: React.FC<AuditJourneyProps> = ({ steps }) => {
           <span className="audit-journey-body">
             <span className="audit-journey-title">{step.title}</span>
             {step.detail && <span className="audit-journey-detail">{step.detail}</span>}
-            <span className="audit-journey-time">{timeAgo(step.timestamp)}</span>
+            <span className="audit-journey-time">{timeAgo(step.occurred_at)}</span>
           </span>
         </li>
       ))}

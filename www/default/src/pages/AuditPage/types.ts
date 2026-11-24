@@ -169,7 +169,8 @@ export interface AuditCaller {
 
 export interface AuditEntry {
   id?: string;
-  timestamp: string;
+  /** When the event happened, RFC 3339. */
+  occurred_at: string;
   /** Raw event field — a string for unit variants, object for struct variants */
   event: AuditEventField;
   caller?: AuditCaller;

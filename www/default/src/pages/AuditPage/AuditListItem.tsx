@@ -89,8 +89,8 @@ const AuditListItem: React.FC<AuditListItemProps> = ({
           </span>
           <span className="audit-item-summary">{summary}</span>
           {detail && <span className="audit-item-detail">{detail}</span>}
-          <span className="audit-item-foot" title={formatDateTime(entry.timestamp, true)}>
-            <span className="audit-item-foot-time">{timeAgo(entry.timestamp)}</span>
+          <span className="audit-item-foot" title={formatDateTime(entry.occurred_at, true)}>
+            <span className="audit-item-foot-time">{timeAgo(entry.occurred_at)}</span>
             <span aria-hidden="true"> · </span>
             <span className="audit-item-foot-actor">{actorOf(entry, userName)}</span>
           </span>

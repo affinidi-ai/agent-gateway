@@ -75,7 +75,7 @@ const AuditDetailPanel: React.FC<AuditDetailPanelProps> = ({
                 )}
               </div>
               <h2 className={`audit-drawer-title audit-item-title--${tone}`}>{narrative.title}</h2>
-              <div className="audit-drawer-sub text-muted">{timeAgo(entry.timestamp)}</div>
+              <div className="audit-drawer-sub text-muted">{timeAgo(entry.occurred_at)}</div>
             </div>
           </div>
           <div className="audit-drawer-filters" data-testid="audit-detail-filters">

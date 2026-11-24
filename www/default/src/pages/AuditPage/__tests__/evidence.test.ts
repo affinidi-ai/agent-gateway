@@ -2,7 +2,7 @@ import { signedVpEntry, traceSiblings } from '../evidence';
 import type { AuditEntry } from '../types';
 
 const at = (event: AuditEntry['event'], extra: Partial<AuditEntry> = {}): AuditEntry => ({
-  timestamp: '2026-02-01T10:00:00Z',
+  occurred_at: '2026-02-01T10:00:00Z',
   event,
   ...extra,
 });

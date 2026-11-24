@@ -2,7 +2,7 @@ import { buildJourney } from '../journey';
 import type { AuditEntry } from '../types';
 
 const at = (event: AuditEntry['event'], extra: Partial<AuditEntry> = {}): AuditEntry => ({
-  timestamp: '2026-02-01T10:00:00Z',
+  occurred_at: '2026-02-01T10:00:00Z',
   event,
   ...extra,
 });
@@ -24,6 +24,18 @@ describe('journey', () => {
 
     const steps = buildJourney([response, gateway, callerTc]);
     expect(steps.map(s => s.key)).toEqual(['caller', 'gw', 'response']);
+  });
+
+  it('orders the events of one stage by when they occurred', () => {
+    const later = at('token_injected', { id: 'later', occurred_at: '2026-02-01T10:00:02Z' });
+    const earlier = at('token_injected', { id: 'earlier', occurred_at: '2026-02-01T10:00:01Z' });
+
+    const steps = buildJourney([later, earlier]);
+
+    expect(steps.map(s => [s.key, s.occurred_at])).toEqual([
+      ['earlier', '2026-02-01T10:00:01Z'],
+      ['later', '2026-02-01T10:00:02Z'],
+    ]);
   });
 
   it('carries tone and a human title from the narrative', () => {

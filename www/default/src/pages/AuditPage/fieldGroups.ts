@@ -43,8 +43,8 @@ export interface FieldGroup {
 
 /**
  * Flattens an audit entry into ordered, grouped key/value rows for the "Details"
- * list. Deliberately omits fields the panel already shows elsewhere (timestamp,
- * event type, trace id, VP fingerprint) to avoid duplication. Pure and
+ * list. Deliberately omits fields the panel already shows elsewhere (occurrence
+ * time, event type, trace id, VP fingerprint) to avoid duplication. Pure and
  * order-stable so the list reads the same every render.
  */
 export function fieldGroups(

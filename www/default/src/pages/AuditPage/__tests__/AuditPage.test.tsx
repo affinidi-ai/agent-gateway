@@ -5,6 +5,7 @@ import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import AuditPage from '..';
 import { apiClient } from '../../../api';
 import { clearUserNames } from '../useUserNames';
+import { formatDateTime } from '../../../utils/stringUtils';
 
 let mockSessionToken: string | null = 'session-1';
 jest.mock('../../../api', () => ({
@@ -39,7 +40,7 @@ const AUDIT_RESPONSE = {
   events: [
     {
       id: 'entry-1',
-      timestamp: '2026-02-01T10:00:00Z',
+      occurred_at: '2026-02-01T10:00:00Z',
       event: {
         policy_decision: {
           scope: 'surface',
@@ -63,7 +64,7 @@ const AUDIT_RESPONSE = {
     },
     {
       id: 'entry-2',
-      timestamp: '2026-02-01T10:05:00Z',
+      occurred_at: '2026-02-01T10:05:00Z',
       event: 'token_injected',
       provider_id: 'prov-1',
       provider_name: 'GitHub',
@@ -277,6 +278,35 @@ describe('AuditPage', () => {
 
     expect(await screen.findByTestId('audit-list')).toBeInTheDocument();
     expect(screen.queryByTestId('audit-log-size')).not.toBeInTheDocument();
+  });
+
+  it('shows when a record occurred in the list, its details and its journey', async () => {
+    const occurredAt = '2026-02-01T10:00:00Z';
+    mockGet.mockResolvedValue({
+      data: {
+        ...AUDIT_RESPONSE,
+        events: [
+          {
+            id: 'occurred',
+            occurred_at: occurredAt,
+            event: 'token_injected',
+            trace_id: 'trace-9',
+            via_fabric: false,
+          },
+        ],
+        total: 1,
+        category_counts: { token_injected: 1 },
+      },
+    });
+    const shown = formatDateTime(occurredAt, true);
+
+    renderPage();
+
+    const item = await screen.findByTestId('audit-item-0');
+    expect(within(item).getByTitle(shown)).toHaveTextContent(shown);
+    const evidence = await screen.findByTestId('audit-evidence');
+    expect(within(evidence).getByTestId('audit-journey')).toHaveTextContent(shown);
+    expect(within(screen.getByTestId('audit-detail-panel')).getAllByText(shown)).toHaveLength(2);
   });
 
   it('keeps the evidence panel open by default and swaps it on selection', async () => {
@@ -603,7 +633,7 @@ describe('AuditPage policy changes', () => {
     events: [
       {
         id: 'change-1',
-        timestamp: '2026-10-27T10:00:00Z',
+        occurred_at: '2026-10-27T10:00:00Z',
         event: {
           policy_attached: {
             policy_definition_id: 'deny-pii',

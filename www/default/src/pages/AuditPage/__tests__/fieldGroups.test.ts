@@ -2,7 +2,7 @@ import { fieldGroups } from '../fieldGroups';
 import type { AuditEntry, PolicyDecisionData, TrustCheckData } from '../types';
 
 const baseEntry = (extra: Partial<AuditEntry> = {}): AuditEntry => ({
-  timestamp: '2026-02-01T10:00:00Z',
+  occurred_at: '2026-02-01T10:00:00Z',
   event: 'token_injected',
   ...extra,
 });
