@@ -127,13 +127,21 @@ async fn send_mcp(
     assert_eq!(status, axum::http::StatusCode::OK);
 }
 
-/// Every `traceparent` header in a recorded request `head`.
-fn traceparents(head: &str) -> Vec<&str> {
+/// Every value of header `name` in a recorded request `head`.
+fn header_values<'a>(
+    head: &'a str,
+    name: &str,
+) -> Vec<&'a str> {
     head.lines()
         .filter_map(|line| line.split_once(':'))
-        .filter(|(name, _)| name.eq_ignore_ascii_case("traceparent"))
+        .filter(|(sent, _)| sent.eq_ignore_ascii_case(name))
         .map(|(_, value)| value.trim())
         .collect()
+}
+
+/// Every `traceparent` header in a recorded request `head`.
+fn traceparents(head: &str) -> Vec<&str> {
+    header_values(head, "traceparent")
 }
 
 /// The `traceparent` headers and the body the managed agent received for one
@@ -222,6 +230,32 @@ async fn a_mirror_is_sent_the_mcp_body_its_managed_agent_is_sent() {
         .collect();
     assert_eq!(to_the_agent.len(), 1);
     assert_eq!(to_the_mirror, to_the_agent);
+}
+
+/// A traffic mirror's copy is marked as one and names the request's trace id
+/// followed by `-mirror`.
+#[tokio::test]
+async fn a_mirror_copy_names_the_trace_with_the_mirror_suffix() {
+    let agent = RecordingServer::start_answering(an_mcp_server()).await;
+    let mirror = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+    let call =
+        json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "lookup", "arguments": {}}});
+
+    send_mcp(
+        mcp_surface(
+            &agent,
+            json!({"mirror": {"endpoint": format!("{}/copy", mirror.origin()), "wait_for_response": true}}),
+        ),
+        &call.to_string(),
+    )
+    .await;
+
+    let copies = mirror.requests();
+    let [(head, _)] = &copies[..] else {
+        panic!("one copy: {copies:?}");
+    };
+    assert_eq!(header_values(head, "x-mirrored-request"), ["true"], "{head}");
+    assert_eq!(header_values(head, "x-gateway-trace-id"), [format!("{CALLERS_TRACE_ID}-mirror")], "{head}");
 }
 
 #[tokio::test]
