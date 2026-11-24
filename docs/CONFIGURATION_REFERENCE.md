@@ -147,12 +147,18 @@ disabled surface reserves no route, so saving one is never refused and, claiming
 disabled, enabling it introduces every path it names: a surface disabled with a refused path
 cannot be enabled until the path changes.
 
-A `listen_path` is also refused when it is the derived route another Transit Point answers on,
-`/outbound/<surface route>/<alias>`, on the same outbound listener, whether that point belongs to
-this surface or another. The two register the same route, and the listener build keeps whichever
-came first and skips the other with an error log, so one point's callers would reach the other's
-Target. A point whose `listen_path` is its own derived route is left alone, and, as with the other
-refusals, only a path a save introduces or changes is refused.
+A `listen_path` is also refused when it is a route another Transit Point already answers on,
+whether that point belongs to this surface or another on the same outbound listener. Those are
+the derived `/outbound/<surface route>/<alias>`, each variant's
+`/outbound/<surface route>$<variant>/<alias>`, and, for a point that sets a `listen_path` of its
+own, `<listen_path>$<variant>`; the listener registers the `$` forms with `%24` beside them, and
+both are refused. A variant route is a path the other checks accept wherever the surface route
+sits below its channel prefix, since the `$` then falls in a later segment: with the prefix
+`/agents` and the route `/agents/orders`, `/outbound/agents/orders$beta/alpha` claims a segment
+of its own under `/outbound/agents`. The two register the same route, and the listener build
+keeps whichever came first and skips the other with an error log, so one point's callers would
+reach the other's Target. A point whose `listen_path` is one of its own routes is left alone,
+and, as with the other refusals, only a path a save introduces or changes is refused.
 
 `shared_hostname_outbound_addresses` of `GET /v1/config/surface-routing` names every outbound
 address whose listener the inbound `/outbound` proxy forwards to, which is where the fourth

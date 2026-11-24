@@ -98,18 +98,24 @@ changes:
         sharing, from the same function the save gate calls, and the dashboard offers the
         /outbound prefixes for exactly those.
     - timestamp: '2026-11-24T09:30:00Z'
-      title: Refuse a listen_path that is another Transit Point's derived route
+      title: Refuse a listen_path that is a route another Transit Point answers on
       description: >-
-        A listen_path now sits in the same namespace as the routes the outbound listener derives,
-        /outbound/<surface route>/<alias>, so a point could claim the route another point answers
-        on, within the surface or across surfaces on the same listener. The save was stored, and
-        the listener build then registered whichever route came first and skipped the other with
-        an error log: one point's callers reached the other's Target, or the custom path never
-        answered, with nothing said at save time and the winner decided by registration order.
-        Such a save is now refused with 400, naming the Transit Point and the surface whose route
-        it claims. A point whose listen_path is its own derived route is unaffected, and, as with
-        the other listen_path refusals, only a path a save introduces or changes is refused, so a
-        surface already stored with such a clash stays editable.
+        A listen_path now sits in the same namespace as the routes the outbound listener
+        registers for every Transit Point, so a point could claim a route another point already
+        answers on, within the surface or across surfaces on the same listener. The save was
+        stored, and the listener build then registered whichever route came first and skipped the
+        other with an error log: one point's callers reached the other's Target, or the custom
+        path never answered, with nothing said at save time and the winner decided by
+        registration order. Such a save is now refused with 400, naming the Transit Point and the
+        surface whose route it claims. The routes compared are the derived
+        /outbound/<surface route>/<alias>, each variant's
+        /outbound/<surface route>$<variant>/<alias>, and <listen_path>$<variant> for a point that
+        sets a path of its own, each in both the $ and the %24 form the listener registers. A
+        variant route is reachable as a listen_path wherever the surface route sits below its
+        channel prefix, which leaves the $ in a later segment. A point whose listen_path is one
+        of its own routes is unaffected, and, as with the other listen_path refusals, only a path
+        a save introduces or changes is refused, so a surface already stored with such a clash
+        stays editable.
     - timestamp: '2026-11-24T09:35:00Z'
       title: Read a shared outbound hostname as the inbound proxy does
       description: >-

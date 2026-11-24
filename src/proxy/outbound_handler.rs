@@ -38,8 +38,21 @@ pub fn transit_point_variant_outbound_path(
     variant: &str,
     alias: &str,
 ) -> String {
+    transit_point_variant_outbound_route(route, "$", variant, alias)
+}
+
+/// [`transit_point_variant_outbound_path`] under one of the two separators the
+/// outbound listener registers a variant route with, `$` and its
+/// percent-encoded `%24`: axum matches them as distinct paths, so both are
+/// registered and both are routes a `listen_path` must not claim.
+pub fn transit_point_variant_outbound_route(
+    route: &str,
+    separator: &str,
+    variant: &str,
+    alias: &str,
+) -> String {
     let route = route.trim_end_matches('/');
-    format!("{TP_OUTBOUND_PATH_PREFIX}{route}${variant}/{alias}")
+    format!("{TP_OUTBOUND_PATH_PREFIX}{route}{separator}{variant}/{alias}")
 }
 
 #[cfg(test)]

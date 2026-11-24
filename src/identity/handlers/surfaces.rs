@@ -2199,27 +2199,55 @@ fn outbound_listen_path_claims(
         .collect()
 }
 
-/// Every `(listener, route)` a surface's Transit Points answer on without a
-/// `listen_path`: the derived `/outbound<route>/<alias>`, which the outbound
-/// listener registers for every point whatever its `listen_path`
-/// ([`crate::proxy::outbound_handler::transit_point_outbound_path`]). Keyed by
-/// the same resolved listener as [`outbound_listen_path_claims`], so the two
-/// are comparable, and carrying the alias so a refusal can name the point.
+/// The separators the outbound listener registers a variant route under, in
+/// `build_outbound_port_router`: the literal `$` and its percent-encoded form,
+/// which axum matches as two distinct paths.
+const VARIANT_ROUTE_SEPARATORS: [&str; 2] = ["$", "%24"];
+
+/// Every `(listener, route)` a surface's Transit Points answer on beside their
+/// own `listen_path`, which is what another point's `listen_path` must not
+/// claim. Keyed by the same resolved listener as [`outbound_listen_path_claims`],
+/// so the two are comparable, and carrying the alias so a refusal can name the
+/// point. Mirrors the route set `build_outbound_port_router` registers per
+/// point:
 ///
-/// The variant forms (`/outbound<route>$<variant>/<alias>`) are left out: a
-/// `listen_path` cannot be one, since `$` never follows a surface prefix in a
-/// path [`crate::proxy::server::listen_path_problems`] accepts.
+/// - the derived `/outbound<route>/<alias>`
+///   ([`crate::proxy::outbound_handler::transit_point_outbound_path`]);
+/// - for every variant of the surface, `/outbound<route>$<variant>/<alias>`
+///   and the same with `%24`;
+/// - for a point that sets a `listen_path`, `<listen_path>$<variant>` and its
+///   `%24` form, which the listener registers beside the path itself.
+///
+/// A variant route is reachable as a `listen_path` wherever the surface route
+/// sits below its channel prefix, since the `$` then falls in a later segment:
+/// with the prefix `/agents` and the route `/agents/orders`, the variant route
+/// `/outbound/agents/orders$beta/alpha` claims a segment under
+/// `/outbound/agents` and passes every check in
+/// [`crate::proxy::server::listen_path_problems`].
 fn outbound_derived_route_claims(
     surface: &AgentSurface,
     resolve_port: &impl Fn(&str) -> Option<u16>,
 ) -> Vec<(ListenerKey, String, String)> {
     transit_point_listeners(surface, resolve_port)
-        .map(|(key, tp)| {
-            (
-                key,
-                crate::proxy::outbound_handler::transit_point_outbound_path(surface.route(), &tp.alias),
-                tp.alias.clone(),
-            )
+        .flat_map(|(key, tp)| {
+            let mut routes =
+                vec![crate::proxy::outbound_handler::transit_point_outbound_path(surface.route(), &tp.alias)];
+            for variant in &surface.variants {
+                for separator in VARIANT_ROUTE_SEPARATORS {
+                    routes.push(crate::proxy::outbound_handler::transit_point_variant_outbound_route(
+                        surface.route(),
+                        separator,
+                        &variant.alias,
+                        &tp.alias,
+                    ));
+                    if let Some(path) = tp.listen_path.as_deref() {
+                        routes.push(format!("{}{separator}{}", path.trim_end_matches('/'), variant.alias));
+                    }
+                }
+            }
+            routes
+                .into_iter()
+                .map(move |route| (key.clone(), route, tp.alias.clone()))
         })
         .collect()
 }
@@ -2303,9 +2331,10 @@ async fn validate_listen_paths(
     check_listen_path_collisions(surface, &existing, resolve_port)
 }
 
-/// Refuse a `listen_path` that is the route another Transit Point is reached at
-/// without one: the derived `/outbound<route>/<alias>`, which the outbound
-/// listener registers for every point. The two register the same Axum route,
+/// Refuse a `listen_path` that is a route another Transit Point is reached at
+/// beside its own path: the derived `/outbound<route>/<alias>` and every
+/// variant form of it ([`outbound_derived_route_claims`]), all of which the
+/// outbound listener registers. The two register the same Axum route,
 /// and the listener build keeps whichever came first and skips the other with
 /// an error log, so one point's callers silently reach the other's Target, or
 /// the custom path never answers. Which of the two wins follows registration
@@ -2340,21 +2369,28 @@ fn check_listen_path_shadowing(
         .unwrap_or_default();
 
     // Every derived route on every listener, with the point and surface it
-    // belongs to. The surface being saved is included: a point may shadow
-    // another point of its own surface.
-    let mut derived: std::collections::HashMap<(ListenerKey, String), (String, String)> =
-        std::collections::HashMap::new();
-    let active = others
-        .iter()
-        .filter(|other| {
-            other.surface_id != surface.surface_id
-                && other.status != crate::config::agent_surface::SurfaceStatus::Disabled
-        })
-        .chain(std::iter::once(surface));
-    for owner in active {
+    // belongs to. The surface being saved is held as `Mine`, never by name or
+    // id: two surfaces may carry the same name, and an id is empty on a create,
+    // so only the walk itself says whose route this is. It is inserted last, so
+    // its own routes win over another surface's identical entry and the
+    // exemption below still applies.
+    let mut derived: std::collections::HashMap<(ListenerKey, String), RouteOwner> = std::collections::HashMap::new();
+    let others = others.iter().filter(|other| {
+        other.surface_id != surface.surface_id && other.status != crate::config::agent_surface::SurfaceStatus::Disabled
+    });
+    for owner in others {
         for (key, route, alias) in outbound_derived_route_claims(owner, resolve_port) {
-            derived.insert((key, route), (owner.name.clone(), alias));
+            derived.insert(
+                (key, route),
+                RouteOwner::Theirs {
+                    surface: owner.name.clone(),
+                    alias,
+                },
+            );
         }
+    }
+    for (key, route, alias) in outbound_derived_route_claims(surface, resolve_port) {
+        derived.insert((key, route), RouteOwner::Mine { alias });
     }
 
     for (key, tp) in transit_point_listeners(surface, resolve_port) {
@@ -2365,23 +2401,35 @@ fn check_listen_path_shadowing(
         if kept.contains(&claim) {
             continue;
         }
-        let Some((owner, alias)) = derived.get(&claim) else {
-            continue;
+        let owner = match derived.get(&claim) {
+            // A point's own route reaches the Target it names, so claiming it
+            // changes nothing.
+            Some(RouteOwner::Mine { alias }) if *alias == tp.alias => continue,
+            Some(RouteOwner::Mine { alias }) => format!("Transit Point '{alias}' of this surface"),
+            Some(RouteOwner::Theirs { surface, alias }) => {
+                format!("Transit Point '{alias}' of surface '{surface}'")
+            }
+            None => continue,
         };
-        if *alias == tp.alias && *owner == surface.name {
-            continue;
-        }
         return Err(SurfaceApiError::BadRequest(format!(
-            "listen_path '{}' on {} is the route Transit Point '{}' of surface '{}' answers on without one, so \
-             the listener would register one of the two and skip the other — choose a different listener path",
+            "listen_path '{}' on {} is a route {} answers on, so the listener would register one of the two and \
+             skip the other — choose a different listener path",
             path,
             key.label("outbound"),
-            alias,
             owner
         )));
     }
 
     Ok(())
+}
+
+/// Whose Transit Point answers on a derived route: the surface being saved, or
+/// another one, which a refusal names. Decided by which walk collected the
+/// route, so no two surfaces can be confused for sharing a name or an id.
+#[derive(Debug)]
+enum RouteOwner {
+    Mine { alias: String },
+    Theirs { surface: String, alias: String },
 }
 
 /// The stored surface a save's exemptions may rest on: none while that surface
@@ -9535,6 +9583,68 @@ mod validation_tests {
             other => panic!("expected a refusal, got {other:?}"),
         };
         assert!(message.contains("surface 'one'"), "{message}");
+    }
+
+    /// A surface route below its channel prefix leaves the variant separator in
+    /// a later segment, so `/outbound/agents/orders$beta/alpha` claims a segment
+    /// under `/outbound/agents` and passes every path check. It is still a route
+    /// the listener registers for `alpha` on variant `beta`.
+    #[test]
+    fn a_listen_path_that_is_another_points_variant_route_is_refused() {
+        let mut surface = surface_with_points(
+            "s1",
+            "one",
+            serde_json::json!([
+                { "alias": "alpha", "target_endpoint": "https://a.example", "protocol": "a2a" },
+                { "alias": "beta-claimer", "target_endpoint": "https://b.example", "protocol": "a2a" }
+            ]),
+        );
+        surface.access_point.route = "/agents/orders".to_string();
+        surface.variants = serde_json::from_value(serde_json::json!([{
+            "id": "v1", "alias": "beta", "name": "Beta", "enabled": true, "overrides": {}
+        }]))
+        .expect("variant fixture");
+
+        for route in ["/outbound/agents/orders$beta/alpha", "/outbound/agents/orders%24beta/alpha"] {
+            let mut claiming = surface.clone();
+            claiming
+                .transit
+                .as_mut()
+                .expect("transit")
+                .points[1]
+                .listen_path = Some(route.to_string());
+            let message = match check_listen_path_shadowing(&claiming, None, &[], &no_ports) {
+                Err(SurfaceApiError::BadRequest(message)) => message,
+                other => panic!("expected a refusal for {route}, got {other:?}"),
+            };
+            assert!(message.contains("'alpha'") && message.contains(route), "{message}");
+        }
+    }
+
+    /// The exemption is for the same point of the same surface, which two
+    /// surfaces sharing a display name are not.
+    #[test]
+    fn another_surface_of_the_same_name_gets_no_own_route_exemption() {
+        let mut other = surface_with_points(
+            "s1",
+            "Orders",
+            serde_json::json!([{ "alias": "alpha", "target_endpoint": "https://a.example", "protocol": "a2a" }]),
+        );
+        other.access_point.route = "/agents/a".to_string();
+
+        let mut surface = surface_with_points(
+            "s2",
+            "Orders",
+            serde_json::json!([{ "alias": "alpha", "target_endpoint": "https://b.example", "protocol": "a2a",
+                                 "listen_path": "/outbound/agents/a/alpha" }]),
+        );
+        surface.access_point.route = "/agents/b".to_string();
+
+        let message = match check_listen_path_shadowing(&surface, None, std::slice::from_ref(&other), &no_ports) {
+            Err(SurfaceApiError::BadRequest(message)) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert!(message.contains("surface 'Orders'"), "{message}");
     }
 
     #[test]
