@@ -360,7 +360,11 @@ A Target bound by external consent is sent the trace id in `X-Gateway-Trace-Id` 
 in the header, and none is added; every other `_meta` key stays as the caller sent it. A Target
 bound by external consent receives `params._meta` as the caller sent it. A traffic mirror is sent
 the body the Target is sent. A request to a `fabric://` Target carries the caller's trace headers
-and MCP body as before. A request sent
+and MCP body as before.
+
+A traffic mirror's copy is the one place where `X-Gateway-Trace-Id` is not the 32 hex form: it
+carries the request's trace id followed by `-mirror`, so a receiver that follows the trace context
+rules treats it as absent and starts its own trace. `X-Mirrored-Request: true` marks the copy. A request sent
 over a Fabric stream carries its trace id as a hyphenated UUID, and the receiving gateway records
 that form.
 
