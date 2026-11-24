@@ -186,10 +186,17 @@ impl VtaConnectionRegistry {
     /// Resolved through the same record and the same usability rules as
     /// [`authority`](Self::authority): a disabled, unpaired or invalid
     /// connection fails here too, rather than being reachable by the back door.
+    /// A signing block that names no connection means the `[vta]` one, so its
+    /// id resolves to the bootstrap record.
     pub async fn client(
         &self,
         connection_id: &str,
     ) -> Result<Arc<VtaRestClient>, VtaError> {
+        let connection_id = if connection_id == crate::vta::key_directory::DEFAULT_CONNECTION_ID {
+            BOOTSTRAP_CONNECTION_ID
+        } else {
+            connection_id
+        };
         if let Some(hit) = self
             .client_cache
             .read()
@@ -808,6 +815,42 @@ mod tests {
                 .expect("an unusable connection must not resolve"),
         );
         assert!(msg.contains("control_key_ref"), "unexpected error: {msg}");
+    }
+
+    /// A signing block that names no connection reaches the `[vta]` client,
+    /// not a record named `default` that does not exist.
+    #[tokio::test]
+    async fn a_signing_block_naming_no_connection_reaches_the_bootstrap_client() {
+        let store = MemoryStore::new(vec![{
+            let mut c = connection(BOOTSTRAP_CONNECTION_ID, true);
+            c.control_key_ref = Some("unused".to_string());
+            c
+        }]);
+        let bootstrap = Arc::new(
+            VtaRestClient::new(
+                "http://127.0.0.1:9",
+                "did:webvh:bootstrap.example",
+                Arc::new(crate::vta::control_key::ControlKey::from_seed([7; 32])),
+                Duration::from_secs(5),
+                4,
+                None,
+            )
+            .unwrap(),
+        );
+        let registry = VtaConnectionRegistry::new(
+            store,
+            None,
+            Some(Arc::new(StubAuthority)),
+            Some(Arc::clone(&bootstrap)),
+            Duration::from_secs(5),
+            4,
+        );
+
+        let client = registry
+            .client(crate::vta::key_directory::DEFAULT_CONNECTION_ID)
+            .await
+            .expect("the default id names the [vta] connection");
+        assert!(Arc::ptr_eq(&client, &bootstrap));
     }
 
     #[tokio::test]

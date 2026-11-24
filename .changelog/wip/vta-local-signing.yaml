@@ -27,7 +27,8 @@ changes:
         and a signing quota. Connecting is optional and forward-only: an
         installation that connects nothing signs exactly as before, and agents
         onboarded before connecting keep their keys, since moving them would
-        change their DIDs.
+        change their DIDs. A signing choice that names no connection signs
+        tokens and issues credentials through the [vta] block.
     - timestamp: '2026-11-16T12:05:00Z'
       title: Add Verifiable Trust Agents on Connections with a full-page connect wizard
       description: >-
@@ -153,7 +154,11 @@ changes:
         minutes, the longest access token lifetime plus clock leeway, across a
         restart (appliance_signer_history.json in the storage directory). It is
         dropped at once when its trust agent connection is deleted, disabled or
-        revoked. Before a token a trust agent signed is returned, the gateway
+        revoked. The current signer is recorded the first time it resolves, so
+        a change made while the gateway was down, or before the new signer
+        signed, still keeps the one it replaced, and a current signer that
+        cannot be resolved stays published for 21 minutes after it last signed.
+        Before a token a trust agent signed is returned, the gateway
         verifies it against the public key recorded for its key id and refuses
         one that does not verify. A signing choice through the [vta] block is
         refused while the block is off.

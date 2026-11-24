@@ -176,8 +176,9 @@ strategy from `signing_public_jwks()` when `iss == get_issuer_did()`), so
 loopback redemption where the issuer and the redeeming resource-AS are the same
 gateway needs **no** operator-configured verification strategy for the gateway's
 own DID. The same self-trust covers an `iss` that is an earlier issuer DID of this
-gateway (a signer Gateway signing moved off within the last 20 minutes and whose
-trust agent connection is still in use, or the gateway's own and `[vta]` keys) and a
+gateway (a signer Gateway signing moved off within the last 20 minutes, or the current
+signer while it cannot be resolved, each only while its trust agent connection is still in
+use, or the gateway's own and `[vta]` keys) and a
 `did:key` whose key the gateway publishes, each verified against the published JWKS;
 see [`TRUST_AGENT_SIGNING.md`](TRUST_AGENT_SIGNING.md#publication). Genuinely external issuers still resolve a configured strategy by `iss`
 — then required to be an actual ID-JAG — explicit `typ: oauth-id-jag+jwt`

@@ -54,7 +54,8 @@ A `signing` block names `backend` (`local` or `vta`) and, for a trust agent, `co
 `context_id` and `key_id`. Surface, issuer and Gateway signing saves run one check: a trust agent
 choice must name `key_id`, and `context_id` unless it goes through an enabled `[vta]` block with
 `auto_provision_contexts` (contexts are created only through that connection); a choice that names
-no connection, `default` or `vta-bootstrap` signs through the `[vta]` block and is refused while the
+no connection, `default` or `vta-bootstrap` signs tokens and issues credentials through the `[vta]`
+block and is refused while the
 block is off; a surface or issuer may sign only through its own tenant's connection or an
 appliance-wide one; Gateway signing must name an existing appliance-wide connection. Changing a surface's, an issuer's or the gateway-wide
 signing choice needs `key_management.edit` on top of the route's own permission; a save that sends
@@ -571,10 +572,16 @@ staying scoped to one context, which each such test names.
   issuer DID, until every token it signed has expired: 20 minutes after Gateway signing moved off
   it (the 15-minute longest access token lifetime plus clock leeway). It is dropped at once when
   its connection is deleted, disabled or revoked, so retiring an agent (move Gateway signing off
-  it, then revoke it) stops the gateway trusting its key. The earlier signers, with the connection
-  each signed through and when it expires, are kept in `appliance_signer_history.json` in the
-  storage directory, so they stay published across a restart, and the JWKS keeps serving them
-  while the current signer cannot be resolved.
+  it, then revoke it) stops the gateway trusting its key. The current signer is recorded the first
+  time it resolves, and with the earlier signers (the connection each signed through and when it
+  expires) kept in `appliance_signer_history.json` in the storage directory. So a change of
+  Gateway signing made while the gateway was down, or before the new signer signed anything,
+  still keeps the one it replaced, and the earlier signers stay published across a restart. A
+  current signer that cannot be resolved, such as one whose trust agent is unreachable, stays
+  published and its issuer DID accepted for 21 minutes after it last signed (the same 20 minutes
+  plus the one minute to which when it last signed is saved), also across a restart, and is
+  dropped at once when its connection is deleted, disabled or revoked. Each save re-reads the
+  file and keeps what another node sharing the storage wrote to it.
 - **Context `did:webvh` logs hosted by the gateway are republished on the next signature.** After
   the trust agent's operator rotates a context's key, a verifier resolving the DID sees the
   previous key, which signed everything so far, until the gateway next signs as it. Hosting on the
