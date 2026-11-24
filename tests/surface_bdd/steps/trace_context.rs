@@ -1,11 +1,15 @@
-//! The trace an Access Point continues or starts: what the caller sends, what
-//! the target receives, and what the `request_forwarded` record carries.
+//! The trace an Access Point continues or starts, and the trace of a Transit
+//! Point request made for it: what the caller sends, what the targets
+//! receive, and what the `request_forwarded` and `transit_request_forwarded`
+//! records carry.
 
 use cucumber::{then, when};
 use serde_json::Value;
 
 use crate::bdd_support::actors::TargetActorKind;
-use crate::bdd_support::forwarded_requests::{generated_traceparent, sent_header, the_forwarded_record};
+use crate::bdd_support::forwarded_requests::{
+    generated_traceparent, sent_header, the_forwarded_record, the_transit_forwarded_record, trace_headers_of,
+};
 use crate::bdd_support::mock_server::ReceivedRequest;
 use crate::steps::then::{gateway_log, get_mcp_request_for_actor, get_observed_request_for_actor};
 use crate::steps::when::{ensure_admin_session, send_request_and_record};
@@ -230,6 +234,100 @@ async fn vp_audit_log_records_the_forwarded_request_with_trace_source(
         trace_source.as_str(),
         "expected trace source {trace_source}, observed {}; record: {record}",
         record["trace_source"]
+    );
+}
+
+#[then(expr = "MCP server {string} received no trace header")]
+fn mcp_server_received_no_trace_header(
+    world: &mut SurfaceWorld,
+    server_name: String,
+) {
+    let received = trace_headers_of(get_mcp_request_for_actor(world, &server_name));
+    assert!(received.is_empty(), "MCP server '{server_name}' expected no trace header, received {received:?}");
+}
+
+/// The one `transit_request_forwarded` record of the scenario's Transit Point
+/// request.
+async fn transit_forwarded_record(world: &mut SurfaceWorld) -> Value {
+    ensure_admin_session(world).await;
+    the_transit_forwarded_record(
+        world
+            .admin_client
+            .as_ref()
+            .expect("admin client must exist"),
+    )
+    .await
+}
+
+/// Field `name` of `record`, which the record must carry.
+fn recorded<'a>(
+    record: &'a Value,
+    name: &str,
+) -> &'a str {
+    record[name]
+        .as_str()
+        .unwrap_or_else(|| panic!("the record must carry {name}: {record}"))
+}
+
+/// Asserts the Transit Point's record is under the trace of the Access
+/// Point's record.
+fn assert_under_the_access_points_trace(
+    transit: &Value,
+    access_point: &Value,
+) {
+    let expected = recorded(access_point, "trace_id");
+    assert_eq!(
+        transit["trace_id"], expected,
+        "expected the Transit Point request under the Access Point request's trace {expected}, observed {}; Transit Point record: {transit}",
+        transit["trace_id"]
+    );
+}
+
+#[then("the VP Audit Log ties the Transit Point request to the Access Point request")]
+async fn vp_audit_log_ties_the_transit_point_request_to_the_access_point_request(world: &mut SurfaceWorld) {
+    let access_point = forwarded_record(world).await;
+    let transit = transit_forwarded_record(world).await;
+    assert_under_the_access_points_trace(&transit, &access_point);
+    let expected = recorded(&access_point, "span_id");
+    assert_eq!(
+        transit["parent_span_id"], expected,
+        "expected the Transit Point request's parent span to be the Access Point request's span {expected}, observed {}; Transit Point record: {transit}",
+        transit["parent_span_id"]
+    );
+}
+
+#[then("the VP Audit Log records the Transit Point request under the trace of the Access Point request")]
+async fn vp_audit_log_records_the_transit_point_request_under_the_trace_of_the_access_point_request(
+    world: &mut SurfaceWorld
+) {
+    let access_point = forwarded_record(world).await;
+    let transit = transit_forwarded_record(world).await;
+    assert_under_the_access_points_trace(&transit, &access_point);
+}
+
+#[then(expr = "the VP Audit Log records the Transit Point request with trace source {string}")]
+async fn vp_audit_log_records_the_transit_point_request_with_trace_source(
+    world: &mut SurfaceWorld,
+    trace_source: String,
+) {
+    let record = transit_forwarded_record(world).await;
+    assert_eq!(
+        record["trace_source"],
+        trace_source.as_str(),
+        "expected trace source {trace_source}, observed {}; record: {record}",
+        record["trace_source"]
+    );
+}
+
+#[then("the VP Audit Log records the Transit Point request with no parent span")]
+async fn vp_audit_log_records_the_transit_point_request_with_no_parent_span(world: &mut SurfaceWorld) {
+    let record = transit_forwarded_record(world).await;
+    assert!(
+        record
+            .get("parent_span_id")
+            .is_none_or(Value::is_null),
+        "expected no parent span, observed {}; record: {record}",
+        record["parent_span_id"]
     );
 }
 

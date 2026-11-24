@@ -7,6 +7,7 @@ use crate::bdd_support::config;
 use crate::bdd_support::config::single_surface_fixture::IdentityProviderEndpoints;
 use crate::bdd_support::config::single_surface_writer::JwksFiles;
 use crate::bdd_support::debug::log_to_file;
+use crate::bdd_support::forwarded_requests::{the_last_access_point_request, trace_headers_of, transit_token_of};
 use crate::bdd_support::gateway_process::{GatewayProcess, SURFACE_TEST_AUTH_TOKEN as TEST_AUTH_TOKEN};
 use crate::bdd_support::http::collect_headers;
 use crate::bdd_support::json_rpc::{
@@ -16,7 +17,7 @@ use crate::bdd_support::json_rpc::{
     build_mcp_tool_call_without_meta, build_modern_mcp_list_tools_body, modern_mcp_request_headers,
 };
 use crate::bdd_support::jwt::{self, JwksServer};
-use crate::bdd_support::mock_server::MockServer;
+use crate::bdd_support::mock_server::{MockServer, ReceivedRequest};
 use crate::bdd_support::oidc::OidcProvider;
 use crate::bdd_support::temp::{TempDirGuard, create_project_temp_dir};
 use crate::world::{
@@ -3064,26 +3065,27 @@ async fn send_mcp_request_through_transit_point_path(
     send_mcp_request_through_transit_point_path_with_headers(world, agent_name, path, body, Vec::new()).await;
 }
 
-/// The transit token the Access Point hands the managed agent: the caller
-/// sends a request to the surface, and the copy the managed agent receives
-/// carries it.
+/// Every request the managed agent received so far; none before the gateway
+/// starts.
+async fn managed_agent_requests(world: &SurfaceWorld) -> Vec<ReceivedRequest> {
+    match world.infra.as_ref() {
+        Some(infra) => infra.mock.requests().await,
+        None => Vec::new(),
+    }
+}
+
+/// The transit token the Access Point gave the managed agent with the last
+/// request it forwarded to it in this scenario. When it forwarded none yet,
+/// the caller first sends a request to the surface.
 pub(crate) async fn transit_token_from_the_access_point(world: &mut SurfaceWorld) -> String {
-    send_request_and_record(world, Vec::new()).await;
-    let forwarded = world
-        .infra
-        .as_ref()
-        .expect("scenario infra must exist")
-        .mock
-        .last_request()
-        .await
-        .expect("the managed agent must receive the caller's request");
-    forwarded
-        .headers
-        .get("x-transit-token")
-        .cloned()
-        .unwrap_or_else(|| {
-            panic!("the Access Point must hand the managed agent a transit token: {:?}", forwarded.headers)
-        })
+    if the_last_access_point_request(&managed_agent_requests(world).await).is_none() {
+        send_request_and_record(world, Vec::new()).await;
+    }
+    let requests = managed_agent_requests(world).await;
+    let forwarded = the_last_access_point_request(&requests).unwrap_or_else(|| {
+        panic!("the Access Point must hand the managed agent a transit token, the managed agent received {requests:?}")
+    });
+    transit_token_of(forwarded)
 }
 
 /// The claims a transit token carries.
@@ -3171,8 +3173,48 @@ pub(crate) async fn ask_for_tools_through_transit_point_with_its_token(
     agent_name: &str,
     transit_point: &str,
 ) {
+    ask_for_tools_through_transit_point_with_its_token_and_headers(world, agent_name, transit_point, Vec::new()).await;
+}
+
+#[when(
+    expr = "managed agent {string} asks for available tools through Transit Point {string} with its transit token and the trace headers it received"
+)]
+async fn managed_agent_asks_for_tools_through_transit_point_with_its_token_and_the_trace_headers_it_received(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    transit_point: String,
+) {
+    let requests = managed_agent_requests(world).await;
+    let received = the_last_access_point_request(&requests)
+        .map(trace_headers_of)
+        .unwrap_or_else(|| {
+            panic!("managed agent '{agent_name}' must have received a request from the Access Point: {requests:?}")
+        });
+    ask_for_tools_through_transit_point_with_its_token_and_headers(world, &agent_name, &transit_point, received).await;
+}
+
+#[when(
+    expr = "managed agent {string} asks for available tools through Transit Point {string} with its transit token and no trace header"
+)]
+async fn managed_agent_asks_for_tools_through_transit_point_with_its_token_and_no_trace_header(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    transit_point: String,
+) {
+    ask_for_tools_through_transit_point_with_its_token_and_headers(world, &agent_name, &transit_point, Vec::new())
+        .await;
+}
+
+/// Managed agent `agent_name` asks for available tools through
+/// `transit_point` with the transit token it holds and `headers`.
+async fn ask_for_tools_through_transit_point_with_its_token_and_headers(
+    world: &mut SurfaceWorld,
+    agent_name: &str,
+    transit_point: &str,
+    headers: Vec<(String, String)>,
+) {
     let body = build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha"));
-    let headers = with_transit_token(world, Vec::new());
+    let headers = with_transit_token(world, headers);
     send_mcp_request_through_transit_point_path_with_headers(
         world,
         agent_name,

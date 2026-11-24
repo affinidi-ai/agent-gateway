@@ -1,7 +1,7 @@
 //! The `request_forwarded` record an Access Point writes for each request it
 //! hands to its Target, and the requests that carry a `traceparent`.
 
-use cucumber::{then, when};
+use cucumber::{given, then, when};
 use serde_json::Value;
 
 use crate::bdd_support::forwarded_requests::{
@@ -18,6 +18,16 @@ async fn request_with_valid_api_key_and_traceparent(world: &mut SurfaceWorld) {
 
 #[when("the caller sends a request to the surface with a traceparent set")]
 async fn request_with_traceparent(world: &mut SurfaceWorld) {
+    send_request_with_traceparent(world).await;
+}
+
+#[given("the caller has sent a request to the surface with a traceparent set")]
+async fn caller_has_sent_a_request_with_traceparent(world: &mut SurfaceWorld) {
+    send_request_with_traceparent(world).await;
+}
+
+/// The caller sends a request to the surface with a fresh `traceparent`.
+async fn send_request_with_traceparent(world: &mut SurfaceWorld) {
     send_request_and_record(world, vec![generated_traceparent()]).await;
 }
 
