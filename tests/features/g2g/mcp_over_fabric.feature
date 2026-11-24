@@ -205,6 +205,17 @@ Feature: MCP requests travel across gateways over fabric
     And the MCP response tool catalog includes a tool named "echo"
     And MCP server "bravo" received MCP _meta key "io.modelcontextprotocol/protocolVersion" with value "2026-07-28"
 
+  Scenario: A modern MCP request over fabric keeps its trace id on the receiving gateway's policy decision
+    Given a fabric with 2 gateways
+    And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
+    And MCP server "bravo" serves a modern MCP tool catalog
+    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And the VP Audit Log of gateway 2 keeps every audit event
+    And surface "alpha" has a request policy that allows all requests
+    When the caller asks gateway 1 MCP surface "charlie" for available tools using protocol version "2026-07-28"
+    Then the response status is 200
+    And the VP Audit Log of gateway 2 records its policy decision on the Fabric request under the trace id the request carried
+
   Scenario: MCP requests over fabric that accept an event stream are answered as JSON
     Given a fabric with 2 gateways
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"

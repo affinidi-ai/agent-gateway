@@ -782,7 +782,7 @@ dependencies = [
 
 [[package]]
 name = "agent-gateway"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "affinidi-did-common 0.4.10",
  "affinidi-did-resolver-cache-sdk",
