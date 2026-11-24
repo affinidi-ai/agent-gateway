@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use super::messages::ReceivedMessage;
 use super::types::GatewayConnectionPoint;
-use crate::integrations::delivery::dispatch::dispatch;
+use crate::integrations::delivery::dispatch::dispatch_at;
 
 const CONNECTED: &str = "connection_point.connected";
 
@@ -18,13 +18,14 @@ impl WebhookClient {
     }
 
     /// Delivers the connection, described by its connection-setup `message`, to every
-    /// integration whose event set holds `connection_point.connected`, in the background.
+    /// integration whose event set holds `connection_point.connected`, in the background. The
+    /// connection happened when the message arrived.
     pub async fn trigger_integration(
         &self,
         connection_point: &GatewayConnectionPoint,
         message: &ReceivedMessage,
     ) -> Result<(), String> {
-        dispatch(CONNECTED, message_values(connection_point, message));
+        dispatch_at(CONNECTED, message.received_at, message_values(connection_point, message));
         Ok(())
     }
 }
@@ -181,6 +182,36 @@ mod tests {
         for name in ["TIMESTAMP", "DATE", "TIME", "DATETIME"] {
             assert!(!values[name].is_empty(), "{name}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_connection_happened_when_its_message_arrived() {
+        let mut message = message();
+        message.received_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .expect("time")
+            .with_timezone(&chrono::Utc);
+
+        WebhookClient::new()
+            .trigger_integration(&connection_point(), &message)
+            .await
+            .expect("dispatched");
+
+        let dispatched =
+            crate::integrations::delivery::dispatch::dispatched::values_of(CONNECTED, "MESSAGE_ID", &message.id);
+        let times: Vec<(Option<&str>, Option<&str>)> = dispatched
+            .iter()
+            .map(|values| {
+                (
+                    values
+                        .get("OCCURRED_AT")
+                        .map(String::as_str),
+                    values
+                        .get("TIMESTAMP")
+                        .map(String::as_str),
+                )
+            })
+            .collect();
+        assert_eq!(times, [(Some("2026-01-02T03:04:05+00:00"), Some("2026-01-02T03:04:05+00:00"))]);
     }
 
     #[test]

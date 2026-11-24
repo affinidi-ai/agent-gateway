@@ -27,9 +27,17 @@ pub struct IntegrationEvent {
     pub variables: Vec<&'static str>,
 }
 
-/// Variables every delivery fills, whatever the event.
-pub const COMMON_VARIABLES: &[&str] =
-    &["EVENT_TYPE", "EVENT_NAME", "EVENT_SUMMARY", "EVENT_DATA", "TIMESTAMP", "APPLIANCE_ID"];
+/// Variables every delivery fills, whatever the event. No trigger supplies them.
+pub const COMMON_VARIABLES: &[&str] = &[
+    "EVENT_TYPE",
+    "EVENT_NAME",
+    "EVENT_SUMMARY",
+    "EVENT_DATA",
+    "EVENT_ID",
+    "OCCURRED_AT",
+    "TIMESTAMP",
+    "APPLIANCE_ID",
+];
 
 const fn var(
     name: &'static str,
@@ -48,6 +56,12 @@ const VARIABLES: &[VariableSpec] = &[
         "Event Data",
         "The event's data as JSON. Used as an entire JSON string value (\"data\": \"${EVENT_DATA}\") it is embedded as a JSON object.",
     ),
+    var(
+        "EVENT_ID",
+        "Event ID",
+        "The id the gateway gave the event when it was created, the same on every delivery of it. Empty for an audit record stored before records had one",
+    ),
+    var("OCCURRED_AT", "Occurred At", "RFC 3339 time the event happened, the same on every delivery of it"),
     var("TIMESTAMP", "Timestamp", "RFC 3339 time the event occurred"),
     var(
         "APPLIANCE_ID",
@@ -670,7 +684,16 @@ mod tests {
     fn every_event_offers_the_common_variables() {
         assert_eq!(
             COMMON_VARIABLES,
-            &["EVENT_TYPE", "EVENT_NAME", "EVENT_SUMMARY", "EVENT_DATA", "TIMESTAMP", "APPLIANCE_ID"]
+            &[
+                "EVENT_TYPE",
+                "EVENT_NAME",
+                "EVENT_SUMMARY",
+                "EVENT_DATA",
+                "EVENT_ID",
+                "OCCURRED_AT",
+                "TIMESTAMP",
+                "APPLIANCE_ID"
+            ]
         );
         for event in catalog() {
             for name in COMMON_VARIABLES {

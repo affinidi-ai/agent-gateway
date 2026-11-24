@@ -11,7 +11,7 @@ use crate::delegation_vault::audit::{
     AuditCallerContext, DelegationAuditAction, DelegationAuditEvent, action_category,
 };
 use crate::integrations::delivery::dispatch::{AuditReceiver, current_routes, deliver};
-use crate::integrations::delivery::values::event_values;
+use crate::integrations::delivery::values::{Occurrence, event_values};
 use crate::integrations::events::find_event;
 
 /// The catalog event of an audit record: `audit.<category>`, e.g. `audit.policy_decision`.
@@ -142,12 +142,17 @@ impl AuditDelivery {
         &self.values
     }
 
+    /// The record's values, as the event it records: its id and the time it was recorded.
     pub(crate) fn from_event(event: &DelegationAuditEvent) -> Self {
+        let occurrence = Occurrence::recorded(event.event_id.clone(), event.timestamp.clone());
         let variables = audit_variables(event);
         let values = match find_event(&audit_event_type(event)) {
-            Some(catalog_event) => {
-                event_values(catalog_event, variables, crate::storage::settings_store::global_appliance_id_override())
-            }
+            Some(catalog_event) => event_values(
+                catalog_event,
+                &occurrence,
+                variables,
+                crate::storage::settings_store::global_appliance_id_override(),
+            ),
             None => variables,
         };
         Self { values }
@@ -310,6 +315,26 @@ mod tests {
         );
         assert_eq!(values["EVENT_DATA"], values["AUDIT_RECORD"]);
         assert_eq!(values["AUDIT_DECISION"], "deny");
+    }
+
+    #[test]
+    fn a_delivery_carries_the_records_id_and_time() {
+        let event = policy_decision("deny");
+
+        let delivery = AuditDelivery::from_event(&event);
+
+        let value = |name: &str| {
+            delivery
+                .values()
+                .get(name)
+                .cloned()
+        };
+        assert_eq!(
+            (value("EVENT_ID"), value("OCCURRED_AT"), value("TIMESTAMP")),
+            (event.event_id.clone(), Some(event.timestamp.clone()), Some(event.timestamp.clone()))
+        );
+        let record: serde_json::Value = serde_json::from_str(&delivery.values()["AUDIT_RECORD"]).unwrap();
+        assert_eq!(record, serde_json::to_value(&event).unwrap(), "the record is the VP Audit Log row");
     }
 
     #[test]

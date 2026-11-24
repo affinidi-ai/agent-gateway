@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use serde_json::Value as JsonValue;
 use tokio::sync::RwLock;
@@ -15,7 +16,7 @@ use tracing::{error, warn};
 
 use super::render::render;
 use super::retry::{is_transient_publish_error, retry_delays};
-use super::values::event_values;
+use super::values::{Occurrence, event_values};
 use crate::integrations::background_tasks::{TaskShare, spawn_background_task, spawn_background_task_in};
 use crate::integrations::definitions::endpoint::resolve_secret_references;
 use crate::integrations::definitions::{DefinitionStores, Endpoint, EventSet, Integration, Status, definition_stores};
@@ -287,9 +288,22 @@ pub async fn deliver(
                 .as_str(),
         )
         .context("No publisher for the endpoint type")?;
+    send_with_retries(&message, |message| publisher.send(&configuration, message)).await
+}
+
+/// Sends the one rendered `message`, and the same message again on each retry of a transient
+/// failure.
+async fn send_with_retries<'m, S, F>(
+    message: &'m Message,
+    send: S,
+) -> Result<()>
+where
+    S: Fn(&'m Message) -> F,
+    F: Future<Output = Result<()>> + 'm,
+{
     RetryIf::start(
         retry_delays().map(jitter),
-        || publisher.send(&configuration, &message),
+        || send(message),
         |error: &anyhow::Error| {
             let transient = is_transient_publish_error(error);
             if transient {
@@ -302,12 +316,22 @@ pub async fn deliver(
 }
 
 /// Delivers `event_id` with its trigger's values to every integration whose event set holds it,
-/// in the background so the operation that raised it never waits or fails.
+/// in the background so the operation that raised it never waits or fails. The event happens
+/// now.
 pub fn dispatch(
     event_id: &str,
     trigger: HashMap<String, String>,
 ) {
-    dispatch_in(None, event_id, trigger);
+    dispatch_in(None, event_id, None, trigger);
+}
+
+/// Like [`dispatch`], for an event that happened at `occurred_at`.
+pub fn dispatch_at(
+    event_id: &str,
+    occurred_at: DateTime<Utc>,
+    trigger: HashMap<String, String>,
+) {
+    dispatch_in(None, event_id, Some(occurred_at), trigger);
 }
 
 /// Like [`dispatch`], but the event's background tasks, its routing and each of its deliveries,
@@ -317,7 +341,7 @@ pub fn dispatch_within(
     event_id: &str,
     trigger: HashMap<String, String>,
 ) {
-    dispatch_in(Some(share), event_id, trigger);
+    dispatch_in(Some(share), event_id, None, trigger);
 }
 
 fn spawn_task<F>(
@@ -333,16 +357,24 @@ fn spawn_task<F>(
     }
 }
 
+/// Creates the event, at `occurred_at` or now, and delivers it.
 fn dispatch_in(
     share: Option<&'static TaskShare>,
     event_id: &str,
+    occurred_at: Option<DateTime<Utc>>,
     trigger: HashMap<String, String>,
 ) {
     let Some(event) = dispatched_event(event_id) else {
         warn!(event_id, "Not dispatching an event outside the integration catalog");
         return;
     };
-    let values = Arc::new(event_values(event, trigger, crate::storage::settings_store::global_appliance_id_override()));
+    let occurrence = Occurrence::at(occurred_at.unwrap_or_else(Utc::now));
+    let values = Arc::new(event_values(
+        event,
+        &occurrence,
+        trigger,
+        crate::storage::settings_store::global_appliance_id_override(),
+    ));
     #[cfg(test)]
     dispatched::record(&event.id, &values);
     spawn_task(share, event_id, async move {
@@ -871,6 +903,117 @@ mod tests {
         assert_eq!(first.as_deref(), Some("slow"));
         let more = tokio::time::timeout(Duration::from_millis(200), deliveries.recv()).await;
         assert!(more.is_err(), "a delivery beyond the share ran: {more:?}");
+    }
+
+    const OCCURRED_AT: &str = "2026-11-24T10:00:00+00:00";
+
+    fn created_gateway_values(occurrence: &Occurrence) -> Arc<HashMap<String, String>> {
+        let event = find_event("gateway.created").expect("catalog event");
+        Arc::new(event_values(
+            event,
+            occurrence,
+            HashMap::from([("GATEWAY_NAME".to_string(), "edge".to_string())]),
+            None,
+        ))
+    }
+
+    #[tokio::test]
+    async fn each_dispatch_of_an_event_is_a_new_event_with_its_own_id() {
+        let marker = uuid::Uuid::new_v4().to_string();
+        for _ in 0..2 {
+            dispatch("gateway.created", HashMap::from([("GATEWAY_ID".to_string(), marker.clone())]));
+        }
+
+        let ids: Vec<Option<String>> = dispatched::values_of("gateway.created", "GATEWAY_ID", &marker)
+            .iter()
+            .map(|values| {
+                values
+                    .get("EVENT_ID")
+                    .cloned()
+            })
+            .collect();
+
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert!(
+            ids.iter()
+                .all(Option::is_some)
+                && ids[0] != ids[1],
+            "two dispatches, two event ids: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_route_of_a_dispatch_receives_the_same_event_id_and_time() {
+        let endpoint = Endpoint::new("Ops".to_string(), String::new(), EndpointType::Stream, json!({}));
+        let gateways = set(&["gateway.created"]);
+        let routes: Vec<Route> = ["first", "second", "third"]
+            .iter()
+            .map(|name| Route {
+                integration: integration_for(name, &endpoint, &gateways),
+                endpoint: endpoint.clone(),
+            })
+            .collect();
+        let values = created_gateway_values(&Occurrence::recorded(Some("evt-7".to_string()), OCCURRED_AT.to_string()));
+        let (delivered, mut deliveries) = tokio::sync::mpsc::unbounded_channel();
+
+        deliver_each(None, "gateway.created", routes, values, move |_route: Route, values| {
+            let delivered = delivered.clone();
+            async move {
+                delivered
+                    .send((
+                        values
+                            .get("EVENT_ID")
+                            .cloned(),
+                        values
+                            .get("OCCURRED_AT")
+                            .cloned(),
+                    ))
+                    .expect("receiver");
+                Ok(())
+            }
+        });
+
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            received.push(
+                tokio::time::timeout(Duration::from_secs(5), deliveries.recv())
+                    .await
+                    .expect("each route is delivered")
+                    .expect("a delivery"),
+            );
+        }
+        assert_eq!(received, vec![(Some("evt-7".to_string()), Some(OCCURRED_AT.to_string())); 3]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_retry_sends_the_message_rendered_once_with_its_event_id_and_time() {
+        let endpoint = Endpoint::new("Ops".to_string(), String::new(), EndpointType::Stream, json!({}));
+        let mut integration = integration_for("ops", &endpoint, &set(&["gateway.created"]));
+        integration.content = json!({"id": "${EVENT_ID}", "at": "${OCCURRED_AT}"});
+        let values = created_gateway_values(&Occurrence::recorded(Some("evt-7".to_string()), OCCURRED_AT.to_string()));
+        let (_, message) = prepare(&Route { integration, endpoint }, &values, None)
+            .await
+            .expect("prepares");
+        let sent = std::sync::Mutex::new(Vec::new());
+
+        send_with_retries(&message, |message: &Message| {
+            let mut sent = sent.lock().expect("sent");
+            sent.push(message.content.clone());
+            let attempt = sent.len();
+            async move {
+                if attempt < 3 {
+                    anyhow::bail!("Webhook failed: 503 Service Unavailable - down")
+                }
+                Ok(())
+            }
+        })
+        .await
+        .expect("the third attempt is accepted");
+
+        let sent = sent
+            .into_inner()
+            .expect("sent");
+        assert_eq!(sent, vec![json!({"id": "evt-7", "at": OCCURRED_AT}); 3]);
     }
 
     #[test]

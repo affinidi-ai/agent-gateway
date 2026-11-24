@@ -14,7 +14,7 @@ use super::{ApiError, DefinitionStores, caller_id, internal_error, not_found, re
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::integrations::definitions::{Definition, DefinitionStore, EventSet, Integration};
 use crate::integrations::delivery::dispatch::{Route, send_once};
-use crate::integrations::delivery::values::{event_values, sample_trigger_values};
+use crate::integrations::delivery::values::{Occurrence, event_values, sample_trigger_values};
 use crate::integrations::events::find_event;
 
 #[derive(Debug, Serialize)]
@@ -95,6 +95,7 @@ async fn send_sample(
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "The event set holds no known event".to_string()))?;
     let values = event_values(
         event,
+        &Occurrence::now(),
         sample_trigger_values(event),
         crate::storage::settings_store::global_appliance_id_override(),
     );

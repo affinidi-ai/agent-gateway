@@ -2,29 +2,77 @@
 
 use std::collections::HashMap;
 
+use chrono::{DateTime, Utc};
+
 use super::render::{Escaping, render};
+use crate::delegation_vault::audit::new_event_id;
 use crate::integrations::events::{COMMON_VARIABLES, IntegrationEvent};
 
+/// When an event happened and the id it was given when it was created. Every delivery of the
+/// event, to each integration and on each retry, carries the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Occurrence {
+    event_id: Option<String>,
+    occurred_at: String,
+}
+
+impl Occurrence {
+    /// An event that happens now.
+    pub fn now() -> Self {
+        Self::at(Utc::now())
+    }
+
+    /// An event created now that happened at `occurred_at`.
+    pub fn at(occurred_at: DateTime<Utc>) -> Self {
+        Self {
+            event_id: new_event_id(),
+            occurred_at: occurred_at.to_rfc3339(),
+        }
+    }
+
+    /// An event recorded earlier, such as an audit record, with the id and time it was
+    /// recorded with. A record stored before records had ids has none.
+    pub fn recorded(
+        event_id: Option<String>,
+        occurred_at: String,
+    ) -> Self {
+        Self { event_id, occurred_at }
+    }
+
+    /// Fills `EVENT_ID`, when the event has one, `OCCURRED_AT`, and `TIMESTAMP`, its
+    /// deprecated alias.
+    pub fn fill(
+        &self,
+        values: &mut HashMap<String, String>,
+    ) {
+        if let Some(event_id) = &self.event_id {
+            values.insert("EVENT_ID".to_string(), event_id.clone());
+        }
+        values.insert("OCCURRED_AT".to_string(), self.occurred_at.clone());
+        values.insert("TIMESTAMP".to_string(), self.occurred_at.clone());
+    }
+}
+
 /// What a delivery of `event` fills: the values its trigger supplied for the event's own
-/// variables, its id and name, a one-line summary, its data as JSON, and the Appliance ID
-/// from System Settings. A trigger cannot supply the computed values itself.
+/// variables, its type and name, its id and occurrence time, a one-line summary, its data as
+/// JSON, and the Appliance ID from System Settings. A trigger cannot supply the values every
+/// delivery fills ([`COMMON_VARIABLES`]).
 pub fn event_values(
     event: &IntegrationEvent,
+    occurrence: &Occurrence,
     trigger: HashMap<String, String>,
     appliance_id: Option<String>,
 ) -> HashMap<String, String> {
     let mut values: HashMap<String, String> = trigger
         .into_iter()
         .filter(|(name, _)| {
-            !COMPUTED.contains(&name.as_str())
+            !COMMON_VARIABLES.contains(&name.as_str())
                 && event
                     .variables
                     .contains(&name.as_str())
         })
         .collect();
-    values
-        .entry("TIMESTAMP".to_string())
-        .or_insert_with(|| chrono::Utc::now().to_rfc3339());
+    occurrence.fill(&mut values);
     values.insert("EVENT_TYPE".to_string(), event.id.clone());
     values.insert("EVENT_NAME".to_string(), event.name.clone());
     values.insert("EVENT_DATA".to_string(), event_data(event, &values));
@@ -52,9 +100,6 @@ pub fn sample_trigger_values(event: &IntegrationEvent) -> HashMap<String, String
         })
         .collect()
 }
-
-/// Values every delivery computes, never taken from a trigger.
-const COMPUTED: &[&str] = &["EVENT_TYPE", "EVENT_NAME", "EVENT_SUMMARY", "EVENT_DATA", "APPLIANCE_ID"];
 
 /// Variables holding JSON text, embedded in `EVENT_DATA` as JSON.
 const JSON_TEXT_VARIABLES: &[&str] = &["OLD_STATE", "NEW_STATE", "MESSAGE_BODY"];
@@ -200,10 +245,56 @@ mod tests {
         find_event(id).expect("catalog event")
     }
 
+    const OCCURRED_AT: &str = "2026-11-24T10:00:00+00:00";
+
+    fn occurrence() -> Occurrence {
+        Occurrence::recorded(Some("evt-1".to_string()), OCCURRED_AT.to_string())
+    }
+
+    fn value<'a>(
+        values: &'a HashMap<String, String>,
+        name: &str,
+    ) -> Option<&'a str> {
+        values
+            .get(name)
+            .map(String::as_str)
+    }
+
+    #[test]
+    fn a_delivery_carries_the_events_id_and_occurrence_time() {
+        let values = event_values(event("gateway.created"), &occurrence(), trigger(&[("GATEWAY_NAME", "edge")]), None);
+
+        assert_eq!(
+            (value(&values, "EVENT_ID"), value(&values, "OCCURRED_AT"), value(&values, "TIMESTAMP")),
+            (Some("evt-1"), Some(OCCURRED_AT), Some(OCCURRED_AT))
+        );
+    }
+
+    #[test]
+    fn a_trigger_cannot_supply_the_events_id_or_occurrence_time() {
+        let values = event_values(
+            event("user.login"),
+            &occurrence(),
+            trigger(&[
+                ("USERNAME", "jane"),
+                ("EVENT_ID", "forged"),
+                ("OCCURRED_AT", "forged"),
+                ("TIMESTAMP", "forged"),
+            ]),
+            None,
+        );
+
+        assert_eq!(
+            (value(&values, "EVENT_ID"), value(&values, "OCCURRED_AT"), value(&values, "TIMESTAMP")),
+            (Some("evt-1"), Some(OCCURRED_AT), Some(OCCURRED_AT))
+        );
+    }
+
     #[test]
     fn a_gateway_event_gets_its_name_summary_and_data() {
         let values = event_values(
             event("gateway.created"),
+            &occurrence(),
             trigger(&[
                 ("EVENT_TYPE", "gateway.created"),
                 ("TIMESTAMP", "2026-10-15T00:00:00Z"),
@@ -219,7 +310,7 @@ mod tests {
         assert_eq!(values["EVENT_NAME"], "Gateway Created");
         assert_eq!(values["EVENT_SUMMARY"], "Gateway edge was created");
         assert_eq!(values["APPLIANCE_ID"], "appliance-7");
-        assert_eq!(values["TIMESTAMP"], "2026-10-15T00:00:00Z");
+        assert_eq!(values["TIMESTAMP"], OCCURRED_AT);
         let data: serde_json::Value = serde_json::from_str(&values["EVENT_DATA"]).expect("json");
         assert_eq!(data["gateway_id"], "gw-1");
         assert_eq!(data["gateway_name"], "edge");
@@ -235,6 +326,7 @@ mod tests {
     fn a_trigger_cannot_supply_computed_values_or_variables_outside_its_event() {
         let values = event_values(
             event("user.login"),
+            &occurrence(),
             trigger(&[
                 ("USERNAME", "jane"),
                 ("APPLIANCE_ID", "forged"),
@@ -258,6 +350,7 @@ mod tests {
     fn a_failed_sign_in_for_an_unknown_account_names_its_method_and_reason_and_no_user() {
         let values = event_values(
             event("user.login_failed"),
+            &occurrence(),
             trigger(&[
                 ("LOGIN_METHOD", "passkey"),
                 ("FAILURE_REASON", "unknown_user"),
@@ -285,6 +378,7 @@ mod tests {
     fn a_status_change_summary_names_both_statuses() {
         let values = event_values(
             event("gateway.status_changed"),
+            &occurrence(),
             trigger(&[("GATEWAY_NAME", "edge"), ("GATEWAY_OLD_STATUS", "Active"), ("GATEWAY_STATUS", "Disabled")]),
             None,
         );
@@ -297,6 +391,7 @@ mod tests {
         let record = r#"{"category":"policy_decision","decision":"deny"}"#;
         let values = event_values(
             event("audit.policy_decision"),
+            &occurrence(),
             trigger(&[
                 ("AUDIT_RECORD", record),
                 ("AUDIT_SURFACE_NAME", "Payments"),
@@ -319,6 +414,7 @@ mod tests {
     fn a_connection_summary_names_who_connected_and_where() {
         let values = event_values(
             event("connection_point.connected"),
+            &occurrence(),
             trigger(&[("CP_NAME", "Orders"), ("FROM_DID", "did:peer:partner")]),
             None,
         );
@@ -333,7 +429,7 @@ mod tests {
             ("connection_point.updated", "updated"),
             ("connection_point.deleted", "deleted"),
         ] {
-            let values = event_values(event(id), trigger(&[("CP_NAME", "Orders")]), None);
+            let values = event_values(event(id), &occurrence(), trigger(&[("CP_NAME", "Orders")]), None);
 
             assert_eq!(values["EVENT_SUMMARY"], format!("Connection point Orders was {verb}"));
         }
@@ -341,7 +437,7 @@ mod tests {
 
     #[test]
     fn an_audit_summary_leaves_out_what_the_record_lacks() {
-        let values = event_values(event("audit.trust_check"), trigger(&[]), None);
+        let values = event_values(event("audit.trust_check"), &occurrence(), trigger(&[]), None);
 
         assert_eq!(values["EVENT_SUMMARY"], "Trust Check");
     }
@@ -354,7 +450,7 @@ mod tests {
                 .iter()
                 .map(|name| (name.to_string(), "x".to_string()))
                 .collect();
-            let values = event_values(event, filled, None);
+            let values = event_values(event, &occurrence(), filled, None);
             assert!(
                 values["EVENT_SUMMARY"].contains('x') || event.family == "audit",
                 "{}: {}",
