@@ -525,9 +525,6 @@ impl SurfaceTaskManager {
             .bootstrap_config
             .load_network_config()
             .map_err(|e| anyhow::anyhow!("Failed to load network configuration: {}", e))?;
-        if let Some(ref vc_issuer) = self.vc_issuer {
-            vc_issuer.set_inbound_origins(network_config.get_inbound_external_urls());
-        }
         let collisions = crate::proxy::paths::check_spa_route_collisions(network_config.dashboard_shadowing_prefixes());
         let skipped_prefixes = (!collisions.is_empty()).then(|| {
             let warning = crate::proxy::paths::spa_collision_warning(&collisions);

@@ -272,11 +272,6 @@ storage unencrypted.
 One listener can serve several Access Points, and one transit listener several Transit
 Points. A request is matched to its surface by route.
 
-An inbound listener's `external_urls` are also the origins an identity presentation sent to
-this gateway over direct HTTP may name as its audience: list every origin other gateways use to
-reach it, internal names included. Changes apply on a configuration reload. See
-[`SOURCE_AUTH.md`](SOURCE_AUTH.md#who-an-identity-presentation-is-for).
-
 An outbound listener's `bind_address` and `external_urls` also decide whether its Transit
 Points are reachable from other hosts: a bind address other than loopback, or an external URL
 whose host is not `localhost` or a loopback or unspecified address (private addresses

@@ -13,16 +13,16 @@ changes:
         holder signed, so a presentation minted with a far-future expiry could be replayed for
         as long as its credential lasted.
     - timestamp: '2026-11-24T00:00:00Z'
-      title: Bind each identity presentation to its recipient so copies cannot be replayed
+      title: Bind identity presentations to their recipient to limit replay
       description: >-
         Identity presentations now name their audience in the proof's `domain`: the peer's DID
         over Fabric, the Target's origin on direct calls, and `urn:affinidi:audit-only` for
-        presentations kept only in the audit log. A gateway refuses a presentation whose
-        `domain` names someone else, so a copy taken from a Target, a peer or an audit
-        integration can no longer be presented as the agent. Presentations without a `domain`
-        are still accepted, so older gateways and clients keep working. A gateway that calls
-        another gateway's Access Point over direct HTTP must use an origin listed in the
-        receiver's inbound `external_urls`.
+        presentations kept only in the audit log. Every verifier refuses an audit-only copy, and
+        a Fabric verifier refuses a presentation addressed to another gateway, so an addressed
+        copy taken from a peer or an audit integration can no longer be presented as the agent
+        there. Direct paths, the STS token endpoint and fetched agent cards accept any other
+        `domain`. Presentations
+        without a `domain` are still accepted, so older gateways and clients keep working.
     - timestamp: '2026-11-24T00:00:00Z'
       title: Address Fabric answers' identity presentations to the calling gateway
       description: >-
@@ -36,5 +36,5 @@ changes:
         A Remote gateway record has `require_addressed_presentations`, set with
         `PUT /v1/gateways/{id}`. Off by default, so a peer may keep relaying presentations from
         an issuer the operator trusts for the connection; on, such a presentation must be
-        addressed to this gateway like the peer's own.
+        addressed to this gateway, and one with no `domain` is refused.
   breaking: []

@@ -178,12 +178,20 @@ presentation another gateway issued. A sender with neither an established nor a 
 rejected with 403; a sender with trusted issuers but a failed attestation exchange is admitted for
 those issuers only.
 
-Every presentation names its recipient in its proof's `domain` (see
+A presentation sent over Fabric names its recipient in its proof's `domain`, and the receiving
+gateway refuses one that names another (see
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#who-an-identity-presentation-is-for)). A presentation from a
 `trusted_issuer_dids` issuer that the peer relays names another recipient, and is accepted
 anyway while the record's `require_addressed_presentations` is `false` (the default). Set it to
 `true` with `PUT /v1/gateways/{id}` (`gateways.edit`, Remote gateways only; the self gateway
-answers `400`) to refuse such relays on this connection.
+answers `400`) to refuse such relays on this connection, including relayed presentations that
+name no recipient.
+
+Accepted risk: a presentation with no `domain` is still accepted, and the gateway mints such
+presentations on public agent cards and direct answers; with `require_addressed_presentations`
+off, a trusted issuer's presentation addressed to another gateway is admitted; and with no replay
+cache, any presentation can be presented again to its own recipient until it expires. See
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#who-an-identity-presentation-is-for).
 
 Earlier builds had a per-surface allowlist, `AgentSurface.trusted_binding_issuers`, which accepted
 a presentation from any peer that forwarded it. The field no longer exists. A stored surface that

@@ -1797,6 +1797,69 @@ mod tests {
         );
     }
 
+    fn mcp_body_with_presentation(
+        presentation: &serde_json::Value,
+        holder_did: &str,
+    ) -> String {
+        let key = crate::config::MCP_AGENT_IDENTITY_BINDING_KEY;
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"_meta": {
+            key: {"verifiablePresentation": presentation.to_string(), "did": holder_did}
+        }}})
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn direct_mcp_accepts_a_presentation_forwarded_by_an_upstream_gateway() {
+        let SignedAgentPresentation {
+            issuer_did,
+            holder_did,
+            presentation,
+            issuer,
+            _temporary,
+        } = crate::identity::test_helpers::signed_agent_presentation_bound_to("https://gw2.example:8443").await;
+
+        let binding = super::verify_mcp_metadata_identity(
+            mcp_body_with_presentation(&presentation, &holder_did).as_bytes(),
+            Some(&issuer),
+            &test_facts(),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(binding.agent_did, holder_did);
+        assert_eq!(binding.gateway_did, issuer_did);
+        assert!(!binding.verified);
+    }
+
+    #[tokio::test]
+    async fn direct_mcp_refuses_a_forwarded_audit_only_presentation() {
+        let SignedAgentPresentation {
+            holder_did,
+            presentation,
+            issuer,
+            _temporary,
+            ..
+        } = crate::identity::test_helpers::signed_agent_presentation_bound_to(
+            crate::identity::vc_issuer::AUDIT_ONLY_VP_DOMAIN,
+        )
+        .await;
+
+        assert!(
+            super::verify_mcp_metadata_identity(
+                mcp_body_with_presentation(&presentation, &holder_did).as_bytes(),
+                Some(&issuer),
+                &test_facts(),
+                None,
+                None,
+            )
+            .await
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn mcp_binding_aliases_do_not_bypass_validation() {
         use crate::config::{ChannelProtocol, MCP_AGENT_IDENTITY_BINDING_KEY, MCP_AGENT_IDENTITY_CREDENTIAL_KEY};

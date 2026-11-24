@@ -1549,36 +1549,48 @@ on a direct request to an inbound `from_api_key` surface, where the key's DID re
 
 ### Who an identity presentation is for
 
-Every identity presentation the gateway signs names its audience in the proof's `domain`, so a
-copy taken from a Target, a peer or the audit log cannot be presented anywhere else:
+An identity presentation the gateway signs for a known recipient names it in the proof's
+`domain`, so a copy taken from a peer or the audit log cannot be presented to another gateway:
 
 | Presentation | `domain` |
 | ------------ | -------- |
-| Sent over Fabric to a paired gateway | The peer's DID, as its Remote gateway record holds it |
+| Sent over Fabric to a paired gateway, by an Access Point or a `fabric://` Transit Point | The peer's DID, as its Remote gateway record holds it |
 | On an answer sent back over Fabric | The calling gateway's Connection Point DID the request came from |
 | Sent to an `http` or `https` Target, by an Access Point or a Transit Point | The Target's origin (`scheme://host[:port]`) |
 | Minted only for the audit log (`consent_required`, `consent_granted`) | `urn:affinidi:audit-only`, which no gateway accepts |
 | On a public agent card, in a direct answer, or to any other Target | None |
 
-A gateway accepts a presentation whose `domain` names it: on a Fabric request or answer, the
-Connection Point DID it was received on (for an answer, the one the request was sent from); on a
-direct request, at the STS token endpoint, and on a fetched agent card, the origin of one of its
-inbound listeners' `external_urls`. Origins are compared without path, with the host in lower
-case and the default port dropped. A presentation with no `domain`, from a gateway or client that
-sets none, is still accepted. A refused presentation is logged with its `domain` and the
-identifiers the gateway accepts; the request is then treated as one whose presentation failed,
-and an answer is refused with `502` and recorded as an `invalid` identity binding.
+Every verifier refuses a presentation whose `domain` is `urn:affinidi:audit-only`. Over Fabric,
+where the gateway knows the recipient, a presentation's `domain` must name the Connection Point
+DID the request was received on (for an answer, the one the request was sent from). On a direct
+request, at the STS token endpoint, and on a fetched agent card the gateway has no recipient DID
+to compare, so it accepts any other `domain`. A presentation with no `domain`, from a gateway or
+client that sets none, is still accepted. A refused presentation is refused with the fixed error
+`VP is not addressed to this gateway` and logged with up to four of its domains (128 characters
+each) and the recipient DID; the request is then treated as one whose presentation failed, and
+an answer is refused with `502` and recorded as an `invalid` identity binding.
+
+A presentation's proof may expire at most 5 minutes after it is verified, plus 2 minutes of
+clock skew, and a proof without `expires` may not be created more than 2 minutes ahead of the
+gateway's clock. The gateway mints its own presentations with a 5 minute lifetime.
 
 A paired gateway may relay a presentation another gateway issued, which names that other
 gateway's recipient. Over Fabric such a presentation is accepted when its issuer is one the
 operator trusts for the connection (`trusted_issuer_dids`) and not the peer's own issuer, unless
 the connection's `require_addressed_presentations` is `true`; see
-[`FABRIC.md`](FABRIC.md#peer-issuer-dids). A presentation the peer itself issued must always name
-this gateway, and `urn:affinidi:audit-only` is never accepted.
+[`FABRIC.md`](FABRIC.md#peer-issuer-dids). With `require_addressed_presentations` on, such a
+relayed presentation must name this gateway and one with no `domain` is refused. A presentation
+the peer itself issued must name this gateway when it names anyone, and
+`urn:affinidi:audit-only` is never accepted.
 
-A gateway that reaches another gateway's Access Point over direct HTTP must use an origin that
-gateway lists in an inbound listener's `external_urls`. If it calls an internal name, such as
-`http://gw2:8080`, add that origin to the receiving gateway's `external_urls`.
+Accepted risk: binding is partial. A presentation with no `domain` is accepted everywhere, and
+the gateway itself mints such presentations on public agent cards and direct answers, so a copy
+of one can be presented to any gateway within its lifetime. Direct paths and the STS token
+endpoint accept any `domain` but the audit-only one, so a copy a Target received can be
+presented to them. With `require_addressed_presentations` off, the default, a Fabric connection
+admits a presentation from an issuer trusted for it that is addressed to another gateway. There
+is no replay cache: any presentation can be presented again to its own audience until it
+expires.
 
 ### A missing identity on the public agent card
 

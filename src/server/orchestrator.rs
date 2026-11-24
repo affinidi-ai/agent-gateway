@@ -1173,7 +1173,6 @@ pub async fn run_axum_proxy(
         .await?,
     ));
     if let Some(ref issuer) = vc_issuer {
-        issuer.set_inbound_origins(network_config.get_inbound_external_urls());
         crate::payment_credentials::set_global_payment_vc_issuer(Arc::clone(issuer));
     }
 

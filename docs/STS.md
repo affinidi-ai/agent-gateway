@@ -69,7 +69,10 @@ VP (`urn:affinidi:params:oauth:token-type:vp`).
   this gateway (`validate_id_jag`), and a token-exchange subject token's `aud`
   is checked against the client's `allowed_subject_audiences` (opt-in, see
   below). A VP is
-  verified via `VCIssuer::verify_agent_presentation_full` (`VcIssuerVpVerifier`)
+  verified via `VCIssuer::verify_agent_presentation_full` (`VcIssuerVpVerifier`),
+  which refuses a proof that outlives the 5 minute VP lifetime and one whose
+  `domain` is `urn:affinidi:audit-only` (see
+  [Who an identity presentation is for](SOURCE_AUTH.md#who-an-identity-presentation-is-for)),
   and the exchanged token's subject becomes the cryptographically-proven
   credential-subject DID. Each proof in the VP must be signed with a key its
   signer's DID document lists under the proof's purpose (`assertionMethod` for a

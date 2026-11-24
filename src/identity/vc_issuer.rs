@@ -45,33 +45,60 @@ pub fn vp_domain_for_endpoint(endpoint: &str) -> Option<String> {
     http_origin(endpoint)
 }
 
-/// Accepts a presentation whose proof names no `domain`, or names one this
-/// gateway answers to: `recipient_did` (the Connection Point DID a fabric
-/// message was received on) or the origin of one of `inbound_origins`.
+/// The error a presentation addressed to another recipient is refused with. It
+/// names no domain: the domains come from the caller, and the refusal reaches
+/// STS clients and the audit log.
+const VP_NOT_ADDRESSED_ERROR: &str = "VP is not addressed to this gateway";
+
+/// How many of a refused presentation's domains are logged, and how many
+/// characters of each.
+const LOGGED_VP_DOMAINS: usize = 4;
+const LOGGED_VP_DOMAIN_CHARS: usize = 128;
+
+/// Accepts a presentation addressed to this gateway. One naming
+/// [`AUDIT_ONLY_VP_DOMAIN`] is refused everywhere. One with no `domain` is
+/// accepted unless `require_domain`. Where the verifier knows `recipient_did`
+/// (the Connection Point DID a Fabric message was received or sent on), a
+/// `domain` must name it; without one, any other `domain` is accepted.
 fn ensure_vp_audience(
     domains: &[String],
     recipient_did: Option<&str>,
-    inbound_origins: &[String],
+    require_domain: bool,
 ) -> Result<()> {
-    if domains.is_empty() {
-        return Ok(());
-    }
-    let accepted = |domain: &str| {
-        recipient_did.is_some_and(|did| did == domain)
-            || http_origin(domain).is_some_and(|origin| inbound_origins.contains(&origin))
-    };
-    if domains
+    let addressed = if domains
         .iter()
-        .any(|domain| accepted(domain))
+        .any(|domain| domain == AUDIT_ONLY_VP_DOMAIN)
     {
+        false
+    } else if domains.is_empty() {
+        !require_domain
+    } else {
+        recipient_did.is_none_or(|did| {
+            domains
+                .iter()
+                .any(|domain| domain == did)
+        })
+    };
+    if addressed {
         return Ok(());
     }
-    anyhow::bail!(
-        "VP is bound to {:?}, which is not this gateway (recipient DID: {:?}, inbound listener origins: {:?})",
-        domains,
-        recipient_did,
-        inbound_origins
-    )
+    let logged: Vec<String> = domains
+        .iter()
+        .take(LOGGED_VP_DOMAINS)
+        .map(|domain| {
+            domain
+                .chars()
+                .take(LOGGED_VP_DOMAIN_CHARS)
+                .collect()
+        })
+        .collect();
+    warn!(
+        domains = ?logged,
+        domain_count = domains.len(),
+        recipient_did = ?recipient_did,
+        "Refusing an identity presentation that is not addressed to this gateway"
+    );
+    anyhow::bail!(VP_NOT_ADDRESSED_ERROR)
 }
 
 /// Lock file in the issuer storage directory that serializes creating, upgrading and repairing
@@ -294,9 +321,6 @@ pub struct VCIssuer {
     tr_listener_manager: Arc<RwLock<Option<Arc<crate::trust_registries::TrustRegistryListenerManager>>>>,
     surface_store: std::sync::OnceLock<Arc<dyn crate::surfaces::AgentSurfaceStore>>,
     surfaces_by_did: SurfacesByDidCache,
-    /// The origins of this gateway's inbound listeners, which a presentation's
-    /// `domain` may name.
-    inbound_origins: std::sync::RwLock<Vec<String>>,
     /// Per agent DID: listed (`None`) when its DID document lists the signing key under
     /// `authentication`, or the time it was last found not listing it.
     #[cfg(feature = "didwebvh")]
@@ -378,7 +402,6 @@ impl VCIssuer {
             tr_listener_manager: Arc::new(RwLock::new(None)),
             surface_store: std::sync::OnceLock::new(),
             surfaces_by_did: SurfacesByDidCache::default(),
-            inbound_origins: std::sync::RwLock::new(Vec::new()),
             #[cfg(feature = "didwebvh")]
             authentication_holders: dashmap::DashMap::new(),
         })
@@ -2013,9 +2036,8 @@ impl VCIssuer {
 
     /// [`Self::verify_agent_presentation_full`] for a presentation that came in
     /// a fabric message received on the Connection Point `recipient_did` over
-    /// the connection whose issuers are `connection`: its `domain` may name
-    /// `recipient_did` besides this gateway's inbound listener origins (see
-    /// [`Self::check_presentation_audience`]).
+    /// the connection whose issuers are `connection`: a `domain` must name
+    /// `recipient_did` (see [`Self::check_presentation_audience`]).
     pub async fn verify_agent_presentation_for(
         &self,
         vp_input: &str,
@@ -2029,11 +2051,14 @@ impl VCIssuer {
         Ok(verified)
     }
 
-    /// Accepts a presentation whose `domains` name this gateway: no domain,
-    /// `recipient_did`, or one of the inbound listener origins. A presentation
-    /// from an issuer `connection` admits as relayed (see
+    /// Accepts a presentation whose `domains` address this gateway. Every
+    /// verifier refuses [`AUDIT_ONLY_VP_DOMAIN`]. With a `recipient_did` a
+    /// `domain` must name it; without one any other `domain` is accepted. A
+    /// presentation from an issuer `connection` admits as relayed (see
     /// [`crate::gateways::types::PeerIssuers::admits_relayed_presentation`]) may
-    /// name another recipient, unless it is [`AUDIT_ONLY_VP_DOMAIN`].
+    /// name another recipient. A connection that requires addressed
+    /// presentations refuses one with no `domain` from a trusted issuer that is
+    /// not the peer's own; the peer's own may still name none.
     pub fn check_presentation_audience(
         &self,
         domains: &[String],
@@ -2051,12 +2076,14 @@ impl VCIssuer {
         {
             return Ok(());
         }
-        let inbound_origins = self
-            .inbound_origins
-            .read()
-            .map(|origins| origins.clone())
-            .unwrap_or_default();
-        ensure_vp_audience(domains, recipient_did, &inbound_origins)
+        let require_domain = connection
+            .zip(issuer_did)
+            .is_some_and(|(connection, issuer)| {
+                connection.require_addressed_presentations
+                    && connection.attested.as_deref() != Some(issuer)
+                    && connection.accepts(issuer)
+            });
+        ensure_vp_audience(domains, recipient_did, require_domain)
     }
 
     /// Verifies a presentation's signatures, lifetime and challenge without
@@ -2128,24 +2155,6 @@ impl VCIssuer {
     #[allow(dead_code)]
     pub fn get_vp_challenge_store(&self) -> Arc<dyn VpChallengeStore> {
         Arc::clone(&self.vp_challenge_store)
-    }
-
-    /// Records the inbound listener URLs (`external_urls`) whose origins a
-    /// presentation's `domain` may name.
-    pub fn set_inbound_origins<I, S>(
-        &self,
-        urls: I,
-    ) where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let origins: Vec<String> = urls
-            .into_iter()
-            .filter_map(|url| http_origin(url.as_ref()))
-            .collect();
-        if let Ok(mut current) = self.inbound_origins.write() {
-            *current = origins;
-        }
     }
 }
 
@@ -4881,48 +4890,53 @@ mod tests {
 
     #[test]
     fn vp_audience_accepts_a_presentation_without_domain() {
-        ensure_vp_audience(&[], None, &[]).unwrap();
+        assert!(ensure_vp_audience(&[], None, false).is_ok());
+        assert!(ensure_vp_audience(&[], Some("did:example:cp"), false).is_ok());
+    }
+
+    #[test]
+    fn vp_audience_refuses_a_presentation_without_domain_when_one_is_required() {
+        let err = ensure_vp_audience(&[], Some("did:example:cp"), true).unwrap_err();
+        assert_eq!(err.to_string(), VP_NOT_ADDRESSED_ERROR);
     }
 
     #[test]
     fn vp_audience_accepts_the_receiving_connection_point_did() {
-        ensure_vp_audience(&["did:example:cp".to_string()], Some("did:example:cp"), &[]).unwrap();
+        assert!(ensure_vp_audience(&["did:example:cp".to_string()], Some("did:example:cp"), true).is_ok());
     }
 
     #[test]
     fn vp_audience_refuses_another_did() {
-        let err = ensure_vp_audience(&["did:example:other".to_string()], Some("did:example:cp"), &[]).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("not this gateway"),
-            "{err}"
-        );
+        let err = ensure_vp_audience(&["did:example:other".to_string()], Some("did:example:cp"), false).unwrap_err();
+        assert_eq!(err.to_string(), VP_NOT_ADDRESSED_ERROR);
     }
 
     #[test]
-    fn vp_audience_accepts_an_inbound_origin_whatever_its_spelling() {
-        let origins = vec!["https://gw2.example".to_string()];
-        ensure_vp_audience(&["https://GW2.example:443/a2a/surface".to_string()], None, &origins).unwrap();
+    fn vp_audience_accepts_any_domain_without_a_recipient() {
+        assert!(ensure_vp_audience(&["https://target.example".to_string()], None, false).is_ok());
+        assert!(ensure_vp_audience(&["did:example:other".to_string()], None, false).is_ok());
     }
 
     #[test]
-    fn vp_audience_refuses_an_origin_that_is_not_inbound() {
-        let origins = vec!["https://gw2.example".to_string()];
-        assert!(ensure_vp_audience(&["https://target.example".to_string()], None, &origins).is_err());
-        assert!(ensure_vp_audience(&["http://gw2.example".to_string()], None, &origins).is_err());
-        assert!(ensure_vp_audience(&["https://gw2.example".to_string()], None, &[]).is_err());
-    }
-
-    #[test]
-    fn vp_audience_refuses_the_audit_only_domain() {
-        let origins = vec!["https://gw2.example".to_string()];
-        assert!(ensure_vp_audience(&[AUDIT_ONLY_VP_DOMAIN.to_string()], Some("did:example:cp"), &origins).is_err());
+    fn vp_audience_refuses_the_audit_only_domain_with_or_without_a_recipient() {
+        let audit_only = [AUDIT_ONLY_VP_DOMAIN.to_string()];
+        assert!(ensure_vp_audience(&audit_only, Some("did:example:cp"), false).is_err());
+        assert!(ensure_vp_audience(&audit_only, None, false).is_err());
+        let with_recipient = [AUDIT_ONLY_VP_DOMAIN.to_string(), "did:example:cp".to_string()];
+        assert!(ensure_vp_audience(&with_recipient, Some("did:example:cp"), false).is_err());
     }
 
     #[test]
     fn vp_audience_accepts_a_list_that_names_this_gateway() {
         let domains = vec!["https://target.example".to_string(), "did:example:cp".to_string()];
-        ensure_vp_audience(&domains, Some("did:example:cp"), &[]).unwrap();
+        assert!(ensure_vp_audience(&domains, Some("did:example:cp"), false).is_ok());
+    }
+
+    #[test]
+    fn vp_audience_refusal_names_no_caller_supplied_domain() {
+        let domains = vec![format!("did:example:{}", "x".repeat(4096))];
+        let err = ensure_vp_audience(&domains, Some("did:example:cp"), false).unwrap_err();
+        assert_eq!(err.to_string(), VP_NOT_ADDRESSED_ERROR);
     }
 
     #[test]
@@ -4937,11 +4951,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_accepts_a_presentation_bound_to_an_inbound_origin() {
-        let signed = crate::identity::test_helpers::signed_agent_presentation_bound_to("https://gw2.example").await;
-        signed
-            .issuer
-            .set_inbound_origins(["https://gw2.example/", "http://localhost:8080"]);
+    async fn verify_accepts_a_presentation_bound_to_any_origin_without_a_recipient() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation_bound_to("https://target.example").await;
 
         let verified = signed
             .issuer
@@ -4951,17 +4962,14 @@ mod tests {
                     .to_string(),
             )
             .await
-            .expect("a presentation bound to this gateway's origin must verify");
+            .expect("a verifier with no recipient DID accepts any domain but the audit-only one");
 
         assert_eq!(verified.holder_did, signed.holder_did);
     }
 
     #[tokio::test]
-    async fn verify_refuses_a_presentation_bound_to_another_origin() {
-        let signed = crate::identity::test_helpers::signed_agent_presentation_bound_to("https://target.example").await;
-        signed
-            .issuer
-            .set_inbound_origins(["https://gw2.example"]);
+    async fn verify_refuses_an_audit_only_presentation_without_a_recipient() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation_bound_to(AUDIT_ONLY_VP_DOMAIN).await;
 
         let err = signed
             .issuer
@@ -4971,9 +4979,9 @@ mod tests {
                     .to_string(),
             )
             .await
-            .expect_err("a presentation bound to a Target must not verify here");
+            .expect_err("an audit-only presentation must not verify on a direct path");
 
-        assert!(format!("{err:#}").contains("not this gateway"), "{err:#}");
+        assert!(format!("{err:#}").contains(VP_NOT_ADDRESSED_ERROR), "{err:#}");
     }
 
     #[tokio::test]
@@ -4993,7 +5001,7 @@ mod tests {
             .verify_agent_presentation_for(&presentation, Some("did:example:other-cp"), None)
             .await
             .expect_err("a presentation bound to another Connection Point must not verify");
-        assert!(format!("{err:#}").contains("not this gateway"), "{err:#}");
+        assert!(format!("{err:#}").contains(VP_NOT_ADDRESSED_ERROR), "{err:#}");
     }
 
     #[tokio::test]
@@ -5012,7 +5020,7 @@ mod tests {
             .await
             .expect_err("an audit-only presentation must never verify, not even relayed");
 
-        assert!(format!("{err:#}").contains("not this gateway"), "{err:#}");
+        assert!(format!("{err:#}").contains(VP_NOT_ADDRESSED_ERROR), "{err:#}");
     }
 
     fn relaying_connection(
@@ -5061,7 +5069,7 @@ mod tests {
             .await
             .expect_err("a connection that requires addressed presentations must refuse a relayed one");
 
-        assert!(format!("{err:#}").contains("not this gateway"), "{err:#}");
+        assert!(format!("{err:#}").contains(VP_NOT_ADDRESSED_ERROR), "{err:#}");
     }
 
     #[tokio::test]
@@ -5085,15 +5093,55 @@ mod tests {
             .await
             .expect_err("the peer's own presentation must be addressed to this gateway");
 
-        assert!(format!("{err:#}").contains("not this gateway"), "{err:#}");
+        assert!(format!("{err:#}").contains(VP_NOT_ADDRESSED_ERROR), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn verify_refuses_an_unbound_relayed_presentation_when_the_connection_requires_addressed_ones() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation().await;
+
+        let err = signed
+            .issuer
+            .verify_agent_presentation_for(
+                &signed
+                    .presentation
+                    .to_string(),
+                Some("did:example:cp"),
+                Some(&relaying_connection(&signed.issuer_did, true)),
+            )
+            .await
+            .expect_err("a connection that requires addressed presentations must refuse an unbound relayed one");
+
+        assert!(format!("{err:#}").contains(VP_NOT_ADDRESSED_ERROR), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn verify_accepts_an_unbound_presentation_from_the_peer_itself_when_addressed_ones_are_required() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation().await;
+        let connection = crate::gateways::types::PeerIssuers {
+            attested: Some(signed.issuer_did.clone()),
+            trusted: vec![signed.issuer_did.clone()],
+            require_addressed_presentations: true,
+        };
+
+        let verified = signed
+            .issuer
+            .verify_agent_presentation_for(
+                &signed
+                    .presentation
+                    .to_string(),
+                Some("did:example:cp"),
+                Some(&connection),
+            )
+            .await
+            .expect("the peer's own presentation may still name no domain");
+
+        assert_eq!(verified.holder_did, signed.holder_did);
     }
 
     #[tokio::test]
     async fn verify_still_accepts_an_unbound_presentation() {
         let signed = crate::identity::test_helpers::signed_agent_presentation().await;
-        signed
-            .issuer
-            .set_inbound_origins(["https://gw2.example"]);
 
         let verified = signed
             .issuer

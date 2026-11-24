@@ -4861,10 +4861,12 @@ async fn step_inject_trusted_identity(
         .as_ref()
         .unwrap_or(&surface_protocol);
 
-    let target_domain = crate::identity::vc_issuer::vp_domain_for_endpoint(
+    let target_domain = crate::proxy::fabric_forward::vp_domain_for_target(
+        &state.listener_manager,
         &ctx.virtual_channel
             .target_endpoint,
-    );
+    )
+    .await;
     let injected_vp_jwt: Option<String> = match protocol {
         ChannelProtocol::A2a | ChannelProtocol::Ap2 => {
             let (signed, vp_jwt) = crate::a2a::extensions::inject_identity_credential_extension(
