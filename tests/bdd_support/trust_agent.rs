@@ -91,8 +91,12 @@ async fn trust_tasks(
             }
             Some(_) => {}
         }
-        return Json(json!({ "session": { "id": "s" }, "tokens": { "accessToken": "t", "expiresIn": 3600 } }))
-            .into_response();
+        return Json(json!({
+            "threadId": body["id"],
+            "session": { "id": body["issuer"], "subject": body["issuer"] },
+            "tokens": { "accessToken": "t", "expiresIn": 3600 },
+        }))
+        .into_response();
     }
     if task.contains("auth/whoami") {
         return Json(json!({ "payload": {

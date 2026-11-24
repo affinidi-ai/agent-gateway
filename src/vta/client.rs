@@ -250,19 +250,45 @@ impl VtaRestClient {
     async fn establish_once(&self) -> Result<(String, Arc<dyn SignerKeyProvider>), VtaError> {
         self.handshake()
             .await
-            .map(|(token, key, _)| (token, key))
+            .map(|(token, key, _, _)| (token, key))
     }
 
     /// Open a fresh session and return its access token with the trust agent's
     /// answer as received, proof included, for a caller that has to check who
     /// signed it. The answer holds the token: never log it.
+    ///
+    /// The answer must be for this sign-in: its `threadId` names the request
+    /// it answers, and the session it opened is for this gateway's control DID.
+    /// Both are inside what the agent signs, so a caller that checks the
+    /// signature has an answer bound to this sign-in, not a replayed one.
     pub async fn authenticate_with_answer(&self) -> Result<(String, Value), VtaError> {
-        self.handshake()
-            .await
-            .map(|(token, _, answer)| (token, answer))
+        let (token, key, answer, request_id) = self.handshake().await?;
+        if answer
+            .get("threadId")
+            .and_then(Value::as_str)
+            != Some(request_id.as_str())
+        {
+            return Err(VtaError::Protocol(
+                "the trust agent's answer is not for the sign-in request this gateway sent".to_string(),
+            ));
+        }
+        let session = answer
+            .get("payload")
+            .and_then(|payload| payload.get("session"))
+            .or_else(|| answer.get("session"));
+        if session
+            .and_then(|session| session.get("subject"))
+            .and_then(Value::as_str)
+            != Some(key.did())
+        {
+            return Err(VtaError::Protocol(
+                "the trust agent's answer opened a session for another DID than this gateway's control DID".to_string(),
+            ));
+        }
+        Ok((token, answer))
     }
 
-    async fn handshake(&self) -> Result<(String, Arc<dyn SignerKeyProvider>, Value), VtaError> {
+    async fn handshake(&self) -> Result<(String, Arc<dyn SignerKeyProvider>, Value, String), VtaError> {
         let (generation, key) = self.current_control();
         // 1. challenge (unsigned): payload = { subject: <control did> }.
         let challenge_doc = self.build_doc(key.did(), TASK_AUTH_CHALLENGE, json!({ "subject": key.did() }));
@@ -281,6 +307,10 @@ impl VtaRestClient {
                 "scope": [],
             }),
         );
+        let request_id = auth_doc["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         let proof = sign_document(&auth_doc, key.as_ref(), PROOF_PURPOSE_AUTHENTICATION).await?;
         auth_doc
             .as_object_mut()
@@ -308,7 +338,7 @@ impl VtaRestClient {
             generation,
             key: Arc::clone(&key),
         });
-        Ok((token, key, answer))
+        Ok((token, key, answer, request_id))
     }
 
     /// A live session's token and the key it was opened with, authenticating
@@ -527,6 +557,16 @@ mod tests {
         auth_count: Arc<AtomicUsize>,
         token_expires_in: u64,
         issuers: Arc<std::sync::Mutex<Vec<String>>>,
+        binding: Binding,
+    }
+
+    /// How the mock's sign-in answer names the sign-in it answers.
+    #[derive(Clone, Copy)]
+    enum Binding {
+        /// The request's id as `threadId`, and the caller's DID as subject.
+        ThisSignIn,
+        AnotherRequest,
+        AnotherSubject,
     }
 
     /// Mock `POST /api/trust-tasks`: routes by the Trust Task `type`, asserts the
@@ -566,8 +606,14 @@ mod tests {
                         .unwrap_or_default()
                         .to_string(),
                 );
+            let (thread, subject) = match state.binding {
+                Binding::ThisSignIn => (body["id"].clone(), body["issuer"].clone()),
+                Binding::AnotherRequest => (json!("urn:uuid:another-request"), body["issuer"].clone()),
+                Binding::AnotherSubject => (body["id"].clone(), json!("did:key:z6MkSomeoneElse")),
+            };
             return Json(json!({
-                "session": { "id": "s", "subject": body["issuer"] },
+                "threadId": thread,
+                "session": { "id": subject, "subject": subject },
                 "tokens": {
                     "accessToken": format!("access-token-{n}"),
                     "tokenType": "Bearer",
@@ -599,12 +645,20 @@ mod tests {
     async fn spawn_recording_vta(
         token_expires_in: u64
     ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<String>>>) {
+        spawn_binding_vta(token_expires_in, Binding::ThisSignIn).await
+    }
+
+    async fn spawn_binding_vta(
+        token_expires_in: u64,
+        binding: Binding,
+    ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<String>>>) {
         let auth_count = Arc::new(AtomicUsize::new(0));
         let issuers = Arc::new(std::sync::Mutex::new(Vec::new()));
         let state = MockState {
             auth_count: Arc::clone(&auth_count),
             token_expires_in,
             issuers: Arc::clone(&issuers),
+            binding,
         };
         let app = Router::new()
             .route(TRUST_TASKS_PATH, post(trust_tasks))
@@ -627,6 +681,25 @@ mod tests {
     ) -> VtaRestClient {
         VtaRestClient::new(base_url, "did:webvh:vta.example", control_key, Duration::from_secs(5), 8, None)
             .expect("build client")
+    }
+
+    /// Verify takes only an answer to its own sign-in: one naming another
+    /// request, or a session for another DID, is refused.
+    #[tokio::test]
+    async fn an_answer_for_another_sign_in_is_refused() {
+        for (binding, accepted) in
+            [(Binding::ThisSignIn, true), (Binding::AnotherRequest, false), (Binding::AnotherSubject, false)]
+        {
+            let (base, _, _) = spawn_binding_vta(3600, binding).await;
+            let client = test_client(&base, Arc::new(ControlKey::from_seed([5u8; 32])));
+            let outcome = client
+                .authenticate_with_answer()
+                .await;
+            assert_eq!(outcome.is_ok(), accepted, "{outcome:?}");
+            if !accepted {
+                assert!(matches!(outcome, Err(VtaError::Protocol(_))));
+            }
+        }
     }
 
     #[tokio::test]
@@ -888,6 +961,7 @@ mod tests {
                 auth_count: Arc::new(AtomicUsize::new(0)),
                 token_expires_in: 3600,
                 issuers: Arc::new(std::sync::Mutex::new(Vec::new())),
+                binding: Binding::ThisSignIn,
             },
             served,
             refused,

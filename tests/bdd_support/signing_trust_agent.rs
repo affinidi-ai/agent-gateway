@@ -166,7 +166,11 @@ async fn trust_tasks(
     if task.contains("auth/authenticate") {
         let claims = json!({ "role": "initiator", "contexts": [agent.context_id] });
         let token = format!("h.{}.s", b64(claims.to_string().as_bytes()));
-        let answer = json!({ "session": { "id": "s" }, "tokens": { "accessToken": token, "expiresIn": 3600 } });
+        let answer = json!({
+            "threadId": body["id"],
+            "session": { "id": body["issuer"], "subject": body["issuer"] },
+            "tokens": { "accessToken": token, "expiresIn": 3600 },
+        });
         return Json(sign_answer(&agent, answer)).into_response();
     }
     if task.contains("auth/whoami") {

@@ -134,6 +134,9 @@ test.describe("Connections against a real trust agent", () => {
         timeout: 120_000,
       })
       .toBeTruthy();
+    // The box is pre-checked only while no gateway-wide default is stored, so
+    // the operator ticks it to make this agent the default.
+    await page.locator("#vta-wizard-make-default").check();
     await page.getByTestId("wizard-submit").click();
     await expect(page).toHaveURL(/\/connections\?tab=trust-agents/);
 
@@ -189,7 +192,9 @@ test.describe("Connections against a real trust agent", () => {
     // An issuer takes the agent to sign for its surfaces, from the issuer editor.
     await page.goto(`${BASE_URL}/identities?tab=issuers`);
     await page.getByTestId("issuers-add-button").click();
-    await page.locator("#issuer-name").fill("Live issuer");
+    // Named for this run's connection: issuers outlive a run of the live harness.
+    const issuerName = `Live issuer ${state.id.slice(0, 8)}`;
+    await page.locator("#issuer-name").fill(issuerName);
     await page
       .locator("#issuer-description")
       .fill("Signs through the live agent");
@@ -201,9 +206,9 @@ test.describe("Connections against a real trust agent", () => {
       .selectOption(state.id);
     await page.getByTestId("issuer-editor-save-button").click();
 
-    await expect(page.getByText("Live issuer")).toBeVisible();
+    await expect(page.getByText(issuerName)).toBeVisible();
     const issuers = (await api(page, "/api/v1/issuers")).json;
-    const issuer = issuers.find((i: any) => i.name === "Live issuer");
+    const issuer = issuers.find((i: any) => i.name === issuerName);
     expect(issuer.signing).toMatchObject({
       backend: "vta",
       connection_id: state.id,

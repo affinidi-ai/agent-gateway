@@ -279,7 +279,10 @@ DID could not be resolved is expected: the listener is not up when the check run
 The trust agent signs its answer to the gateway's authentication with an `eddsa-jcs-2022` proof
 made by the key of its DID. Verifying a connection checks that proof against the resolved DID
 document and pins the DID that signed it: an unsigned answer fails verification (`502`), and an
-answer signed as another DID takes the connection out of use (`409`, naming that DID). A trust
+answer signed as another DID takes the connection out of use (`409`, naming that DID). The signed
+answer must also be for this sign-in: its `threadId` names the authenticate request the gateway
+sent, and its `session.subject` is the connection's control DID; an answer that is not fails
+verification (`502`). A trust
 agent that cannot be reached leaves the stored state as it was (`502`). `pairing.last_error` holds
 a summary (status and error code), never the trust agent's response body. The `[vta]` block is
 never verified this way: its identity rests on TLS to `base_url`.

@@ -150,7 +150,9 @@ changes:
         overwrite each other; an edit made while the connection was disabled,
         repointed or rekeyed elsewhere is refused with 409. Verify keeps the stored state while the agent
         answers 408, 429 or a 5xx, and degrades the connection only on a
-        definite refusal. A revoked connection stays revoked until it is paired
+        definite refusal. Verify accepts only the agent's signed answer to the
+        sign-in it sent, for the connection's control DID. A revoked connection
+        stays revoked until it is paired
         again: Verify refuses it, and a revoke made during a Verify is kept. The
         [vta] block's own connection cannot be revoked, since it keeps signing
         through the block. A Standby node leaves a pending [vta] control key to

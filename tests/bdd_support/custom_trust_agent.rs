@@ -310,7 +310,11 @@ async fn trust_tasks(
             .insert(issuer.clone(), token.clone());
         s.signed_in
             .push((issuer, fragment));
-        let answer = json!({ "session": { "id": "s" }, "tokens": { "accessToken": token, "expiresIn": 3600 } });
+        let answer = json!({
+            "threadId": body["id"],
+            "session": { "id": body["issuer"], "subject": body["issuer"] },
+            "tokens": { "accessToken": token, "expiresIn": 3600 },
+        });
         let answer = match s.answer_signer {
             AnswerSigner::Agent => sign_answer(answer, &AGENT_SEED),
             AnswerSigner::Impostor => sign_answer(answer, &IMPOSTOR_SEED),
