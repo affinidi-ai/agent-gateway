@@ -14,7 +14,9 @@ Feature: A Transit Point's listen_path is held to the routes the gateway serves
   a deployment whose outbound listener has a hostname of its own serves such a
   path and stores it without a word. A path a surface already holds is answered
   with a Warning rather than refused, and a path that is a route another Transit
-  Point answers on is refused when a save introduces it.
+  Point answers on is refused when a save introduces it. A variant answers at
+  its base Transit Point's routes, so a variant listen_path the base point does
+  not hold is served nowhere and refused when a save introduces it.
 
   Background:
     Given A2A surface "example-surface" is defined for route "/example" with managed agent "example-agent" as its target
@@ -75,6 +77,17 @@ Feature: A Transit Point's listen_path is held to the routes the gateway serves
     Then the admin API response status is 400
     And the admin API error response carries the code "listen_path_route_clash"
     And the admin API error response mentions "Transit Point 'charlie'"
+
+  Scenario: A variant listen_path its base Transit Point does not hold is refused
+    When the operator adds variant "beta" in which Transit Point "alpha" has listen_path "/outbound/example/partner-beta"
+    Then the admin API response status is 400
+    And the admin API error response carries the code "listen_path_variant_unserved"
+    And the admin API error response mentions "Transit Point 'alpha' in variant 'beta'"
+
+  Scenario: A variant repeating its base Transit Point's listen_path is saved
+    Given the operator updates Transit Point "alpha" listen_path to "/outbound/example/partner-alpha"
+    When the operator adds variant "beta" in which Transit Point "alpha" has listen_path "/outbound/example/partner-alpha"
+    Then the admin API response status is 200
 
   Scenario: The surface routing settings name the prefixes a Transit Point may listen under
     When the operator reads the surface routing settings

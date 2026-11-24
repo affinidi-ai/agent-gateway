@@ -1287,6 +1287,8 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResp
 /// each JWT bearer method stored without an audience
 /// ([`AgentSurface::unchecked_audience_warnings`]), then one naming
 /// each Transit Point that serves callers it does not authenticate where other hosts reach it, each
+/// whose `listen_path` the gateway cannot serve ([`crate::proxy::server::listen_path_warnings`])
+/// or is a route another Transit Point answers on ([`listen_path_route_clash_warnings`]), each
 /// that accepts the Access Point's own tokens ([`shared_audience_warnings`]),
 /// each whose JWT verification strategy names an issuer the surface also
 /// accepts through another ([`shared_issuer_warnings`]), each whose stored
@@ -1322,6 +1324,7 @@ async fn save_warnings(
         surface,
     )
     .await;
+    let route_clashes = stored_listen_path_route_clash_warnings(state, surface).await;
     let mut headers = axum::http::HeaderMap::new();
     for warning in surface
         .access_point_warnings()
@@ -1333,6 +1336,7 @@ async fn save_warnings(
                 .filter_map(crate::proxy::server::OpenTransitPoint::exposure),
         )
         .chain(crate::proxy::server::listen_path_warnings(&state.network_config, surface))
+        .chain(route_clashes)
         .chain(shared_audience_warnings(surface))
         .chain(shared_issuer_warnings(surface, &issuers))
         .chain(unusable_principal_claim_warnings(surface, &issuers))
@@ -2401,7 +2405,8 @@ async fn validate_listen_paths(
 ///
 /// Only a path this save introduces or changes is refused, as in
 /// [`check_listen_paths`], so a surface stored with such a clash stays
-/// editable; the listener build still logs it.
+/// editable; its save is answered with a `Warning` of the same text
+/// ([`listen_path_route_clash_warnings`]), and the listener build still logs it.
 fn check_listen_path_shadowing(
     surface: &AgentSurface,
     stored: Option<&AgentSurface>,
@@ -2421,34 +2426,6 @@ fn check_listen_path_shadowing(
         })
         .unwrap_or_default();
 
-    // Every derived route on every listener, with the point and surface it
-    // belongs to. The surface being saved is held as `Mine`, never by name or
-    // id: two surfaces may carry the same name, and an id is empty on a create,
-    // so only the walk itself says whose route this is. It is inserted last, so
-    // its own routes win over another surface's identical entry and the
-    // exemption below still applies.
-    let mut derived: std::collections::HashMap<(ListenerKey, String), RouteOwner> = std::collections::HashMap::new();
-    let active_others = || {
-        others.iter().filter(|other| {
-            other.surface_id != surface.surface_id
-                && other.status != crate::config::agent_surface::SurfaceStatus::Disabled
-        })
-    };
-    for owner in active_others() {
-        for (key, route, point) in outbound_derived_route_claims(owner, resolve_port) {
-            derived.insert(
-                (key, route),
-                RouteOwner::Theirs {
-                    surface: owner.name.clone(),
-                    point,
-                },
-            );
-        }
-    }
-    for (key, route, point) in outbound_derived_route_claims(surface, resolve_port) {
-        derived.insert((key, route), RouteOwner::Mine { point });
-    }
-
     // The other direction: a route this save introduces, from a new point, a
     // new variant or a changed surface route, landing on a `listen_path`
     // another surface already holds. The clash is the same one, and the save
@@ -2464,7 +2441,7 @@ fn check_listen_path_shadowing(
         .unwrap_or_default();
     let mut claimed_paths: std::collections::HashMap<(ListenerKey, String), (String, String)> =
         std::collections::HashMap::new();
-    for other in active_others() {
+    for other in active_other_surfaces(surface, others) {
         for (key, path) in outbound_listen_path_claims(other, resolve_port) {
             for (_, point) in transit_point_listeners(other, resolve_port) {
                 if point
@@ -2499,6 +2476,81 @@ fn check_listen_path_shadowing(
         }
     }
 
+    for clash in listen_path_route_clashes(surface, others, resolve_port) {
+        let claim = (clash.key.clone(), clash.path.clone());
+        // A path the same Transit Point already held is exempt, unless the route it now
+        // clashes with is one of this surface's own that this save introduces:
+        // adding a point whose derived route is an older point's path is the
+        // same clash, arriving from the other side, and the save that
+        // introduces it is this one. Another surface's route is never this
+        // save's to introduce.
+        let introduced_here = clash.on_own_route && !kept_routes.contains(&claim);
+        if kept.contains(&(clash.key, clash.alias, clash.path)) && !introduced_here {
+            continue;
+        }
+        return Err(SurfaceApiError::BadRequestCode(crate::proxy::server::LISTEN_PATH_ROUTE_CLASH, clash.message));
+    }
+
+    Ok(())
+}
+
+/// The surfaces in `others` whose routes the outbound listener registers beside
+/// `surface`'s: every one but `surface` itself, and none that is disabled.
+fn active_other_surfaces<'a>(
+    surface: &'a AgentSurface,
+    others: &'a [AgentSurface],
+) -> impl Iterator<Item = &'a AgentSurface> + 'a {
+    others.iter().filter(|other| {
+        other.surface_id != surface.surface_id && other.status != crate::config::agent_surface::SurfaceStatus::Disabled
+    })
+}
+
+/// One `listen_path` of the surface being saved that is a route another
+/// Transit Point answers on ([`listen_path_route_clashes`]).
+struct ListenPathRouteClash {
+    key: ListenerKey,
+    alias: String,
+    /// The path as the listener registers it ([`registered_path`]).
+    path: String,
+    /// Whether the route it lands on is one of the saved surface's own.
+    on_own_route: bool,
+    /// What the operator is told, as the refusal of a save that introduces
+    /// the clash or as the `Warning` of one that keeps it.
+    message: String,
+}
+
+/// Every `listen_path` of `surface` that is a route another Transit Point
+/// answers on, of this surface or of an active one in `others`, whatever the
+/// stored surface held: [`check_listen_path_shadowing`] refuses the ones a
+/// save introduces, and [`listen_path_route_clash_warnings`] tells the rest.
+fn listen_path_route_clashes(
+    surface: &AgentSurface,
+    others: &[AgentSurface],
+    resolve_port: &impl Fn(&str) -> Option<u16>,
+) -> Vec<ListenPathRouteClash> {
+    // Every derived route on every listener, with the point and surface it
+    // belongs to. The surface being saved is held as `Mine`, never by name or
+    // id: two surfaces may carry the same name, and an id is empty on a create,
+    // so only the walk itself says whose route this is. It is inserted last, so
+    // its own routes win over another surface's identical entry and the
+    // exemption in the save gate still applies.
+    let mut derived: std::collections::HashMap<(ListenerKey, String), RouteOwner> = std::collections::HashMap::new();
+    for owner in active_other_surfaces(surface, others) {
+        for (key, route, point) in outbound_derived_route_claims(owner, resolve_port) {
+            derived.insert(
+                (key, route),
+                RouteOwner::Theirs {
+                    surface: owner.name.clone(),
+                    point,
+                },
+            );
+        }
+    }
+    for (key, route, point) in outbound_derived_route_claims(surface, resolve_port) {
+        derived.insert((key, route), RouteOwner::Mine { point });
+    }
+
+    let mut clashes = Vec::new();
     for (key, tp) in transit_point_listeners(surface, resolve_port) {
         let Some(path) = tp
             .listen_path
@@ -2509,17 +2561,6 @@ fn check_listen_path_shadowing(
         };
         let path = &path;
         let claim = (key.clone(), path.clone());
-        // A path the same Transit Point already held is exempt, unless the route it now
-        // clashes with is one of this surface's own that this save introduces:
-        // adding a point whose derived route is an older point's path is the
-        // same clash, arriving from the other side, and the save that
-        // introduces it is this one. Another surface's route is never this
-        // save's to introduce.
-        let introduced_here =
-            matches!(derived.get(&claim), Some(RouteOwner::Mine { .. })) && !kept_routes.contains(&claim);
-        if kept.contains(&(key.clone(), tp.alias.clone(), path.clone())) && !introduced_here {
-            continue;
-        }
         // A point claiming its own derived route changes nothing: that route is
         // registered for it either way and reaches the Target it names. Only
         // that one route is exempt, never a variant form of it, which is a
@@ -2559,17 +2600,70 @@ fn check_listen_path_shadowing(
                 )
             }
         };
-        return Err(SurfaceApiError::BadRequestCode(
-            crate::proxy::server::LISTEN_PATH_ROUTE_CLASH,
-            format!(
-                "listen_path '{}' on {} is {reason}; choose a different listener path",
-                path,
-                key.label("outbound")
-            ),
-        ));
+        let message = format!(
+            "listen_path '{}' on {} is {reason}; choose a different listener path",
+            path,
+            key.label("outbound")
+        );
+        clashes.push(ListenPathRouteClash {
+            on_own_route: matches!(derived.get(&claim), Some(RouteOwner::Mine { .. })),
+            key,
+            alias: tp.alias.clone(),
+            path: path.clone(),
+            message,
+        });
     }
+    clashes
+}
 
-    Ok(())
+/// What an operator is told on a save about each `listen_path` of `surface`
+/// that is a route another Transit Point answers on
+/// ([`listen_path_route_clashes`]). The save that introduces one is refused
+/// ([`check_listen_path_shadowing`]), so a warning is what a clash the surface
+/// is already stored with gets. A disabled surface registers no route, so it
+/// clashes with nothing.
+fn listen_path_route_clash_warnings(
+    surface: &AgentSurface,
+    others: &[AgentSurface],
+    resolve_port: &impl Fn(&str) -> Option<u16>,
+) -> Vec<String> {
+    if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+        return Vec::new();
+    }
+    listen_path_route_clashes(surface, others, resolve_port)
+        .into_iter()
+        .map(|clash| clash.message)
+        .collect()
+}
+
+/// [`listen_path_route_clash_warnings`] for a surface just saved, against every
+/// surface the store holds. A store that cannot be listed costs the warning,
+/// never the save, which has already happened.
+async fn stored_listen_path_route_clash_warnings(
+    state: &IdentityApiState,
+    surface: &AgentSurface,
+) -> Vec<String> {
+    let Some(store) = state.agent_surface_store.as_ref() else {
+        return Vec::new();
+    };
+    let resolve_port = |addr: &str| {
+        state
+            .network_config
+            .map_url_to_port_for_type(addr, Some("outbound"))
+    };
+    if transit_point_listeners(surface, &resolve_port)
+        .next()
+        .is_none()
+    {
+        return Vec::new();
+    }
+    match store.list_all().await {
+        Ok(others) => listen_path_route_clash_warnings(surface, &others, &resolve_port),
+        Err(error) => {
+            tracing::warn!("Could not list surfaces for listen_path clash warnings: {error}");
+            Vec::new()
+        }
+    }
 }
 
 /// Whose Transit Point answers on a derived route: the surface being saved, or
@@ -2612,9 +2706,12 @@ fn claiming_stored_surface(stored: Option<&AgentSurface>) -> Option<&AgentSurfac
 ///
 /// Only a path this save introduces or changes is refused: the same Transit
 /// Point, in the same variant, keeping the same path is exempt, so a surface
-/// stored with such a path before this release stays editable, while moving a
-/// path, copying it into a variant, or renaming the point or the variant is a
-/// new claim. A disabled surface registers no route, and is skipped as
+/// stored with such a path before this release stays editable, as is a variant
+/// repeating the path its base point holds in this save and held before it
+/// ([`crate::proxy::server::inherits_a_kept_base_claim`]). Moving a path,
+/// copying the base point's old path into a variant in the save that moves it,
+/// or renaming the point or the variant is a new claim. A disabled surface
+/// registers no route, and is skipped as
 /// `check_listen_path_collisions` skips it; it claims nothing either
 /// ([`claiming_stored_surface`]).
 fn check_listen_paths(
@@ -2629,7 +2726,8 @@ fn check_listen_paths(
     match crate::proxy::server::listen_path_problems(surface, network_config)
         .into_iter()
         .find(|problem| {
-            !kept.contains(&problem.claim) && !crate::proxy::server::inherits_a_kept_base_claim(&problem.claim, &kept)
+            !kept.contains(&problem.claim)
+                && !crate::proxy::server::inherits_a_kept_base_claim(&problem.claim, &kept, surface)
         }) {
         Some(problem) => Err(SurfaceApiError::BadRequestCode(problem.code, problem.message)),
         None => Ok(()),
@@ -9989,6 +10087,18 @@ mod validation_tests {
         check_listen_path_shadowing(&stored, Some(&stored), std::slice::from_ref(&other), &no_ports)
             .expect("a path the surface already held, saved unchanged, is exempt");
 
+        // Exempt, and still told: the save answers it with a Warning.
+        let warnings = listen_path_route_clash_warnings(&stored, std::slice::from_ref(&other), &no_ports);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("listen_path '/outbound/agents/a/alpha'"), "{warnings:?}");
+        assert!(warnings[0].contains("Transit Point 'alpha' of surface 'other'"), "{warnings:?}");
+        let mut disabled = stored.clone();
+        disabled.status = SurfaceStatus::Disabled;
+        assert!(
+            listen_path_route_clash_warnings(&disabled, std::slice::from_ref(&other), &no_ports).is_empty(),
+            "a disabled surface registers no route, so it clashes with nothing"
+        );
+
         let mut renamed = stored.clone();
         renamed
             .transit
@@ -10348,21 +10458,29 @@ mod validation_tests {
         surface
     }
 
-    /// The accepted risk of the configuration reference: a variant copy of the
-    /// stored base path is held, not introduced, so a save that moves the base
-    /// path stores it with a Warning rather than refusing it.
+    /// A variant copy of the base path the variant already held is kept, so a
+    /// save that moves the base path stores it with a Warning rather than
+    /// refusing it; one the same save sets is introduced, and refused.
     #[test]
-    fn a_variant_copy_of_the_stored_base_path_is_warned_about_when_the_base_moves() {
+    fn a_variant_copy_of_the_old_base_path_is_kept_only_where_the_variant_held_it() {
         let stored = surface_with_a_variant_copy("/outbound/api/old", Some("/outbound/api/old"));
         let saved = surface_with_a_variant_copy("/outbound/api/new", Some("/outbound/api/old"));
 
-        listen_path_check(&saved, Some(&stored)).expect("the variant's copy of the stored base path is held");
+        listen_path_check(&saved, Some(&stored)).expect("the variant's own stored copy is held");
 
         // Set in this save rather than kept: equal to the stored base point's
-        // path, so it is exempt all the same.
-        let stored_without_a_variant_path = surface_with_a_variant_copy("/outbound/api/old", None);
-        listen_path_check(&saved, Some(&stored_without_a_variant_path))
-            .expect("a variant path set to the stored base point's path is exempt");
+        // path only, which the same save moves, so nothing registers it.
+        for variant_path in [None, Some("/outbound/api/other")] {
+            let stored = surface_with_a_variant_copy("/outbound/api/old", variant_path);
+            let (code, msg) = listen_path_refusal(&saved, Some(&stored));
+            assert_eq!(code, crate::proxy::server::LISTEN_PATH_VARIANT_UNSERVED, "{variant_path:?}");
+            assert!(msg.contains("which here is '/outbound/api/new'"), "{msg}");
+        }
+
+        // The base point keeping its path keeps the variant's copy exempt.
+        let unmoved = surface_with_a_variant_copy("/outbound/api/old", Some("/outbound/api/old"));
+        listen_path_check(&unmoved, Some(&surface_with_a_variant_copy("/outbound/api/old", None)))
+            .expect("a variant repeating its base point's path adds no route");
 
         let warnings = crate::proxy::server::listen_path_warnings(&network_with_channels(), &saved);
         assert_eq!(warnings.len(), 1, "{warnings:?}");

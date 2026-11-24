@@ -9,6 +9,15 @@ changes:
         which had grown to the 1 MB asset budget and failed the build. That code is now split into
         several common chunks of at most 500 KB each, so the budget keeps flagging real growth and
         the browser can cache and load the parts separately.
+    - timestamp: '2026-11-25T10:20:00Z'
+      title: Warn on every save about a stored listen_path that is another Transit Point's route
+      description: >-
+        A save that introduces a listen_path equal to a route another Transit Point answers on is
+        refused with listen_path_route_clash, while a surface already stored with such a clash
+        stays editable. Its saves were answered with no word about the clash, which the outbound
+        listener resolves by registering one of the two routes and skipping the other. Every save
+        of such a surface now carries a Warning header with the refusal's text, naming the path,
+        the listener and the Transit Point whose route it is, until one of the two paths moves.
   fixed:
     - timestamp: '2026-11-24T18:05:00Z'
       title: Carry a base Transit Point's Listen Path edit into its variants
@@ -20,6 +29,48 @@ changes:
         configuration disagreed with where it answers. The copy now follows the base path, together
         with the prefix and custom path the picker shows, in every variant whose copy held the
         base's previous path; a variant that had set a different path keeps it.
+    - timestamp: '2026-11-25T10:40:00Z'
+      title: Keep a cleared Transit Point Listen Path unset when its panel reopens
+      description: >-
+        Clearing a Transit Point's Custom Path in the Surface Builder asks for the route the
+        gateway derives from its alias. Reopening the panel read the cleared point as a new one,
+        seeded a random Listen Path and moved it to the first outbound listener, so a later
+        unrelated save created a custom route and moved the derived one. A Transit Point that holds
+        a listener address but no Listen Path is now left as it is.
+    - timestamp: '2026-11-25T10:50:00Z'
+      title: Block a Listen Path typed without a prefix on a gateway-routed Transit Point
+      description: >-
+        A Custom Path typed while no surface prefix is selected composes no Listen Path, so the
+        Surface Builder keeps the stored one and the typed path is dropped on save. That blocked
+        the save of a Transit Point routed to a URL but not of one routed through another gateway,
+        which saved as if the edit had applied. Both are now blocked until a prefix is picked.
+    - timestamp: '2026-11-25T11:00:00Z'
+      title: Check malformed and unserved variant Listen Paths in the Surface Builder before saving
+      description: >-
+        The Surface Builder blocked a Listen Path outside the configured surface prefixes before
+        sending the save, but left two other gateway refusals to the round trip. It now also blocks
+        a path the outbound router cannot register, such as one with a ':partner' or '{id}'
+        segment (listen_path_invalid), and a variant path its base Transit Point does not hold,
+        which no route serves (listen_path_variant_unserved), with the same exemptions the gateway
+        applies to a path the surface or variant already holds.
   removed: []
   security: []
-  breaking: []
+  breaking:
+    - timestamp: '2026-11-25T10:00:00Z'
+      title: Refuse every variant listen_path no route serves, as listen_path_variant_unserved
+      description: >-
+        The outbound listener registers routes from the base surface's Transit Points alone and
+        builds each variant's from the base point's alias and path, so a variant's own listen_path
+        is served only where the base point holds the same path. Version 1.0.10 refused such a path
+        only on an alias no base Transit Point defines, with the code listen_path_variant_only, and
+        stored one that differs from its base point's path. Both shapes are now refused when a save
+        introduces the path, with 400 and the code listen_path_variant_unserved, which replaces
+        listen_path_variant_only. For an alias the base surface defines, this is told before any
+        other problem with the path, since the listener never registers it. A variant repeating the
+        path its base point holds before and after the save adds no route and is exempt. Where the
+        same save moves the base point's path, a variant path equal to the old one is refused,
+        unless that variant already held it, in which case the save is answered with a Warning
+        header. Migration: a client matching on listen_path_variant_only matches on
+        listen_path_variant_unserved instead, and a save that sets a variant path differing from
+        its base point's sets the path on the base Transit Point, or leaves the variant's copy as
+        the base point has it.

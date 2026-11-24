@@ -2,7 +2,7 @@ branch: fix/tp-route
 changes:
   added:
     - timestamp: '2026-11-19T22:40:00Z'
-      title: Expose outbound_channel_path_prefix in the surface routing config
+      title: Surface routing config says which prefixes a Transit Point may listen under
       description: >-
         GET /v1/config/surface-routing now returns outbound_channel_path_prefix beside
         channel_path_prefix: the same channel prefixes under the gateway's outbound prefix, with the
@@ -13,22 +13,43 @@ changes:
         outbound prefix answers on the outbound listener alone, so on a shared hostname it is never
         reached. The field is always present and may be empty.
     - timestamp: '2026-11-23T16:20:00Z'
-      title: Expose shared_hostname_outbound_addresses in the surface routing config
+      title: Surface routing config says which outbound addresses share an inbound hostname
       description: >-
         GET /v1/config/surface-routing now returns shared_hostname_outbound_addresses: every entry
         of available_outbound_listen_addresses whose listener the inbound /outbound proxy forwards
-        to, which is the first outbound listener whose hostname that inbound listener shares. That
-        is where a listen_path outside /outbound is refused, so a client that offers the /outbound
-        prefixes for exactly these addresses offers what a save accepts. It cannot be derived from
-        the two address lists, because a listener answers on every one of its external_urls: an
-        alias URL in no inbound list still belongs to a shared listener, and the same hostname on
-        another port is the same hostname. The gateway answers it with the same function its save
-        gate uses, so a second outbound listener carrying the inbound hostname, which nothing
-        forwards to, is listed by neither. The field is always present and may be empty.
+        to. That is where a listen_path outside /outbound is refused, so a client that offers the
+        /outbound prefixes for exactly these addresses offers what a save accepts. It cannot be
+        derived from the two address lists, because a listener answers on every one of its
+        external_urls: an alias URL in no inbound list still belongs to a shared listener, and the
+        same hostname on another port is the same hostname. The gateway answers it with the same
+        function its save gate uses, and the field is always present and may be empty.
   changed: []
   fixed:
+    - timestamp: '2026-11-20T10:30:00Z'
+      title: ⭐ Refuse a Transit Point listen_path no deployment serves
+      description: >-
+        A Transit Point whose listen_path is /outbound, bare or with a trailing slash, registers
+        that prefix and its wildcard on the outbound listener, so it answers every outbound request
+        no other Transit Point's route matches more closely, and one the outbound router cannot
+        register as written, such as a path with no leading slash, panics the outbound listener
+        build. Until now both were only logged as a warning while the listener was built, by which
+        time the surface was stored and the operator none the wiser. The admin API now refuses the
+        save that introduces either, with 400 and the code listen_path_is_outbound_prefix or
+        listen_path_invalid, naming the Transit Point, its variant and what to do instead, on the
+        base surface and in every variant. A brace, which axum reads as a path parameter so the
+        point silently answers every value in that position, is now one of the paths the gateway
+        calls malformed, as is a segment starting with ':' or '*', the parameter syntax axum used
+        before 0.8 and refuses now. Only a path the save introduces or changes is refused: the same
+        Transit Point, in the same variant, keeping the same path is exempt, so a surface stored
+        with such a path stays editable, while moving it to another Transit Point, copying it into
+        a variant, renaming the point, or renaming the variant, which re-introduces every path that
+        variant holds, is a new claim. A variant that overrides no Transit Point of its own keeps
+        the base surface's claims, so a dashboard save, which writes each variant's points in full,
+        is not refused for a path nobody touched. A disabled surface reserves no route, so saving
+        one is never refused, and claims nothing while disabled, so enabling it introduces every
+        path it names. A listen_path already on disk is still served as stored.
     - timestamp: '2026-11-20T16:40:00Z'
-      title: Read a Transit Point's prefix in the Surface Builder from the list it offers
+      title: The Surface Builder reads a Transit Point's prefix from the list it offers
       description: >-
         On an outbound address that shares the inbound hostname a Transit Point listens under
         /outbound plus a channel's prefix, and the prefix picker offers exactly those forms. Two
@@ -66,6 +87,28 @@ changes:
         blocked: it answers at the route the gateway derives from its alias, and clearing the
         fields is how the dashboard asks for that, which the save now reports as a warning naming
         the path that stops answering.
+    - timestamp: '2026-11-24T14:05:00Z'
+      title: Refuse a listen_path on an alias only a variant defines
+      description: >-
+        The outbound listener registers routes from the base surface's Transit Points alone, so a
+        point an alias only a variant defines is reached at no route, and a listen_path on it adds
+        none: the path was stored and nothing answered it. A path outside the outbound prefix
+        already said so in its refusal; one under the prefix was accepted silently. Such a save is
+        now refused with 400 and the code listen_path_variant_only, asking for the alias in the
+        base surface rather than naming a path to set. The refusal also names the prefixes the
+        point's own listener serves, rather than every configured form, and offers adding the
+        prefix to channels in gateway.json as the other way out.
+    - timestamp: '2026-11-24T09:35:00Z'
+      title: Read a shared outbound hostname as the inbound proxy does
+      description: >-
+        An inbound listener forwards /outbound to the first outbound listener whose hostname it
+        shares, so where two outbound listeners carry that hostname only the first is reached
+        through the inbound address. The listen_path gate called both shared and held a path on
+        the second to the outbound prefix, although the inbound listener never forwards to it and
+        hides nothing there. It now asks the same question the proxy answers, so a listener
+        nothing forwards to is treated as having a hostname of its own, and
+        shared_hostname_outbound_addresses, which the dashboard's prefix picker reads, lists only
+        the listeners that really are reached through an inbound address.
   removed: []
   security:
     - timestamp: '2026-11-20T12:40:00Z'
@@ -114,51 +157,6 @@ changes:
         the inbound hostname, move any stored path outside /outbound under one of the /outbound
         prefixes. A path a surface is already stored with is answered with a Warning header rather
         than refused, so such a surface stays editable.
-    - timestamp: '2026-11-20T10:30:00Z'
-      title: ⭐ Refuse a Transit Point listen_path no deployment serves
-      description: >-
-        A Transit Point whose listen_path is /outbound, bare or with a trailing slash, registers
-        that prefix and its wildcard on the outbound listener, so it answers every outbound request
-        no other Transit Point's route matches more closely, and one the outbound router cannot
-        register as written, such as a path with no leading slash, panics the outbound listener
-        build. Until now both were only logged as a warning while the listener was built, by which
-        time the surface was stored and the operator none the wiser. The admin API now refuses the
-        save that introduces either, with 400 and the code listen_path_is_outbound_prefix or
-        listen_path_invalid, naming the Transit Point, its variant and what to do instead, on the
-        base surface and in every variant, except that a variant path on an alias the base surface
-        defines that differs from the base point's path is told listen_path_variant_unserved
-        instead. A brace, which axum reads as a path parameter so the
-        point silently answers every value in that position, is now one of the paths the gateway
-        calls malformed, as is a segment starting with ':' or '*', the parameter syntax axum used
-        before 0.8 and refuses now. This refuses saves every deployment accepted until now:
-        Migration: move any stored path of either shape, which no deployment served as the Transit
-        Point meant it. Only a path the save introduces or changes is refused: the same Transit
-        Point, in the same variant, keeping the same path is exempt, so a surface stored with such
-        a path stays editable, while moving it to another Transit Point, renaming the point, or
-        renaming the variant, which re-introduces every path that variant holds, is a new claim. A
-        variant that repeats its base point's path adds no route, so it keeps that point's claim
-        and a dashboard save, which writes each variant's points in full, is not refused for a path
-        nobody touched. A disabled surface reserves no route, so saving one is never refused, and
-        claims nothing while disabled, so enabling it introduces every path it names. A listen_path
-        already on disk is still served as stored.
-    - timestamp: '2026-11-24T14:05:00Z'
-      title: Refuse a variant's listen_path that no route serves
-      description: >-
-        The outbound listener registers routes from the base surface's Transit Points alone and
-        builds each variant's from a base point's alias and path, so a variant's own listen_path is
-        served only where the base point holds the same path. Two shapes were stored and answered
-        by nothing: one on an alias only a variant defines, which has no route at all, and one a
-        variant sets where its base point holds a different path or none. Both are now refused with
-        400 and the code listen_path_variant_unserved, naming the base point's path and asking for
-        the alias, or the path, on the base surface, when the save introduces that path. For an
-        alias the base surface defines, this is told before any other problem with the path, since
-        the listener never registers it. A variant path equal to the stored base point's path, kept
-        or set in that save, is stored with a Warning header and not refused, even when the same
-        save moves the base point's path. This refuses saves accepted until now.
-        Migration: set the path on the base Transit Point, or leave the variant's copy as the base
-        point has it. The refusal also names the prefixes the point's own listener serves, rather
-        than every configured form, and offers adding the prefix to channels in gateway.json as the
-        other way out.
     - timestamp: '2026-11-24T09:30:00Z'
       title: Refuse a listen_path that is a route another Transit Point answers on
       description: >-

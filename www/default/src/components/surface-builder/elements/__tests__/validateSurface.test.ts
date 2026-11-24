@@ -2,7 +2,11 @@
  * `validateSurfacePayload` unit tests.
  */
 
-import { validateSurfacePayload, hasBlockingIssues } from '../validateSurface';
+import {
+  validateSurfacePayload,
+  hasBlockingIssues,
+  variantListenPathProblem,
+} from '../validateSurface';
 // Side-effect import: registers every element definition so the
 // validator's registry-aware checks (e.g. parent-type classification
 // for the chain-leak watchdog) can resolve types.
@@ -184,6 +188,79 @@ describe('validateSurfacePayload', () => {
           )
         ).toMatchObject({ severity: 'error' });
       }
+    });
+
+    // The gateway's `listen_path_invalid`: a path under an offered prefix the outbound
+    // router still cannot register.
+    it('blocks a path the outbound router cannot register', () => {
+      for (const [path, reason] of [
+        ['/outbound/agents/:partner', 'segment starting with ":" or "*" (":partner")'],
+        ['/outbound/agents/*partner', 'segment starting with ":" or "*" ("*partner")'],
+        ['/outbound/agents/{id}', 'must not contain "{" or "}"'],
+        ['/outbound/agents/../secret', 'must not contain ".." segments'],
+      ]) {
+        const issues = validateSurfacePayload(surface(path), { stored: null, routing });
+        const issue = issues.find(i => i.path?.endsWith('listen_path'));
+        expect(issue).toMatchObject({ severity: 'error' });
+        expect(issue?.message).toContain(reason);
+      }
+    });
+  });
+
+  describe('a variant Listen Path its base Transit Point does not hold', () => {
+    const point = (listen_path?: string) => ({
+      alias: 'partner-a',
+      target_endpoint: 'https://partner.example/a',
+      ...(listen_path === undefined ? {} : { listen_path }),
+    });
+    const wire = (base?: string, variant?: string) => ({
+      ...ok(),
+      transit: { points: [point(base)] },
+      variants: [{ id: 'v-beta', alias: 'beta', overrides: { transit: { points: [point(variant)] } } }],
+    });
+
+    it('blocks a variant path the base point does not hold, which no route serves', () => {
+      expect(
+        variantListenPathProblem(
+          wire('/outbound/agents/new', '/outbound/agents/old'),
+          wire('/outbound/agents/old')
+        )
+      ).toContain('which is "/outbound/agents/new"');
+      expect(variantListenPathProblem(wire(undefined, '/outbound/agents/x'), null)).toContain(
+        'which is unset'
+      );
+    });
+
+    it('lets a variant repeat its base point, or keep a path the variant already held', () => {
+      expect(
+        variantListenPathProblem(wire('/outbound/agents/a', '/outbound/agents/a'), null)
+      ).toBeNull();
+      const held = wire('/outbound/agents/old', '/outbound/agents/old');
+      expect(
+        variantListenPathProblem(wire('/outbound/agents/new', '/outbound/agents/old'), held)
+      ).toBeNull();
+      // A disabled stored surface claims nothing; a disabled draft registers nothing.
+      expect(
+        variantListenPathProblem(wire('/outbound/agents/new', '/outbound/agents/old'), {
+          ...held,
+          status: 'disabled',
+        })
+      ).not.toBeNull();
+      expect(
+        variantListenPathProblem({ ...wire(undefined, '/outbound/agents/x'), status: 'disabled' }, null)
+      ).toBeNull();
+    });
+
+    it('blocks a path on an alias only the variant defines', () => {
+      const payload = {
+        ...ok(),
+        variants: [
+          { alias: 'beta', overrides: { transit: { points: [point('/outbound/agents/x')] } } },
+        ],
+      };
+      expect(variantListenPathProblem(payload, null)).toContain(
+        'Define the Transit Point in the base surface too'
+      );
     });
   });
 

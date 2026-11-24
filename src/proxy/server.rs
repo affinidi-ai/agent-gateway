@@ -895,7 +895,8 @@ pub(crate) fn kept_listen_path_claims(
 }
 
 /// Whether `claim` is a variant's copy of a base point's path that `kept`
-/// already holds, so it introduces nothing.
+/// already holds and `surface`, the save, still holds, so it introduces
+/// nothing.
 ///
 /// The outbound listener builds a variant's routes from the base surface's
 /// Transit Point and its path, so a variant that repeats that path registers no
@@ -906,22 +907,29 @@ pub(crate) fn kept_listen_path_claims(
 /// not be one the gateway already stores, since a variant added in the same
 /// save copies the same path.
 ///
-/// `kept` is the stored surface's, so a variant path equal to the stored base
-/// point's path, kept or set in this save, is exempt even when the same save
-/// moves the base point's path: it is stored with a `Warning` that no route
-/// serves it rather than refused.
+/// The base point must still hold the path in this save. Where the same save
+/// moves the base point's path, a variant path equal to the old one is
+/// registered nowhere, so it is a new claim unless that variant already held
+/// it, which `kept` then holds as the variant's own claim.
 pub(crate) fn inherits_a_kept_base_claim(
     claim: &ListenPathClaim<'_>,
     kept: &std::collections::HashSet<ListenPathClaim<'_>>,
+    surface: &crate::config::agent_surface::AgentSurface,
 ) -> bool {
-    claim.0.is_some() && kept.contains(&(None, claim.1, claim.2))
+    claim.0.is_some()
+        && kept.contains(&(None, claim.1, claim.2))
+        && surface
+            .transit
+            .iter()
+            .flat_map(|transit| transit.points.iter())
+            .any(|base| base.alias == claim.1 && base.listen_path.as_deref() == Some(claim.2))
 }
 
 /// The code of the refusal [`listen_path_problems`] does not decide: a
 /// `listen_path` that is a route another Transit Point already answers on
 /// (`check_listen_path_shadowing`), which needs every surface on the listener
-/// to see. A clash a surface is already stored with is left alone here and
-/// logged by the listener build, since this check has no `Warning` path.
+/// to see. A clash a surface is already stored with is not refused: its save
+/// is answered with a `Warning` of the same text, and the listener build logs it.
 pub(crate) const LISTEN_PATH_ROUTE_CLASH: &str = "listen_path_route_clash";
 
 /// The code for a `listen_path` a variant sets that no route serves: on an
@@ -4635,18 +4643,29 @@ mod tests {
         assert_eq!(kept.len(), 1, "a point with no listen_path claims nothing: {kept:?}");
         assert!(kept.contains(&(None, "outside", "/partner-a-webhook")));
         assert!(
-            inherits_a_kept_base_claim(&(Some("candidate"), "outside", "/partner-a-webhook"), &kept),
+            inherits_a_kept_base_claim(&(Some("candidate"), "outside", "/partner-a-webhook"), &kept, &stored),
             "the same point's path under a variant adds no route: the listener builds the variant's routes from \
              the base point, and a dashboard save writes that inherited copy into every variant, stored or added \
              in this same save"
         );
         assert!(
-            !inherits_a_kept_base_claim(&(Some("candidate"), "elsewhere", "/partner-a-webhook"), &kept),
+            !inherits_a_kept_base_claim(&(Some("candidate"), "elsewhere", "/partner-a-webhook"), &kept, &stored),
             "the same path on another Transit Point is a claim of its own, in a variant as on the base surface"
         );
         assert!(
-            !inherits_a_kept_base_claim(&(Some("candidate"), "outside", "/moved"), &kept),
+            !inherits_a_kept_base_claim(&(Some("candidate"), "outside", "/moved"), &kept, &stored),
             "a variant that changes the path claims a route the base point does not hold"
+        );
+        let moved = surface_with_points(
+            serde_json::json!([
+                { "alias": "outside", "target_endpoint": "https://a.example", "listen_path": "/moved" },
+                { "alias": "derived", "target_endpoint": "https://c.example" }
+            ]),
+            serde_json::json!([]),
+        );
+        assert!(
+            !inherits_a_kept_base_claim(&(Some("candidate"), "outside", "/partner-a-webhook"), &kept, &moved),
+            "where the same save moves the base point's path, the old one is registered nowhere"
         );
         assert!(
             !kept.contains(&(None, "elsewhere", "/partner-a-webhook")),

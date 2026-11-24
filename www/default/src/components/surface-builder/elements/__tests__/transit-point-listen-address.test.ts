@@ -89,3 +89,26 @@ describe('transit-point listen_address validation', () => {
     ).toEqual([]);
   });
 });
+
+describe('transit-point Listen Path typed without a prefix', () => {
+  const incompleteReason = (config: Record<string, unknown>) =>
+    registry.get('transit-point-a2a')?.incompleteReason?.(config as any);
+  const typedWithoutPrefix = {
+    listen_address: 'https://out.example.com',
+    route_prefix: '',
+    route_suffix: 'partner-a',
+  };
+
+  // The panel keeps the stored path while no prefix is picked, so the typed one would
+  // be dropped on save, whatever the point routes to.
+  it('blocks the save on a URL route and on a gateway route alike', () => {
+    for (const target of [
+      { target_endpoint: 'https://upstream.example.com' },
+      { endpoint_type: 'gateway', gateway_id: 'gw-1', target_endpoint: 'fabric://gw-1/surface-1' },
+    ]) {
+      expect(incompleteReason({ ...typedWithoutPrefix, ...target })).toBe(
+        'Pick a surface prefix for the Listen Path'
+      );
+    }
+  });
+});

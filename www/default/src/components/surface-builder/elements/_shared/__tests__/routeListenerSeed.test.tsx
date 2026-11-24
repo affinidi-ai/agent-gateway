@@ -122,6 +122,29 @@ describe('a Transit Point on an outbound address with a hostname of its own', ()
     expect(held.listen_path).toBe('');
   });
 
+  // A cleared path answers at the derived route: reopening the panel must not seed a
+  // random one, nor move the point to the first listener on offer.
+  it('keeps a cleared Listen Path unset, on its own listener, when the panel reopens', async () => {
+    const second = 'https://second.example.net';
+    (fetchRoutingConfig as jest.Mock).mockResolvedValue(
+      routing({
+        available_outbound_listen_addresses: [OWN, second],
+        shared_hostname_outbound_addresses: [],
+      })
+    );
+    const { held, updateFields } = renderTransitPoint({
+      listen_address: second,
+      listen_path: '',
+      route_prefix: '/agents',
+      route_suffix: '',
+    });
+
+    await waitFor(() => expect(screen.getAllByRole('option').length).toBeGreaterThan(1));
+    expect(updateFields).not.toHaveBeenCalled();
+    expect(held.listen_address).toBe(second);
+    expect(held.listen_path).toBe('');
+  });
+
   it('resolves a stored /outbound path, since the save accepts both forms there', async () => {
     renderTransitPoint({
       listen_address: OWN,

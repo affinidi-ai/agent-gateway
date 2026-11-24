@@ -10,6 +10,7 @@ import { CanvasNode, getIncompleteReason } from '../components/surface-builder/S
 import {
   registry,
   validateSurfacePayload,
+  variantListenPathProblem,
   buildCanvasBlob,
 } from '../components/surface-builder/elements';
 import {
@@ -1354,6 +1355,13 @@ const SurfaceDetailPage: React.FC = () => {
         } else {
           payload = activePayload;
         }
+      }
+      // Read on the wire payload, once a base Listen Path edit has been carried into the
+      // variants that held the old path, which the per-view checks above run before.
+      const unservedVariantPath = variantListenPathProblem(payload, surface);
+      if (unservedVariantPath) {
+        showBlockingToast({ message: unservedVariantPath });
+        return;
       }
       payload.surface_id = surfaceId;
       payload.name = name;

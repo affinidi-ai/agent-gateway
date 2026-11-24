@@ -369,13 +369,16 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `/outbound/`) is dropped, both fields being re-derived from the stored route instead. Seeding
   writes a prefix only when the route starts with one that is offered, so a route under none of
   them is left unresolved rather than relabelled, and a brand-new node seeds the first offered
-  prefix with a two-word random path. After a save attempt (`hasAttemptedSave`) an empty prefix and
+  prefix with a two-word random path. A Transit Point that already holds a listen address but no
+  Listen Path is not seeded: its path was cleared, or never set, and it answers at its derived
+  route. After a save attempt (`hasAttemptedSave`) an empty prefix and
   an empty path are each marked invalid, the prefix with "Pick a surface prefix." naming the stored
   route as under none of those offered and the path with "Enter a path."; `validatePath`'s own
   message still wins over the latter. A Transit Point with no Listen Path at all is exempt from
   both marks, since it answers at its derived `/outbound` route. `listenPathProblem` carries the
-  gateway's own two refusals into `validateSurfacePayload`, which blocks the save while a Listen
-  Path claims no segment under a configured surface prefix (either form, with or without
+  gateway's own refusals into `validateSurfacePayload`, which blocks the save while a Listen Path
+  is one the outbound router cannot register (`listenPathFormatProblem`, the gateway's
+  `listen_path_invalid`), claims no segment under a configured surface prefix (either form, with or without
   `/outbound`, since the admin API takes both) or sits outside `/outbound` on a shared-hostname
   address. Checking it against the narrower offered list instead would block a good `/outbound`
   path on an address with a hostname of its own. It runs only on a path the save introduces or
@@ -386,7 +389,13 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   stops answering. A base Transit Point's Listen Path edit is carried into every variant snapshot
   whose copy of that alias held the base's previous path (`propagateBaseListenPaths`), since a
   variant path that differs from its base point's is never served (`listen_path_variant_unserved`
-  on a save that introduces it); a variant whose path already differed keeps it. What the gateway
+  on a save that introduces it); a variant whose path already differed keeps it. The save then
+  reads the wire payload with `variantListenPathProblem`, which blocks a variant path its base
+  point does not hold unless that variant already held it, as the gateway does; it runs after
+  `buildVariantsWireSlice`, since the per-view checks run before the base edit reaches the
+  variants. A path that is a route another Transit Point answers on is still left to the API's
+  `listen_path_route_clash`. A Listen Path typed with no prefix blocks the Transit Point through
+  its `incompleteReason` whatever it routes to, a gateway included. What the gateway
   stores and what it refuses is in
   [`docs/CONFIGURATION_REFERENCE.md`](../../docs/CONFIGURATION_REFERENCE.md#transit-point-listen-paths).
 - **Entry point URL** is the label for an Access Point's composed URL, with "The URL used to

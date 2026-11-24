@@ -195,10 +195,35 @@ export interface TransitPointRoute {
 }
 
 /**
- * What blocks a save of one Transit Point's Listen Path, or `null`. The two refusals the
+ * What is wrong with the shape of a Listen Path the outbound router cannot register as
+ * written, or `null`: the gateway's `listen_path_invalid` refusal, mirroring
+ * `validate_outbound_listen_path_format` in `src/config/types.rs`. A path with no
+ * segment of its own is left to `listenPathProblem`'s prefix check, which names the
+ * prefixes to use instead.
+ */
+export function listenPathFormatProblem(path: string): string | null {
+  if (!path.startsWith('/')) return `Listen Path "${path}" must start with "/".`;
+  const segments = path.split('/');
+  if (segments.some(segment => segment === '..')) {
+    return `Listen Path "${path}" must not contain ".." segments.`;
+  }
+  if (/[{}]/.test(path)) {
+    return `Listen Path "${path}" must not contain "{" or "}": the gateway would read them as a path parameter.`;
+  }
+  const parameter = segments.find(segment => segment.startsWith(':') || segment.startsWith('*'));
+  if (parameter !== undefined) {
+    return `Listen Path "${path}" must not contain a segment starting with ":" or "*" ("${parameter}"): the outbound listener cannot register it.`;
+  }
+  return null;
+}
+
+/**
+ * What blocks a save of one Transit Point's Listen Path, or `null`. The refusals the
  * admin API answers such a save with, in the same order, so the dashboard refuses exactly
  * what the gateway would (`listen_path_problems` in `src/proxy/server.rs`):
  *
+ * - `listen_path_invalid`: a path the outbound router cannot register as written
+ *   (`listenPathFormatProblem`).
  * - `listen_path_not_a_channel_prefix`: the path must sit under one of the configured
  *   surface prefixes, with or without `/outbound` in front, and needs a segment of its own
  *   after it. Both forms are accepted wherever the path is reachable, which is why this is
@@ -220,6 +245,8 @@ export function listenPathProblem(
   if (!routing) return null;
   const composed = typeof point.listen_path === 'string' ? point.listen_path.trim() : '';
   if (!composed) return null;
+  const formatProblem = listenPathFormatProblem(composed);
+  if (formatProblem) return formatProblem;
   const channels = routing.channel_path_prefix ?? [];
   const outbound = outboundChannelPrefixes(routing);
   const every = channels.flatMap((c, idx) => {
