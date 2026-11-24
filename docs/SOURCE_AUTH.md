@@ -217,8 +217,10 @@ carries no proof is forwarded byte for byte. Policy tells these callers apart by
 request body sets the caller there.
 
 A stored surface whose inbound `from_jwt_claim` or `from_api_key` identity has no method of its
-kind, which a save refuses, refuses its callers as earlier releases did (`500`) rather than
-serving them without an identity.
+kind, which a save refuses, refuses its verified callers as earlier releases did (`500`) rather
+than serving them without an identity. A caller whose credential failed is handled as before:
+refused with `401` beside `from_jwt_claim`, and passed to policy with no identity beside
+`from_api_key` on a public Access Point.
 
 **Accepted risk:** a caller of another method is admitted with no identity by any policy that
 does not check it. To keep such callers out, deny the methods that get no identity, for example
@@ -254,8 +256,8 @@ storage ([`fall_back_to_first_source_auth_methods`](../src/surfaces/store.rs)); 
 node, a storage event and a DynamoDB-sourced surface are corrected in memory only. A stored
 `from_jwt_claim` identity on another slot without `jwt_bearer` as its only method, and an
 inbound `from_jwt_claim` or `from_api_key` identity with no method of its kind to read, are
-logged as a warning at startup, which says their callers are refused until the surface is fixed,
-and refused on the next save.
+logged as a warning at startup, which says their verified callers are refused until the surface
+is fixed, and refused on the next save.
 
 Before rolling back to a release that enforces only the first method, remove every method but
 the first. That release strips only the first method's header, so it would forward a later
@@ -978,6 +980,10 @@ claims of the JWT the Transit Point verified (its `source_auth` or `mcp_http.aut
 whichever header carried it. A caller verified another way (API key, mTLS) binds no claims. A
 Transit Point that authenticated no caller reads the `Authorization` header as sent, which the
 gateway has not verified, so give such a Transit Point `source_auth` before binding its claims.
+The Target's Workload Binding on an Access Point (`target.workload_binding`) follows the same
+rule: it binds the claims source authentication verified for a JWT Bearer caller, no claims for
+a caller verified another way or one whose credential failed, and reads the `Authorization`
+header as sent only on an Access Point that authenticates no caller.
 
 The identity hash covers the method, the issuer (the JWT `iss`, the API Key Provider agent,
 a hash of the subject and public key of the CA an mTLS client certificate was verified against), the

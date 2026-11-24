@@ -11,7 +11,7 @@ Feature: Inbound identity derived from the API key a caller presents
     And the operator has created the surface for route "/example"
     When the caller sends a request to the surface with a valid API key
     Then the response status is 200
-    And managed agent "bravo" received the forwarded request with a VP proving the caller Agent DID
+    And managed agent "bravo" received the forwarded request with a VP proving the Agent DID of the presented API key
 
   Scenario: A surface deriving the inbound identity from the API key serves a token caller with no identity, even one it proves
     Given an A2A surface targeting managed agent "bravo"
@@ -22,6 +22,27 @@ Feature: Inbound identity derived from the API key a caller presents
     When the caller sends a request to the surface with a valid token and an identity proof of its own
     Then the response status is 200
     And managed agent "bravo" received the forwarded request with no caller identity
+
+  Scenario: A surface deriving the inbound identity from the API key tells the Target no DID a token caller asserts
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface accepts "JWT Bearer" and "API Key" source authentication
+    And the surface derives the inbound identity from the API key the caller presents
+    And the surface accepts JWT audience "bdd-test-audience"
+    And the surface has a request policy that allows all requests
+    When the caller sends a request to the surface with a valid token and an identity proof of its own
+    Then the response status is 200
+    And managed agent "bravo" received header "x-caller-did" with value "anonymous"
+
+  Scenario: A public Access Point deriving the inbound identity from the API key serves a caller whose key failed with no identity
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface requires "API Key" source authentication
+    And the surface derives the inbound identity from the API key the caller presents
+    And the surface is stored with a public Access Point
+    And the surface has a request policy that allows all requests
+    When the caller sends a request to the surface with an invalid API key and an identity proof of its own
+    Then the response status is 200
+    And managed agent "bravo" received the forwarded request with no caller identity
+    And managed agent "bravo" received header "x-caller-did" with value "anonymous"
 
   Scenario: A surface deriving the inbound identity from the API key without an API key method is refused at save
     Given an A2A surface targeting managed agent "bravo"

@@ -8,14 +8,25 @@ changes:
         An inbound From JWT Claims identity now needs a JWT Bearer Caller Context method, and an
         inbound From API Key identity an API Key or API Key Provider method, instead of every
         method being of that kind. Callers of the method the identity reads get their identity
-        as before. Callers authenticated by another method, and callers whose credential failed
-        on a public Access Point, are served with no inbound identity: none is derived from their
-        credential or taken from their request body, policy input carries no agent DID or
-        trust-registry claims for them, and the identity binding VP and identity credential they
-        put in their request are removed before the Target.
+        as before. Callers authenticated by another method, and, beside a From API Key identity,
+        callers whose credential failed on a public Access Point, are served with no inbound
+        identity: none is derived from their credential or taken from their request body, policy
+        input carries no agent DID or trust-registry claims for them, and the identity binding VP
+        and identity credential they put in their request are removed before the Target.
   fixed: []
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-11-24T16:00:00Z'
+      title: Bind only verified JWT claims into an Access Point Target's Workload Binding
+      description: >-
+        A Target Workload Binding with caller_source authorization_bearer_jwt took the caller
+        claims it signs from the request's Authorization header without verifying it, whichever
+        method verified the caller, so on a surface whose JWT Bearer method reads another header
+        an API key caller could have claims of its choosing signed into the gateway's
+        presentation. It now binds the claims source authentication verified for a JWT Bearer
+        caller, none for a caller verified another way or whose credential failed, and reads the
+        Authorization header only on an Access Point that authenticates no caller, as a Transit
+        Point already did.
   breaking:
     - timestamp: '2026-11-24T14:00:00Z'
       title: Serve other methods' callers of a stored mixed surface without an identity
@@ -23,9 +34,11 @@ changes:
         A stored surface whose inbound From JWT Claims or From API Key identity sits beside a
         Caller Context method of another kind refused that method's callers with 500. It now
         forwards them to policy and the Target with no identity, and logs no startup warning.
-        Before upgrading, find such surfaces through
+        Before upgrading, list such surfaces from the startup warnings of the release being
+        upgraded from ("callers that authenticate with another method are refused until the
+        surface is fixed"), which name every one whatever its traffic, or from
         agent_gateway_managed_identity_resolve_total with mode="from_api_key" and
-        result="api_key_unavailable", or a 500 for callers of the other method on a From JWT
-        Claims surface, and deny input.source_auth.method in surface policy if those callers must
-        stay out. A stored surface with no method of its identity's kind still refuses its
-        callers.
+        result="api_key_unavailable", or mode="from_jwt_claim" and
+        result="jwt_claims_unavailable", which name those that had traffic from the other method.
+        Deny input.source_auth.method in surface policy if those callers must stay out. A stored
+        surface with no method of its identity's kind still refuses its verified callers.

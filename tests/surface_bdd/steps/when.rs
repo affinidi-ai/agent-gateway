@@ -2746,8 +2746,9 @@ async fn request_with_valid_api_key(world: &mut SurfaceWorld) {
 const AGENT_IDENTITY_BINDING_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity-binding/v1";
 const TRUST_REGISTRY_EXTENSION_URI: &str = "https://fabric.affinidi.io/extensions/trust-registry";
 
-/// `body`, an A2A message, carrying the caller's own identity proofs: an
-/// identity binding VP and an identity credential naming a DID it asserts.
+/// `body`, an A2A message, carrying the caller's own identity proofs (an
+/// identity binding VP and an identity credential naming a DID it asserts) and
+/// a trust-registry `agent_did` asserting the same DID.
 fn with_caller_identity_proof(mut body: serde_json::Value) -> serde_json::Value {
     let message = body
         .pointer_mut("/params/message")
@@ -2761,7 +2762,8 @@ fn with_caller_identity_proof(mut body: serde_json::Value) -> serde_json::Value 
         "metadata".to_string(),
         serde_json::json!({
             AGENT_IDENTITY_BINDING_URI: {"verifiablePresentation": "caller-made-presentation"},
-            AGENT_IDENTITY_CREDENTIAL_URI: {"did": "did:web:asserted.example", "verifiablePresentation": "caller-made-presentation"}
+            AGENT_IDENTITY_CREDENTIAL_URI: {"did": "did:web:asserted.example", "verifiablePresentation": "caller-made-presentation"},
+            TRUST_REGISTRY_EXTENSION_URI: {"agent_did": "did:web:asserted.example"}
         }),
     );
     body
@@ -2792,6 +2794,13 @@ async fn caller_asks_mcp_surface_with_valid_api_key_and_own_identity_proof(world
 #[when("the caller sends a request to the surface with a valid API key and an identity proof of its own")]
 async fn request_with_valid_api_key_and_own_identity_proof(world: &mut SurfaceWorld) {
     let header = build_valid_api_key_source_auth_header(world);
+    let body = with_caller_identity_proof(build_request_body(&world.surface_config.protocol));
+    send_json_request_and_record(world, body, vec![header]).await;
+}
+
+#[when("the caller sends a request to the surface with an invalid API key and an identity proof of its own")]
+async fn request_with_invalid_api_key_and_own_identity_proof(world: &mut SurfaceWorld) {
+    let header = build_api_key_source_auth_header(world, "bdd-invalid-api-key".to_string());
     let body = with_caller_identity_proof(build_request_body(&world.surface_config.protocol));
     send_json_request_and_record(world, body, vec![header]).await;
 }

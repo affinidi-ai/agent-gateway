@@ -48,7 +48,7 @@ Feature: Inbound identity derived from a JWT claim
     And the operator has created the surface for route "/example"
     When the caller sends a request to the surface with a valid token
     Then the response status is 200
-    And managed agent "bravo" received the forwarded request with a VP proving the caller Agent DID
+    And managed agent "bravo" received the forwarded request with a VP proving the Agent DID of the token's subject
 
   Scenario: A surface deriving the inbound identity from a JWT claim gives a token caller beside an API key method its identity
     Given an A2A surface targeting managed agent "bravo"
@@ -58,7 +58,7 @@ Feature: Inbound identity derived from a JWT claim
     And the operator has created the surface for route "/example"
     When the caller sends a request to the surface with a valid token
     Then the response status is 200
-    And managed agent "bravo" received the forwarded request with a VP proving the caller Agent DID
+    And managed agent "bravo" received the forwarded request with a VP proving the Agent DID of the token's subject
 
   Scenario: A surface deriving the inbound identity from a JWT claim serves an API key caller with no identity, even one it proves
     Given an A2A surface targeting managed agent "bravo"

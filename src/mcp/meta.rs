@@ -359,24 +359,32 @@ pub fn metadata_mut(
         .ok_or(McpMetadataError::InvalidObject("_meta"))
 }
 
+/// Remove `key`, and its historical or canonical alias, from every MCP `_meta`
+/// object of `body`; whether any was there.
 pub fn remove_metadata_key(
     body: &mut Value,
     key: &str,
-) {
+) -> bool {
+    let mut removed = false;
     for path in ["/_meta", "/params/_meta", "/result/_meta"] {
         if let Some(metadata) = body
             .pointer_mut(path)
             .and_then(Value::as_object_mut)
         {
-            metadata.remove(key);
+            removed |= metadata.remove(key).is_some();
             for (historical, canonical) in MCP_METADATA_ALIASES {
                 if key == *historical || key == *canonical {
-                    metadata.remove(*historical);
-                    metadata.remove(*canonical);
+                    removed |= metadata
+                        .remove(*historical)
+                        .is_some();
+                    removed |= metadata
+                        .remove(*canonical)
+                        .is_some();
                 }
             }
         }
     }
+    removed
 }
 
 pub fn validate_raw_identity_key(
@@ -477,6 +485,15 @@ pub fn validate_custom_metadata(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn removing_a_metadata_key_says_whether_it_was_there() {
+        let mut body = serde_json::json!({"params": {"_meta": {"kept": 1, "gone": 2}}});
+
+        assert!(remove_metadata_key(&mut body, "gone"));
+        assert!(!remove_metadata_key(&mut body, "gone"));
+        assert_eq!(body, serde_json::json!({"params": {"_meta": {"kept": 1}}}));
+    }
+
     #[test]
     fn metadata_free_legacy_payloads_remain_byte_for_byte_unchanged() {
         for raw in [r#"{ "jsonrpc": "2.0", "id": 1, "result": "ok" }"#, r#"{"method":"tools/list"}"#] {

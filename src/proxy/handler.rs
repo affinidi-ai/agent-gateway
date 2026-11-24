@@ -2848,10 +2848,12 @@ async fn proxy_charged_request(
     })?;
     // A caller verified by a method the inbound identity does not read (an API
     // key beside `from_jwt_claim`, a token beside `from_api_key`) gets no
-    // inbound identity: none its request body asserts or proves either.
+    // inbound identity: none its request body asserts or proves either. An MCP
+    // POST loses its proofs once admitted, so admission reads the bytes sent.
     let caller_identified =
         caller_gets_inbound_identity(&state.surface, authenticated_identity.as_ref(), source_auth_failed);
-    if !caller_identified {
+    let mcp_admits_the_body = mcp_http.is_some() && method == Method::POST;
+    if !caller_identified && !mcp_admits_the_body {
         body_bytes = strip_caller_identity_proofs(
             &body_bytes,
             &state
@@ -2905,6 +2907,14 @@ async fn proxy_charged_request(
                     .decrement()
                     .await;
                 return Ok(refusal.into_response_for(&classification, &body_bytes));
+            }
+            if !caller_identified {
+                body_bytes = strip_caller_identity_proofs(
+                    &body_bytes,
+                    &state
+                        .surface
+                        .channel_protocol(),
+                );
             }
             let mcp_metadata_context = crate::mcp::meta::McpMetadataContext::from_classification(
                 &classification,
@@ -5789,7 +5799,7 @@ async fn proxy_charged_request(
                 {
                     let body_json: Option<serde_json::Value> = serde_json::from_slice(&body_bytes).ok();
                     let agent_ctx = crate::policies::build_agent_context(
-                        body_json.as_ref(),
+                        claims_of_the_body(caller_identified, body_json.as_ref()),
                         Some(&card_json),
                         state
                             .trust_registry_listener_manager
@@ -10851,6 +10861,16 @@ fn bind_api_key_caller_did(
     }
 }
 
+/// The request body as a source of the DIDs and trust-registry claims beside
+/// an agent card: none for a caller that gets no inbound identity, so a card
+/// without a DID never falls back to one the caller asserts.
+fn claims_of_the_body(
+    caller_identified: bool,
+    body: Option<&serde_json::Value>,
+) -> Option<&serde_json::Value> {
+    body.filter(|_| caller_identified)
+}
+
 /// Reaching this means no credential was verified on a `from_jwt_claim`
 /// surface that serves the caller anyway, such as a stored surface without
 /// caller authentication: a caller verified by another method gets no identity
@@ -11855,7 +11875,7 @@ async fn handle_fabric_request_inner(
 
         let agent_ctx = if fabric_card_json.is_some() {
             let agent_ctx = crate::policies::build_agent_context(
-                body_ref,
+                claims_of_the_body(caller_identified, body_ref),
                 fabric_card_json.as_ref(),
                 state
                     .trust_registry_listener_manager
@@ -16688,11 +16708,9 @@ fn strip_caller_identity_proofs(
 
 /// Remove the caller identity proofs from an MCP request's `_meta`; whether any was there.
 fn remove_mcp_identity_proofs(request: &mut serde_json::Value) -> bool {
-    let before = request.clone();
-    for key in CALLER_IDENTITY_PROOFS {
-        crate::mcp::meta::remove_metadata_key(request, key);
-    }
-    *request != before
+    CALLER_IDENTITY_PROOFS
+        .iter()
+        .fold(false, |removed, key| crate::mcp::meta::remove_metadata_key(request, key) | removed)
 }
 
 /// Remove the caller identity proofs from an A2A or AP2 message's `metadata`;
@@ -16806,8 +16824,11 @@ fn inject_identity_binding_vp_into_request(
 /// Build the request-leg `workloadBinding` credential-subject for the MA→EXT
 /// VP. Only produced when the primary target configures an enabled Workload
 /// Binding element: the configurable subject binds the managed-agent identity to
-/// caller context captured from the inbound `Authorization` bearer JWT (no
-/// transit token on this leg), plus the resolved `delegationAction`. Returns
+/// caller context, plus the resolved `delegationAction`. A bearer JWT source
+/// reads the claims source authentication verified for a JWT Bearer caller,
+/// nothing for a caller of another method or one whose credential failed, and
+/// the raw `Authorization` header only on a surface that authenticates no
+/// caller, as a Transit Point does. Returns
 /// `None` when no WB element is configured, so the VP keeps the flat
 /// `identityFields` credential-subject shape. Shared by the direct
 /// (`proxy_handler_with_mcp_runtime`) and `fabric://` (`handle_fabric_request`) request
@@ -16821,14 +16842,29 @@ fn build_target_request_workload_binding(
     authenticated_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
 ) -> Option<serde_json::Value> {
     let cfg = surface.target_workload_binding()?;
-    let captured = match cfg.caller_source {
-        crate::config::types::CallerContextSource::AuthorizationBearerJwt
-        | crate::config::types::CallerContextSource::TransitToken => headers
+    let unverified_bearer = || {
+        headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|auth| {
                 crate::proxy::workload_binding::capture_from_bearer_jwt(auth, &cfg.caller_context_fields).ok()
-            }),
+            })
+    };
+    let captured = match cfg.caller_source {
+        crate::config::types::CallerContextSource::AuthorizationBearerJwt => match authenticated_identity {
+            Some(crate::source_auth::AuthenticatedIdentity::JwtBearer { claims, .. }) => {
+                crate::proxy::workload_binding::capture_from_verified_claims(claims, &cfg.caller_context_fields).ok()
+            }
+            Some(_) => None,
+            None if surface
+                .source_auth_methods()
+                .is_empty() =>
+            {
+                unverified_bearer()
+            }
+            None => None,
+        },
+        crate::config::types::CallerContextSource::TransitToken => unverified_bearer(),
         crate::config::types::CallerContextSource::Did => authenticated_identity.and_then(|id| {
             crate::proxy::workload_binding::capture_from_did(
                 id,
@@ -23195,6 +23231,101 @@ allow if {
         .unwrap()
     }
 
+    mod target_workload_binding {
+        use serde_json::json;
+
+        fn surface(methods: serde_json::Value) -> crate::config::agent_surface::AgentSurface {
+            serde_json::from_value(json!({
+                "surface_id": "bound", "name": "Bound",
+                "access_point": {
+                    "listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a",
+                    "caller_authentication": {"methods": methods}
+                },
+                "target": {
+                    "endpoint": "https://agent.example/a2a",
+                    "workload_binding": {"enabled": true, "caller_source": "authorization_bearer_jwt", "caller_context_fields": ["tid"]}
+                }
+            }))
+            .unwrap()
+        }
+
+        fn jwt_and_api_key() -> serde_json::Value {
+            json!([
+                {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": ["aud"],
+                 "extraction": {"source": "http_header", "field": "X-User-Token"}},
+                {"type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "keys"}
+            ])
+        }
+
+        /// The Workload Binding subject built for `caller` beside an
+        /// `Authorization` header nothing verified, whose `tid` is `forged`.
+        fn binding_for(
+            surface: &crate::config::agent_surface::AgentSurface,
+            caller: Option<&crate::source_auth::AuthenticatedIdentity>,
+        ) -> String {
+            use base64::Engine as _;
+            let b64 = |value: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value);
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {}.{}.sig", b64(br#"{"alg":"none"}"#), b64(br#"{"tid":"forged"}"#))
+                    .parse()
+                    .unwrap(),
+            );
+            super::super::build_target_request_workload_binding(
+                surface,
+                &headers,
+                &std::collections::HashMap::new(),
+                "trace-1",
+                None,
+                caller,
+            )
+            .expect("an enabled Workload Binding builds a subject")
+            .to_string()
+        }
+
+        #[test]
+        fn a_jwt_caller_is_bound_by_the_claims_source_authentication_verified() {
+            let caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+                strategy_id: None,
+                principal_claim: "sub".to_string(),
+                subject: "alice".to_string(),
+                claims: json!({"iss": "https://idp.example", "sub": "alice", "tid": "contoso"}),
+                verification: Default::default(),
+            };
+
+            let binding = binding_for(&surface(jwt_and_api_key()), Some(&caller));
+
+            assert!(binding.contains("contoso"), "{binding}");
+            assert!(!binding.contains("forged"), "{binding}");
+        }
+
+        #[test]
+        fn a_caller_of_another_method_or_whose_credential_failed_binds_no_unverified_claims() {
+            let api_key_caller = crate::source_auth::AuthenticatedIdentity::ApiKey {
+                key_name: "keys".to_string(),
+                provider_agent_id: None,
+            };
+
+            for caller in [Some(&api_key_caller), None] {
+                let binding = binding_for(&surface(jwt_and_api_key()), caller);
+                assert!(!binding.contains("forged"), "{binding}");
+            }
+        }
+
+        #[test]
+        fn a_surface_that_authenticates_no_caller_binds_the_authorization_header() {
+            let mut surface = surface(jwt_and_api_key());
+            surface
+                .access_point
+                .caller_authentication = None;
+
+            let binding = binding_for(&surface, None);
+
+            assert!(binding.contains("forged"), "{binding}");
+        }
+    }
+
     mod presented_api_key_identity {
         use super::{bare_proxy_state, mcp_surface};
         use crate::identity::IdentityOrigin;
@@ -23858,6 +23989,34 @@ allow if {
 
             assert_eq!(agent.did, None);
             assert_eq!(agent.provider_did, None);
+        }
+
+        #[tokio::test]
+        async fn a_card_without_a_did_takes_none_from_a_caller_that_gets_no_inbound_identity() {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "message/send",
+                "params": {"message": {"role": "user", "messageId": "m1", "parts": [{"kind": "text", "text": "hi"}],
+                    "metadata": {crate::config::TRUST_REGISTRY_EXTENSION: {"agent_did": "did:web:asserted.example"}}}}
+            });
+            let card = serde_json::json!({"name": "remote", "capabilities": {"extensions": []}});
+
+            let unidentified = crate::policies::build_agent_context(
+                super::super::claims_of_the_body(false, Some(&body)),
+                Some(&card),
+                None,
+                true,
+            )
+            .await;
+            let identified = crate::policies::build_agent_context(
+                super::super::claims_of_the_body(true, Some(&body)),
+                Some(&card),
+                None,
+                true,
+            )
+            .await;
+
+            assert_eq!(unidentified.did, None);
+            assert_eq!(identified.did.as_deref(), Some("did:web:asserted.example"));
         }
 
         #[test]

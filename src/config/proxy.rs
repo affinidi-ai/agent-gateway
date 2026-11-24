@@ -417,7 +417,7 @@ fn validate_source_auth_surface(surface: &crate::config::agent_surface::AgentSur
     {
         warn!(
             "Channel '{}': inbound identity from_api_key needs an api_key or api_key_provider source authentication \
-             method; its callers are refused until the surface is fixed, and the next save refuses it",
+             method; its verified callers are refused until the surface is fixed, and the next save refuses it",
             surface.name
         );
     }
