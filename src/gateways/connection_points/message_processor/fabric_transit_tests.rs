@@ -30,6 +30,8 @@ pub(super) const PEER_CONNECTION_POINT_DID: &str = "did:web:peer.example";
 pub(super) const PEER_ISSUER_DID: &str = "did:web:partner.example";
 pub(super) const SURFACE_ID: &str = "fabric-transit";
 pub(super) const CALLER_KEY: &str = "peer-target-auth-key";
+/// The trace id the peer names in [`forward_request`], in its written form.
+pub(super) const PEER_TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
 
 /// Runs the calling test again in a child process, where the process-wide
 /// stores this path reads are unset until the test sets them. Returns `true`
@@ -208,7 +210,7 @@ pub(super) fn forward_request(
         None,
         Some(crate::gateways::connection_points::envelope_replay::now_secs() + 60),
         json!({ "channel_id": SURFACE_ID, "method": "POST", "path": "/rpc", "headers": headers, "body": body,
-            "trace_id": "trace-from-the-peer" }),
+            "trace_id": PEER_TRACE_ID }),
         MessageMetadata {
             encrypted: true,
             authenticated: true,
@@ -219,17 +221,12 @@ pub(super) fn forward_request(
     .with_context("agent_surface_storage_path", json!(root.join("agent_surfaces")))
 }
 
-/// The forward-response for `message`, served as the listener serves a
-/// forward-request: in the trace the peer named.
+/// The forward-response for `message`, dispatched as the listener dispatches a
+/// forward-request.
 pub(super) async fn forward_response(message: &ReceivedMessage) -> Value {
-    let trace_id = message.message_body["trace_id"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        crate::observability::policy_audit::REQUEST_TRACE_ID
-            .scope(trace_id, Box::pin(super::process_forward_request(message))),
+        Box::pin(super::process_message_internal(message, &MessageType::ForwardRequest)),
     )
     .await
     .expect("Fabric receive timed out");
@@ -380,8 +377,8 @@ async fn a_fabric_request_reaches_the_agent_with_one_transit_token_issued_for_it
             Some("fabric-asserted"),
             "{case}"
         );
-        assert_eq!(claims.trace_id.as_deref(), Some("trace-from-the-peer"), "{case}");
-        assert_eq!(header_values(&received, "x-gateway-trace-id"), ["trace-from-the-peer"], "{case}");
+        assert_eq!(claims.trace_id.as_deref(), Some(PEER_TRACE_ID), "{case}");
+        assert_eq!(header_values(&received, "x-gateway-trace-id"), [PEER_TRACE_ID], "{case}");
         assert_eq!(claims.exp - claims.iat, 300, "{case}: the surface's lifetime");
     }
 
@@ -421,11 +418,11 @@ async fn a_fabric_request_reaches_the_agent_with_one_transit_token_issued_for_it
     );
 }
 
-/// A Fabric receive continues the trace id the peer sent, whatever its form:
-/// the agent receives it, and every record of the request carries it, for a
-/// request the surface serves and for one it refuses.
+/// A Fabric receive continues the trace id the peer sent: the agent receives
+/// it, and every record of the request carries it, for a request the surface
+/// serves and for one it refuses.
 #[tokio::test]
-async fn a_fabric_receive_continues_any_trace_id_it_is_sent() {
+async fn a_fabric_receive_continues_the_trace_id_it_is_sent() {
     if ran_in_child("ATG_FABRIC_RECEIVE_TRACE_CHILD").await {
         return;
     }
@@ -443,14 +440,14 @@ async fn a_fabric_receive_continues_any_trace_id_it_is_sent() {
         .await;
         assert_eq!(response["status"], status, "{response}");
         for event in &events {
-            assert_eq!(event.trace_id.as_deref(), Some("trace-from-the-peer"), "{event:?}");
+            assert_eq!(event.trace_id.as_deref(), Some(PEER_TRACE_ID), "{event:?}");
         }
         recorded += events.len();
     }
     assert!(recorded > 0, "the receive wrote no record");
     let received = target.received();
     assert_eq!(received.len(), 1, "only the served request reaches the agent");
-    assert_eq!(header_values(&received[0], "x-gateway-trace-id"), ["trace-from-the-peer"]);
+    assert_eq!(header_values(&received[0], "x-gateway-trace-id"), [PEER_TRACE_ID]);
 }
 
 /// A request past the hop limit is refused with `508`, and one whose hop
@@ -499,7 +496,7 @@ async fn a_fabric_request_past_the_hop_limit_or_with_a_malformed_count_is_refuse
         assert!(
             events
                 .iter()
-                .all(|event| event.via_fabric && event.trace_id.as_deref() == Some("trace-from-the-peer")),
+                .all(|event| event.via_fabric && event.trace_id.as_deref() == Some(PEER_TRACE_ID)),
             "{hops}"
         );
         assert!(
@@ -618,7 +615,7 @@ async fn a_framed_stream_past_the_hop_limit_or_with_a_malformed_count_is_refused
         let (result, events) = crate::audit::producer::capture(tokio::time::timeout(
             Duration::from_secs(10),
             crate::observability::policy_audit::REQUEST_TRACE_ID.scope(
-                "trace-from-the-peer".to_string(),
+                PEER_TRACE_ID.to_string(),
                 Box::pin(super::process_forward_request_with_mcp_runtime(
                     &message,
                     Some(super::FabricStreamRequest {
@@ -663,7 +660,7 @@ async fn a_framed_stream_past_the_hop_limit_or_with_a_malformed_count_is_refused
             .collect();
         assert_eq!(
             rejected,
-            [(RejectionStage::Routing, reason, None, Some("trace-from-the-peer".to_string()), None)],
+            [(RejectionStage::Routing, reason, None, Some(PEER_TRACE_ID.to_string()), None)],
             "{hops}: no HTTP status on Fabric, and no variant before one is resolved"
         );
     }
@@ -784,8 +781,8 @@ async fn a_modern_mcp_stream_continues_the_trace_the_peer_named() {
     let claims = test_issuer()
         .validate_for_transit_point(tokens[0], SURFACE_ID, "crm", 300)
         .unwrap();
-    assert_eq!(claims.trace_id.as_deref(), Some("trace-from-the-peer"));
-    assert_eq!(header_values(&received[0], "x-gateway-trace-id"), ["trace-from-the-peer"]);
+    assert_eq!(claims.trace_id.as_deref(), Some(PEER_TRACE_ID));
+    assert_eq!(header_values(&received[0], "x-gateway-trace-id"), [PEER_TRACE_ID]);
 }
 
 fn caller(
@@ -1227,7 +1224,7 @@ async fn a_refused_partner_delegation_is_recorded_and_answers_mcp_with_a_json_rp
     let facts = crate::audit::request_events::RequestFacts {
         surface_id: &surface.surface_id,
         channel_name: &surface.name,
-        trace_id: Some("trace-from-the-peer"),
+        trace_id: Some(PEER_TRACE_ID),
         via_fabric: true,
     };
     let request = serde_json::to_vec(
@@ -1284,7 +1281,7 @@ async fn a_refused_partner_delegation_is_recorded_and_answers_mcp_with_a_json_rp
                 .collect();
             assert_eq!(
                 rejected,
-                [(RejectionStage::Admission, recorded, true, Some("trace-from-the-peer".to_string()))],
+                [(RejectionStage::Admission, recorded, true, Some(PEER_TRACE_ID.to_string()))],
                 "{reason} mcp={mcp}"
             );
         }
@@ -1573,7 +1570,7 @@ fn a_fabric_token_names_every_transit_point_of_the_surface() {
 async fn a_fabric_request_is_refused_when_its_transit_token_cannot_be_issued() {
     let surface = surface("a2a", "https://agent.example", &["crm"]);
     let (result, events) = crate::audit::producer::capture(async {
-        transit_token_unavailable_refusal(&surface, Some("trace-from-the-peer"))
+        transit_token_unavailable_refusal(&surface, Some(PEER_TRACE_ID))
     })
     .await;
     let ProcessingResult::RequiresResponse { response_body, .. } = result else {
@@ -1595,7 +1592,7 @@ async fn a_fabric_request_is_refused_when_its_transit_token_cannot_be_issued() {
             RejectionStage::Forward,
             RejectionReason::TransitTokenUnavailable,
             true,
-            Some("trace-from-the-peer".to_string())
+            Some(PEER_TRACE_ID.to_string())
         )]
     );
 }
