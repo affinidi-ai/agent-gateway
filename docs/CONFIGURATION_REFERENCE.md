@@ -610,6 +610,12 @@ keys set to `null` are not reported. Only key names are logged, each cut to 64 c
 startup continues.
 `idp_metadata_url` and `graph_api.note` are ignored and not reported.
 
+The page the ACS (`/saml/acs`) returns after a successful sign-in hands the session token to the
+dashboard from one inline script. It writes the token and the return target as JSON string
+literals with `<`, `>`, `&`, U+2028 and U+2029 escaped, and is served with a per-response
+nonce `Content-Security-Policy: default-src 'none'; script-src 'nonce-…'; base-uri 'none';
+form-action 'none'; frame-ancestors 'none'`.
+
 ## `x402.json`
 
 `x402.json` configures payment networks, assets, and facilitator behaviour for the x402
