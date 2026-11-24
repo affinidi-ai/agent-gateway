@@ -625,21 +625,31 @@ pub(crate) fn garble(
     dir: &Path,
     seq: u64,
 ) {
+    rewrite_line(dir, seq, |_| "{\"seq\":garbled".to_string());
+}
+
+/// Replaces the journal line holding `seq` with what `rewrite` makes of it.
+#[cfg(test)]
+pub(crate) fn rewrite_line(
+    dir: &Path,
+    seq: u64,
+    rewrite: impl Fn(&str) -> String,
+) {
     for path in segment_paths(dir).unwrap() {
         let content = fs::read_to_string(&path).unwrap();
-        let mut garbled = false;
+        let mut rewritten = false;
         let lines: Vec<String> = content
             .lines()
             .map(|line| {
                 if JournalEntry::parse(line.as_bytes()).is_some_and(|entry| entry.seq == seq) {
-                    garbled = true;
-                    "{\"seq\":garbled".to_string()
+                    rewritten = true;
+                    rewrite(line)
                 } else {
                     line.to_string()
                 }
             })
             .collect();
-        if garbled {
+        if rewritten {
             fs::write(&path, lines.join("\n") + "\n").unwrap();
             return;
         }

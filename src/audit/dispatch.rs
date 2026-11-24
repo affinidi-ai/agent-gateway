@@ -1003,6 +1003,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_record_with_no_time_is_skipped_counted_and_the_reader_carries_on() {
+        let sink_id = SinkId::Integration("timeless-mid-batch".to_string());
+        let mut f = Fixture::new();
+        f.cursors
+            .set(&sink_id, 0)
+            .unwrap();
+        let addressed = std::slice::from_ref(&sink_id);
+        f.append(&[addressed, addressed, addressed]);
+        crate::audit::cursors::rewrite_line(f.dir.path(), 2, |line| {
+            let mut entry: serde_json::Value = serde_json::from_str(line).unwrap();
+            let record = entry["record"]
+                .as_object_mut()
+                .unwrap();
+            assert!(
+                record
+                    .remove("occurred_at")
+                    .is_some(),
+                "the record had a time: {line}"
+            );
+            assert!(!record.contains_key("timestamp"), "{line}");
+            entry.to_string()
+        });
+        let before = corrupt_skips(&sink_id);
+
+        let sink = RecordingSink::default();
+        let reader = f.spawn(sink_id.clone(), sink.clone());
+        wait_until(|| f.cursors.get(&sink_id) == Some(3)).await;
+
+        assert_eq!(*sink.delivered.lock(), vec![1, 3]);
+        assert_eq!(corrupt_skips(&sink_id), before + 1);
+        reader.abort();
+    }
+
+    #[tokio::test]
     async fn a_garbled_line_in_the_newest_segment_does_not_stall_the_reader() {
         let sink_id = SinkId::Integration("garbled-newest".to_string());
         let mut f = Fixture::with_segment_bytes(1);
