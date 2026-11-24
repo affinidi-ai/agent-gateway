@@ -139,6 +139,27 @@ describe('validateSurfacePayload', () => {
       expect(hasBlockingIssues(issues)).toBe(false);
     });
 
+    it('judges nothing on a disabled surface, which registers no route', () => {
+      const disabled = { ...surface(refused), status: 'disabled' };
+      const issues = validateSurfacePayload(disabled, { stored: surface(), routing });
+      expect(issues.find(i => i.path?.endsWith('listen_path'))).toBeUndefined();
+      expect(hasBlockingIssues(issues)).toBe(false);
+    });
+
+    it('judges a draft being enabled, whose paths the gateway then claims', () => {
+      const storedDisabled = { ...surface(refused), status: 'disabled' };
+      const issues = validateSurfacePayload(
+        { ...surface(refused), status: 'active' },
+        {
+          stored: storedDisabled,
+          routing,
+        }
+      );
+      expect(issues.find(i => i.path?.endsWith('listen_path'))).toMatchObject({
+        severity: 'error',
+      });
+    });
+
     it('judges nothing while the routing config has not loaded', () => {
       const issues = validateSurfacePayload(surface(refused), { stored: surface(), routing: null });
       expect(issues.find(i => i.path?.endsWith('listen_path'))).toBeUndefined();

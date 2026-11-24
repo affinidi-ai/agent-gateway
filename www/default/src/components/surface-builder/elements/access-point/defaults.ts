@@ -48,7 +48,7 @@ export const OUTBOUND_PREFIX = '/outbound';
  *
  * The result is used to:
  * - Label shared addresses in the TP "Listen Address" dropdown.
- * - Show the `/outbound/` channel-prefix options only for shared selections.
+ * - Narrow the channel-prefix options to the `/outbound/` forms on a shared selection.
  */
 export function computeSharedOutboundAddresses(config: RoutingConfig): Set<string> {
   const outbound = config.available_outbound_listen_addresses ?? [];
@@ -227,10 +227,10 @@ export function listenPathProblem(
     return [plain, outbound[idx]?.prefix ?? `${OUTBOUND_PREFIX}${plain}`].filter(Boolean);
   });
   const offered = every.map(p => `${p}/`).join(', ') || 'this gateway configures none';
-  // Every prefix, not the first that matches, and read as the listener registers
-  // the path: this mirrors `claims_a_channel_prefix`, so `/agents/team` listed
-  // before `/agents` no longer blocks a path the gateway accepts, and a path whose
-  // only remainder is slashes is refused here as it is there.
+  // Matched against every prefix, and read as the listener registers the path,
+  // which is what `claims_a_channel_prefix` does: a nested prefix listed first
+  // claims no path its own segments do not cover, and a path whose only
+  // remainder is slashes claims the bare prefix.
   const registered = composed.replace(/\/+$/, '');
   const match = every.find(
     p => registered.startsWith(`${p}/`) && registered.slice(p.length).replace(/\//g, '') !== ''

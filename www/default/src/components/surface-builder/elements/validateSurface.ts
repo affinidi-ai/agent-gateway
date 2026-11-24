@@ -226,9 +226,12 @@ export function validateSurfacePayload(
   // only when this save introduces or changes it. That is what the admin API refuses:
   // the same point keeping the same path is exempt, so a surface stored with such a
   // path stays editable and its save is answered with a `Warning` header instead.
-  // Variant overrides are left to the gateway's own refusal.
+  // A disabled surface registers no route, so it claims no path and the gateway
+  // returns before reading one; saving one is never blocked here either. This
+  // reads the surface's own points; a variant's overrides, and a path that is
+  // another surface's route, are refused by the gateway.
   const routing = options.routing === undefined ? getCachedRoutingConfig() : options.routing;
-  if (routing) {
+  if (routing && text(payload?.status) !== 'disabled') {
     tps.forEach((tp, idx) => {
       const path = text(tp?.listen_path);
       if (!path) return;

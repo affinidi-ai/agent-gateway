@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import RouteListenerSection from '../RouteListenerSection';
 import { fetchRoutingConfig, type RoutingConfig } from '../../access-point/defaults';
@@ -102,6 +102,26 @@ describe('a Transit Point on an outbound address with a hostname of its own', ()
     await waitFor(() => expect(updateFields).toHaveBeenCalled());
     expect(held.listen_address).toBe(OWN);
     expect(held.route_prefix).toBe('/agents');
+  });
+
+  // Clearing the path is how the dashboard asks for the derived route, and both
+  // refusals tell the operator to do it, so the empty value has to be written.
+  it('clears the stored listen_path when Custom Path is emptied', async () => {
+    const { held, updateFields } = renderTransitPoint({
+      listen_address: OWN,
+      listen_path: '/agents/partner-a',
+      route_prefix: '/agents',
+      route_suffix: 'partner-a',
+    });
+
+    // Wait for the routing config, so the field is the one the loaded section renders.
+    await waitFor(() => expect(screen.getAllByRole('option').length).toBeGreaterThan(1));
+    await act(async () => {
+      fireEvent.change(screen.getByPlaceholderText('my-agent/v1'), { target: { value: '' } });
+    });
+
+    expect(updateFields).toHaveBeenCalledWith(expect.objectContaining({ listen_path: '' }));
+    expect(held.listen_path).toBe('');
   });
 
   it('resolves a stored /outbound path, since the save accepts both forms there', async () => {

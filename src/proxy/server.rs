@@ -888,43 +888,47 @@ pub(crate) fn kept_listen_path_claims(
     let Some(stored) = stored else {
         return std::collections::HashSet::new();
     };
-    let mut claims: std::collections::HashSet<ListenPathClaim<'_>> = transit_points_with_variant(stored)
+    let claims: std::collections::HashSet<ListenPathClaim<'_>> = transit_points_with_variant(stored)
         .filter_map(|(variant, point)| Some((variant, point.alias.as_str(), point.listen_path.as_deref()?)))
         .collect();
-    // A variant that overrides no Transit Point of its own answers at the base
-    // surface's, and a dashboard save writes that inherited copy into the
-    // variant's `overrides.transit.points`. The copy registers no route the
-    // base point did not, so it keeps the base claim rather than introducing
-    // one: without this, saving an unrelated field on a surface holding a path
-    // from before these rules is refused for a path nobody touched.
-    let base: Vec<(&str, &str)> = stored
-        .transit
-        .iter()
-        .flat_map(|transit| transit.points.iter())
-        .filter_map(|point| Some((point.alias.as_str(), point.listen_path.as_deref()?)))
-        .collect();
-    for variant in &stored.variants {
-        for (alias, path) in &base {
-            claims.insert((Some(variant.alias.as_str()), alias, path));
-        }
-    }
     claims
 }
 
-/// The codes that tell the four cases of [`listen_path_problems`] apart. The
-/// admin API refuses a save that introduces one of the first three; the last
-/// is a `Warning` on a save it stores.
-/// The code of the fifth refusal, which [`listen_path_problems`] does not
-/// decide: a `listen_path` that is a route another Transit Point already
-/// answers on (`check_listen_path_shadowing`), which needs every surface on
-/// the listener to see.
+/// Whether `claim` is a variant's copy of a base point's path that `kept`
+/// already holds, so it introduces nothing.
+///
+/// The outbound listener builds a variant's routes from the base surface's
+/// Transit Point and its path, so a variant that repeats that path registers no
+/// route the base point did not. A dashboard save writes every variant's points
+/// in full, inherited paths included, which would otherwise read as a new claim
+/// on each one: on a surface holding a path from before these rules, saving an
+/// unrelated field would be refused for a path nobody touched. The variant need
+/// not be one the gateway already stores, since a variant added in the same
+/// save copies the same path.
+pub(crate) fn inherits_a_kept_base_claim(
+    claim: &ListenPathClaim<'_>,
+    kept: &std::collections::HashSet<ListenPathClaim<'_>>,
+) -> bool {
+    claim.0.is_some() && kept.contains(&(None, claim.1, claim.2))
+}
+
+/// The code of the refusal [`listen_path_problems`] does not decide: a
+/// `listen_path` that is a route another Transit Point already answers on
+/// (`check_listen_path_shadowing`), which needs every surface on the listener
+/// to see. A clash a surface is already stored with is left alone here and
+/// logged by the listener build, since this check has no `Warning` path.
 pub(crate) const LISTEN_PATH_ROUTE_CLASH: &str = "listen_path_route_clash";
 
-/// The code for a `listen_path` on an alias only a variant defines: the
-/// outbound listener registers no route for it, so the path is stored and
-/// nothing answers it ([`VARIANT_ONLY_REMEDY`]).
-pub(crate) const LISTEN_PATH_VARIANT_ONLY: &str = "listen_path_variant_only";
+/// The code for a `listen_path` a variant sets that no route serves: on an
+/// alias only that variant defines, which has no route at all, or on one whose
+/// base point holds a different path, since the listener registers the base
+/// point's path with `$<variant>` after it and never the variant's own
+/// ([`variant_path_no_route_serves`]).
+pub(crate) const LISTEN_PATH_VARIANT_UNSERVED: &str = "listen_path_variant_unserved";
 
+/// The codes that tell the cases of [`listen_path_problems`] apart. The admin
+/// API refuses a save that introduces any of them, and answers one a surface
+/// already holds with a `Warning` of the same text.
 pub(crate) const LISTEN_PATH_INVALID: &str = "listen_path_invalid";
 pub(crate) const LISTEN_PATH_IS_OUTBOUND_PREFIX: &str = "listen_path_is_outbound_prefix";
 pub(crate) const LISTEN_PATH_NOT_A_CHANNEL_PREFIX: &str = "listen_path_not_a_channel_prefix";
@@ -993,6 +997,41 @@ const VARIANT_ONLY_REMEDY: &str = "No listen_path reaches this Transit Point at 
      surface's Transit Points alone, and builds a variant's routes from a base point's alias and path. Define \
      the alias in the base surface too, and this variant answers at that point's routes with '$<variant>' in \
      them.";
+
+/// Why no route serves the `listen_path` a variant sets on `point`, or `None`
+/// when one does. The outbound listener registers routes from the base
+/// surface's Transit Points alone (`group_outbound_vcs_by_port`), and builds
+/// each variant's from a base point's alias and path, so a variant's own path
+/// is registered only where it is the base point's path too.
+fn variant_path_no_route_serves(
+    surface: &crate::config::agent_surface::AgentSurface,
+    variant: Option<&str>,
+    point: &crate::config::agent_surface::TransitPoint,
+) -> Option<String> {
+    variant?;
+    let Some(base) = surface
+        .transit
+        .as_ref()
+        .into_iter()
+        .flat_map(|transit| transit.points.iter())
+        .find(|base| base.alias == point.alias)
+    else {
+        return Some(VARIANT_ONLY_REMEDY.to_string());
+    };
+    if base.listen_path.as_deref() == point.listen_path.as_deref() {
+        return None;
+    }
+    let base_path = base
+        .listen_path
+        .as_deref()
+        .map(|path| format!("'{path}'"))
+        .unwrap_or_else(|| "none".to_string());
+    Some(format!(
+        "The outbound listener registers a variant's routes from the base surface's Transit Point and its path, \
+         which here is {base_path}, so this variant answers there with its alias after it and never at a path of \
+         its own. Set the path on the base Transit Point, or leave this one as the base point has it."
+    ))
+}
 
 /// A Transit Point as every refusal and warning names it.
 fn named_transit_point(
@@ -1069,20 +1108,20 @@ pub(crate) fn listen_path_problems<'a>(
                     ),
                 });
             }
+            // A path a variant sets that the listener never registers, wherever
+            // it sits: `group_outbound_vcs_by_port` reads the base surface's
+            // Transit Points, so an alias only a variant defines has no route to
+            // add one to, and a variant that overrides a base point's path is
+            // registered at the base point's path with `$<variant>` after it,
+            // never at its own.
+            if let Some(unserved) = variant_path_no_route_serves(surface, variant, point) {
+                return Some(ListenPathProblem {
+                    claim,
+                    code: LISTEN_PATH_VARIANT_UNSERVED,
+                    message: format!("{named} has listen_path '{path}', which no route serves. {unserved}"),
+                });
+            }
             if is_under_outbound_prefix(path) {
-                // Under the prefix every address serves, but an alias only a
-                // variant defines has no route there either: the listener
-                // registers routes from the base surface's points alone, so
-                // this path is stored and nothing answers it.
-                if derived_outbound_route(surface, variant, &point.alias).is_none() {
-                    return Some(ListenPathProblem {
-                        claim,
-                        code: LISTEN_PATH_VARIANT_ONLY,
-                        message: format!(
-                            "{named} has listen_path '{path}', which no route serves. {VARIANT_ONLY_REMEDY}"
-                        ),
-                    });
-                }
                 return None;
             }
             // Reachable where the point's own outbound listener has a hostname
@@ -4320,11 +4359,38 @@ mod tests {
             ]),
             serde_json::json!([
                 { "alias": "inside", "target_endpoint": "https://e.example",
-                    "listen_path": "/outbound/example/v" }
+                    "listen_path": "/outbound/example/b" }
             ]),
         );
 
         assert!(listen_path_problems(&served, &channel_config()).is_empty());
+    }
+
+    /// The listener builds a variant's routes from the base point's path, so a
+    /// variant that overrides a base point with a path of its own is registered
+    /// nowhere: it answers at the base path with its alias after it.
+    #[test]
+    fn a_variant_path_its_base_point_does_not_hold_is_told_no_route_serves_it() {
+        let surface = surface_with_points(
+            serde_json::json!([
+                { "alias": "inside", "target_endpoint": "https://b.example", "listen_path": "/outbound/example/b" }
+            ]),
+            serde_json::json!([
+                { "alias": "inside", "target_endpoint": "https://e.example",
+                    "listen_path": "/outbound/example/v" }
+            ]),
+        );
+
+        let problems = listen_path_problems(&surface, &channel_config());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].code, LISTEN_PATH_VARIANT_UNSERVED);
+        assert!(
+            problems[0]
+                .message
+                .contains("which here is '/outbound/example/b'"),
+            "{}",
+            problems[0].message
+        );
     }
 
     /// Under the prefix every address serves, so the first three checks pass,
@@ -4343,7 +4409,7 @@ mod tests {
 
         let problems = listen_path_problems(&surface, &channel_config());
         assert_eq!(problems.len(), 1, "{problems:?}");
-        assert_eq!(problems[0].code, LISTEN_PATH_VARIANT_ONLY);
+        assert_eq!(problems[0].code, LISTEN_PATH_VARIANT_UNSERVED);
         assert!(
             problems[0]
                 .message
@@ -4537,16 +4603,21 @@ mod tests {
 
         let kept = kept_listen_path_claims(Some(&stored));
 
+        assert_eq!(kept.len(), 1, "a point with no listen_path claims nothing: {kept:?}");
         assert!(kept.contains(&(None, "outside", "/partner-a-webhook")));
         assert!(
-            kept.contains(&(Some("candidate"), "outside", "/partner-a-webhook")),
+            inherits_a_kept_base_claim(&(Some("candidate"), "outside", "/partner-a-webhook"), &kept),
             "the same point's path under a variant adds no route: the listener builds the variant's routes from \
-             the base point, and a dashboard save writes that inherited copy into every variant"
+             the base point, and a dashboard save writes that inherited copy into every variant, stored or added \
+             in this same save"
         );
-        assert_eq!(kept.len(), 2, "a point with no listen_path claims nothing: {kept:?}");
         assert!(
-            !kept.contains(&(Some("candidate"), "elsewhere", "/partner-a-webhook")),
+            !inherits_a_kept_base_claim(&(Some("candidate"), "elsewhere", "/partner-a-webhook"), &kept),
             "the same path on another Transit Point is a claim of its own, in a variant as on the base surface"
+        );
+        assert!(
+            !inherits_a_kept_base_claim(&(Some("candidate"), "outside", "/moved"), &kept),
+            "a variant that changes the path claims a route the base point does not hold"
         );
         assert!(
             !kept.contains(&(None, "elsewhere", "/partner-a-webhook")),

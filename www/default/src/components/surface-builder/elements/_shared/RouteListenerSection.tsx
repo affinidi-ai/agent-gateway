@@ -87,6 +87,10 @@ function translatePrefixForNewAddress({
   if (addressSource !== 'outbound' || !selectedPrefix || !routingConfig) return selectedPrefix;
   const here = offeredChannelPrefixes(routingConfig, addressSource, address);
   const there = offeredChannelPrefixes(routingConfig, addressSource, newAddress);
+  // The prefix as chosen, where the new address offers it: an address with a
+  // hostname of its own offers both forms, so moving between two of them must
+  // leave an `/outbound` path alone rather than rewrite it to the plain form.
+  if (there.some(c => c.prefix === selectedPrefix)) return selectedPrefix;
   const channel = here.find(c => c.prefix === selectedPrefix);
   if (!channel) return selectedPrefix;
   const sameChannel = (id: string) => id.replace(/^outbound-/, '');
@@ -210,12 +214,10 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
   const composedRoute: string = config[routeFieldName] || '';
 
   const { selectedPrefix, customPath } = useMemo(() => {
-    // A persisted prefix is only trusted while the selector still offers it. One that
-    // is not among the options cannot be shown as selected, so taking it here left the
-    // dropdown on its placeholder and Custom Path empty on a surface whose route was
-    // perfectly good - which is what a stale or wrongly seeded route_prefix looks like
-    // (an inbound /agents on a Transit Point whose path starts /outbound/). Falling
-    // through re-derives both from the route itself.
+    // A persisted prefix is trusted only while the selector offers it: one it does
+    // not offer cannot be shown as selected, so a stale value (an inbound /agents on
+    // a Transit Point whose path starts /outbound/) falls through and both fields are
+    // re-derived from the route itself.
     const offersPersistedPrefix =
       !config.route_prefix || channelPrefixes.some(p => p.prefix === config.route_prefix);
     if (offersPersistedPrefix && (config.route_prefix || config.route_suffix !== undefined)) {
@@ -308,12 +310,13 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
     const trimmed = suffix.trim();
     const path = trimmed ? (trimmed.startsWith('/') ? trimmed : `/${trimmed}`) : '';
     const composed = prefix && path ? `${prefix}${path}` : '';
-    // An incomplete pair composes nothing, which must not wipe a route the node
-    // already holds: a stored path the picker cannot place leaves the prefix
-    // unresolved, and typing in the other field would otherwise clear it. The
-    // required-field errors and the save gate report the incomplete pair.
+    // Emptying the path clears the route: that is how the dashboard asks for the
+    // derived one, and both refusals tell the operator to do it. What must not
+    // clear a stored route is the other half of the pair going missing, which is
+    // what a prefix the picker cannot place looks like while a path is typed
+    // under it; the Transit Point's `incompleteReason` blocks the save on that.
     const fields: Record<string, any> = { route_prefix: prefix, route_suffix: suffix };
-    if (composed || !composedRoute) fields[routeFieldName] = composed;
+    if (composed || !composedRoute || !trimmed) fields[routeFieldName] = composed;
     updateFields(fields);
   };
 

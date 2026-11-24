@@ -2507,7 +2507,11 @@ fn check_listen_path_shadowing(
         };
         let path = &path;
         let claim = (key.clone(), path.clone());
-        if kept.contains(&claim) {
+        // A path the surface already held is exempt, unless the route it now
+        // clashes with is one this save introduces: adding a point whose derived
+        // route is an older point's path is the same clash, arriving from the
+        // other side, and the save that introduces it is this one.
+        if kept.contains(&claim) && kept_routes.contains(&claim) {
             continue;
         }
         // A point claiming its own derived route changes nothing: that route is
@@ -2618,8 +2622,9 @@ fn check_listen_paths(
     let kept = crate::proxy::server::kept_listen_path_claims(claiming_stored_surface(stored));
     match crate::proxy::server::listen_path_problems(surface, network_config)
         .into_iter()
-        .find(|problem| !kept.contains(&problem.claim))
-    {
+        .find(|problem| {
+            !kept.contains(&problem.claim) && !crate::proxy::server::inherits_a_kept_base_claim(&problem.claim, &kept)
+        }) {
         Some(problem) => Err(SurfaceApiError::BadRequestCode(problem.code, problem.message)),
         None => Ok(()),
     }
@@ -10234,7 +10239,7 @@ mod validation_tests {
         // alone, so this alias has none and the path adds none.
         let under_the_prefix = surface_with_a_variant_only_listen_path("/outbound/api/partner-b");
         let (code, msg) = listen_path_refusal(&under_the_prefix, None);
-        assert_eq!(code, crate::proxy::server::LISTEN_PATH_VARIANT_ONLY);
+        assert_eq!(code, crate::proxy::server::LISTEN_PATH_VARIANT_UNSERVED);
         assert!(msg.contains("Define the alias in the base surface too"), "{msg}");
     }
 

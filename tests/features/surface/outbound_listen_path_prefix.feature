@@ -11,8 +11,10 @@ Feature: A Transit Point's listen_path is held to the routes the gateway serves
   A listen_path outside the outbound prefix is served on the outbound
   listener's own address alone, so where an inbound listener shares that
   hostname, as it does here, the save that introduces one is refused as well;
-  a deployment whose outbound listener has a hostname of its own keeps it,
-  with a Warning on a path already stored.
+  a deployment whose outbound listener has a hostname of its own serves such a
+  path and stores it without a word. A path a surface already holds is answered
+  with a Warning rather than refused, and a path that is a route another Transit
+  Point answers on is refused whoever holds it.
 
   Background:
     Given A2A surface "example-surface" is defined for route "/example" with managed agent "example-agent" as its target
@@ -71,6 +73,7 @@ Feature: A Transit Point's listen_path is held to the routes the gateway serves
     Given Transit Point "charlie" routes to MCP server "delta"
     When the operator sets Transit Point "alpha" listen_path to "/outbound/example/charlie"
     Then the admin API response status is 400
+    And the admin API error response carries the code "listen_path_route_clash"
     And the admin API error response mentions "Transit Point 'charlie'"
 
   Scenario: The surface routing settings name the prefixes a Transit Point may listen under
