@@ -1402,6 +1402,7 @@ impl ConnectionPointListenerManager {
             trusted: gateway
                 .trusted_issuer_dids
                 .clone(),
+            require_addressed_presentations: gateway.require_addressed_presentations,
         };
         if recorded.accepts(issuer_did) || recorded.attested.is_some() {
             return Ok(recorded);
@@ -1421,6 +1422,7 @@ impl ConnectionPointListenerManager {
         deadline: std::time::Duration,
     ) -> Result<crate::gateways::types::PeerIssuers, String> {
         let trusted = gateway.trusted_issuer_dids;
+        let require_addressed_presentations = gateway.require_addressed_presentations;
         let attested = match gateway.issuer_did {
             Some(issuer_did) => Some(issuer_did),
             None => match self
@@ -1438,7 +1440,11 @@ impl ConnectionPointListenerManager {
                 Err(e) => return Err(format!("peer issuer DID not established for gateway {}: {e}", gateway.id)),
             },
         };
-        Ok(crate::gateways::types::PeerIssuers { attested, trusted })
+        Ok(crate::gateways::types::PeerIssuers {
+            attested,
+            trusted,
+            require_addressed_presentations,
+        })
     }
 
     /// Return the peer's verified issuer DID for a Remote gateway, running the
@@ -3796,6 +3802,7 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
                         issuer_did: None,
                         issuer_did_source: None,
                         trusted_issuer_dids: Vec::new(),
+                        require_addressed_presentations: false,
                         gateway_type: crate::gateways::types::GatewayType::Remote,
                         status: crate::gateways::types::GatewayStatus::Pending,
                         creation_type: crate::gateways::types::GatewayCreationType::System,
@@ -4053,6 +4060,7 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
             issuer_did: None,
             issuer_did_source: None,
             trusted_issuer_dids: Vec::new(),
+            require_addressed_presentations: false,
             gateway_type: crate::gateways::types::GatewayType::Remote,
             status: crate::gateways::types::GatewayStatus::Pending,
             creation_type: crate::gateways::types::GatewayCreationType::System,
@@ -6281,6 +6289,7 @@ mod peer_issuer_tests {
             PeerIssuers {
                 attested: Some("did:web:peer-issuer".to_string()),
                 trusted: vec!["did:web:relay".to_string()],
+                require_addressed_presentations: false,
             }
         );
     }
@@ -6322,6 +6331,7 @@ mod peer_issuer_tests {
             PeerIssuers {
                 attested: None,
                 trusted: vec!["did:web:relay".to_string()],
+                require_addressed_presentations: false,
             }
         );
     }
@@ -6342,6 +6352,7 @@ mod peer_issuer_tests {
             PeerIssuers {
                 attested: None,
                 trusted: vec!["did:web:relay".to_string()],
+                require_addressed_presentations: false,
             }
         );
     }
@@ -6491,6 +6502,7 @@ mod peer_issuer_tests {
             PeerIssuers {
                 attested: Some("did:web:peer-issuer".to_string()),
                 trusted: Vec::new(),
+                require_addressed_presentations: false,
             }
         );
         assert!(!issuers.accepts("did:web:another-issuer"));

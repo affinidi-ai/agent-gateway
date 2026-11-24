@@ -21,15 +21,20 @@ pub struct ResponsePresentation {
     pub issuer_did: String,
     pub vp_jwt: String,
     pub identity_fields: HashMap<String, JsonValue>,
+    /// The audiences the presentation's proof names in `domain`.
+    pub domains: Vec<String>,
 }
 
 /// Whether the connection's issuers vouch for a response presentation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ResponseAttribution {
     /// The issuer is one of the connection's issuers.
     Verified,
     /// The issuer is not one of them; the answer is refused.
     Untrusted,
+    /// The presentation is addressed to another recipient, with the reason;
+    /// the answer is refused.
+    Unaddressed(String),
 }
 
 /// Why the calling gateway refuses a fabric answer's identity presentation.
@@ -68,6 +73,9 @@ pub struct AnswerIdentityCheck<'a> {
     pub listener_manager: Option<Arc<crate::gateways::ConnectionPointListenerManager>>,
     /// The Remote gateway record the `fabric://` Target names.
     pub gateway_id: &'a str,
+    /// The Connection Point DID this gateway sent the request from, which the
+    /// answer's presentation must name in its `domain` when it names one.
+    pub recipient_did: Option<&'a str>,
     pub facts: &'a crate::audit::request_events::RequestFacts<'a>,
     /// The request's authenticated caller.
     pub caller: Option<crate::delegation_vault::audit::AuditCallerContext>,
@@ -100,8 +108,12 @@ pub async fn check_answer_identity(
     };
     match record_response_presentation(
         &presentation,
-        check.listener_manager,
-        check.gateway_id,
+        ResponseConnection {
+            listener_manager: check.listener_manager,
+            gateway_id: check.gateway_id,
+            vc_issuer: check.vc_issuer,
+            recipient_did: check.recipient_did,
+        },
         check.surface,
         check.facts,
         check.caller,
@@ -120,6 +132,7 @@ pub async fn check_answer_identity(
             Ok(Some(presentation))
         }
         ResponseAttribution::Untrusted => Err(AnswerIdentityRefusal::Untrusted),
+        ResponseAttribution::Unaddressed(reason) => Err(AnswerIdentityRefusal::Invalid(reason)),
     }
 }
 
@@ -255,7 +268,7 @@ async fn verify_fabric_credential(
         return Err("VP verification failed for server agent identity: no VC issuer to verify the presentation".into());
     };
     let verified = vc_issuer
-        .verify_agent_presentation_full(vp_jwt)
+        .verify_agent_presentation_unaddressed(vp_jwt)
         .await
         .map_err(|e| {
             warn!(channel = channel_name, error = %format!("{e:#}"), "✗ Fabric: VP verification FAILED");
@@ -276,6 +289,7 @@ async fn verify_fabric_credential(
         issuer_did,
         vp_jwt: vp_jwt.to_string(),
         identity_fields: verified.identity_fields,
+        domains: verified.domains,
     }))
 }
 
@@ -307,14 +321,21 @@ fn attribute_response_presentation(
 /// (`untrusted`) otherwise. Issuers that cannot be resolved vouch for nothing,
 /// and the `untrusted` record then says why in its `error_detail`.
 /// The received presentation names `caller`, the request's authenticated caller.
+/// A presentation the connection's issuers vouch for but that is addressed to
+/// another recipient is recorded as `identity_binding_failed` (`invalid`).
 async fn record_response_presentation(
     presentation: &ResponsePresentation,
-    listener_manager: Option<Arc<crate::gateways::ConnectionPointListenerManager>>,
-    gateway_id: &str,
+    connection: ResponseConnection<'_>,
     surface: &crate::config::agent_surface::AgentSurface,
     facts: &crate::audit::request_events::RequestFacts<'_>,
     caller: Option<crate::delegation_vault::audit::AuditCallerContext>,
 ) -> ResponseAttribution {
+    let ResponseConnection {
+        listener_manager,
+        gateway_id,
+        vc_issuer,
+        recipient_did,
+    } = connection;
     let (peer_issuers, unresolved) = match listener_manager {
         Some(manager) => match manager
             .peer_issuers_vouching_for(gateway_id, &presentation.issuer_did)
@@ -336,9 +357,25 @@ async fn record_response_presentation(
             Some("issuers of the answering gateway could not be established: no Fabric listener".to_string()),
         ),
     };
-    let attribution = attribute_response_presentation(presentation, &peer_issuers, facts.channel_name);
+    let mut attribution = attribute_response_presentation(presentation, &peer_issuers, facts.channel_name);
+    if attribution == ResponseAttribution::Verified {
+        let addressed = match vc_issuer {
+            Some(vc_issuer) => vc_issuer.check_presentation_audience(
+                &presentation.domains,
+                Some(&presentation.issuer_did),
+                recipient_did,
+                Some(&peer_issuers),
+            ),
+            None => Err(anyhow::anyhow!("no VC issuer to check the presentation's audience")),
+        };
+        if let Err(error) = addressed {
+            warn!(channel = facts.channel_name, error = %error, "✗ Fabric: response VP is addressed to another recipient");
+            attribution =
+                ResponseAttribution::Unaddressed(format!("VP verification failed for server agent identity: {error}"));
+        }
+    }
 
-    match attribution {
+    match &attribution {
         ResponseAttribution::Verified => {
             crate::audit::request_events::identity_binding_verified(
                 facts,
@@ -370,8 +407,18 @@ async fn record_response_presentation(
             Some(&presentation.issuer_did),
             unresolved.as_deref(),
         ),
+        ResponseAttribution::Unaddressed(reason) => record_invalid_response_presentation(facts, reason),
     }
     attribution
+}
+
+/// The connection a fabric answer came over, for
+/// [`record_response_presentation`].
+struct ResponseConnection<'a> {
+    listener_manager: Option<Arc<crate::gateways::ConnectionPointListenerManager>>,
+    gateway_id: &'a str,
+    vc_issuer: Option<&'a Arc<crate::identity::VCIssuer>>,
+    recipient_did: Option<&'a str>,
 }
 
 /// The first [`INVALID_DETAIL_MAX_CHARS`] characters of `error`.
@@ -471,6 +518,7 @@ mod tests {
         crate::gateways::types::PeerIssuers {
             attested: Some(attested.to_string()),
             trusted: Vec::new(),
+            require_addressed_presentations: false,
         }
     }
 
@@ -594,8 +642,7 @@ mod tests {
 
         let (attribution, events) = crate::audit::producer::capture(record_response_presentation(
             &presentation,
-            Some(manager),
-            &gateway_id,
+            connection(Some(manager), &gateway_id, selector, None),
             &surface(),
             &facts(),
             Some(caller()),
@@ -651,8 +698,7 @@ mod tests {
 
         let (attribution, events) = crate::audit::producer::capture(record_response_presentation(
             &presentation,
-            Some(manager),
-            &gateway_id,
+            connection(Some(manager), &gateway_id, selector, None),
             &surface(),
             &facts(),
             Some(caller()),
@@ -686,8 +732,7 @@ mod tests {
 
         let (attribution, _events) = crate::audit::producer::capture(record_response_presentation(
             &presentation,
-            None,
-            "gw-b",
+            connection(None, "gw-b", selector, None),
             &surface(),
             &facts(),
             None,
@@ -695,6 +740,68 @@ mod tests {
         .await;
 
         assert_eq!(attribution, ResponseAttribution::Untrusted);
+    }
+
+    fn connection<'a>(
+        listener_manager: Option<Arc<crate::gateways::ConnectionPointListenerManager>>,
+        gateway_id: &'a str,
+        vc_issuer: Option<&'a Arc<crate::identity::VCIssuer>>,
+        recipient_did: Option<&'a str>,
+    ) -> ResponseConnection<'a> {
+        ResponseConnection {
+            listener_manager,
+            gateway_id,
+            vc_issuer,
+            recipient_did,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_presentation_addressed_to_this_connection_point_is_recorded_as_verified() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation_bound_to("did:example:local-cp").await;
+        let selector = Some(&signed.issuer);
+        let presentation = presented(&credential_response(&signed.presentation), selector).await;
+        let root = tempfile::tempdir().unwrap();
+        let (manager, gateway_id, _issuer_dir) = manager_with_peer(root.path(), &signed.issuer_did).await;
+
+        let (attribution, _events) = crate::audit::producer::capture(record_response_presentation(
+            &presentation,
+            connection(Some(manager), &gateway_id, selector, Some("did:example:local-cp")),
+            &surface(),
+            &facts(),
+            None,
+        ))
+        .await;
+
+        assert_eq!(attribution, ResponseAttribution::Verified);
+    }
+
+    #[tokio::test]
+    async fn a_presentation_addressed_to_another_recipient_is_recorded_as_an_invalid_identity_binding() {
+        use crate::delegation_vault::audit::DelegationAuditAction;
+        let signed = crate::identity::test_helpers::signed_agent_presentation_bound_to("did:example:other-cp").await;
+        let selector = Some(&signed.issuer);
+        let presentation = presented(&credential_response(&signed.presentation), selector).await;
+        let root = tempfile::tempdir().unwrap();
+        let (manager, gateway_id, _issuer_dir) = manager_with_peer(root.path(), &signed.issuer_did).await;
+
+        let (attribution, events) = crate::audit::producer::capture(record_response_presentation(
+            &presentation,
+            connection(Some(manager), &gateway_id, selector, Some("did:example:local-cp")),
+            &surface(),
+            &facts(),
+            None,
+        ))
+        .await;
+
+        assert!(matches!(attribution, ResponseAttribution::Unaddressed(_)), "{attribution:?}");
+        assert_eq!(events.len(), 1, "{events:?}");
+        match &events[0].event {
+            DelegationAuditAction::IdentityBindingFailed { outcome, .. } => {
+                assert_eq!(*outcome, crate::audit::events::IdentityBindingFailure::Invalid);
+            }
+            other => panic!("expected IdentityBindingFailed, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -751,6 +858,7 @@ mod tests {
             vc_issuer,
             listener_manager: None,
             gateway_id: "gw-b",
+            recipient_did: None,
             facts: &facts,
             caller: None,
         }))
@@ -783,6 +891,7 @@ mod tests {
             vc_issuer: Some(&signed.issuer),
             listener_manager: Some(manager),
             gateway_id: &gateway_id,
+            recipient_did: None,
             facts: &facts,
             caller: None,
         }))
@@ -915,8 +1024,7 @@ mod tests {
 
         let (attribution, events) = crate::audit::producer::capture(record_response_presentation(
             &presentation,
-            Some(manager),
-            "unknown-gateway",
+            connection(Some(manager), "unknown-gateway", selector, None),
             &surface(),
             &facts(),
             None,

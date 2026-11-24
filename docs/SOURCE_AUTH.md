@@ -1547,6 +1547,39 @@ identity presentation reports `vp` or `vp_unanchored` regardless of the configur
 on a direct request to an inbound `from_api_key` surface, where the key's DID replaces it; see
 [`POLICY.md`](POLICY.md#caller-identity-verification-in-policy-input).
 
+### Who an identity presentation is for
+
+Every identity presentation the gateway signs names its audience in the proof's `domain`, so a
+copy taken from a Target, a peer or the audit log cannot be presented anywhere else:
+
+| Presentation | `domain` |
+| ------------ | -------- |
+| Sent over Fabric to a paired gateway | The peer's DID, as its Remote gateway record holds it |
+| On an answer sent back over Fabric | The calling gateway's Connection Point DID the request came from |
+| Sent to an `http` or `https` Target, by an Access Point or a Transit Point | The Target's origin (`scheme://host[:port]`) |
+| Minted only for the audit log (`consent_required`, `consent_granted`) | `urn:affinidi:audit-only`, which no gateway accepts |
+| On a public agent card, in a direct answer, or to any other Target | None |
+
+A gateway accepts a presentation whose `domain` names it: on a Fabric request or answer, the
+Connection Point DID it was received on (for an answer, the one the request was sent from); on a
+direct request, at the STS token endpoint, and on a fetched agent card, the origin of one of its
+inbound listeners' `external_urls`. Origins are compared without path, with the host in lower
+case and the default port dropped. A presentation with no `domain`, from a gateway or client that
+sets none, is still accepted. A refused presentation is logged with its `domain` and the
+identifiers the gateway accepts; the request is then treated as one whose presentation failed,
+and an answer is refused with `502` and recorded as an `invalid` identity binding.
+
+A paired gateway may relay a presentation another gateway issued, which names that other
+gateway's recipient. Over Fabric such a presentation is accepted when its issuer is one the
+operator trusts for the connection (`trusted_issuer_dids`) and not the peer's own issuer, unless
+the connection's `require_addressed_presentations` is `true`; see
+[`FABRIC.md`](FABRIC.md#peer-issuer-dids). A presentation the peer itself issued must always name
+this gateway, and `urn:affinidi:audit-only` is never accepted.
+
+A gateway that reaches another gateway's Access Point over direct HTTP must use an origin that
+gateway lists in an inbound listener's `external_urls`. If it calls an internal name, such as
+`http://gw2:8080`, add that origin to the receiving gateway's `external_urls`.
+
 ### A missing identity on the public agent card
 
 On the protected slot, `payload_extraction` refuses a response that carries no identity with

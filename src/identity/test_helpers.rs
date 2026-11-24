@@ -527,16 +527,24 @@ pub struct SignedAgentPresentation {
 }
 
 pub async fn signed_agent_presentation() -> SignedAgentPresentation {
-    signed_agent_presentation_about(None).await
+    signed_agent_presentation_about(None, None).await
 }
 
 /// A [`signed_agent_presentation`] whose credential names `subject_did`
 /// instead of the presentation's holder.
 pub async fn signed_agent_presentation_for_another_subject(subject_did: &str) -> SignedAgentPresentation {
-    signed_agent_presentation_about(Some(subject_did)).await
+    signed_agent_presentation_about(Some(subject_did), None).await
 }
 
-async fn signed_agent_presentation_about(subject_did: Option<&str>) -> SignedAgentPresentation {
+/// A [`signed_agent_presentation`] whose proof names `domain` as its audience.
+pub async fn signed_agent_presentation_bound_to(domain: &str) -> SignedAgentPresentation {
+    signed_agent_presentation_about(None, Some(domain)).await
+}
+
+async fn signed_agent_presentation_about(
+    subject_did: Option<&str>,
+    domain: Option<&str>,
+) -> SignedAgentPresentation {
     use crate::identity::ssi::vc_issuer::{AgentIdentity, IssueVcPayload, LocalVcIssuer, LocalVcSigner, VcIssuer};
     use crate::identity::ssi::vp_issuer::{Credentials, LocalVpIssuer, LocalVpSigner, VpIssuer, VpIssuerPayload};
     use std::borrow::Cow;
@@ -571,7 +579,7 @@ async fn signed_agent_presentation_about(subject_did: Option<&str>) -> SignedAge
             holder_did: Cow::Borrowed(&holder_did),
             verifiable_credentials: Cow::Owned(vec![credential]),
             challenge: None,
-            domain: None,
+            domain: domain.map(Cow::Borrowed),
             proof_purpose: ssi::verification_methods::ProofPurpose::Assertion,
         }))
         .await

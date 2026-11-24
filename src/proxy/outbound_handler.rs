@@ -2540,6 +2540,7 @@ async fn step_extract_protocol_context_with_versions(
             state.vc_issuer.as_ref(),
             &transit_audit_facts(ctx),
             None,
+            None,
         )
         .await
         .map_err(|error| {
@@ -4860,6 +4861,10 @@ async fn step_inject_trusted_identity(
         .as_ref()
         .unwrap_or(&surface_protocol);
 
+    let target_domain = crate::identity::vc_issuer::vp_domain_for_endpoint(
+        &ctx.virtual_channel
+            .target_endpoint,
+    );
     let injected_vp_jwt: Option<String> = match protocol {
         ChannelProtocol::A2a | ChannelProtocol::Ap2 => {
             let (signed, vp_jwt) = crate::a2a::extensions::inject_identity_credential_extension(
@@ -4869,6 +4874,7 @@ async fn step_inject_trusted_identity(
                 workload_binding,
                 vc_issuer,
                 channel_name,
+                target_domain.as_deref(),
             )
             .await
             .map_err(|e| {
@@ -4906,6 +4912,7 @@ async fn step_inject_trusted_identity(
                 &protected_meta_field,
                 protected_strip_raw,
                 ctx.mcp_metadata_context,
+                target_domain.as_deref(),
             )
             .await
             .map_err(|e| {

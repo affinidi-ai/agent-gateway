@@ -49,6 +49,33 @@ Feature: Gateway DID validation over Fabric
     Then the response status is 200
     And managed agent "bravo" received the forwarded request carrying an identity presentation issued by gateway 1
 
+  Scenario: An identity presentation sent over Fabric is addressed to the receiving gateway
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And gateway 1 has an A2A surface "charlie" targeting managed agent "delta"
+    And surface "charlie" has A2A Transit Point "tr1" over Fabric to gateway 2 surface "alpha"
+    And gateway 1 surface "charlie" has managed identity enabled
+    And surface "alpha" has a policy that requires the caller identity to be issued by gateway 1
+    When managed agent "delta" sends an A2A message/send request through Transit Point "tr1"
+    Then the response status is 200
+    And managed agent "bravo" received the forwarded request carrying an identity presentation issued by gateway 1
+    And managed agent "bravo" received the forwarded request carrying an identity presentation addressed to gateway 2
+
+  Scenario: An identity presentation a gateway sent to its Target is not attributed over Fabric
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And gateway 1 has an A2A surface "charlie" targeting managed agent "delta"
+    And surface "charlie" has A2A Transit Point "tr1" over Fabric to gateway 2 surface "alpha"
+    And gateway 1 has an A2A surface "echo" targeting managed agent "foxtrot"
+    And gateway 1 has an A2A surface "golf" targeting managed agent "hotel"
+    And surface "golf" has A2A Transit Point "tr2" to managed agent "foxtrot"
+    And gateway 1 surface "golf" has managed identity enabled
+    And surface "alpha" has a policy that requires the caller identity to be issued by gateway 1
+    And managed agent "delta" has obtained the identity presentation that gateway 1 issued for managed agent "hotel"
+    When managed agent "delta" sends an A2A message/send request through Transit Point "tr1"
+    Then the response status is 403
+    And managed agent "bravo" did not receive a forwarded message
+
   Scenario: A peer gateway cannot replay an identity presentation issued by another gateway
     Given a fabric with 3 gateways
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
@@ -77,6 +104,22 @@ Feature: Gateway DID validation over Fabric
     When managed agent "delta" sends an A2A message/send request through Transit Point "tr1"
     Then the response status is 200
     And managed agent "bravo" received the forwarded request carrying an identity presentation issued by gateway 3
+
+  Scenario: A connection that requires addressed presentations refuses a relayed one
+    Given a fabric with 3 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And gateway 1 has an A2A surface "charlie" targeting managed agent "delta"
+    And surface "charlie" has A2A Transit Point "tr1" over Fabric to gateway 2 surface "alpha"
+    And gateway 3 has an A2A surface "echo" targeting managed agent "foxtrot"
+    And surface "echo" has A2A Transit Point "tr2" over Fabric to gateway 2 surface "alpha"
+    And gateway 3 surface "echo" has managed identity enabled
+    And surface "alpha" has a policy that requires the caller identity to be issued by gateway 3
+    And managed agent "delta" has obtained the identity presentation that gateway 3 issued for managed agent "foxtrot"
+    And gateway 2 trusts gateway 3's gateway DID as an issuer of its connection with gateway 1
+    And gateway 2 requires presentations addressed to it on its connection with gateway 1
+    When managed agent "delta" sends an A2A message/send request through Transit Point "tr1"
+    Then the response status is 403
+    And managed agent "bravo" did not receive a forwarded message
 
   Scenario: An issuer trusted for one connection does not admit a replay over another connection
     Given a fabric with 3 gateways

@@ -241,7 +241,8 @@ pub async fn inject_custom_metadata_extension(
 ///
 /// When `workload_binding` is supplied (Transit Point Workload Binding), the VC
 /// carries the structured `workloadBinding` credential subject; otherwise it
-/// falls back to the flat `identityFields` shape.
+/// falls back to the flat `identityFields` shape. The presentation is bound to
+/// `domain` (see [`crate::identity::vc_issuer::vp_domain_for_endpoint`]).
 pub async fn inject_identity_credential_extension(
     body_bytes: &bytes::Bytes,
     agent_did: &str,
@@ -249,10 +250,11 @@ pub async fn inject_identity_credential_extension(
     workload_binding: Option<serde_json::Value>,
     vc_issuer: &Arc<crate::identity::VCIssuer>,
     channel_name: &str,
+    domain: Option<&str>,
 ) -> anyhow::Result<(bytes::Bytes, String)> {
     // Create VP containing VC signed by agent DID
     let vp_jwt = vc_issuer
-        .create_agent_identity_presentation_with_binding(agent_did, identity_fields, workload_binding, None, None)
+        .create_agent_identity_presentation_with_binding(agent_did, identity_fields, workload_binding, None, domain)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create identity presentation: {}", e))?;
 
@@ -747,7 +749,10 @@ async fn inject_credential_into_agent_card_inner(
 /// Inject VP into A2A response
 /// Replaces raw identity extension with credential extension containing VP.
 /// Returns `None`, without signing, when no location carries the identity
-/// extension (see [`visit_credential_locations`]).
+/// extension (see [`visit_credential_locations`]). The presentation is bound
+/// to `domain`: the calling gateway's Connection Point DID on a fabric answer,
+/// `None` on a direct one.
+#[allow(clippy::too_many_arguments)]
 pub async fn inject_vp_into_a2a_response(
     response_bytes: &bytes::Bytes,
     agent_did: &str,
@@ -756,6 +761,7 @@ pub async fn inject_vp_into_a2a_response(
     vc_issuer: &Arc<crate::identity::VCIssuer>,
     channel_name: &str,
     inbound_chained_vcs: Vec<serde_json::Value>,
+    domain: Option<&str>,
 ) -> anyhow::Result<Option<(bytes::Bytes, String)>> {
     let mut response_json: JsonValue = serde_json::from_slice(response_bytes)
         .map_err(|e| anyhow::anyhow!("Failed to parse response as JSON: {}", e))?;
@@ -778,7 +784,7 @@ pub async fn inject_vp_into_a2a_response(
             identity_fields,
             workload_binding,
             None,
-            None,
+            domain,
             inbound_chained_vcs,
         )
         .await
@@ -1469,9 +1475,10 @@ mod tests {
     async fn inject_backend_vp(body: &serde_json::Value) -> (Option<(serde_json::Value, String)>, String) {
         let (issuer, did, _tmp) = issuer_with_identity().await;
         let bytes = bytes::Bytes::from(serde_json::to_vec(body).expect("serialize body"));
-        let injected = inject_vp_into_a2a_response(&bytes, &did, &identity_fields(), None, &issuer, "ch", Vec::new())
-            .await
-            .expect("injection should not fail");
+        let injected =
+            inject_vp_into_a2a_response(&bytes, &did, &identity_fields(), None, &issuer, "ch", Vec::new(), None)
+                .await
+                .expect("injection should not fail");
         let parsed = injected.map(|(body, vp)| (serde_json::from_slice(&body).expect("injected body is JSON"), vp));
         (parsed, did)
     }

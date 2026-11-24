@@ -44,6 +44,9 @@ pub struct FabricLink {
     pub exposed: bool,
 }
 
+/// A Transit Point of `from_gw`'s `from_surface` and what it reaches: over
+/// Fabric, `to_gw`'s `to_surface`; directly, the managed agent behind
+/// `to_surface` on the same gateway (`to_gw == from_gw`).
 #[derive(Debug, Clone)]
 pub struct TransitPointFabricLink {
     pub from_gw: usize,
@@ -68,6 +71,8 @@ pub struct TopologyBuilder {
     pub plans: HashMap<usize, GatewayPlan>,
     pub fabric_links: Vec<FabricLink>,
     pub transit_point_fabric_links: Vec<TransitPointFabricLink>,
+    /// Transit Points that reach a managed agent of their own gateway directly.
+    pub transit_point_direct_links: Vec<TransitPointFabricLink>,
     pub gateway_policies: HashMap<usize, String>,
     /// gw_index -> the own mediator alias declared by `gateway N uses
     /// mediator "M"`. Gateways with no entry share one default mediator;
@@ -726,29 +731,37 @@ impl G2gWorld {
             .expect("harness not started; an action step must call G2gWorld::start first")
     }
 
-    /// The Fabric link declared for a Transit Point alias.
+    /// Every Transit Point link, over Fabric or direct.
+    fn transit_point_links(&self) -> impl Iterator<Item = &TransitPointFabricLink> {
+        self.topology
+            .transit_point_fabric_links
+            .iter()
+            .chain(
+                self.topology
+                    .transit_point_direct_links
+                    .iter(),
+            )
+    }
+
+    /// The link declared for a Transit Point alias.
     pub fn transit_point_link(
         &self,
         transit_point: &str,
     ) -> &TransitPointFabricLink {
-        self.topology
-            .transit_point_fabric_links
-            .iter()
+        self.transit_point_links()
             .find(|link| link.transit_point == transit_point)
-            .unwrap_or_else(|| panic!("Transit Point '{transit_point}' is not configured over Fabric"))
+            .unwrap_or_else(|| panic!("Transit Point '{transit_point}' is not configured"))
     }
 
-    /// The Transit Point through which a managed agent's surface reaches the Fabric.
+    /// The Transit Point a managed agent's surface calls out through.
     pub fn transit_point_of_managed_agent(
         &self,
         agent_name: &str,
     ) -> &TransitPointFabricLink {
         let (gw_index, surface_id) = self.target(agent_name);
-        self.topology
-            .transit_point_fabric_links
-            .iter()
+        self.transit_point_links()
             .find(|link| link.from_gw == gw_index && link.from_surface == surface_id)
-            .unwrap_or_else(|| panic!("managed agent '{agent_name}' has no Transit Point over Fabric"))
+            .unwrap_or_else(|| panic!("managed agent '{agent_name}' has no Transit Point"))
     }
 
     pub fn surface_spec(

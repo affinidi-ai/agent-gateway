@@ -1624,7 +1624,7 @@ pub async fn oauth_callback(
                                 &identity_fields,
                                 Some(workload_binding),
                                 None,
-                                None,
+                                Some(crate::identity::vc_issuer::AUDIT_ONLY_VP_DOMAIN),
                             )
                             .await
                         {

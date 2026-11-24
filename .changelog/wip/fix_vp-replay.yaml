@@ -1,0 +1,40 @@
+branch: fix/vp-replay
+changes:
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-24T00:00:00Z'
+      title: Refuse agent presentations whose proof outlives the 5 minute VP lifetime
+      description: >-
+        A presentation's proof now expires at most 5 minutes (plus 2 minutes of clock skew)
+        after it is verified, and a proof without `expires` may not be created more than 2
+        minutes ahead of the gateway's clock. Before, the gateway accepted any `expires` the
+        holder signed, so a presentation minted with a far-future expiry could be replayed for
+        as long as its credential lasted.
+    - timestamp: '2026-11-24T00:00:00Z'
+      title: Bind each identity presentation to its recipient so copies cannot be replayed
+      description: >-
+        Identity presentations now name their audience in the proof's `domain`: the peer's DID
+        over Fabric, the Target's origin on direct calls, and `urn:affinidi:audit-only` for
+        presentations kept only in the audit log. A gateway refuses a presentation whose
+        `domain` names someone else, so a copy taken from a Target, a peer or an audit
+        integration can no longer be presented as the agent. Presentations without a `domain`
+        are still accepted, so older gateways and clients keep working. A gateway that calls
+        another gateway's Access Point over direct HTTP must use an origin listed in the
+        receiver's inbound `external_urls`.
+    - timestamp: '2026-11-24T00:00:00Z'
+      title: Address Fabric answers' identity presentations to the calling gateway
+      description: >-
+        The identity presentation on an answer sent back over Fabric now names the calling
+        gateway's Connection Point, and the calling gateway refuses an answer whose presentation
+        names another recipient with `502`, recorded as an `invalid` identity binding.
+  added:
+    - timestamp: '2026-11-24T00:00:00Z'
+      title: Let a Remote gateway connection refuse relayed identity presentations
+      description: >-
+        A Remote gateway record has `require_addressed_presentations`, set with
+        `PUT /v1/gateways/{id}`. Off by default, so a peer may keep relaying presentations from
+        an issuer the operator trusts for the connection; on, such a presentation must be
+        addressed to this gateway like the peer's own.
+  breaking: []

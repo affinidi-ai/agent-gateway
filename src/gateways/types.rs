@@ -108,6 +108,8 @@ pub enum IssuerDidSource {
 pub struct PeerIssuers {
     pub attested: Option<String>,
     pub trusted: Vec<String>,
+    /// The connection's `require_addressed_presentations`.
+    pub require_addressed_presentations: bool,
 }
 
 impl PeerIssuers {
@@ -117,6 +119,22 @@ impl PeerIssuers {
     ) -> bool {
         self.attested.as_deref() == Some(issuer_did)
             || self
+                .trusted
+                .iter()
+                .any(|trusted| trusted == issuer_did)
+    }
+
+    /// Whether a presentation from `issuer_did` may arrive over this connection
+    /// addressed to another recipient, as one the peer relays: the issuer is one
+    /// an operator trusts for the connection, not the peer's own, and the
+    /// connection does not require addressed presentations.
+    pub fn admits_relayed_presentation(
+        &self,
+        issuer_did: &str,
+    ) -> bool {
+        !self.require_addressed_presentations
+            && self.attested.as_deref() != Some(issuer_did)
+            && self
                 .trusted
                 .iter()
                 .any(|trusted| trusted == issuer_did)
@@ -178,6 +196,14 @@ pub struct Gateway {
     /// added on every connection it should be accepted from.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_issuer_dids: Vec<String>,
+
+    /// For a remote gateway: refuse a presentation from a `trusted_issuer_dids`
+    /// issuer that arrives over this connection addressed to another recipient.
+    /// Off by default, so the peer may relay presentations it obtained
+    /// elsewhere; presentations from the peer's own `issuer_did` must always be
+    /// addressed to this gateway.
+    #[serde(default)]
+    pub require_addressed_presentations: bool,
 
     /// Type of gateway (self or remote)
     pub gateway_type: GatewayType,
@@ -250,6 +276,7 @@ impl Gateway {
             issuer_did: None,
             issuer_did_source: None,
             trusted_issuer_dids: Vec::new(),
+            require_addressed_presentations: false,
             status: GatewayStatus::Active,
             creation_type,
             role: GatewayRole::Peer,
@@ -539,6 +566,7 @@ mod tests {
         let issuers = PeerIssuers {
             attested: Some("did:web:peer.example".to_string()),
             trusted: vec!["did:web:relay.example".to_string()],
+            require_addressed_presentations: false,
         };
 
         assert!(issuers.accepts("did:web:peer.example"));
@@ -548,10 +576,44 @@ mod tests {
     }
 
     #[test]
+    fn peer_issuers_admit_relayed_presentations_from_trusted_issuers_only() {
+        let mut issuers = PeerIssuers {
+            attested: Some("did:web:peer.example".to_string()),
+            trusted: vec!["did:web:relay.example".to_string()],
+            require_addressed_presentations: false,
+        };
+
+        assert!(issuers.admits_relayed_presentation("did:web:relay.example"));
+        assert!(!issuers.admits_relayed_presentation("did:web:peer.example"));
+        assert!(!issuers.admits_relayed_presentation("did:web:other.example"));
+
+        issuers.require_addressed_presentations = true;
+        assert!(!issuers.admits_relayed_presentation("did:web:relay.example"));
+    }
+
+    #[test]
+    fn a_peer_issuer_also_trusted_by_the_operator_is_never_relayed() {
+        let issuers = PeerIssuers {
+            attested: Some("did:web:peer.example".to_string()),
+            trusted: vec!["did:web:peer.example".to_string()],
+            require_addressed_presentations: false,
+        };
+
+        assert!(!issuers.admits_relayed_presentation("did:web:peer.example"));
+    }
+
+    #[test]
+    fn gateway_records_without_the_setting_do_not_require_addressed_presentations() {
+        let gateway: Gateway = serde_json::from_value(pre_issuer_did_record_json()).unwrap();
+        assert!(!gateway.require_addressed_presentations);
+    }
+
+    #[test]
     fn peer_issuers_without_attested_or_trusted_accept_nothing() {
         let issuers = PeerIssuers {
             attested: None,
             trusted: Vec::new(),
+            require_addressed_presentations: false,
         };
 
         assert!(!issuers.accepts("did:web:peer.example"));

@@ -221,7 +221,10 @@ You also need:
 - **A public DNS name** that callers, browsers and
   [remote gateways](../CONTEXT.md) can reach. Use it in
   `listeners[].external_urls`, `webauthn.rp_id`, `webauthn.external_origin` and
-  `did.domain`.
+  `did.domain`. A remote gateway that calls an Access Point over direct HTTP by another name,
+  such as an internal service name, needs that origin in an inbound listener's `external_urls`
+  too, or its identity presentations are refused; see
+  [Who an identity presentation is for](SOURCE_AUTH.md#who-an-identity-presentation-is-for).
 - **A trusted TLS certificate** for that name, on the load balancer if it terminates
   TLS, otherwise in `[tls]` in `config.toml`. A self-signed certificate works only for
   local testing; remote gateways and DID resolvers reject it.

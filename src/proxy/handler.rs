@@ -2934,6 +2934,7 @@ async fn proxy_charged_request(
                 state.vc_issuer.as_ref(),
                 &audit_facts,
                 None,
+                None,
             )
             .await
             .map_err(|error| {
@@ -5478,6 +5479,7 @@ async fn proxy_charged_request(
             &state.identity_selector,
             &channel_name,
             None,
+            None,
         )
         .await;
         crate::observability::identity_binding_audit::audit_extraction(&audit_facts, None, &result);
@@ -7180,7 +7182,7 @@ async fn proxy_charged_request(
                             &result.identity_fields,
                             wb,
                             None,
-                            None,
+                            Some(crate::identity::vc_issuer::AUDIT_ONLY_VP_DOMAIN),
                         )
                         .await
                     {
@@ -7430,8 +7432,15 @@ async fn proxy_charged_request(
             delegation_actions_for_vp.clone(),
             authenticated_identity.as_ref(),
         );
+        let target_domain = crate::identity::vc_issuer::vp_domain_for_endpoint(&state.surface.target.endpoint);
         match vc_issuer
-            .create_agent_identity_presentation_with_binding(&result.did, &result.identity_fields, wb, None, None)
+            .create_agent_identity_presentation_with_binding(
+                &result.did,
+                &result.identity_fields,
+                wb,
+                None,
+                target_domain.as_deref(),
+            )
             .await
         {
             Ok(final_vp_jwt) => {
@@ -11243,6 +11252,7 @@ async fn handle_fabric_request_inner(
             &state.identity_selector,
             channel_name,
             None,
+            None,
         )
         .await;
         crate::observability::identity_binding_audit::audit_extraction(
@@ -12474,7 +12484,7 @@ async fn handle_fabric_request_inner(
                     &result.identity_fields,
                     fabric_workload_binding,
                     None,
-                    None,
+                    Some(remote_gateway_did.as_str()),
                     chained_credentials,
                 )
                 .await
@@ -13587,6 +13597,11 @@ async fn handle_fabric_request_inner(
                             vc_issuer: state.vc_issuer.as_ref(),
                             listener_manager,
                             gateway_id,
+                            recipient_did: Some(
+                                gateway_listener
+                                    .gateway_did
+                                    .as_str(),
+                            ),
                             facts: &response_audit_facts,
                             caller: authenticated_identity
                                 .as_ref()
@@ -16490,6 +16505,7 @@ async fn inject_backend_agent_vp(
                 &protected_meta_field,
                 protected_strip_raw,
                 mcp_metadata_context,
+                None,
             )
             .await
         }
@@ -16502,6 +16518,7 @@ async fn inject_backend_agent_vp(
                 &vc_issuer,
                 channel_name,
                 inbound_chained_vcs.clone(),
+                None,
             )
             .await
             .map(|injected| injected.map_or_else(|| (response_body.clone(), None), |(body, proof)| (body, Some(proof))))

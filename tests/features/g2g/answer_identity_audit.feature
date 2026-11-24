@@ -18,6 +18,18 @@ Feature: The identity on a Fabric answer is audited by the calling gateway
     And the VP Audit Log of gateway 1 records the identity presentation received on the answer
     And the VP Audit Log of gateway 1 records the answer's identity under the trace id of the request
 
+  Scenario: An answer's identity presentation is addressed to the calling gateway
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And gateway 2 surface "alpha" has managed identity enabled
+    And managed agent "bravo" response contains the agent-identity extension
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And gateway 1 surface "charlie" has managed identity enabled
+    And the VP Audit Log of gateway 1 keeps every audit event
+    When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
+    Then the response status is 200
+    And the VP Audit Log of gateway 1 records the identity presentation received on the answer addressed to gateway 1
+
   Scenario: A legacy pairing obtains the answering gateway's issuer DID on the first answer
     Given a fabric with 2 gateways
     And gateway 1 has an A2A surface "alpha" targeting managed agent "bravo"

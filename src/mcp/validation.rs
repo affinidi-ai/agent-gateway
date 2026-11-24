@@ -166,6 +166,7 @@ async fn inject_vp_into_mcp(
     strip_raw_meta: bool,
     target: McpMetaTarget,
     context: McpMetadataContext,
+    domain: Option<&str>,
 ) -> anyhow::Result<(bytes::Bytes, Option<String>)> {
     let mut message_json: JsonValue = serde_json::from_slice(message_bytes)?;
     super::meta::normalize_metadata(&mut message_json, context)?;
@@ -200,7 +201,7 @@ async fn inject_vp_into_mcp(
             identity_fields,
             workload_binding,
             None,
-            None,
+            domain,
             inbound_chained_vcs,
         )
         .await
@@ -234,7 +235,8 @@ async fn inject_vp_into_mcp(
 }
 
 /// Inject the backend agent identity credential VP into an MCP **response**
-/// (`result._meta`, per the MCP spec).
+/// (`result._meta`, per the MCP spec), bound to `domain`: the calling
+/// gateway's Connection Point DID on a fabric answer, `None` on a direct one.
 pub async fn inject_vp_into_mcp_response(
     response_bytes: &bytes::Bytes,
     agent_did: &str,
@@ -246,6 +248,7 @@ pub async fn inject_vp_into_mcp_response(
     meta_field: &str,
     strip_raw_meta: bool,
     context: McpMetadataContext,
+    domain: Option<&str>,
 ) -> anyhow::Result<(bytes::Bytes, Option<String>)> {
     inject_vp_into_mcp(
         response_bytes,
@@ -259,10 +262,13 @@ pub async fn inject_vp_into_mcp_response(
         strip_raw_meta,
         McpMetaTarget::Result,
         context,
+        domain,
     )
     .await
 }
 
+/// Inject the managed agent identity credential VP into an MCP **request**,
+/// bound to `domain` (see [`crate::identity::vc_issuer::vp_domain_for_endpoint`]).
 pub async fn inject_vp_into_mcp_request(
     request_bytes: &bytes::Bytes,
     agent_did: &str,
@@ -274,6 +280,7 @@ pub async fn inject_vp_into_mcp_request(
     meta_field: &str,
     strip_raw_meta: bool,
     context: McpMetadataContext,
+    domain: Option<&str>,
 ) -> anyhow::Result<(bytes::Bytes, Option<String>)> {
     inject_vp_into_mcp(
         request_bytes,
@@ -287,6 +294,7 @@ pub async fn inject_vp_into_mcp_request(
         strip_raw_meta,
         McpMetaTarget::TopLevel,
         context,
+        domain,
     )
     .await
 }
@@ -311,6 +319,7 @@ mod tests {
             "agentIdentity",
             true,
             context,
+            None,
         )
         .await
         .unwrap();
@@ -379,6 +388,7 @@ mod tests {
             "agentIdentity",
             true,
             modern_context(&request),
+            None,
         )
         .await
         .unwrap();
@@ -417,6 +427,7 @@ mod tests {
             "serverIdentity",
             false,
             modern_context(&modern_tools_call()),
+            None,
         )
         .await
         .unwrap();
@@ -451,6 +462,7 @@ mod tests {
                 "serverIdentity",
                 false,
                 McpMetadataContext::default(),
+                None,
             )
             .await
             .unwrap();
@@ -489,6 +501,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_injection_binds_the_presentation_to_the_domain() {
+        let (issuer, _tmp, did) = issuer_with_did().await;
+        let request =
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "echo"}});
+
+        let (_, vp_jwt) = inject_vp_into_mcp_request(
+            &bytes::Bytes::from(request.to_string()),
+            &did,
+            &identity_fields(),
+            None,
+            &issuer,
+            "test-surface",
+            Vec::new(),
+            "agentIdentity",
+            false,
+            McpMetadataContext::default(),
+            Some("https://target.example"),
+        )
+        .await
+        .unwrap();
+
+        let vp: JsonValue = serde_json::from_str(&vp_jwt.unwrap()).unwrap();
+        assert_eq!(vp["proof"]["domain"], "https://target.example");
+    }
+
+    #[tokio::test]
     async fn request_injection_targets_top_level_meta_on_params_only_body() {
         let (issuer, _tmp, did) = issuer_with_did().await;
 
@@ -512,6 +550,7 @@ mod tests {
             "agentIdentity",
             false,
             McpMetadataContext::default(),
+            None,
         )
         .await
         .expect("request injection must succeed on a params-only body");
@@ -570,6 +609,7 @@ mod tests {
             "serverIdentity",
             false,
             McpMetadataContext::default(),
+            None,
         )
         .await
         .expect_err("response injection must fail without a result object");
@@ -602,6 +642,7 @@ mod tests {
             "serverIdentity",
             false,
             McpMetadataContext::default(),
+            None,
         )
         .await
         .expect("response injection must succeed with a result object");

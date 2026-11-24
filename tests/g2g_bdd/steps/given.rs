@@ -437,6 +437,39 @@ pub async fn surface_has_a2a_transit_point_over_fabric(
         });
 }
 
+#[given(expr = "surface {string} has A2A Transit Point {string} to managed agent {string}")]
+pub async fn surface_has_a2a_transit_point_to_managed_agent(
+    world: &mut G2gWorld,
+    surface_name: String,
+    transit_point: String,
+    agent_name: String,
+) {
+    world
+        .topology
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let (from_gw, from_surface_id) = world.surface(&surface_name);
+    let (agent_gw, agent_surface_id) = world.target(&agent_name);
+    assert_eq!(
+        agent_gw, from_gw,
+        "managed agent '{agent_name}' must be behind gateway {from_gw}, the gateway of surface '{surface_name}'"
+    );
+    let target_endpoint = format!("{}{agent_surface_id}", crate::harness::multi_gateway::DIRECT_TRANSIT_TARGET_PREFIX);
+    surface_spec_mut(world, &surface_name)
+        .transit_points
+        .push(TransitPointSpec::new(&transit_point, "a2a", target_endpoint));
+    world
+        .topology
+        .transit_point_direct_links
+        .push(TransitPointFabricLink {
+            from_gw,
+            from_surface: from_surface_id,
+            transit_point,
+            to_gw: from_gw,
+            to_surface: agent_surface_id,
+        });
+}
+
 #[given(expr = "Transit Point {string} requires a transit token")]
 pub async fn transit_point_requires_a_transit_token(
     world: &mut G2gWorld,
@@ -972,6 +1005,31 @@ pub async fn gateway_trusts_issuer_on_connection(
             .contains(&issuer_did),
         "gateway {gw_index}'s record for gateway {connection_gw} should list {issuer_did} as a trusted issuer, got {:?}",
         updated.trusted_issuer_dids
+    );
+}
+
+#[given(expr = "gateway {int} requires presentations addressed to it on its connection with gateway {int}")]
+pub async fn gateway_requires_addressed_presentations_on_connection(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    connection_gw: usize,
+) {
+    world.start().await;
+    let remote_id = remote_record_id(world, gw_index, connection_gw);
+    let updated = world
+        .harness()
+        .gw(gw_index)
+        .admin
+        .require_addressed_presentations(&remote_id, true)
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "require addressed presentations on gateway {gw_index}'s connection with gateway {connection_gw}: {error:#}"
+            )
+        });
+    assert!(
+        updated.require_addressed_presentations,
+        "gateway {gw_index}'s record for gateway {connection_gw} should require addressed presentations, got {updated:?}"
     );
 }
 
