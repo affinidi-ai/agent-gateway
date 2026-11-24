@@ -804,11 +804,8 @@ fn naming_trace(
     root: &std::path::Path,
     trace_id: Option<&str>,
 ) -> ReceivedMessage {
-    let mut message = forward_request(
-        root,
-        json!({ "content-type": "application/json", "x-api-key": REFUSED_KEY }),
-        a2a_body(),
-    );
+    let mut message =
+        forward_request(root, json!({ "content-type": "application/json", "x-api-key": REFUSED_KEY }), a2a_body());
     match trace_id {
         Some(trace_id) => message.message_body["trace_id"] = json!(trace_id),
         None => {
@@ -1051,7 +1048,10 @@ async fn a_modern_mcp_stream_continues_its_hyphenated_trace_in_the_written_form(
     } } });
     let mut message = forward_request(root.path(), headers.clone(), Value::Null);
     message.message_body["trace_id"] = json!(uuid::Uuid::parse_str(PEER_TRACE_ID).unwrap());
-    assert_eq!(message.message_body["trace_id"], "4bf92f35-77b3-4da6-a3ce-929d0e0e4736", "as the stream's Open names it");
+    assert_eq!(
+        message.message_body["trace_id"], "4bf92f35-77b3-4da6-a3ce-929d0e0e4736",
+        "as the stream's Open names it"
+    );
     let (result, events) = crate::audit::producer::capture(tokio::time::timeout(
         Duration::from_secs(10),
         Box::pin(super::process_stream_forward_request(
@@ -1109,12 +1109,7 @@ async fn a_framed_stream_refused_for_its_variant_records_its_trace_in_the_writte
         None,
     ))
     .await;
-    assert_eq!(
-        result
-            .err()
-            .as_deref(),
-        Some("Fabric stream variant is unavailable")
-    );
+    assert_eq!(result.err().as_deref(), Some("Fabric stream variant is unavailable"));
     let recorded: Vec<_> = events
         .iter()
         .map(|event| event.trace_id.clone())
@@ -1906,10 +1901,9 @@ fn a_fabric_token_names_every_transit_point_of_the_surface() {
 #[tokio::test]
 async fn a_fabric_request_is_refused_when_its_transit_token_cannot_be_issued() {
     let surface = surface("a2a", "https://agent.example", &["crm"]);
-    let (result, events) = crate::audit::producer::capture(async {
-        transit_token_unavailable_refusal(&surface, Some(PEER_TRACE_ID))
-    })
-    .await;
+    let (result, events) =
+        crate::audit::producer::capture(async { transit_token_unavailable_refusal(&surface, Some(PEER_TRACE_ID)) })
+            .await;
     let ProcessingResult::RequiresResponse { response_body, .. } = result else {
         panic!("expected a refusal, got {result:?}");
     };
@@ -1925,11 +1919,6 @@ async fn a_fabric_request_is_refused_when_its_transit_token_cannot_be_issued() {
         .collect();
     assert_eq!(
         rejected,
-        [(
-            RejectionStage::Forward,
-            RejectionReason::TransitTokenUnavailable,
-            true,
-            Some(PEER_TRACE_ID.to_string())
-        )]
+        [(RejectionStage::Forward, RejectionReason::TransitTokenUnavailable, true, Some(PEER_TRACE_ID.to_string()))]
     );
 }

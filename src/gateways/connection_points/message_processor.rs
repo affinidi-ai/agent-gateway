@@ -4311,9 +4311,7 @@ fn fabric_receive_trace_id(named: Option<&str>) -> String {
         }
         None => crate::proxy::trace::TraceId::mint(),
     };
-    trace_id
-        .as_str()
-        .to_string()
+    trace_id.as_str().to_string()
 }
 
 async fn process_forward_request_inner(
