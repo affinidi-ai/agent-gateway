@@ -402,7 +402,9 @@ seven days, or seven days without one. The startup cleanup of orphaned key direc
 keys of a permanent DID minted ahead of the pairing, a reservation or an acceptance's
 `secure_cp_id`, while a stored Connection Point names it. The same expiry
 bounds an acceptance's wait for approval, with or without the pause: a `pending` acceptance whose
-temporary Connection Point is unexpired survives a restart, and its listener is started again. A
+temporary Connection Point is unexpired survives a restart, and its listener is started again. The
+startup pass re-reads each Connection Point before it starts the listener, so a pairing that
+finishes during that pass leaves no listener on its deleted temporary Connection Point. A
 restart removes a paused gateway whose invitation has expired, and a `pending` one with no
 unexpired temporary Connection Point; one whose Connection Points cannot be read is kept. `GET …/{id}/mediator-access`
 returns the DIDs of a pause again: their role (`connection_point`, `temporary`, `permanent`), the

@@ -77,6 +77,16 @@ changes:
         page, which says the connection is pending, keeps Gateway Enabled off until the inviter
         accepts, and shows the issuer DIDs and surfaces only once it does. Rows waiting for
         approval or mediator access keep their own action.
+    - timestamp: '2026-11-23T16:00:00Z'
+      title: Keep a pairing finished just after a restart from leaving a stale listener
+      description: >-
+        The startup pass that restarts Connection Point listeners lists them once, about half a
+        second after boot. A pairing that a Continue finished in between deleted its temporary
+        Connection Point, but the pass still started a listener for it from that list, and a ping
+        could then go out from the temporary DID, which the peer's mediator refuses, so it timed
+        out. The pass now re-reads each Connection Point before starting its listener, skips one
+        that is gone or paused, and stops a listener whose Connection Point was deleted while it
+        started.
   removed: []
   security:
     - timestamp: '2026-11-20T11:00:00Z'

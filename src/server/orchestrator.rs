@@ -3418,7 +3418,13 @@ pub async fn run_axum_proxy(
                                         }
                                     };
 
-                                    // Start the listener
+                                    // The list was read once, and a pairing continued since then
+                                    // may have deleted or changed this point; start from what is
+                                    // stored now.
+                                    let Some(cp) = listenable_point(cp_store_clone.as_ref(), &cp).await else {
+                                        info!("  └─ Skipped: '{}' is gone or waits for mediator access", cp.name);
+                                        continue;
+                                    };
                                     info!("  └─ Starting listener...");
                                     if let Err(e) = manager_clone
                                         .start_listener(&cp, mediator_did, mediator_url, config_clone.clone())
@@ -3426,6 +3432,16 @@ pub async fn run_axum_proxy(
                                     {
                                         error!("     ❌ Failed to start listener for '{}': {}", cp.name, e);
                                         failed += 1;
+                                    } else if listenable_point(cp_store_clone.as_ref(), &cp)
+                                        .await
+                                        .is_none()
+                                    {
+                                        // Deleted while its listener started: stop it, so no
+                                        // listener is left on a DID whose pairing is over.
+                                        let _ = manager_clone
+                                            .stop_listener(&cp.id)
+                                            .await;
+                                        info!("     Stopped the listener of '{}': it was deleted meanwhile", cp.name);
                                     } else {
                                         info!("     ✅ Listener started successfully for '{}'", cp.name);
                                         started += 1;
@@ -5158,6 +5174,26 @@ async fn initialize_saml_state(
     })
 }
 
+/// The stored record of a connection point the start-up pass listed, when its listener
+/// should run: still stored and not waiting for mediator access. The pass lists the
+/// points once, and a pairing that continues meanwhile can delete its temporary point
+/// after that; a listener started from the list would then stay on that point's DID and
+/// could be picked to send for the paired gateway. A point that cannot be read is
+/// started as listed.
+async fn listenable_point<P: ConnectionPointStore + ?Sized>(
+    store: &P,
+    listed: &crate::gateways::connection_points::types::GatewayConnectionPoint,
+) -> Option<crate::gateways::connection_points::types::GatewayConnectionPoint> {
+    match store.get(&listed.id).await {
+        Ok(Some(point)) => (!point.awaiting_mediator_access).then_some(point),
+        Ok(None) => None,
+        Err(e) => {
+            warn!("Could not re-read connection point '{}' before starting its listener: {}", listed.id, e);
+            Some(listed.clone())
+        }
+    }
+}
+
 /// Removes the gateways paused for mediator access whose invitation has expired, with
 /// their system connection points and pending pairing. User connection points are kept,
 /// as a gateway delete keeps them. A gateway whose connection points cannot be read is kept.
@@ -6815,6 +6851,60 @@ mod startup_sweep_tests {
                 .get("tmp-abandoned")
                 .await
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_startup_pass_starts_only_points_still_stored_and_not_paused() {
+        let stores = stores().await;
+        let listed = temporary_point("gw-listed", Utc::now() + Duration::days(1), false);
+        stores
+            .points
+            .create(&listed)
+            .await
+            .unwrap();
+        assert_eq!(
+            super::listenable_point(&stores.points, &listed)
+                .await
+                .map(|point| point.id),
+            Some(listed.id.clone())
+        );
+
+        let mut paused = listed.clone();
+        paused.awaiting_mediator_access = true;
+        stores
+            .points
+            .update(&paused)
+            .await
+            .unwrap();
+        assert!(
+            super::listenable_point(&stores.points, &listed)
+                .await
+                .is_none(),
+            "a point paused since it was listed gets no listener"
+        );
+
+        stores
+            .points
+            .delete(&listed.id)
+            .await
+            .unwrap();
+        assert!(
+            super::listenable_point(&stores.points, &listed)
+                .await
+                .is_none(),
+            "a point deleted since it was listed, such as a finished pairing's temporary point, gets no listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_startup_pass_starts_a_point_it_cannot_re_read_as_listed() {
+        let listed = temporary_point("gw-unreadable", Utc::now() + Duration::days(1), false);
+        assert_eq!(
+            super::listenable_point(&UnreadablePoints, &listed)
+                .await
+                .map(|point| point.id),
+            Some(listed.id.clone())
         );
     }
 }
