@@ -20,11 +20,15 @@ export interface TemplateField {
   help?: string;
 }
 
-/** The webhook and stream payload of an empty template. */
+/**
+ * The webhook and stream payload of an empty template. Whatever a template writes, the gateway
+ * sets the top-level `event_id` and `occurred_at` and sends no top-level `timestamp`.
+ */
 export const DEFAULT_ENVELOPE = {
   event_type: '${EVENT_TYPE}',
   event_name: '${EVENT_NAME}',
-  timestamp: '${TIMESTAMP}',
+  event_id: '${EVENT_ID}',
+  occurred_at: '${OCCURRED_AT}',
   appliance_id: '${APPLIANCE_ID}',
   summary: '${EVENT_SUMMARY}',
   data: '${EVENT_DATA}',

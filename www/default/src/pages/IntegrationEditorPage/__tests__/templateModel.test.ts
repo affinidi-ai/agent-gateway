@@ -57,11 +57,21 @@ describe('template fields', () => {
     expect(DEFAULT_ENVELOPE).toEqual({
       event_type: '${EVENT_TYPE}',
       event_name: '${EVENT_NAME}',
-      timestamp: '${TIMESTAMP}',
+      event_id: '${EVENT_ID}',
+      occurred_at: '${OCCURRED_AT}',
       appliance_id: '${APPLIANCE_ID}',
       summary: '${EVENT_SUMMARY}',
       data: '${EVENT_DATA}',
     });
+    expect(Object.keys(DEFAULT_ENVELOPE)).toEqual([
+      'event_type',
+      'event_name',
+      'event_id',
+      'occurred_at',
+      'appliance_id',
+      'summary',
+      'data',
+    ]);
   });
 });
 
