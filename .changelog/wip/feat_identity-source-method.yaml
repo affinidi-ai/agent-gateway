@@ -8,9 +8,9 @@ changes:
         An inbound From JWT Claims identity now needs a JWT Bearer Caller Context method, and an
         inbound From API Key identity an API Key or API Key Provider method, instead of every
         method being of that kind. Callers of the method the identity reads get their identity
-        as before; callers authenticated by another method are served with no inbound identity,
-        neither derived from their credential nor taken from their request body, and the Target
-        receives no identity binding VP for them. A stored surface that mixed them answered
+        as before; callers authenticated by another method are served with no inbound identity:
+        none derived from their credential or taken from their request body, no agent DID in
+        policy input, and the identity proofs they send are removed so the Target receives none. A stored surface that mixed them answered
         those callers with 500; it now serves them without an identity.
   fixed: []
   removed: []

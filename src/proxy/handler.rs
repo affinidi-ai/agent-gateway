@@ -2846,6 +2846,18 @@ async fn proxy_charged_request(
         }
         create_error_response(StatusCode::BAD_REQUEST, "Failed to read request body")
     })?;
+    // A caller verified by a method the inbound identity does not read (an API
+    // key beside `from_jwt_claim`, a token beside `from_api_key`) gets no
+    // inbound identity: none its request body asserts or proves either.
+    let caller_identified = caller_gets_inbound_identity(&state.surface, authenticated_identity.as_ref());
+    if !caller_identified {
+        body_bytes = strip_caller_identity_proofs(
+            &body_bytes,
+            &state
+                .surface
+                .channel_protocol(),
+        );
+    }
     if let Some(policy) = &mcp_http
         && let Some(response) = policy.non_post_body_response(&method, &body_bytes)
     {
@@ -3392,7 +3404,14 @@ async fn proxy_charged_request(
             None
         };
     let mut pre_identity_agent_context = agent_context.clone();
-    bind_api_key_caller_did(&state.surface, method.as_str(), uri.path(), pre_identity_agent_context.as_mut(), None);
+    bind_api_key_caller_did(
+        &state.surface,
+        caller_identified,
+        method.as_str(),
+        uri.path(),
+        pre_identity_agent_context.as_mut(),
+        None,
+    );
 
     // ── Trust Check stage placeholder ───────────────────────────────────────
     // The caller-leg Trust Check stage runs at the single post-identity seam
@@ -4536,6 +4555,7 @@ async fn proxy_charged_request(
                 &headers,
                 &body_bytes,
                 authenticated_identity.as_ref(),
+                caller_identified,
                 source_auth_context.as_ref(),
                 mcp_context.as_ref(),
                 payment_context.as_ref(),
@@ -4595,6 +4615,7 @@ async fn proxy_charged_request(
                 &headers,
                 &body_bytes,
                 authenticated_identity.as_ref(),
+                caller_identified,
                 source_auth_context.as_ref(),
                 mcp_context.as_ref(),
                 payment_context.as_ref(),
@@ -4717,6 +4738,7 @@ async fn proxy_charged_request(
                 &headers,
                 &body_bytes,
                 authenticated_identity.as_ref(),
+                caller_identified,
                 source_auth_context.as_ref(),
                 mcp_context.as_ref(),
                 payment_context.as_ref(),
@@ -4846,6 +4868,7 @@ async fn proxy_charged_request(
                 &headers,
                 &body_bytes,
                 authenticated_identity.as_ref(),
+                caller_identified,
                 source_auth_context.as_ref(),
                 mcp_context.as_ref(),
                 payment_context.as_ref(),
@@ -5234,16 +5257,6 @@ async fn proxy_charged_request(
     };
 
     // ── Configured caller identity (FromMtls / FromApiKey / Static) ─────────
-    // A caller verified by a method the inbound identity does not read (an API
-    // key beside `from_jwt_claim`, a token beside `from_api_key`) gets no
-    // inbound identity, not even one its request body asserts.
-    let caller_identified = authenticated_identity
-        .as_ref()
-        .is_none_or(|caller| {
-            state
-                .surface
-                .inbound_identity_reads(caller)
-        });
     if !caller_identified {
         identity_result = None;
     }
@@ -5454,6 +5467,7 @@ async fn proxy_charged_request(
         });
     bind_api_key_caller_did(
         &state.surface,
+        caller_identified,
         method.as_str(),
         uri.path(),
         agent_context.as_mut(),
@@ -10818,15 +10832,17 @@ fn configured_caller_identity_applies(
 
 /// On an inbound `from_api_key` surface the caller is the presented key, so
 /// `input.agent.did` is the key's DID (or absent when none was resolved), never
-/// a DID the request body asserts. Other surfaces keep the body DID.
+/// a DID the request body asserts; a caller that gets no inbound identity
+/// (`caller_identified` false) has none either. Other callers keep the body DID.
 fn bind_api_key_caller_did(
     surface: &crate::config::agent_surface::AgentSurface,
+    caller_identified: bool,
     method: &str,
     path: &str,
     agent: Option<&mut crate::surface_context::AgentContext>,
     extension_identity: Option<&crate::surface_context::ExtensionIdentityContext>,
 ) {
-    if surface.inbound_identity_from_api_key()
+    if (surface.inbound_identity_from_api_key() || !caller_identified)
         && !crate::proxy::paths::is_public_request(method, path)
         && let Some(agent) = agent
     {
@@ -11135,6 +11151,17 @@ async fn handle_fabric_request_inner(
     } = request;
     let source_auth_failed =
         matches!(source_auth_context, Some(crate::surface_context::SourceAuthContext::Failed { .. }));
+    let caller_identified = caller_gets_inbound_identity(&state.surface, authenticated_identity.as_ref());
+    let body_bytes = if caller_identified {
+        body_bytes
+    } else {
+        strip_caller_identity_proofs(
+            &body_bytes,
+            &state
+                .surface
+                .channel_protocol(),
+        )
+    };
     let modern_mcp_context = mcp_classification.and_then(crate::mcp::modern_mcp_context);
     let mut modern_request = match mcp_classification {
         Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) => Some((**request).clone()),
@@ -11352,16 +11379,6 @@ async fn handle_fabric_request_inner(
     }
 
     // ── Configured caller identity (FromMtls / FromApiKey / Static) ─────────
-    // A caller verified by a method the inbound identity does not read (an API
-    // key beside `from_jwt_claim`, a token beside `from_api_key`) gets no
-    // inbound identity, not even one its request body asserts.
-    let caller_identified = authenticated_identity
-        .as_ref()
-        .is_none_or(|caller| {
-            state
-                .surface
-                .inbound_identity_reads(caller)
-        });
     if !caller_identified {
         identity_result = None;
     }
@@ -11630,6 +11647,7 @@ async fn handle_fabric_request_inner(
         };
         bind_api_key_caller_did(
             &state.surface,
+            caller_identified,
             method.as_str(),
             uri.path(),
             agent_ctx.as_mut(),
@@ -15228,6 +15246,7 @@ async fn evaluate_mcp_proxy_opa_policies(
     headers: &HeaderMap,
     body_bytes: &[u8],
     authenticated_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
+    caller_identified: bool,
     source_auth_context: Option<&crate::surface_context::SourceAuthContext>,
     mcp_context: Option<&crate::surface_context::McpContext>,
     payment_context: Option<&crate::surface_context::PaymentContext>,
@@ -15291,7 +15310,7 @@ async fn evaluate_mcp_proxy_opa_policies(
             .await,
         );
     }
-    bind_api_key_caller_did(&state.surface, method, uri.path(), policy_input.agent.as_mut(), None);
+    bind_api_key_caller_did(&state.surface, caller_identified, method, uri.path(), policy_input.agent.as_mut(), None);
     policy_input.normalize_caller_did();
 
     // ── Trust Check stage (caller leg) ─────────────────────────────────────
@@ -16608,6 +16627,73 @@ fn has_vp_injection_prerequisites(
     }
 
     has_prerequisites
+}
+
+/// Whether a caller verified as `caller` gets an inbound identity: always,
+/// unless the inbound identity reads a credential of another kind (see
+/// [`crate::config::agent_surface::AgentSurface::inbound_identity_reads`]).
+fn caller_gets_inbound_identity(
+    surface: &crate::config::agent_surface::AgentSurface,
+    caller: Option<&crate::source_auth::AuthenticatedIdentity>,
+) -> bool {
+    caller.is_none_or(|caller| surface.inbound_identity_reads(caller))
+}
+
+/// The identity proofs a caller can put in its request body: the identity
+/// binding VP and the identity credential.
+const CALLER_IDENTITY_PROOFS: [&str; 2] = [
+    crate::config::AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION,
+    crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION,
+];
+
+/// `body_bytes` without the identity proofs its caller put in it (MCP `_meta`
+/// entries, A2A and AP2 message metadata and extension URIs), for a caller that
+/// gets no inbound identity, so none of its own reaches the Target. A body that
+/// is not JSON, or of another protocol, carries no such proof and is returned
+/// as it is.
+fn strip_caller_identity_proofs(
+    body_bytes: &bytes::Bytes,
+    protocol: &crate::config::ChannelProtocol,
+) -> bytes::Bytes {
+    let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
+        return body_bytes.clone();
+    };
+    match protocol {
+        crate::config::ChannelProtocol::Mcp => {
+            for key in CALLER_IDENTITY_PROOFS {
+                crate::mcp::meta::remove_metadata_key(&mut body, key);
+            }
+        }
+        crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2 => {
+            for pointer in ["/params/message", "/message"] {
+                let Some(message) = body
+                    .pointer_mut(pointer)
+                    .and_then(serde_json::Value::as_object_mut)
+                else {
+                    continue;
+                };
+                if let Some(metadata) = message
+                    .get_mut("metadata")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    for key in CALLER_IDENTITY_PROOFS {
+                        metadata.remove(key);
+                    }
+                }
+                if let Some(extensions) = message
+                    .get_mut("extensions")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    extensions.retain(|uri| {
+                        !uri.as_str()
+                            .is_some_and(|uri| CALLER_IDENTITY_PROOFS.contains(&uri))
+                    });
+                }
+            }
+        }
+        _ => return body_bytes.clone(),
+    }
+    serde_json::to_vec(&body).map_or_else(|_| body_bytes.clone(), bytes::Bytes::from)
 }
 
 /// Inject an identity binding VP into an outbound request body.
@@ -23630,24 +23716,25 @@ allow if {
             };
 
             let mut agent = asserted_agent();
-            super::super::bind_api_key_caller_did(&api_key, "POST", "/mcp", Some(&mut agent), Some(&key));
+            super::super::bind_api_key_caller_did(&api_key, true, "POST", "/mcp", Some(&mut agent), Some(&key));
             assert_eq!(agent.did.as_deref(), Some("did:webvh:key"));
             assert_eq!(agent.did_verification, Some(IdentityVerification::SourceAuth));
 
             let mut agent = asserted_agent();
-            super::super::bind_api_key_caller_did(&api_key, "POST", "/mcp", Some(&mut agent), None);
+            super::super::bind_api_key_caller_did(&api_key, true, "POST", "/mcp", Some(&mut agent), None);
             assert_eq!(agent.did, None);
 
             let mut agent = asserted_agent();
             agent.did = None;
             agent.provider_did = Some("did:web:provider.example".into());
-            super::super::bind_api_key_caller_did(&api_key, "POST", "/mcp", Some(&mut agent), None);
+            super::super::bind_api_key_caller_did(&api_key, true, "POST", "/mcp", Some(&mut agent), None);
             assert_eq!(agent.did, None);
             assert_eq!(agent.provider_did, None);
 
             let mut agent = asserted_agent();
             super::super::bind_api_key_caller_did(
                 &api_key,
+                true,
                 "GET",
                 "/.well-known/agent-card.json",
                 Some(&mut agent),
@@ -23681,6 +23768,7 @@ allow if {
                 &axum::http::HeaderMap::new(),
                 &body,
                 None,
+                true,
                 None,
                 None,
                 None,
@@ -23730,10 +23818,98 @@ allow if {
             ];
             for surface in &surfaces {
                 let mut agent = asserted_agent();
-                super::super::bind_api_key_caller_did(surface, "POST", "/mcp", Some(&mut agent), Some(&key));
+                super::super::bind_api_key_caller_did(surface, true, "POST", "/mcp", Some(&mut agent), Some(&key));
                 assert_eq!(agent.did.as_deref(), Some("did:web:asserted.example"));
                 assert_eq!(agent.did_verification, None);
             }
+        }
+
+        #[test]
+        fn a_caller_that_gets_no_inbound_identity_keeps_no_body_asserted_did() {
+            let surface = surface_with(
+                "jwt-claim-beside-api-key",
+                Some(ManagedIdentityConfig::FromJwtClaim {
+                    claim: "sub".into(),
+                    namespace_claims: vec!["iss".into()],
+                }),
+                None,
+            );
+
+            let mut agent = asserted_agent();
+            agent.provider_did = Some("did:web:provider.example".into());
+            super::super::bind_api_key_caller_did(&surface, false, "POST", "/mcp", Some(&mut agent), None);
+
+            assert_eq!(agent.did, None);
+            assert_eq!(agent.provider_did, None);
+        }
+
+        #[test]
+        fn a_caller_that_gets_no_inbound_identity_sends_no_a2a_identity_proof() {
+            let binding = crate::config::AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION;
+            let credential = crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION;
+            let body = serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "message/send",
+                "params": {"message": {
+                    "role": "user", "messageId": "m1", "parts": [{"kind": "text", "text": "hi"}],
+                    "extensions": [binding, credential, "https://example.com/other/v1"],
+                    "metadata": {
+                        binding: {"verifiablePresentation": "caller-made"},
+                        credential: {"credential": "caller-made"},
+                        "https://example.com/other/v1": {"kept": true}
+                    }
+                }}
+            });
+
+            let stripped = super::super::strip_caller_identity_proofs(
+                &serde_json::to_vec(&body)
+                    .unwrap()
+                    .into(),
+                &crate::config::ChannelProtocol::A2a,
+            );
+            let stripped: serde_json::Value = serde_json::from_slice(&stripped).unwrap();
+
+            let message = &stripped["params"]["message"];
+            assert_eq!(message["extensions"], serde_json::json!(["https://example.com/other/v1"]));
+            assert_eq!(message["metadata"], serde_json::json!({"https://example.com/other/v1": {"kept": true}}));
+            assert_eq!(message["parts"], body["params"]["message"]["parts"]);
+        }
+
+        #[test]
+        fn a_caller_that_gets_no_inbound_identity_sends_no_mcp_identity_proof() {
+            let binding = crate::config::AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION;
+            let body = serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                "params": {"_meta": {
+                    binding: {"verifiablePresentation": "caller-made"},
+                    crate::config::MCP_TRUST_REGISTRY_KEY: {"agent_did": "did:web:asserted.example"}
+                }}
+            });
+
+            let stripped = super::super::strip_caller_identity_proofs(
+                &serde_json::to_vec(&body)
+                    .unwrap()
+                    .into(),
+                &crate::config::ChannelProtocol::Mcp,
+            );
+            let stripped: serde_json::Value = serde_json::from_slice(&stripped).unwrap();
+
+            assert!(
+                stripped["params"]["_meta"]
+                    .get(binding)
+                    .is_none(),
+                "{stripped}"
+            );
+            assert!(
+                stripped["params"]["_meta"]
+                    .get(crate::config::MCP_TRUST_REGISTRY_KEY)
+                    .is_some()
+            );
+        }
+
+        #[test]
+        fn a_body_that_is_not_json_is_forwarded_as_it_is() {
+            let body = axum::body::Bytes::from_static(b"not json");
+            assert_eq!(super::super::strip_caller_identity_proofs(&body, &crate::config::ChannelProtocol::A2a), body);
         }
     }
 

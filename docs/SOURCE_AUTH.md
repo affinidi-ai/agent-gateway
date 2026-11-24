@@ -206,8 +206,9 @@ Both identity rules follow from the caller: `from_jwt_claim` needs a verified JW
 `from_jwt_claim` identity identifies the callers of a `jwt_bearer` method and an inbound
 `from_api_key` identity those of an API key method. A caller authenticated by any other method
 is served with no inbound identity: none is derived from its credential or taken from its request
-body, `input.agent.did` is absent on a `from_api_key` surface, and the Target receives no identity
-binding VP for it. Policy tells these callers apart by `input.source_auth.method` and `key_name`;
+body, `input.agent.did` is absent, and the identity binding VP and identity credential it puts in
+its request are removed, so the Target receives no identity proof for it, on direct requests and
+Fabric send. Policy tells these callers apart by `input.source_auth.method` and `key_name`;
 to keep them out, deny the methods that get no identity, for example
 `input.source_auth.method != "jwt_bearer"` beside `from_jwt_claim`. Fabric receive does not read
 these identities; the request body sets the caller there. A `from_jwt_claim` DID is derived from

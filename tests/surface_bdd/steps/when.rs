@@ -2743,6 +2743,43 @@ async fn request_with_valid_api_key(world: &mut SurfaceWorld) {
     send_request_and_record(world, vec![header]).await;
 }
 
+/// `body`, an A2A message, carrying the caller's own identity proofs: an
+/// identity binding VP and an identity credential naming a DID it asserts.
+fn with_caller_identity_proof(mut body: serde_json::Value) -> serde_json::Value {
+    const BINDING: &str = "https://fabric.affinidi.io/extensions/agent-identity-binding/v1";
+    const CREDENTIAL: &str = "https://fabric.affinidi.io/extensions/agent-identity-credential/v1";
+    let message = body
+        .pointer_mut("/params/message")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("an A2A message/send request");
+    message.insert("extensions".to_string(), serde_json::json!([BINDING, CREDENTIAL]));
+    message.insert(
+        "metadata".to_string(),
+        serde_json::json!({
+            BINDING: {"verifiablePresentation": "caller-made-presentation"},
+            CREDENTIAL: {"did": "did:web:asserted.example", "verifiablePresentation": "caller-made-presentation"}
+        }),
+    );
+    body
+}
+
+#[when("the caller sends a request to the surface with a valid API key and an identity proof of its own")]
+async fn request_with_valid_api_key_and_own_identity_proof(world: &mut SurfaceWorld) {
+    let header = build_valid_api_key_source_auth_header(world);
+    let body = with_caller_identity_proof(build_request_body(&world.surface_config.protocol));
+    send_json_request_and_record(world, body, vec![header]).await;
+}
+
+#[when("the caller sends a request to the surface with a valid token and an identity proof of its own")]
+async fn request_with_valid_token_and_own_identity_proof(world: &mut SurfaceWorld) {
+    ensure_gateway_running(world).await;
+    let issuer = get_jwt_source_auth_issuer(world);
+    let audience = caller_token_audience(world);
+    let token = create_valid_jwt_for_issuer_with_audience(issuer, audience);
+    let body = with_caller_identity_proof(build_request_body(&world.surface_config.protocol));
+    send_json_request_and_record(world, body, vec![("authorization".to_string(), format!("Bearer {token}"))]).await;
+}
+
 #[when(expr = "the caller sends a request to the surface path {string} with a valid alternate variant API key")]
 async fn request_to_path_with_alternate_variant_api_key(
     world: &mut SurfaceWorld,
