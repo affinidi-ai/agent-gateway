@@ -115,7 +115,20 @@ changes:
         channel prefix, which leaves the $ in a later segment. A point whose listen_path is one
         of its own routes is unaffected, and, as with the other listen_path refusals, only a path
         a save introduces or changes is refused, so a surface already stored with such a clash
-        stays editable.
+        stays editable. A point claiming its own derived route is unaffected, since that route
+        reaches the Target it names either way, but claiming one of its own variant routes is
+        refused too: the listen_path registration wins over the variant one, so a caller that
+        named the variant would be served by the default variant's Target.
+    - timestamp: '2026-11-24T12:10:00Z'
+      title: Refuse a listen_path whose only segment is trailing slashes
+      description: >-
+        The outbound listener trims every trailing slash from a listen_path before registering
+        it, which the check for a segment of its own under a surface prefix did not: it counted
+        the slashes themselves. A path such as /outbound/<channel>// was accepted and registered
+        as the bare prefix and its wildcard, so the point answered every request under that
+        prefix no more specific route matched, where the caller should have had a 404. Such a
+        path is now refused with 400 and the code listen_path_not_a_channel_prefix, as the bare
+        prefix already was.
     - timestamp: '2026-11-24T09:35:00Z'
       title: Read a shared outbound hostname as the inbound proxy does
       description: >-

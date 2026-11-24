@@ -820,13 +820,24 @@ pub(crate) fn listen_path_prefixes(network_config: &crate::config::NetworkConfig
 /// own after it. A bare prefix claims the whole surface prefix, and a path
 /// under no prefix at all claims a route the gateway serves no Transit Point
 /// on.
+///
+/// Read as the outbound listener registers it, which trims every trailing
+/// slash: `/<channel>//` is the bare prefix and its wildcard once registered,
+/// so the slashes are no segment of its own however many there are. A segment
+/// is one with something in it, so `/<channel>//x` claims `x`.
 fn claims_a_channel_prefix(
     path: &str,
     prefixes: &[String],
 ) -> bool {
+    let path = path.trim_end_matches('/');
     prefixes.iter().any(|prefix| {
         path.strip_prefix(prefix.as_str())
-            .is_some_and(|rest| rest.starts_with('/') && rest.len() > 1)
+            .is_some_and(|rest| {
+                rest.starts_with('/')
+                    && !rest
+                        .trim_matches('/')
+                        .is_empty()
+            })
     })
 }
 
@@ -4305,6 +4316,33 @@ mod tests {
         assert_eq!(problems.len(), 1, "only the point on the shared listener is unreachable: {problems:?}");
         assert_eq!(problems[0].claim, (None, "on-shared", "/transit/a"));
         assert_eq!(problems[0].code, LISTEN_PATH_NOT_SERVED);
+    }
+
+    /// The outbound listener trims every trailing slash before registering a
+    /// `listen_path`, so slashes are no segment of their own: `/outbound/x//`
+    /// would register the bare prefix and its wildcard, answering every request
+    /// under it that no more specific route matches.
+    #[test]
+    fn trailing_slashes_are_no_segment_under_a_surface_prefix() {
+        let surface = surface_with_points(
+            serde_json::json!([
+                { "alias": "slashes", "target_endpoint": "https://a.example", "listen_path": "/outbound/example//" },
+                { "alias": "one-slash", "target_endpoint": "https://b.example", "listen_path": "/outbound/example/" },
+                { "alias": "segment", "target_endpoint": "https://c.example", "listen_path": "/outbound/example//x" }
+            ]),
+            serde_json::json!([]),
+        );
+
+        let problems = listen_path_problems(&surface, &channel_config());
+        let told: Vec<(&str, &str)> = problems
+            .iter()
+            .map(|problem| (problem.claim.1, problem.code))
+            .collect();
+        assert_eq!(
+            told,
+            vec![("slashes", LISTEN_PATH_NOT_A_CHANNEL_PREFIX), ("one-slash", LISTEN_PATH_NOT_A_CHANNEL_PREFIX)],
+            "a path whose only remainder is slashes claims the bare prefix; one with a segment is served"
+        );
     }
 
     #[test]

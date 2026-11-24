@@ -1978,10 +1978,11 @@ pub struct TransitPoint {
     /// inbound listener that shares a hostname with the outbound one forwards
     /// `/outbound` and nothing else, so on such a deployment only the derived
     /// route, or a `listen_path` under `/outbound`, is reachable from another
-    /// host, so the save warns about such a path and stores it. `/outbound`
-    /// itself answers every outbound request no more specific route matches,
-    /// and a path the router cannot register panics the listener build; the
-    /// save that introduces either is refused.
+    /// host. A save that introduces such a path there is refused; one the
+    /// surface already holds unchanged is stored and answered with a warning.
+    /// `/outbound` itself answers every outbound request no more specific route
+    /// matches, and a path the router cannot register panics the listener
+    /// build; the save that introduces either is refused, on every deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_path: Option<String>,
 

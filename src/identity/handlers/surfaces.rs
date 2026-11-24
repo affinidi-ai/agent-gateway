@@ -2346,7 +2346,9 @@ async fn validate_listen_paths(
 /// [`check_listen_path_collisions`] is.
 ///
 /// A point whose `listen_path` is its own derived route is left alone: the
-/// route is registered for it either way and reaches the Target it names.
+/// route is registered for it either way and reaches the Target it names. Its
+/// own variant routes are not, since claiming one makes the point answer the
+/// variant's callers from the default variant.
 ///
 /// Only a path this save introduces or changes is refused, as in
 /// [`check_listen_paths`], so a surface stored with such a clash stays
@@ -2401,22 +2403,41 @@ fn check_listen_path_shadowing(
         if kept.contains(&claim) {
             continue;
         }
-        let owner = match derived.get(&claim) {
-            // A point's own route reaches the Target it names, so claiming it
-            // changes nothing.
-            Some(RouteOwner::Mine { alias }) if *alias == tp.alias => continue,
-            Some(RouteOwner::Mine { alias }) => format!("Transit Point '{alias}' of this surface"),
-            Some(RouteOwner::Theirs { surface, alias }) => {
-                format!("Transit Point '{alias}' of surface '{surface}'")
-            }
+        // A point claiming its own derived route changes nothing: that route is
+        // registered for it either way and reaches the Target it names. Only
+        // that one route is exempt, never a variant form of it, which is a
+        // route of the same point but not the same request: the `listen_path`
+        // registration wins over the variant one, and the handler then reads
+        // the path as the custom route rather than as `route$variant`, so a
+        // caller that named the variant is served by the default variant's
+        // Target instead.
+        if *path == crate::proxy::outbound_handler::transit_point_outbound_path(surface.route(), &tp.alias) {
+            continue;
+        }
+        let reason = match derived.get(&claim) {
             None => continue,
+            Some(RouteOwner::Mine { alias }) if *alias == tp.alias => {
+                "a variant route this Transit Point already answers on, where the listen_path registration wins \
+                 and a caller that named the variant reaches the default variant's Target instead"
+                    .to_string()
+            }
+            Some(RouteOwner::Mine { alias }) => {
+                format!(
+                    "a route Transit Point '{alias}' of this surface answers on, so the listener would register \
+                     one of the two and skip the other"
+                )
+            }
+            Some(RouteOwner::Theirs { surface, alias }) => {
+                format!(
+                    "a route Transit Point '{alias}' of surface '{surface}' answers on, so the listener would \
+                     register one of the two and skip the other"
+                )
+            }
         };
         return Err(SurfaceApiError::BadRequest(format!(
-            "listen_path '{}' on {} is a route {} answers on, so the listener would register one of the two and \
-             skip the other — choose a different listener path",
+            "listen_path '{}' on {} is {reason}; choose a different listener path",
             path,
-            key.label("outbound"),
-            owner
+            key.label("outbound")
         )));
     }
 
@@ -9645,6 +9666,47 @@ mod validation_tests {
             other => panic!("expected a refusal, got {other:?}"),
         };
         assert!(message.contains("surface 'Orders'"), "{message}");
+    }
+
+    /// Its own derived route is exempt; its own variant route is not. The
+    /// listen_path registration wins over the variant one, and the handler then
+    /// reads the path as the custom route, so the variant's callers would be
+    /// served by the default variant.
+    #[test]
+    fn a_points_own_variant_route_is_not_exempt() {
+        let mut surface = surface_with_points(
+            "s1",
+            "one",
+            serde_json::json!([{ "alias": "alpha", "target_endpoint": "https://a.example", "protocol": "a2a" }]),
+        );
+        surface.access_point.route = "/agents/orders".to_string();
+        surface.variants = serde_json::from_value(serde_json::json!([{
+            "id": "v1", "alias": "beta", "name": "Beta", "enabled": true, "overrides": {}
+        }]))
+        .expect("variant fixture");
+
+        let mut own_derived = surface.clone();
+        own_derived
+            .transit
+            .as_mut()
+            .expect("transit")
+            .points[0]
+            .listen_path = Some("/outbound/agents/orders/alpha".to_string());
+        check_listen_path_shadowing(&own_derived, None, &[], &no_ports)
+            .expect("its own derived route reaches the Target it names");
+
+        let mut own_variant = surface.clone();
+        own_variant
+            .transit
+            .as_mut()
+            .expect("transit")
+            .points[0]
+            .listen_path = Some("/outbound/agents/orders$beta/alpha".to_string());
+        let message = match check_listen_path_shadowing(&own_variant, None, &[], &no_ports) {
+            Err(SurfaceApiError::BadRequest(message)) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert!(message.contains("default variant's Target"), "{message}");
     }
 
     #[test]
