@@ -234,6 +234,29 @@ impl VtaConnectionRegistry {
         Ok(client)
     }
 
+    /// A tenant's connection is dialled only while its endpoint's host resolves
+    /// to public addresses, so a name re-pointed at an internal address after
+    /// it was saved is refused before the gateway connects.
+    async fn assert_tenant_endpoint_public(connection: &VtaConnection) -> Result<(), VtaError> {
+        if connection.tenant_id.is_none() || connection.transport != VtaConnectionTransport::Https {
+            return Ok(());
+        }
+        let endpoint = connection
+            .endpoint
+            .trim()
+            .to_string();
+        tokio::task::spawn_blocking(move || crate::url_validation::validate_resolved_webhook_url(&endpoint))
+            .await
+            .map_err(|e| VtaError::Config(format!("the endpoint check did not finish: {e}")))?
+            .map(|_| ())
+            .map_err(|e| {
+                VtaError::Config(format!(
+                    "VTA connection `{}` is not usable: a tenant's trust agent endpoint must resolve to public addresses: {e}",
+                    connection.id
+                ))
+            })
+    }
+
     /// What the record of `connection_id` says about its use: in use, retired
     /// (deleted, disabled or revoked), or unknown when it cannot be read, whose
     /// keys stop being trusted rather than staying trusted on an error.
@@ -297,6 +320,7 @@ impl VtaConnectionRegistry {
         connection
             .validate()
             .map_err(|e| VtaError::Config(format!("VTA connection `{}` is not usable: {e}", connection.id)))?;
+        Self::assert_tenant_endpoint_public(connection).await?;
 
         let control_key = self
             .control_key(connection)
@@ -430,6 +454,7 @@ impl VtaConnectionRegistry {
         connection: &VtaConnection,
     ) -> Result<Arc<VtaRestClient>, VtaError> {
         Self::assert_record_usable(connection)?;
+        Self::assert_tenant_endpoint_public(connection).await?;
 
         // Same exemption as `build`: the bootstrap connection's client is the
         // one `[vta]` already dialled, and re-dialling it would open a second

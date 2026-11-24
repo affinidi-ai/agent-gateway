@@ -289,7 +289,12 @@ never verified this way: its identity rests on TLS to `base_url`.
 
 A connection's `endpoint`, and the `[vta]` block's `base_url`, must be `https`; plain `http` is
 accepted only to a loopback address (`127.0.0.0/8`, `::1`, `localhost`), so the session token
-never crosses the network in clear, and cloud metadata hosts are refused.
+never crosses the network in clear, and cloud metadata hosts are refused. An endpoint carries no
+query or fragment. A tenant's connection is held to public addresses, as a webhook is: its
+endpoint may not name a loopback, private or link-local address when saved, and its host must
+resolve to public addresses each time the gateway dials it (Verify and building its client), so a
+name re-pointed at an internal address later is refused. Appliance-wide connections may still
+reach a trust agent on the gateway's own network.
 
 ### Disconnecting
 

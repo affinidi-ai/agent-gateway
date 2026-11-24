@@ -288,10 +288,15 @@ impl SigningKeys {
 
 /// A trust agent endpoint is `https`, and plain `http` only to a loopback host,
 /// where the traffic never leaves this machine (a co-located agent in
-/// development). A cloud-provider metadata service is never an endpoint.
+/// development). A cloud-provider metadata service is never an endpoint, and an
+/// endpoint carries no query or fragment. A tenant's connection is further held
+/// to public addresses (see [`VtaConnection::validate`]).
 pub(crate) fn validate_endpoint_url(endpoint: &str) -> Result<(), String> {
     let url = crate::url_validation::validate_url_not_cloud_metadata_host(endpoint)
         .map_err(|e| format!("endpoint is not valid: {e}"))?;
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("endpoint must not carry a query or a fragment".to_string());
+    }
     if url.scheme() == "https" {
         return Ok(());
     }
@@ -343,6 +348,12 @@ impl VtaConnection {
         let endpoint = self.endpoint.trim();
         if self.transport == VtaConnectionTransport::Https || endpoint.starts_with("http") {
             validate_endpoint_url(endpoint)?;
+            // A tenant's connection is dialled by the appliance on the tenant's
+            // say-so, so it may name only a public address, as a webhook may.
+            if self.tenant_id.is_some() {
+                crate::url_validation::validate_webhook_url(endpoint)
+                    .map_err(|e| format!("a tenant's trust agent endpoint must be a public https address: {e}"))?;
+            }
         }
         // A control key is how the gateway authenticates to the VTA. Without
         // one there is nothing to sign the handshake with, so an enabled
@@ -756,6 +767,42 @@ mod tests {
             .expect("a didcomm mediator may be named by DID");
         c.endpoint = "http://mediator.example".to_string();
         assert!(c.validate().is_err(), "a mediator URL follows the same rule");
+    }
+
+    /// A tenant's connection may name only a public address; the appliance's
+    /// own may still reach a co-located agent. No endpoint carries a query or
+    /// a fragment.
+    #[test]
+    fn a_tenants_endpoint_is_public_and_no_endpoint_carries_a_query() {
+        for endpoint in
+            ["https://127.0.0.1:8443", "https://10.0.0.5:8443", "https://192.168.1.4", "http://localhost:3000"]
+        {
+            let mut tenant = connection("c1");
+            tenant.tenant_id = Some("tenant-a".to_string());
+            tenant.endpoint = endpoint.to_string();
+            assert!(tenant.validate().is_err(), "a tenant's `{endpoint}` must be refused");
+
+            let mut appliance = connection("c1");
+            appliance.endpoint = endpoint.to_string();
+            appliance
+                .validate()
+                .unwrap_or_else(|e| panic!("the appliance's `{endpoint}` was refused: {e}"));
+        }
+        let mut tenant = connection("c1");
+        tenant.tenant_id = Some("tenant-a".to_string());
+        tenant.endpoint = "https://vta.customer.example".to_string();
+        tenant
+            .validate()
+            .expect("a tenant may name a public host");
+
+        for endpoint in ["https://vta.customer.example/?next=x", "https://vta.customer.example/#frag"] {
+            let mut c = connection("c1");
+            c.endpoint = endpoint.to_string();
+            let err = c
+                .validate()
+                .expect_err(endpoint);
+            assert!(err.contains("query or a fragment"), "`{endpoint}`: {err}");
+        }
     }
 
     #[tokio::test]

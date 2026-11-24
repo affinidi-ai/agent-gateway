@@ -184,7 +184,9 @@ changes:
         trust agent addresses of the connections it may see, without the
         appliance control DID or control key. Onboarding an agent falls back to
         a gateway-held key only when the trust agent refuses with 403, and
-        fails while the agent cannot be reached.
+        fails while the agent cannot be reached. A tenant's connection may name only a
+        public https address, checked when it is saved and before each dial,
+        and no connection endpoint carries a query or a fragment.
     - timestamp: '2026-11-24T10:15:00Z'
       title: Show the trust agent's state and reasons in the dashboard
       description: >-

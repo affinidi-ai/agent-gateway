@@ -121,6 +121,55 @@ async fn gateway_signs_through_the_trust_agent_by_default(world: &mut SurfaceWor
     assert_eq!(response.status, 200, "setting the gateway-wide signing default: {}", response.body);
 }
 
+#[given("Gateway signing moves to the gateway's own key")]
+async fn gateway_signing_moves_to_the_gateways_own_key(world: &mut SurfaceWorld) {
+    let body = json!({ "default_signing": { "backend": "local" } });
+    let response = send(world, Method::POST, "/v1/settings", Some(&body)).await;
+    assert_eq!(response.status, 200, "moving Gateway signing to the gateway's own key: {}", response.body);
+}
+
+#[given("the operator revokes that trust agent's connection")]
+async fn operator_revokes_that_trust_agents_connection(world: &mut SurfaceWorld) {
+    let path = format!(
+        "/v1/vta/connections/{}/revoke?acknowledge_signing_users=true&acknowledge_stranded_agents=true",
+        world.trust_agent_connections[CONNECTION]
+    );
+    let response = send(world, Method::POST, &path, None).await;
+    assert_eq!(response.status, 200, "revoking the trust agent's connection: {}", response.body);
+}
+
+/// Whether `/oauth2/jwks.json` publishes the trust agent's key now.
+async fn publishes_the_trust_agents_key(world: &SurfaceWorld) -> bool {
+    let port = world
+        .infra
+        .as_ref()
+        .expect("the gateway is running")
+        .gateway_port;
+    let keys: Value = reqwest::get(format!("http://127.0.0.1:{port}/api/oauth2/jwks.json"))
+        .await
+        .expect("the key set request completes")
+        .json()
+        .await
+        .expect("the key set is JSON");
+    let agent = agent(world);
+    keys["keys"]
+        .as_array()
+        .is_some_and(|keys| {
+            keys.iter()
+                .any(|key| key["kid"] == agent.key_id())
+        })
+}
+
+#[then("the gateway still publishes the trust agent's key")]
+async fn gateway_still_publishes_the_trust_agents_key(world: &mut SurfaceWorld) {
+    assert!(publishes_the_trust_agents_key(world).await, "the earlier signer's key is published");
+}
+
+#[then("the gateway no longer publishes the trust agent's key")]
+async fn gateway_no_longer_publishes_the_trust_agents_key(world: &mut SurfaceWorld) {
+    assert!(!publishes_the_trust_agents_key(world).await, "a retired signer's key is not published");
+}
+
 #[given("the surface signs through that trust agent")]
 async fn surface_signs_through_the_trust_agent(world: &mut SurfaceWorld) {
     let name = world

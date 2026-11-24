@@ -71,3 +71,26 @@ Feature: What the gateway signs through a trust agent verifies against the trust
     When the caller fetches the agent card for surface "orders"
     Then the response status is 200
     And the agent card carries a presentation whose credential the trust agent context issued
+
+  Scenario: A token the trust agent signed is still accepted after Gateway signing moves off it
+    Given the operator has connected a trust agent that signs as its context "orders" with key "orders-key"
+    And the gateway signs through that trust agent by default
+    And the operator has a managed connection for agent "alpha" allowing audience "/reports"
+    And agent "alpha" holds an identity assertion for subject "did:example:user"
+    And agent "alpha" has exchanged the identity assertion for a token scoped to audience "/reports"
+    And Gateway signing moves to the gateway's own key
+    When agent "alpha" exchanges the issued token for a token scoped to audience "/reports"
+    Then the response status is 200
+    And the gateway still publishes the trust agent's key
+
+  Scenario: A token the trust agent signed is refused once its connection is revoked
+    Given the operator has connected a trust agent that signs as its context "orders" with key "orders-key"
+    And the gateway signs through that trust agent by default
+    And the operator has a managed connection for agent "alpha" allowing audience "/reports"
+    And agent "alpha" holds an identity assertion for subject "did:example:user"
+    And agent "alpha" has exchanged the identity assertion for a token scoped to audience "/reports"
+    And Gateway signing moves to the gateway's own key
+    And the operator revokes that trust agent's connection
+    When agent "alpha" exchanges the issued token for a token scoped to audience "/reports"
+    Then no token is issued
+    And the gateway no longer publishes the trust agent's key
