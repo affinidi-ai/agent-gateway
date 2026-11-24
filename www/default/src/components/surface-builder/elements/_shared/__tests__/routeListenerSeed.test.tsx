@@ -1,5 +1,5 @@
 import React from 'react';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import RouteListenerSection from '../RouteListenerSection';
 import { fetchRoutingConfig, type RoutingConfig } from '../../access-point/defaults';
@@ -116,9 +116,7 @@ describe('a Transit Point on an outbound address with a hostname of its own', ()
 
     // Wait for the routing config, so the field is the one the loaded section renders.
     await waitFor(() => expect(screen.getAllByRole('option').length).toBeGreaterThan(1));
-    await act(async () => {
-      fireEvent.change(screen.getByPlaceholderText('my-agent/v1'), { target: { value: '' } });
-    });
+    fireEvent.change(screen.getByPlaceholderText('my-agent/v1'), { target: { value: '' } });
 
     expect(updateFields).toHaveBeenCalledWith(expect.objectContaining({ listen_path: '' }));
     expect(held.listen_path).toBe('');
