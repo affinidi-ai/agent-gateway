@@ -439,7 +439,11 @@ async fn sign_in_with_saml_layout(
             .await;
     world.caller_response = Some(crate::bdd_support::admin_client::RecordedResponse {
         status: answer.status,
-        headers: Default::default(),
+        headers: if answer.set_cookies.is_empty() {
+            Default::default()
+        } else {
+            [("set-cookie".to_string(), answer.set_cookies.join("\n"))].into()
+        },
         body: serde_json::from_str(&answer.body).unwrap_or(Value::String(answer.body)),
     });
 }
@@ -618,6 +622,53 @@ fn event_has_the_fields_naming_an_account(world: &mut SurfaceWorld) {
 #[then("that event carries only the fields of a sign-in event for no account")]
 fn event_has_the_fields_naming_no_account(world: &mut SurfaceWorld) {
     assert_exact_fields(sign_in_event(world), false);
+}
+
+#[then("the gateway issues no session cookie")]
+fn the_gateway_issues_no_session_cookie(world: &mut SurfaceWorld) {
+    let response = world
+        .caller_response
+        .as_ref()
+        .expect("the sign-in answer");
+    assert!(
+        !response
+            .headers
+            .contains_key("set-cookie"),
+        "the refused sign-in set a cookie: {:?}",
+        response.headers
+    );
+}
+
+#[then(expr = "no human user {string} is stored")]
+fn no_console_user_is_stored(
+    world: &mut SurfaceWorld,
+    username: String,
+) {
+    let base = world
+        .infra
+        .as_ref()
+        .expect("the gateway runs")
+        ._temp_dir
+        .path()
+        .to_path_buf();
+    let users_dir = ["_storage/passkeys"]
+        .iter()
+        .map(|relative| base.join(relative))
+        .find(|dir| dir.is_dir())
+        .unwrap_or_else(|| panic!("no stored users directory under {base:?}"));
+    let stored: Vec<Value> = std::fs::read_dir(&users_dir)
+        .expect("read the users directory")
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .filter_map(|text| serde_json::from_str(&text).ok())
+        .collect();
+    assert!(!stored.is_empty(), "the first user's account is stored in {users_dir:?}");
+    assert!(
+        stored
+            .iter()
+            .all(|user| user["username"] != username),
+        "the refused sign-in stored {username:?}: {stored:?}"
+    );
 }
 
 #[then(expr = "that event names human user {string}")]

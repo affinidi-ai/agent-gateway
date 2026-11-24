@@ -16,6 +16,7 @@ const ROLE_CLAIM: &str = "http://schemas.microsoft.com/ws/2008/06/identity/claim
 /// The gateway's answer to an assertion.
 pub struct AcsAnswer {
     pub status: u16,
+    pub set_cookies: Vec<String>,
     pub body: String,
 }
 
@@ -199,6 +200,13 @@ pub async fn sign_in(
         .expect("POST the signed SAML response");
     AcsAnswer {
         status: response.status().as_u16(),
+        set_cookies: response
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_string)
+            .collect(),
         body: response
             .text()
             .await
