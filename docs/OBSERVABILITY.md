@@ -365,8 +365,16 @@ and MCP body as before.
 A traffic mirror's copy is the one place where `X-Gateway-Trace-Id` is not the 32 hex form: it
 carries the request's trace id followed by `-mirror`, so a receiver that follows the trace context
 rules treats it as absent and starts its own trace. `X-Mirrored-Request: true` marks the copy. A request sent
-over a Fabric stream carries its trace id as a hyphenated UUID, and the receiving gateway records
-that form.
+over a Fabric stream carries its trace id as a hyphenated UUID.
+
+A Fabric receive continues the trace id the Fabric message names, read as `X-Gateway-Trace-Id` is:
+32 hexadecimal digits or the hyphenated 8-4-4-4-12 form, in any case and not all zero, written as
+32 lowercase hex on every record, in the Managed Agent's transit token and in its
+`X-Gateway-Trace-Id`. A message that names no trace id, or one that is not valid, starts a new
+trace, and its records, transit token and header carry that one id; no part of the invalid id is
+recorded or sent on. The records carry the message's trace id, never the trace of the span the
+sending gateway exports, which the message carries beside it. A surface with `terminate_trace_id`
+sends its Managed Agent a fresh 32 hex trace id while its own records keep the one it continued.
 
 A Transit Point continues the trace of the transit token it verified, whether or not it requires
 one, with `trace_source` `transit_token`. The managed agent's `traceparent` gives the parent span

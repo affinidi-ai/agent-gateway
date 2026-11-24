@@ -140,8 +140,7 @@ changes:
         the value as a hyphenated UUID must accept the new form; a parser that accepts a UUID
         without hyphens, as earlier gateways do, needs no change. An Access Point and a Transit
         Point also write a trace id they continue from X-Gateway-Trace-Id in this form, and no
-        longer continue a braced or urn: one. A gateway that receives a request over a Fabric
-        stream still records its trace id hyphenated.
+        longer continue a braced or urn: one.
     - timestamp: '2026-11-23T18:00:00Z'
       title: Resolve a Transit Point's trace from its transit token, then its headers
       description: >-
@@ -177,3 +176,14 @@ changes:
         version journalled but had not delivered when it stopped, so the earlier build delivers them
         neither to the VP Audit Log nor to an integration, and they are not sent after upgrading
         again.
+    - timestamp: '2026-11-25T12:00:00Z'
+      title: Write a Fabric receive's trace id as 32 lowercase hex, or start a new one
+      description: >-
+        A gateway that receives a request over the Fabric now reads the trace id the Fabric message
+        names as an Access Point reads X-Gateway-Trace-Id and continues it as 32 lowercase
+        hexadecimal digits on its records, in the Managed Agent's transit token and in its
+        X-Gateway-Trace-Id. A request over a Fabric stream, whose trace id arrives hyphenated, was
+        recorded and sent on hyphenated. A message naming no trace id, or one that is not valid,
+        starts a new trace shared by its records, token and header; any text was passed on as sent
+        before. The records carry the message's trace id, no longer the trace of the span the
+        sending gateway exports, and a surface with terminate_trace_id sends a 32 hex onward id.
