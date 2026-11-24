@@ -1106,7 +1106,8 @@ operator limits one (group Delegation); see
   first. The record's `occurred_at` is when the gateway removed the credential, which can be
   long after the consent ended (the hourly pass, a restart, a standby node), and `expired_at`,
   RFC 3339, is when the consent ended: the same end the `detail` names, omitted when it is not
-  known. No other record carries `expired_at`, and one stored before it existed has none. It is recorded wherever `consent_granted` is selected, whether or not it is selected
+  known. No other record carries `expired_at`, and one stored before it existed has none. It
+  is recorded wherever `consent_granted` is selected, whether or not it is selected
   itself (`RECEIVED_WITH` in `src/audit/catalog.rs`): a selection made before this event
   existed names only `consent_granted`, and a gateway that records the consents given must not
   miss their end. This holds for `audit_events` and for an integration's event set alike.
