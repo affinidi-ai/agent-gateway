@@ -763,6 +763,12 @@ receive does not read this mode; the request body sets the caller there (see
 - `input.extension_identity` and `input.agent.did`, `did_verified` and
   `did_verification` are the key's DID, replacing any DID or identity
   presentation in the request body.
+- A caller verified by another method beside the API key method, and likewise
+  a caller of a method other than JWT Bearer beside an inbound `from_jwt_claim`
+  identity, gets no caller identity: `input.extension_identity` and
+  `input.agent.did` are absent, with the trust-registry claims below; tell it
+  apart by `input.source_auth.method` (see
+  [`SOURCE_AUTH.md`](SOURCE_AUTH.md#several-methods-on-one-access-point)).
 - When the body does not assert the key's own DID, including when it names no DID,
   the trust-registry claims it made are dropped: `provider_did`, `trust_registry_did`,
   `authority_did`, `identity_issuer_did`, `agent_dna` and the trust verifications. A Trust Check

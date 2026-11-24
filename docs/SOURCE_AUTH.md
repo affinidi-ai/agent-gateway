@@ -1634,9 +1634,9 @@ Per-key caller identity therefore needs an API Key Provider.
 A save (`POST`, `PUT`, `PATCH`, and each enabled variant) refuses an inbound `from_api_key`
 with `400` when:
 
-- a Caller Context method is not API Key or API Key Provider: a caller verified another way
-  presents no key to identify it, and the request path refuses it with `500`. At startup a
-  stored surface breaking this rule loads with a warning;
+- no Caller Context method is API Key or API Key Provider, so no caller presents a key to
+  identify it. A caller verified by another method beside one is served with no identity (see
+  above). At startup a stored surface breaking this rule loads with a warning;
 - `mcp_http.authorization` is set, because resource tokens identify those callers;
 - the target is an MCP `proxy://` MCP Proxy.
 
@@ -1958,7 +1958,7 @@ Point's outbound request:
 
 | Condition | Status | `result` |
 | --- | --- | --- |
-| Caller authentication is not API Key or API Key Provider | `500` | `api_key_unavailable` |
+| No caller was authenticated, such as on a stored surface without caller authentication | `500` | `api_key_unavailable` |
 | A plain API Key's secret is not in the secrets store | `500` | `secret_not_found` |
 | The secrets store cannot be read | `503` | `secrets_store_unavailable` or `store_lookup_failed` |
 | A stored `from_api_key` Managed Agent or Transit Point identity has no `api_key_id` | `500` | `api_key_id_missing` |
