@@ -198,7 +198,7 @@ impl KeyManager {
 
     fn create_kms_client_blocking() -> Result<AwsKmsDataKeysClient> {
         let sdk_config =
-            Self::block_on(async { aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await })?;
+            Self::block_on(async { aws_config::load_defaults(aws_config::BehaviorVersion::v2026_11_17()).await })?;
         Ok(AwsKmsDataKeysClient {
             client: KmsClient::new(&sdk_config),
         })
