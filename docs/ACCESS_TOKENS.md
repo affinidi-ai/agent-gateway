@@ -260,7 +260,9 @@ the whole history, `history_bytes` and `soft_cap_bytes`; other callers read `0` 
 scoped by required headers alone, or by a resource pattern without a tenant, reads no record. While
 the credential providers cannot be read, a tenant PAT gets `500` from `/api/v1/delegation-audit` and
 an empty page marked `truncated` from `/v1/audit`. A record follows its provider's current tenant,
-as a vault token does.
+as a vault token does. Each record is answered with its time as `occurred_at`, never `timestamp`,
+whichever name it was stored under
+([`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)).
 
 ### Ownership of child records
 

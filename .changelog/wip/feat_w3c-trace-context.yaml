@@ -159,6 +159,21 @@ changes:
         top level, set by the gateway whatever the integration's template wrote there, and no
         top-level timestamp: a template's top-level timestamp key is removed. The default envelope
         sends event_id and occurred_at in place of timestamp. A receiver that read timestamp must
-        read occurred_at. A key named timestamp inside the message, such as the audit record's own
-        field, is unchanged. Slack and email messages are sent as before, and no Kafka record
-        carries a header.
+        read occurred_at. A key named timestamp that an operator nests inside the message is
+        unchanged. Slack and email messages are sent as before, and no Kafka record carries a
+        header.
+    - timestamp: '2026-11-24T18:00:00Z'
+      title: Name the audit record's time occurred_at in place of timestamp
+      description: >-
+        An audit record now carries its time as occurred_at, not timestamp: in the VP Audit Log,
+        in the records /api/v1/audit, /api/v1/delegation-audit and /api/admin/payments/audit
+        answer, and in the record embedded in a webhook or stream delivery (record, audit_record or
+        data), which now carries the same event_id and occurred_at as the delivery. Readers of these
+        APIs and of an embedded record's timestamp must read occurred_at. Known limits: a row
+        written before this version keeps timestamp on disk and is read as occurred_at; a line
+        naming both is not read and is counted in dropped_records. A gateway rolled back to an
+        earlier build cannot read a record written with occurred_at: its audit APIs leave such rows
+        out and count them in dropped_records, and every audit sink moves past the records this
+        version journalled but had not delivered when it stopped, so the earlier build delivers them
+        neither to the VP Audit Log nor to an integration, and they are not sent after upgrading
+        again.

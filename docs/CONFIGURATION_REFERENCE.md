@@ -976,7 +976,9 @@ filtered by `surface_id`, `stage` (`challenge_issued`, `verify_attempt`, `verifi
 `since` and `until` (RFC 3339), and paged with `page` and `page_size` (default 50, at most 500):
 `{events, total, page, page_size, total_pages, truncated, dropped_records}`. An unknown stage or an
 unreadable time is `400`.
-A record leaves with its `vp_fingerprint` only, never `vp_jwt`. It reads only what the log keeps,
+Each record's time is `occurred_at`, also for a row stored under `timestamp` before the field had
+that name ([`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)); `since` and
+`until` compare it. A record leaves with its `vp_fingerprint` only, never `vp_jwt`. It reads only what the log keeps,
 so it is empty unless the VP Audit Log selects the `payment` event. The read walks the live log and
 the rotated files behind it, filters and pages inside that walk, and stops at the same scan limit
 as `/v1/audit`: `truncated: true` says the read stopped before the end of the history, and

@@ -236,7 +236,7 @@ Every event fills these variables, plus its own:
 | `EVENT_SUMMARY` | One line on what happened, such as `Gateway edge was created` |
 | `EVENT_DATA` | The event's own variables as a JSON object with lower-case keys; for an audit event, the audit record |
 | `EVENT_ID` | The event id: the UUID the gateway gives the event when it creates it, the same on every delivery and retry of it. For an audit event, the record's `event_id`; empty for an audit record stored before records had one |
-| `OCCURRED_AT` | When the event happened, RFC 3339, the same on every delivery and retry of it. For an audit event, the record's own `timestamp`; for `connection_point.connected`, when the connection-setup message was received |
+| `OCCURRED_AT` | When the event happened, RFC 3339, the same on every delivery and retry of it. For an audit event, the record's own `occurred_at`; for `connection_point.connected`, when the connection-setup message was received |
 | `TIMESTAMP` | Deprecated: the same value as `OCCURRED_AT`. Use `OCCURRED_AT` |
 | `APPLIANCE_ID` | The **Appliance ID** set in Settings › System Settings (`appliance_id` in `settings.json`), such as the appliance's id in Agent Watch. It never comes from event values, is never the appliance DID, and is unrelated to any Kafka topic name. Empty while unset. |
 
@@ -281,7 +281,11 @@ level, set by the gateway after the template is filled
 ([`delivery/values.rs`](../src/integrations/delivery/values.rs)): whatever the template wrote
 under those keys is replaced, an event without an id gets no `event_id` key, and a top-level
 `timestamp` key is removed. Keys inside the message, such as a `timestamp` an operator nests in
-their own object or the audit record's own `timestamp`, are sent as rendered. A webhook's
+their own object, are sent as rendered. An embedded audit record (`record`, `audit_record` or
+`data`) carries the same `event_id` and `occurred_at` and no `timestamp`. A `consent_expired`
+record's `occurred_at` is when the gateway removed the consent; it also carries `expired_at`,
+when the consent ended ([`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)). A
+webhook's
 signature covers the body as sent. `slack` and `email` messages are sent as rendered. A Kafka
 record carries the message as its payload, keyed by the integration id, and no record header.
 
@@ -320,7 +324,7 @@ behind them, from Kafka:
   each message is:
 
   ```json
-  {"event_type":"audit.policy_decision","appliance_id":"<appliance id>","record":{"event_id":"…","timestamp":"…","event":{"policy_decision":{…}},…},"event_id":"…","occurred_at":"…"}
+  {"event_type":"audit.policy_decision","appliance_id":"<appliance id>","record":{"event_id":"…","occurred_at":"…","event":{"policy_decision":{…}},…},"event_id":"…","occurred_at":"…"}
   ```
 
   A template saved earlier with `"timestamp":"${TIMESTAMP}"` keeps working: the delivered message

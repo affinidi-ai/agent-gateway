@@ -786,6 +786,32 @@ none rather than that the log is empty. `/api/admin/payments/audit` carries both
 own counts; it has no dashboard view, so a consumer that shows those counts must present them as
 lower bounds the same way.
 
+**A record's time.** Every audit record carries `occurred_at`, the RFC 3339 time the event
+happened, set when the gateway records it: in the VP Audit Log, in every record that
+`/api/v1/audit`, `/api/v1/delegation-audit` and `/api/admin/payments/audit` answer, and in the
+record delivered to integrations. No record is answered or delivered with `timestamp`. A row
+written before records named it `occurred_at` holds its time under `timestamp` on disk: it is
+read as `occurred_at` and is not rewritten. A line that names its time under both is no record
+the gateway wrote: it is not read and is counted in `dropped_records`. On a `consent_expired`
+record, `occurred_at` is when the gateway removed the consent and `expired_at` when the consent
+ended (see `consent_expired` below). The integrations' drop policy
+(`audit_drop_after_secs`) measures a record's age from `occurred_at`, so an expiry noticed late
+is still delivered.
+
+**Known limit: rolling back.** A gateway build from before `occurred_at` cannot read a record
+written with it:
+
+- Its `/api/v1/audit`, `/api/v1/delegation-audit` and `/api/admin/payments/audit` do not return
+  such rows and count them in `dropped_records`. The rows stay in the VP Audit Log, and the
+  audit APIs return them again once the gateway is upgraded again.
+- Its audit dispatcher cannot read the records the newer build journalled but had not delivered
+  when it stopped. Every sink moves its cursor past them, as past any unreadable journal line
+  (the warning "Audit journal lines could not be read; the sink moved past them" and
+  `agent_gateway_audit_sink_skipped_total{reason="corrupt"}`), so the older build delivers them
+  neither to the VP Audit Log nor to any integration. Upgrading again does not send them: every
+  cursor is saved past them, and the journal segment that holds them is deleted once every
+  cursor has passed it.
+
 **Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths, and
 at a Transit Point where an event below says so.
 Reasons are fixed codes; no record carries a credential, token or validator message.
@@ -1077,7 +1103,10 @@ operator limits one (group Delegation); see
   UTC and `source` what found the consent ended: `release` is a request that needed the
   credential, and `sweep` the hourly removal of ended consents, whose record names no surface
   for an agent-keyed token. One removal writes one record, whichever finds the consent ended
-  first. It is recorded wherever `consent_granted` is selected, whether or not it is selected
+  first. The record's `occurred_at` is when the gateway removed the credential, which can be
+  long after the consent ended (the hourly pass, a restart, a standby node), and `expired_at`,
+  RFC 3339, is when the consent ended: the same end the `detail` names, omitted when it is not
+  known. No other record carries `expired_at`, and one stored before it existed has none. It is recorded wherever `consent_granted` is selected, whether or not it is selected
   itself (`RECEIVED_WITH` in `src/audit/catalog.rs`): a selection made before this event
   existed names only `consent_granted`, and a gateway that records the consents given must not
   miss their end. This holds for `audit_events` and for an integration's event set alike.
@@ -1346,7 +1375,7 @@ release the lock.
 `EVENT_SUMMARY` (the event's name, then whichever of the surface, decision, policy, reason and
 caller the record holds), `EVENT_DATA` (the same as `AUDIT_RECORD`), `APPLIANCE_ID`,
 `EVENT_ID` (the record's `event_id`; empty for a record stored before records had one),
-`OCCURRED_AT` (the record's own `timestamp`), `TIMESTAMP` (deprecated, the same value as
+`OCCURRED_AT` (the record's own `occurred_at`), `TIMESTAMP` (deprecated, the same value as
 `OCCURRED_AT`), `AUDIT_RECORD`, `AUDIT_CATEGORY`, `AUDIT_TRACE_ID`,
 `AUDIT_SPAN_ID` (the record's `span_id`), `AUDIT_PARENT_SPAN_ID` (its `parent_span_id`, empty
 when the request named none), `AUDIT_TRACE_SOURCE` (its `trace_source`, empty outside a traced
@@ -1393,8 +1422,8 @@ template sends the default event envelope, whose `data` is the record:
 
 Whatever its template, a Stream or Webhook delivery of a record carries the record's `event_id`
 and its time as `occurred_at` at its top level, and no top-level `timestamp` (see
-[`INTEGRATIONS.md`](INTEGRATIONS.md#templates)). The record inside (`data`, `record`) keeps its own
-`timestamp` field, as the VP Audit Log stores it.
+[`INTEGRATIONS.md`](INTEGRATIONS.md#templates)). The record inside (`data`, `record`) carries the
+same `event_id` and `occurred_at` and no `timestamp`, as the audit APIs answer it.
 
 Kafka producers belong to the endpoint: every integration and test send on one endpoint shares
 it. It is rebuilt when the brokers, security protocol or SASL settings change and dropped

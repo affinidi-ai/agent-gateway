@@ -2588,7 +2588,10 @@ event existed still receives it: the agent, the caller's identity hash (or `owne
 surface, the scopes, the token or grant id, and in `detail`
 `consent_granted_at:<time>,consent_expired_at:<time>,source:<source>`, where `source` is
 `release` for a request that needed the credential and `sweep` for the hourly removal, which
-names no surface for an agent-keyed token. A request served by a
+names no surface for an agent-keyed token. The record's `occurred_at` is when the gateway removed
+the credential, and its `expired_at`, RFC 3339, when the consent ended, omitted when that is not
+known: the hourly pass, a restart or a standby node can remove a consent long after it ended. A
+request served by a
 binding that only finds the consent too old audits nothing: it logs its usual `consent_required`.
 For a grant by binding the vendor revocation that follows is recorded as its own
 `token_revoked`, whose `detail` ends `,consent_expired`, so it reads as the outcome of the
