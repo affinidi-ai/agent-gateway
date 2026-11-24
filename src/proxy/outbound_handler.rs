@@ -15,6 +15,89 @@
 /// Changing this value renames the prefix everywhere without a search-and-replace.
 pub const TP_OUTBOUND_PATH_PREFIX: &str = "/outbound";
 
+/// The path a Transit Point answers on, from its surface's `route` and its own
+/// `alias`. Registered for every Transit Point whatever its `listen_path`, and
+/// the only form an inbound listener sharing a hostname with the outbound one
+/// forwards, so it is what a caller on another host can rely on.
+pub fn transit_point_outbound_path(
+    route: &str,
+    alias: &str,
+) -> String {
+    // A route of `/` trims to empty, so one branch covers both.
+    let route = route.trim_end_matches('/');
+    format!("{TP_OUTBOUND_PATH_PREFIX}{route}/{alias}")
+}
+
+/// The path a Transit Point a variant defines answers on: the surface's
+/// `route` with the variant alias behind `$`, then the point's own `alias`.
+/// The outbound listener registers this form for every variant of the surface,
+/// so it, not the base [`transit_point_outbound_path`], is what a caller of
+/// that variant can rely on.
+pub fn transit_point_variant_outbound_path(
+    route: &str,
+    variant: &str,
+    alias: &str,
+) -> String {
+    transit_point_variant_outbound_route(route, "$", variant, alias)
+}
+
+/// The separators a variant route is registered under: the literal `$` and its
+/// percent-encoded form, which axum matches as two distinct paths. Read by the
+/// listener build and by the save-time clash check, so neither can miss a form
+/// the other registers.
+pub const VARIANT_ROUTE_SEPARATORS: [&str; 2] = ["$", "%24"];
+
+/// [`transit_point_variant_outbound_path`] under one of the two separators the
+/// outbound listener registers a variant route with, `$` and its
+/// percent-encoded `%24`: axum matches them as distinct paths, so both are
+/// registered and both are routes a `listen_path` must not claim.
+pub fn transit_point_variant_outbound_route(
+    route: &str,
+    separator: &str,
+    variant: &str,
+    alias: &str,
+) -> String {
+    let route = route.trim_end_matches('/');
+    format!("{TP_OUTBOUND_PATH_PREFIX}{route}{separator}{variant}/{alias}")
+}
+
+#[cfg(test)]
+mod transit_point_outbound_path_tests {
+    use super::{transit_point_outbound_path, transit_point_variant_outbound_path};
+
+    #[test]
+    fn a_route_is_kept_between_the_prefix_and_the_alias() {
+        assert_eq!(transit_point_outbound_path("/agents", "pricing"), "/outbound/agents/pricing");
+        assert_eq!(transit_point_outbound_path("/agents/", "pricing"), "/outbound/agents/pricing");
+    }
+
+    #[test]
+    fn a_root_route_leaves_the_prefix_beside_the_alias() {
+        for route in ["", "/"] {
+            assert_eq!(transit_point_outbound_path(route, "pricing"), "/outbound/pricing", "{route:?}");
+        }
+    }
+
+    #[test]
+    fn a_variant_names_itself_behind_a_dollar_after_the_route() {
+        assert_eq!(
+            transit_point_variant_outbound_path("/agents", "candidate", "pricing"),
+            "/outbound/agents$candidate/pricing"
+        );
+        assert_eq!(
+            transit_point_variant_outbound_path("/agents/", "candidate", "pricing"),
+            "/outbound/agents$candidate/pricing"
+        );
+        for route in ["", "/"] {
+            assert_eq!(
+                transit_point_variant_outbound_path(route, "candidate", "pricing"),
+                "/outbound$candidate/pricing",
+                "{route:?}"
+            );
+        }
+    }
+}
+
 use axum::{
     extract::{ConnectInfo, Request, State},
     http::{HeaderMap, Method, StatusCode},
@@ -136,6 +219,11 @@ pub(crate) enum OutboundPipelineError {
 
     #[error("Request blocked by surface policy")]
     SurfacePolicyDenied,
+
+    /// The Transit Point's own policy denied the request; the caller is told
+    /// the policy's `deny_reason` when it set one.
+    #[error("Request blocked by surface policy")]
+    TransitPointPolicyDenied { reason: Option<String> },
 
     /// The surface or transit-point policy could not decide. Why is logged
     /// and audited, never shown to the caller.
@@ -332,6 +420,7 @@ impl OutboundPipelineError {
             Self::GatewayPolicyDenied
             | Self::GatewayPolicyError(_)
             | Self::SurfacePolicyDenied
+            | Self::TransitPointPolicyDenied { .. }
             | Self::SurfacePolicyError(_)
             | Self::TransitPointResponsePolicyDenied
             | Self::TransitMcpToolGated => StatusCode::FORBIDDEN,
@@ -482,6 +571,11 @@ impl IntoResponse for OutboundPipelineError {
         ) {
             return crate::protocols::no_transit_point_response();
         }
+        if let Self::TransitPointPolicyDenied { reason: Some(reason) } = &self
+            && !reason.is_empty()
+        {
+            return create_error_response(self.status_code(), &format!("{self}: {reason}"));
+        }
         // ConsentRequired carries a pre-formed JSON body for the caller
         if let Self::ConsentRequired(body) = self {
             return Response::builder()
@@ -565,8 +659,8 @@ pub struct OutboundPipelineContext {
     /// consumes this to synthesize `AGENT_CARD_UNAVAILABLE` results per
     /// configured element instead of executing TRQP probes.
     pub target_agent_card_unavailable: bool,
-    /// Marker: the routed Transit Point's `trust_check_list` is non-empty
-    /// (Trust Check active) and the target card's agent identity could not
+    /// Marker: the routed Transit Point's `trust_check_list` holds elements
+    /// that ask about the destination and the target card's agent identity could not
     /// be established — either the `agent-identity-credential/v1` VP is
     /// absent, or it is present but fails cryptographic verification
     /// (proof/expiry failure, or no `VCIssuer` to verify with).
@@ -581,7 +675,7 @@ pub struct OutboundPipelineContext {
     /// `step_trust_check`). Threaded into every outbound OPA evaluation
     /// via `build_outbound_policy_input`. `None` when the routed Transit
     /// Point's `trust_check_list` is empty; otherwise the routed Transit
-    /// Point's results under `target`.
+    /// Point's results under `target` and `managed_agent`.
     pub trust_check_results: Option<crate::trust_registry_verification::TrustCheckResultsContext>,
     /// The request's trace id once [`step_resolve_trace`] resolved it; until
     /// then the request's span id, which only log lines carry.
@@ -1172,6 +1266,9 @@ async fn outbound_proxy_handler_in_request_scope(
 
     // [8] Trust Context Collection
     step_collect_trust_context(&state, &mut ctx).await?;
+
+    // [8a] Transit Point Trust Recorder: records the calling agent in the background.
+    step_record_transit_point_agent(&state, &ctx);
 
     // [8b] Trust Check stage (target leg) — runs before any OPA so all
     // three outbound OPA scopes see the same `input.trust_check_results`.
@@ -3571,10 +3668,11 @@ async fn step_collect_trust_context(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
-    let target_trust_check_present = !ctx
+    let target_trust_check_present = ctx
         .virtual_channel
         .trust_check_list
-        .is_empty();
+        .iter()
+        .any(|element| element.subject.is_target());
 
     if !target_trust_check_present {
         return Ok(());
@@ -3773,10 +3871,8 @@ async fn step_trust_check(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
-    let target_elements = ctx
-        .virtual_channel
-        .trust_check_list
-        .clone();
+    step_managed_agent_trust_check(state, ctx).await;
+    let target_elements = target_elements(ctx);
     if target_elements.is_empty() {
         return Ok(());
     }
@@ -3889,6 +3985,195 @@ async fn step_trust_check(
         ctx.trust_check_results = Some(results);
     }
     Ok(())
+}
+
+/// [8a] The routed Transit Point's Trust Recorder writes, in the background,
+/// the records of the DID the managed agent calls out under, on every request
+/// that has one, like the surface's recorder on the response leg (see
+/// [`crate::trust_registry_verification::spawn_recorder`]). Never waits for the
+/// writes or refuses the request.
+fn step_record_transit_point_agent(
+    state: &OutboundProxyState,
+    ctx: &OutboundPipelineContext,
+) {
+    let Some((recorder, did)) = transit_point_agent_to_record(ctx) else {
+        return;
+    };
+    crate::trust_registry_verification::spawn_recorder(
+        &ctx.surface,
+        &recorder,
+        &did,
+        state
+            .trust_registry_listener_manager
+            .clone(),
+    );
+}
+
+/// The routed Transit Point's Trust Recorder and the DID its managed agent calls out
+/// under, when there is something to record: the recorder has entries, a managed
+/// identity was resolved and the request is not a discovery read.
+fn transit_point_agent_to_record(
+    ctx: &OutboundPipelineContext
+) -> Option<(crate::config::types::TrustRecorderConfig, String)> {
+    let recorder = ctx
+        .virtual_channel
+        .trust_recorder
+        .as_ref()
+        .filter(|recorder| !recorder.entries.is_empty())?;
+    let ProtectedAgentIdentity::Managed { did, .. } = &ctx.resolved_identity else {
+        return None;
+    };
+    if is_transit_discovery_read(ctx) {
+        return None;
+    }
+    Some((recorder.clone(), did.clone()))
+}
+
+/// [8b] The routed Transit Point's managed-agent Trust Check elements: the
+/// self recognition check. Unless the request is a discovery read, each
+/// element asks about the DID the managed agent calls out under. Results land at `input.trust_check_results.managed_agent`; the stage never
+/// denies. Without a trust registry listener manager every element fails with
+/// `TRUST_REGISTRY_UNREACHABLE`, so a policy that requires recognition refuses;
+/// a request with no managed agent DID reports that instead.
+async fn step_managed_agent_trust_check(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+) {
+    let elements = managed_agent_elements(ctx);
+    if elements.is_empty() || is_transit_discovery_read(ctx) {
+        return;
+    }
+    let Some(manager) = state
+        .trust_registry_listener_manager
+        .clone()
+    else {
+        let surface_id = ctx.surface.surface_id.clone();
+        let transit_point = ctx
+            .virtual_channel
+            .alias
+            .clone();
+        let (code, detail) = if matches!(ctx.resolved_identity, ProtectedAgentIdentity::Anonymous) {
+            (
+                crate::trust_registry_verification::MANAGED_AGENT_IDENTITY_UNAVAILABLE,
+                "no managed agent identity was resolved for this request",
+            )
+        } else {
+            (
+                crate::trust_registry_verification::trust_check_executor::TRUST_REGISTRY_UNREACHABLE,
+                "no trust registry connection is available",
+            )
+        };
+        let results = crate::trust_registry_verification::synthesize_unavailable(
+            crate::observability::trust_check_audit::TrustCheckOrigin {
+                surface_id: &surface_id,
+                transit_point: Some(&transit_point),
+            },
+            crate::trust_registry_verification::TrustCheckLeg::ManagedAgent,
+            &elements,
+            code,
+            detail,
+        );
+        store_managed_agent_results(ctx, results);
+        return;
+    };
+    let client = crate::trust_registry_verification::TrqpListenerClient::new(manager);
+    run_managed_agent_trust_checks(ctx, &elements, &client).await;
+}
+
+/// The routed Transit Point's Trust Check elements that ask about its
+/// destination.
+fn target_elements(ctx: &OutboundPipelineContext) -> Vec<crate::trust_registry_verification::TrustCheckElement> {
+    ctx.virtual_channel
+        .trust_check_list
+        .iter()
+        .filter(|element| element.subject.is_target())
+        .cloned()
+        .collect()
+}
+
+fn managed_agent_elements(ctx: &OutboundPipelineContext) -> Vec<crate::trust_registry_verification::TrustCheckElement> {
+    ctx.virtual_channel
+        .trust_check_list
+        .iter()
+        .filter(|element| !element.subject.is_target())
+        .cloned()
+        .collect()
+}
+
+/// Runs `elements` through `client` against the DID the managed agent of
+/// `ctx` calls out under, filling a blank `entity_id` with it, and stores the
+/// results at `managed_agent`. Without a resolved managed identity every
+/// element fails with `MANAGED_AGENT_IDENTITY_UNAVAILABLE` and nothing is asked.
+async fn run_managed_agent_trust_checks<
+    C: crate::trust_registry_verification::trust_check_executor::TrqpClient + Sync + ?Sized,
+>(
+    ctx: &mut OutboundPipelineContext,
+    elements: &[crate::trust_registry_verification::TrustCheckElement],
+    client: &C,
+) {
+    let surface_id = ctx.surface.surface_id.clone();
+    let transit_point = ctx
+        .virtual_channel
+        .alias
+        .clone();
+    let origin = crate::observability::trust_check_audit::TrustCheckOrigin {
+        surface_id: &surface_id,
+        transit_point: Some(&transit_point),
+    };
+    let did = match &ctx.resolved_identity {
+        ProtectedAgentIdentity::Managed { did, .. } => Some(did.clone()),
+        ProtectedAgentIdentity::Anonymous => None,
+    };
+    let results = match did {
+        Some(did) => {
+            let elements: Vec<_> = elements
+                .iter()
+                .cloned()
+                .map(|mut element| {
+                    if element
+                        .query
+                        .entity_id
+                        .trim()
+                        .is_empty()
+                    {
+                        element.query.entity_id = did.clone();
+                    }
+                    element
+                })
+                .collect();
+            let input = serde_json::to_value(build_outbound_policy_input(ctx)).unwrap_or_default();
+            crate::trust_registry_verification::run_trust_check_stage(
+                origin,
+                crate::trust_registry_verification::TrustCheckLeg::ManagedAgent,
+                &elements,
+                &input,
+                client,
+            )
+            .await
+            .map(|context| context.managed_agent)
+            .unwrap_or_default()
+        }
+        None => crate::trust_registry_verification::synthesize_unavailable(
+            origin,
+            crate::trust_registry_verification::TrustCheckLeg::ManagedAgent,
+            elements,
+            crate::trust_registry_verification::MANAGED_AGENT_IDENTITY_UNAVAILABLE,
+            "no managed agent identity was resolved for this request",
+        ),
+    };
+    store_managed_agent_results(ctx, results);
+}
+
+fn store_managed_agent_results(
+    ctx: &mut OutboundPipelineContext,
+    results: Vec<crate::trust_registry_verification::trust_check_element::TrustCheckResult>,
+) {
+    let mut context = ctx
+        .trust_check_results
+        .take()
+        .unwrap_or_default();
+    context.managed_agent = results;
+    ctx.trust_check_results = Some(context);
 }
 
 /// The protected agent's DID for outbound policy-audit attribution, or `None`
@@ -4325,7 +4610,11 @@ async fn step_transit_point_opa_policy(
                 alias = %ctx.virtual_channel.alias,
                 "Per-transit-point OPA policy denied"
             );
-            return Err(OutboundPipelineError::SurfacePolicyDenied);
+            return Err(OutboundPipelineError::TransitPointPolicyDenied {
+                reason: decision
+                    .reason
+                    .filter(|reason| reason != crate::policies::opa::DEFAULT_DENY_REASON),
+            });
         }
         Err(e) => {
             let error = crate::observability::PolicyEvaluationError::EvaluationError;
@@ -14748,6 +15037,344 @@ mod tests {
         );
     }
 
+    /// A TRQP client whose listed trust registries recognise every agent and
+    /// whose others answer `recognized: false`. Records the entity each query
+    /// asks about.
+    struct RecognisedIn(&'static [&'static str], std::sync::Mutex<Vec<String>>);
+
+    impl RecognisedIn {
+        fn new(registries: &'static [&'static str]) -> Self {
+            Self(registries, std::sync::Mutex::new(Vec::new()))
+        }
+
+        fn asked_about(&self) -> Vec<String> {
+            self.1.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::trust_registry_verification::trust_check_executor::TrqpClient for RecognisedIn {
+        async fn query(
+            &self,
+            registry_id: &str,
+            _query_type: crate::trust_registry_verification::trust_check_element::TrqpQueryType,
+            params: &crate::trust_registry_verification::trust_check_element::TrqpQueryParams,
+        ) -> Result<
+            crate::trust_registry_verification::trust_check_executor::TrqpOutcome,
+            crate::trust_registry_verification::trust_check_executor::TrqpClientError,
+        > {
+            use crate::trust_registry_verification::trust_check_executor::TrqpOutcome;
+            self.1
+                .lock()
+                .unwrap()
+                .push(params.entity_id.clone());
+            Ok(if self.0.contains(&registry_id) {
+                TrqpOutcome::Allowed
+            } else {
+                TrqpOutcome::Denied {
+                    detail: "Registry answered `recognized: false`".to_string(),
+                }
+            })
+        }
+    }
+
+    /// A managed-agent element on trust registry `registry` with a blank
+    /// entity, so it asks about the agent calling out.
+    fn managed_agent_element(
+        id: &str,
+        registry: &str,
+    ) -> crate::trust_registry_verification::TrustCheckElement {
+        let mut element = make_test_element(id);
+        element.trust_registry_id = registry.to_string();
+        element.query.entity_id = String::new();
+        element.subject = crate::trust_registry_verification::trust_check_element::TrustCheckSubject::ManagedAgent;
+        element
+    }
+
+    /// A call through a Transit Point that checks its managed agent
+    /// `did:web:agent.example` on trust registry `alpha`, and its destination.
+    fn managed_agent_checked_call() -> OutboundPipelineContext {
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel
+            .trust_check_list = vec![make_test_element("destination"), managed_agent_element("self", "alpha")];
+        ctx.resolved_identity = ProtectedAgentIdentity::Managed {
+            did: "did:web:agent.example".to_string(),
+            identity_fields: std::collections::HashMap::new(),
+        };
+        ctx
+    }
+
+    /// Each `trust_check` record's leg, Transit Point and outcome.
+    fn trust_check_records(
+        events: &[crate::delegation_vault::audit::DelegationAuditEvent]
+    ) -> Vec<(String, Option<String>, bool)> {
+        use crate::delegation_vault::audit::DelegationAuditAction;
+        events
+            .iter()
+            .filter_map(|event| match &event.event {
+                DelegationAuditAction::TrustCheck { leg, transit_point, ok, .. } => {
+                    Some((leg.clone(), transit_point.clone(), *ok))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn managed_agent_results(ctx: &OutboundPipelineContext) -> Vec<(String, bool, Option<String>)> {
+        ctx.trust_check_results
+            .as_ref()
+            .map(|results| {
+                results
+                    .managed_agent
+                    .iter()
+                    .map(|result| {
+                        (
+                            result.id.clone(),
+                            result.ok,
+                            result
+                                .error
+                                .as_ref()
+                                .map(|error| error.code.clone()),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_managed_agent_element_asks_about_the_agent_calling_out_and_lands_on_its_own_leg() {
+        let mut ctx = managed_agent_checked_call();
+        let elements = managed_agent_elements(&ctx);
+        let client = RecognisedIn::new(&["alpha"]);
+
+        let ((), events) =
+            crate::audit::producer::capture(run_managed_agent_trust_checks(&mut ctx, &elements, &client)).await;
+
+        assert_eq!(client.asked_about(), ["did:web:agent.example"], "only the managed-agent element is asked");
+        assert_eq!(managed_agent_results(&ctx), [("self".to_string(), true, None)]);
+        let results = ctx
+            .trust_check_results
+            .as_ref()
+            .unwrap();
+        assert!(results.target.is_empty() && results.caller.is_empty(), "{results:?}");
+        assert_eq!(
+            trust_check_records(&events),
+            [(
+                "managed_agent".to_string(),
+                Some(
+                    ctx.virtual_channel
+                        .alias
+                        .clone()
+                ),
+                true
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_managed_agent_element_with_its_own_entity_asks_about_that_entity() {
+        let mut ctx = managed_agent_checked_call();
+        let mut element = managed_agent_element("self", "alpha");
+        element.query.entity_id = "did:web:other.example".to_string();
+        let client = RecognisedIn::new(&["alpha"]);
+
+        run_managed_agent_trust_checks(&mut ctx, &[element], &client).await;
+
+        assert_eq!(client.asked_about(), ["did:web:other.example"]);
+    }
+
+    #[tokio::test]
+    async fn an_agent_no_longer_recognised_fails_its_result_and_policy_decides() {
+        let state = test_outbound_state();
+        let mut ctx = managed_agent_checked_call();
+        let elements = managed_agent_elements(&ctx);
+
+        run_managed_agent_trust_checks(&mut ctx, &elements, &RecognisedIn::new(&[])).await;
+
+        assert_eq!(
+            managed_agent_results(&ctx),
+            [(
+                "self".to_string(),
+                false,
+                Some(crate::trust_registry_verification::trust_check_executor::NOT_RECOGNIZED.to_string())
+            )]
+        );
+        assert!(
+            step_trust_check(&state, &mut ctx)
+                .await
+                .is_ok(),
+            "the stage never refuses the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_managed_agent_identity_nothing_is_asked_and_policy_is_told_why() {
+        let mut ctx = managed_agent_checked_call();
+        ctx.resolved_identity = ProtectedAgentIdentity::Anonymous;
+        let elements = managed_agent_elements(&ctx);
+        let client = RecognisedIn::new(&["alpha"]);
+
+        let ((), events) =
+            crate::audit::producer::capture(run_managed_agent_trust_checks(&mut ctx, &elements, &client)).await;
+
+        assert!(
+            client
+                .asked_about()
+                .is_empty()
+        );
+        assert_eq!(
+            managed_agent_results(&ctx),
+            [(
+                "self".to_string(),
+                false,
+                Some(crate::trust_registry_verification::MANAGED_AGENT_IDENTITY_UNAVAILABLE.to_string())
+            )]
+        );
+        assert_eq!(
+            trust_check_records(&events)
+                .iter()
+                .map(|(leg, _, ok)| (leg.as_str(), *ok))
+                .collect::<Vec<_>>(),
+            [("managed_agent", false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_agent_results_reach_policy_input_only_when_there_are_some() {
+        let mut ctx = managed_agent_checked_call();
+        let elements = managed_agent_elements(&ctx);
+        run_managed_agent_trust_checks(&mut ctx, &elements, &RecognisedIn::new(&["alpha"])).await;
+        let input = serde_json::to_value(build_outbound_policy_input(&ctx)).unwrap();
+        assert_eq!(input["trust_check_results"]["managed_agent"][0]["id"], "self");
+
+        ctx.trust_check_results = Some(crate::trust_registry_verification::TrustCheckResultsContext::default());
+        let input = serde_json::to_value(build_outbound_policy_input(&ctx)).unwrap();
+        assert!(
+            input["trust_check_results"]
+                .get("managed_agent")
+                .is_none(),
+            "{input}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_managed_agent_check_skips_discovery_reads_and_fails_without_a_trust_registry_connection() {
+        let state = test_outbound_state();
+        let mut discovery = managed_agent_checked_call();
+        discovery.original_method = Method::GET;
+        discovery.request_path = "/outbound/surfaces/order/partner-a/.well-known/agent-card.json".to_string();
+        step_managed_agent_trust_check(&state, &mut discovery).await;
+        assert!(managed_agent_results(&discovery).is_empty(), "a discovery read is not checked");
+
+        let mut no_connection = managed_agent_checked_call();
+        step_managed_agent_trust_check(&state, &mut no_connection).await;
+        assert_eq!(
+            managed_agent_results(&no_connection),
+            [(
+                "self".to_string(),
+                false,
+                Some(crate::trust_registry_verification::trust_check_executor::TRUST_REGISTRY_UNREACHABLE.to_string())
+            )],
+            "without a connection the element fails, so a policy requiring it refuses"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_managed_agent_identity_is_reported_even_without_a_trust_registry_connection() {
+        let state = test_outbound_state();
+        let mut ctx = managed_agent_checked_call();
+        ctx.resolved_identity = ProtectedAgentIdentity::Anonymous;
+        step_managed_agent_trust_check(&state, &mut ctx).await;
+        assert_eq!(
+            managed_agent_results(&ctx),
+            [(
+                "self".to_string(),
+                false,
+                Some(crate::trust_registry_verification::MANAGED_AGENT_IDENTITY_UNAVAILABLE.to_string())
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_list_of_managed_agent_elements_only_fetches_no_destination_card() {
+        crate::proxy::agent_card_cache::invalidate_all();
+        let state = test_outbound_state();
+        let mut ctx = managed_agent_checked_call();
+        ctx.virtual_channel
+            .trust_check_list = vec![managed_agent_element("self", "alpha")];
+        ctx.virtual_channel
+            .target_endpoint = "http://127.0.0.1:1".to_string();
+
+        step_collect_trust_context(&state, &mut ctx)
+            .await
+            .expect("collect ok");
+
+        assert!(!ctx.target_agent_card_unavailable, "no card was fetched for trust");
+        assert!(
+            ctx.target_agent_context
+                .is_none()
+        );
+        assert!(target_elements(&ctx).is_empty());
+    }
+
+    fn recorder_with(registries: &[&str]) -> crate::config::types::TrustRecorderConfig {
+        crate::config::types::TrustRecorderConfig {
+            entries: registries
+                .iter()
+                .map(|registry| crate::config::types::TrustRecorderEntry {
+                    trust_registry_id: registry.to_string(),
+                    issuer_did: "did:web:issuer.example".to_string(),
+                    authority_did: "did:web:authority.example".to_string(),
+                    authority_source: None,
+                    include_owned_agent: true,
+                    custom_resources: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_transit_point_recorder_records_the_did_its_agent_calls_out_under() {
+        let mut ctx = managed_agent_checked_call();
+        ctx.virtual_channel
+            .trust_recorder = Some(recorder_with(&["alpha"]));
+        let (recorder, did) = transit_point_agent_to_record(&ctx).expect("something to record");
+        assert_eq!(did, "did:web:agent.example");
+        assert_eq!(recorder.entries[0].trust_registry_id, "alpha");
+    }
+
+    #[test]
+    fn a_transit_point_recorder_records_nothing_without_entries_a_did_or_for_a_discovery_read() {
+        let mut no_recorder = managed_agent_checked_call();
+        no_recorder
+            .virtual_channel
+            .trust_recorder = None;
+        let mut no_entries = managed_agent_checked_call();
+        no_entries
+            .virtual_channel
+            .trust_recorder = Some(recorder_with(&[]));
+        let mut no_did = managed_agent_checked_call();
+        no_did
+            .virtual_channel
+            .trust_recorder = Some(recorder_with(&["alpha"]));
+        no_did.resolved_identity = ProtectedAgentIdentity::Anonymous;
+        let mut discovery = managed_agent_checked_call();
+        discovery
+            .virtual_channel
+            .trust_recorder = Some(recorder_with(&["alpha"]));
+        discovery.original_method = Method::GET;
+        discovery.request_path = "/outbound/surfaces/order/partner-a/.well-known/agent-card.json".to_string();
+        for (case, ctx) in [
+            ("no recorder", &no_recorder),
+            ("no entries", &no_entries),
+            ("no DID", &no_did),
+            ("discovery read", &discovery),
+        ] {
+            assert!(transit_point_agent_to_record(ctx).is_none(), "{case}");
+        }
+    }
+
     #[tokio::test]
     async fn the_transit_point_vp_injection_record_names_the_transit_caller() {
         let (vc_issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer().await;
@@ -17577,6 +18204,7 @@ mod tests {
             },
             timeout_secs: None,
             name: Some(format!("elem-{}", id)),
+            subject: Default::default(),
         }
     }
 
@@ -17603,6 +18231,7 @@ mod tests {
             },
             timeout_secs: None,
             name: Some(format!("elem-{}", id)),
+            subject: Default::default(),
         }
     }
 
@@ -23935,6 +24564,31 @@ mod tests {
 
         assert!(call("fabric://peer-gateway/peer-surface", 7, false).is_ok());
         assert!(call("https://partner.example/a2a", 8, false).is_ok(), "only Fabric crossings are counted");
+    }
+
+    #[tokio::test]
+    async fn a_transit_point_policy_deny_tells_the_caller_its_reason() {
+        async fn detail(reason: Option<&str>) -> serde_json::Value {
+            let response = OutboundPipelineError::TransitPointPolicyDenied {
+                reason: reason.map(str::to_string),
+            }
+            .into_response();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            body["detail"].clone()
+        }
+
+        assert_eq!(
+            detail(Some("Calling agent is not recognised")).await,
+            "Request blocked by surface policy: Calling agent is not recognised"
+        );
+        assert_eq!(detail(None).await, "Request blocked by surface policy");
+        assert_eq!(detail(Some("")).await, "Request blocked by surface policy");
     }
 
     /// A Transit Point records the call it refuses at the hop limit as a

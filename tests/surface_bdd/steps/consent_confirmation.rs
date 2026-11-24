@@ -286,10 +286,11 @@ async fn managed_agent_calls_tool_through_transit_point(
         serde_json::json!({ "aud": crate::steps::given::TRANSIT_AUDIENCE }),
     );
     let body = crate::bdd_support::json_rpc::build_mcp_tool_call_body("schedule_meeting", serde_json::json!({}));
+    let path = crate::steps::when::transit_point_path(world, &transit_point);
     crate::steps::when::send_mcp_request_through_transit_point_path_with_headers(
         world,
         &agent_name,
-        &format!("/transit/{transit_point}"),
+        &path,
         body,
         vec![("x-transit-token".to_string(), transit_token), ("authorization".to_string(), format!("Bearer {token}"))],
     )

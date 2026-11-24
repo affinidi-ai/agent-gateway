@@ -16,7 +16,10 @@ export interface JourneyStep {
  */
 function stageRank(entry: AuditEntry): number {
   const tc = trustCheck(entry);
-  if (tc) return tc.leg === 'caller' ? 20 : 60;
+  if (tc) {
+    if (tc.leg === 'caller') return 20;
+    return tc.leg === 'managed_agent' ? 25 : 60;
+  }
 
   const pd = policyDecision(entry);
   if (pd) {

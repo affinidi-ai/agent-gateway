@@ -138,9 +138,28 @@ The Surface Builder offers **Override Agent Card Location** on a Transit Point w
 destination only, not on a `fabric://` one; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+A Transit Point Trust Check element with `"subject": "managed_agent"` (the self recognition
+check) survives every dashboard save with its blank entity (an explicit entity is kept, shown as
+replacing the calling agent's DID with a Clear button), and a save keeps a Transit Point's
+stored `identity_injection` while its `inject_vp` is `true`; see _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder) and
+[`docs/POLICY.md`](docs/POLICY.md#self-recognition-check).
+
 A Transit Point's Rate Limit panel has a **Per caller** section that writes
 `transit.points[].per_caller_rate_limit` beside the point's shared `rate_limit`; see _Surface
 Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+The Surface Builder's **Listen Path** offers the surface prefixes `GET /config/surface-routing`
+reports, with `/outbound` in front on an outbound address the gateway lists in
+`shared_hostname_outbound_addresses`, never on a guess from the two address lists, so the picker
+offers what the save gate accepts. It reads a stored route against that offered list alone: a node
+whose route is under none of the offered prefixes keeps **Surface Prefix** and **Custom Path**
+unresolved and marked after a save attempt, rather than being relabelled under a prefix its path
+does not start with, and a Transit Point whose Listen Path the gateway would refuse blocks Save. A
+Transit Point with no Listen Path at all is neither marked nor blocked, since it answers at its
+derived `/outbound` route. See _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder) and _Transit Point listen paths_
+in [`docs/CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#transit-point-listen-paths).
 
 The Surface Builder palette offers the A2A Transit Point only on A2A and AP2 surfaces and the MCP
 Transit Point only on MCP surfaces; existing Transit Points stay editable; see _Surface Builder_ in
@@ -302,17 +321,23 @@ with a refresh button beside it, and Save is blocked while no secret is picked; 
 Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 A Trust Check on a Managed Agent → Transit Point arrow belongs to that Transit Point and saves
-to `transit.points[i].trust_check_list` (new ones on A2A and AP2 Transit Points only); the
+to `transit.points[i].trust_check_list`, and each query's **Checks** select picks the destination
+agent or this surface's managed agent (on MCP Transit Points only the managed agent); the
 Managed Agent's own Trust Check is offered only for `a2a-proxy://` and `fabric://` targets (on
 any other target it blocks Save), Transit Points whose list was migrated from the old
-surface-wide list are flagged for review (migrated copies can exist on MCP and HTTP Transit
-Points, but new Trust Checks can't be added there), and every surface write and template create
-or update sends `trust_check_split: true`; see
+surface-wide list are flagged for review (a migrated destination copy on an MCP Transit Point is
+read-only), and every surface write and template create or update sends
+`trust_check_split: true`; see
 _Trust Check_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-check).
 
 The Gateways list shows, under a remote gateway's status, when its peer was last heard from
 (`peer_last_seen_at` on `GET /v1/gateways`), apart from this gateway's own mediator link; see
 _Elsewhere_ under remote gateway issuer DIDs in [`www/default/AGENTS.md`](www/default/AGENTS.md).
+
+A Trust Recorder dropped on a Managed Agent → Transit Point arrow is that Transit Point's own,
+saved to `transit.points[i].trust_recorder` with the same panels as the surface's on the
+response arrow; see _Trust Recorder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder).
 
 The Trust Recorder panel and its entries warn while an entry uses the surface Issuer as its
 Authority and the surface has no Issuer or its Issuer no longer exists; see _Trust Recorder_ in
@@ -384,7 +409,8 @@ DIDs with a copy button; see _Agents page_ in
 
 The Identities page shows one row per surface Managed Agent, with its earlier DIDs (from its
 responses and from its Transit Points) and certificate or API key rotations listed as
-versions in the expanded row, each earlier DID with its own actions; rows carry only
+versions in the expanded row, each earlier DID with its own actions and Trust Recorder status
+chip; rows carry only
 `rotation_count`, and Version History loads the rotations when opened; see _Identities page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page) and
 [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#identity-versions).

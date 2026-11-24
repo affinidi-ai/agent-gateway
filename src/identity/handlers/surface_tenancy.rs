@@ -2023,6 +2023,13 @@ fn collect_effective_surface_references(
             for trust_check in &point.trust_check_list {
                 push_reference(references, ResourceKind::TrustRegistries, &trust_check.trust_registry_id);
             }
+            for entry in point
+                .trust_recorder
+                .iter()
+                .flat_map(|recorder| &recorder.entries)
+            {
+                push_reference(references, ResourceKind::TrustRegistries, &entry.trust_registry_id);
+            }
             collect_target_auth_reference(point.target_auth.as_ref(), references);
             collect_custom_metadata_references(transit_metadata(surface), references);
             if let Some(source_auth) = point.source_auth.as_ref() {
@@ -4300,6 +4307,20 @@ mod tests {
 
     #[test]
     fn collects_trust_registries_from_both_legs_and_variants() {
+        let recording = |alias: &str, trust_registry_id: &str, recorder_registry_id: &str| {
+            let mut point = transit_point(alias, trust_registry_id);
+            point.trust_recorder = Some(TrustRecorderConfig {
+                entries: vec![TrustRecorderEntry {
+                    trust_registry_id: recorder_registry_id.into(),
+                    issuer_did: "did:example:issuer".into(),
+                    authority_did: "did:example:authority".into(),
+                    authority_source: None,
+                    include_owned_agent: true,
+                    custom_resources: Vec::new(),
+                }],
+            });
+            point
+        };
         let mut surface = AgentSurface::default();
         surface
             .access_point
@@ -4345,14 +4366,14 @@ mod tests {
                     ..Default::default()
                 }),
                 transit: Some(TransitOverrides {
-                    points: Some(vec![transit_point("variant-tp", "tr-variant-tp")]),
+                    points: Some(vec![recording("variant-tp", "tr-variant-tp", "tr-variant-tp-recorder")]),
                     ..Default::default()
                 }),
                 ..Default::default()
             },
         }];
         surface.transit = Some(crate::config::agent_surface::TransitConfig {
-            points: vec![transit_point("base-tp", "tr-base-tp")],
+            points: vec![recording("base-tp", "tr-base-tp", "tr-base-tp-recorder")],
             outbound_listen_address: None,
             shared: Default::default(),
         });
@@ -4375,6 +4396,8 @@ mod tests {
                 "tr-variant-recorder",
                 "tr-base-tp",
                 "tr-variant-tp",
+                "tr-base-tp-recorder",
+                "tr-variant-tp-recorder",
             ])
         );
     }

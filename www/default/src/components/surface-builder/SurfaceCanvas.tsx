@@ -6,6 +6,7 @@ import type { SurfaceNodeType } from './nodeTypes';
 import { deriveEdges } from './elements/edges/deriveEdges';
 import {
   getArchetype,
+  archetypeHasSlotFor,
   findArchetypeForPair,
   findSlotForNode,
   tryDrop,
@@ -1205,8 +1206,13 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
           const snap = _registry.get(type)?.edgeSnap;
           const snapRadius = snap?.radius ?? 50;
           const archetypeFilter = snap?.archetypes
-            ? (_link: D3Link, s: D3Node, t: D3Node) =>
-                _registry.snapsToArchetype(type, findArchetypeForPair(s.type, t.type), snapContext)
+            ? (link: D3Link, s: D3Node, t: D3Node) => {
+                const archetype = findArchetypeForPair(s.type, t.type);
+                return (
+                  _registry.snapsToArchetype(type, archetype, snapContext) &&
+                  (!link.direction || archetypeHasSlotFor(archetype, type, link.direction))
+                );
+              }
             : undefined;
           const nearest = findNearestEdge(
             mx,
@@ -1326,10 +1332,15 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
         const snap = _registry.get(type)?.edgeSnap;
         const snapRadius = snap?.radius ?? 60;
         const archetypeFilter = snap?.archetypes
-          ? (_link: D3Link, s: D3Node, t: D3Node) =>
-              _registry.snapsToArchetype(type, findArchetypeForPair(s.type, t.type), {
-                targetEndpoint: nodes.find(n => n.type === 'target')?.config?.endpoint,
-              })
+          ? (link: D3Link, s: D3Node, t: D3Node) => {
+              const archetype = findArchetypeForPair(s.type, t.type);
+              return (
+                _registry.snapsToArchetype(type, archetype, {
+                  targetEndpoint: nodes.find(n => n.type === 'target')?.config?.endpoint,
+                }) &&
+                (!link.direction || archetypeHasSlotFor(archetype, type, link.direction))
+              );
+            }
           : undefined;
         const nearest = findNearestEdge(
           mx,

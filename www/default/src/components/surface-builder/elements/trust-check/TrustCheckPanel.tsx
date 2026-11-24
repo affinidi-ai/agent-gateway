@@ -73,7 +73,7 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
     allNodes !== undefined &&
     isManagedAgentTrustCheck(node, allNodes) &&
     !managedAgentTargetLegTrustCheckAllowed(managedAgentEndpoint);
-  const readOnlyProtocol = readOnlyTrustCheckProtocol(node, allNodes);
+  const readOnlyProtocol = readOnlyTrustCheckProtocol({ ...node, config }, allNodes);
   const queries = readQueries(config);
   const authorityDids = useOptionalSurfaceMeta()?.authorityDids;
   const missingAuthorities = missingTrustCheckAuthorities(config, authorityDids);
@@ -113,7 +113,9 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
               data-testid={`trust-check-panel-query-${idx}`}
             >
               <span className="text-muted fw-semibold">Query {idx + 1}</span>
-              <span className="fw-semibold text-end">{typeLabel}</span>
+              <span className="fw-semibold text-end">
+                {q.subject === 'managed_agent' ? `Managed agent · ${typeLabel}` : typeLabel}
+              </span>
             </li>
           );
         })}
@@ -181,8 +183,15 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
           style={{ fontSize: '11px' }}
           data-testid="trust-check-panel-results-ref"
         >
-          Results land on OPA at <code>input.trust_check_results.{legLabel}[]</code>: OPA decides
-          allow / deny.
+          Results land on OPA at <code>input.trust_check_results.{legLabel}[]</code>
+          {leg === 'transit-point' && (
+            <>
+              {' '}
+              (queries that check the managed agent at{' '}
+              <code>input.trust_check_results.managed_agent[]</code>)
+            </>
+          )}
+          : OPA decides allow / deny.
         </Form.Text>
       </div>
 

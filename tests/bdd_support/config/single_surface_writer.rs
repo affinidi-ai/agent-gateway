@@ -137,7 +137,6 @@ fn transit_point_json(
         "alias": transit_point.alias,
         "target_endpoint": target_endpoint,
         "protocol": transit_point.protocol,
-        "listen_path": format!("/transit/{}", transit_point.alias),
         "require_transit_token": transit_point.require_transit_token
     });
     if let Some(source_auth) = &transit_point.source_auth {
@@ -163,6 +162,9 @@ fn transit_point_json(
     }
     if let Some(requests) = transit_point.per_caller_rate_limit_per_minute {
         transit_point_json["per_caller_rate_limit"] = serde_json::json!({ "requests": requests, "window_secs": 60 });
+    }
+    if transit_point.inject_vp {
+        transit_point_json["identity_injection"] = serde_json::json!({ "inject_vp": true });
     }
     if !transit_point
         .header_metadata_mapping
@@ -209,6 +211,12 @@ fn transit_point_json(
                 .trust_check_list
                 .clone(),
         );
+    }
+    if !transit_point
+        .trust_recorder_entries
+        .is_empty()
+    {
+        transit_point_json["trust_recorder"] = serde_json::json!({ "entries": transit_point.trust_recorder_entries });
     }
     if let Some(policy) = &transit_point.policy {
         transit_point_json["policy"] = serde_json::json!({ "policy_definition_id": policy.id });
@@ -675,7 +683,7 @@ fn write_single_surface_config_inner(
         );
     }
     if surface_config.signs_in_with_saml {
-        crate::bdd_support::config::sign_in::sign_in_with_saml(base_dir, gateway_port);
+        crate::bdd_support::config::sign_in::sign_in_with_saml(base_dir, gateway_port, &surface_config.saml_settings);
     }
     if !surface_config
         .rbac_permissions

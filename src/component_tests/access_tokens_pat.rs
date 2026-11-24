@@ -548,7 +548,8 @@ async fn a_pat_rotates_its_own_descendant() {
 async fn a_pat_cannot_rotate_a_token_outside_its_lineage_and_the_denial_leaves_it_usable() {
     let fixture = rotation_app().await;
     let (_, caller_secret) = create_managed_token(&fixture.store, &["access_tokens.edit"], None).await;
-    let (other_id, other_secret) = create_managed_token(&fixture.store, &["access_tokens.edit"], None).await;
+    let (other_id, other_secret) =
+        create_managed_token(&fixture.store, &["access_tokens.edit", "gateways.view"], None).await;
 
     assert_eq!(
         rotate(&fixture.app, &other_id, Some(&caller_secret))
@@ -811,7 +812,7 @@ async fn a_header_scoped_pat_reaches_the_rotate_handler_and_is_refused() {
         &fixture.store,
         None,
         tenant_selector_header(),
-        vec!["access_tokens.edit".to_string()],
+        vec!["access_tokens.edit".to_string(), "gateways.view".to_string()],
     )
     .await;
     let audit = AuditEvents::capture();
@@ -907,10 +908,10 @@ async fn a_newline_in_the_rotated_token_id_stays_on_one_plain_log_line() {
 #[tokio::test]
 async fn a_child_pat_cannot_rotate_its_parent_or_a_sibling() {
     let fixture = rotation_app().await;
-    let (root_id, root_secret) = create_managed_token(&fixture.store, &["access_tokens.edit"], None).await;
-    let (_, first_child_secret) = create_managed_token(&fixture.store, &["access_tokens.edit"], Some(&root_id)).await;
-    let (second_child_id, second_child_secret) =
-        create_managed_token(&fixture.store, &["access_tokens.edit"], Some(&root_id)).await;
+    let scopes = ["access_tokens.edit", "gateways.view"];
+    let (root_id, root_secret) = create_managed_token(&fixture.store, &scopes, None).await;
+    let (_, first_child_secret) = create_managed_token(&fixture.store, &scopes, Some(&root_id)).await;
+    let (second_child_id, second_child_secret) = create_managed_token(&fixture.store, &scopes, Some(&root_id)).await;
     let audit = AuditEvents::capture();
 
     assert_eq!(

@@ -196,7 +196,7 @@ flowchart TB
     end
     subgraph P["Trust and policy"]
         direction LR
-        C0[Trust context] --> C1["Trust Check, target leg"] --> C2[Gateway OPA] --> C3[Surface OPA] --> C4[Transit Point OPA] --> C5["MCP tool gating, tools/call"]
+        C0[Trust context] --> C0a["Transit Point<br/>Trust Recorder"] --> C1["Trust Check, target and<br/>managed-agent elements"] --> C2[Gateway OPA] --> C3[Surface OPA] --> C4[Transit Point OPA] --> C5["MCP tool gating, tools/call"]
     end
     subgraph F["Forward and respond"]
         direction LR
@@ -253,12 +253,17 @@ Transit Point sets other gating or policies than the base surface's is refused w
 Fabric hop check (a `fabric://` Transit Point refuses a call past the hop limit with `508`) →
 Transit Point header mapping
 (A2A and AP2) → outbound extension inspection (A2A) → identity resolution → trusted
-identity → custom metadata → trust context → Trust Check (the Transit Point's own list) → gateway OPA →
+identity → custom metadata → trust context → Transit Point Trust Recorder (writes the calling
+agent's records in the background on every request except a discovery read, never waits or refuses; see
+[`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#transit-point-trust-recorder)) → Trust Check (the Transit Point's own list; its
+managed-agent elements ask about the managed agent calling out, see
+[`docs/POLICY.md`](docs/POLICY.md#self-recognition-check)) → gateway OPA →
 surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection →
 forward (a `proxy://` Transit Point is answered by its MCP Proxy, whose backend gets only a
 `consent_mode: external` grant) → response and agent-card rewrite → metrics. A discovery read (a `GET` or `HEAD` of a discovery document on the Transit Point) runs
-the same stages, transit token validation included, except identity resolution: it has no body
-to resolve an identity from, so it reaches Trust Check and policy without a resolved identity.
+the same stages, transit token validation included, except identity resolution and the self
+recognition check: it has no body to resolve an identity from, so it reaches Trust Check and
+policy without a resolved identity.
 
 This page is the authority on pipeline ordering. When it disagrees with a summary
 elsewhere, the source is the arbiter and this page is corrected.
@@ -442,7 +447,7 @@ from.
 | --- | --- | --- |
 | [`auth/`](src/auth/), [`auth_manager/`](src/auth_manager/) | Dashboard login: passkey and SAML, sessions, and `fabric` CLI browser login (in-memory single-use codes, so one gateway instance) | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#samljson), [`ACCESS_TOKENS.md`](docs/ACCESS_TOKENS.md#cli-browser-login), [`TERMS_AND_CONSENT.md`](docs/TERMS_AND_CONSENT.md#gating-the-session) |
 | [`rbac/`](src/rbac/) | Management API role enforcement | [`RBAC.md`](docs/RBAC.md) |
-| [`access_tokens/`](src/access_tokens/) | Management PATs, delegation, resource patterns | [`ACCESS_TOKENS.md`](docs/ACCESS_TOKENS.md) |
+| [`access_tokens/`](src/access_tokens/) | Management PATs, delegation, resource patterns; the permissions that cover each management route for a PAT with feature scopes live in [`auth_manager/route_scopes.rs`](src/auth_manager/route_scopes.rs) | [`ACCESS_TOKENS.md`](docs/ACCESS_TOKENS.md#feature-scopes) |
 | [`tenancy/`](src/tenancy/) | Tenant context and record ownership | [`ACCESS_TOKENS.md`](docs/ACCESS_TOKENS.md) |
 | [`surfaces/`](src/surfaces/) | Agent Surface CRUD | Source only: [`src/surfaces/mod.rs`](src/surfaces/mod.rs) |
 | [`surface_templates/`](src/surface_templates/) | Built-in and user surface templates | [`templates README`](config/examples/agent_surface_templates/README.md) |

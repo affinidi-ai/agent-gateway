@@ -11,6 +11,7 @@ use tempfile::TempDir;
 
 use bdd_support::admin_client::AdminApiClient;
 use bdd_support::config;
+use bdd_support::config::gateway_bootstrap::TRANSIT_CHANNEL_PREFIX;
 use bdd_support::config::single_surface_fixture::{
     ApiKeyProviderSourceAuthConfig, McpToolPolicyFixture, SurfaceConfigBuilder, SurfaceSourceAuthConfig,
     SurfaceTransitPointConfig,
@@ -284,7 +285,9 @@ fn write_config_can_skip_seed_surface_and_register_api_route() {
         .iter()
         .filter_map(|legacy_channel| legacy_channel["prefix"].as_str())
         .collect();
-    assert_eq!(prefixes, vec!["/created", "/updated"]);
+    // Every BDD gateway also configures the prefix the multi-gateway fixtures
+    // give a Transit Point a listen_path under.
+    assert_eq!(prefixes, vec!["/created", "/updated", TRANSIT_CHANNEL_PREFIX]);
     assert_eq!(gateway_json["routes"]["api"]["type"], "identity_api");
     assert_eq!(gateway_json["routes"]["api"]["prefix"], "/api");
 }

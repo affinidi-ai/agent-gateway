@@ -248,6 +248,14 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   always-visible warning names the receiving gateway. Test ids:
   `<managed-agent|transit-point>-fabric-delegated-credentials-switch` and
   `-warning`. There is no surface-wide switch.
+- **Self recognition check**: a Transit Point Trust Check element with
+  `"subject": "managed_agent"` asks about the managed agent calling out, not the destination.
+  `trust-check/definition.ts` reads `subject` in `queryFromElement` and writes it back in
+  `buildEntry`, keeping such an element's blank `entity_id` blank (the gateway fills in the
+  agent's DID) instead of the destination template, so every save keeps it. The Transit Point
+  factory sends a stored `identity_injection` back while its `inject_vp` is `true`, so a save
+  keeps the identity those elements ask about. A Transit Point's `trust_recorder`, which
+  records that identity, is edited on its arrow (see _Trust Recorder_).
 - **Gateway picker** is one shared gateway-then-surface picker
   (`_shared/GatewaySurfacePicker.tsx`, data from `_shared/useGatewaySurfaces.ts`) used by the
   Managed Agent and Transit Point **via Gateway Connection** routes and by Payment. Every user
@@ -336,6 +344,48 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   external slots still offer it. A protected
   identity already set to From API Key keeps showing its key selector. Transit Point
   identities offer only From Payload.
+- **Listen Path** is the shared routing editor of Access Points and Transit Points
+  (`_shared/RouteListenerSection.tsx`): a required **Surface Prefix** select and a required
+  **Custom Path** input, which compose the node's route, helped by
+  `field-help-route-listener-section-surface-prefix` and `-custom-path`. The prefixes come from
+  `GET /config/surface-routing`. An inbound node offers `channel_path_prefix` as it stands. An
+  outbound one offers those prefixes with `/outbound` in front when the gateway lists the selected
+  address in `shared_hostname_outbound_addresses` (`computeSharedOutboundAddresses`), since the
+  inbound pipeline owns every non-`/outbound` path there. An outbound address with a hostname of
+  its own offers both forms, which the admin API both accept, except a root surface prefix, whose
+  plain form is the whole listener and which is therefore offered only under `/outbound`. The
+  `/outbound` forms come from the response's `outbound_channel_path_prefix` when it carries them,
+  and are derived by the same rule when it does not. The shared classification comes from the
+  gateway, which decides it per listener with the same function its save gate uses, since no
+  comparison of the two address lists can express it.
+  `offeredChannelPrefixes` is the one implementation of the offered list, read by the picker, by
+  the errors beside it and by the seed, which passes the address it is about to write.
+  `listenPathProblem`, the save check, builds its own list instead: the admin API accepts a path
+  under either form of a prefix wherever it is reachable, so it reads every configured prefix and
+  then applies the shared-hostname rule, mirroring `claims_a_channel_prefix`. It checks the paths
+  of this surface alone; a path that is another surface's route is left to the API's
+  `listen_path_route_clash`. A stored `route_prefix` shows as selected only while
+  it is still offered, and one that is not (a Transit Point recorded as `/agents` whose path begins
+  `/outbound/`) is dropped, both fields being re-derived from the stored route instead. Seeding
+  writes a prefix only when the route starts with one that is offered, so a route under none of
+  them is left unresolved rather than relabelled, and a brand-new node seeds the first offered
+  prefix with a two-word random path. After a save attempt (`hasAttemptedSave`) an empty prefix and
+  an empty path are each marked invalid, the prefix with "Pick a surface prefix." naming the stored
+  route as under none of those offered and the path with "Enter a path."; `validatePath`'s own
+  message still wins over the latter. A Transit Point with no Listen Path at all is exempt from
+  both marks, since it answers at its derived `/outbound` route. `listenPathProblem` carries the
+  gateway's own two refusals into `validateSurfacePayload`, which blocks the save while a Listen
+  Path claims no segment under a configured surface prefix (either form, with or without
+  `/outbound`, since the admin API takes both) or sits outside `/outbound` on a shared-hostname
+  address. Checking it against the narrower offered list instead would block a good `/outbound`
+  path on an address with a hostname of its own. It runs only on a path the save introduces or
+  changes, compared with `options.stored`, because that is what the admin API refuses: a surface
+  already stored with such a path stays editable and its save is answered with a `Warning` header.
+  That comparison is why the rule cannot live in the node's `incompleteReason`, which sees no
+  stored surface. Clearing the path saves, and `validateSurfacePayload` warns that the stored path
+  stops answering. What the gateway
+  stores and what it refuses is in
+  [`docs/CONFIGURATION_REFERENCE.md`](../../docs/CONFIGURATION_REFERENCE.md#transit-point-listen-paths).
 - **Entry point URL** is the label for an Access Point's composed URL, with "The URL used to
   access this gateway" behind its `FieldHelp`. It shows at the top of the Access Point panel
   and as a banner along the top of the canvas, both rendered by `RouteListenerBanner`
@@ -871,17 +921,38 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   (slot `request:trust-check-transit_points_trust_check_list`, node
   `trust-check-<transit point node id>`, parented on the Transit Point). The Transit Point
   factory writes it to `transit.points[i].trust_check_list`; the trust-check element's own
-  `buildPayload` skips Transit-Point-parented nodes. A new one can be dropped only on A2A and AP2
-  Transit Points (`makeSurfaceSlotFilter`). A stored list on an MCP or HTTP Transit Point (a
-  migrated copy) still hydrates onto that Transit Point's arrow and saves back, so it can be
-  kept or removed; once removed it cannot be added there again. Such a copy is read-only
-  (`readOnlyTrustCheckProtocol`): the sidebar panel and fullscreen editor say "Trust Checks can't
-  be changed on an MCP Transit Point; keep or remove this migrated copy.", the sidebar button
-  (`trust-check-panel-configure`) reads "View Queries…" instead of "Configure Queries…", the
-  fullscreen query list sits in a disabled `fieldset` (no field edits, add or remove query) and
-  has no Save. It keeps the stored wire entries (`STORED_TRUST_CHECK_LIST_KEY`) and saves them
-  back exactly as loaded, never rebuilt from the panel's queries. A2A and AP2 copies stay
-  editable and are rebuilt from their queries.
+  `buildPayload` skips Transit-Point-parented nodes. One can be dropped on every Transit Point
+  (`makeSurfaceSlotFilter`).
+- Each query of a Transit Point's Trust Check has a **Checks** select
+  (`trust-check-query-<n>-subject`, `transitPointSubjectChoice`): "Destination agent" (no
+  `subject`, the default on A2A and AP2) or "This surface's managed agent" (`subject:
+  "managed_agent"`, the self recognition check). Switching drops the stored entity. A
+  managed-agent query shows a fixed note (`trust-check-query-<n>-entity-managed-agent`) in place
+  of the Entity ID picker and saves a blank `entity_id`, which the gateway fills in with the DID
+  the managed agent calls out under. A stored managed-agent query with an explicit entity keeps
+  it on save and shows instead a note that it replaces the calling agent's DID
+  (`trust-check-query-<n>-entity-managed-agent-override`) with a **Clear** button
+  (`-entity-managed-agent-clear`) that blanks it. When the Transit Point presents no managed
+  identity (no `identity_injection.inject_vp` and no managed identity node,
+  `transitPointPresentsManagedIdentity`), the fullscreen editor adds a `--warning-text` note
+  (`-entity-managed-agent-no-identity`) that the check reports
+  `MANAGED_AGENT_IDENTITY_UNAVAILABLE`. MCP Transit Points cannot check their destination
+  (`transitPointChecksDestination`): there the select offers only the managed agent, with a note
+  (`trust-check-query-<n>-subject-only-managed-agent`), and new queries start as managed-agent
+  queries. The sidebar list labels a managed-agent query "Managed agent · <type>", and both the
+  sidebar and the fullscreen editor name `input.trust_check_results.managed_agent[]`.
+- The dashboard has no HTTP Transit Point node (a stored HTTP Transit Point loads as A2A), so
+  these MCP rules do not reach one; edit an HTTP Transit Point's list through the API.
+- A stored list on an MCP Transit Point that holds a destination query (a migrated copy)
+  still hydrates onto that Transit Point's arrow and saves back, so it can be kept or removed.
+  Such a copy is read-only (`readOnlyTrustCheckProtocol`): the sidebar panel and fullscreen
+  editor say "Trust Checks can't be changed on an MCP Transit Point; keep or remove this migrated
+  copy.", the sidebar button (`trust-check-panel-configure`) reads "View Queries…" instead of
+  "Configure Queries…", the fullscreen query list sits in a disabled `fieldset` (no field edits,
+  add or remove query) and has no Save. It keeps the stored wire entries
+  (`STORED_TRUST_CHECK_LIST_KEY`) and saves them back exactly as loaded, never rebuilt from the
+  panel's queries. A list there that holds only managed-agent queries, and A2A and AP2 lists,
+  stay editable and are rebuilt from their queries.
 - A node parented on a Transit Point is that Transit Point's leg whatever its slot id says
   (`trustCheckLeg(node, allNodes)`); otherwise the slot decides, and a node with no known slot is
   the caller leg. Only a node in the Managed Agent slot is the Managed Agent's own leg. An empty
@@ -1002,6 +1073,7 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
 | Fullscreen leg label             | `trust-check-fullscreen-leg`                                                                       |
 | Managed Agent URL-target warning | `trust-check-panel-managed-agent-target-warning`                                                   |
 | Read-only migrated copy line     | `trust-check-panel-read-only`, `trust-check-fullscreen-read-only`                                  |
+| Checks select and notes          | `trust-check-query-<n>-subject`, `-subject-only-managed-agent`, `-entity-managed-agent`, `-entity-managed-agent-override`, `-entity-managed-agent-clear`, `-entity-managed-agent-no-identity` |
 | Fullscreen query list            | `trust-check-fullscreen-queries`                                                                   |
 | Migrated warning and Keep        | `trust-check-panel-migrated-warning`, `trust-check-fullscreen-migrated-warning`, each with `-keep` |
 | Review summary                   | `surface-migrated-trust-checks-summary`                                                            |
@@ -1012,6 +1084,21 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
 
 ## Trust Recorder
 
+- A Trust Recorder has two slots, both edited with the same panels: the surface's on the
+  Managed Agent → Access Point response arrow (`response:trust-recorder`, node
+  `trust-recorder-target-response`, writes `access_point.trust_recorder`), and each Transit
+  Point's own on its Managed Agent → Transit Point request arrow (`request:trust-recorder`,
+  ordered before that Transit Point's Trust Check, node `trust-recorder-<transit point node id>`,
+  parented to the Transit Point). `deriveEdges` binds the second to that Transit Point's arrow,
+  so it is drawn on the arrow and drags only along it, like the Trust Check beside it. The
+  Transit Point factory writes the second as
+  `transit.points[i].trust_recorder` and the element's own `buildPayload` skips it; removing the
+  node removes the Transit Point's recorder. The stored surface owns both recorders' entries
+  (`payloadOwnsConfig`): the canvas layout restores a recorder only while the payload has it, or
+  as a placeholder with no entries. The element is `directionality: 'either'` and snaps
+  only to an arrow and direction with a slot for it (`archetypeHasSlotFor`). The panels name the
+  leg through `TrustRecorderLeg` (`isTransitPointTrustRecorder`); the Last outcome row is the
+  surface's, which Transit Point recorders also update.
 - The sidebar panel and each entry in its fullscreen editor show the shared
   `NoSurfaceIssuerWarning` (`elements/trust-recorder/NoSurfaceIssuerWarning.tsx`, an
   `InfoBanner` warning variant, never the amber `alert-warning`, which fails contrast) while
@@ -2528,7 +2615,9 @@ parts `IdentityNameCell`, `IdentitySurfaceCell`, `IdentityOriginBadge`,
   fields); the first version lists its values. A rotation with field changes (a certificate)
   is labelled "Credential rotated"; one without (an API key, whose update may only have
   edited its details) is labelled "Credential updated". A version that introduces a DID other
-  than the row's offers that DID's actions (`identities-version-<n>-<action>-button`). A
+  than the row's offers that DID's actions (`identities-version-<n>-<action>-button`) and,
+  when the DID has one, its Trust Recorder status chip (`identities-version-<n>-recorder`), so
+  a Transit Point's own managed identity shows whether it was recorded. A
   certificate or API key identity with no versions yet still shows the section, saying none
   are recorded. Rows carry only `rotation_count`. Opening Version History fetches every page
   of each member DID's rotations with a count above 0 (`getIdentityRotations` in `api.ts`,

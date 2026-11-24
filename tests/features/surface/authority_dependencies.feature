@@ -53,6 +53,19 @@ Feature: Authorities that Trust Checks and Trust Recorder entries use
     And the refusal says a Trust Recorder entry of the surface under test uses the Authority
     And the Authority "Acme" is stored
 
+  Scenario: Deleting an Authority that a Transit Point's Trust Recorder entry uses is refused naming the Transit Point
+    Given the operator has created the surface for route "/orders" whose Transit Point "partner" has a Trust Recorder taking DID "did:web:acme.example" as its authority
+    When the operator deletes the Authority "Acme"
+    Then the admin API response status is 409
+    And the refusal names the surface under test as a record that uses it
+    And the refusal says a Trust Recorder entry of Transit Point "partner" of the surface under test uses the Authority
+    And the Authority "Acme" is stored
+
+  Scenario: A Transit Point's Trust Recorder with more entries than allowed is refused
+    When the operator creates the surface for route "/orders" whose Transit Point "partner" has a Trust Recorder with 11 entries
+    Then the admin API response status is 400
+    And the admin API error response mentions "transit point 'partner': trust_recorder has 11 entries (max 10)"
+
   Scenario: Deleting an Authority that a managed connection's Trust Check uses is refused naming the connection
     Given the operator has created the managed connection "cli" with a Trust Check against DID "did:web:acme.example"
     When the operator deletes the Authority "Acme"

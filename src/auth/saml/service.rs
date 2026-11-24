@@ -470,27 +470,36 @@ impl SamlService {
     }
 }
 
-/// Reject a SAML response that does not contain exactly one `Assertion`
-/// element anywhere in the document (see the XSW comment at the call site).
+/// Reject a SAML response that carries an `EncryptedAssertion` element or
+/// does not contain exactly one `Assertion` element anywhere in the document
+/// (see the XSW comment at the call site).
 fn reject_multiple_assertions(xml: &str) -> Result<()> {
     use quick_xml::Reader;
     use quick_xml::events::Event;
 
     let mut reader = Reader::from_str(xml);
     let mut count = 0usize;
+    let mut encrypted_count = 0usize;
     loop {
         match reader
             .read_event()
             .context("Failed to scan SAML response for Assertion elements")?
         {
             Event::Eof => break,
-            Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"Assertion" => {
-                count += 1;
-            }
+            Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
+                b"Assertion" => count += 1,
+                b"EncryptedAssertion" => encrypted_count += 1,
+                _ => {}
+            },
             _ => {}
         }
     }
 
+    if encrypted_count > 0 {
+        anyhow::bail!(
+            "encrypted SAML assertions are not supported; configure the identity provider to send unencrypted signed assertions"
+        );
+    }
     if count != 1 {
         anyhow::bail!(
             "SAML response must contain exactly one Assertion element, found {count} (possible XML Signature Wrapping attack)"
@@ -867,7 +876,46 @@ mod tests {
     #[test]
     fn rejects_response_with_no_assertion() {
         let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"></samlp:Response>"#;
-        assert!(reject_multiple_assertions(xml).is_err());
+        let error = reject_multiple_assertions(xml)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("found 0"), "{error}");
+    }
+
+    fn assert_refuses_encrypted_assertion(xml: &str) {
+        let error = reject_multiple_assertions(xml)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("encrypted SAML assertions are not supported"), "{error}");
+    }
+
+    #[test]
+    fn rejects_response_with_only_an_encrypted_assertion() {
+        assert_refuses_encrypted_assertion(
+            r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
+            <saml:EncryptedAssertion><xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#"/></saml:EncryptedAssertion>
+        </samlp:Response>"#,
+        );
+    }
+
+    #[test]
+    fn rejects_response_with_an_encrypted_assertion_next_to_a_plain_one() {
+        assert_refuses_encrypted_assertion(
+            r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
+            <saml:Assertion ID="a1"></saml:Assertion>
+            <saml:EncryptedAssertion><xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#"/></saml:EncryptedAssertion>
+        </samlp:Response>"#,
+        );
+    }
+
+    #[test]
+    fn rejects_response_with_two_encrypted_assertions() {
+        assert_refuses_encrypted_assertion(
+            r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
+            <saml:EncryptedAssertion><xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#"/></saml:EncryptedAssertion>
+            <saml:EncryptedAssertion/>
+        </samlp:Response>"#,
+        );
     }
 
     #[test]
