@@ -278,6 +278,18 @@ async fn producer_for(
     Ok(producer)
 }
 
+/// The Kafka record of one delivery: the payload, which carries the event's id and occurrence
+/// time, keyed by the integration. It carries no record header.
+fn record<'a>(
+    topic: &'a str,
+    payload: &'a str,
+    integration_id: &'a str,
+) -> FutureRecord<'a, str, str> {
+    FutureRecord::to(topic)
+        .payload(payload)
+        .key(integration_id)
+}
+
 #[async_trait]
 impl StreamPublisher for KafkaPublisher {
     fn validate_config(
@@ -306,12 +318,8 @@ impl StreamPublisher for KafkaPublisher {
 
         let event_json = serde_json::to_string(event).context("Failed to serialize event payload")?;
 
-        let record = FutureRecord::to(topic)
-            .payload(&event_json)
-            .key(integration_id);
-
         producer
-            .send(record, Duration::from_secs(30))
+            .send(record(topic, &event_json, integration_id), Duration::from_secs(30))
             .await
             .map_err(|(e, _)| anyhow::anyhow!("Failed to send event to Kafka: {:?}", e))?;
 
@@ -332,6 +340,50 @@ mod tests {
 
     fn configured(config: Value) -> ClientConfig {
         client_config("broker:9092", &config).expect("valid configuration")
+    }
+
+    #[tokio::test]
+    async fn a_record_carries_the_event_in_its_payload_and_no_header() {
+        use crate::integrations::definitions::{Endpoint, EndpointType, Integration};
+        use crate::integrations::delivery::dispatch::{Route, prepare};
+        use crate::integrations::delivery::values::{Occurrence, event_values};
+        let endpoint = Endpoint::new(
+            "Kafka".to_string(),
+            String::new(),
+            EndpointType::Stream,
+            json!({"platform": "kafka", "topic": "events", "brokers": "broker:9092"}),
+        );
+        let integration =
+            Integration::new("Kafka".to_string(), String::new(), endpoint.id.clone(), String::new(), json!({}));
+        let occurrence = Occurrence::recorded(Some("evt-7".to_string()), "2026-11-24T10:00:00+00:00".to_string());
+        let event = crate::integrations::events::find_event("gateway.created").expect("catalog event");
+        let values = event_values(event, &occurrence, std::collections::HashMap::new(), None);
+        let (_, message) = prepare(&Route { integration, endpoint }, &values, None)
+            .await
+            .expect("prepares");
+        let payload = serde_json::to_string(&message.content).expect("serializes");
+
+        let record = record("events", &payload, &message.integration_id);
+
+        assert!(record.headers.is_none(), "a record carries no header");
+        assert_eq!(
+            (record.topic, record.key),
+            (
+                "events",
+                Some(
+                    message
+                        .integration_id
+                        .as_str()
+                )
+            )
+        );
+        let sent: Value = serde_json::from_str(
+            record
+                .payload
+                .expect("a payload"),
+        )
+        .expect("JSON");
+        assert_eq!((&sent["event_id"], &sent["occurred_at"]), (&json!("evt-7"), &json!("2026-11-24T10:00:00+00:00")));
     }
 
     #[test]
