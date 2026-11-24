@@ -684,7 +684,7 @@ fn write_single_surface_config_inner(
         );
     }
     if surface_config.signs_in_with_saml {
-        crate::bdd_support::config::sign_in::sign_in_with_saml(base_dir, gateway_port);
+        crate::bdd_support::config::sign_in::sign_in_with_saml(base_dir, gateway_port, &surface_config.saml_settings);
     }
     if !surface_config
         .rbac_permissions

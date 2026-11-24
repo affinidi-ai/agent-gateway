@@ -82,7 +82,7 @@ Each of these behaves differently from the obvious reading of the field.
 | `server_mode` | Must be a top-level key, before any `[table]` header. Placed after one, TOML nests it under that table and the setting is silently ignored. |
 | `a2a.message_expires_seconds` | Should be strictly greater than `a2a.fabric_gateway_timeout_ms / 1000`. Nothing validates this. When it is not, a fabric message expires at the mediator while the sending gateway is still waiting, and the failure looks like a timeout with no cause. |
 | `backup_encryption_key` | Required. The service does not start without a resolvable value. |
-| Unknown top-level keys | Ignored, not rejected. A misspelled key takes no effect and produces no error. |
+| Unknown top-level keys | Ignored, not rejected. A misspelled key takes no effect and produces no error; in `saml.json` it logs a warning at startup ([`saml.json`](#samljson)). |
 | `encryption.key_source = "local"` | Does not encrypt. It writes plaintext `ENC[0::…]` envelopes and is for development only. It does not count as encryption at rest for delegated grants by binding, so with it, as with `[encryption]` off, a binding with `consent_mode: external`, a Transit Point's or the Access Point Target's, is refused. See [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#grants-by-binding). |
 | `encryption.enabled` | `--generate-bootstrap` writes `[encryption]` with `enabled = false`, and a `config.toml` without the table runs unencrypted. Deployment tooling that builds `config.toml` from `--generate-bootstrap` replaces that table, so its output keeps encryption off and the table's shape stable. The development setup turns encryption on for an environment it creates: a local one reads the master key from `envs/master_encryption_key` (`key_source = "file"`), a Docker one from `AG_MASTER_KEY`. When it regenerates an existing `config.toml`, it keeps that file's `[encryption]` table. An existing environment that runs unencrypted stays unencrypted. To opt in, set `[encryption]` by hand (`enabled = true`, `key_source = "file"`, `key_file` = the absolute path of `envs/master_encryption_key` or of another file holding a 64-hex or base64 32-byte key) and restart; plaintext records are rewritten as `.json.enc` when they are loaded. |
 | `encryption.field_encryption_enabled` | Reserved and not wired to any field. Leave it false. |
@@ -232,7 +232,7 @@ description that exists today.
 | --- | --- |
 | `server_mode` | `active` serves traffic. `standby` drops listeners and returns 503 on `/api/v1/health` while `/api/v1/alive` stays 200. `SIGUSR1` promotes, `SIGUSR2` steps down. |
 | `cache_refresh_interval_secs` | Above 0, DashMap-backed stores reconcile with disk on that interval, so manual `_storage/` edits are picked up without a reload. Policy definitions and global policies do not participate. |
-| `auth_mode` | `passkey` uses WebAuthn. `saml` requires `saml.json` and a configured identity provider. |
+| `auth_mode` | `passkey` uses WebAuthn. `saml` requires `saml.json` and a configured identity provider; it reads `saml.json` and fails startup if it cannot be read or any of its settings is refused ([`saml.json`](#samljson)). |
 | `secrets_backend` | `filesystem` keeps secrets under `_storage/`. `aws` uses AWS. |
 | `encryption.enabled` | Writes whole storage files as `.json.enc`. Losing the master key loses the data. |
 | `metrics_retention_minutes` | Parsed but not used. Retention is the value in `_storage/settings/settings.json`, set from the dashboard, which defaults to 360 minutes whatever this field says. |
@@ -492,9 +492,9 @@ Read when `auth_mode = "saml"`. Ignored otherwise.
 
 | Group | Fields |
 | --- | --- |
-| Identity provider | `idp_entity_id`, `idp_sso_url`, `idp_slo_url`, `idp_cert_path` |
+| Identity provider | `idp_entity_id`, `idp_sso_url`, `idp_cert_path` |
 | Service provider | `sp_entity_id`, `sp_acs_url`, `sp_key_path`, `sp_cert_path` |
-| Security | `sign_requests`, `require_encrypted_assertions` |
+| Security | `sign_requests` |
 | Sign-in throttle | `login_throttle`: `enabled` (default `false`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds) per client IP for `/saml/login`. Behind a load balancer, set `client_ip.trusted_proxies` in `gateway.json` first. |
 | Claims | `attribute_mapping` from SAML claim URI to user field |
 | Roles | `role_mapping` from identity-provider role to gateway role |
@@ -509,6 +509,25 @@ first user to sign in becomes the primary administrator and keeps that role what
 identity provider sends later, so a missing or changed role claim cannot remove the only
 guaranteed administrator. A sign-in that would have changed it logs a warning instead
 ([`saml/user_provisioning.rs`](../src/auth/saml/user_provisioning.rs)).
+
+Encrypted assertions and SAML single logout are not supported. `"require_encrypted_assertions": true`
+refuses startup; set it to `false` or remove it, and configure the identity provider to send
+unencrypted signed assertions. A SAML response that carries an encrypted assertion is refused at
+sign-in, and the log says "encrypted SAML assertions are not supported". A non-null
+`"idp_slo_url"` refuses startup; remove it. `false` or absent `require_encrypted_assertions`, and
+`null` or absent `idp_slo_url`, are accepted. Signing out ends the dashboard session only; see the
+accepted risk below.
+
+Accepted risk: SAML single logout is not supported. Signing out ends the dashboard session only
+and does not sign out of the identity provider, so the next SAML sign-in in that browser can
+complete without asking for credentials. Sign out of the identity provider as well, or have it
+require re-authentication.
+
+Startup logs one warning that names up to 20 of the `saml.json` keys that are not read, and how
+many there are, at the top level and inside `attribute_mapping`, `graph_api` and `login_throttle`;
+keys set to `null` are not reported. Only key names are logged, each cut to 64 characters, and
+startup continues.
+`idp_metadata_url` and `graph_api.note` are ignored and not reported.
 
 ## `x402.json`
 
