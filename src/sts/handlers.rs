@@ -38,6 +38,9 @@ use crate::sts::types::{
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
+/// The longest lifetime of an access token the STS issues.
+pub const MAX_ACCESS_TOKEN_TTL_SECS: u64 = 900;
+
 /// Runtime tuning for the STS.
 #[derive(Debug, Clone)]
 pub struct StsConfig {
@@ -66,7 +69,7 @@ impl Default for StsConfig {
     fn default() -> Self {
         Self {
             default_ttl_secs: 300,
-            max_ttl_secs: 900,
+            max_ttl_secs: MAX_ACCESS_TOKEN_TTL_SECS,
             id_jag_ttl_secs: 120,
             public_base_url: None,
             replay_backend: crate::sts::replay::IN_PROCESS_BACKEND.to_string(),

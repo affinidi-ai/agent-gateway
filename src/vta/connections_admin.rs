@@ -505,6 +505,60 @@ fn to_connection(
     }
 }
 
+/// Makes `next` the active key of the connection as stored now, retiring the
+/// one it replaces, so a key change saved meanwhile is kept rather than
+/// overwritten. Returns the saved connection and the retired key id, or why
+/// the switch was refused.
+async fn switch_active_key(
+    state: &VtaConnectionAdminState,
+    id: &str,
+    next: crate::vta::connections::SigningKey,
+) -> anyhow::Result<Result<(VtaConnection, Option<String>), String>> {
+    let mut outcome = Ok(None);
+    let updated = crate::vta::connections::modify(state.store.as_ref(), id, |stored| {
+        let previous = stored
+            .keys
+            .active
+            .as_ref()
+            .map(|key| key.key_id.clone());
+        outcome = stored
+            .keys
+            .rotate_to(next, chrono::Utc::now())
+            .map(|()| previous);
+    })
+    .await?;
+    Ok(outcome.map(|previous| (updated, previous)))
+}
+
+/// The connection as edited: each editable field the edit sends, and the stored
+/// value of each it leaves out. A field sent as `null` is cleared.
+fn edited_request(
+    existing: &VtaConnection,
+    edit: serde_json::Value,
+) -> Result<VtaConnectionRequest, String> {
+    let serde_json::Value::Object(sent) = edit else {
+        return Err("the edit must be a JSON object".to_string());
+    };
+    let mut merged = serde_json::json!({
+        "name": existing.name,
+        "description": existing.description,
+        "enabled": existing.enabled,
+        "transport": existing.transport,
+        "endpoint": existing.endpoint,
+        "vta_did": existing.vta_did,
+        "default_context_id": existing.default_context_id,
+        "control_key_ref": existing.control_key_ref,
+    });
+    if let Some(fields) = merged.as_object_mut() {
+        for (field, value) in sent {
+            if fields.contains_key(&field) {
+                fields.insert(field, value);
+            }
+        }
+    }
+    serde_json::from_value(merged).map_err(|e| format!("invalid edit: {e}"))
+}
+
 /// Whether an edit points the connection at another trust agent: a different
 /// endpoint, agent DID or transport.
 fn points_elsewhere(
@@ -730,7 +784,7 @@ pub async fn update_connection(
     pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
-    Json(mut body): Json<VtaConnectionRequest>,
+    Json(edit): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     if let Err(e) = require_permission(
         &user_id,
@@ -768,6 +822,10 @@ pub async fn update_connection(
         )
             .into_response();
     }
+    let mut body = match edited_request(&existing, edit) {
+        Ok(body) => body,
+        Err(message) => return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response(),
+    };
     let repointed = points_elsewhere(&existing, &body);
     if (existing.enabled && !body.enabled
         || repointed
@@ -2047,7 +2105,7 @@ pub async fn rotate_connection_key(
     scope: Option<Extension<PatResourceScope>>,
     Json(body): Json<RotateKeyRequest>,
 ) -> impl IntoResponse {
-    let mut connection = match load_for_pairing(
+    let connection = match load_for_pairing(
         &user_id,
         &passkey_storage,
         &rbac_config,
@@ -2065,27 +2123,24 @@ pub async fn rotate_connection_key(
         Err(e) => return e.into_response(),
     };
 
-    let previous = connection
+    let next = crate::vta::connections::SigningKey {
+        key_id: body.key_id.trim().to_string(),
+        public_key: body.public_key,
+        label: body.label,
+        added_at: chrono::Utc::now(),
+        retired_at: None,
+    };
+    if let Err(message) = connection
         .keys
-        .active
-        .as_ref()
-        .map(|k| k.key_id.clone());
-    if let Err(message) = connection.keys.rotate_to(
-        crate::vta::connections::SigningKey {
-            key_id: body.key_id.trim().to_string(),
-            public_key: body.public_key,
-            label: body.label,
-            added_at: chrono::Utc::now(),
-            retired_at: None,
-        },
-        chrono::Utc::now(),
-    ) {
+        .clone()
+        .rotate_to(next.clone(), chrono::Utc::now())
+    {
         return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response();
     }
 
-    let keys = connection.keys;
-    match crate::vta::connections::modify(state.store.as_ref(), &id, |stored| stored.keys = keys).await {
-        Ok(updated) => {
+    match switch_active_key(&state, &id, next).await {
+        Ok(Err(message)) => (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response(),
+        Ok(Ok((updated, previous))) => {
             info!(
                 target: "vta_audit",
                 connection_id = %id,
@@ -2182,7 +2237,7 @@ pub async fn provision_connection_key(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
 ) -> impl IntoResponse {
-    let mut connection = match load_for_pairing(
+    if let Err(e) = load_for_pairing(
         &user_id,
         &passkey_storage,
         &rbac_config,
@@ -2196,9 +2251,8 @@ pub async fn provision_connection_key(
     )
     .await
     {
-        Ok(connection) => connection,
-        Err(e) => return e.into_response(),
-    };
+        return e.into_response();
+    }
 
     let Some(registry) = state.registry.as_ref() else {
         return (
@@ -2223,22 +2277,10 @@ pub async fn provision_connection_key(
         }
     };
     let key_id = created.key_id.clone();
-    let previous_key_id = connection
-        .keys
-        .active
-        .as_ref()
-        .map(|key| key.key_id.clone());
 
-    if let Err(message) = connection
-        .keys
-        .rotate_to(created, chrono::Utc::now())
-    {
-        return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response();
-    }
-
-    let keys = connection.keys;
-    match crate::vta::connections::modify(state.store.as_ref(), &id, |stored| stored.keys = keys).await {
-        Ok(updated) => {
+    match switch_active_key(&state, &id, created).await {
+        Ok(Err(message)) => (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response(),
+        Ok(Ok((updated, previous_key_id))) => {
             info!(
                 target: "vta_audit",
                 connection_id = %id,
@@ -2618,6 +2660,199 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    async fn send(
+        router: &Router,
+        method: &str,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// A connected connection with a description, a default context and an
+    /// active key, so an edit that drops any of them shows.
+    async fn stored_connected(state: &VtaConnectionAdminState) -> VtaConnection {
+        let mut connection = new_connection();
+        connection.id = "conn".to_string();
+        connection.description = Some("the customer's agent".to_string());
+        connection.enabled = true;
+        connection.default_context_id = Some("ctx-1".to_string());
+        connection.control_key_ref = Some(CONTROL_KEY_REF.to_string());
+        connection.pairing.state = crate::vta::pairing::PairingState::Connected;
+        connection.status = connection
+            .pairing
+            .state
+            .into();
+        connection
+            .keys
+            .rotate_to(
+                crate::vta::connections::SigningKey {
+                    key_id: "key-1".to_string(),
+                    public_key: None,
+                    label: None,
+                    added_at: chrono::Utc::now(),
+                    retired_at: None,
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        state
+            .store
+            .create(connection)
+            .await
+            .unwrap()
+    }
+
+    const CONTROL_KEY_REF: &str = "vta-control-key-3f2c9a1e-7d4b-4c1a-9e55-0a1b2c3d4e5f";
+
+    /// The admin router with the secrets store holding the control key that
+    /// [`stored_connected`] names.
+    async fn edit_router(state: &VtaConnectionAdminState) -> (Router, tempfile::TempDir) {
+        let (router, users) = admin_router(state.clone(), None).await;
+        (router.layer(Extension(store_holding(&"2a".repeat(32)))), users)
+    }
+
+    async fn reread(state: &VtaConnectionAdminState) -> VtaConnection {
+        state
+            .store
+            .get("conn")
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn an_edit_changes_only_the_fields_it_sends() {
+        let _guard = crate::vta::isolation::TEST_LOCK
+            .lock()
+            .unwrap();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async {
+                let (state, _dir) = admin_state(None).await;
+                let before = stored_connected(&state).await;
+                let (router, _users) = edit_router(&state).await;
+
+                let (status, body) =
+                    send(&router, "PUT", "/v1/vta/connections/conn", serde_json::json!({ "name": "Renamed" })).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let after = reread(&state).await;
+                assert_eq!(after.name, "Renamed");
+                assert_eq!(after.description, before.description);
+                assert!(after.enabled, "an edit that leaves out enabled keeps it");
+                assert_eq!(after.transport, before.transport);
+                assert_eq!(after.endpoint, before.endpoint);
+                assert_eq!(after.vta_did, before.vta_did);
+                assert_eq!(after.default_context_id, before.default_context_id);
+                assert_eq!(after.pairing.state, crate::vta::pairing::PairingState::Connected);
+                assert_eq!(after.keys, before.keys);
+
+                let (status, _) =
+                    send(&router, "PUT", "/v1/vta/connections/conn", serde_json::json!({ "description": null })).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(
+                    reread(&state)
+                        .await
+                        .description,
+                    None,
+                    "a field sent as null is cleared"
+                );
+
+                let (status, _) =
+                    send(&router, "PUT", "/v1/vta/connections/conn", serde_json::json!({ "enabled": "yes" })).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                let (status, _) = send(&router, "PUT", "/v1/vta/connections/conn", serde_json::json!(["name"])).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(reread(&state).await.enabled, "a refused edit changes nothing");
+                crate::vta::isolation::clear_reservations();
+            });
+    }
+
+    #[test]
+    fn an_edit_points_elsewhere_when_it_changes_the_endpoint_agent_did_or_transport() {
+        let existing = new_connection();
+        let edit = |change: serde_json::Value| edited_request(&existing, change).unwrap();
+        assert!(!points_elsewhere(&existing, &edit(serde_json::json!({ "name": "Renamed", "enabled": false }))));
+        assert!(points_elsewhere(&existing, &edit(serde_json::json!({ "endpoint": "https://other.example" }))));
+        assert!(points_elsewhere(
+            &existing,
+            &edit(serde_json::json!({ "vta_did": "did:webvh:QmOther:other.example" }))
+        ));
+        assert!(points_elsewhere(&existing, &edit(serde_json::json!({ "transport": "didcomm" }))));
+    }
+
+    /// Repointing a connection is a disconnect from the agent it was granted
+    /// by: refused while a surface signs through it, unless acknowledged, and
+    /// once done the new agent has to grant and be verified again.
+    #[test]
+    fn repointing_resets_the_pairing_and_is_refused_while_something_signs_through_the_connection() {
+        let _guard = crate::vta::isolation::TEST_LOCK
+            .lock()
+            .unwrap();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async {
+                let (state, _dir) = admin_state(None).await;
+                let before = stored_connected(&state).await;
+                let surfaces_dir = tempfile::tempdir().unwrap();
+                let surfaces = crate::surfaces::FileSystemAgentSurfaceStore::new(
+                    surfaces_dir
+                        .path()
+                        .to_path_buf(),
+                )
+                .await
+                .unwrap();
+                crate::surfaces::AgentSurfaceStore::save(
+                    &surfaces,
+                    &signing_surface("s1", None, vta_signing(Some("conn"))),
+                )
+                .await
+                .unwrap();
+                let surfaces: Arc<dyn crate::surfaces::AgentSurfaceStore> = Arc::new(surfaces);
+                let (router, _users) = edit_router(&state).await;
+                let router = router.layer(Extension(surfaces));
+                let repoint = serde_json::json!({ "endpoint": "https://other.example" });
+
+                let (status, body) = send(&router, "PUT", "/v1/vta/connections/conn", repoint.clone()).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{body}");
+                assert_eq!(body["signing_users"], serde_json::json!(["surface \"surface s1\""]));
+                let unchanged = reread(&state).await;
+                assert_eq!(unchanged.endpoint, before.endpoint);
+                assert_eq!(unchanged.pairing.state, crate::vta::pairing::PairingState::Connected);
+
+                let (status, _) =
+                    send(&router, "PUT", "/v1/vta/connections/conn", serde_json::json!({ "name": "Renamed" })).await;
+                assert_eq!(status, StatusCode::OK, "a rename points nowhere else and is not refused");
+
+                let (status, _) =
+                    send(&router, "PUT", "/v1/vta/connections/conn?acknowledge_signing_users=true", repoint).await;
+                assert_eq!(status, StatusCode::OK);
+                let repointed = reread(&state).await;
+                assert_eq!(repointed.endpoint, "https://other.example");
+                assert_eq!(repointed.pairing.state, crate::vta::pairing::PairingState::Draft);
+                assert_eq!(repointed.status, VtaConnectionStatus::Unpaired);
+                assert_eq!(repointed.name, "Renamed");
+                crate::vta::isolation::clear_reservations();
+            });
     }
 
     async fn status_body(router: &Router) -> serde_json::Value {

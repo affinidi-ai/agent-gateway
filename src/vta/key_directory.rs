@@ -197,15 +197,18 @@ impl KeyScope {
         }
     }
 
-    /// The surface a request is served by, and the variant serving it, if any.
+    /// The surface a request is served by, its owner, and the variant serving
+    /// it, if any. The owner names the surface's derived context, so a surface
+    /// created under another tenant with a deleted surface's id never signs in
+    /// that surface's context.
     pub fn serving(
-        surface_id: &str,
+        surface: &crate::config::agent_surface::AgentSurface,
         variant_id: Option<&str>,
     ) -> Self {
         Self {
-            surface_id: Some(surface_id.to_string()),
+            tenant_id: surface.tenant_id.clone(),
+            surface_id: Some(surface.surface_id.clone()),
             variant_id: variant_id.map(str::to_string),
-            ..Self::default()
         }
     }
 
@@ -758,6 +761,22 @@ impl KeyDirectory {
     /// declared block this backend cannot serve for `purpose`, is an error: the
     /// surface may map a trust agent key, and reading either as "no mapping"
     /// would sign with the appliance key instead.
+    /// The tenant owning the surface `scope` names: the stored surface's, which
+    /// a caller cannot get wrong, then the scope's.
+    async fn surface_owner(
+        &self,
+        scope: &KeyScope,
+    ) -> Result<Option<String>, VtaError> {
+        if let (Some(store), Some(surface_id)) = (self.surfaces.as_ref(), scope.surface_id.as_deref())
+            && let Some(surface) = crate::surfaces::AgentSurfaceStore::get_checked(store.as_ref(), surface_id)
+                .await
+                .map_err(|e| VtaError::Config(format!("surface `{surface_id}` could not be read for its owner: {e}")))?
+        {
+            return Ok(surface.tenant_id);
+        }
+        Ok(scope.tenant_id.clone())
+    }
+
     async fn live_surface_ref(
         &self,
         purpose: KeyPurpose,
@@ -1008,6 +1027,23 @@ impl KeyDirectory {
     ///
     /// A surface whose mapping cannot be read counts as mapped, so its signing
     /// fails closed rather than falling back to the appliance key.
+    /// Whether the managed connection `connection_id` was deleted, disabled or
+    /// revoked, so keys it signed with are no longer this gateway's. A
+    /// directory with no connection records retires nothing.
+    pub async fn connection_retired(
+        &self,
+        connection_id: &str,
+    ) -> bool {
+        match &self.connections {
+            Some(connections) => {
+                connections
+                    .retired(connection_id)
+                    .await
+            }
+            None => false,
+        }
+    }
+
     pub async fn has_explicit_mapping(
         &self,
         purpose: KeyPurpose,
@@ -1075,8 +1111,11 @@ impl KeyDirectory {
         let Some(surface_id) = scope.surface_id.as_deref() else {
             return Ok(key_ref);
         };
+        let owner = self
+            .surface_owner(scope)
+            .await?;
         let name = crate::config::agent_surface::derived_context_name(
-            scope.tenant_id.as_deref(),
+            owner.as_deref(),
             surface_id,
             scope.variant_id.as_deref(),
         );
@@ -1215,11 +1254,14 @@ pub fn provisions_contexts_on(
 /// fallback to the local key.
 ///
 /// The JWKS also publishes the keys tokens signed earlier may carry: the local
-/// key, the `[vta]` key, and every key this authority signed with before the
-/// default moved off it, so a switch does not invalidate tokens in flight.
+/// key, the `[vta]` key, and each key this authority signed with before the
+/// default moved off it, so a switch does not invalidate tokens in flight. An
+/// earlier signer is dropped once every token it signed has expired
+/// ([`EARLIER_SIGNER_GRACE_SECS`] after the switch), and at once when its
+/// connection is deleted, disabled or revoked.
 ///
-/// The earlier signers' public keys and issuer DIDs are kept in a file when one
-/// is given, so tokens they signed still verify after a restart.
+/// The earlier signers are kept in a file when one is given, so tokens they
+/// signed still verify after a restart.
 pub struct ApplianceAuthority {
     directory: Arc<KeyDirectory>,
     signer: RwLock<Option<(KeyRef, Arc<dyn CredentialAuthority>)>>,
@@ -1227,14 +1269,39 @@ pub struct ApplianceAuthority {
     history_path: Option<std::path::PathBuf>,
 }
 
-/// The public keys and issuer DIDs of the signers the gateway-wide default
-/// moved off. Public material only.
+/// The signers the gateway-wide default moved off. Public material only.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 struct SignerHistory {
     #[serde(default)]
-    keys: Vec<serde_json::Value>,
+    signers: Vec<EarlierSigner>,
+}
+
+/// A signer the gateway-wide default moved off: the connection it signed
+/// through, its public keys and issuer DID, and when the last token it signed
+/// expires.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct EarlierSigner {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    connection_id: Option<String>,
     #[serde(default)]
-    issuer_dids: Vec<String>,
+    keys: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    issuer_did: Option<String>,
+    not_after: chrono::DateTime<chrono::Utc>,
+}
+
+/// How long an earlier signer stays this gateway's after the default moves off
+/// it: the longest lifetime of a token the gateway signs as itself, plus clock
+/// leeway.
+pub const EARLIER_SIGNER_GRACE_SECS: i64 = crate::sts::handlers::MAX_ACCESS_TOKEN_TTL_SECS as i64 + 300;
+
+/// The managed connection `key_ref` signs through; `None` for the local key
+/// and the `[vta]` block, which stay published as built-in signers.
+fn managed_connection(key_ref: &KeyRef) -> Option<String> {
+    match &key_ref.backend {
+        KeyBackend::Vta { connection_id } if !is_bootstrap_connection(connection_id) => Some(connection_id.clone()),
+        _ => None,
+    }
 }
 
 /// File name of the signer history under the gateway's storage directory.
@@ -1315,22 +1382,59 @@ impl ApplianceAuthority {
         Ok(authority)
     }
 
-    /// The keys of the last signer that resolved, which tokens it signed carry.
+    /// The keys of the last signer that resolved, which tokens it signed carry,
+    /// unless its connection was retired since.
     async fn last_signer_keys(&self) -> Vec<serde_json::Value> {
         let last = self
             .signer
             .read()
             .await
             .as_ref()
-            .map(|(_, authority)| Arc::clone(authority));
-        match last {
-            Some(authority) => authority
-                .issuer_jwks()
+            .map(|(key_ref, authority)| (managed_connection(key_ref), Arc::clone(authority)));
+        let Some((connection, authority)) = last else {
+            return Vec::new();
+        };
+        if let Some(connection) = connection
+            && self
+                .directory
+                .connection_retired(&connection)
                 .await
-                .map(|jwks| jwks_keys(&jwks))
-                .unwrap_or_default(),
-            None => Vec::new(),
+        {
+            return Vec::new();
         }
+        authority
+            .issuer_jwks()
+            .await
+            .map(|jwks| jwks_keys(&jwks))
+            .unwrap_or_default()
+    }
+
+    /// The earlier signers tokens may still carry: not yet past their
+    /// `not_after`, and with a connection that is still in use.
+    async fn live_signers(&self) -> Vec<EarlierSigner> {
+        let now = chrono::Utc::now();
+        let kept = self
+            .previous
+            .read()
+            .await
+            .signers
+            .clone();
+        let mut live = Vec::new();
+        for signer in kept {
+            if signer.not_after <= now {
+                continue;
+            }
+            if let Some(connection) = &signer.connection_id
+                && self
+                    .directory
+                    .connection_retired(connection)
+                    .await
+            {
+                continue;
+            }
+            live.push(signer);
+        }
+        live
     }
 
     /// Remembers the keys of the signer `key_ref` replaces, so they stay published.
@@ -1347,11 +1451,9 @@ impl ApplianceAuthority {
             if matches!(signer.as_ref(), Some((known, _)) if *known == key_ref) {
                 return;
             }
-            signer
-                .replace((key_ref, Arc::clone(authority)))
-                .map(|(_, previous)| previous)
+            signer.replace((key_ref, Arc::clone(authority)))
         };
-        let Some(previous) = replaced else {
+        let Some((previous_ref, previous)) = replaced else {
             return;
         };
         let keys = match previous.issuer_jwks().await {
@@ -1369,16 +1471,19 @@ impl ApplianceAuthority {
             .issuer_did()
             .await
             .ok();
+        let now = chrono::Utc::now();
+        let earlier = EarlierSigner {
+            connection_id: managed_connection(&previous_ref),
+            keys,
+            issuer_did,
+            not_after: now + chrono::Duration::seconds(EARLIER_SIGNER_GRACE_SECS),
+        };
         let history = {
             let mut kept = self.previous.write().await;
-            merge_keys(&mut kept.keys, keys);
-            if let Some(did) = issuer_did
-                && !kept
-                    .issuer_dids
-                    .contains(&did)
-            {
-                kept.issuer_dids.push(did);
-            }
+            kept.signers.retain(|s| {
+                s.not_after > now && (s.connection_id != earlier.connection_id || s.issuer_did != earlier.issuer_did)
+            });
+            kept.signers.push(earlier);
             kept.clone()
         };
         self.save_history(&history)
@@ -1451,25 +1556,25 @@ impl CredentialAuthority for ApplianceAuthority {
                 self.last_signer_keys().await
             }
         };
-        merge_keys(
-            &mut keys,
-            self.previous
-                .read()
-                .await
-                .keys
-                .clone(),
-        );
+        for signer in self.live_signers().await {
+            merge_keys(&mut keys, signer.keys);
+        }
         merge_keys(&mut keys, self.built_in_keys().await);
         Ok(serde_json::json!({ "keys": keys }))
     }
 
     async fn earlier_issuer_dids(&self) -> Vec<String> {
-        let mut dids = self
-            .previous
-            .read()
+        let mut dids: Vec<String> = Vec::new();
+        for did in self
+            .live_signers()
             .await
-            .issuer_dids
-            .clone();
+            .into_iter()
+            .filter_map(|signer| signer.issuer_did)
+        {
+            if !dids.contains(&did) {
+                dids.push(did);
+            }
+        }
         let built_in = std::iter::once(&self.directory.local).chain(self.directory.vta.as_ref());
         for authority in built_in {
             if let Ok(did) = authority.issuer_did().await
@@ -3132,6 +3237,222 @@ mod tests {
         );
     }
 
+    fn managed_jwt_ref(connection_id: &str) -> KeyRef {
+        KeyRef {
+            backend: KeyBackend::Vta {
+                connection_id: connection_id.to_string(),
+            },
+            ..vta_jwt_ref("key-1")
+        }
+    }
+
+    async fn connected_store(
+        ids: &[&str]
+    ) -> (Arc<dyn crate::vta::connections::VtaConnectionStorage>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn crate::vta::connections::VtaConnectionStorage> = Arc::new(
+            crate::vta::connections::FileSystemVtaConnectionStore::new(tmp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        for id in ids {
+            store
+                .create(crate::vta::connections::VtaConnection {
+                    id: id.to_string(),
+                    tenant_id: None,
+                    name: id.to_string(),
+                    description: None,
+                    enabled: true,
+                    transport: crate::vta::connections::VtaConnectionTransport::Https,
+                    endpoint: format!("https://{id}.example"),
+                    vta_did: format!("did:webvh:{id}.example"),
+                    default_context_id: None,
+                    control_key_ref: None,
+                    control_did: None,
+                    control_key_state: Default::default(),
+                    status: crate::vta::connections::VtaConnectionStatus::Connected,
+                    keys: Default::default(),
+                    pairing: crate::vta::pairing::PairingRecord {
+                        state: crate::vta::pairing::PairingState::Connected,
+                        ..Default::default()
+                    },
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                })
+                .await
+                .unwrap();
+        }
+        (store, tmp)
+    }
+
+    /// Retiring an agent means moving the default off it and then revoking,
+    /// deleting or disabling its connection. From then on its keys are no
+    /// longer published and a token claiming its issuer is no longer this
+    /// gateway's.
+    #[tokio::test]
+    async fn an_earlier_signer_is_dropped_once_its_connection_is_retired() {
+        for retire in ["revoke", "disable", "delete"] {
+            let (store, _tmp) = connected_store(&["vta-a", "vta-b"]).await;
+            let registry = Arc::new(crate::vta::registry::VtaConnectionRegistry::new(
+                Arc::clone(&store),
+                None,
+                None,
+                None,
+                std::time::Duration::from_secs(5),
+                4,
+            ));
+            let authority = ApplianceAuthority::new(Arc::new(directory_with(None).with_connections(registry)));
+            authority
+                .note_signer(
+                    managed_jwt_ref("vta-a"),
+                    &(StubAuthority::new("did:key:a", vec!["a-1"]) as Arc<dyn CredentialAuthority>),
+                )
+                .await;
+            authority
+                .note_signer(
+                    managed_jwt_ref("vta-b"),
+                    &(StubAuthority::new("did:key:b", vec!["b-1"]) as Arc<dyn CredentialAuthority>),
+                )
+                .await;
+            assert!(
+                authority
+                    .earlier_issuer_dids()
+                    .await
+                    .contains(&"did:key:a".to_string()),
+                "{retire}: still this gateway's right after the switch"
+            );
+            assert!(
+                kids(
+                    &authority
+                        .issuer_jwks()
+                        .await
+                        .unwrap()
+                )
+                .contains(&"a-1".to_string()),
+                "{retire}"
+            );
+
+            match retire {
+                "delete" => store
+                    .delete("vta-a")
+                    .await
+                    .unwrap(),
+                _ => {
+                    crate::vta::connections::modify(store.as_ref(), "vta-a", |c| {
+                        if retire == "revoke" {
+                            c.pairing.state = crate::vta::pairing::PairingState::Revoked;
+                        } else {
+                            c.enabled = false;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                }
+            }
+
+            assert!(
+                !authority
+                    .earlier_issuer_dids()
+                    .await
+                    .contains(&"did:key:a".to_string()),
+                "{retire}: a token claiming the retired signer is refused"
+            );
+            assert!(
+                !kids(
+                    &authority
+                        .issuer_jwks()
+                        .await
+                        .unwrap()
+                )
+                .contains(&"a-1".to_string()),
+                "{retire}"
+            );
+        }
+    }
+
+    /// An earlier signer stays published only until every token it signed has
+    /// expired, including across a restart.
+    #[tokio::test]
+    async fn an_earlier_signer_is_dropped_once_its_tokens_have_expired() {
+        let history = tempfile::tempdir().unwrap();
+        let path = history
+            .path()
+            .join(SIGNER_HISTORY_FILE);
+        let signer = |did: &str, kid: &str, not_after: chrono::DateTime<chrono::Utc>| EarlierSigner {
+            connection_id: None,
+            keys: vec![serde_json::json!({ "kid": kid })],
+            issuer_did: Some(did.to_string()),
+            not_after,
+        };
+        let now = chrono::Utc::now();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&SignerHistory {
+                signers: vec![
+                    signer("did:key:old", "old-1", now - chrono::Duration::seconds(1)),
+                    signer("did:key:recent", "recent-1", now + chrono::Duration::seconds(60)),
+                ],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let authority = ApplianceAuthority::new(Arc::new(directory_with(None)))
+            .with_history(path)
+            .await;
+
+        assert_eq!(
+            authority
+                .earlier_issuer_dids()
+                .await,
+            vec!["did:key:recent".to_string(), "did:key:local".to_string()]
+        );
+        assert_eq!(
+            kids(
+                &authority
+                    .issuer_jwks()
+                    .await
+                    .unwrap()
+            ),
+            vec!["local-1", "recent-1"]
+        );
+    }
+
+    /// A switch keeps the earlier signer for the longest token lifetime, no longer.
+    #[tokio::test]
+    async fn a_switch_keeps_the_earlier_signer_for_the_longest_token_lifetime() {
+        let authority = ApplianceAuthority::new(Arc::new(directory_with(None)));
+        let before = chrono::Utc::now();
+        authority
+            .note_signer(
+                managed_jwt_ref("vta-a"),
+                &(StubAuthority::new("did:key:a", vec!["a-1"]) as Arc<dyn CredentialAuthority>),
+            )
+            .await;
+        authority
+            .note_signer(
+                managed_jwt_ref("vta-b"),
+                &(StubAuthority::new("did:key:b", vec!["b-1"]) as Arc<dyn CredentialAuthority>),
+            )
+            .await;
+        let kept = authority
+            .previous
+            .read()
+            .await
+            .signers
+            .clone();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0]
+                .connection_id
+                .as_deref(),
+            Some("vta-a")
+        );
+        let grace = (kept[0].not_after - before).num_seconds();
+        assert!((EARLIER_SIGNER_GRACE_SECS - 2..=EARLIER_SIGNER_GRACE_SECS).contains(&grace), "{grace}");
+        assert!(EARLIER_SIGNER_GRACE_SECS > crate::sts::handlers::MAX_ACCESS_TOKEN_TTL_SECS as i64);
+    }
+
     /// Before any switch the JWKS is the signer's own keys and the built-in ones.
     #[tokio::test]
     async fn the_jwks_publishes_no_earlier_signer_before_the_default_moves() {
@@ -3356,6 +3677,53 @@ mod tests {
                 .len(),
             1,
             "only the `[vta]` connection's context was created"
+        );
+    }
+
+    /// A surface's derived context is named for its owner, read from the
+    /// stored surface. A surface created under another tenant with a deleted
+    /// surface's id therefore gets a context of its own, not the deleted
+    /// surface's, even when the caller's scope names no tenant.
+    #[tokio::test]
+    async fn a_surface_recreated_under_another_tenant_gets_its_own_context() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            crate::surfaces::FileSystemAgentSurfaceStore::new(tmp.path().to_path_buf())
+                .await
+                .expect("surface store"),
+        ) as Arc<dyn crate::surfaces::AgentSurfaceStore>;
+        let creator = Arc::new(RecordingCreator(std::sync::Mutex::new(Vec::new())));
+        let dir = directory_with(None)
+            .with_surface_store(Arc::clone(&store))
+            .with_provisioner(Arc::new(crate::vta::provisioning::ContextProvisioner::new(
+                Arc::clone(&creator) as Arc<dyn crate::vta::provisioning::ContextCreator>,
+                10,
+            )));
+        let owned_by = |tenant: &str| crate::config::agent_surface::AgentSurface {
+            surface_id: "reused".to_string(),
+            tenant_id: Some(tenant.to_string()),
+            signing: Some(crate::config::agent_surface::SurfaceSigningConfig {
+                backend: Some(crate::config::agent_surface::SigningBackendKind::Vta),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        for tenant in ["tenant-a", "tenant-b"] {
+            crate::surfaces::AgentSurfaceStore::delete(store.as_ref(), "reused")
+                .await
+                .ok();
+            crate::surfaces::AgentSurfaceStore::save(store.as_ref(), &owned_by(tenant))
+                .await
+                .expect("save the surface");
+            dir.resolve_and_provision(KeyPurpose::Credential, &KeyScope::surface("reused"))
+                .await
+                .expect("provisions");
+        }
+
+        assert_eq!(
+            *creator.0.lock().unwrap(),
+            vec!["ctx:tenant-a/reused".to_string(), "ctx:tenant-b/reused".to_string()],
         );
     }
 

@@ -7757,7 +7757,7 @@ async fn process_charged_forward_request(
                                 };
 
                                 let key_scope = crate::vta::key_directory::KeyScope::serving(
-                                    &resolved_surface.surface_id,
+                                    &resolved_surface,
                                     active_variant_id.as_deref(),
                                 );
                                 // Use protocol-specific injection (RESPONSE functions, not request functions!)

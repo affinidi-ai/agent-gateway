@@ -5067,7 +5067,7 @@ async fn step_inject_trusted_identity(
         .unwrap_or(&surface_protocol);
 
     let key_scope = crate::vta::key_directory::KeyScope::serving(
-        &ctx.surface.surface_id,
+        &ctx.surface,
         ctx.active_variant_id
             .as_deref(),
     );

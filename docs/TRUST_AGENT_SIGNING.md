@@ -284,7 +284,8 @@ never crosses the network in clear, and cloud metadata hosts are refused.
 
 ### Disconnecting
 
-Editing a connection changes only the fields sent: its pairing, keys and control key state stay,
+Editing a connection (`PUT`) changes only the fields sent, and a field sent as `null` is cleared;
+its pairing, keys and control key state stay,
 so a renamed connection keeps signing and tokens its keys signed keep verifying. An edit that
 points it at another endpoint, agent DID or transport resets its pairing, so the new agent has to
 be granted and verified again.
@@ -316,7 +317,10 @@ and issuers the caller may see, and for a tenant PAT only its own orphaned conte
 `control_key_ref` must name a secret its tenant may reference. Gateway signing, the `[vta]` block
 and its control key are appliance-wide. A tenant's surface or issuer that signs through the
 appliance's own trust agent (no connection, `default` or `vta-bootstrap`) cannot name a context:
-the agent's grant covers every context, so the gateway creates the tenant's own. For a tenant PAT,
+the agent's grant covers every context, so the gateway creates the tenant's own. A surface's
+created context is named for its owner and id, `ctx:<tenant>/<surface id>` (`_global` for an
+appliance-wide surface), with the owner read from the stored surface, so a surface created under
+another tenant with a deleted surface's id never signs in that surface's context. For a tenant PAT,
 `GET /v1/vta/status` lists only the reserved addresses of the connections it may see, and leaves out
 the appliance control DID and control key. See
 [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#trust-agent-connections) and
@@ -563,9 +567,14 @@ staying scoped to one context, which each such test names.
   signer's keys (with a connection's retired keys), the gateway's own key, the `[vta]` key and the
   keys of the signer used before Gateway signing last changed, so a token a surface signs with
   another trust agent key may not verify through it; such a token verifies by resolving its
-  `iss`. The earlier signers' public keys and issuer DIDs are kept in
-  `appliance_signer_history.json` in the storage directory, so they stay published across a
-  restart, and the JWKS keeps serving them while the current signer cannot be resolved.
+  `iss`. An earlier signer stays published, and token exchange accepts a token claiming its
+  issuer DID, until every token it signed has expired: 20 minutes after Gateway signing moved off
+  it (the 15-minute longest access token lifetime plus clock leeway). It is dropped at once when
+  its connection is deleted, disabled or revoked, so retiring an agent (move Gateway signing off
+  it, then revoke it) stops the gateway trusting its key. The earlier signers, with the connection
+  each signed through and when it expires, are kept in `appliance_signer_history.json` in the
+  storage directory, so they stay published across a restart, and the JWKS keeps serving them
+  while the current signer cannot be resolved.
 - **Context `did:webvh` logs hosted by the gateway are republished on the next signature.** After
   the trust agent's operator rotates a context's key, a verifier resolving the DID sees the
   previous key, which signed everything so far, until the gateway next signs as it. Hosting on the

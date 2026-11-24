@@ -130,6 +130,53 @@ changes:
         agent_gateway_vta_circuit_open_total the times a client's circuit breaker
         opened, and agent_gateway_vta_quota_exceeded_total the signatures the
         signing quota refused, so failing trust agent signing can be alerted on.
+    - timestamp: '2026-11-24T10:00:00Z'
+      title: Edit a trust agent connection without dropping its pairing or keys
+      description: >-
+        An edit (PUT) changes only the fields it sends, and a field sent as null
+        is cleared, so a renamed connection stays paired and its keys stay
+        published. Pointing a connection at another endpoint, agent DID or
+        transport resets its pairing, and while it is connected that is refused
+        with 409, like a revoke, while Gateway signing, a surface or an issuer
+        signs through it, unless acknowledged. A control key rotation, Verify,
+        revoke, an edit and the key routes each re-read the connection under one
+        lock and save only the fields they change, so concurrent changes do not
+        overwrite each other. Verify keeps the stored state while the agent
+        answers 408, 429 or a 5xx, and degrades the connection only on a
+        definite refusal. A Standby node leaves a pending [vta] control key to
+        the Active node.
+    - timestamp: '2026-11-24T10:05:00Z'
+      title: Keep tokens signed before a Gateway signing change verifying for a while
+      description: >-
+        When Gateway signing moves off a signer, its public keys stay in the
+        JWKS and token exchange accepts a token claiming its issuer DID for 20
+        minutes, the longest access token lifetime plus clock leeway, across a
+        restart (appliance_signer_history.json in the storage directory). It is
+        dropped at once when its trust agent connection is deleted, disabled or
+        revoked. Before a token a trust agent signed is returned, the gateway
+        verifies it against the public key recorded for its key id and refuses
+        one that does not verify. A signing choice through the [vta] block is
+        refused while the block is off.
+    - timestamp: '2026-11-24T10:10:00Z'
+      title: Keep each tenant's trust agent signing to its own contexts and agents
+      description: >-
+        A tenant's surface or issuer that signs through the appliance's own
+        trust agent cannot name a context; the gateway creates one named for the
+        tenant and surface, read from the stored surface, so a surface created
+        under another tenant with a deleted surface's id never signs in that
+        surface's context. For a tenant token, GET /v1/vta/status lists only the
+        trust agent addresses of the connections it may see, without the
+        appliance control DID or control key. Onboarding an agent falls back to
+        a gateway-held key only when the trust agent refuses with 403, and
+        fails while the agent cannot be reached.
+    - timestamp: '2026-11-24T10:15:00Z'
+      title: Show the trust agent's state and reasons in the dashboard
+      description: >-
+        A revoked or degraded connection opens in the connect wizard showing its
+        state and reason, and pairs only after Pair again. When Verify fails,
+        the wizard shows the reason the gateway recorded. Editors that follow
+        the gateway-wide signing default name the default the dashboard set, or
+        say it could not be read.
   changed:
     - timestamp: '2026-11-11T18:00:00Z'
       title: ⭐ Sign with the gateway's own keys through the VTA library
@@ -142,74 +189,6 @@ changes:
         accepting them, and a signing fix now lands in one place for local and
         remote signing. The gateway keeps no key store and links no VTA server code.
   fixed:
-    - timestamp: '2026-11-23T10:20:00Z'
-      title: Keep a trust agent connection paired and its keys published when edited
-      description: >-
-        Saving a connection, even only to rename it, reset its pairing to draft,
-        so nothing could sign through it while it still read connected, and
-        dropped its active and retiring keys from the JWKS, so tokens they signed
-        stopped verifying. An edit now changes only the fields the operator
-        edits. Pointing the connection at another endpoint, agent DID or
-        transport resets the pairing and is refused, like a disconnect, while
-        something still signs through it.
-    - timestamp: '2026-11-23T10:25:00Z'
-      title: Stop concurrent trust agent changes from saving over each other
-      description: >-
-        A control key rotation, Verify, revoke and the key routes each saved the
-        copy of a connection they read before calling the trust agent, so a
-        revoke during a key switch could be written back as connected. Each now
-        re-reads the connection under one lock and saves only the fields it owns.
-    - timestamp: '2026-11-23T10:30:00Z'
-      title: Keep a trust agent connected while it answers 408, 429 or a 5xx
-      description: >-
-        Verify kept a connection's state only when the agent could not be
-        reached at all. A restarting agent or its proxy answering 408, 429 or a
-        5xx made it degraded and stopped every signer mapped to it. Those answers
-        now keep the stored state, and only a definite refusal degrades it.
-    - timestamp: '2026-11-23T10:35:00Z'
-      title: Keep tokens signed before a signing default change verifying
-      description: >-
-        After the gateway-wide default moved to a trust agent, tokens the gateway
-        had signed as its own did:web were refused at token exchange, the keys of
-        earlier signers were forgotten on restart, and the JWKS failed outright
-        while the current signer could not be resolved. Earlier signers' public
-        keys and issuer DIDs are now kept in appliance_signer_history.json in the
-        storage directory, token exchange accepts a token signed as any of them
-        while their keys are published, and the JWKS keeps publishing them when
-        the current signer cannot be resolved.
-    - timestamp: '2026-11-23T10:40:00Z'
-      title: Refuse a signing choice through the [vta] block while it is off
-      description: >-
-        A trust agent signing choice naming no connection, default or
-        vta-bootstrap signs through the [vta] block, and was saved even when the
-        block was disabled, after which every token it covered failed. Such a
-        choice is now refused at save while the block is off.
-    - timestamp: '2026-11-23T10:45:00Z'
-      title: Leave a pending control key to the Active node
-      description: >-
-        A Standby node sharing storage settled a pending [vta] control key at
-        startup and on a reload, and could delete the key the Active node was
-        switching to. Only the Active node settles it now.
-    - timestamp: '2026-11-23T10:50:00Z'
-      title: Open a revoked or degraded trust agent without pairing it again
-      description: >-
-        Opening a revoked or degraded connection from its row started pairing at
-        once, which un-revoked it and dropped the agent DID it pinned. It now
-        opens showing its state and reason, with a Pair again button.
-    - timestamp: '2026-11-23T10:55:00Z'
-      title: Show the trust agent's reason when Verify fails
-      description: >-
-        When a trust agent refused Verify, the wizard showed "Bad Gateway"
-        rather than the reason the gateway recorded on the connection. It now
-        shows that reason.
-    - timestamp: '2026-11-23T11:00:00Z'
-      title: Show the gateway-wide signing default the dashboard set
-      description: >-
-        Surfaces and issuers that follow the gateway-wide default read "Gateway
-        secret" after the default was set to a trust agent in the dashboard,
-        because the status reported only the configuration file's default. The
-        status now reports the effective default, and an editor that cannot read
-        it says so rather than naming one.
     - timestamp: '2026-11-09T15:15:00Z'
       title: Stop the dashboard reloading forever on a session the gateway forgot
       description: >-
@@ -221,39 +200,6 @@ changes:
         session, and otherwise forgets the stale token and shows the sign-in form.
   removed: []
   security:
-    - timestamp: '2026-11-23T10:00:00Z'
-      title: Publish a trust agent token only once its recorded public key verifies it
-      description: >-
-        Rotating a connection's signing key recorded the key id and public key
-        from the request, and a signature was checked only for the key id and
-        algorithm the agent echoed. A mistyped or substituted public key was then
-        published in the JWKS that STS self-trust verifies against. Each token
-        the agent signs is now verified against the public key recorded with its
-        key id before it is returned, and one that does not verify is refused.
-    - timestamp: '2026-11-23T10:05:00Z'
-      title: Show a tenant only the trust agent addresses of its own connections
-      description: >-
-        GET /v1/vta/status returned the reserved address of every connected
-        trust agent and the appliance control DID to any caller with
-        vta_connections.view. A tenant token now gets the addresses of the
-        connections it may see, and no appliance control DID or control key.
-    - timestamp: '2026-11-23T10:10:00Z'
-      title: Keep a tenant's surfaces and issuers out of the appliance agent's contexts
-      description: >-
-        A tenant's surface or issuer that signed through the appliance's own
-        trust agent (no connection, default or vta-bootstrap) could name any
-        context, and the agent's grant covers every context, so it could sign as
-        the appliance's or another tenant's. Such a choice may no longer name a
-        context: the gateway creates the tenant's own.
-    - timestamp: '2026-11-23T10:15:00Z'
-      title: Fall back to a gateway-held agent key only when the trust agent refuses
-      description: >-
-        Onboarding an agent while a trust agent is the gateway-wide default fell
-        back to a key the gateway holds on any provisioning error, so an
-        unreachable agent, an open circuit, a timeout or a spent quota left the
-        new agent with a gateway-held key for good. It now falls back only when
-        the trust agent refuses (403, such as a grant without context-create)
-        and fails onboarding otherwise.
     - timestamp: '2026-11-19T16:30:00Z'
       title: Record trust agent changes and refusals as tamper-evident security records
       description: >-

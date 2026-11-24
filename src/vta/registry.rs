@@ -217,6 +217,25 @@ impl VtaConnectionRegistry {
         Ok(client)
     }
 
+    /// Whether `connection_id` was deleted, disabled or revoked. A record that
+    /// cannot be read counts as retired, so its keys stop being trusted rather
+    /// than staying trusted on an error.
+    pub async fn retired(
+        &self,
+        connection_id: &str,
+    ) -> bool {
+        match self
+            .store
+            .get(connection_id)
+            .await
+        {
+            Ok(Some(connection)) => {
+                !connection.enabled || connection.pairing.state == crate::vta::pairing::PairingState::Revoked
+            }
+            Ok(None) | Err(_) => true,
+        }
+    }
+
     /// Drop the cached connector for `connection_id` so the next use rebuilds
     /// it from the current record. Called whenever a record is written or
     /// removed, which is what makes edits take effect without a restart.

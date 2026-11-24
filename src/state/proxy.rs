@@ -121,7 +121,7 @@ impl ProxyState {
     /// variant serving it.
     pub fn key_scope(&self) -> crate::vta::key_directory::KeyScope {
         crate::vta::key_directory::KeyScope::serving(
-            &self.surface.surface_id,
+            &self.surface,
             self.active_variant_id
                 .as_deref(),
         )

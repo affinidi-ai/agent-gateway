@@ -173,6 +173,26 @@ async fn operator_renames(world: &mut SurfaceWorld) {
     world.admin_response = Some(response);
 }
 
+async fn repoint(
+    world: &mut SurfaceWorld,
+    query: &str,
+) {
+    let id = connection_id(world);
+    let body = json!({ "endpoint": "https://another-trust-agent.example.test" });
+    let response = send(world, Method::PUT, &format!("/v1/vta/connections/{id}{query}"), Some(&body)).await;
+    world.admin_response = Some(response);
+}
+
+#[when("the operator points the custom connection at another trust agent")]
+async fn operator_repoints(world: &mut SurfaceWorld) {
+    repoint(world, "").await;
+}
+
+#[when("the operator points the custom connection at another trust agent acknowledging what stops signing")]
+async fn operator_repoints_acknowledged(world: &mut SurfaceWorld) {
+    repoint(world, "?acknowledge_signing_users=true").await;
+}
+
 fn body(world: &SurfaceWorld) -> &Value {
     &world
         .admin_response
@@ -300,6 +320,17 @@ async fn not_connected_unsigned(world: &mut SurfaceWorld) {
     let pairing = &body(world)["pairing"];
     assert_eq!(pairing["state"], "degraded", "{}", body(world));
     assert_eq!(pairing["pinned_vta_did"], custom_trust_agent_did(), "the pin is kept");
+}
+
+#[then("the custom connection has to be paired again")]
+async fn has_to_be_paired_again(world: &mut SurfaceWorld) {
+    let id = connection_id(world);
+    let connection = send(world, Method::GET, &format!("/v1/vta/connections/{id}"), None).await;
+    assert_eq!(connection.status, 200, "{}", connection.body);
+    assert_eq!(connection.body["endpoint"], "https://another-trust-agent.example.test", "{}", connection.body);
+    assert_eq!(connection.body["pairing"]["state"], "draft", "{}", connection.body);
+    let status = send(world, Method::GET, &format!("/v1/vta/connections/{id}/status"), None).await;
+    assert_eq!(status.body["usable"], false, "{}", status.body);
 }
 
 #[then("the custom connection can still sign")]
