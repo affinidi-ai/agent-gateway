@@ -101,6 +101,7 @@ mod tests {
             query: TrqpQueryParams::default(),
             timeout_secs: None,
             name: None,
+            subject: Default::default(),
         }
     }
 

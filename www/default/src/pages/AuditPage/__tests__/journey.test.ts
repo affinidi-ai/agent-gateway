@@ -26,6 +26,24 @@ describe('journey', () => {
     expect(steps.map(s => s.key)).toEqual(['caller', 'gw', 'response']);
   });
 
+  it('places a self recognition check before policy and the target Trust Check', () => {
+    const target = at(
+      { trust_check: { leg: 'target', authority_id: 'a', entity_id: 'e', ok: true } },
+      { id: 'target' }
+    );
+    const gateway = at(
+      { policy_decision: { scope: 'gateway', policy_id: 'g', decision: 'allow' } },
+      { id: 'gw' }
+    );
+    const self = at(
+      { trust_check: { leg: 'managed_agent', authority_id: 'a', entity_id: 'e', ok: true } },
+      { id: 'self' }
+    );
+
+    const steps = buildJourney([target, gateway, self]);
+    expect(steps.map(s => s.key)).toEqual(['self', 'gw', 'target']);
+  });
+
   it('carries tone and a human title from the narrative', () => {
     const steps = buildJourney([
       at(

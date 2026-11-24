@@ -21,7 +21,8 @@ gateway deny is final. Using the wrong package name fails closed.
 There are exactly two policy planes — **Gateway** (appliance-to-appliance) and
 **Agent Surface**. Legacy `package channel.policy` is auto-migrated to
 `surface.policy` at boot. Deny reason: `data.surface.policy.deny_reason` /
-`data.gateway.policy.deny_reason`.
+`data.gateway.policy.deny_reason`. A Transit Point's own policy and a Fabric receive refusal
+send their deny reason to the caller, so it must not include data from `input`.
 
 A surface's own policy is skipped only for a public discovery read: a `GET` or `HEAD` of a path
 ending in `/agent-card.json`, `/agent.json`, `/.well-known/agent-card`, `/.well-known/ucp` or
@@ -320,7 +321,7 @@ every plane's global assignments (`global_policies/global.json`). `GET
 ## Trust Check
 
 `src/trust_registry_verification/` runs TRQP queries per-leg, with results at
-`input.trust_check_results.{caller|target}`. The stage never denies — OPA decides.
+`input.trust_check_results.{caller|target|managed_agent}`. The stage never denies — OPA decides.
 Discovery paths bypass the caller-leg check. See the source for error codes and
 template syntax.
 
@@ -331,13 +332,14 @@ Each leg carries a `trust_check_list`:
 | List | Runs on |
 | --- | --- |
 | `access_point.trust_check_list` | The caller leg, for requests arriving at the Access Point. |
-| `transit.points[].trust_check_list` | Requests the managed agent sends through that Transit Point, and no other. The Surface Builder adds Trust Checks to A2A and AP2 Transit Points only; on an MCP or HTTP Transit Point it shows a migrated copy read-only, to keep or remove. |
+| `transit.points[].trust_check_list` | Requests the managed agent sends through that Transit Point, and no other. In the Surface Builder each query checks the destination or the [managed agent](#self-recognition-check); on an MCP Transit Point only the managed agent, and a migrated copy holding a destination query is shown read-only, to keep or remove. |
 | `target.trust_check_list` | The managed agent's own target leg: `a2a-proxy://` Targets and Fabric send. |
 
 A Transit Point with an empty list runs no Trust Check on its traffic: no agent-card fetch
 for trust, no identity verification, no TRQP query. A request through a Transit Point sees
-only that Transit Point's results, at `input.trust_check_results.target`, in all three
-outbound OPA scopes (gateway, surface, Transit Point).
+only that Transit Point's results, at `input.trust_check_results.target`, and those of its
+[managed-agent elements](#self-recognition-check) at `input.trust_check_results.managed_agent`,
+in all three outbound OPA scopes (gateway, surface, Transit Point).
 
 A list has no limit on its elements or on the authorities they query
 ([`src/config/agent_surface.rs`](../src/config/agent_surface.rs)). The gateway queries every
@@ -393,8 +395,8 @@ saved.
 
 MCP and HTTP Transit Points receive a copy too, because the old list ran on them. There it
 usually reports `AGENT_CARD_UNAVAILABLE`, but an HTTP Transit Point whose destination serves an
-A2A agent card runs real identity and TRQP checks. The Surface Builder does not add Trust Checks
-to MCP or HTTP Transit Points and shows such a copy read-only, to keep or remove; the
+A2A agent card runs real identity and TRQP checks. On an MCP Transit Point the Surface Builder
+adds only managed-agent queries and shows such a copy read-only, to keep or remove; the
 management API accepts a list on any Transit Point. Removing a copy during review means that
 Transit Point's traffic is no longer checked, so a policy that denied on its results allows
 it.
@@ -456,6 +458,84 @@ surface id, the request's trace id and the authenticated caller (on the Access P
 and MCP-proxy paths), so a trust check can be tied to the request and principal that
 triggered it. On the outbound path the record also names the Transit Point.
 
+### Self recognition check
+
+An element of a Transit Point's `trust_check_list` with `"subject": "managed_agent"` asks
+about the managed agent calling out through the Transit Point instead of its destination.
+Elements without `subject` ask about the destination, as before. Only a Transit Point's list
+may hold managed-agent elements; any other list refuses them with `400`.
+
+A managed-agent element whose `query.entity_id` is blank asks about the DID the Transit Point
+calls out under: its own managed identity's when it has one, otherwise the surface Managed
+Agent's identity it injects. Templates, authority lists, `authority_source`, query types and
+timeouts work as on any element. When no managed agent DID is resolved for the request, each
+managed-agent element reports `MANAGED_AGENT_IDENTITY_UNAVAILABLE` without asking its trust
+registry; such a Transit Point can still be saved. Managed-agent elements need no destination
+agent card, so a list holding only them fetches none for trust.
+
+Their results are at `input.trust_check_results.managed_agent`, in the gateway, surface and
+Transit Point outbound scopes, beside `target`. The key is absent when the Transit Point has
+no managed-agent elements or the request is a discovery read. Without a trust registry
+connection each element fails with `TRUST_REGISTRY_UNREACHABLE`, except that a request with no
+managed agent DID still reports `MANAGED_AGENT_IDENTITY_UNAVAILABLE`. Like every Trust Check
+the stage never denies: policy decides. Nothing is cached, so turning recognition off in the
+trust registry takes effect on the next call, unless a Transit Point Trust Recorder writes the
+record again (see below). The Transit Point's policy still runs on a
+discovery read, such as an agent card read, where the key is absent. To refuse a managed agent
+the trust registry no longer recognises and still serve discovery reads, allow a request whose
+results are absent and otherwise require that every result is `ok`:
+
+```rego
+package surface.policy
+
+default allow := false
+
+allow if not input.trust_check_results.managed_agent
+
+allow if {
+    count(input.trust_check_results.managed_agent) > 0
+    every r in input.trust_check_results.managed_agent { r.ok }
+}
+
+deny_reason := "Calling agent has no managed identity" if {
+    not allow
+    some r in input.trust_check_results.managed_agent
+    r.error.code == "MANAGED_AGENT_IDENTITY_UNAVAILABLE"
+} else := "Calling agent is not recognised" if not allow
+```
+
+The first rule allows every call while the Transit Point has no managed-agent elements, so pair
+this policy with them. A failed result carries its reason in `error.code`, so the second
+`deny_reason` tells a Transit Point that resolves no managed agent DID apart from an agent the
+trust registry does not recognise.
+
+The check answers whether the trust registry recognises a DID, not who presents it: any
+request the Transit Point sends under that DID passes. It assumes the managed agent is the
+operator's own, and lets the trust registry withdraw its recognition; it does not stop an agent
+that controls its own identity from claiming another one, and the registry decides what this
+gateway may write to it. To bind a Transit Point to the agent calling it, authenticate that
+agent with the Transit Point's own `source_auth` (mTLS, JWT or API key, see
+[Transit Point source authentication](SOURCE_AUTH.md#transit-point-source-authentication)),
+and its responses with `target.response_auth` (see
+[Response authentication](SOURCE_AUTH.md#response-authentication)).
+
+A Transit Point's own policy that denies answers `403` with the `detail` "Request blocked by
+surface policy", followed by `: <deny_reason>` when the policy sets one, so the managed agent
+learns why it was refused. That reason reaches the caller: never build it from `input`.
+
+A Transit Point with its own `trust_recorder` writes its managed agent's records in the
+background on every request except a discovery read, without waiting, so the agent is
+recognised once those records exist, which may be after its first call. It writes before the
+Trust Check and policy, so a call policy refuses is recorded too. A record the operator removes
+is written again by the next call through any Transit Point that records the same agent in that
+registry; one made inactive is written again only if the registry accepts the create, and a
+registry that answers with a conflict leaves it inactive. To turn recognition off, remove that
+recorder entry as well. See [Transit Point Trust Recorder](SOURCE_AUTH.md#transit-point-trust-recorder).
+
+Managed-agent elements run on A2A, AP2, MCP and HTTP Transit Points, including `fabric://`
+ones, and not on discovery reads. Each query is a `trust_check` record with `leg`
+`managed_agent` that names the Transit Point.
+
 ### Several authorities in one query
 
 A query that must accept an entity any of several organisations recognises lists them in
@@ -480,7 +560,8 @@ combines the answers. Such an element cannot set `timeout_secs`. Each
 authority gets its own result, in list order, all carrying the element's `id` and each its own
 `authority_id`, and its own audit record and `agent_gateway_trust_check_total` sample. A result
 failed with `AGENT_CARD_UNAVAILABLE`, `TRUST_REGISTRY_METADATA_UNAVAILABLE`,
-`IDENTITY_VP_VERIFICATION_FAILED` or `TARGET_AGENT_IDENTITY_UNAVAILABLE` omits `authority_id`
+`IDENTITY_VP_VERIFICATION_FAILED`, `TARGET_AGENT_IDENTITY_UNAVAILABLE` or
+`MANAGED_AGENT_IDENTITY_UNAVAILABLE` omits `authority_id`
 and `entity_id`, so the authorities of one element tell such results apart only by order. A
 template that fails to resolve, a missing metadata field or an unreachable registry fails only
 that authority's result. An authority that resolves to a blank value, in a list or in

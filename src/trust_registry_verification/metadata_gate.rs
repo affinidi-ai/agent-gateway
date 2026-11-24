@@ -185,7 +185,7 @@ pub fn build_missing_metadata_message(
 ) -> String {
     match leg {
         TrustCheckLeg::Target => build_target_message(fields),
-        TrustCheckLeg::Caller => build_caller_message(fields),
+        TrustCheckLeg::Caller | TrustCheckLeg::ManagedAgent => build_caller_message(fields),
     }
 }
 
@@ -286,6 +286,7 @@ mod tests {
             },
             timeout_secs: None,
             name: None,
+            subject: Default::default(),
         }
     }
 

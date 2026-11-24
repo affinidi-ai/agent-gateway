@@ -86,6 +86,29 @@ describe('deriveEdges', () => {
     );
   });
 
+  it("binds a Transit Point's Trust Recorder to that Transit Point's arrow only", () => {
+    const nodes: CanvasNode[] = [
+      node({ id: 'ap', type: 'access-point' }),
+      node({ id: 'ma', type: 'target', parentId: 'ap' }),
+      node({ id: 'tp1', type: 'transit-point-a2a' }),
+      node({ id: 'tp2', type: 'transit-point-a2a' }),
+      node({
+        id: 'trust-recorder-tp2',
+        type: 'trust-recorder',
+        parentId: 'tp2',
+        slotId: 'request:trust-recorder',
+      }),
+    ];
+    const edges = deriveEdges(nodes);
+    const slotOf = (id: string) =>
+      edges.find(e => e.id === id)?.slots.get('request:trust-recorder');
+    expect(slotOf('ma-tp:ma:tp2')).toEqual(['trust-recorder-tp2']);
+    expect(slotOf('ma-tp:ma:tp1')).toBeUndefined();
+    expect(
+      edges.find(e => e.id === 'ap-ma:ap:ma')?.slots.get('response:trust-recorder')
+    ).toBeUndefined();
+  });
+
   it('routes per-TP request and response policies into the per-tp slots', () => {
     const nodes: CanvasNode[] = [
       node({ id: 'ap', type: 'access-point' }),

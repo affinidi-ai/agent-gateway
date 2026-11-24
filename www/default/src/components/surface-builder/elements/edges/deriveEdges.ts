@@ -16,6 +16,7 @@ import {
   ANY_EDGE_MW,
   TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
   TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
+  TRUST_RECORDER_TRANSIT_POINT_SLOT_ID,
 } from './archetypes';
 
 /**
@@ -265,6 +266,11 @@ export function deriveEdges(nodes: ReadonlyArray<CanvasNode>): DerivedEdge[] {
           ) {
             pushSlot(edge, TRUST_CHECK_TRANSIT_POINT_SLOT_ID, k.id);
           }
+        } else if (
+          k.type === 'trust-recorder' &&
+          k.slotId === TRUST_RECORDER_TRANSIT_POINT_SLOT_ID
+        ) {
+          pushSlot(edge, TRUST_RECORDER_TRANSIT_POINT_SLOT_ID, k.id);
         } else if (k.type === 'workload-binding' && (k.direction ?? 'request') === 'request') {
           // Per-TP workload binding is a per-endpoint request slot
           // (`ownedBy: 'target'`), so it parents directly on the TP and

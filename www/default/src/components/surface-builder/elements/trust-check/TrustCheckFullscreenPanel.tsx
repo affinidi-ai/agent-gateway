@@ -15,17 +15,30 @@ import {
   readOnlyTrustCheckProtocol,
   readQueries,
   pickAuthorities,
+  transitPointPresentsManagedIdentity,
+  transitPointSubjectChoice,
   trustCheckLeg,
   type AuthorityRow,
   type TrustCheckQueryConfig,
   type TrustCheckRecordType,
+  type TrustCheckSubjectChoice,
 } from './definition';
 import TrustCheckQueryForm from './TrustCheckQueryForm';
 import MigratedTrustCheckWarning from './MigratedTrustCheckWarning';
 
-function seedInitial(config: any): TrustCheckQueryConfig[] {
+/** A new query; on a Transit Point that cannot check its destination it checks the managed agent. */
+function newQuery(subjectChoice: TrustCheckSubjectChoice | undefined): TrustCheckQueryConfig {
+  return subjectChoice === 'managed-agent-only'
+    ? { ...makeDefaultQuery(), subject: 'managed_agent' }
+    : makeDefaultQuery();
+}
+
+function seedInitial(
+  config: any,
+  subjectChoice: TrustCheckSubjectChoice | undefined
+): TrustCheckQueryConfig[] {
   const existing = readQueries(config);
-  return existing.length > 0 ? existing : [makeDefaultQuery()];
+  return existing.length > 0 ? existing : [newQuery(subjectChoice)];
 }
 
 const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
@@ -37,7 +50,10 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
   allNodes,
 }) => {
   const leg = trustCheckLeg(node, allNodes);
-  const readOnlyProtocol = readOnlyTrustCheckProtocol(node, allNodes);
+  const readOnlyProtocol = readOnlyTrustCheckProtocol({ ...node, config }, allNodes);
+  const subjectChoice = transitPointSubjectChoice(node, allNodes);
+  const managedIdentityMissing =
+    transitPointPresentsManagedIdentity(node, allNodes ?? []) === false;
   const isApMa = leg === 'caller';
   const legLabel = isApMa ? 'caller' : 'target';
 
@@ -88,7 +104,7 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
     };
   }, []);
 
-  const initial = useMemo(() => seedInitial(config), [config]);
+  const initial = useMemo(() => seedInitial(config, subjectChoice), [config, subjectChoice]);
   const [draft, setDraft] = useState<TrustCheckQueryConfig[]>(initial);
   const initialJson = useMemo(() => JSON.stringify(initial), [initial]);
   const draftJson = useMemo(() => JSON.stringify(draft), [draft]);
@@ -137,7 +153,7 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
   };
 
   const addQuery = () => {
-    const next = [...draft, makeDefaultQuery()];
+    const next = [...draft, newQuery(subjectChoice)];
     setDraft(next);
     setExpandedIdx(next.length - 1);
   };
@@ -192,6 +208,7 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
     const headerLabel = nameValue ? `Query ${idx + 1} · ${nameValue}` : `Query ${idx + 1}`;
     const listed = listedAuthorities(q.query).length;
     const headerSummary = [
+      ...(q.subject === 'managed_agent' ? ['managed agent'] : []),
       queryType,
       registryNameById(q.trust_registry_id),
       ...(isMultiAuthorityQuery(q) ? [authorityCountLabel(listed)] : []),
@@ -246,6 +263,8 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
             updateEntityAt={updateEntityAt}
             handleQueryTypeChangeAt={handleQueryTypeChangeAt}
             saveAttempted={saveAttempted}
+            subjectChoice={subjectChoice}
+            managedIdentityMissing={managedIdentityMissing}
           />
         )}
       </div>
@@ -262,7 +281,14 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
         <div className="text-muted small" data-testid="trust-check-fullscreen-leg">
           Runs on the <strong>{legLabel} leg</strong>
           {leg === 'transit-point' && <> of this Transit Point only</>}. Each query lands on OPA at{' '}
-          <code>input.trust_check_results.{legLabel}[]</code> in the order shown below.
+          <code>input.trust_check_results.{legLabel}[]</code>
+          {leg === 'transit-point' && (
+            <>
+              {' '}
+              (managed-agent queries at <code>input.trust_check_results.managed_agent[]</code>)
+            </>
+          )}{' '}
+          in the order shown below.
         </div>
         {readOnlyProtocol && (
           <div className="small mt-1" data-testid="trust-check-fullscreen-read-only">

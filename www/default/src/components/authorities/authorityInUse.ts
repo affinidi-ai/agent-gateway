@@ -96,6 +96,7 @@ export function describeAuthorityUse(
         ? `Trust Recorder entry for ${registryName(use.trustRegistryId)}`
         : 'Trust Recorder entry'
     );
+    if (use.transitPoint) parts.push(`on Transit Point ${use.transitPoint}`);
   } else {
     parts.push(use.name ? `Trust Check “${use.name}”` : 'Trust Check');
     if (use.placement === 'transit_point' && use.transitPoint) {

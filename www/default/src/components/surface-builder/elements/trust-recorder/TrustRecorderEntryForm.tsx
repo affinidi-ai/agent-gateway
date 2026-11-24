@@ -343,7 +343,7 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
             <>
               <strong>[Authority]</strong> Agent DID <em>is</em> <code>ownedAgent</code>
               <span className="text-muted ms-2" style={{ fontSize: '11px' }}>
-                (Agent DID auto-filled from the response)
+                (Agent DID auto-filled)
               </span>
             </>
           }

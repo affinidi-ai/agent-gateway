@@ -203,6 +203,9 @@ const IdentitiesPage: React.FC = () => {
     searchTerm,
     recorderFilter,
   });
+  // The identity behind a version's DID, when that DID is not the row's own.
+  const earlierIdentity = (rowDid: string, versionDid: string) =>
+    versionDid !== rowDid ? identityFor(versionDid) : undefined;
 
   const linkedDid = didParam ? decodeURIComponent(didParam) : undefined;
   const linkedPrimaryDid = linkedDid ? primaryDidFor(linkedDid) : undefined;
@@ -1035,9 +1038,10 @@ const IdentitiesPage: React.FC = () => {
                                                           : undefined
                                                       }
                                                       renderActions={version => {
-                                                        const earlier =
-                                                          version.did !== identity.did &&
-                                                          identityFor(version.did);
+                                                        const earlier = earlierIdentity(
+                                                          identity.did,
+                                                          version.did
+                                                        );
                                                         return earlier
                                                           ? identityActions(
                                                               earlier,
@@ -1045,6 +1049,18 @@ const IdentitiesPage: React.FC = () => {
                                                                 `identities-version-${version.number}-${action}-button`
                                                             )
                                                           : null;
+                                                      }}
+                                                      renderRecorderStatus={version => {
+                                                        const earlier = earlierIdentity(
+                                                          identity.did,
+                                                          version.did
+                                                        );
+                                                        return earlier?.trust_recorder ? (
+                                                          <IdentityRecorderChip
+                                                            status={earlier.trust_recorder}
+                                                            surface={earlier.trust_recorder_surface}
+                                                          />
+                                                        ) : null;
                                                       }}
                                                     />
                                                   </div>
