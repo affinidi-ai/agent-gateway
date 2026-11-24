@@ -326,6 +326,9 @@ jobs:
       VALKEY_VERSION: 8.1.4
       # Preserve per-gateway temp dirs so gateway.log survives for the artifact.
       BDD_KEEP_TEMP_DIRS: "1"
+      # Info-level gateway logs, so a failed scenario's log shows what each
+      # gateway did, not only its errors.
+      G2G_BDD_GATEWAY_LOG_LEVEL: info
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
