@@ -11,7 +11,10 @@ changes:
     - timestamp: '2024-11-24T17:00:00Z'
       title: Keep indication when payment list is capped at 500 rows
       description: Added a truncation notice on the Payments page when the ledger response contains more than 500 matching payments. The notice informs operators that only the newest 500 payments are shown and that older matching payments were not searched, preventing silent failures when searching for older payments.
-  fixed: []
+  fixed:
+    - timestamp: '2024-11-24T17:15:00Z'
+      title: Update Agents page browser tests for removed controls
+      description: Removed references to deleted count badge test IDs from the Agents browser tests and updated the empty-state test to use the new Add Surface button instead of the removed link, ensuring all tests now work with the redesigned UI.
   removed: []
   security: []
   breaking: []
