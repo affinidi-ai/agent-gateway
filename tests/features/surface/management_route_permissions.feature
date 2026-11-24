@@ -7,7 +7,10 @@ Feature: Management route permissions
   access token or one scoped by required headers alone cannot download them and is shown none
   of their lines on the dashboard. Listing and reading agents needs surfaces.view, and a tenant's
   token sees only the agents of its own surfaces. A tenant's token reads an agent card only
-  through a surface of its own tenant.
+  through a surface of its own tenant. A personal access token with feature scopes reaches a
+  route only when one of its scopes covers it, including a route a signed-in operator reaches
+  without any permission: reading the gateway settings needs settings.view. Whatever its scopes,
+  such a token reads its own token info and never reads the operator profile.
 
   Scenario: An administrator downloads the server logs
     Given a log file "agent-gateway.log"
@@ -232,3 +235,28 @@ Feature: Management route permissions
     When operator "ada" validates a credential provider
     Then the admin API response status is 200
     And the response reports the token endpoint the credential provider validation checked
+
+  Scenario: A personal access token whose scopes do not cover the gateway settings cannot read them
+    Given operator "ada" has the "administrator" role
+    And operator "ada" holds a personal access token with scopes "surfaces.view"
+    When the personal access token reads the gateway settings
+    Then the admin API response status is 403
+
+  Scenario: A personal access token with settings.view reads the gateway settings
+    Given operator "ada" has the "administrator" role
+    And operator "ada" holds a personal access token with scopes "settings.view"
+    When the personal access token reads the gateway settings
+    Then the admin API response status is 200
+
+  Scenario: A personal access token reads its own token info whatever its scopes
+    Given operator "ada" has the "administrator" role
+    And operator "ada" holds a personal access token with scopes "surfaces.view"
+    When the personal access token reads its own token info
+    Then the admin API response status is 200
+    And the token info lists the scopes "surfaces.view"
+
+  Scenario: A personal access token cannot read the operator profile whatever its scopes
+    Given operator "ada" has the "administrator" role
+    And operator "ada" holds a personal access token with scopes "settings.view, users.view, surfaces.view"
+    When the personal access token reads the operator profile
+    Then the admin API response status is 403
