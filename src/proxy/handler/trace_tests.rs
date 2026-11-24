@@ -1,10 +1,11 @@
 //! The trace id an Access Point records and the one it sends its Target.
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::variant_routing_tests::{dispatch, router, send, surface};
 use crate::component_tests::helpers::RecordingTarget;
 use crate::delegation_vault::audit::DelegationAuditAction;
+use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
 
 const CALLERS_TRACE_ID: &str = "0af7651916cd43dd8448eb211c80319c";
 const CALLERS_TRACEPARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
@@ -87,6 +88,140 @@ async fn an_access_point_sends_its_target_one_set_of_trace_headers() {
     assert_eq!(parts[3], "00", "a trace the gateway starts is not sampled when it does not export: {traceparent}");
     assert_eq!(values(&started, "x-gateway-trace-id"), [parts[1]], "the new trace in X-Gateway-Trace-Id");
     assert!(values(&started, "tracestate").is_empty(), "a new trace drops the caller's tracestate: {started:?}");
+}
+
+/// An MCP surface whose Target is the managed agent at `agent`, with
+/// `networking` as its Target's networking settings.
+fn mcp_surface(
+    agent: &RecordingServer,
+    networking: Value,
+) -> crate::config::agent_surface::AgentSurface {
+    serde_json::from_value(json!({
+        "surface_id": "tools", "name": "Tools",
+        "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+        "target": {"endpoint": format!("{}/mcp", agent.origin()), "networking": networking}
+    }))
+    .unwrap()
+}
+
+fn an_mcp_server() -> Vec<Answer> {
+    vec![Answer::json(200, json!({"jsonrpc": "2.0", "id": 7, "result": {"content": []}}))]
+}
+
+/// Sends `body` as an MCP request with the caller's `traceparent` through the
+/// Access Point of `surface`.
+async fn send_mcp(
+    surface: crate::config::agent_surface::AgentSurface,
+    body: &str,
+) {
+    let request = axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION)
+        .header("traceparent", CALLERS_TRACEPARENT)
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    let (status, _) = dispatch(router(surface), request).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+}
+
+/// Every `traceparent` header in a recorded request `head`.
+fn traceparents(head: &str) -> Vec<&str> {
+    head.lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("traceparent"))
+        .map(|(_, value)| value.trim())
+        .collect()
+}
+
+/// The `traceparent` headers and the body the managed agent received for one
+/// MCP request the caller sent through the Access Point with `body`.
+async fn mcp_received_by_the_managed_agent(body: &str) -> (Vec<String>, String) {
+    let agent = RecordingServer::start_answering(an_mcp_server()).await;
+    send_mcp(mcp_surface(&agent, json!({})), body).await;
+    let received = agent.requests();
+    assert_eq!(received.len(), 1);
+    let (head, body) = &received[0];
+    (
+        traceparents(head)
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        body.clone(),
+    )
+}
+
+/// Toward its Managed Agent, a Fabric target, the Access Point replaces the
+/// `traceparent` an MCP request carries in `params._meta` with the one it
+/// sends in the header, and keeps every other key.
+#[tokio::test]
+async fn an_access_point_writes_its_traceparent_into_mcp_metadata() {
+    let sent = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "lookup",
+        "arguments": {"city": "Paris"},
+        "_meta": {"traceparent": CALLERS_TRACEPARENT, "tracestate": CALLERS_TRACESTATE, "progressToken": "progress-1"}}});
+
+    let (traceparents, body) = mcp_received_by_the_managed_agent(&sent.to_string()).await;
+
+    let [traceparent] = &traceparents[..] else {
+        panic!("one traceparent header: {traceparents:?}");
+    };
+    let received: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        received["params"]["_meta"]["traceparent"],
+        traceparent.as_str(),
+        "the body names the traceparent the header sends: {body}"
+    );
+    let mut expected = sent;
+    expected["params"]["_meta"]["traceparent"] = json!(traceparent);
+    assert_eq!(received, expected, "every other key as the caller sent it");
+}
+
+/// An MCP request without a `traceparent` in `params._meta` gains none, and
+/// reaches the Managed Agent byte for byte as the caller sent it.
+#[tokio::test]
+async fn an_mcp_body_without_a_traceparent_reaches_the_managed_agent_as_sent() {
+    for sent in [
+        r#"{"jsonrpc": "2.0", "method": "tools/call", "id": 7, "params": {"name": "lookup", "arguments": {}, "_meta": {"progressToken": "progress-1"}}}"#,
+        r#"{"jsonrpc": "2.0", "method": "tools/call", "id": 7, "params": {"name": "lookup", "arguments": {}}}"#,
+    ] {
+        let (traceparents, body) = mcp_received_by_the_managed_agent(sent).await;
+
+        assert_eq!(traceparents.len(), 1, "the header is sent: {traceparents:?}");
+        assert_eq!(body, sent);
+    }
+}
+
+/// A traffic mirror is sent the MCP body the Managed Agent is sent.
+#[tokio::test]
+async fn a_mirror_is_sent_the_mcp_body_its_managed_agent_is_sent() {
+    let agent = RecordingServer::start_answering(an_mcp_server()).await;
+    let mirror = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+    let sent = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "lookup",
+        "arguments": {}, "_meta": {"traceparent": CALLERS_TRACEPARENT, "progressToken": "progress-1"}}});
+
+    send_mcp(
+        mcp_surface(
+            &agent,
+            json!({"mirror": {"endpoint": format!("{}/copy", mirror.origin()), "wait_for_response": true}}),
+        ),
+        &sent.to_string(),
+    )
+    .await;
+
+    let to_the_agent: Vec<String> = agent
+        .requests()
+        .into_iter()
+        .map(|(_, body)| body)
+        .collect();
+    let to_the_mirror: Vec<String> = mirror
+        .requests()
+        .into_iter()
+        .map(|(_, body)| body)
+        .collect();
+    assert_eq!(to_the_agent.len(), 1);
+    assert_eq!(to_the_mirror, to_the_agent);
 }
 
 #[tokio::test]

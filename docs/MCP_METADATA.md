@@ -369,6 +369,15 @@ by the specification's second-label rule. Reserved protocol values are preserved
 without assuming their shape; preserved tracing strings are not newly trusted
 or used for tracing by this migration.
 
+The gateway itself writes `params._meta.traceparent` by the class of the target
+it sends a request to. Toward a Fabric target, which an Access Point's Managed
+Agent always is, a `traceparent` the request carries is replaced by the one sent
+in the `traceparent` header, and none is added. A Transit Point's third-party
+target receives neither `traceparent` nor `tracestate`. A Target bound by
+external consent receives both as the caller sent them. Every other `_meta` key
+stays. An Access Point's `fabric://` send and a Fabric receive keep the body as
+it is. See [Request correlation](OBSERVABILITY.md#request-correlation).
+
 Checks apply at surface creation/update across all resolved variants. The
 request boundary rechecks only the selected, already-resolved surface snapshot
 for loaded configuration; it does not clone and revalidate unrelated variants.

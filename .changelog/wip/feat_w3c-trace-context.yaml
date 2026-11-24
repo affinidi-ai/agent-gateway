@@ -67,6 +67,13 @@ changes:
         for its Managed Agent; an MCP body's params._meta traceparent is replaced by the one sent.
         Any other target, a third party, receives no trace header, and traceparent and tracestate
         are removed from an MCP body's params._meta, so a vendor never learns the trace.
+    - timestamp: '2026-11-24T09:00:00Z'
+      title: Write the Access Point's traceparent into MCP metadata
+      description: >-
+        An Access Point now replaces a traceparent an MCP request carries in params._meta with
+        the traceparent it sends its Managed Agent in the header, so both name the Access Point's
+        span. A body without one gains none, and every other _meta key stays. A Target bound by
+        external consent, and a fabric:// Target, receive the body as the caller sent it.
   fixed: []
   removed: []
   security: []

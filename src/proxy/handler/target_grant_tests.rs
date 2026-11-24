@@ -1161,13 +1161,16 @@ async fn the_target_gets_nothing_of_the_callers_but_its_request() {
 /// A Target bound by external consent is sent the request's trace id in
 /// `X-Gateway-Trace-Id` alone, in its written form, and neither a
 /// `traceparent` nor a `tracestate`, whatever trace headers the caller sent.
+/// The MCP body goes as the caller sent it, `params._meta` trace keys included.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_target_bound_by_external_consent_is_sent_the_trace_id_alone() {
     let fixture = Fixture::new(vec![Answer::status(200)], vec![vendor_result()]).await;
     fixture
         .store(&owner_key(), "owner-access")
         .await;
-    let (mut parts, body) = mcp_call(Some(KEY)).into_parts();
+    let sent = r#"{"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {"_meta": {"traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01", "tracestate": "congo=t61rcWkgMzE", "progressToken": "progress-1"}}}"#;
+    let (mut parts, _) = mcp_call(Some(KEY)).into_parts();
+    let body = axum::body::Body::from(sent);
     for (name, value) in [
         ("traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
         ("tracestate", "congo=t61rcWkgMzE"),
@@ -1195,6 +1198,13 @@ async fn a_target_bound_by_external_consent_is_sent_the_trace_id_alone() {
     assert_eq!(values("x-gateway-trace-id"), ["0af7651916cd43dd8448eb211c80319c"], "{line}: {headers:?}");
     assert!(values("traceparent").is_empty(), "{line} sent a traceparent: {headers:?}");
     assert!(values("tracestate").is_empty(), "{line} sent a tracestate: {headers:?}");
+    let bodies: Vec<String> = fixture
+        .vendor
+        .requests()
+        .into_iter()
+        .map(|(_, body)| body)
+        .collect();
+    assert_eq!(bodies, [sent]);
 }
 
 /// Of the caller's headers the vendor is sent only the protocol headers its

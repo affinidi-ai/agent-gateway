@@ -1416,26 +1416,33 @@ pub(crate) fn replace_request_header(
     }
 }
 
-/// `request` with the trace headers of `trace` the Access Point's target
-/// receives, each once: its Managed Agent is a Fabric target, and a Target
-/// bound by external consent (`bound_target`) gets the trace id alone. The
-/// caller's `tracestate` (`caller_headers`) passes on only when `trace`
-/// continues the caller's `traceparent`. Gateway does not export the request's
-/// span yet, so the sampled flag follows [`crate::proxy::trace::SpanExport::Off`].
-fn with_onward_trace_headers(
-    mut request: reqwest::RequestBuilder,
+/// The trace of `trace` the Access Point's target is sent: its Managed Agent is
+/// a Fabric target, and a Target bound by external consent (`bound_target`)
+/// gets the trace id alone. The caller's `tracestate` (`caller_headers`) passes
+/// on only when `trace` continues the caller's `traceparent`. Gateway does not
+/// export the request's span yet, so the sampled flag follows
+/// [`crate::proxy::trace::SpanExport::Off`].
+fn onward_trace(
     trace: &crate::proxy::trace::OutgoingTrace,
     caller_headers: &HeaderMap,
     bound_target: bool,
-) -> reqwest::RequestBuilder {
+) -> crate::proxy::trace::SentTrace {
     use crate::proxy::trace::TargetClass;
     let class = if bound_target {
         TargetClass::ExternalConsent
     } else {
         TargetClass::Fabric
     };
-    for (name, value) in trace.headers_toward(class, crate::proxy::trace::SpanExport::Off, caller_headers) {
-        request = request.header(name, value);
+    trace.sent_toward(class, crate::proxy::trace::SpanExport::Off, caller_headers)
+}
+
+/// `request` with the trace headers of `onward`, each once.
+fn with_onward_trace_headers(
+    mut request: reqwest::RequestBuilder,
+    onward: &crate::proxy::trace::SentTrace,
+) -> reqwest::RequestBuilder {
+    for (name, value) in onward.headers() {
+        request = request.header(*name, value);
     }
     request
 }
@@ -6622,6 +6629,7 @@ async fn proxy_charged_request(
     // what a Transit Point sends its vendor, no caller-info or DID header, and
     // is asked for an answer the gateway can read as it is sent.
     let bound_target = crate::proxy::target_grant::binds_the_target(&state.surface);
+    let onward = onward_trace(&outgoing_trace, &headers, bound_target);
     let credential_headers = target_credential_header_names(&state.surface);
     // The caller's trace headers never pass on: the gateway writes its own
     // ([`with_onward_trace_headers`]).
@@ -6674,7 +6682,7 @@ async fn proxy_charged_request(
         upstream_req = upstream_req.header(reqwest::header::ACCEPT, "text/event-stream, application/json");
     }
 
-    upstream_req = with_onward_trace_headers(upstream_req, &outgoing_trace, &headers, bound_target);
+    upstream_req = with_onward_trace_headers(upstream_req, &onward);
 
     // Inject DID:webvh identity into HTTP headers (Header and SignedHeader modes)
     #[cfg(feature = "didwebvh")]
@@ -6877,7 +6885,7 @@ async fn proxy_charged_request(
                             upstream_req = upstream_req.header(key.as_str(), value.as_bytes());
                         }
                     }
-                    upstream_req = with_onward_trace_headers(upstream_req, &outgoing_trace, &headers, bound_target);
+                    upstream_req = with_onward_trace_headers(upstream_req, &onward);
                 }
                 Err(e) => {
                     warn!(channel = channel_name, error = %e, "Failed to inject DID:webvh identity into MCP _meta, using original body");
@@ -7584,6 +7592,18 @@ async fn proxy_charged_request(
         // No identity selector / resolved identity: submit the deferred
         // events unchanged.
         deferred_audit.flush();
+    }
+
+    // The MCP metadata names the traceparent the headers carry: after every
+    // other body rewrite, before the request is paid for, mirrored or sent.
+    if state
+        .surface
+        .channel_protocol()
+        == crate::config::ChannelProtocol::Mcp
+        && let Some(body) = onward.mcp_body(&body_bytes)
+    {
+        body_bytes = body.into();
+        upstream_req = upstream_req.body(body_bytes.clone());
     }
 
     debug!("🟢 OUTBOUND REQUEST: trace_id={} target={}", trace_id, loggable::url(&target_url));

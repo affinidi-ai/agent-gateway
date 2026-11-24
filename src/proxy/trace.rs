@@ -485,6 +485,21 @@ impl OutgoingTrace {
         }
     }
 
+    /// The trace a request is sent toward a target of `class`:
+    /// [`Self::headers_toward`], composed once for its headers and its MCP
+    /// metadata alike.
+    pub fn sent_toward(
+        &self,
+        class: TargetClass,
+        export: SpanExport,
+        received: &axum::http::HeaderMap,
+    ) -> SentTrace {
+        SentTrace {
+            class,
+            headers: self.headers_toward(class, export, received),
+        }
+    }
+
     /// The trace headers a Fabric message carries: those toward a Fabric
     /// target but `X-Gateway-Trace-Id`. The message names the trace id itself,
     /// and the receiving gateway writes `X-Gateway-Trace-Id` from it, so its
@@ -599,6 +614,36 @@ pub fn mcp_body_toward(
         return None;
     }
     serde_json::to_vec(&request).ok()
+}
+
+/// The trace one request is sent toward a target of one class
+/// ([`OutgoingTrace::sent_toward`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentTrace {
+    class: TargetClass,
+    headers: Vec<(&'static str, String)>,
+}
+
+impl SentTrace {
+    /// The trace headers the request is sent with, each once.
+    pub fn headers(&self) -> &[(&'static str, String)] {
+        &self.headers
+    }
+
+    /// An MCP request `body` as it is sent with [`Self::headers`]: its
+    /// `params._meta` by [`mcp_body_toward`], with the `traceparent` those
+    /// headers carry.
+    pub fn mcp_body(
+        &self,
+        body: &[u8],
+    ) -> Option<Vec<u8>> {
+        let traceparent = self
+            .headers
+            .iter()
+            .find(|(name, _)| *name == "traceparent")
+            .map(|(_, traceparent)| traceparent.as_str());
+        mcp_body_toward(self.class, body, traceparent)
+    }
 }
 
 /// The trace a payment call goes out under.

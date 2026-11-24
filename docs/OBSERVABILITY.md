@@ -356,7 +356,11 @@ is sampled when the caller's continued `traceparent` was, and unsampled when the
 the trace. The caller's `tracestate` goes on unchanged only when its `traceparent` is continued.
 A surface with `terminate_trace_id` sends the fresh trace in both headers, with no `tracestate`.
 A Target bound by external consent is sent the trace id in `X-Gateway-Trace-Id` alone. A
-request to a `fabric://` Target carries the caller's trace headers as before. A request sent
+`traceparent` in an MCP request's `params._meta` is replaced by the one the Managed Agent is sent
+in the header, and none is added; every other `_meta` key stays as the caller sent it. A Target
+bound by external consent receives `params._meta` as the caller sent it. A traffic mirror is sent
+the body the Target is sent. A request to a `fabric://` Target carries the caller's trace headers
+and MCP body as before. A request sent
 over a Fabric stream carries its trace id as a hyphenated UUID, and the receiving gateway records
 that form.
 
