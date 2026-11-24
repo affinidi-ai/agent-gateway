@@ -324,9 +324,10 @@ pub struct KeyDirectory {
     /// Scoped overrides, consulted before the defaults.
     mappings: Vec<KeyMapping>,
     local: Arc<dyn CredentialAuthority>,
-    /// Contexts already given a signing identity, so the bootstrap costs one
-    /// round trip per context rather than one per request.
-    identified: tokio::sync::RwLock<std::collections::HashSet<String>>,
+    /// Contexts already given a signing identity, by connection and context,
+    /// so the bootstrap costs one round trip per context rather than one per
+    /// request, and a same-named context on another agent gets its own.
+    identified: tokio::sync::RwLock<std::collections::HashSet<(String, String)>>,
     /// Attestation signers by client and context, so a context's identity is
     /// read once per connection client rather than on every attestation.
     context_signers: RwLock<HashMap<(usize, String), Arc<dyn crate::vta::context_signer::ContextSigner>>>,
@@ -488,13 +489,15 @@ impl KeyDirectory {
     async fn ensure_can_issue(
         &self,
         client: &Arc<crate::vta::client::VtaRestClient>,
+        connection_id: &str,
         context_id: &str,
     ) {
+        let key = (connection_id.to_string(), context_id.to_string());
         if self
             .identified
             .read()
             .await
-            .contains(context_id)
+            .contains(&key)
         {
             return;
         }
@@ -502,7 +505,7 @@ impl KeyDirectory {
             self.identified
                 .write()
                 .await
-                .insert(context_id.to_string());
+                .insert(key);
         }
     }
 
@@ -639,7 +642,7 @@ impl KeyDirectory {
                 // identity bootstrap the appliance default gets. Without it a
                 // hand-made parent context — the one the operator creates in
                 // the walkthrough — refuses the first issuance outright.
-                self.ensure_can_issue(&client, context_id.as_str())
+                self.ensure_can_issue(&client, connection_id, context_id.as_str())
                     .await;
                 IssuingContext::Agent {
                     client,
@@ -997,20 +1000,20 @@ impl KeyDirectory {
         }
     }
 
-    /// Whether the managed connection `connection_id` was deleted, disabled or
-    /// revoked, so keys it signed with are no longer this gateway's. A
-    /// directory with no connection records retires nothing.
-    pub async fn connection_retired(
+    /// What the record of the managed connection `connection_id` says about
+    /// its use: keys of one deleted, disabled or revoked are no longer this
+    /// gateway's. A directory with no connection records retires nothing.
+    pub async fn connection_retirement(
         &self,
         connection_id: &str,
-    ) -> bool {
+    ) -> crate::vta::registry::Retirement {
         match &self.connections {
             Some(connections) => {
                 connections
-                    .retired(connection_id)
+                    .retirement(connection_id)
                     .await
             }
-            None => false,
+            None => crate::vta::registry::Retirement::InUse,
         }
     }
 
@@ -1434,14 +1437,58 @@ impl ApplianceAuthority {
             return None;
         }
         if let Some(connection) = &last.connection_id
-            && self
-                .directory
-                .connection_retired(connection)
+            && !self
+                .still_in_use(connection)
                 .await
         {
             return None;
         }
         Some(last)
+    }
+
+    /// Whether keys `connection_id` signed with are still this gateway's. One
+    /// seen deleted, disabled or revoked is removed from the history for good,
+    /// so enabling or pairing it again does not bring its earlier keys back;
+    /// one that cannot be read is left out without being forgotten.
+    async fn still_in_use(
+        &self,
+        connection_id: &str,
+    ) -> bool {
+        match self
+            .directory
+            .connection_retirement(connection_id)
+            .await
+        {
+            crate::vta::registry::Retirement::InUse => true,
+            crate::vta::registry::Retirement::Unknown => false,
+            crate::vta::registry::Retirement::Retired => {
+                self.forget_connection(connection_id)
+                    .await;
+                false
+            }
+        }
+    }
+
+    async fn forget_connection(
+        &self,
+        connection_id: &str,
+    ) {
+        let mut history = self.history.write().await;
+        let before = history.signers.len();
+        history
+            .signers
+            .retain(|s| s.connection_id.as_deref() != Some(connection_id));
+        let current_retired = history
+            .current
+            .as_ref()
+            .is_some_and(|c| c.connection_id.as_deref() == Some(connection_id));
+        if current_retired {
+            history.current = None;
+        }
+        if current_retired || history.signers.len() != before {
+            self.save_history(&history)
+                .await;
+        }
     }
 
     /// The earlier signers tokens may still carry: not yet past their
@@ -1460,9 +1507,8 @@ impl ApplianceAuthority {
                 continue;
             }
             if let Some(connection) = &signer.connection_id
-                && self
-                    .directory
-                    .connection_retired(connection)
+                && !self
+                    .still_in_use(connection)
                     .await
             {
                 continue;
@@ -1618,8 +1664,9 @@ impl CredentialAuthority for ApplianceAuthority {
     }
 
     /// The current signer's keys, then every earlier and built-in key. A
-    /// current signer that cannot be resolved, such as one whose connection was
-    /// just disabled, still leaves the keys outstanding tokens carry published.
+    /// current signer that cannot be resolved, such as one whose trust agent
+    /// cannot be reached, leaves its keys published until the tokens it last
+    /// signed have expired.
     async fn issuer_jwks(&self) -> anyhow::Result<serde_json::Value> {
         let current = match self.current().await {
             Ok(current) => current.issuer_jwks().await,
@@ -3246,8 +3293,8 @@ mod tests {
         );
     }
 
-    /// A signer that stops resolving, such as one whose connection was disabled,
-    /// still leaves the keys outstanding tokens carry published.
+    /// A signer that stops resolving, such as one whose trust agent cannot be
+    /// reached, still leaves the keys outstanding tokens carry published.
     #[tokio::test]
     async fn the_jwks_keeps_the_earlier_keys_when_the_signer_cannot_be_resolved() {
         let default = Arc::new(SwitchableDefault(std::sync::Mutex::new(default_signing_with("key-a"))));
@@ -3472,6 +3519,32 @@ mod tests {
                 .contains(&"a-1".to_string()),
                 "{retire}"
             );
+
+            if retire != "delete" {
+                crate::vta::connections::modify(store.as_ref(), "vta-a", |c| {
+                    c.enabled = true;
+                    c.pairing.state = crate::vta::pairing::PairingState::Connected;
+                })
+                .await
+                .unwrap();
+                assert!(
+                    !authority
+                        .earlier_issuer_dids()
+                        .await
+                        .contains(&"did:key:a".to_string()),
+                    "{retire}: enabling or pairing it again does not bring the earlier signer back"
+                );
+                assert!(
+                    !kids(
+                        &authority
+                            .issuer_jwks()
+                            .await
+                            .unwrap()
+                    )
+                    .contains(&"a-1".to_string()),
+                    "{retire}"
+                );
+            }
         }
     }
 

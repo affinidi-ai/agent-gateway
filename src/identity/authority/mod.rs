@@ -2,10 +2,9 @@
 //!
 //! The gateway signs STS access tokens / ID-JAGs, payment-receipt presentations
 //! and AP2 presentations with its local Ed25519 *issuer* key (owned by
-//! [`VCIssuer`]). To let a Verifiable Trust Agent (VTA) take over those
-//! private-key operations in later tickets of the VTA-integration epic, every
-//! such caller goes through the [`CredentialAuthority`] port instead of binding
-//! to `VCIssuer` directly.
+//! [`VCIssuer`]). So that a Verifiable Trust Agent (VTA) can take over those
+//! private-key operations, every such caller goes through the
+//! [`CredentialAuthority`] port instead of binding to `VCIssuer` directly.
 //!
 //! [`LocalCredentialAuthority`] delegates to the in-process `VCIssuer`; the
 //! trust agent implementation (`VtaCredentialAuthority`) dispatches the

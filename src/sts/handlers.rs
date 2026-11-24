@@ -4633,7 +4633,7 @@ mod tests {
         assert!(text.contains("verification failed"), "it fails at signature verification: {text}");
     }
 
-    /// The regression this ticket exists to prevent: when signing moves to a
+    /// When signing moves to a
     /// VTA, minted tokens carry the **VTA's** issuer DID. If self-trust were
     /// still resolved from the local issuer, the gateway would stop recognising
     /// its own tokens and loopback ID-JAG redemption would fail with "no

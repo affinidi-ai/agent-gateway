@@ -131,16 +131,10 @@ pub async fn build_issuer_attestation(
     aud: &str,
     nonce: &str,
 ) -> anyhow::Result<String> {
-    let claims = IssuerAttestationClaims::new(
-        vc_issuer
-            .attestation_issuer_did()
-            .await?,
-        sub_connection_point_did,
-        aud,
-        nonce,
-    );
     vc_issuer
-        .sign_attestation_typ(&serde_json::to_value(&claims)?, ISSUER_ATTESTATION_TYP)
+        .sign_attestation(ISSUER_ATTESTATION_TYP, |issuer_did| {
+            Ok(serde_json::to_value(IssuerAttestationClaims::new(issuer_did, sub_connection_point_did, aud, nonce))?)
+        })
         .await
 }
 

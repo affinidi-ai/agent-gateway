@@ -132,6 +132,8 @@ pub enum StartError {
 pub enum CancelError {
     NotFound,
     NothingToCancel,
+    /// A rotation step is talking to the trust agent right now.
+    Busy,
     /// The gateway already signs in with the new key.
     TooLate,
     Failed(VtaError),
@@ -425,7 +427,7 @@ impl ConnectionKeyRotator {
         &self,
         id: &str,
     ) -> Result<Outcome, Stalled> {
-        let Some(_running) = Running::begin(&self.running, id) else {
+        let Some(mut running) = Running::begin(&self.running, id) else {
             return Ok(Outcome::Busy);
         };
         loop {
@@ -460,7 +462,16 @@ impl ConnectionKeyRotator {
             };
             match step {
                 Ok(None) => {}
-                Ok(Some(Step::Wait(wait))) => self.clock.sleep(wait).await,
+                Ok(Some(Step::Wait(wait))) => {
+                    // Released while waiting, so a cancel can go through; the
+                    // next round reloads the record and sees it.
+                    drop(running);
+                    self.clock.sleep(wait).await;
+                    running = match Running::begin(&self.running, id) {
+                        Some(running) => running,
+                        None => return Ok(Outcome::Busy),
+                    };
+                }
                 Ok(Some(Step::RolledBack)) => return Ok(Outcome::RolledBack),
                 Err(e) => return Err(Stalled(e.log_detail().to_string())),
             }
@@ -690,7 +701,7 @@ impl ConnectionKeyRotator {
         &self,
         id: &str,
     ) -> Result<RotationView, CancelError> {
-        let _running = Running::begin(&self.running, id).ok_or(CancelError::NothingToCancel)?;
+        let _running = Running::begin(&self.running, id).ok_or(CancelError::Busy)?;
         let mut connection = self
             .load(id)
             .await
@@ -1057,6 +1068,13 @@ mod tests {
     }
 
     async fn fixture(accepted: &[&str]) -> Fixture {
+        fixture_with_clock(accepted, Arc::new(FakeClock(Mutex::new(Utc::now())))).await
+    }
+
+    async fn fixture_with_clock(
+        accepted: &[&str],
+        clock: Arc<dyn Clock>,
+    ) -> Fixture {
         let storage = tempfile::tempdir().unwrap();
         let old = ControlKey::from_seed([61u8; 32]);
         let did = ensure_connection_auth_did(storage.path(), "example.com", ID, &old)
@@ -1105,7 +1123,6 @@ mod tests {
             .await
             .unwrap();
         let clients = FakeClients::new(accepted);
-        let clock = Arc::new(FakeClock(Mutex::new(now)));
         let rotator = Arc::new(ConnectionKeyRotator::new(
             store.clone(),
             secrets.clone(),
@@ -1243,6 +1260,65 @@ mod tests {
             .unwrap();
         let key = ControlKey::from_seed(crate::vta::decode_hex_seed(stored.value.trim()).unwrap());
         assert_eq!(declared_keys(&f.log().await)[0].multibase, key.public_key_multibase());
+    }
+
+    /// A clock whose sleep waits until the test lets it go.
+    struct ParkedClock {
+        parked: tokio::sync::Notify,
+        released: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl Clock for ParkedClock {
+        fn now(&self) -> DateTime<Utc> {
+            Utc::now()
+        }
+
+        async fn sleep(
+            &self,
+            _duration: Duration,
+        ) {
+            self.parked.notify_one();
+            self.released.notified().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rotation_waiting_to_retry_can_be_cancelled() {
+        let clock = Arc::new(ParkedClock {
+            parked: tokio::sync::Notify::new(),
+            released: tokio::sync::Notify::new(),
+        });
+        let f = fixture_with_clock(&["key-1"], clock.clone()).await;
+        f.rotator
+            .start(ID, None)
+            .await
+            .unwrap();
+        let rotator = Arc::clone(&f.rotator);
+        let drive = tokio::spawn(async move { rotator.drive(ID).await });
+        clock.parked.notified().await;
+
+        f.rotator
+            .cancel(ID)
+            .await
+            .expect("a cancel while the rotation waits goes through");
+        assert!(
+            f.record()
+                .await
+                .control_key_state
+                .rotation
+                .is_none()
+        );
+
+        clock.released.notify_one();
+        assert_eq!(
+            drive
+                .await
+                .unwrap()
+                .expect("drive"),
+            Outcome::NothingToDo,
+            "the driver sees the cancel and stops"
+        );
     }
 
     #[tokio::test]

@@ -274,7 +274,7 @@ mod tests {
         );
     }
 
-    /// The property this whole ticket exists for: an agent provisioned through
+    /// An agent provisioned through
     /// a VTA has **no private key on this host**, and its DID is the one the
     /// VTA minted.
     #[tokio::test]

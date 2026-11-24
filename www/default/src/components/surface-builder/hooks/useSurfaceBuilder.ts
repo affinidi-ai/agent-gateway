@@ -1107,10 +1107,7 @@ export function useSurfaceBuilder<T extends SurfaceBuilderState>(
       protocol: string;
       status?: string;
       /**
-       * Which backend signs for this surface. The body below has always
-       * read it; leaving it off this type meant callers could not pass it
-       * and it was silently always `undefined` — invisible because the
-       * dashboard build transpiles rather than type-checks.
+       * Which backend signs for this surface; the body below reads it.
        */
       signing?: SurfaceSigning;
     }): any => {

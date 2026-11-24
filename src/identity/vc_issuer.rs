@@ -2149,8 +2149,11 @@ impl VCIssuer {
             .clone())
     }
 
-    /// The DID the fabric issuer attestation should claim, and which must
-    /// therefore also be the issuer of the credentials peers will receive.
+    /// The DID the fabric issuer attestation claims, and which must therefore
+    /// also be the issuer of the credentials peers will receive. Signing goes
+    /// through [`sign_attestation`](Self::sign_attestation), which resolves it
+    /// with the key in one step.
+    #[cfg(test)]
     pub async fn attestation_issuer_did(&self) -> Result<String> {
         match self
             .current_attestation_signer()
@@ -2161,23 +2164,28 @@ impl VCIssuer {
         }
     }
 
-    /// Sign an attestation as [`attestation_issuer_did`](Self::attestation_issuer_did).
-    pub async fn sign_attestation_typ(
+    /// Sign an attestation whose claims `claims_for` builds from the issuer
+    /// DID. The signer is resolved once, so the DID the claims name and the
+    /// key that signs them always belong together, even when Gateway signing
+    /// changes meanwhile.
+    pub async fn sign_attestation(
         &self,
-        claims: &serde_json::Value,
         typ: &str,
+        claims_for: impl FnOnce(String) -> Result<serde_json::Value>,
     ) -> Result<String> {
         match self
             .current_attestation_signer()
             .await?
         {
             Some(signer) => {
+                let claims = claims_for(signer.issuer_did().await?)?;
                 signer
-                    .sign_typ(claims, typ)
+                    .sign_typ(&claims, typ)
                     .await
             }
             None => {
-                self.sign_jwt_with_gateway_key_typ(claims, typ)
+                let claims = claims_for(self.get_issuer_did().await?)?;
+                self.sign_jwt_with_gateway_key_typ(&claims, typ)
                     .await
             }
         }
@@ -7550,7 +7558,10 @@ mod surface_injection_tests {
         );
 
         let jws = issuer
-            .sign_attestation_typ(&json!({ "iss": attested }), "issuer-attestation+jwt")
+            .sign_attestation("issuer-attestation+jwt", |iss| {
+                assert_eq!(iss, attested, "the claims name the DID of the key that signs them");
+                Ok(json!({ "iss": iss }))
+            })
             .await
             .expect("signed as the context");
         let header: serde_json::Value = serde_json::from_slice(

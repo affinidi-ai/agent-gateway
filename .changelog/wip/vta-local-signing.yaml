@@ -115,7 +115,8 @@ changes:
         done, 202 while it carries on and 502 when the trust agent refused the
         new key and the old one was put back after [vta]
         connection_key_switch_timeout_secs. POST .../rotate/cancel stops a
-        rotation that has not switched, a restart resumes one, and the row shows
+        rotation that has not switched, also while it waits to retry, a restart
+        resumes one, and the row shows
         when the key was last rotated and a rotation under way.
     - timestamp: '2026-11-16T12:15:00Z'
       title: Show which keys sign what on the Secrets page's Key Management tab
@@ -125,7 +126,8 @@ changes:
         context and key each surface the user may see signs with, contexts no
         surface claims any more, and which kinds of key stay on the gateway's disk and why. Users
         with key management rights can provision a connection's signing key and
-        rotate to a new one, keeping the old one published.
+        rotate to a new one, keeping the old one published. A retired key no
+        longer signs: every choice that named it signs with the active key.
     - timestamp: '2026-11-16T12:20:00Z'
       title: Count trust agent calls, circuit trips and quota refusals in metrics
       description: >-
@@ -145,7 +147,8 @@ changes:
         signs through it, unless acknowledged. A control key rotation, Verify,
         revoke, an edit and the key routes each re-read the connection under one
         lock and save only the fields they change, so concurrent changes do not
-        overwrite each other. Verify keeps the stored state while the agent
+        overwrite each other; an edit made while the connection was disabled,
+        repointed or rekeyed elsewhere is refused with 409. Verify keeps the stored state while the agent
         answers 408, 429 or a 5xx, and degrades the connection only on a
         definite refusal. A revoked connection stays revoked until it is paired
         again: Verify refuses it, and a revoke made during a Verify is kept. The
@@ -159,8 +162,8 @@ changes:
         JWKS and token exchange accepts a token claiming its issuer DID for 20
         minutes, the longest access token lifetime plus clock leeway, across a
         restart (appliance_signer_history.json in the storage directory). It is
-        dropped at once when its trust agent connection is deleted, disabled or
-        revoked. The current signer is recorded the first time it resolves, so
+        dropped at once, and for good, when its trust agent connection is
+        deleted, disabled or revoked. The current signer is recorded the first time it resolves, so
         a change made while the gateway was down, or before the new signer
         signed, still keeps the one it replaced, and a current signer that
         cannot be resolved stays published for 21 minutes after it last signed.

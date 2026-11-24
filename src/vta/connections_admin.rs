@@ -811,6 +811,15 @@ pub async fn update_connection(
         )
             .into_response();
     }
+    let sent: Vec<String> = edit
+        .as_object()
+        .map(|fields| {
+            fields
+                .keys()
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
     let mut body = match edited_request(&existing, edit) {
         Ok(body) => body,
         Err(message) => return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response(),
@@ -878,23 +887,17 @@ pub async fn update_connection(
     // points the connection at another agent, whose grant has to be approved
     // and verified again. Which key of the DID the gateway signs in with is the
     // gateway's to change, never the request's.
+    let mut changed_meanwhile = false;
     match crate::vta::connections::modify(state.store.as_ref(), &id, |stored| {
-        if repointed {
-            stored.pairing = Default::default();
-            stored.status = stored.pairing.state.into();
-        }
-        stored.name = updated.name;
-        stored.description = updated.description;
-        stored.enabled = updated.enabled;
-        stored.transport = updated.transport;
-        stored.endpoint = updated.endpoint;
-        stored.vta_did = updated.vta_did;
-        stored.default_context_id = updated.default_context_id;
-        stored.control_key_ref = updated.control_key_ref;
-        stored.control_did = updated.control_did;
+        changed_meanwhile = apply_edit(stored, &existing, updated, &sent, repointed).is_err();
     })
     .await
     {
+        Ok(_) if changed_meanwhile => (
+            StatusCode::CONFLICT,
+            ErrorBody::json("the connection changed while it was being edited; reload it and try again"),
+        )
+            .into_response(),
         Ok(updated) => {
             info!(id = %id, enabled = updated.enabled, "VTA connection updated");
             security_records::connection_updated(&existing, &updated, acknowledged(&query));
@@ -909,6 +912,72 @@ pub async fn update_connection(
             not_found().into_response()
         }
     }
+}
+
+/// What an edit's checks were made against: the fields that decide whether it
+/// disconnects or repoints the connection, and whether a rotation is under way.
+fn edit_basis(connection: &VtaConnection) -> impl PartialEq + '_ {
+    (
+        connection.enabled,
+        &connection.transport,
+        &connection.endpoint,
+        &connection.vta_did,
+        connection.pairing.state,
+        &connection.control_key_ref,
+        connection
+            .control_key_state
+            .rotation
+            .is_some(),
+    )
+}
+
+/// Writes the fields an edit sent onto the record read under the write lock.
+/// Refuses, changing nothing, when what the edit was checked against changed
+/// since it was read, such as a disable or a control-key change made meanwhile.
+fn apply_edit(
+    stored: &mut VtaConnection,
+    read: &VtaConnection,
+    updated: VtaConnection,
+    sent: &[String],
+    repointed: bool,
+) -> Result<(), ()> {
+    if edit_basis(stored) != edit_basis(read) {
+        return Err(());
+    }
+    if repointed {
+        stored.pairing = Default::default();
+        stored.status = stored.pairing.state.into();
+    }
+    let was_sent = |field: &str| {
+        sent.iter()
+            .any(|sent| sent == field)
+    };
+    if was_sent("name") {
+        stored.name = updated.name;
+    }
+    if was_sent("description") {
+        stored.description = updated.description;
+    }
+    if was_sent("enabled") {
+        stored.enabled = updated.enabled;
+    }
+    if was_sent("transport") {
+        stored.transport = updated.transport;
+    }
+    if was_sent("endpoint") {
+        stored.endpoint = updated.endpoint;
+    }
+    if was_sent("vta_did") {
+        stored.vta_did = updated.vta_did;
+    }
+    if was_sent("default_context_id") {
+        stored.default_context_id = updated.default_context_id;
+    }
+    if was_sent("control_key_ref") {
+        stored.control_key_ref = updated.control_key_ref;
+        stored.control_did = updated.control_did;
+    }
+    Ok(())
 }
 
 /// `DELETE /v1/vta/connections/{id}` — remove a connection.
@@ -1960,6 +2029,11 @@ pub async fn cancel_connection_control_key_rotation(
         Err(CancelError::NothingToCancel) => {
             (StatusCode::CONFLICT, ErrorBody::json("there is no rotation to cancel")).into_response()
         }
+        Err(CancelError::Busy) => (
+            StatusCode::CONFLICT,
+            ErrorBody::json("a rotation step is talking to the trust agent right now; try again in a moment"),
+        )
+            .into_response(),
         Err(CancelError::TooLate) => (
             StatusCode::CONFLICT,
             ErrorBody::json("the gateway already signs in with the new key; the rotation can no longer be cancelled"),
@@ -3237,6 +3311,46 @@ mod tests {
         );
 
         assert!(signing_users("unused", None, &surfaces, &[], None, None).is_empty());
+    }
+
+    /// An edit writes only the fields it sent onto the record read under the
+    /// lock, and refuses when what it was checked against changed meanwhile.
+    #[test]
+    fn an_edit_writes_only_what_it_sent_and_refuses_a_record_changed_meanwhile() {
+        let mut read = new_connection();
+        read.enabled = true;
+        let mut updated = read.clone();
+        updated.name = "Renamed".to_string();
+        updated.enabled = !read.enabled;
+        updated.default_context_id = Some("other".to_string());
+
+        let mut stored = read.clone();
+        stored.description = Some("written meanwhile".to_string());
+        apply_edit(&mut stored, &read, updated.clone(), &["name".to_string()], false).expect("applied");
+        assert_eq!(stored.name, "Renamed");
+        assert_eq!(stored.enabled, read.enabled, "not sent, so not written");
+        assert_eq!(stored.default_context_id, read.default_context_id);
+        assert_eq!(stored.description.as_deref(), Some("written meanwhile"), "a field it did not send is kept");
+
+        let mut disabled = read.clone();
+        disabled.enabled = false;
+        let mut stored = disabled.clone();
+        assert!(apply_edit(&mut stored, &read, updated.clone(), &["name".to_string()], false).is_err());
+        assert_eq!(
+            serde_json::to_value(&stored).unwrap(),
+            serde_json::to_value(&disabled).unwrap(),
+            "nothing is written over a disable made meanwhile"
+        );
+
+        let mut rekeyed = read.clone();
+        rekeyed.control_key_ref = Some("vta-control-key-next".to_string());
+        let mut stored = rekeyed.clone();
+        assert!(apply_edit(&mut stored, &read, updated, &["control_key_ref".to_string()], false).is_err());
+        assert_eq!(
+            serde_json::to_value(&stored).unwrap(),
+            serde_json::to_value(&rekeyed).unwrap(),
+            "a control-key change made meanwhile is kept"
+        );
     }
 
     /// Revoking the `[vta]` connection would record it revoked while it keeps

@@ -1,7 +1,7 @@
 //! The gateway's private-key surfaces, and what was decided about each.
 //!
-//! The epic's goal is "an attacker who takes the gateway cannot sign as us".
-//! That claim is only as good as the **least** migrated key, so it cannot be
+//! The claim "an attacker who takes the gateway cannot sign as us" is only as
+//! good as the **least** migrated key, so it cannot be
 //! asserted in prose and left to drift — a surface added later would silently
 //! falsify it. This module is the enumeration, in code, with the residual
 //! exceptions computed from live configuration and reported by
@@ -240,7 +240,7 @@ pub fn surfaces(vta_enabled: bool) -> Vec<KeySurface> {
 
 /// The surfaces that should be in the trust agent and are not.
 ///
-/// This is the honest form of the epic's claim: it is empty, or it is a list.
+/// This is the honest form of that claim: it is empty, or it is a list.
 pub fn residual_exceptions(vta_enabled: bool) -> Vec<&'static str> {
     surfaces(vta_enabled)
         .into_iter()
@@ -322,9 +322,9 @@ mod tests {
         );
     }
 
-    /// The point of the whole ticket: the claim is false today, and the reason
-    /// is the update key. If this test ever starts failing because the claim
-    /// became true, that is the ticket being finished — update it deliberately.
+    /// The claim is false today, and the reason is the update key. If this
+    /// test ever starts failing because the claim became true, update it
+    /// deliberately.
     #[test]
     fn the_no_signing_key_claim_is_not_yet_true_and_says_why() {
         assert!(!holds_no_forging_key(true), "the claim must not become true by accident");

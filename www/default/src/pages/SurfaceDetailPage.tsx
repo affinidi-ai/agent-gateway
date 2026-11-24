@@ -1340,10 +1340,7 @@ const SurfaceDetailPage: React.FC = () => {
       payload.issuer_id = issuerId.trim() || undefined;
       payload = withA2aValidationSettled(payload);
       // Assigned here rather than passed through `buildPayload`, matching
-      // `issuer_id`. Omitting it meant editing a surface silently discarded
-      // its signing key: every stored surface read back `signing: null`, so
-      // both "use this agent" and "use the local key" resolved the appliance
-      // default and the setting looked like it did nothing.
+      // `issuer_id`, so a save keeps the surface's signing choice.
       payload.signing = signing;
       // A PUT that leaves out a stored discovery setting keeps it, so one the
       // operator removed is sent as null, removed only if the save succeeds.

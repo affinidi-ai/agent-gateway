@@ -449,9 +449,13 @@ trust agent call.
 An internal key cannot be recovered if the trust agent is lost. Recovery is re-provision and
 rotate: mint a new key, sign with it, and keep the old one published as a retiring key
 (`[[vta.retiring_keys]]` with its `public_key`, or the connection's retired keys after
-`POST /v1/vta/connections/{id}/rotate`) until every token it signed has expired. A public key
-recorded with a key id, rather than read from the trust agent, is checked on every signature: a
-token the recorded key does not verify is refused, never published. Name an owner
+`POST /v1/vta/connections/{id}/rotate`) until every token it signed has expired. A retired key
+no longer signs: a surface, issuer or Gateway signing choice that names it signs with the
+connection's active key from then on, so a rotation or a newly provisioned key moves everything
+that signed with the old one. Every token the trust agent returns is checked before it is
+published: its header must name the requested key, algorithm and type, its payload must be the
+claims sent, and the key's public key (recorded with the key id, or else read from the trust agent
+once) must verify its signature; anything else is refused. Name an owner
 for the trust agent's encrypted backup (`pnm backup export`) and its restore test. A trust agent
 operator with host access can still use the key, though not extract it.
 
@@ -586,8 +590,9 @@ staying scoped to one context, which each such test names.
   token lifetime plus clock leeway). That covers what is verified against this key set: access
   tokens, ID-JAGs and MCP access tokens. Agent identity credentials and payment receipts, which
   live longer, name the trust agent key's `did:key` or context DID as their issuer and verify by
-  resolving it, so they do not depend on the window. It is dropped at once when
-  its connection is deleted, disabled or revoked, so retiring an agent (move Gateway signing off
+  resolving it, so they do not depend on the window. An earlier signer is dropped at once, and for
+  good, when its connection is deleted, disabled or revoked: enabling or pairing the connection
+  again does not bring its earlier keys back. So retiring an agent (move Gateway signing off
   it, then revoke it) stops the gateway trusting its key. The current signer is recorded the first
   time it resolves, and with the earlier signers (the connection each signed through and when it
   expires) kept in `appliance_signer_history.json` in the storage directory. So a change of

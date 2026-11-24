@@ -96,6 +96,9 @@ pub struct VtaCredentialAuthority {
     /// publishing it (`/oauth2/jwks.json`) is not a per-call VTA hop — and so
     /// **verification stays a local public-key operation**.
     jwks_cache: RwLock<Option<Value>>,
+    /// The signing key's public key read from the agent, so each returned
+    /// token is verified locally without asking again.
+    public_key_cache: RwLock<Option<String>>,
     /// Optional, bounded, non-blocking audit sink for signing events.
     audit: Option<VtaAuditSink>,
     /// Caps how many signatures may be minted per window.
@@ -116,6 +119,7 @@ impl VtaCredentialAuthority {
             signing_key_public: None,
             carried_over_jwks: Vec::new(),
             jwks_cache: RwLock::new(None),
+            public_key_cache: RwLock::new(None),
             audit,
             quota: SignQuota::new(0, 0),
         }
@@ -176,6 +180,14 @@ impl VtaCredentialAuthority {
         let public_key = match &self.signing_key_public {
             Some(public_key) => public_key.clone(),
             None => {
+                if let Some(cached) = self
+                    .public_key_cache
+                    .read()
+                    .await
+                    .clone()
+                {
+                    return Ok(cached);
+                }
                 let result: KeyShowResult = self
                     .client
                     .dispatch(TASK_KEYS_SHOW, json!({ "keyId": self.signing_key_id }))
@@ -184,6 +196,15 @@ impl VtaCredentialAuthority {
             }
         };
         ed25519_multibase_to_jwk(&public_key, &self.signing_key_id)?;
+        if self
+            .signing_key_public
+            .is_none()
+        {
+            *self
+                .public_key_cache
+                .write()
+                .await = Some(public_key.clone());
+        }
         Ok(public_key)
     }
 
@@ -255,12 +276,15 @@ impl VtaCredentialAuthority {
                 response.alg
             )));
         }
-        // A public key recorded with the key id, rather than read from the
-        // agent, is only as good as whoever typed it: a token is published only
-        // once that key verifies it.
-        if let Some(public_key) = &self.signing_key_public {
-            verify_jws_signature(&response.jws, public_key)?;
-        }
+        // The token is published only once it is the one asked for: its
+        // header names the requested key, algorithm and type, its payload is
+        // the claims sent, and the key's public key (recorded with the key id,
+        // or else read from the agent once) verifies its signature.
+        check_returned_jws(&response.jws, &self.signing_key_id, typ, claims)?;
+        let public_key = self
+            .signing_key_public_multibase()
+            .await?;
+        verify_jws_signature(&response.jws, &public_key)?;
         if let Some(audit) = &self.audit {
             let subject = claims
                 .get("sub")
@@ -273,6 +297,46 @@ impl VtaCredentialAuthority {
         }
         Ok(response.jws)
     }
+}
+
+/// Checks that the compact `jws` an agent returned is the token asked for: its
+/// protected header names `key_id`, the gateway's algorithm and `typ`, and its
+/// payload is `claims`. Other header fields the agent adds are allowed.
+fn check_returned_jws(
+    jws: &str,
+    key_id: &str,
+    typ: &str,
+    claims: &Value,
+) -> Result<(), VtaError> {
+    let decode = |part: &str, what: &str| -> Result<Value, VtaError> {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(part)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .ok_or_else(|| VtaError::Protocol(format!("keys/sign-jws returned a JWS whose {what} is not JSON")))
+    };
+    let mut parts = jws.split('.');
+    let (Some(header), Some(payload), Some(_), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+        return Err(VtaError::Protocol("keys/sign-jws returned a JWS that is not compact".to_string()));
+    };
+    let header = decode(header, "header")?;
+    for (field, expected) in [("kid", key_id), ("alg", SIGNING_ALGORITHM), ("typ", typ)] {
+        if header
+            .get(field)
+            .and_then(Value::as_str)
+            != Some(expected)
+        {
+            return Err(VtaError::Protocol(format!(
+                "keys/sign-jws returned a JWS whose `{field}` is not the `{expected}` requested"
+            )));
+        }
+    }
+    if decode(payload, "payload")? != *claims {
+        return Err(VtaError::Protocol(
+            "keys/sign-jws returned a JWS whose payload is not the claims sent".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Checks that the compact `jws` carries a signature the Ed25519 multibase
@@ -448,7 +512,7 @@ impl CredentialAuthority for VtaCredentialAuthority {
 /// [`crate::vta::client::tests::live_authenticate_against_real_vta`]; the
 /// signing path is described in `docs/TRUST_AGENT_SIGNING.md`.
 #[cfg(test)]
-mod poc_tests {
+mod live_tests {
     use super::*;
     use crate::vta::control_key::{ControlKey, SignerKeyProvider};
     use std::sync::Mutex;
@@ -469,6 +533,15 @@ mod poc_tests {
         /// When set, the `keys/sign-jws` response echoes this `keyId` instead of
         /// the requested one — used to drive the fail-closed attribution check.
         key_id_echo_override: Arc<Mutex<Option<String>>>,
+        /// When set, the returned JWS is not the token asked for.
+        tamper: Arc<Mutex<Option<Tamper>>>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Tamper {
+        Payload,
+        Typ,
+        Signature,
     }
 
     fn b64(bytes: &[u8]) -> String {
@@ -525,14 +598,26 @@ mod poc_tests {
                 .cloned()
                 .unwrap_or_default();
             header.insert("alg".to_string(), json!("EdDSA"));
+            let tamper = *vta.tamper.lock().unwrap();
+            let mut claims = payload["payload"].clone();
+            match tamper {
+                Some(Tamper::Payload) => claims["sub"] = json!("someone-else"),
+                Some(Tamper::Typ) => {
+                    header.insert("typ".to_string(), json!("other+jwt"));
+                }
+                _ => {}
+            }
             let signing_input = format!(
                 "{}.{}",
                 b64(&serde_json::to_vec(&Value::Object(header)).unwrap()),
-                b64(&serde_json::to_vec(&payload["payload"]).unwrap()),
+                b64(&serde_json::to_vec(&claims).unwrap()),
             );
-            let sig = vta
-                .signing
-                .sign(signing_input.as_bytes());
+            let sig = match tamper {
+                Some(Tamper::Signature) => SigningKey::from_bytes(&[99u8; 32]).sign(signing_input.as_bytes()),
+                _ => vta
+                    .signing
+                    .sign(signing_input.as_bytes()),
+            };
             // The real VTA echoes the key it signed with and the algorithm it
             // chose; only `jws` carries signature material — no key crosses back.
             let echoed_key_id = vta
@@ -557,6 +642,7 @@ mod poc_tests {
             sign_calls: Arc::new(AtomicUsize::new(0)),
             last_key_id: Arc::new(Mutex::new(None)),
             key_id_echo_override: Arc::new(Mutex::new(None)),
+            tamper: Arc::new(Mutex::new(None)),
         };
         let app = Router::new()
             .route("/trust-tasks", post(trust_tasks))
@@ -653,6 +739,24 @@ mod poc_tests {
             "the error names the unexpected key: {}",
             vta_err.log_detail()
         );
+    }
+
+    /// A token is published only when it is the one asked for: the claims
+    /// sent, the type requested, and a signature the key's public key verifies.
+    #[tokio::test]
+    async fn a_returned_token_that_is_not_the_one_asked_for_is_refused() {
+        for tamper in [Tamper::Payload, Tamper::Typ, Tamper::Signature] {
+            let signing = Arc::new(SigningKey::from_bytes(&[12u8; 32]));
+            let (base, vta) = spawn(Arc::clone(&signing)).await;
+            *vta.tamper.lock().unwrap() = Some(tamper);
+            let auth = authority(&base, "key-gateway-jwt");
+
+            let err = auth
+                .sign_token(&json!({ "sub": "x" }))
+                .await
+                .expect_err("a token other than the one asked for is not published");
+            assert!(matches!(err.downcast_ref::<VtaError>(), Some(VtaError::Protocol(_))), "{tamper:?}: {err}");
+        }
     }
 
     #[tokio::test]
@@ -1077,8 +1181,8 @@ mod poc_tests {
     /// ```text
     /// VTA_LIVE_URL=http://127.0.0.1:3000 \
     /// VTA_LIVE_DID=did:webvh:<scid>:localhost%3A3000 \
-    ///   cargo test --bin agent-trust-gateway \
-    ///     vta::authority::poc_tests::live_sign_token_against_real_vta_verifies \
+    ///   cargo test --bin agent-gateway \
+    ///     vta::authority::live_tests::live_sign_token_against_real_vta_verifies \
     ///     -- --ignored --nocapture
     /// ```
     ///
@@ -1115,8 +1219,8 @@ mod poc_tests {
                 "https://trusttasks.org/spec/keys/create/0.1",
                 json!({
                     "keyType": "ed25519",
-                    "keyId": format!("gateway-jwt-poc-{idx}"),
-                    "label": "gateway-jwt-poc",
+                    "keyId": format!("gateway-jwt-live-{idx}"),
+                    "label": "gateway-jwt-live",
                     "internal": true,
                 }),
             )
@@ -1163,7 +1267,7 @@ mod poc_tests {
             // `keys/create` response, captured into config at provisioning.
             .with_signing_key_public(Some(public_key_mb.clone()));
         let jws = auth
-            .sign_token(&json!({ "sub": "urn:agent:live-poc", "scope": "mcp:call" }))
+            .sign_token(&json!({ "sub": "urn:agent:live", "scope": "mcp:call" }))
             .await
             .expect("the live VTA signs the token");
 
@@ -1175,7 +1279,7 @@ mod poc_tests {
         let vk = VerifyingKey::from_bytes(&vk_bytes).expect("verifying key");
         let (header, payload) = verify_compact_jws(&jws, &vk);
         assert_eq!(header["alg"], "EdDSA");
-        assert_eq!(payload["sub"], "urn:agent:live-poc");
+        assert_eq!(payload["sub"], "urn:agent:live");
 
         // The published JWKS (resolved from the VTA via keys/show,
         // bearer-only) yields the same verifying key — so a resource server
@@ -1221,7 +1325,7 @@ mod poc_tests {
         );
     }
 
-    /// The PoC's no-signing-oracle rule, as a harness: verify the inbound
+    /// The no-signing-oracle rule, as a harness: verify the inbound
     /// Ed25519 assertion first, and only then delegate to the VTA signer.
     async fn sign_if_verified(
         auth: &VtaCredentialAuthority,

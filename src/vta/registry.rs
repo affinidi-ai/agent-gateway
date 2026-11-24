@@ -77,6 +77,16 @@ fn cache_key_prefix(connection_id: &str) -> String {
 }
 
 /// Builds and caches one connector per enabled connection record.
+/// What a connection record says about whether its keys are still in use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retirement {
+    InUse,
+    /// Deleted, disabled or revoked.
+    Retired,
+    /// The record could not be read.
+    Unknown,
+}
+
 pub struct VtaConnectionRegistry {
     store: Arc<dyn VtaConnectionStorage>,
     secrets: Option<Arc<dyn SecretsStore>>,
@@ -224,22 +234,26 @@ impl VtaConnectionRegistry {
         Ok(client)
     }
 
-    /// Whether `connection_id` was deleted, disabled or revoked. A record that
-    /// cannot be read counts as retired, so its keys stop being trusted rather
-    /// than staying trusted on an error.
-    pub async fn retired(
+    /// What the record of `connection_id` says about its use: in use, retired
+    /// (deleted, disabled or revoked), or unknown when it cannot be read, whose
+    /// keys stop being trusted rather than staying trusted on an error.
+    pub async fn retirement(
         &self,
         connection_id: &str,
-    ) -> bool {
+    ) -> Retirement {
         match self
             .store
             .get(connection_id)
             .await
         {
-            Ok(Some(connection)) => {
-                !connection.enabled || connection.pairing.state == crate::vta::pairing::PairingState::Revoked
+            Ok(Some(connection))
+                if !connection.enabled || connection.pairing.state == crate::vta::pairing::PairingState::Revoked =>
+            {
+                Retirement::Retired
             }
-            Ok(None) | Err(_) => true,
+            Ok(Some(_)) => Retirement::InUse,
+            Ok(None) => Retirement::Retired,
+            Err(_) => Retirement::Unknown,
         }
     }
 
@@ -354,16 +368,28 @@ impl VtaConnectionRegistry {
         // `default_context_id` here made the agent refuse with "key `<context>`
         // is not within the caller's scope", because the name addressed no key
         // it held.
-        let signing_key_id = key_id
-            .map(str::to_string)
-            .or_else(|| {
-                connection
-                    .keys
-                    .active
-                    .as_ref()
-                    .map(|k| k.key_id.clone())
-            })
-            .unwrap_or_default();
+        //
+        // A key the connection retired no longer signs: a choice that named it
+        // signs with the active key, so a rotation moves everything that signed
+        // with the old key, which stays published for the tokens it signed.
+        let active = connection
+            .keys
+            .active
+            .as_ref()
+            .map(|k| k.key_id.clone());
+        let retired = |named: &str| {
+            connection
+                .keys
+                .retiring
+                .iter()
+                .any(|k| k.key_id == named)
+        };
+        let signing_key_id = match key_id {
+            Some(named) if retired(named) && active.is_some() => active,
+            Some(named) => Some(named.to_string()),
+            None => active,
+        }
+        .unwrap_or_default();
 
         // The public half the connection recorded when it minted the key. The
         // keys are internal, so the agent will not return their records: without
@@ -1021,6 +1047,42 @@ mod tests {
                 .len(),
             2,
             "the signing key is published once, not again as a retiring key"
+        );
+    }
+
+    /// A choice that names a key the connection retired signs with its active
+    /// key, so rotating moves everything that signed with the old key.
+    #[tokio::test]
+    async fn a_choice_naming_a_retired_key_signs_with_the_active_one() {
+        let mut c = connection("c1", true);
+        c.pairing = crate::vta::pairing::PairingRecord {
+            state: crate::vta::pairing::PairingState::Connected,
+            ..Default::default()
+        };
+        c.keys = crate::vta::connections::SigningKeys {
+            active: Some(recorded_key("key-new", 2, false)),
+            retiring: vec![recorded_key("key-old", 1, true)],
+        };
+        let registry = registry(MemoryStore::new(vec![c]), secrets_with_seed());
+
+        let signing_key = |jwks: serde_json::Value| {
+            jwks["keys"][0]["kid"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let retired = registry
+            .authority_for_key("c1", Some("key-old"))
+            .await
+            .unwrap();
+        assert_eq!(
+            signing_key(
+                retired
+                    .issuer_jwks()
+                    .await
+                    .unwrap()
+            ),
+            "key-new"
         );
     }
 

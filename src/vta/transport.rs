@@ -107,8 +107,8 @@ impl TrustTaskTransport for HttpsTransport {
 ///
 /// A port rather than a concrete mediator client: the correlation, deadline and
 /// memory-bounding rules below are the gateway's responsibility and are worth
-/// testing on their own, while the mediator plumbing is existing infrastructure
-/// this ticket deliberately does not re-implement.
+/// testing on their own, while the mediator plumbing is the existing
+/// infrastructure behind this port.
 #[async_trait]
 pub trait DidCommChannel: Send + Sync {
     /// Send `body` to `to_did`, tagged with `correlation_id` so the reply can

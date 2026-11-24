@@ -279,7 +279,7 @@ mod tests {
 
     const WEBVH: &str = "did:webvh:QmExample:gateway.example";
 
-    /// The property the whole ticket exists for: rotating the signing key
+    /// Rotating the signing key
     /// leaves the identifier unchanged, so the VTA's ACL grant, its audit trail
     /// and the relationship survive a rotation. With a `did:key` the same
     /// rotation produces a different identity and needs a fresh grant.
