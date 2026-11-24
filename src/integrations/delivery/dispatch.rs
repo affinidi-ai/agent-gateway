@@ -1111,6 +1111,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_delivered_expiry_occurred_when_the_consent_was_removed_and_names_when_it_ended() {
+        use crate::delegation_vault::audit::DelegationAuditEvent;
+        use crate::delegation_vault::test_support::{EXPIRY_ROW, EXPIRY_ROW_END};
+        use crate::integrations::audit_integration_triggers::AuditDelivery;
+        let record: DelegationAuditEvent = serde_json::from_str(EXPIRY_ROW).unwrap();
+        let values = AuditDelivery::from_event(&record)
+            .values()
+            .clone();
+        let templates = [
+            ("data", json!({})),
+            (
+                "record",
+                json!({"event_type": "${EVENT_TYPE}", "appliance_id": "${APPLIANCE_ID}", "record": "${EVENT_DATA}"}),
+            ),
+        ];
+        for endpoint_type in JSON_ENDPOINTS {
+            for (key, template) in &templates {
+                let content = delivered_with(endpoint_type, template.clone(), &values).await;
+
+                assert_eq!(
+                    (&content["occurred_at"], &content[key]["expired_at"]),
+                    (&json!(record.occurred_at), &json!(EXPIRY_ROW_END)),
+                    "{endpoint_type:?} {key}: {content}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn a_template_cannot_write_the_top_level_event_id_or_occurrence_time() {
         let forging = json!({
             "event_id": "forged",

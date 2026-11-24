@@ -266,6 +266,11 @@ pub struct DelegationAuditEvent {
     /// Absent outside surface requests and on a misconfigured default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface_variant: Option<String>,
+    /// On `consent_expired` only: when the consent ended, RFC 3339. The
+    /// record's `occurred_at` is when the gateway removed it. Absent when the
+    /// end is not known and on records stored before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expired_at: Option<chrono::DateTime<Utc>>,
     /// Additional context
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -1399,6 +1404,7 @@ pub fn audit_event(
         parent_span_id: None,
         trace_source: None,
         surface_variant: None,
+        expired_at: None,
         detail: None,
         tenant_id: None,
     }
@@ -2631,6 +2637,7 @@ pub fn audit_policy_decision(
         parent_span_id: None,
         trace_source: None,
         surface_variant: None,
+        expired_at: None,
         detail: None,
         tenant_id: None,
     });
@@ -2687,6 +2694,7 @@ pub fn audit_trust_check(
         parent_span_id: None,
         trace_source: None,
         surface_variant: None,
+        expired_at: None,
         detail: None,
         tenant_id: None,
     });
@@ -2736,6 +2744,7 @@ pub fn audit_trace_terminated(
         parent_span_id: None,
         trace_source: None,
         surface_variant: None,
+        expired_at: None,
         detail: Some(format!("downstream_trace_id={downstream_trace_id}")),
         tenant_id: None,
     });
@@ -3703,6 +3712,7 @@ mod tests {
             parent_span_id: None,
             trace_source: None,
             surface_variant: None,
+            expired_at: None,
             detail: Some("downstream_trace_id=down-456".to_string()),
             tenant_id: None,
         };
@@ -4210,6 +4220,33 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_expiry_keeps_when_its_consent_ended() {
+        use crate::delegation_vault::test_support::{EXPIRY_ROW, EXPIRY_ROW_END};
+        let read: DelegationAuditEvent = serde_json::from_str(EXPIRY_ROW).unwrap();
+
+        let answered = serde_json::to_value(&read).unwrap();
+
+        assert_eq!(
+            (answered.get("occurred_at"), answered.get("expired_at")),
+            (Some(&serde_json::json!("2026-11-24T10:00:00+00:00")), Some(&serde_json::json!(EXPIRY_ROW_END))),
+            "{answered}"
+        );
+    }
+
+    #[test]
+    fn only_an_expiry_whose_end_is_known_names_expired_at() {
+        use crate::delegation_vault::test_support::OLD_EXPIRY_ROW;
+        let old: DelegationAuditEvent = serde_json::from_str(OLD_EXPIRY_ROW).expect("an expiry stored without its end");
+        let unknown_end = audit_event(DelegationAuditAction::ConsentExpired, None, None, Some("cp-1"), None);
+        let granted = audit_event(DelegationAuditAction::ConsentGranted, None, None, Some("cp-1"), None);
+
+        for (case, record) in [("stored without it", old), ("end unknown", unknown_end), ("another kind", granted)] {
+            let written = serde_json::to_value(&record).unwrap();
+            assert_eq!(written.get("expired_at"), None, "{case}: {written}");
+        }
+    }
+
+    #[test]
     fn a_stored_record_is_read_under_either_name_of_its_time_and_refused_under_both() {
         use crate::delegation_vault::test_support::{OLD_ROW, OLD_ROW_TIME, ROW_WITH_BOTH_TIMES};
         let new_row = OLD_ROW.replace("\"timestamp\"", "\"occurred_at\"");
@@ -4304,6 +4341,7 @@ mod tests {
                 parent_span_id: None,
                 trace_source: None,
                 surface_variant: None,
+                expired_at: None,
                 detail: None,
                 tenant_id: None,
             },
@@ -4349,6 +4387,7 @@ mod tests {
                 parent_span_id: None,
                 trace_source: None,
                 surface_variant: None,
+                expired_at: None,
                 detail: None,
                 tenant_id: None,
             },

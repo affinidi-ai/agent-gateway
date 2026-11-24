@@ -63,6 +63,14 @@ changes:
         The event hook's body now carries occurred_at, when the Connection Point event happened.
         timestamp stays, with the same value, for receivers that read it; occurred_at is the field
         to use. Both are the same on every retry, as event_id is.
+    - timestamp: '2026-11-24T16:00:00Z'
+      title: Record when an expired consent ended on its consent_expired record
+      description: >-
+        A consent_expired audit record now carries expired_at, the time the consent ended, beside
+        occurred_at, the time the gateway removed it, which can be much later: the hourly pass, a
+        restart or a standby node notices an ended consent late. It is in the VP Audit Log, in the
+        audit APIs and in the record delivered to integrations, and is omitted when the end is not
+        known. No other record carries it, and a consent_expired record stored earlier has none.
   changed:
     - timestamp: '2026-11-24T14:00:00Z'
       title: Place connection_point.connected at the time its message arrived

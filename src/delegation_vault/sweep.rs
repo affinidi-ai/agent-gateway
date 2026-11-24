@@ -2399,6 +2399,65 @@ mod tests {
         assert!(server.requests().is_empty(), "an agent-keyed token is revoked at no vendor");
     }
 
+    /// An expiry the hourly pass finds long after the consent ended is
+    /// recorded when the consent was removed, and names when it ended: an
+    /// agent-keyed token's and a grant's alike.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_expiry_found_late_is_recorded_when_removed_and_names_when_the_consent_ended() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = RecordingServer::start(200).await;
+        let sweeper = sweeper(&directory, &server, true).await;
+        limit_provider(&sweeper, 3_600).await;
+        let now = Utc::now();
+        let ended_token = token("ended", "vendor", now, 10 * 60, true);
+        sweeper
+            .vault
+            .store(ended_token.clone())
+            .await
+            .unwrap();
+        let key = GrantKey::owner(Some("tenant-a"), "surface", "served", "vendor");
+        let mut ended_grant = crate::delegation_vault::grants::tests::grant(&key, "ended");
+        ended_grant.created_at = now - chrono::Duration::hours(10);
+        ended_grant.consent_expires_at = Some(ended_grant.created_at + chrono::Duration::hours(1));
+        sweeper
+            .vault
+            .store_grant(ended_grant.clone())
+            .await
+            .unwrap();
+
+        let (report, events) = crate::audit::producer::capture(sweeper.end_consents(now)).await;
+
+        assert_eq!((report.ended_consent_tokens, report.ended_consent_grants), (1, 1), "{report:?}");
+        let mut recorded: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::ConsentExpired)
+            })
+            .map(|event| {
+                let occurred_at = DateTime::parse_from_rfc3339(&event.occurred_at).unwrap();
+                assert!(
+                    Utc::now() - occurred_at.with_timezone(&Utc) < chrono::Duration::minutes(1),
+                    "recorded when removed, not when the consent ended: {}",
+                    event.occurred_at
+                );
+                (
+                    event
+                        .token_id
+                        .clone()
+                        .unwrap(),
+                    event.expired_at,
+                )
+            })
+            .collect();
+        recorded.sort();
+        let mut expected = vec![
+            (ended_token.id.clone(), ended_token.consent_expires_at),
+            (key.record_id(), ended_grant.consent_expires_at),
+        ];
+        expected.sort();
+        assert_eq!(recorded, expected);
+    }
+
     /// A consent time further ahead of this gateway's clock than clocks may
     /// differ says a clock is wrong, not that the consent ended. The hourly
     /// pass keeps such a token and such a grant, counts them, records no

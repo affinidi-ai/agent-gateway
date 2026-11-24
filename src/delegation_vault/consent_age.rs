@@ -322,6 +322,7 @@ pub async fn end_consent(
         );
         event.token_id = Some(token.id.clone());
         event.scopes = Some(token.scopes.clone());
+        event.expired_at = ended_at;
         event.detail = Some(expiry_detail(token.consent_granted_at, ended_at, source));
         describe(&mut event);
         event
@@ -350,6 +351,7 @@ pub fn record_grant_expiry(
         event.provider_name = provider_name.map(str::to_string);
         event.scopes = Some(removed.scopes.clone());
         event.tenant_id = removed.tenant_id.clone();
+        event.expired_at = ended_at;
         event.detail = Some(expiry_detail(removed.created_at, ended_at, source));
         event
     });

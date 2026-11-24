@@ -261,6 +261,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_expiry_is_answered_with_when_its_consent_ended_when_it_was_recorded() {
+        use crate::delegation_vault::audit::{DelegationAuditAction, audit_event};
+        use crate::delegation_vault::test_support::{EXPIRY_ROW, EXPIRY_ROW_END, OLD_EXPIRY_ROW, audit_log_holding};
+        let directory = tempfile::tempdir().unwrap();
+        let written = audit_event(DelegationAuditAction::TokenInjected, None, None, Some("cp-global"), None);
+
+        let page =
+            appliance_wide_page_of(audit_log_holding(directory.path(), &[OLD_EXPIRY_ROW, EXPIRY_ROW], &written)).await;
+
+        let ends: Vec<_> = page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event.get("expired_at"))
+            .collect();
+        assert_eq!(ends, [None, Some(&serde_json::json!(EXPIRY_ROW_END)), None], "newest first: {page}");
+        assert_eq!(page["dropped_records"], 0, "{page}");
+    }
+
+    #[tokio::test]
     async fn a_line_naming_its_time_twice_is_counted_as_unreadable() {
         use crate::delegation_vault::audit::{DelegationAuditAction, audit_event};
         use crate::delegation_vault::test_support::{ROW_WITH_BOTH_TIMES, audit_log_holding};

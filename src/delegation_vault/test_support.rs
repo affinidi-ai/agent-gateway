@@ -82,6 +82,17 @@ pub(crate) const OLD_ROW_TIME: &str = "2026-11-07T10:00:00Z";
 pub(crate) const OLD_ROW: &str =
     r#"{"timestamp":"2026-11-07T10:00:00Z","event":"consent_granted","provider_id":"cp-global","via_fabric":false}"#;
 
+/// When the consent of [`EXPIRY_ROW`] ended.
+pub(crate) const EXPIRY_ROW_END: &str = "2026-11-24T08:00:00Z";
+
+/// A `consent_expired` record as the gateway writes it: the consent was
+/// removed at `occurred_at`, two hours after it ended at `expired_at`.
+pub(crate) const EXPIRY_ROW: &str = r#"{"occurred_at":"2026-11-24T10:00:00+00:00","event":"consent_expired","provider_id":"cp-global","via_fabric":false,"detail":"consent_granted_at:2026-11-24T07:00:00Z,consent_expired_at:2026-11-24T08:00:00Z,source:sweep","expired_at":"2026-11-24T08:00:00Z"}"#;
+
+/// A `consent_expired` record as releases before `expired_at` stored it.
+pub(crate) const OLD_EXPIRY_ROW: &str =
+    r#"{"timestamp":"2026-11-07T10:00:00Z","event":"consent_expired","provider_id":"cp-global","via_fabric":false}"#;
+
 /// A line naming its time under both names, which no release writes.
 pub(crate) const ROW_WITH_BOTH_TIMES: &str = r#"{"timestamp":"2026-11-07T10:00:00Z","occurred_at":"2026-11-07T11:00:00Z","event":"token_revoked","via_fabric":false}"#;
 
