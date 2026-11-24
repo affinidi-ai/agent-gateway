@@ -57,9 +57,6 @@ const AccessTokensTab: React.FC<AccessTokensTabProps> = ({ searchTerm }) => {
             icon="fa-user-lock"
             title="No access tokens yet"
             body="Access tokens let automation call the management API without an interactive session."
-            ctaLabel={list.canEdit ? 'New Access Token' : undefined}
-            ctaIcon="fa-plus"
-            onCtaClick={list.canEdit ? list.openCreate : undefined}
           />
         ) : list.filtered.length === 0 ? (
           <div className="text-center text-muted py-5" data-testid="access-token-empty-filter">

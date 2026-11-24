@@ -151,10 +151,6 @@ const PaymentGatewaysPage: React.FC<PaymentGatewaysPageProps> = ({
               icon="fa-credit-card"
               title="Connect a payment gateway"
               body="A payment gateway is an agent-pay gateway that takes payments for your surfaces: it issues the payment challenge, verifies and settles the payment and returns the receipt. Connect with the Connection Point Link and secret its administrator shares; agent-pay's administrator then approves the connection."
-              ctaLabel={canEdit ? 'Connect Payment Gateway' : undefined}
-              ctaIcon="fa-plus"
-              onCtaClick={canEdit ? connect : undefined}
-              ctaTestId="payment-gateways-empty-connect-button"
               docsHref={DOCS_URL.payments}
             />
           </div>
