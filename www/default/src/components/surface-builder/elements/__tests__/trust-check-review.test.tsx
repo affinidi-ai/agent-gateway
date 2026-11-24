@@ -262,7 +262,7 @@ describe('migrated Trust Check copy on an MCP Transit Point', () => {
     expect(rebuild(nodes).transit.points[0].trust_check_list[0]).not.toHaveProperty('timeout_secs');
   });
 
-  it('refuses a new Trust Check dropped on the MCP Transit Point arrow', () => {
+  it('accepts a new Trust Check on the MCP Transit Point arrow, for its managed agent', () => {
     const nodes = hydrate(migratedMcp()).filter(n => n.id !== MCP_TC);
     const edges = deriveEdges(nodes);
     const filter = makeSurfaceSlotFilter('https://agent.example.com/a2a', true, nodes);
@@ -273,7 +273,10 @@ describe('migrated Trust Check copy on an MCP Transit Point', () => {
     const a2aEdge = edges.find(
       e => e.archetype === 'ma-tp' && e.endpoints.target === 'transit-point-a2a-1'
     )!;
-    expect(tryDrop(mcpEdge, 'trust-check', 'request', typeOf, filter).ok).toBe(false);
+    expect(tryDrop(mcpEdge, 'trust-check', 'request', typeOf, filter)).toEqual({
+      ok: true,
+      slotId: TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
+    });
     expect(tryDrop(a2aEdge, 'trust-check', 'request', typeOf, filter)).toEqual({
       ok: true,
       slotId: TRUST_CHECK_TRANSIT_POINT_SLOT_ID,

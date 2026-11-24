@@ -30,6 +30,32 @@ function baseProps(config: Record<string, unknown> = {}) {
   };
 }
 
+describe('TrustRecorderPanel — leg', () => {
+  it('names the response leg for the surface recorder', () => {
+    render(<TrustRecorderPanel {...(baseProps() as any)} />);
+    expect(screen.getByTestId('trust-recorder-panel-results-ref')).toHaveTextContent(
+      'response leg (Managed Agent → Access Point)'
+    );
+  });
+
+  it("names the request leg for a Transit Point's recorder", () => {
+    const props = baseProps();
+    props.node = {
+      ...props.node,
+      parentId: 'transit-point-a2a-1',
+      slotId: 'request:trust-recorder',
+    };
+    render(<TrustRecorderPanel {...(props as any)} />);
+    expect(screen.getByTestId('trust-recorder-panel-results-ref')).toHaveTextContent(
+      'request leg (Managed Agent → Transit Point), in the background, for the DID the managed agent calls out under'
+    );
+    fireEvent.click(screen.getByTestId('trust-recorder-panel-context-toggle'));
+    expect(screen.getByTestId('trust-recorder-panel-context-body')).toHaveTextContent(
+      'this Transit Point’s Trust Check can recognise it'
+    );
+  });
+});
+
 describe('TrustRecorderPanel — sidebar context block', () => {
   it('renders the collapsible context block collapsed by default', () => {
     render(<TrustRecorderPanel {...(baseProps() as any)} />);

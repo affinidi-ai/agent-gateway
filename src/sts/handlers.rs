@@ -3369,6 +3369,7 @@ mod tests {
             query: crate::trust_registry_verification::trust_check_element::TrqpQueryParams::default(),
             timeout_secs: None,
             name: None,
+            subject: Default::default(),
         }
     }
 

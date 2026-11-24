@@ -16,6 +16,7 @@ import {
 } from './definition';
 import TrustRecorderLastOutcome from '../../../trust-recorder/TrustRecorderLastOutcome';
 import TrustRecorderEntryForm from './TrustRecorderEntryForm';
+import TrustRecorderLeg from './TrustRecorderLeg';
 
 function seedInitial(config: any): TrustRecorderEntry[] {
   const existing = readEntries(config);
@@ -23,6 +24,7 @@ function seedInitial(config: any): TrustRecorderEntry[] {
 }
 
 const TrustRecorderFullscreenPanel: React.FC<ConfigPanelProps> = ({
+  node,
   config,
   updateField,
   closeFullscreenEditor,
@@ -260,8 +262,7 @@ const TrustRecorderFullscreenPanel: React.FC<ConfigPanelProps> = ({
           Trust Recorder
         </h4>
         <div className="text-muted small">
-          Writes agent-registration records on the <strong>response leg</strong> (Managed Agent
-          &rarr; Access Point) to every configured Trust Registry.
+          <TrustRecorderLeg node={node} />
         </div>
         <div className="text-muted small mt-1">
           <strong>

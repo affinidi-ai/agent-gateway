@@ -104,6 +104,16 @@ bucket for the point, and `per_caller_rate_limit` gives each caller the point id
 of their own. Both are counted on each gateway node. See
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point).
 
+An element of a Transit Point's `trust_check_list` with `"subject": "managed_agent"` asks a
+trust registry about the managed agent calling out through it, not the destination; its
+results reach policy at `input.trust_check_results.managed_agent`. Elements without `subject`
+check the destination. See [`POLICY.md`](POLICY.md#self-recognition-check).
+
+A Transit Point's `trust_recorder` (absent by default) has the shape of
+`access_point.trust_recorder` and writes, in the background on every request except a discovery read, the records of
+the managed agent calling out through it. See
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-trust-recorder).
+
 ## Browser origins of a surface
 
 A browser page can call a surface only from an allowed origin. `network.cors` in `gateway.json` lists
