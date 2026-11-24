@@ -93,6 +93,7 @@ module.exports = {
                 priority: 10,
                 reuseExistingChunk: true,
                 name: "common",
+                maxSize: 500000,
               },
             },
           },
