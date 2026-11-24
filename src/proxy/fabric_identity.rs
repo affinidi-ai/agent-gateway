@@ -199,12 +199,69 @@ async fn extract_fabric_backend_agent_identity(
             extract_a2a_fabric_identity(&response_json, vc_issuer, channel_name).await
         }
         crate::config::agent_surface::SurfaceProtocol::Mcp => {
-            // MCP not yet implemented for fabric VP verification
-            debug!(channel = channel_name, "Fabric: MCP VP verification not yet implemented");
-            Ok(None)
+            extract_mcp_fabric_identity(&response_json, vc_issuer, channel_name).await
         }
         _ => Ok(None),
     }
+}
+
+/// Find the credential in the answer's `result._meta`, where GW2 places it
+/// (see `crate::mcp::inject_vp_into_mcp_response`), or in the top-level
+/// `_meta` of the historical envelope, under its canonical key or the
+/// historical alias, and verify its presentation. Both locations are read
+/// whatever else the body holds, so a stray `params` cannot hide the
+/// credential. An answer with neither `_meta` carries none; a `_meta` that is
+/// not an object, or copies of the credential that differ, are refused.
+async fn extract_mcp_fabric_identity(
+    response_json: &JsonValue,
+    vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
+    channel_name: &str,
+) -> Result<Option<ResponsePresentation>, String> {
+    let credential = mcp_answer_credential(response_json).map_err(|e| {
+        warn!(channel = channel_name, error = e, "✗ Fabric: MCP answer metadata cannot be read");
+        format!("VP verification failed for server agent identity: {e}")
+    })?;
+    match credential {
+        Some(credential) => {
+            info!(channel = channel_name, "Fabric: Found VP credential in MCP answer _meta from GW2");
+            verify_fabric_credential(credential, vc_issuer, channel_name).await
+        }
+        None => {
+            debug!(channel = channel_name, "Fabric: No VP credential in MCP answer _meta");
+            Ok(None)
+        }
+    }
+}
+
+/// The identity credential an MCP answer carries in its top-level `_meta` or
+/// its `result._meta`, under any key that canonicalises to
+/// [`crate::config::MCP_AGENT_IDENTITY_CREDENTIAL_KEY`]. A `null` `_meta`
+/// counts as absent.
+fn mcp_answer_credential(response_json: &JsonValue) -> Result<Option<&JsonValue>, &'static str> {
+    let mut found: Option<&JsonValue> = None;
+    for path in ["/_meta", "/result/_meta"] {
+        let Some(meta) = response_json
+            .pointer(path)
+            .filter(|meta| !meta.is_null())
+        else {
+            continue;
+        };
+        let meta = meta
+            .as_object()
+            .ok_or("MCP answer _meta must be a JSON object")?;
+        for (key, value) in meta {
+            if crate::mcp::meta::canonical_key(key) != crate::config::MCP_AGENT_IDENTITY_CREDENTIAL_KEY {
+                continue;
+            }
+            match found {
+                Some(existing) if existing != value => {
+                    return Err("MCP answer carries conflicting identity credentials");
+                }
+                _ => found = Some(value),
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// Find the credential extension on the agent's message, where GW2 places it
@@ -1108,20 +1165,194 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn an_mcp_answer_carries_no_checked_presentation() {
-        let signed = crate::identity::test_helpers::signed_agent_presentation().await;
-        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+    fn mcp_surface() -> crate::config::agent_surface::AgentSurface {
+        serde_json::from_value(json!({
             "name": "a-party",
             "access_point": { "listen_address": "http://localhost:8700", "route": "/agents/a", "protocol": "mcp" },
             "target": { "endpoint": "fabric://gw-2/b-party" }
         }))
-        .expect("surface JSON");
-        let body = credential_response(&signed.presentation).to_string();
+        .expect("surface JSON")
+    }
 
-        let presented = extract_fabric_backend_agent_identity(&body, &surface, Some(&signed.issuer), "a-party").await;
+    /// An MCP tool result whose `result._meta` carries `credential` under `key`.
+    fn mcp_answer(
+        key: &str,
+        credential: JsonValue,
+    ) -> JsonValue {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "content": [{ "type": "text", "text": "done" }], "_meta": { key: credential } }
+        })
+    }
 
-        assert_eq!(presented, Ok(None));
+    /// Check an MCP answer from the peer whose issuer signed `signed`, sent
+    /// from the Connection Point `did:example:local-cp`.
+    async fn checked_mcp_answer(
+        signed: &crate::identity::test_helpers::SignedAgentPresentation,
+        response: &JsonValue,
+    ) -> (
+        Result<Option<ResponsePresentation>, AnswerIdentityRefusal>,
+        Vec<crate::delegation_vault::audit::DelegationAuditEvent>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let (manager, gateway_id, _issuer_dir) = manager_with_peer(root.path(), &signed.issuer_did).await;
+        let body = response.to_string();
+        let surface = mcp_surface();
+        let facts = facts();
+        crate::audit::producer::capture(check_answer_identity(AnswerIdentityCheck {
+            response_body: &body,
+            surface: &surface,
+            vc_issuer: Some(&signed.issuer),
+            listener_manager: Some(manager),
+            gateway_id: &gateway_id,
+            recipient_did: Some("did:example:local-cp"),
+            facts: &facts,
+            caller: None,
+        }))
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_mcp_answer_addressed_to_the_calling_connection_point_is_attributed() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation_bound_to("did:example:local-cp").await;
+        for key in [CREDENTIAL_URI, crate::config::MCP_AGENT_IDENTITY_CREDENTIAL_KEY] {
+            let response = mcp_answer(
+                key,
+                json!({ "verifiablePresentation": signed.presentation.to_string(), "did": signed.holder_did }),
+            );
+
+            let (result, events) = checked_mcp_answer(&signed, &response).await;
+
+            match result {
+                Ok(Some(presentation)) => assert_eq!(presentation.agent_did, signed.holder_did, "{key}"),
+                other => panic!("expected an attributed presentation under {key}, got {other:?}"),
+            }
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(
+                        event.event,
+                        crate::delegation_vault::audit::DelegationAuditAction::IdentityBindingVerified { .. }
+                    )),
+                "{key}: {events:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_mcp_answer_addressed_to_another_connection_point_is_refused_as_invalid_and_recorded() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation_bound_to("did:example:other-cp").await;
+        let response = mcp_answer(
+            crate::config::MCP_AGENT_IDENTITY_CREDENTIAL_KEY,
+            json!({ "verifiablePresentation": signed.presentation.to_string(), "did": signed.holder_did }),
+        );
+
+        let (result, events) = checked_mcp_answer(&signed, &response).await;
+
+        assert!(matches!(result, Err(AnswerIdentityRefusal::Invalid(_))), "{result:?}");
+        assert_eq!(failed_outcome(&events), Some(crate::audit::events::IdentityBindingFailure::Invalid));
+    }
+
+    #[tokio::test]
+    async fn an_mcp_answer_without_a_presentation_passes_the_check_unrecorded() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation().await;
+        let response =
+            json!({ "jsonrpc": "2.0", "id": 1, "result": { "content": [], "_meta": { "traceparent": "t" } } });
+
+        let (result, events) = checked_mcp_answer(&signed, &response).await;
+
+        assert_eq!(result, Ok(None));
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stray_params_does_not_hide_a_wrong_recipient_presentation_in_an_mcp_answer() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation_bound_to("did:example:other-cp").await;
+        let mut response = mcp_answer(
+            crate::config::MCP_AGENT_IDENTITY_CREDENTIAL_KEY,
+            json!({ "verifiablePresentation": signed.presentation.to_string(), "did": signed.holder_did }),
+        );
+        response["params"] = json!({});
+
+        let (result, events) = checked_mcp_answer(&signed, &response).await;
+
+        assert!(matches!(result, Err(AnswerIdentityRefusal::Invalid(_))), "{result:?}");
+        assert_eq!(failed_outcome(&events), Some(crate::audit::events::IdentityBindingFailure::Invalid));
+    }
+
+    #[test]
+    fn mcp_answer_credential_refuses_differing_copies_at_top_level_and_in_the_result() {
+        let answer = json!({
+            "_meta": { CREDENTIAL_URI: { "did": "did:example:a" } },
+            "result": { "_meta": { crate::config::MCP_AGENT_IDENTITY_CREDENTIAL_KEY: { "did": "did:example:b" } } }
+        });
+
+        assert!(mcp_answer_credential(&answer).is_err());
+    }
+
+    #[test]
+    fn mcp_answer_credential_refuses_a_canonical_key_and_alias_that_differ_in_one_meta() {
+        let answer = json!({ "result": { "_meta": {
+            CREDENTIAL_URI: { "did": "did:example:a" },
+            crate::config::MCP_AGENT_IDENTITY_CREDENTIAL_KEY: { "did": "did:example:b" }
+        } } });
+
+        assert!(mcp_answer_credential(&answer).is_err());
+    }
+
+    #[test]
+    fn mcp_answer_credential_refuses_a_meta_that_is_not_an_object() {
+        let answer = json!({ "result": { "_meta": "not-an-object" } });
+
+        assert!(mcp_answer_credential(&answer).is_err());
+    }
+
+    #[test]
+    fn mcp_answer_credential_treats_a_null_meta_as_absent() {
+        let answer = json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32603, "message": "x" }, "_meta": null });
+
+        assert_eq!(mcp_answer_credential(&answer), Ok(None));
+    }
+
+    #[test]
+    fn mcp_answer_credential_finds_a_credential_beside_a_null_meta() {
+        let credential = json!({ "did": "did:example:a" });
+        let in_result = json!({ "_meta": null, "result": { "_meta": { CREDENTIAL_URI: credential.clone() } } });
+        let at_top_level = json!({ "_meta": { CREDENTIAL_URI: credential.clone() }, "result": { "_meta": null } });
+
+        assert_eq!(mcp_answer_credential(&in_result), Ok(Some(&credential)));
+        assert_eq!(mcp_answer_credential(&at_top_level), Ok(Some(&credential)));
+    }
+
+    #[test]
+    fn mcp_answer_credential_finds_a_credential_only_in_the_top_level_meta() {
+        let credential = json!({ "did": "did:example:a" });
+        let answer = json!({ "_meta": { CREDENTIAL_URI: credential.clone() }, "result": {} });
+
+        assert_eq!(mcp_answer_credential(&answer), Ok(Some(&credential)));
+    }
+
+    #[test]
+    fn mcp_answer_credential_accepts_identical_copies() {
+        let credential = json!({ "did": "did:example:a" });
+        let answer = json!({
+            "_meta": { CREDENTIAL_URI: credential.clone() },
+            "result": { "_meta": { crate::config::MCP_AGENT_IDENTITY_CREDENTIAL_KEY: credential.clone() } }
+        });
+
+        assert_eq!(mcp_answer_credential(&answer), Ok(Some(&credential)));
+    }
+
+    #[tokio::test]
+    async fn an_mcp_answer_with_a_null_result_and_no_metadata_passes_the_check_unrecorded() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation().await;
+        let response = json!({ "jsonrpc": "2.0", "id": 1, "result": null });
+
+        let (result, events) = checked_mcp_answer(&signed, &response).await;
+
+        assert_eq!(result, Ok(None));
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[tokio::test]

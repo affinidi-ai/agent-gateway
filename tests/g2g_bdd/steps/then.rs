@@ -785,12 +785,17 @@ async fn vp_audit_log_records_answer_identity_under_request_trace_id(
     );
 }
 
-/// The audit outcome for a failed identity binding, as the step names it.
-fn audited_identity_binding_failure(reason: &str) -> &'static str {
+/// The audit outcome for a failed identity binding, as the step names it, and
+/// the text its `error_detail` must contain when the outcome alone does not
+/// say which check refused it.
+fn audited_identity_binding_failure(reason: &str) -> (&'static str, Option<&'static str>) {
     match reason {
-        "no identity presentation was sent" => "absent",
-        "its identity presentation failed verification" => "invalid",
-        "its issuer is not trusted on that connection" => "untrusted",
+        "no identity presentation was sent" => ("absent", None),
+        "its identity presentation failed verification" => ("invalid", None),
+        "its identity presentation is addressed to another Connection Point" => {
+            ("invalid", Some("VP is not addressed to this gateway"))
+        }
+        "its issuer is not trusted on that connection" => ("untrusted", None),
         other => panic!("no audited outcome for the identity binding failure '{other}'"),
     }
 }
@@ -801,12 +806,20 @@ async fn vp_audit_log_of_gateway_records_failed_identity_binding(
     gateway: usize,
     reason: String,
 ) {
-    let outcome = audited_identity_binding_failure(&reason);
+    let (outcome, detail) = audited_identity_binding_failure(&reason);
     let (found, events) = world
         .harness()
         .gw(gateway)
         .admin
-        .wait_for_audit_event(|event| event["event"]["identity_binding_failed"]["outcome"] == outcome)
+        .wait_for_audit_event(|event| {
+            let failed = &event["event"]["identity_binding_failed"];
+            failed["outcome"] == outcome
+                && detail.is_none_or(|detail| {
+                    failed["error_detail"]
+                        .as_str()
+                        .is_some_and(|recorded| recorded.contains(detail))
+                })
+        })
         .await
         .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
     assert!(found, "expected gateway {gateway} to record a failed identity binding because {reason}, got {events:?}");

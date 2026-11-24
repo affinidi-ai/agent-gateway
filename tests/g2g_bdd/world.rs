@@ -24,6 +24,7 @@ use crate::bdd_support::json_rpc::{
 use crate::bdd_support::mcp_consent::{ConsentRequest, exchange_identity_token};
 use crate::bdd_support::oidc::OidcProvider;
 use crate::bdd_support::policies::build_gateway_source_did_allow_policy;
+use crate::bdd_support::presentation_signer::PresentationSigner;
 use crate::harness::multi_gateway::{FabricRouteReadyProbe, GatewayPlan, MultiGatewayHarness};
 
 const AGENTS_PATH: &str = "/v1/agents";
@@ -370,6 +371,9 @@ pub struct G2gWorld {
     /// Identity proofs a managed agent obtained from an earlier forwarded
     /// request, keyed by the managed agent that now presents them.
     pub obtained_identity_proofs: HashMap<String, IdentityBindingProof>,
+    /// The DIDs that sign the identity presentations a Target answers with,
+    /// keyed by the Target; each serves its DID log while the scenario runs.
+    pub target_presentation_signers: HashMap<String, PresentationSigner>,
     /// Outcome of the last MCP conformance suite run.
     pub conformance_run: Option<ConformanceRun>,
     /// Requests sent over one Legacy SSE session, each with the SSE reply
@@ -437,6 +441,7 @@ impl G2gWorld {
             remote_gateway_records: HashMap::new(),
             issuer_request_result: None,
             obtained_identity_proofs: HashMap::new(),
+            target_presentation_signers: HashMap::new(),
             conformance_run: None,
             legacy_sse_exchange: Vec::new(),
             named_mediators: HashMap::new(),

@@ -28,7 +28,15 @@ changes:
       description: >-
         The identity presentation on an answer sent back over Fabric now names the calling
         gateway's Connection Point, and the calling gateway refuses an answer whose presentation
-        names another recipient with `502`, recorded as an `invalid` identity binding.
+        names another recipient with `502`, recorded as an `invalid` identity binding. The
+        calling gateway now also checks the presentation in an MCP answer's `result._meta` or
+        top-level `_meta`, which it did not check before, as it does on A2A answers: an MCP answer whose
+        presentation fails verification, is addressed to another recipient, or comes from an
+        issuer the connection does not trust is refused with `502`. This includes a Managed
+        Agent's own credential passed through when the paired gateway adds none (its surface
+        has no managed identity, or the result is not complete). On an MCP surface that takes
+        the agent's identity from the payload, a verified presentation now supplies that
+        identity.
   added:
     - timestamp: '2026-11-24T00:00:00Z'
       title: Let a Remote gateway connection refuse relayed identity presentations

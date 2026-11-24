@@ -1,7 +1,7 @@
 use cucumber::{given, when};
 use serde_json::{Value, json};
 
-use crate::bdd_support::presentation_signer::PresentationSigner;
+use crate::bdd_support::presentation_signer::{PresentationSigner, ProofTimes};
 use crate::steps::when::send_json_request_and_record;
 use crate::world::{RequestPolicyFixture, SurfaceWorld};
 
@@ -73,6 +73,11 @@ async fn caller_lists_key_for_authentication_only(world: &mut SurfaceWorld) {
     world.presentation_signer = Some(PresentationSigner::publish(&["authentication"]).await);
 }
 
+#[given("the caller's DID document lists its key for assertions and authentication")]
+async fn caller_lists_key_for_assertions_and_authentication(world: &mut SurfaceWorld) {
+    world.presentation_signer = Some(PresentationSigner::publish(&["authentication", "assertionMethod"]).await);
+}
+
 #[given("the caller has since listed its key for assertions in its DID document")]
 async fn caller_lists_key_for_assertions(world: &mut SurfaceWorld) {
     presentation_signer(world)
@@ -104,6 +109,32 @@ async fn gateway_accepted_presentation_of_credential_from_another_issuer(world: 
 async fn caller_sends_presentation_of_own_credential(world: &mut SurfaceWorld) {
     let presentation = presentation_signer(world)
         .present_own_credential()
+        .await;
+    send_presentation(world, presentation).await;
+}
+
+#[when(
+    expr = "the caller sends a request with a presentation of a credential it issued itself that expires in {int} minutes"
+)]
+async fn caller_sends_presentation_expiring_in(
+    world: &mut SurfaceWorld,
+    minutes: i64,
+) {
+    let presentation = presentation_signer(world)
+        .present_own_credential_with(ProofTimes::ExpiresIn(chrono::Duration::minutes(minutes)))
+        .await;
+    send_presentation(world, presentation).await;
+}
+
+#[when(
+    expr = "the caller sends a request with a presentation of a credential it issued itself, created {int} minutes ahead and without an expiry"
+)]
+async fn caller_sends_presentation_created_ahead(
+    world: &mut SurfaceWorld,
+    minutes: i64,
+) {
+    let presentation = presentation_signer(world)
+        .present_own_credential_with(ProofTimes::CreatedInWithoutExpiry(chrono::Duration::minutes(minutes)))
         .await;
     send_presentation(world, presentation).await;
 }

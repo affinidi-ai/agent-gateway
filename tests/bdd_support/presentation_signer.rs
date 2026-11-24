@@ -26,6 +26,15 @@ const CREDENTIALS_V2: &str = "https://www.w3.org/ns/credentials/v2";
 /// The verification methods a signature resolves, the signer, and the proof options.
 type ProofSetup = (HashMap<IriBuf, AnyMethod>, LocalSigner<SingleSecretSigner<JWK>>, AnyInputOptions);
 
+/// The times a presentation's proof carries.
+#[derive(Debug, Clone, Copy)]
+pub enum ProofTimes {
+    /// Created now, expiring after the given time.
+    ExpiresIn(Duration),
+    /// Created the given time from now, with no `expires`.
+    CreatedInWithoutExpiry(Duration),
+}
+
 /// A party that signs credentials and presentations with one Ed25519 key.
 struct SigningKey {
     did: String,
@@ -65,6 +74,26 @@ impl SigningKey {
         &self,
         credentials: Vec<Value>,
     ) -> Value {
+        self.sign_presentation_with(credentials, ProofTimes::ExpiresIn(Duration::minutes(5)))
+            .await
+    }
+
+    async fn sign_presentation_with(
+        &self,
+        credentials: Vec<Value>,
+        times: ProofTimes,
+    ) -> Value {
+        self.sign_presentation_for(credentials, times, None)
+            .await
+    }
+
+    /// A presentation whose proof carries `times` and, when given, names `domain` as its audience.
+    async fn sign_presentation_for(
+        &self,
+        credentials: Vec<Value>,
+        times: ProofTimes,
+        domain: Option<&str>,
+    ) -> Value {
         let presentation = json!({
             "@context": [CREDENTIALS_V2],
             "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
@@ -75,12 +104,18 @@ impl SigningKey {
         let presentation: vc::v2::syntax::JsonPresentation =
             serde_json::from_value(presentation).expect("the presentation is a v2 presentation");
         let (methods, signer, mut options) = self.signing_parts(ProofPurpose::Authentication);
-        let expires = (Utc::now() + Duration::minutes(5)).to_rfc3339();
-        options.expires = Some(
-            expires
+        let rfc3339 = |time: chrono::DateTime<Utc>| {
+            time.to_rfc3339()
                 .parse()
-                .expect("an RFC 3339 time"),
-        );
+                .expect("an RFC 3339 time")
+        };
+        match times {
+            ProofTimes::ExpiresIn(lifetime) => options.expires = Some(rfc3339(Utc::now() + lifetime)),
+            ProofTimes::CreatedInWithoutExpiry(ahead) => options.created = Some(rfc3339(Utc::now() + ahead)),
+        }
+        if let Some(domain) = domain {
+            options.domains = vec![domain.to_string()];
+        }
         let signed = AnySuite::EdDsaRdfc2022
             .sign_with(SignatureEnvironment::default(), presentation, &methods, signer, options, Default::default())
             .await
@@ -311,12 +346,35 @@ impl PresentationSigner {
 
     /// A presentation signed by this caller for authentication, of a credential it issued to itself.
     pub async fn present_own_credential(&self) -> Value {
+        self.present_own_credential_with(ProofTimes::ExpiresIn(Duration::minutes(5)))
+            .await
+    }
+
+    /// A [`Self::present_own_credential`] whose proof carries `times`.
+    pub async fn present_own_credential_with(
+        &self,
+        times: ProofTimes,
+    ) -> Value {
         let credential = self
             .signer
             .sign_credential(&self.signer.did)
             .await;
         self.signer
-            .sign_presentation(vec![credential])
+            .sign_presentation_with(vec![credential], times)
+            .await
+    }
+
+    /// A [`Self::present_own_credential`] whose proof names `domain` as its audience.
+    pub async fn present_own_credential_addressed_to(
+        &self,
+        domain: &str,
+    ) -> Value {
+        let credential = self
+            .signer
+            .sign_credential(&self.signer.did)
+            .await;
+        self.signer
+            .sign_presentation_for(vec![credential], ProofTimes::ExpiresIn(Duration::minutes(5)), Some(domain))
             .await
     }
 

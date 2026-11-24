@@ -989,20 +989,49 @@ pub async fn gateway_trusts_issuer_on_connection(
         .self_gateway_did(issuer_gw)
         .await
         .unwrap_or_else(|error| panic!("{error:#}"));
+    trust_issuer_on_connection(world, gw_index, &issuer_did, connection_gw).await;
+}
+
+#[given(
+    expr = "gateway {int} trusts the issuer of the identity presentation of MCP server {string} on its connection with gateway {int}"
+)]
+pub async fn gateway_trusts_mcp_server_presentation_issuer_on_connection(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    server_name: String,
+    connection_gw: usize,
+) {
+    let issuer_did = world
+        .target_presentation_signers
+        .get(&server_name)
+        .unwrap_or_else(|| panic!("MCP server '{server_name}' answers with no identity presentation"))
+        .did()
+        .to_string();
+    world.start().await;
+    trust_issuer_on_connection(world, gw_index, &issuer_did, connection_gw).await;
+}
+
+async fn trust_issuer_on_connection(
+    world: &G2gWorld,
+    gw_index: usize,
+    issuer_did: &str,
+    connection_gw: usize,
+) {
     let remote_id = remote_record_id(world, gw_index, connection_gw);
     let updated = world
         .harness()
         .gw(gw_index)
         .admin
-        .add_trusted_issuer_did(&remote_id, &issuer_did)
+        .add_trusted_issuer_did(&remote_id, issuer_did)
         .await
         .unwrap_or_else(|error| {
-            panic!("trust gateway {issuer_gw}'s DID on gateway {gw_index}'s connection with gateway {connection_gw}: {error:#}")
+            panic!("trust {issuer_did} on gateway {gw_index}'s connection with gateway {connection_gw}: {error:#}")
         });
     assert!(
         updated
             .trusted_issuer_dids
-            .contains(&issuer_did),
+            .iter()
+            .any(|trusted| trusted == issuer_did),
         "gateway {gw_index}'s record for gateway {connection_gw} should list {issuer_did} as a trusted issuer, got {:?}",
         updated.trusted_issuer_dids
     );
@@ -1162,6 +1191,67 @@ pub fn managed_agent_response_contains_agent_identity_extension(
             }
         }),
     );
+}
+
+/// The MCP server's tool result carries its `agent-identity/v1` payload in
+/// `result.metadata`, where the answering gateway reads a Target's identity on
+/// any answer.
+#[given(expr = "MCP server {string} response contains the agent-identity extension")]
+pub fn mcp_server_response_contains_agent_identity_extension(
+    world: &mut G2gWorld,
+    server_name: String,
+) {
+    use crate::bdd_support::json_rpc::AGENT_IDENTITY_EXTENSION_URI as AGENT_IDENTITY_URI;
+    world
+        .topology
+        .actors
+        .expect_target_kind(&server_name, TargetActorKind::McpServer);
+    let mut response = build_mcp_tools_call_response();
+    response["result"]["metadata"] = serde_json::json!({
+        AGENT_IDENTITY_URI: {
+            "softwareInfo": { "name": "mcp-server", "version": "2.0" },
+            "cloudProvider": "local"
+        }
+    });
+    set_target_response(world, &server_name, response);
+}
+
+/// The canonical MCP `_meta` key of an agent identity credential.
+const MCP_AGENT_IDENTITY_CREDENTIAL_KEY: &str = "io.affinidi.fabric/agent-identity-credential";
+
+/// A Connection Point DID no gateway of the scenario holds.
+const ANOTHER_CONNECTION_POINT_DID: &str = "did:example:another-connection-point";
+
+/// The MCP server answers with a presentation of a credential it issued
+/// itself, signed with a DID the harness publishes and addressed to
+/// [`ANOTHER_CONNECTION_POINT_DID`]. No gateway signs it, so the surface in
+/// front of the server must not have managed identity, which would replace it.
+#[given(expr = "MCP server {string} response contains an identity presentation addressed to another Connection Point")]
+pub async fn mcp_server_response_contains_presentation_addressed_elsewhere(
+    world: &mut G2gWorld,
+    server_name: String,
+) {
+    world
+        .topology
+        .actors
+        .expect_target_kind(&server_name, TargetActorKind::McpServer);
+    let signer =
+        crate::bdd_support::presentation_signer::PresentationSigner::publish(&["authentication", "assertionMethod"])
+            .await;
+    let presentation = signer
+        .present_own_credential_addressed_to(ANOTHER_CONNECTION_POINT_DID)
+        .await;
+    let mut response = build_mcp_tools_call_response();
+    response["result"]["_meta"] = serde_json::json!({
+        MCP_AGENT_IDENTITY_CREDENTIAL_KEY: {
+            "did": signer.did(),
+            "verifiablePresentation": presentation.to_string(),
+        }
+    });
+    set_target_response(world, &server_name, response);
+    world
+        .target_presentation_signers
+        .insert(server_name, signer);
 }
 
 fn remote_record_id(

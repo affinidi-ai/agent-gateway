@@ -269,9 +269,13 @@ outcome `invalid`. One whose issuer is not one of the connection's issuers, incl
 cannot be established, also refuses the answer with `502`: the answering agent's DID is not
 stored, and the VP Audit Log records `identity_binding_failed` with outcome `untrusted`. A verified
 one records `identity_binding_verified` and the received presentation (`vp_injected`, detail
-`response_path_fabric_received`), both with `via_fabric: true` and the request's trace id. Answers
-to a Transit Point over Fabric, to MCP requests over Fabric, and agent cards fetched over Fabric
-are not checked.
+`response_path_fabric_received`), both with `via_fabric: true` and the request's trace id. On an
+A2A answer the calling gateway reads the presentation from the status message; on an MCP answer,
+from the credential in `result._meta` or the top-level `_meta`
+(`io.affinidi.fabric/agent-identity-credential`, or its historical extension URI key). An answer to
+a modern MCP request, which travels on a framed Fabric stream, is checked the same way, message by
+message. Answers to a Transit Point over Fabric and agent cards fetched over Fabric are not
+checked.
 
 Accepted risk: an answer that carries no presentation is not checked. A paired gateway signs one
 only when its surface has a managed identity and it has a VC issuer, so an answer from any other
