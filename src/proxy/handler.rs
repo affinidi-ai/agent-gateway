@@ -3147,7 +3147,16 @@ async fn proxy_charged_request(
                     "Header Metadata Mapping evaluated"
                 );
                 if mapped_count > 0 {
-                    body_bytes = modified_body;
+                    body_bytes = if caller_identified {
+                        modified_body
+                    } else {
+                        strip_caller_identity_proofs(
+                            &modified_body,
+                            &state
+                                .surface
+                                .channel_protocol(),
+                        )
+                    };
                 }
             }
             Err(e) => {

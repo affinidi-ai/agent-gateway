@@ -36,6 +36,9 @@ pub struct SurfaceConfigBuilder {
     pub jwt_claim_inbound_identity: bool,
     /// The inbound identity is the API key the caller presents (`from_api_key`).
     pub api_key_inbound_identity: bool,
+    /// The Access Point maps this caller header into the identity binding
+    /// extension's `verifiablePresentation`.
+    pub identity_binding_header: Option<String>,
     pub target_auth: Option<SurfaceTargetAuthConfig>,
     pub target_auth_provider: Option<SurfaceTargetAuthProviderConfig>,
     pub mcp_tool_policy: Option<McpToolPolicyFixture>,
@@ -271,6 +274,7 @@ impl Default for SurfaceConfigBuilder {
             mcp_inbound_identity_strip_raw: false,
             jwt_claim_inbound_identity: false,
             api_key_inbound_identity: false,
+            identity_binding_header: None,
             target_auth: None,
             target_auth_provider: None,
             mcp_tool_policy: None,

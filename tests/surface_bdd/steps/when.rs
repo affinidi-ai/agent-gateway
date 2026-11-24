@@ -730,6 +730,18 @@ pub(crate) async fn build_new_surface_payload(
             .collect();
         access_point.insert("caller_authentication".to_string(), serde_json::json!({ "methods": methods }));
     }
+    if let Some(header) = &world
+        .surface_config
+        .identity_binding_header
+    {
+        access_point.insert(
+            "header_metadata_mapping".to_string(),
+            serde_json::json!({
+                "extension_uri": AGENT_IDENTITY_BINDING_URI,
+                "headers": [{ "header": header, "field": "verifiablePresentation" }]
+            }),
+        );
+    }
     let inbound = if world
         .surface_config
         .jwt_claim_inbound_identity

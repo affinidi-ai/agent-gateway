@@ -12,7 +12,8 @@ changes:
         callers whose credential failed on a public Access Point, are served with no inbound
         identity: none is derived from their credential or taken from their request body, policy
         input carries no agent DID or trust-registry claims for them, and the identity binding VP
-        and identity credential they put in their request are removed before the Target.
+        and identity credential they put in their request, or that Header Metadata Mapping copies
+        from their headers, are removed before the Target.
   fixed: []
   removed: []
   security:

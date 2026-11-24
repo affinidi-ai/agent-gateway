@@ -3449,6 +3449,16 @@ fn surface_derives_inbound_identity_from_jwt_claim(world: &mut SurfaceWorld) {
         .jwt_claim_inbound_identity = true;
 }
 
+#[given(expr = "the surface maps caller header {string} into the identity binding presentation")]
+fn surface_maps_caller_header_into_the_identity_binding_presentation(
+    world: &mut SurfaceWorld,
+    header: String,
+) {
+    world
+        .surface_config
+        .identity_binding_header = Some(header);
+}
+
 #[given("the surface derives the inbound identity from the API key the caller presents")]
 fn surface_derives_inbound_identity_from_presented_api_key(world: &mut SurfaceWorld) {
     world

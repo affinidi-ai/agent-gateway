@@ -208,8 +208,9 @@ Both identity rules follow from the caller: `from_jwt_claim` needs a verified JW
 or whose credential failed on a public Access Point, is served with no inbound identity, on direct
 requests and Fabric send: none is derived from its credential or taken from its request body,
 `input.agent.did` and the trust-registry claims its body makes are absent from policy input, and
-the identity binding VP and identity credential it puts in its request are removed before the
-Target, in a single request, each request of a batch, or a bare message. The extension URIs that
+the identity binding VP and identity credential it puts in its request, or that Header Metadata
+Mapping copies from its headers, are removed before the Target, in a single request, each request
+of a batch, or a bare message. The extension URIs that
 name them stay, since they also ask for the responding agent's credential, and other metadata the
 caller sends, such as a trust-registry `agent_did`, is forwarded unsigned as it came. A body that
 carries no proof is forwarded byte for byte. Policy tells these callers apart by
