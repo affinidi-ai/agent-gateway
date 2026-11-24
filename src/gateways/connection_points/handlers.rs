@@ -1634,6 +1634,9 @@ pub async fn use_connection_point<S: ConnectionPointStore>(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
 ) -> Result<Json<GatewayConnectionPoint>, (StatusCode, String)> {
+    // Waits for a Continue of this connection point, which rewrites the whole record,
+    // so neither change is lost.
+    let _continuing = crate::gateways::mediator_access::lock(&id).await;
     let (mut connection_point, _) =
         load_user_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, true).await?;
 
@@ -1668,6 +1671,9 @@ pub async fn update_connection_point<S: ConnectionPointStore>(
 ) -> Result<Json<GatewayConnectionPoint>, (StatusCode, String)> {
     info!("Updating connection point: {}", id);
 
+    // Waits for a Continue of this connection point, which rewrites the whole record,
+    // so neither change is lost.
+    let _continuing = crate::gateways::mediator_access::lock(&id).await;
     let (old_connection_point, _gateway) =
         load_user_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, true).await?;
 
@@ -1731,6 +1737,9 @@ pub async fn update_connection_point_exposed_channels<S: ConnectionPointStore>(
 ) -> Result<Json<GatewayConnectionPoint>, (StatusCode, String)> {
     info!("Updating exposed channels for connection point: {}", id);
 
+    // Waits for a Continue of this connection point, which rewrites the whole record,
+    // so neither change is lost.
+    let _continuing = crate::gateways::mediator_access::lock(&id).await;
     let (mut connection_point, gateway) =
         load_user_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, true).await?;
 
@@ -2833,6 +2842,99 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!((stored.name.as_str(), stored.use_count), ("Point", 0));
+    }
+
+    #[tokio::test]
+    async fn an_edit_waits_for_a_continue_of_the_same_connection_point() {
+        use crate::gateways::connection_points::ConnectionPointStore;
+        use crate::gateways::store::GatewayStore;
+        use crate::gateways::types::{Gateway, GatewayType};
+        use axum::Extension;
+        use axum::extract::Path;
+
+        let dir = tempfile::tempdir().unwrap();
+        let gateways = Arc::new(
+            crate::gateways::FileSystemGatewayStore::new(dir.path().join("gateways"), None)
+                .await
+                .unwrap(),
+        );
+        let gateway = Gateway::new("Partner".into(), String::new(), "did:peer:2.partner".into(), GatewayType::Remote);
+        gateways
+            .create(&gateway)
+            .await
+            .unwrap();
+        let points = Arc::new(
+            crate::gateways::connection_points::FileSystemConnectionPointStore::new(dir.path().join("points"))
+                .await
+                .unwrap(),
+        );
+        let paused = connection_point_for(&gateway.id);
+        points
+            .create(&paused)
+            .await
+            .unwrap();
+        let (listener_manager, _listener_dir) = crate::gateways::test_helpers::test_listener_manager(dir.path()).await;
+        let listener_manager = Arc::new(listener_manager);
+
+        let continuing = crate::gateways::mediator_access::lock(&paused.id).await;
+        let used = tokio::spawn(super::use_connection_point(
+            Extension(points.clone()),
+            Extension(gateways.clone()),
+            Path(paused.id.clone()),
+            None,
+            None,
+        ));
+        let updated = tokio::spawn(super::update_connection_point(
+            Extension(points.clone()),
+            Extension(gateways.clone()),
+            Extension(listener_manager),
+            Path(paused.id.clone()),
+            None,
+            None,
+            axum::Json(super::UpdateConnectionPointRequest {
+                name: Some("Renamed".into()),
+                description: None,
+                enabled: None,
+            }),
+        ));
+        let exposed = tokio::spawn(super::update_connection_point_exposed_channels(
+            Extension(points.clone()),
+            Extension(gateways.clone()),
+            Extension(None),
+            Path(paused.id.clone()),
+            None,
+            None,
+            axum::Json(super::UpdateExposedChannelsRequest { exposed_channels: Vec::new() }),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert!(!used.is_finished() && !updated.is_finished() && !exposed.is_finished());
+        let stored = points
+            .get(&paused.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((stored.name.as_str(), stored.use_count), ("CP", 0));
+
+        drop(continuing);
+        let _ = used
+            .await
+            .unwrap()
+            .expect("use after Continue");
+        let _ = updated
+            .await
+            .unwrap()
+            .expect("update after Continue");
+        let _ = exposed
+            .await
+            .unwrap()
+            .expect("exposed surfaces after Continue");
+        let stored = points
+            .get(&paused.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((stored.name.as_str(), stored.use_count), ("Renamed", 1));
     }
 
     #[tokio::test]

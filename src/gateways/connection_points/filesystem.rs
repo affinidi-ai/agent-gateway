@@ -72,11 +72,10 @@ impl FileSystemConnectionPointStore {
     /// `reserved_permanent` or as the `secure_cp_id` an acceptance keeps in its
     /// `oob_message`.
     pub async fn cleanup_orphaned_directories(&self) -> Result<usize> {
-        use tracing::{info, warn};
-
+        // Keys are removed only after every stored record was read: an unreadable one may
+        // name the directory as its reservation.
         let reserved: std::collections::HashSet<String> = self
-            .storage
-            .list_all()
+            .list_all_checked()
             .await?
             .into_iter()
             .flat_map(|point| {
@@ -92,6 +91,16 @@ impl FileSystemConnectionPointStore {
                     .chain(acceptance)
             })
             .collect();
+        self.remove_orphaned_directories(&reserved)
+            .await
+    }
+
+    /// Removes the key directories with no config sibling that no name in `reserved` keeps.
+    async fn remove_orphaned_directories(
+        &self,
+        reserved: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
+        use tracing::{info, warn};
 
         let mut cleaned = 0;
         let mut dir = tokio::fs::read_dir(&self.base_path).await?;
@@ -369,6 +378,66 @@ impl ConnectionPointStore for FileSystemConnectionPointStore {
             .await;
         Ok(())
     }
+
+    async fn create_reserved(
+        &self,
+        connection_point: &GatewayConnectionPoint,
+        reserving_id: &str,
+    ) -> Result<()> {
+        // `delete` holds this lock while it checks for the permanent record and removes
+        // the reservation's keys, so the two cannot interleave.
+        let _reserving = self
+            .lock_id(reserving_id)
+            .await;
+        if self
+            .storage
+            .get(reserving_id)
+            .await?
+            .is_none()
+        {
+            anyhow::bail!("connection point {reserving_id} that reserved this permanent DID was deleted");
+        }
+        self.create(connection_point)
+            .await
+    }
+
+    async fn list_all_checked(&self) -> Result<Vec<GatewayConnectionPoint>> {
+        let points = self.list_all().await?;
+        let listed: std::collections::HashSet<&str> = points
+            .iter()
+            .map(|point| point.id.as_str())
+            .collect();
+        // A record file the cache left out is either unreadable, which is an error
+        // here, or was deleted or added since the list was read.
+        let mut dir = tokio::fs::read_dir(&self.base_path).await?;
+        while let Some(entry) = dir.next_entry().await? {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(id) = name
+                .strip_suffix(".json.enc")
+                .or_else(|| name.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            if !listed.contains(id) {
+                self.storage
+                    .get_checked(id)
+                    .await?;
+            }
+        }
+        Ok(points)
+    }
+
+    async fn list_by_gateway_checked(
+        &self,
+        gateway_id: &str,
+    ) -> Result<Vec<GatewayConnectionPoint>> {
+        let mut points = self
+            .list_all_checked()
+            .await?;
+        points.retain(|point| point.gateway_id == gateway_id);
+        Ok(points)
+    }
 }
 
 #[cfg(test)]
@@ -496,8 +565,10 @@ mod tests {
             .await
             .unwrap();
 
+        // The configs above are placeholders the store cannot read, so the full cleanup
+        // would refuse to run; this checks which directories count as orphans.
         let cleaned = store
-            .cleanup_orphaned_directories()
+            .remove_orphaned_directories(&std::collections::HashSet::new())
             .await
             .unwrap();
 
@@ -1183,6 +1254,118 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reserved_point_is_stored_only_while_its_reserving_point_is() {
+        let dir = TempDir::new().unwrap();
+        let store = FileSystemConnectionPointStore::new(dir.path().join("cps"))
+            .await
+            .unwrap();
+        let mut paused = sample_cp();
+        paused.awaiting_mediator_access = true;
+        paused.reserved_permanent = Some(super::super::types::ReservedPermanent {
+            cp_id: "reserved-cp".to_string(),
+            did: "did:peer:2.reserved".to_string(),
+            mediator_id: "med-1".to_string(),
+            mediator_did: "did:example:mediator".to_string(),
+            consumed: false,
+        });
+        store
+            .create(&paused)
+            .await
+            .unwrap();
+        let mut permanent = sample_cp();
+        permanent.id = "reserved-cp".to_string();
+
+        store
+            .create_reserved(&permanent, &paused.id)
+            .await
+            .expect("stored while the reserving point is");
+        store
+            .delete(&permanent.id)
+            .await
+            .unwrap();
+        store
+            .delete(&paused.id)
+            .await
+            .unwrap();
+
+        store
+            .create_reserved(&permanent, &paused.id)
+            .await
+            .expect_err("its reserving point, and with it the keys, are gone");
+        assert!(
+            store
+                .get(&permanent.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_are_kept_while_a_stored_connection_point_cannot_be_read() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("cps");
+        let store = FileSystemConnectionPointStore::new(base.clone())
+            .await
+            .unwrap();
+        store
+            .create(&sample_cp())
+            .await
+            .unwrap();
+        // An unreadable record may name these keys as its reservation.
+        tokio::fs::write(base.join("unreadable.json"), b"not json")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(base.join("reserved-cp"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .list_all()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .list_all_checked()
+            .await
+            .expect_err("a stored record could not be read");
+        store
+            .list_by_gateway_checked("gw-1")
+            .await
+            .expect_err("the unreadable record may be this gateway's");
+        store
+            .cleanup_orphaned_directories()
+            .await
+            .expect_err("no cleanup without a complete read");
+        assert!(
+            base.join("reserved-cp")
+                .is_dir()
+        );
+
+        tokio::fs::remove_file(base.join("unreadable.json"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .list_all_checked()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .cleanup_orphaned_directories()
+                .await
+                .unwrap(),
+            1
         );
     }
 }

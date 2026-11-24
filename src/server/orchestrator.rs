@@ -5219,7 +5219,7 @@ async fn remove_lapsed_pauses<P: crate::gateways::connection_points::ConnectionP
         }
         // A pause counts as lapsed only after a successful read shows it.
         let points = match cp_store
-            .list_by_gateway(&gateway.id)
+            .list_by_gateway_checked(&gateway.id)
             .await
         {
             Ok(points) => points,
@@ -5299,7 +5299,7 @@ async fn remove_abandoned_pending_gateways<P: crate::gateways::connection_points
         .filter(|gw| gw.is_left_pending_by_an_earlier_run(started_at))
     {
         let points = match cp_store
-            .list_by_gateway(&gateway.id)
+            .list_by_gateway_checked(&gateway.id)
             .await
         {
             Ok(points) => points,
@@ -6733,6 +6733,51 @@ mod startup_sweep_tests {
                 "{id}'s pairing is kept"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_pause_whose_temporary_point_cannot_be_read_is_kept() {
+        let stores = stores().await;
+        let now = Utc::now();
+        let paused = gateway("paused", GatewayStatus::AwaitingMediatorAccess, now - Duration::days(9));
+        stores
+            .gateways
+            .create(&paused)
+            .await
+            .unwrap();
+        stores
+            .pending
+            .store(pending_for(&paused))
+            .await;
+        // Its temporary point is stored, but cannot be read (as one that cannot be decrypted).
+        tokio::fs::write(
+            stores
+                ._dir
+                .path()
+                .join("connection_points")
+                .join("tmp-paused.json"),
+            b"not json",
+        )
+        .await
+        .unwrap();
+
+        remove_lapsed_pauses(&stores.gateways, &stores.points, &stores.pending, now).await;
+
+        assert!(
+            stores
+                .gateways
+                .get("paused")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            stores
+                .pending
+                .get("tmp-paused")
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]

@@ -286,11 +286,17 @@ pub async fn approve_gateway<
         let point_store = cp_store.clone();
         let reserving_id = connection_point.id.clone();
         let store_permanent = async move {
-            point_store
-                .create(&record)
-                .await?;
             if announced_at_pause {
+                // Fails if the reserving connection point was deleted meanwhile, with the
+                // keys of its reservation.
+                point_store
+                    .create_reserved(&record, &reserving_id)
+                    .await?;
                 crate::gateways::mediator_access::mark_reservation_consumed(point_store.as_ref(), &reserving_id).await;
+            } else {
+                point_store
+                    .create(&record)
+                    .await?;
             }
             Ok::<(), anyhow::Error>(())
         };

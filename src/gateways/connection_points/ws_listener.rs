@@ -4392,12 +4392,21 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
         .complete(
             async move {
                 let _held_until_saved = mediator_guard;
-                point_store
-                    .create(&record)
-                    .await?;
-                if let Some(reserving_id) = reserving_id {
-                    crate::gateways::mediator_access::mark_reservation_consumed(point_store.as_ref(), &reserving_id)
-                        .await;
+                match &reserving_id {
+                    // Fails if the reserving point was deleted meanwhile, with the keys
+                    // of its reservation.
+                    Some(reserving_id) => {
+                        point_store
+                            .create_reserved(&record, reserving_id)
+                            .await?;
+                        crate::gateways::mediator_access::mark_reservation_consumed(point_store.as_ref(), reserving_id)
+                            .await;
+                    }
+                    None => {
+                        point_store
+                            .create(&record)
+                            .await?
+                    }
                 }
                 Ok::<(), anyhow::Error>(())
             },

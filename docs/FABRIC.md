@@ -400,13 +400,18 @@ their keys and state on disk, survive a restart, and last until the invitation e
 Connection Point's own expiry, and for an acceptance the invitation's `expires_time`, capped at
 seven days, or seven days without one. The startup cleanup of orphaned key directories keeps the
 keys of a permanent DID minted ahead of the pairing, a reservation or an acceptance's
-`secure_cp_id`, while a stored Connection Point names it. The same expiry
+`secure_cp_id`, while a stored Connection Point names it; while a stored Connection Point cannot
+be read, it removes none. The permanent record is stored only while the Connection Point that
+reserved it still is, so deleting that point during the pairing fails the pairing rather than leave
+the record without keys. The same expiry
 bounds an acceptance's wait for approval, with or without the pause: a `pending` acceptance whose
 temporary Connection Point is unexpired survives a restart, and its listener is started again. The
 startup pass re-reads each Connection Point before it starts the listener, so a pairing that
 finishes during that pass leaves no listener on its deleted temporary Connection Point. A
 restart removes a paused gateway whose invitation has expired, and a `pending` one with no
-unexpired temporary Connection Point; one whose Connection Points cannot be read is kept. `GET …/{id}/mediator-access`
+unexpired temporary Connection Point; while any stored Connection Point cannot be read, both are
+kept. Use, edit and exposed-surfaces changes of a
+paused Connection Point wait for its Continue, as a delete does. `GET …/{id}/mediator-access`
 returns the DIDs of a pause again: their role (`connection_point`, `temporary`, `permanent`), the
 mediator that must admit each (an acceptance also names each one's mediator, since with mediator
 federation its permanent DID sits on its own), and the expiry. Once the invitation has expired,

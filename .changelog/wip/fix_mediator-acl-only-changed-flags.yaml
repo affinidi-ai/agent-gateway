@@ -87,6 +87,32 @@ changes:
         out. The pass now re-reads each Connection Point before starting its listener, skips one
         that is gone or paused, and stops a listener whose Connection Point was deleted while it
         started.
+    - timestamp: '2026-11-24T10:00:00Z'
+      title: Keep a Connection Point edit and a Continue from undoing each other
+      description: >-
+        Use, edit and exposed-surfaces changes of a Connection Point now wait for a Continue of
+        the same point, as a delete already did. Both rewrite the whole record, so an edit made
+        while Continue waited on the mediator could restore the pause, or Continue could undo the
+        edit.
+    - timestamp: '2026-11-24T10:00:00Z'
+      title: Keep a pairing finished as its Connection Point is deleted from losing its keys
+      description: >-
+        Deleting a paused Connection Point removes the keys of the permanent DID it reserved
+        when no record names them. A pairing that stored that permanent record at the same moment
+        could be left without keys. The permanent record is now stored only while the reserving
+        point still is, under the lock its delete holds, so the pairing fails cleanly instead.
+    - timestamp: '2026-11-24T10:00:00Z'
+      title: Keep pauses and reserved keys when a stored Connection Point cannot be read
+      description: >-
+        A Connection Point record that cannot be decrypted is left out of the list. The startup
+        sweeps took that list as complete, so they could remove a paused gateway or the reserved
+        keys that record names. They now keep both until every stored record can be read.
+    - timestamp: '2026-11-24T10:00:00Z'
+      title: Ignore a Continue answer for a pairing the wizard has already left
+      description: >-
+        Switching the dashboard's Connection Point wizard to another paused point, or leaving the
+        Add Gateway step, while a Continue was still running let its late answer move the new
+        pairing to Complete or show the old pairing's refusal. Such an answer is now dropped.
   removed: []
   security:
     - timestamp: '2026-11-20T11:00:00Z'
