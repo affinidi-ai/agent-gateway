@@ -39,7 +39,8 @@ fn event_envelope() -> Value {
     serde_json::json!({
         "event_type": "${EVENT_TYPE}",
         "event_name": "${EVENT_NAME}",
-        "timestamp": "${TIMESTAMP}",
+        "event_id": "${EVENT_ID}",
+        "occurred_at": "${OCCURRED_AT}",
         "appliance_id": "${APPLIANCE_ID}",
         "summary": "${EVENT_SUMMARY}",
         "data": "${EVENT_DATA}"
@@ -103,7 +104,8 @@ pub trait IntegrationPublisher: Send + Sync {
     }
 
     /// Whether the transport takes structured JSON, so a JSON-valued variable alone in a field
-    /// is embedded as JSON. Otherwise it is sent as text.
+    /// is embedded as JSON, and the message is delivered in its delivered form
+    /// ([`crate::integrations::delivery::values::delivered_form`]). Otherwise it is sent as text.
     fn embeds_json(&self) -> bool {
         false
     }

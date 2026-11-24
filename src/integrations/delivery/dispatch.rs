@@ -16,7 +16,7 @@ use tracing::{error, warn};
 
 use super::render::render;
 use super::retry::{is_transient_publish_error, retry_delays};
-use super::values::{Occurrence, event_values};
+use super::values::{Occurrence, delivered_form, event_values};
 use crate::integrations::background_tasks::{TaskShare, spawn_background_task, spawn_background_task_in};
 use crate::integrations::definitions::endpoint::resolve_secret_references;
 use crate::integrations::definitions::{DefinitionStores, Endpoint, EventSet, Integration, Status, definition_stores};
@@ -239,7 +239,10 @@ pub async fn prepare(
         )
         .context("No publisher for the endpoint type")?;
     let template = publisher.complete_template(&route.integration.content);
-    let content = render(&template, values, publisher.escaping(&template), publisher.embeds_json());
+    let mut content = render(&template, values, publisher.escaping(&template), publisher.embeds_json());
+    if publisher.embeds_json() {
+        content = delivered_form(content, values);
+    }
     let configuration = resolve_secret_references(route.endpoint.endpoint_type, &route.endpoint.configuration, secrets)
         .await
         .map_err(|reason| anyhow::anyhow!(reason))?;
@@ -985,6 +988,148 @@ mod tests {
         assert_eq!(received, vec![(Some("evt-7".to_string()), Some(OCCURRED_AT.to_string())); 3]);
     }
 
+    fn evt_7() -> Occurrence {
+        Occurrence::recorded(Some("evt-7".to_string()), OCCURRED_AT.to_string())
+    }
+
+    /// The content `prepare` gives a `gateway.created` event of `occurrence` through an
+    /// endpoint of `endpoint_type` with `template`.
+    async fn delivered(
+        endpoint_type: EndpointType,
+        template: JsonValue,
+        occurrence: &Occurrence,
+    ) -> JsonValue {
+        let endpoint = Endpoint::new("Ops".to_string(), String::new(), endpoint_type, json!({}));
+        let mut integration = integration_for("ops", &endpoint, &set(&["gateway.created"]));
+        integration.content = template;
+        prepare(&Route { integration, endpoint }, &created_gateway_values(occurrence), None)
+            .await
+            .expect("prepares")
+            .1
+            .content
+    }
+
+    const JSON_ENDPOINTS: [EndpointType; 2] = [EndpointType::Webhook, EndpointType::Stream];
+
+    #[tokio::test]
+    async fn the_default_envelope_carries_the_events_id_and_occurrence_time_and_no_timestamp() {
+        for endpoint_type in JSON_ENDPOINTS {
+            let content = delivered(endpoint_type, json!({}), &evt_7()).await;
+
+            assert_eq!(
+                content,
+                json!({
+                    "event_type": "gateway.created",
+                    "event_name": "Gateway Created",
+                    "event_id": "evt-7",
+                    "occurred_at": OCCURRED_AT,
+                    "appliance_id": "",
+                    "summary": "Gateway edge was created",
+                    "data": {"gateway_name": "edge"}
+                }),
+                "{endpoint_type:?}"
+            );
+            let keys: Vec<&String> = content
+                .as_object()
+                .expect("an object")
+                .keys()
+                .collect();
+            assert_eq!(
+                keys,
+                ["event_type", "event_name", "event_id", "occurred_at", "appliance_id", "summary", "data"],
+                "{endpoint_type:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_watchs_saved_template_is_delivered_with_its_event_id_and_occurrence_time_and_no_timestamp() {
+        let saved = json!({
+            "event_type": "${EVENT_TYPE}",
+            "timestamp": "${TIMESTAMP}",
+            "appliance_id": "${APPLIANCE_ID}",
+            "record": "${EVENT_DATA}"
+        });
+        for endpoint_type in JSON_ENDPOINTS {
+            assert_eq!(
+                delivered(endpoint_type, saved.clone(), &evt_7()).await,
+                json!({
+                    "event_type": "gateway.created",
+                    "appliance_id": "",
+                    "record": {"gateway_name": "edge"},
+                    "event_id": "evt-7",
+                    "occurred_at": OCCURRED_AT
+                }),
+                "{endpoint_type:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_template_cannot_write_the_top_level_event_id_or_occurrence_time() {
+        let forging = json!({
+            "event_id": "forged",
+            "occurred_at": "${EVENT_DATA}",
+            "${EVENT_ID}": "${OCCURRED_AT}",
+            "note": "${EVENT_SUMMARY}"
+        });
+        for endpoint_type in JSON_ENDPOINTS {
+            assert_eq!(
+                delivered(endpoint_type, forging.clone(), &evt_7()).await,
+                json!({
+                    "event_id": "evt-7",
+                    "occurred_at": OCCURRED_AT,
+                    "${EVENT_ID}": OCCURRED_AT,
+                    "note": "Gateway edge was created"
+                }),
+                "{endpoint_type:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_nested_timestamp_is_left_alone_and_renders_the_occurrence_time() {
+        let nested = json!({"meta": {"timestamp": "${TIMESTAMP}", "event_id": "theirs"}});
+        for endpoint_type in JSON_ENDPOINTS {
+            assert_eq!(
+                delivered(endpoint_type, nested.clone(), &evt_7()).await,
+                json!({
+                    "meta": {"timestamp": OCCURRED_AT, "event_id": "theirs"},
+                    "event_id": "evt-7",
+                    "occurred_at": OCCURRED_AT
+                }),
+                "{endpoint_type:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_event_without_an_id_is_delivered_without_an_event_id() {
+        let without_id = Occurrence::recorded(None, OCCURRED_AT.to_string());
+        for endpoint_type in JSON_ENDPOINTS {
+            assert_eq!(
+                delivered(endpoint_type, json!({"event_id": "forged", "type": "${EVENT_TYPE}"}), &without_id).await,
+                json!({"type": "gateway.created", "occurred_at": OCCURRED_AT}),
+                "{endpoint_type:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn slack_and_email_messages_are_sent_as_rendered() {
+        let slack = json!({"text": "${EVENT_SUMMARY}", "timestamp": "${TIMESTAMP}"});
+        let email = json!({"subject": "${EVENT_NAME}", "body": "at ${TIMESTAMP}"});
+
+        assert_eq!(
+            delivered(EndpointType::Slack, slack, &evt_7()).await,
+            json!({"text": "Gateway edge was created", "timestamp": OCCURRED_AT})
+        );
+        assert_eq!(
+            delivered(EndpointType::Email, email, &evt_7()).await,
+            json!({"subject": "Gateway Created", "body": format!("at {OCCURRED_AT}"), "format": "plain"})
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn every_retry_sends_the_message_rendered_once_with_its_event_id_and_time() {
         let endpoint = Endpoint::new("Ops".to_string(), String::new(), EndpointType::Stream, json!({}));
@@ -1013,7 +1158,10 @@ mod tests {
         let sent = sent
             .into_inner()
             .expect("sent");
-        assert_eq!(sent, vec![json!({"id": "evt-7", "at": OCCURRED_AT}); 3]);
+        assert_eq!(
+            sent,
+            vec![json!({"id": "evt-7", "at": OCCURRED_AT, "event_id": "evt-7", "occurred_at": OCCURRED_AT}); 3]
+        );
     }
 
     #[test]

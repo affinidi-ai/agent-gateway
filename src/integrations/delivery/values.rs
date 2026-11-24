@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
+use serde_json::Value as JsonValue;
 
 use super::render::{Escaping, render};
 use crate::delegation_vault::audit::new_event_id;
@@ -51,6 +52,29 @@ impl Occurrence {
         values.insert("OCCURRED_AT".to_string(), self.occurred_at.clone());
         values.insert("TIMESTAMP".to_string(), self.occurred_at.clone());
     }
+}
+
+/// `content` as a webhook or stream delivers it: at its top level `event_id` and `occurred_at`
+/// are the event's, whatever the template wrote there, with no `event_id` for an event without
+/// one, and there is no `timestamp`. Nested keys are left as rendered, and so is content that
+/// is not an object.
+pub fn delivered_form(
+    content: JsonValue,
+    values: &HashMap<String, String>,
+) -> JsonValue {
+    let JsonValue::Object(mut fields) = content else {
+        return content;
+    };
+    fields.retain(|name, _| name != "timestamp");
+    for (key, variable) in [("event_id", "EVENT_ID"), ("occurred_at", "OCCURRED_AT")] {
+        match values.get(variable) {
+            Some(value) => {
+                fields.insert(key.to_string(), JsonValue::String(value.clone()));
+            }
+            None => fields.retain(|name, _| name != key),
+        }
+    }
+    JsonValue::Object(fields)
 }
 
 /// What a delivery of `event` fills: the values its trigger supplied for the event's own
@@ -288,6 +312,16 @@ mod tests {
             (value(&values, "EVENT_ID"), value(&values, "OCCURRED_AT"), value(&values, "TIMESTAMP")),
             (Some("evt-1"), Some(OCCURRED_AT), Some(OCCURRED_AT))
         );
+    }
+
+    #[test]
+    fn content_that_is_not_an_object_is_delivered_as_rendered() {
+        let mut values = HashMap::new();
+        occurrence().fill(&mut values);
+
+        for content in [serde_json::json!(["a"]), serde_json::json!("text"), serde_json::Value::Null] {
+            assert_eq!(delivered_form(content.clone(), &values), content);
+        }
     }
 
     #[test]

@@ -104,11 +104,11 @@ impl IntegrationPublisher for WebhookPublisher {
             "PATCH" => client.patch(url),
             method => return Err(anyhow::anyhow!("Unsupported HTTP method: {}", method)),
         };
-        let body = serde_json::to_string(&message.content).context("Failed to serialize payload")?;
         let timestamp = chrono::Utc::now()
             .timestamp()
             .to_string();
-        request = request.headers(request_headers(configuration, &timestamp, &body)?);
+        let (headers, body) = signed_request(configuration, message, &timestamp)?;
+        request = request.headers(headers);
         let response = request
             .body(body)
             .send()
@@ -142,6 +142,17 @@ pub(crate) fn reserved_header(name: &str) -> bool {
             .to_ascii_lowercase()
             .as_str(),
     )
+}
+
+/// The headers and body of one delivery of `message`: the body is the message as sent, and the
+/// signature covers that body.
+fn signed_request(
+    configuration: &Value,
+    message: &Message,
+    timestamp: &str,
+) -> Result<(HeaderMap, String)> {
+    let body = serde_json::to_string(&message.content).context("Failed to serialize payload")?;
+    Ok((request_headers(configuration, timestamp, &body)?, body))
 }
 
 /// The headers of one delivery: the configured ones first, then the reserved ones, each set
@@ -207,7 +218,8 @@ mod tests {
                 json!({
                     "event_type": "${EVENT_TYPE}",
                     "event_name": "${EVENT_NAME}",
-                    "timestamp": "${TIMESTAMP}",
+                    "event_id": "${EVENT_ID}",
+                    "occurred_at": "${OCCURRED_AT}",
                     "appliance_id": "${APPLIANCE_ID}",
                     "summary": "${EVENT_SUMMARY}",
                     "data": "${EVENT_DATA}"
@@ -337,6 +349,38 @@ mod tests {
             WebhookPublisher
                 .validate_config(&json!({"url": URL, "method": "patch"}))
                 .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_signature_covers_the_body_as_delivered() {
+        use crate::integrations::definitions::{EndpointType, Integration};
+        use crate::integrations::delivery::dispatch::{Route, prepare};
+        use crate::integrations::delivery::values::{Occurrence, event_values};
+        let endpoint = crate::integrations::definitions::Endpoint::new(
+            "Ops".to_string(),
+            String::new(),
+            EndpointType::Webhook,
+            json!({"url": URL, "signing_secret": "s3cr3t"}),
+        );
+        let integration =
+            Integration::new("Ops".to_string(), String::new(), endpoint.id.clone(), String::new(), json!({}));
+        let occurrence = Occurrence::recorded(Some("evt-7".to_string()), "2026-11-24T10:00:00+00:00".to_string());
+        let event = crate::integrations::events::find_event("gateway.created").expect("catalog event");
+        let event_values = event_values(event, &occurrence, std::collections::HashMap::new(), None);
+        let (configuration, message) = prepare(&Route { integration, endpoint }, &event_values, None)
+            .await
+            .expect("prepares");
+
+        let (headers, body) = signed_request(&configuration, &message, "1700000000").expect("signs");
+
+        let sent: Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!((sent.get("event_id"), sent.get("timestamp")), (Some(&json!("evt-7")), None));
+        assert_eq!(
+            values(&headers, "x-webhook-signature-256"),
+            [signature("s3cr3t", "1700000000", &body)
+                .expect("signs")
+                .as_str()]
         );
     }
 
