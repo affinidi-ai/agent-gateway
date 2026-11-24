@@ -5016,6 +5016,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_delegation_audit_record_is_answered_with_occurred_at_whichever_name_it_was_stored_under() {
+        use crate::delegation_vault::audit::{DelegationAuditAction, audit_event};
+        use crate::delegation_vault::test_support::{OLD_ROW, OLD_ROW_TIME, audit_log_holding, times_of};
+        let directory = tempfile::tempdir().unwrap();
+        let written = audit_event(DelegationAuditAction::TokenInjected, None, None, Some("cp-global"), None);
+        let log = audit_log_holding(directory.path(), &[OLD_ROW], &written);
+        let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;
+
+        let (status, page) = audit_page(app, "/api/v1/delegation-audit", &log).await;
+
+        assert_eq!(status, StatusCode::OK.as_u16(), "{page}");
+        assert_eq!(
+            times_of(&page),
+            [(Some(&serde_json::json!(written.occurred_at)), None), (Some(&serde_json::json!(OLD_ROW_TIME)), None)],
+            "newest first; the stored rows are not rewritten"
+        );
+        assert_eq!(page["dropped_records"], 0, "{page}");
+    }
+
+    #[tokio::test]
     async fn a_token_scoped_by_required_headers_alone_reads_no_delegation_audit_record() {
         let directory = tempfile::tempdir().unwrap();
         let log = audit_log_of_two_tenants(directory.path()).await;

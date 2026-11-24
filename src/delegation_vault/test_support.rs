@@ -74,6 +74,45 @@ pub(crate) async fn audit_log_of_two_tenants(directory: &std::path::Path) -> std
     path
 }
 
+/// When [`OLD_ROW`] occurred.
+pub(crate) const OLD_ROW_TIME: &str = "2026-11-07T10:00:00Z";
+
+/// A record as releases before `occurred_at` stored it: its time under
+/// `timestamp`, and no event id.
+pub(crate) const OLD_ROW: &str =
+    r#"{"timestamp":"2026-11-07T10:00:00Z","event":"consent_granted","provider_id":"cp-global","via_fabric":false}"#;
+
+/// A line naming its time under both names, which no release writes.
+pub(crate) const ROW_WITH_BOTH_TIMES: &str = r#"{"timestamp":"2026-11-07T10:00:00Z","occurred_at":"2026-11-07T11:00:00Z","event":"token_revoked","via_fabric":false}"#;
+
+/// A VP Audit Log in `directory` holding the `stored` lines, oldest first,
+/// then `written` as the gateway writes it.
+pub(crate) fn audit_log_holding(
+    directory: &std::path::Path,
+    stored: &[&str],
+    written: &super::audit::DelegationAuditEvent,
+) -> std::path::PathBuf {
+    let path = directory.join("delegation-audit.jsonl");
+    let lines: String = stored
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .chain([serde_json::to_string(written).unwrap() + "\n"])
+        .collect();
+    std::fs::write(&path, lines).unwrap();
+    path
+}
+
+/// The `occurred_at` and `timestamp` of each record of an audit page, as
+/// answered.
+pub(crate) fn times_of(page: &serde_json::Value) -> Vec<(Option<&serde_json::Value>, Option<&serde_json::Value>)> {
+    page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| (event.get("occurred_at"), event.get("timestamp")))
+        .collect()
+}
+
 /// Credential providers held in memory: `cp-a` of `tenant-a`, `cp-b` of
 /// `tenant-b` and the appliance-wide `cp-global`, all with the slug `github`;
 /// or a store that cannot be read.

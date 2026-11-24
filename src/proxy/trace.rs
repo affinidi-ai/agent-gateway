@@ -1378,7 +1378,7 @@ mod tests {
     }
 
     /// Where each vector group is run, or why Gateway does not run it.
-    const VECTOR_GROUPS: [(&str, &str); 15] = [
+    const VECTOR_GROUPS: [(&str, &str); 17] = [
         ("trace_id", "run here"),
         ("span_id", "run here"),
         ("traceparent_parse", "run here"),
@@ -1394,12 +1394,20 @@ mod tests {
         ("link", "not Gateway's: Agent Watch follows links"),
         ("caller_identity_verified", "not Gateway's: Agent Stream writes it"),
         ("caller_key", "not Gateway's: Agent Watch builds caller keys"),
+        (
+            "delivery_event_id",
+            "Agent Watch's reading of deliveries; Gateway's delivered form is pinned in integrations::delivery::dispatch",
+        ),
+        (
+            "delivery_occurred_at",
+            "Agent Watch's reading of deliveries; Gateway's delivered form is pinned in integrations::delivery::dispatch",
+        ),
     ];
 
     #[test]
     fn every_vector_group_is_run_or_named_and_the_version_is_pinned() {
         let vectors = vectors();
-        assert_eq!(vectors["version"], 6, "the vectors version this gateway is tested against");
+        assert_eq!(vectors["version"], 7, "the vectors version this gateway is tested against");
         let groups = vectors["groups"]
             .as_object()
             .unwrap();
@@ -1412,7 +1420,7 @@ mod tests {
                     .len()
             })
             .sum();
-        assert_eq!(cases, 162, "the case count of vectors version 6");
+        assert_eq!(cases, 195, "the case count of vectors version 7");
         let mut named: Vec<&str> = VECTOR_GROUPS
             .iter()
             .map(|(group, _)| *group)

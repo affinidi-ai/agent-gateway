@@ -233,6 +233,49 @@ mod tests {
         assert_eq!((response.history_bytes, response.dropped_records), (0, 0), "and it says nothing of the log");
     }
 
+    async fn appliance_wide_page_of(log: std::path::PathBuf) -> serde_json::Value {
+        let query = serde_json::from_value(serde_json::json!({})).unwrap();
+        let caller = reader(None, None, None);
+        let Json(page) =
+            reading_audit_log_from(log, audit_log_page(Some(&InMemoryProviders::unreadable()), &caller, query))
+                .await
+                .expect("a page is answered with 200");
+        serde_json::to_value(page).unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_record_is_answered_with_occurred_at_whichever_name_it_was_stored_under() {
+        use crate::delegation_vault::audit::{DelegationAuditAction, audit_event};
+        use crate::delegation_vault::test_support::{OLD_ROW, OLD_ROW_TIME, audit_log_holding, times_of};
+        let directory = tempfile::tempdir().unwrap();
+        let written = audit_event(DelegationAuditAction::TokenInjected, None, None, Some("cp-global"), None);
+
+        let page = appliance_wide_page_of(audit_log_holding(directory.path(), &[OLD_ROW], &written)).await;
+
+        assert_eq!(
+            times_of(&page),
+            [(Some(&serde_json::json!(written.occurred_at)), None), (Some(&serde_json::json!(OLD_ROW_TIME)), None)],
+            "newest first; the stored rows are not rewritten"
+        );
+        assert_eq!(page["dropped_records"], 0, "{page}");
+    }
+
+    #[tokio::test]
+    async fn a_line_naming_its_time_twice_is_counted_as_unreadable() {
+        use crate::delegation_vault::audit::{DelegationAuditAction, audit_event};
+        use crate::delegation_vault::test_support::{ROW_WITH_BOTH_TIMES, audit_log_holding};
+        let directory = tempfile::tempdir().unwrap();
+        let written = audit_event(DelegationAuditAction::TokenInjected, None, None, Some("cp-global"), None);
+
+        let page = appliance_wide_page_of(audit_log_holding(directory.path(), &[ROW_WITH_BOTH_TIMES], &written)).await;
+
+        assert_eq!(
+            (&page["total"], &page["dropped_records"]),
+            (&serde_json::json!(1), &serde_json::json!(1)),
+            "{page}"
+        );
+    }
+
     #[test]
     fn a_read_that_failed_is_answered_with_an_error_not_an_empty_page() {
         let (status, Json(body)) = respond(Err(anyhow::anyhow!("Audit logger not initialized")))

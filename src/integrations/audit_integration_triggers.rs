@@ -143,7 +143,7 @@ impl AuditDelivery {
 
     /// The record's values, as the event it records: its id and the time it was recorded.
     pub(crate) fn from_event(event: &DelegationAuditEvent) -> Self {
-        let occurrence = Occurrence::recorded(event.event_id.clone(), event.timestamp.clone());
+        let occurrence = Occurrence::recorded(event.event_id.clone(), event.occurred_at.clone());
         let mut variables = audit_variables(event);
         let values = match find_event(&audit_event_type(event)) {
             Some(catalog_event) => event_values(
@@ -333,7 +333,7 @@ mod tests {
         };
         assert_eq!(
             (value("EVENT_ID"), value("OCCURRED_AT"), value("TIMESTAMP")),
-            (event.event_id.clone(), Some(event.timestamp.clone()), Some(event.timestamp.clone()))
+            (event.event_id.clone(), Some(event.occurred_at.clone()), Some(event.occurred_at.clone()))
         );
         let record: serde_json::Value = serde_json::from_str(&delivery.values()["AUDIT_RECORD"]).unwrap();
         assert_eq!(record, serde_json::to_value(&event).unwrap(), "the record is the VP Audit Log row");

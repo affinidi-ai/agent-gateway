@@ -999,10 +999,20 @@ mod tests {
         template: JsonValue,
         occurrence: &Occurrence,
     ) -> JsonValue {
+        delivered_with(endpoint_type, template, &created_gateway_values(occurrence)).await
+    }
+
+    /// The content `prepare` gives `values` through an endpoint of `endpoint_type` with
+    /// `template`.
+    async fn delivered_with(
+        endpoint_type: EndpointType,
+        template: JsonValue,
+        values: &HashMap<String, String>,
+    ) -> JsonValue {
         let endpoint = Endpoint::new("Ops".to_string(), String::new(), endpoint_type, json!({}));
         let mut integration = integration_for("ops", &endpoint, &set(&["gateway.created"]));
         integration.content = template;
-        prepare(&Route { integration, endpoint }, &created_gateway_values(occurrence), None)
+        prepare(&Route { integration, endpoint }, values, None)
             .await
             .expect("prepares")
             .1
@@ -1062,6 +1072,41 @@ mod tests {
                 }),
                 "{endpoint_type:?}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delivered_audit_records_event_id_and_occurrence_time_are_the_deliverys_and_it_has_no_timestamp() {
+        use crate::delegation_vault::audit::{DelegationAuditAction, audit_event};
+        use crate::integrations::audit_integration_triggers::AuditDelivery;
+        let record = audit_event(DelegationAuditAction::ConsentGranted, None, None, Some("cp-1"), Some("surface-1"));
+        let values = AuditDelivery::from_event(&record)
+            .values()
+            .clone();
+        let templates = [
+            ("data", json!({})),
+            (
+                "record",
+                json!({"event_type": "${EVENT_TYPE}", "appliance_id": "${APPLIANCE_ID}", "record": "${EVENT_DATA}"}),
+            ),
+            ("audit_record", json!({"audit_record": "${AUDIT_RECORD}"})),
+        ];
+        for endpoint_type in JSON_ENDPOINTS {
+            for (key, template) in &templates {
+                let content = delivered_with(endpoint_type, template.clone(), &values).await;
+
+                let embedded = &content[key];
+                assert_eq!(
+                    (&embedded["event_id"], &embedded["occurred_at"], embedded.get("timestamp")),
+                    (&content["event_id"], &content["occurred_at"], None),
+                    "{endpoint_type:?} {key}: {content}"
+                );
+                assert_eq!(
+                    (&content["event_id"], &content["occurred_at"]),
+                    (&json!(record.event_id), &json!(record.occurred_at)),
+                    "{endpoint_type:?} {key}"
+                );
+            }
         }
     }
 

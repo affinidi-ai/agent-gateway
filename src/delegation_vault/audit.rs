@@ -175,8 +175,11 @@ pub struct DelegationAuditEvent {
     /// delivered again. Absent on records stored before it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
-    /// ISO-8601 timestamp
-    pub timestamp: String,
+    /// When the event happened, RFC 3339. A record stored before this field
+    /// had its name holds it under `timestamp`, read here and never rewritten;
+    /// a line holding both names is not read as a record.
+    #[serde(alias = "timestamp")]
+    pub occurred_at: String,
     /// The type of audit event
     pub event: DelegationAuditAction,
     /// Agent endpoint used as vault namespace key (equals target_endpoint)
@@ -1371,7 +1374,7 @@ pub fn audit_event(
 ) -> DelegationAuditEvent {
     DelegationAuditEvent {
         event_id: new_event_id(),
-        timestamp: Utc::now().to_rfc3339(),
+        occurred_at: Utc::now().to_rfc3339(),
         event: action,
         agent_did: agent_did.map(String::from),
         agent_identity_did: None,
@@ -2584,7 +2587,7 @@ pub fn audit_policy_decision(
 ) {
     emit("policy_decision", || DelegationAuditEvent {
         event_id: new_event_id(),
-        timestamp: Utc::now().to_rfc3339(),
+        occurred_at: Utc::now().to_rfc3339(),
         event: DelegationAuditAction::PolicyDecision {
             scope: scope.to_string(),
             flow: flow.to_string(),
@@ -2652,7 +2655,7 @@ pub fn audit_trust_check(
 ) {
     emit("trust_check", || DelegationAuditEvent {
         event_id: new_event_id(),
-        timestamp: Utc::now().to_rfc3339(),
+        occurred_at: Utc::now().to_rfc3339(),
         event: DelegationAuditAction::TrustCheck {
             leg: leg.to_string(),
             authority_id: authority_id.map(str::to_string),
@@ -2704,7 +2707,7 @@ pub fn audit_trace_terminated(
 ) {
     emit("trace_terminated", || DelegationAuditEvent {
         event_id: new_event_id(),
-        timestamp: Utc::now().to_rfc3339(),
+        occurred_at: Utc::now().to_rfc3339(),
         event: DelegationAuditAction::TraceTerminated {
             own_trace_id: own_trace_id.to_string(),
             downstream_trace_id: downstream_trace_id.to_string(),
@@ -3671,7 +3674,7 @@ mod tests {
     fn test_trace_terminated_event_correlates_to_own_trace() {
         let event = DelegationAuditEvent {
             event_id: None,
-            timestamp: Utc::now().to_rfc3339(),
+            occurred_at: Utc::now().to_rfc3339(),
             event: DelegationAuditAction::TraceTerminated {
                 own_trace_id: "own-123".to_string(),
                 downstream_trace_id: "down-456".to_string(),
@@ -4194,6 +4197,30 @@ mod tests {
     }
 
     #[test]
+    fn a_record_is_written_with_occurred_at_and_no_timestamp() {
+        let event = audit_event(DelegationAuditAction::ConsentGranted, None, None, None, None);
+
+        let written = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(
+            (written.get("occurred_at"), written.get("timestamp")),
+            (Some(&serde_json::json!(event.occurred_at)), None),
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn a_stored_record_is_read_under_either_name_of_its_time_and_refused_under_both() {
+        use crate::delegation_vault::test_support::{OLD_ROW, OLD_ROW_TIME, ROW_WITH_BOTH_TIMES};
+        let new_row = OLD_ROW.replace("\"timestamp\"", "\"occurred_at\"");
+        let read = |line: &str| serde_json::from_str::<DelegationAuditEvent>(line).map(|event| event.occurred_at);
+
+        assert_eq!(read(OLD_ROW).unwrap(), OLD_ROW_TIME, "a record stored before the rename");
+        assert_eq!(read(&new_row).unwrap(), OLD_ROW_TIME, "a record stored since");
+        assert!(read(ROW_WITH_BOTH_TIMES).is_err(), "a line naming its time twice is no record the gateway wrote");
+    }
+
+    #[test]
     fn the_category_tally_counts_every_record_the_walk_sees() {
         let dir = tempfile::TempDir::new().unwrap();
         let consent = audit_event(DelegationAuditAction::ConsentGranted, None, None, None, None);
@@ -4252,7 +4279,7 @@ mod tests {
         let mut events = vec![
             DelegationAuditEvent {
                 event_id: None,
-                timestamp: "2026-08-18T00:00:00Z".to_string(),
+                occurred_at: "2026-08-18T00:00:00Z".to_string(),
                 event: DelegationAuditAction::VpInjected,
                 agent_did: None,
                 agent_identity_did: None,
@@ -4282,7 +4309,7 @@ mod tests {
             },
             DelegationAuditEvent {
                 event_id: None,
-                timestamp: "2026-08-18T00:00:01Z".to_string(),
+                occurred_at: "2026-08-18T00:00:01Z".to_string(),
                 event: DelegationAuditAction::PolicyDecision {
                     scope: "surface".to_string(),
                     flow: "fabric".to_string(),

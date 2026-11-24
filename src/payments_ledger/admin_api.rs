@@ -251,7 +251,7 @@ impl AuditFilter {
             return false;
         };
         let at = || {
-            DateTime::parse_from_rfc3339(&event.timestamp)
+            DateTime::parse_from_rfc3339(&event.occurred_at)
                 .ok()
                 .map(|t| t.with_timezone(&Utc))
         };
@@ -664,7 +664,7 @@ mod tests {
         surface_id: Option<&str>,
         stage: PaymentStage,
         trace_id: &str,
-        timestamp: &str,
+        occurred_at: &str,
     ) -> DelegationAuditEvent {
         use crate::delegation_vault::audit::{PaymentEventDetails, PaymentRail, audit_event};
         let mut event = audit_event(
@@ -689,7 +689,7 @@ mod tests {
             surface_id,
         );
         event.trace_id = Some(trace_id.to_string());
-        event.timestamp = timestamp.to_string();
+        event.occurred_at = occurred_at.to_string();
         event.vp_jwt = Some("eyJ.grant.sig".to_string());
         event.vp_fingerprint = Some(format!("sha256:{trace_id}"));
         event
@@ -760,6 +760,37 @@ mod tests {
             vec!["t-2", "t-1"]
         );
         assert!(kept(&[("trace_id", "nope")]).is_empty(), "a filter nothing matches keeps nothing");
+    }
+
+    #[test]
+    fn the_audit_trail_filter_reads_the_time_of_a_record_stored_under_either_name() {
+        let stored_under = |name: &str, trace_id: &str, at: &str| {
+            let mut line =
+                serde_json::to_value(payment_event(Some("s-1"), PaymentStage::Verified, trace_id, at)).unwrap();
+            let fields = line.as_object_mut().unwrap();
+            let time = fields
+                .remove("occurred_at")
+                .or_else(|| fields.remove("timestamp"))
+                .unwrap();
+            fields.insert(name.to_string(), time);
+            serde_json::from_value::<DelegationAuditEvent>(line)
+                .unwrap_or_else(|e| panic!("a payment record stored with {name} is read: {e}"))
+        };
+        let stored = [
+            stored_under("occurred_at", "t-new", "2026-10-26T12:00:00Z"),
+            stored_under("occurred_at", "t-new-early", "2026-10-26T08:00:00Z"),
+            stored_under("timestamp", "t-old", "2026-10-26T11:00:00Z"),
+            stored_under("timestamp", "t-old-early", "2026-10-26T08:00:00Z"),
+        ];
+        let filter = AuditFilter::parse(&audit_query(&[("since", "2026-10-26T10:00:00Z")])).unwrap();
+
+        let kept: Vec<&str> = stored
+            .iter()
+            .filter(|event| filter.matches(event))
+            .filter_map(|event| event.trace_id.as_deref())
+            .collect();
+
+        assert_eq!(kept, ["t-new", "t-old"]);
     }
 
     #[test]

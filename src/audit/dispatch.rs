@@ -213,8 +213,8 @@ async fn deliver_from_cursor<D: Deliver>(
     }
 }
 
-/// Whether the record is older than `max_age`. A record whose timestamp does
-/// not parse is never treated as old.
+/// Whether the record occurred longer ago than `max_age`. A record whose
+/// occurrence time does not parse is never treated as old.
 fn is_older_than(
     entry: &JournalEntry,
     max_age: Option<Duration>,
@@ -222,8 +222,8 @@ fn is_older_than(
     let Some(max_age) = max_age else {
         return false;
     };
-    chrono::DateTime::parse_from_rfc3339(&entry.record.timestamp).is_ok_and(|timestamp| {
-        (chrono::Utc::now() - timestamp.with_timezone(&chrono::Utc))
+    chrono::DateTime::parse_from_rfc3339(&entry.record.occurred_at).is_ok_and(|occurred_at| {
+        (chrono::Utc::now() - occurred_at.with_timezone(&chrono::Utc))
             .to_std()
             .is_ok_and(|age| age > max_age)
     })
@@ -766,18 +766,18 @@ mod tests {
             self.append_aged(recipients, Duration::ZERO);
         }
 
-        /// Appends records whose timestamp is `age` in the past.
+        /// Appends records that occurred `age` in the past.
         fn append_aged(
             &mut self,
             recipients: &[&[SinkId]],
             age: Duration,
         ) {
-            let timestamp = (chrono::Utc::now() - chrono::Duration::from_std(age).unwrap()).to_rfc3339();
+            let occurred_at = (chrono::Utc::now() - chrono::Duration::from_std(age).unwrap()).to_rfc3339();
             let batch: Vec<Pending> = recipients
                 .iter()
                 .map(|sinks| {
                     let mut record = audit_event(DelegationAuditAction::ConsentGranted, None, None, None, None);
-                    record.timestamp = timestamp.clone();
+                    record.occurred_at = occurred_at.clone();
                     Pending {
                         recipients: sinks.to_vec(),
                         record,
@@ -1693,6 +1693,24 @@ mod tests {
 
         assert_eq!(*sink.delivered.lock(), vec![2]);
         reader.abort();
+    }
+
+    #[test]
+    fn a_records_age_is_read_from_its_occurrence_time_whichever_name_it_was_journalled_under() {
+        let journalled = |name: &str, age: chrono::Duration| {
+            let line = serde_json::json!({
+                "seq": 1,
+                "recipients": [],
+                "record": {name: (chrono::Utc::now() - age).to_rfc3339(), "event": "consent_granted", "via_fabric": false}
+            });
+            JournalEntry::parse(line.to_string().as_bytes())
+                .unwrap_or_else(|| panic!("a record journalled with {name} is read"))
+        };
+        let older = |entry: &JournalEntry| is_older_than(entry, Some(Duration::from_secs(3600)));
+
+        assert!(older(&journalled("timestamp", chrono::Duration::hours(2))), "journalled before the rename");
+        assert!(older(&journalled("occurred_at", chrono::Duration::hours(2))), "journalled since");
+        assert!(!older(&journalled("occurred_at", chrono::Duration::minutes(1))));
     }
 
     #[tokio::test]
