@@ -18,6 +18,8 @@ LOCK_CLEARING="${WORK}/.lock-clearing"
 RUN="${WORK}/run"
 LOGS="${RUN}/logs"
 RESULTS="${RUN}/results"
+REPORT_DIR="${RUN}/report"
+GAPS_FILE="${RUN}/gaps.md"
 
 SPEC_VERSION="2026-07-28"
 REFERENCE_SHA="f44482ba17df816d3176962a11cdf36aec9bda00"
@@ -28,6 +30,7 @@ REFERENCE_SERVER_DIR="${REFERENCE_DIR}/examples/servers/typescript"
 BIN_NAME="$(sed -n 's/^name = "\(.*\)"/\1/p' "${REPO}/Cargo.toml" | head -1)"
 DEFAULT_BINARY="${REPO}/target/debug/${BIN_NAME}"
 NODE_MIN="22.0.0"
+REQUIREMENTS_FILE="${HERE}/node_modules/@modelcontextprotocol/conformance/requirements/${SPEC_VERSION}.yaml"
 SUITE_VERSION="$(sed -n 's|.*"@modelcontextprotocol/conformance": "\(.*\)".*|\1|p' "${HERE}/package.json")"
 SUITE_TARGETS=(direct access-point transit owned-proxy proxy-surface fabric)
 OWNED_SCENARIOS=(tools-list tools-call-simple-text caching)
@@ -64,6 +67,10 @@ Usage: scripts/mcp-conformance/run.sh [options]
                           (fabric needs Docker for the mediator between its two gateways)
   --unit-tests            Also run the full binary test suite
                           (not run, with a warning, when LIST has no modern target)
+  --report                Report only: run every scenario the suite has against
+                          each selected target, ignore the suite's verdicts and
+                          the baselines, and list the open gaps in
+                          target/mcp-conformance/run/gaps.md
   -h, --help              Show this help
 
 Environment:
@@ -82,6 +89,7 @@ option_value() {
 
 SKIP_BUILD=false
 UNIT_TESTS=false
+REPORT=false
 BINARY=""
 ONLY="direct,access-point,transit,owned-proxy,proxy-surface,fabric,client,legacy"
 
@@ -89,6 +97,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-build) SKIP_BUILD=true ;;
         --unit-tests) UNIT_TESTS=true ;;
+        --report) REPORT=true ;;
         --binary) option_value "$1" "${2:-}"; BINARY="$2"; shift ;;
         --only) option_value "$1" "${2:-}"; ONLY="$2"; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -114,8 +123,10 @@ done
 if [[ ${#MODERN_TARGETS[@]} -gt 0 ]]; then RUN_MODERN=true; else RUN_MODERN=false; fi
 if selected legacy; then RUN_LEGACY=true; else RUN_LEGACY=false; fi
 if selected client; then RUN_CLIENT=true; else RUN_CLIENT=false; fi
+# The legacy target runs no suite scenario, so a report has nothing to say about it.
+if [[ "${REPORT}" == true ]]; then RUN_LEGACY=false; fi
 if [[ "${RUN_MODERN}" != true && "${RUN_LEGACY}" != true && "${RUN_CLIENT}" != true ]]; then
-    echo "--only selects no target: '${ONLY}'" >&2
+    echo "--only selects no target$([[ "${REPORT}" != true ]] || echo ' that --report covers'): '${ONLY}'" >&2
     exit 2
 fi
 
@@ -132,6 +143,7 @@ absolute_path() {
 [[ -z "${BINARY}" ]] || absolute_path BINARY --binary "${BINARY}"
 
 SUMMARY=()
+REPORT_TARGETS=()
 FAILED=false
 STARTED_PIDS=()
 OWN_LOCK=false
@@ -254,11 +266,12 @@ write_summary() {
     echo "suite: @modelcontextprotocol/conformance@${SUITE_VERSION}, requirements ${SPEC_VERSION}"
     echo "reference: ${REFERENCE_REPO} @ ${REFERENCE_SHA}"
     echo "targets: ${ONLY}"
+    if [[ "${REPORT}" == true ]]; then echo "mode: report only; suite verdicts and baselines are ignored"; fi
     echo
     printf '%s\n' "${SUMMARY[@]+"${SUMMARY[@]}"}"
     echo
     case "$1" in
-        0) echo "RESULT: PASS (exit 0)" ;;
+        0) if [[ "${REPORT}" == true ]]; then echo "RESULT: REPORT WRITTEN (exit 0)"; else echo "RESULT: PASS (exit 0)"; fi ;;
         2) echo "RESULT: PRECONDITION NOT MET (exit 2)" ;;
         3) echo "RESULT: DEPENDENCY FETCH FAILED (exit 3)" ;;
         *) echo "RESULT: FAIL (exit $1)" ;;
@@ -431,28 +444,66 @@ stop_gateway() {
     stop_pid "${GATEWAY_PID}"
 }
 
+suite_counts() {
+    local leg="$1" dir="$2"
+    shift 2
+    node "${HERE}/suite-report.mjs" counts --results "${dir}" --leg "${leg}" --requirements "${REQUIREMENTS_FILE}" "$@" 2> /dev/null ||
+        echo "no results"
+}
+
 suite_detail() {
-    local log="$1" ran expected
-    ran="$(grep -cE '^=== Running scenario: ' "${log}" || true)"
-    expected="$(grep -cE '^  ~ ' "${log}" || true)"
-    echo "${ran} scenarios run; ${expected} expected failure(s)"
+    local log="$1" name="$2" baseline="$3"
+    echo "$(grep -cE '^=== Running scenario: ' "${log}" || true) scenarios run; $(suite_counts server "${RESULTS}/${name}" --baseline "${HERE}/expected-failures/${baseline}.yaml")"
+}
+
+# A report-only run of one target: "$@ --scenario <name>" for every scenario the
+# suite lists for the leg, ignoring the verdict. A scenario runs on the
+# ${SPEC_VERSION} wire when it applies there or is an extension, and at its own
+# revision otherwise. The suite's exit status marks a scenario it failed, which
+# can happen without a failed check.
+report_run() {
+    local name="$1" log="$2" leg="$3" scenario tags flags count=0
+    shift 3
+    : > "${log}"
+    : > "${REPORT_DIR}/${name}.failed"
+    while read -r scenario tags <&3; do
+        flags=()
+        if [[ ",${tags}," == *",${SPEC_VERSION},"* || "${tags}" == extension ]]; then
+            flags=(--spec-version "${SPEC_VERSION}" --force)
+        fi
+        echo "=== ${scenario} ===" >> "${log}"
+        "$@" --scenario "${scenario}" "${flags[@]+"${flags[@]}"}" >> "${log}" 2>&1 ||
+            echo "${scenario}" >> "${REPORT_DIR}/${name}.failed"
+        count=$((count + 1))
+    done 3< <("${CONFORMANCE}" list "--${leg}" 2> /dev/null | sed -n 's/^  - \([^ ]*\) \[\(.*\)\]$/\1 \2/p')
+    [[ ${count} -gt 0 ]] || fail 1 "suite ${name}: the suite lists no ${leg} scenario"
+    record INFO "suite ${name}: ${count} scenarios run, verdict ignored"
+    REPORT_TARGETS+=("${name}")
 }
 
 run_suite() {
     local name="$1" url="$2" baseline="$3" log="${LOGS}/suite-${1}.log"
     local out="${RESULTS}/${name}"
+    if [[ "${REPORT}" == true ]]; then
+        report_run "${name}" "${log}" server "${CONFORMANCE}" server --url "${url}" -o "${out}"
+        return
+    fi
     if "${CONFORMANCE}" server --url "${url}" --requirements "${SPEC_VERSION}" \
         --expected-failures "${HERE}/expected-failures/${baseline}.yaml" -o "${out}" > "${log}" 2>&1; then
-        record PASS "suite ${name}: $(suite_detail "${log}")"
+        record PASS "suite ${name}: $(suite_detail "${log}" "${name}" "${baseline}")"
     else
         tail -40 "${log}"
-        record FAIL "suite ${name}: $(suite_detail "${log}") (log: $(relative "${log}"))"
+        record FAIL "suite ${name}: $(suite_detail "${log}" "${name}" "${baseline}") (log: $(relative "${log}"))"
         FAILED=true
     fi
 }
 
 run_owned_suite() {
-    local name="$1" url="$2" log="${LOGS}/suite-${1}.log" scenario ok=true
+    local name="$1" url="$2" log="${LOGS}/suite-${1}.log" scenario ok=true counts
+    if [[ "${REPORT}" == true ]]; then
+        run_suite "${name}" "${url}" owned
+        return
+    fi
     : > "${log}"
     for scenario in "${OWNED_SCENARIOS[@]}"; do
         echo "=== ${scenario} ===" >> "${log}"
@@ -461,11 +512,12 @@ run_owned_suite() {
             ok=false
         fi
     done
+    counts="$(suite_counts server "${RESULTS}/${name}" --baseline "${HERE}/expected-failures/owned.yaml")"
     if [[ "${ok}" == true ]]; then
-        record PASS "suite ${name}: ${OWNED_SCENARIOS[*]}; $(grep -cE '^  ~ ' "${log}" || true) expected failure(s)"
+        record PASS "suite ${name}: ${OWNED_SCENARIOS[*]}; ${counts}"
     else
         tail -40 "${log}"
-        record FAIL "suite ${name}: ${OWNED_SCENARIOS[*]} (log: $(relative "${log}"))"
+        record FAIL "suite ${name}: ${OWNED_SCENARIOS[*]}; ${counts} (log: $(relative "${log}"))"
         FAILED=true
     fi
 }
@@ -475,9 +527,9 @@ run_owned_suite() {
 # step runs the suite against gateway 1, whose Access Point targets fabric:// to
 # gateway 2. Gateway 2 forwards to the reference server through the shim.
 run_fabric_suite() {
-    local log="${LOGS}/suite-fabric.log" bdd_log="${LOGS}/g2g-fabric.log"
+    local log="${LOGS}/suite-fabric.log" bdd_log="${LOGS}/g2g-fabric.log" ok=true
     : > "${log}"
-    if (cd "${REPO}" && env \
+    (cd "${REPO}" && env \
         G2G_BDD_PARALLELISM=1 FABRIC_BDD_MANAGED_MEDIATOR=1 FABRIC_BDD_DID_METHOD=peer \
         RUST_LOG="${RUST_LOG:-info}" G2G_BDD_GATEWAY_LOG_LEVEL="${G2G_BDD_GATEWAY_LOG_LEVEL:-warn}" \
         BDD_FEATURE_PATH="${HERE}/fabric.feature" \
@@ -488,12 +540,20 @@ run_fabric_suite() {
         MCP_CONFORMANCE_OUTPUT="${RESULTS}/fabric" \
         MCP_CONFORMANCE_LOG="${log}" \
         CARGO_TARGET_DIR="${REPO}/target" \
-        cargo test --locked --test g2g_bdd) > "${bdd_log}" 2>&1 &&
-        grep -qE '^=== Running scenario: ' "${log}"; then
-        record PASS "suite fabric: $(suite_detail "${log}")"
+        cargo test --locked --test g2g_bdd) > "${bdd_log}" 2>&1 || ok=false
+    # The BDD step runs the suite once, so a report-only run of this target has
+    # the requirement set's scenarios and no others.
+    if [[ "${REPORT}" == true ]] && grep -qE '^=== Running scenario: ' "${log}"; then
+        sed -n 's/^✗ \(.*\): [0-9][0-9]* passed.*/\1/p' "${log}" > "${REPORT_DIR}/fabric.failed"
+        record INFO "suite fabric: $(grep -cE '^=== Running scenario: ' "${log}") scenarios run, verdict ignored"
+        REPORT_TARGETS+=(fabric)
+        return
+    fi
+    if [[ "${ok}" == true ]] && grep -qE '^=== Running scenario: ' "${log}"; then
+        record PASS "suite fabric: $(suite_detail "${log}" fabric fabric)"
     else
         tail -40 "${bdd_log}"
-        record FAIL "suite fabric: $(suite_detail "${log}") (logs: $(relative "${bdd_log}"), $(relative "${log}"))"
+        record FAIL "suite fabric: $(suite_detail "${log}" fabric fabric) (logs: $(relative "${bdd_log}"), $(relative "${log}"))"
         FAILED=true
     fi
 }
@@ -502,8 +562,8 @@ run_fabric_suite() {
 # client: straight at the suite's own server, and through a gateway that
 # client-driver.mjs starts with that server as its Target.
 client_scenario() {
-    local mode="$1" scenario="$2"
-    shift 2
+    local mode="$1" status=0 waited=0
+    shift
     env MCP_CONFORMANCE_DRIVER_MODE="${mode}" \
         MCP_CONFORMANCE_DRIVER_REFERENCE="${REFERENCE_DIR}" \
         MCP_CONFORMANCE_DRIVER_BINARY="${BINARY}" \
@@ -511,8 +571,16 @@ client_scenario() {
         MCP_CONFORMANCE_DRIVER_INBOUND_PORT="${CLIENT_INBOUND_PORT}" \
         MCP_CONFORMANCE_DRIVER_OUTBOUND_PORT="${CLIENT_OUTBOUND_PORT}" \
         MCP_CONFORMANCE_DRIVER_FIXTURE_URL="http://127.0.0.1:${FIXTURE_PORT}" \
-        "${CONFORMANCE}" client --scenario "${scenario}" --spec-version "${SPEC_VERSION}" "$@" \
-        -o "${RESULTS}/client-${mode}" --command "node ${HERE}/client-driver.mjs"
+        "${CONFORMANCE}" client "$@" \
+        -o "${RESULTS}/client-${mode}" --command "node ${HERE}/client-driver.mjs" || status=$?
+    # A gateway left behind by one scenario would answer the next one.
+    while port_open "${CLIENT_INBOUND_PORT}"; do
+        [[ ${waited} -lt 20 ]] ||
+            fail 1 "suite client: a gateway is still listening on port ${CLIENT_INBOUND_PORT} after a scenario"
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    return "${status}"
 }
 
 run_client_mode() {
@@ -520,7 +588,7 @@ run_client_mode() {
     : > "${log}"
     for scenario in "${CLIENT_SCENARIOS[@]}"; do
         echo "=== ${scenario} ===" >> "${log}"
-        client_scenario "${mode}" "${scenario}" >> "${log}" 2>&1 || true
+        client_scenario "${mode}" --scenario "${scenario}" --spec-version "${SPEC_VERSION}" >> "${log}" 2>&1 || true
     done
 }
 
@@ -529,7 +597,7 @@ run_client_mode() {
 run_client_auth() {
     local log="${LOGS}/suite-client-auth.log"
     local name="suite client: ${CLIENT_AUTH_SCENARIO}, the gateway fetches and attaches the token"
-    if client_scenario gateway "${CLIENT_AUTH_SCENARIO}" --force > "${log}" 2>&1; then
+    if client_scenario gateway --scenario "${CLIENT_AUTH_SCENARIO}" --spec-version "${SPEC_VERSION}" --force > "${log}" 2>&1; then
         record PASS "${name}"
     else
         tail -40 "${log}"
@@ -538,11 +606,38 @@ run_client_auth() {
     fi
 }
 
+# The scenarios parity lets fail, as long as they fail the same way both ways.
+client_may_fail() {
+    local scenario names=()
+    for scenario in "${CLIENT_SCENARIOS[@]}"; do
+        [[ " ${CLIENT_MUST_PASS[*]} " == *" ${scenario} "* ]] || names+=("${scenario}")
+    done
+    (IFS=,; echo "${names[*]+"${names[*]}"}")
+}
+
+write_gaps() {
+    local log="${LOGS}/gaps.log" line
+    if ! node "${HERE}/suite-report.mjs" gaps --results "${RESULTS}" --targets "$(IFS=,; echo "${REPORT_TARGETS[*]}")" \
+        --failed-dir "${REPORT_DIR}" --out "${GAPS_FILE}" > "${log}" 2>&1; then
+        tail -5 "${log}"
+        record FAIL "report: a target has no results (log: $(relative "${log}"))"
+        FAILED=true
+    fi
+    while read -r line; do
+        record INFO "report ${line}"
+    done < <(grep -E '^[a-z-]+: [0-9]+ passed; ' "${log}" || true)
+    record INFO "report: the open gaps are in $(relative "${GAPS_FILE}")"
+}
+
 run_client_suite() {
     require_free_ports client "${CLIENT_INBOUND_PORT}" "${CLIENT_OUTBOUND_PORT}"
+    if [[ "${REPORT}" == true ]]; then
+        report_run client "${LOGS}/suite-client-gateway.log" client client_scenario gateway
+        return
+    fi
     run_client_mode direct
     run_client_mode gateway
-    check "suite client: ${#CLIENT_SCENARIOS[@]} scenarios, same result with and without the gateway" \
+    check "suite client: ${#CLIENT_SCENARIOS[@]} scenarios, same result with and without the gateway; $(suite_counts client "${RESULTS}/client-gateway" --expected-scenarios "$(client_may_fail)")" \
         "${LOGS}/client-parity.log" \
         node "${HERE}/client-parity.mjs" --direct "${RESULTS}/client-direct" --gateway "${RESULTS}/client-gateway" \
         --scenarios "$(IFS=,; echo "${CLIENT_SCENARIOS[*]}")" --must-pass "$(IFS=,; echo "${CLIENT_MUST_PASS[*]}")"
@@ -586,7 +681,7 @@ if [[ "${UNIT_TESTS}" == true && "${RUN_MODERN}" != true ]]; then
     record WARN "unit tests: not run; --unit-tests needs a modern target in --only (${ONLY})"
 fi
 rm -rf "${RUN}"
-mkdir -p "${LOGS}" "${RESULTS}"
+mkdir -p "${LOGS}" "${RESULTS}" "${REPORT_DIR}"
 RUN_CREATED=true
 
 # 2. Pinned dependencies
@@ -608,7 +703,7 @@ REFERENCE_PID="${STARTED_PID}"
 wait_for_ports "${FIXTURE_PID}" "${FIXTURE_PORT}" || fail 1 "fixtures: REST fixture did not start"
 wait_for_ports "${REFERENCE_PID}" "${REFERENCE_PORT}" || fail 1 "fixtures: reference server did not start"
 node --test "${HERE}/shim.test.mjs" "${HERE}/client-shim.test.mjs" "${HERE}/client-parity.test.mjs" \
-    "${HERE}/client-auth.test.mjs" > "${LOGS}/shim-test.log" 2>&1 ||
+    "${HERE}/client-auth.test.mjs" "${HERE}/suite-report.test.mjs" > "${LOGS}/shim-test.log" 2>&1 ||
     fail 1 "fixtures: harness unit tests failed (log: $(relative "${LOGS}/shim-test.log"))"
 start_process "${LOGS}/shim.log" "${HERE}" node shim.mjs --port "${SHIM_PORT}" \
     --upstream "http://127.0.0.1:${REFERENCE_PORT}"
@@ -649,15 +744,17 @@ if [[ "${RUN_MODERN}" == true ]]; then
         esac
     done
 
-    targets_csv="$(IFS=,; echo "${MODERN_TARGETS[*]}")"
-    owned_csv="$(IFS=,; echo "${OWNED_SCENARIOS[*]}")"
-    check "modern: check-results (caching parity, real owned calls, results present)" "${LOGS}/check-results.log" \
-        node "${HERE}/check-results.mjs" --results "${RESULTS}" --targets "${targets_csv}" \
-        --owned-scenarios "${owned_csv}" --requirements "${HERE}/node_modules/@modelcontextprotocol/conformance/requirements/${SPEC_VERSION}.yaml"
-    check "modern: compat admitted (every endpoint admits ${SPEC_VERSION})" "${LOGS}/compat-admitted-modern.log" \
-        node "${HERE}/compat.mjs" admitted --targets "${TARGETS_FILE}"
-    check "modern: compat legacy session (2024-11-05)" "${LOGS}/compat-legacy-modern.log" \
-        node "${HERE}/compat.mjs" legacy --targets "${TARGETS_FILE}"
+    if [[ "${REPORT}" != true ]]; then
+        targets_csv="$(IFS=,; echo "${MODERN_TARGETS[*]}")"
+        owned_csv="$(IFS=,; echo "${OWNED_SCENARIOS[*]}")"
+        check "modern: check-results (caching parity, real owned calls, results present)" "${LOGS}/check-results.log" \
+            node "${HERE}/check-results.mjs" --results "${RESULTS}" --targets "${targets_csv}" \
+            --owned-scenarios "${owned_csv}" --requirements "${REQUIREMENTS_FILE}"
+        check "modern: compat admitted (every endpoint admits ${SPEC_VERSION})" "${LOGS}/compat-admitted-modern.log" \
+            node "${HERE}/compat.mjs" admitted --targets "${TARGETS_FILE}"
+        check "modern: compat legacy session (2024-11-05)" "${LOGS}/compat-legacy-modern.log" \
+            node "${HERE}/compat.mjs" legacy --targets "${TARGETS_FILE}"
+    fi
     stop_gateway
 fi
 
@@ -683,6 +780,8 @@ if [[ "${RUN_LEGACY}" == true ]]; then
         node "${HERE}/compat.mjs" legacy --targets "${TARGETS_FILE}"
     stop_gateway
 fi
+
+if [[ "${REPORT}" == true && ${#REPORT_TARGETS[@]} -gt 0 ]]; then write_gaps; fi
 
 [[ "${FAILED}" == true ]] && exit 1
 exit 0

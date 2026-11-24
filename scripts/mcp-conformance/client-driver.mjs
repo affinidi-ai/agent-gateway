@@ -43,6 +43,24 @@ export function accessPointUrl(inboundPort) {
   return `http://127.0.0.1:${inboundPort}/conformance/mcp`;
 }
 
+// The suite ends a client that outlives its timeout with a signal. Without
+// this the gateway would outlive the driver and answer the next scenario.
+const children = new Set();
+function track(child) {
+  children.add(child);
+  child.once('exit', () => children.delete(child));
+  return child;
+}
+
+export function killChildrenOnSignal(running, target = process) {
+  for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+    target.once(signal, () => {
+      for (const child of running) child.kill('SIGKILL');
+      target.exit(1);
+    });
+  }
+}
+
 function portOpen(port) {
   return new Promise((resolve) => {
     const socket = net.connect({ host: '127.0.0.1', port });
@@ -83,7 +101,7 @@ async function startGateway(config, { seed, tokenEndpoint } = {}) {
   seed?.(envDir);
   const backupKeyVar = fs.readFileSync(path.join(envDir, 'backup-key-var'), 'utf8').trim();
   const log = fs.openSync(path.join(envDir, 'gateway.log'), 'w');
-  const child = spawn(config.binary, ['--config', 'config.toml'], {
+  const child = track(spawn(config.binary, ['--config', 'config.toml'], {
     cwd: path.join(envDir, 'config'),
     env: {
       ...process.env,
@@ -96,7 +114,7 @@ async function startGateway(config, { seed, tokenEndpoint } = {}) {
       ...(tokenEndpoint ? { AG_BDD_OAUTH_ENDPOINT_ALLOWLIST: tokenEndpoint } : {}),
     },
     stdio: ['ignore', log, log],
-  });
+  }));
   try {
     await waitForPort(config.inboundPort, child);
   } catch (error) {
@@ -117,10 +135,12 @@ function stop(child) {
 
 function runReferenceClient(referenceDir, url) {
   return new Promise((resolve, reject) => {
-    const client = spawn(
-      process.execPath,
-      ['--import', 'tsx', path.join('examples', 'clients', 'typescript', 'everything-client.ts'), url],
-      { cwd: referenceDir, env: process.env, stdio: 'inherit' },
+    const client = track(
+      spawn(process.execPath, ['--import', 'tsx', path.join('examples', 'clients', 'typescript', 'everything-client.ts'), url], {
+        cwd: referenceDir,
+        env: process.env,
+        stdio: 'inherit',
+      }),
     );
     client.once('error', reject);
     client.once('exit', (code, signal) => resolve(code ?? (signal ? 1 : 0)));
@@ -166,6 +186,7 @@ async function main() {
 }
 
 if (import.meta.filename === process.argv[1]) {
+  killChildrenOnSignal(children);
   main().then(
     (code) => process.exit(code),
     (error) => {

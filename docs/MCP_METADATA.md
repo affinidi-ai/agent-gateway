@@ -2123,7 +2123,10 @@ listed: a forwarding endpoint's `-32022` must advertise only the versions the
 upstream's discovery delivered (see [Forwarding Discovery](#forwarding-discovery)).
 Scenarios the suite reports but never scores, including every `tasks-*`
 extension scenario, are not gates; this matches owned discovery not advertising
-the Tasks extension.
+the Tasks extension. Their failed and warned checks are counted on each suite
+line of the run summary as unscored failures, next to the checks that passed
+and the failures the baseline expects, so a passing run still shows how much
+lies outside the gate. The counts do not change the exit code.
 
 **Checks the suite does not make.** `check-results.mjs` requires a result for
 every scenario each target ran; requires the Access Point, Transit Point and
@@ -2178,7 +2181,8 @@ registration, DPoP, or a token issued outside the gateway, none of which Target
 authentication does. `auth/client-credentials-basic` is not run either, because
 an `oauth2_client_credentials` provider sends the client secret in the form
 body, not as HTTP Basic; `client-driver.mjs` accepts the scenario so the gap can
-be reproduced by hand (see the harness README). The suite's `authorization`
+be reproduced by hand or listed by a report-only run (see the harness README).
+The suite's `authorization`
 command is not run: its scenarios require an authorization-code server, which
 the STS profile is not (see [MCP Resource Authorization](#mcp-resource-authorization)).
 
@@ -2194,9 +2198,23 @@ endpoint must answer the unmodelled `2099-01-01` with HTTP `400`, `-32022`, a
 `supported` list that includes `2024-11-05` and not the requested revision, and
 the request id echoed.
 
+**Report-only run.** `make mcp-conformance ARGS="--report"` measures the open
+gaps and gates nothing. It runs every scenario the suite has: all server
+scenarios against each server target, the owned ones included, and all client
+scenarios, every `auth/*` one among them, through the gateway. A scenario that
+applies to `2026-07-28` or is an extension runs on that wire, and a scenario of
+older revisions only runs at its own. The `fabric` target is the exception: its
+BDD step runs the suite once, so it reports on the requirement set's scenarios.
+The run ignores the suite's verdicts and the baselines, skips the checks
+the suite does not make and the legacy phase, and exits `0` unless the harness
+itself fails. `target/mcp-conformance/run/gaps.md` then lists, per target, each
+failed or warned check with its scenario, check id, status and the suite's
+message; credentials in a message are redacted and a check's details are never
+copied. `--only` narrows it to some targets.
+
 **Running.** `make mcp-conformance` runs both phases, `ARGS=--unit-tests` also
-runs the full binary test suite, and `make mcp-conformance-legacy` runs only
-the legacy-phase compatibility checks.
+runs the full binary test suite, `ARGS=--report` makes the report-only run, and
+`make mcp-conformance-legacy` runs only the legacy-phase compatibility checks.
 Run outputs stay under the ignored `target/mcp-conformance/`. Exit codes are `0`
 pass, `1` failure, `2` invalid options or precondition not met, `3` dependency
 fetch failure, `130` interrupted (SIGINT) and `143` terminated (SIGTERM).

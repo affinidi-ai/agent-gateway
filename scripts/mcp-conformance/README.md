@@ -11,6 +11,7 @@ gateway-side contract (which paths it covers, what the baselines mean) is in
 ```sh
 make mcp-conformance                    # both phases
 make mcp-conformance ARGS=--unit-tests  # also the full binary test suite
+make mcp-conformance ARGS=--report      # report only: every scenario, open gaps listed
 make mcp-conformance-legacy             # legacy compatibility checks only
 ./scripts/mcp-conformance/run.sh --help
 ```
@@ -35,6 +36,7 @@ prebuilt binary without `--unit-tests`.
 | `--binary PATH` | Gateway binary for the modern and legacy phases; the `fabric` target builds its own through Cargo |
 | `--only LIST` | Comma-separated, non-empty subset of `direct,access-point,transit,owned-proxy,proxy-surface,fabric,client,legacy` |
 | `--unit-tests` | Run the full binary test suite before the suite; when `--only` selects no modern target the tests do not run and the summary shows a `WARN` line |
+| `--report` | Report only: run every scenario the suite has against each selected target, ignore the suite's verdicts and the baselines, and write the open gaps to `run/gaps.md`. See [Report-only mode](#report-only-mode) |
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -105,6 +107,9 @@ not be fetched, `130` interrupted (SIGINT), `143` terminated (SIGTERM).
    `Mcp-Name` headers and sometimes the `Accept` list, which the gateway
    rightly rejects on a modern request, so the adapter adds them to requests
    that carry `MCP-Protocol-Version` and passes everything else through.
+   The suite ends a client that outlives its timeout with a signal; the driver
+   then kills the gateway and reference client it started, and the run stops
+   if a gateway is still listening after a scenario.
    Last, `auth/client-credentials-jwt` runs through the gateway only:
    `client-auth.mjs` follows the suite server's `401` challenge to the token
    endpoint, writes a credential provider and its secrets into the env and
@@ -138,17 +143,89 @@ Outputs, all under the ignored `target/mcp-conformance/`:
 
 | Path | Contents |
 | --- | --- |
-| `run/summary.txt` | One line per step and the overall result |
+| `run/summary.txt` | One line per step and the overall result; see [Reading a suite line](#reading-a-suite-line) |
+| `run/gaps.md` | Written by `--report` only: per target, each failed or warned check with its scenario, check id, status and the suite's message |
+| `run/report/` | Written by `--report` only: per target, the scenarios the suite marked failed |
 | `run/logs/` | Build, npm, gateway, fixture, suite and check logs; `g2g-fabric.log` is the `fabric` target's BDD run |
 | `run/results/<target>/` | The suite's `checks.json` per scenario; the `client` target writes `client-direct/` and `client-gateway/` |
 | `env/<modern\|legacy>/` | The generated gateway envs and `targets.json` |
 | `env/client/<scenario>/` | The env and `gateway.log` of the gateway started for one client scenario |
+
+### Reading a suite line
+
+Each suite line of the summary counts checks, from the `checks.json` files the
+suite saved:
+
+```text
+PASS  suite direct: 50 scenarios run; 147 passed; 1 expected failure(s); 42 unscored failure(s)
+```
+
+- **passed**: checks with status `SUCCESS`.
+- **expected failure(s)**: failed or warned checks of scored scenarios that the
+  target's baseline lists. On the `client` line they are the failed checks of
+  the scenarios that may fail, as long as they fail the same way without the
+  gateway.
+- **unscored failure(s)**: failed or warned checks of scenarios the suite runs
+  but the requirement set does not score (its `not_scored` list, such as every
+  `tasks-*` scenario). The suite never fails a run on them and no baseline
+  covers them, so this count is the only place a normal run shows them.
+- **unexpected failure(s)**: shown only when there are some, on a `FAIL` line.
+  The suite log named on that line lists each one.
+
+The counts do not change the exit code. The numbers differ from the suite's own
+`Total:` line, which counts failures and leaves warnings out.
+
+### Report-only mode
+
+`--report` answers "what does the gateway not do yet", where a normal run
+answers "did anything regress". It combines with `--only`.
+
+```sh
+make mcp-conformance ARGS="--report"
+make mcp-conformance ARGS="--report --only client"
+```
+
+| Target | Scenarios in a report-only run |
+| --- | --- |
+| `direct`, `access-point`, `transit`, `owned-proxy`, `proxy-surface` | Every scenario of `conformance list --server`, one at a time, including the ones outside the `2026-07-28` requirement set and, for the owned targets, outside their tool subset |
+| `client` | Every scenario of `conformance list --client`, one at a time, through the gateway only. This includes every `auth/*` scenario, the ones the normal run leaves out among them |
+| `fabric` | The scenarios of the `2026-07-28` requirement set, scored and unscored. The BDD step runs the suite once, so the scenarios of older revisions are not run over the Fabric |
+| `legacy` | None: it runs no suite scenario, so `--report` leaves it out. `--report --only legacy` exits `2` |
+
+A scenario that applies to `2026-07-28`, or that is an extension, runs on the
+`2026-07-28` wire, as in a normal run. A scenario of older revisions only, such
+as `server-initialize`, runs at its own revision.
+
+The run ignores the suite's exit status and the baselines, and does not run
+`check-results.mjs`, `client-parity.mjs` or `compat.mjs`. It exits `0` however
+many gaps it finds. It still exits non-zero when the harness itself fails: a
+build error, a gateway or fixture that does not start, a port in use, a gateway
+still listening after its client scenario ended, or a target for which the
+suite ran no scenario or saved no result.
+
+`run/gaps.md` has one section per target with the number of passed checks and
+one table row per failed or warned check. A scenario the suite failed without a
+failed check, for instance because the client exited with an error, gets a row
+with `-` as its check. The summary repeats the totals:
+
+```text
+INFO  report client: 115 passed; 81 open gap(s)
+INFO  report: the open gaps are in target/mcp-conformance/run/gaps.md
+```
+
+The file takes the suite's message of a check and never its `details`, and
+bearer, Basic and DPoP values, JWTs, PEM blocks and the values of token and
+secret fields in a message are replaced with `[redacted]`. A gap of the
+`client` target is not always the gateway's: the reference client has no
+handler for some scenarios and fails them without the gateway too, which only
+the normal run's parity check tells apart.
 
 ### Reproducing a client scenario by hand
 
 After a run, with the fixtures stopped, one scenario can be run again from the
 repository root. `auth/client-credentials-basic` is the known gap: the gateway
 sends the client secret in the form body, and the scenario requires HTTP Basic.
+A `--report` run lists it in `run/gaps.md` with every other open gap.
 
 ```sh
 MCP_CONFORMANCE_DRIVER_MODE=gateway \

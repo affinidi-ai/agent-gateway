@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import http from 'node:http';
 import test from 'node:test';
 import { encodeHeaderValue, standardHeaders, startClientShim, withStandardHeaders } from './client-shim.mjs';
-import { accessPointUrl, settings } from './client-driver.mjs';
+import { accessPointUrl, killChildrenOnSignal, settings } from './client-driver.mjs';
 
 const request = (method, params) => JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
 
@@ -98,4 +99,27 @@ test('driver settings need a mode, a reference checkout and the suite URL', () =
     /MCP_CONFORMANCE_DRIVER_BINARY is required/,
   );
   assert.equal(accessPointUrl(18790), 'http://127.0.0.1:18790/conformance/mcp');
+});
+
+test('a signal to the driver kills the processes it started and no others', () => {
+  const target = new EventEmitter();
+  const exits = [];
+  target.exit = (code) => exits.push(code);
+  const killed = [];
+  const child = (name) => ({ kill: (signal) => killed.push(`${name}:${signal}`) });
+  const running = new Set([child('gateway'), child('client')]);
+  killChildrenOnSignal(running, target);
+  assert.deepEqual(killed, []);
+  target.emit('SIGTERM');
+  assert.deepEqual(killed, ['gateway:SIGKILL', 'client:SIGKILL']);
+  assert.deepEqual(exits, [1]);
+});
+
+test('a driver with nothing running exits on a signal without killing anything', () => {
+  const target = new EventEmitter();
+  const exits = [];
+  target.exit = (code) => exits.push(code);
+  killChildrenOnSignal(new Set(), target);
+  target.emit('SIGINT');
+  assert.deepEqual(exits, [1]);
 });
