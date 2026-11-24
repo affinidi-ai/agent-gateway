@@ -227,13 +227,21 @@ export function listenPathProblem(
     return [plain, outbound[idx]?.prefix ?? `${OUTBOUND_PREFIX}${plain}`].filter(Boolean);
   });
   const offered = every.map(p => `${p}/`).join(', ') || 'this gateway configures none';
-  const match = every.find(p => composed === p || composed.startsWith(`${p}/`));
-  if (!match || composed === match) {
+  // Every prefix, not the first that matches, and read as the listener registers
+  // the path: this mirrors `claims_a_channel_prefix`, so `/agents/team` listed
+  // before `/agents` no longer blocks a path the gateway accepts, and a path whose
+  // only remainder is slashes is refused here as it is there.
+  const registered = composed.replace(/\/+$/, '');
+  const match = every.find(
+    p => registered.startsWith(`${p}/`) && registered.slice(p.length).replace(/\//g, '') !== ''
+  );
+  if (!match) {
     return `Listen Path "${composed}" claims no segment of its own under a surface prefix this gateway serves Transit Points on (${offered}). Pick a prefix and a path under it, or clear the path to answer at the derived ${OUTBOUND_PREFIX} route.`;
   }
   const address = typeof point.listen_address === 'string' ? point.listen_address : '';
   const sharedHostname = computeSharedOutboundAddresses(routing).has(address);
-  const underOutbound = composed === OUTBOUND_PREFIX || composed.startsWith(`${OUTBOUND_PREFIX}/`);
+  const underOutbound =
+    registered === OUTBOUND_PREFIX || registered.startsWith(`${OUTBOUND_PREFIX}/`);
   if (sharedHostname && !underOutbound) {
     return `Listen Path "${composed}" is outside ${OUTBOUND_PREFIX}, and an inbound listener shares this outbound listener's hostname, so it answers on the outbound address alone. Pick one of the ${OUTBOUND_PREFIX} prefixes, or clear the path to answer at the derived ${OUTBOUND_PREFIX} route.`;
   }

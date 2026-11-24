@@ -665,19 +665,27 @@ fn point_listener_shares_an_inbound_hostname(
     surface: &crate::config::agent_surface::AgentSurface,
     point: &crate::config::agent_surface::TransitPoint,
 ) -> bool {
+    let surface_address = surface
+        .transit
+        .as_ref()
+        .and_then(|transit| {
+            transit
+                .outbound_listen_address
+                .as_deref()
+        });
+    // The router resolves the point's own address and falls back to the
+    // surface's when it names no listener (`group_outbound_vcs_by_port`), so
+    // the answer about an unresolvable point address is the surface's listener,
+    // not the appliance-wide one.
     let address = point
         .listen_address
         .as_deref()
-        .or_else(|| {
-            surface
-                .transit
-                .as_ref()
-                .and_then(|transit| {
-                    transit
-                        .outbound_listen_address
-                        .as_deref()
-                })
-        });
+        .filter(|address| {
+            network_config
+                .map_url_to_port_for_type(address, Some("outbound"))
+                .is_some()
+        })
+        .or(surface_address);
     outbound_address_shares_an_inbound_hostname(network_config, address)
 }
 
@@ -802,6 +810,10 @@ pub(crate) fn listen_path_prefixes(network_config: &crate::config::NetworkConfig
     network_config
         .channels
         .iter()
+        // A prefix the gateway does not serve, because its first segment is a
+        // dashboard page, is not offered by `GET /v1/config/surface-routing`
+        // either (`served_prefixes`), and a path under it reaches nothing.
+        .filter(|channel| crate::proxy::paths::shadowed_dashboard_page(&channel.prefix).is_none())
         .flat_map(|channel| {
             let prefix = channel
                 .prefix
@@ -814,6 +826,24 @@ pub(crate) fn listen_path_prefixes(network_config: &crate::config::NetworkConfig
             }
         })
         .collect()
+}
+
+/// The prefixes a refusal offers one Transit Point, as the Surface Builder's
+/// picker offers them: all of them where its outbound listener has a hostname
+/// of its own, and the `/outbound` forms alone where an inbound listener shares
+/// that hostname, since a plain one there leads straight to the next refusal.
+/// `None` when the gateway configures none, which needs a different sentence.
+fn offered_listen_path_prefixes(
+    prefixes: &[String],
+    shared_hostname: bool,
+) -> Option<String> {
+    let outbound = crate::proxy::outbound_handler::TP_OUTBOUND_PATH_PREFIX;
+    let shown: Vec<String> = prefixes
+        .iter()
+        .filter(|prefix| !shared_hostname || prefix.starts_with(outbound))
+        .map(|prefix| format!("'{prefix}/'"))
+        .collect();
+    (!shown.is_empty()).then(|| shown.join(", "))
 }
 
 /// Whether `path` claims a route under one of `prefixes` with a segment of its
@@ -887,6 +917,11 @@ pub(crate) fn kept_listen_path_claims(
 /// answers on (`check_listen_path_shadowing`), which needs every surface on
 /// the listener to see.
 pub(crate) const LISTEN_PATH_ROUTE_CLASH: &str = "listen_path_route_clash";
+
+/// The code for a `listen_path` on an alias only a variant defines: the
+/// outbound listener registers no route for it, so the path is stored and
+/// nothing answers it ([`VARIANT_ONLY_REMEDY`]).
+pub(crate) const LISTEN_PATH_VARIANT_ONLY: &str = "listen_path_variant_only";
 
 pub(crate) const LISTEN_PATH_INVALID: &str = "listen_path_invalid";
 pub(crate) const LISTEN_PATH_IS_OUTBOUND_PREFIX: &str = "listen_path_is_outbound_prefix";
@@ -982,20 +1017,25 @@ pub(crate) fn listen_path_problems<'a>(
 ) -> Vec<ListenPathProblem<'a>> {
     let prefix = crate::proxy::outbound_handler::TP_OUTBOUND_PATH_PREFIX;
     let prefixes = listen_path_prefixes(network_config);
-    let offered = if prefixes.is_empty() {
-        "this gateway configures none".to_string()
-    } else {
-        prefixes
-            .iter()
-            .map(|prefix| format!("'{prefix}/'"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
     transit_points_with_variant(surface)
         .filter_map(|(variant, point)| {
             let path = point.listen_path.as_deref()?;
             let claim = (variant, point.alias.as_str(), path);
             let named = named_transit_point(variant, &point.alias);
+            // Offered for this point's own listener: where an inbound listener
+            // shares its hostname, a plain prefix leads to a path that listener
+            // hides, which is the next refusal, so only the `/outbound` forms
+            // are named here.
+            let shared_hostname = point_listener_shares_an_inbound_hostname(network_config, surface, point);
+            let set_a_path = match offered_listen_path_prefixes(&prefixes, shared_hostname) {
+                Some(offered) => format!(
+                    "Set a listen_path with a segment of its own under one of {offered}, or add the prefix it \
+                     needs to 'channels' in gateway.json"
+                ),
+                None => "Add a surface prefix to 'channels' in gateway.json and set a listen_path with a segment \
+                         of its own under it"
+                    .to_string(),
+            };
             if let Err(refusal) = crate::config::types::validate_outbound_listen_path_format(path) {
                 return Some(ListenPathProblem {
                     claim,
@@ -1023,16 +1063,24 @@ pub(crate) fn listen_path_problems<'a>(
                     message: format!(
                         "{named} has listen_path '{path}', under no surface prefix this gateway serves Transit \
                          Points on. {}",
-                        listen_path_remedy(
-                            surface,
-                            variant,
-                            &point.alias,
-                            &format!("Set a listen_path with a segment of its own under one of {offered}")
-                        )
+                        listen_path_remedy(surface, variant, &point.alias, &set_a_path)
                     ),
                 });
             }
             if is_under_outbound_prefix(path) {
+                // Under the prefix every address serves, but an alias only a
+                // variant defines has no route there either: the listener
+                // registers routes from the base surface's points alone, so
+                // this path is stored and nothing answers it.
+                if derived_outbound_route(surface, variant, &point.alias).is_none() {
+                    return Some(ListenPathProblem {
+                        claim,
+                        code: LISTEN_PATH_VARIANT_ONLY,
+                        message: format!(
+                            "{named} has listen_path '{path}', which no route serves. {VARIANT_ONLY_REMEDY}"
+                        ),
+                    });
+                }
                 return None;
             }
             // Reachable where the point's own outbound listener has a hostname
@@ -2341,7 +2389,6 @@ pub async fn build_outbound_port_router(
             //   * When `vc.listen_path` is also set, additionally register
             //     that custom path (the handler uses `vc_alias_override` to
             //     resolve the VC without parsing the request path).
-            let outbound_prefix = crate::proxy::outbound_handler::TP_OUTBOUND_PATH_PREFIX;
             let outbound_base = crate::proxy::outbound_handler::transit_point_outbound_path(route_prefix, &vc.alias);
             let outbound_wildcard = format!("{outbound_base}/{{*path}}");
 
@@ -2377,9 +2424,15 @@ pub async fn build_outbound_port_router(
             }
 
             for variant in &surface.variants {
-                for separator in ["$", "%24"] {
-                    let variant_route =
-                        format!("{outbound_prefix}{route_prefix}{separator}{}/{}", variant.alias, vc.alias);
+                // The same builder the save-time clash check reads, so the two
+                // cannot drift about which routes a variant answers on.
+                for separator in crate::proxy::outbound_handler::VARIANT_ROUTE_SEPARATORS {
+                    let variant_route = crate::proxy::outbound_handler::transit_point_variant_outbound_route(
+                        route_prefix,
+                        separator,
+                        &variant.alias,
+                        &vc.alias,
+                    );
                     vc_routes.push(format!("{variant_route}/{{*path}}"));
                     vc_routes.push(variant_route);
                     if let Some(custom) = vc.listen_path.as_deref() {

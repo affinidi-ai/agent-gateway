@@ -47,9 +47,14 @@ interface StoredTransitPoint extends TransitPointRoute {
   alias?: unknown;
 }
 
-/** The stored surface's Transit Points, or none when it has, or is, nothing usable. */
+/**
+ * The stored surface's Transit Points, or none when it has, or is, nothing usable.
+ * A disabled surface reserves no route and so claims no path, as the gateway reads
+ * it, which is why its points are none.
+ */
 function storedTransitPoints(stored: unknown): StoredTransitPoint[] {
   if (!stored || typeof stored !== 'object') return [];
+  if ((stored as { status?: unknown }).status === 'disabled') return [];
   const transit = (stored as { transit?: unknown }).transit;
   if (!transit || typeof transit !== 'object') return [];
   const points = (transit as { points?: unknown }).points;
@@ -228,9 +233,9 @@ export function validateSurfacePayload(
       const path = text(tp?.listen_path);
       if (!path) return;
       const alias = text(tp?.alias);
-      const before = storedPoints.find(
-        stored => (alias && stored?.alias === alias) || (tp?.id && stored?.id === tp.id)
-      );
+      // By alias alone, as the gateway keys a kept claim: a path that moved to
+      // another point is a new claim there, whatever id it carries.
+      const before = storedPoints.find(stored => alias && text(stored?.alias) === alias);
       const kept = text(before?.listen_path);
       if (kept === path) return;
       const problem = listenPathProblem(tp, routing);

@@ -3,7 +3,7 @@ use std::path::Path;
 use serde_json::json;
 
 /// The surface prefix every BDD gateway configures beside its bootstrap
-/// surfaces'. The multi-gateway fixtures give a Transit Point a `listen_path`
+/// surfaces'. The fixtures that set one give a Transit Point a `listen_path`
 /// of `/transit/<agent>`, and the admin API serves a Transit Point only under a
 /// configured prefix, so a save that keeps such a path needs this one. The
 /// single-surface fixture sets no `listen_path` at all: its Transit Points

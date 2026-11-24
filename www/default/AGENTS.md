@@ -359,7 +359,12 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   gateway, which decides it per listener with the same function its save gate uses, since no
   comparison of the two address lists can express it.
   `offeredChannelPrefixes` is the one implementation of the offered list, read by the picker, by
-  the errors beside it and by the seed, which passes the address it is about to write. A stored `route_prefix` shows as selected only while
+  the errors beside it and by the seed, which passes the address it is about to write.
+  `listenPathProblem`, the save check, builds its own list instead: the admin API accepts a path
+  under either form of a prefix wherever it is reachable, so it reads every configured prefix and
+  then applies the shared-hostname rule, mirroring `claims_a_channel_prefix`. It checks the paths
+  of this surface alone; a path that is another surface's route is left to the API's
+  `listen_path_route_clash`. A stored `route_prefix` shows as selected only while
   it is still offered, and one that is not (a Transit Point recorded as `/agents` whose path begins
   `/outbound/`) is dropped, both fields being re-derived from the stored route instead. Seeding
   writes a prefix only when the route starts with one that is offered, so a route under none of

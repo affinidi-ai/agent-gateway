@@ -64,37 +64,34 @@ function buildRoutePath(customPath: string): string {
   return customPath.startsWith('/') ? customPath : `/${customPath}`;
 }
 
+/**
+ * The same channel's prefix as the new address offers it. Both lists are built by
+ * `offeredChannelPrefixes` and carry the channel's `id`, so the translation follows
+ * the channel rather than the string: a root channel, whose plain form is the whole
+ * listener, keeps its `/outbound` form on every address instead of being stripped to
+ * `/` and composing a path that starts `//`.
+ */
 function translatePrefixForNewAddress({
   selectedPrefix,
   addressSource,
-  isSharedDomain,
-  newIsShared,
+  address,
+  newAddress,
   routingConfig,
 }: {
   selectedPrefix: string;
   addressSource: 'inbound' | 'outbound';
-  isSharedDomain: boolean;
-  newIsShared: boolean;
+  address: string;
+  newAddress: string;
   routingConfig: RoutingConfig | null;
 }): string {
-  if (addressSource !== 'outbound' || !selectedPrefix) return selectedPrefix;
-
-  const prefixes = routingConfig?.channel_path_prefix ?? [];
-
-  if (!isSharedDomain && newIsShared) {
-    const plain = prefixes.find(c => c.prefix === selectedPrefix);
-    if (!plain) return selectedPrefix;
-    return `${OUTBOUND}${plain.prefix.replace(/\/$/, '')}`;
-  }
-
-  if (isSharedDomain && !newIsShared) {
-    if (!selectedPrefix.startsWith(OUTBOUND)) return selectedPrefix;
-    const stripped = selectedPrefix.slice(OUTBOUND.length) || '/';
-    const match = prefixes.find(c => c.prefix === stripped || c.prefix === `${stripped}/`);
-    return match ? match.prefix : selectedPrefix;
-  }
-
-  return selectedPrefix;
+  if (addressSource !== 'outbound' || !selectedPrefix || !routingConfig) return selectedPrefix;
+  const here = offeredChannelPrefixes(routingConfig, addressSource, address);
+  const there = offeredChannelPrefixes(routingConfig, addressSource, newAddress);
+  const channel = here.find(c => c.prefix === selectedPrefix);
+  if (!channel) return selectedPrefix;
+  const sameChannel = (id: string) => id.replace(/^outbound-/, '');
+  const moved = there.find(c => sameChannel(c.id) === sameChannel(channel.id));
+  return moved ? moved.prefix : selectedPrefix;
 }
 
 function HostPortOptions({
@@ -344,12 +341,11 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
   }, [selectedHostPort, selectedPrefix, customPath]);
 
   const handleHostPortChange = (newAddr: string) => {
-    const newIsShared = sharedOutboundAddresses.has(newAddr);
     const newPrefix = translatePrefixForNewAddress({
       selectedPrefix,
       addressSource,
-      isSharedDomain,
-      newIsShared,
+      address: selectedHostPort,
+      newAddress: newAddr,
       routingConfig,
     });
     if (newPrefix === selectedPrefix) {

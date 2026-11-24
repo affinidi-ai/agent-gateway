@@ -41,6 +41,12 @@ pub fn transit_point_variant_outbound_path(
     transit_point_variant_outbound_route(route, "$", variant, alias)
 }
 
+/// The separators a variant route is registered under: the literal `$` and its
+/// percent-encoded form, which axum matches as two distinct paths. Read by the
+/// listener build and by the save-time clash check, so neither can miss a form
+/// the other registers.
+pub const VARIANT_ROUTE_SEPARATORS: [&str; 2] = ["$", "%24"];
+
 /// [`transit_point_variant_outbound_path`] under one of the two separators the
 /// outbound listener registers a variant route with, `$` and its
 /// percent-encoded `%24`: axum matches them as distinct paths, so both are

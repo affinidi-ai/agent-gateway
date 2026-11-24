@@ -87,6 +87,17 @@ changes:
         blocked: it answers at the route the gateway derives from its alias, and clearing the
         fields is how the dashboard asks for that, which the save now reports as a warning naming
         the path that stops answering.
+    - timestamp: '2026-11-24T14:05:00Z'
+      title: Refuse a listen_path on an alias only a variant defines
+      description: >-
+        The outbound listener registers routes from the base surface's Transit Points alone, so a
+        point an alias only a variant defines is reached at no route, and a listen_path on it adds
+        none: the path was stored and nothing answered it. A path outside the outbound prefix
+        already said so in its refusal; one under the prefix was accepted silently. Such a save is
+        now refused with 400 and the code listen_path_variant_only, asking for the alias in the
+        base surface rather than naming a path to set. The refusal also names the prefixes the
+        point's own listener serves, rather than every configured form, and offers adding the
+        prefix to channels in gateway.json as the other way out.
     - timestamp: '2026-11-24T09:35:00Z'
       title: Read a shared outbound hostname as the inbound proxy does
       description: >-
