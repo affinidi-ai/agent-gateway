@@ -176,6 +176,8 @@ Gateway OPA runs before surface-level or transit-level OPA, and a gateway deny i
 | **Span**                                 | One appliance's handling of one request within a trace. The gateway's span id is its request id. _Avoid: hop._ |
 | **Parent span**                          | The span a request names as the one that sent it, in a `traceparent` of the same trace. A request that names none has no parent span. |
 | **Trace source**                         | Where a request's trace id came from: `transit_token` (a verified transit token), `header` (`traceparent` or `X-Gateway-Trace-Id`) or `minted` (the gateway started the trace). |
+| **Event id**                             | The identifier the gateway gives an event when it is created, the same on every delivery of that event (`event_id`). An audit record stored before records had one has none. _Avoid: message id, delivery id._ |
+| **Occurrence time**                      | When an event happened, set by the gateway when the event is created (`occurred_at`), the same on every delivery and retry of that event. Never the time of a send attempt. _Avoid: timestamp, delivery time._ |
 
 ## Payment and outbound mechanics
 

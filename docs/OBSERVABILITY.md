@@ -1345,7 +1345,9 @@ release the lock.
 **Payload.** Audit templates may use `EVENT_TYPE` (`audit.<event>`), `EVENT_NAME`,
 `EVENT_SUMMARY` (the event's name, then whichever of the surface, decision, policy, reason and
 caller the record holds), `EVENT_DATA` (the same as `AUDIT_RECORD`), `APPLIANCE_ID`,
-`TIMESTAMP` (the record's own timestamp), `AUDIT_RECORD`, `AUDIT_CATEGORY`, `AUDIT_TRACE_ID`,
+`EVENT_ID` (the record's `event_id`; empty for a record stored before records had one),
+`OCCURRED_AT` (the record's own `timestamp`), `TIMESTAMP` (deprecated, the same value as
+`OCCURRED_AT`), `AUDIT_RECORD`, `AUDIT_CATEGORY`, `AUDIT_TRACE_ID`,
 `AUDIT_SPAN_ID` (the record's `span_id`), `AUDIT_PARENT_SPAN_ID` (its `parent_span_id`, empty
 when the request named none), `AUDIT_TRACE_SOURCE` (its `trace_source`, empty outside a traced
 request), `AUDIT_SURFACE_ID`, `AUDIT_SURFACE_NAME`,
@@ -1381,12 +1383,18 @@ template sends the default event envelope, whose `data` is the record:
 {
   "event_type": "${EVENT_TYPE}",
   "event_name": "${EVENT_NAME}",
-  "timestamp": "${TIMESTAMP}",
+  "event_id": "${EVENT_ID}",
+  "occurred_at": "${OCCURRED_AT}",
   "appliance_id": "${APPLIANCE_ID}",
   "summary": "${EVENT_SUMMARY}",
   "data": "${EVENT_DATA}"
 }
 ```
+
+Whatever its template, a Stream or Webhook delivery of a record carries the record's `event_id`
+and its time as `occurred_at` at its top level, and no top-level `timestamp` (see
+[`INTEGRATIONS.md`](INTEGRATIONS.md#templates)). The record inside (`data`, `record`) keeps its own
+`timestamp` field, as the VP Audit Log stores it.
 
 Kafka producers belong to the endpoint: every integration and test send on one endpoint shares
 it. It is rebuilt when the brokers, security protocol or SASL settings change and dropped

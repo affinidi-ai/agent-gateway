@@ -207,7 +207,7 @@ when the receipt charged another), `PRICE_MISMATCH` (`true` or `false`), `REASON
 was refused, failed or released, as the ledger row keeps it: clipped to 200 characters with
 credential-shaped words redacted), and `SEVERITY` (`info` for
 `paid`, `challenge_issued`, `held`, `authorized` and `voided`, `warning` for `rejected` and `unconfirmed`, `error` for `unavailable`, `capture_failed` and `reconcile_failed`),
-alongside `EVENT_TYPE` and `TIMESTAMP`. A value that is absent is an empty string. No payer
+alongside the variables every event fills. A value that is absent is an empty string. No payer
 identity or credential is included. The governance audit forwarding of a `payment` record carries
 only the fingerprint of its signed credential (`AUDIT_VP_FINGERPRINT`); `AUDIT_VP_JWT` is empty
 for it (see [`OBSERVABILITY.md`](OBSERVABILITY.md#payment-credentials-in-the-audit-trail)).
@@ -225,21 +225,22 @@ template sends a complete message:
 | --- | --- |
 | `email` | `subject` `${EVENT_NAME}`, `body` `${EVENT_SUMMARY}`, `format` `plain` (or `html` when the body is HTML) |
 | `slack` | `text` `*${EVENT_NAME}*` and `${EVENT_SUMMARY}` on the next line |
-| `webhook`, `stream` | `event_type`, `event_name`, `timestamp`, `appliance_id`, `summary` and `data` (`${EVENT_DATA}`) |
+| `webhook`, `stream` | `event_type`, `event_name`, `event_id`, `occurred_at`, `appliance_id`, `summary` and `data` (`${EVENT_DATA}`) |
 
 Every event fills these variables, plus its own:
 
 | Variable | Value |
 | --- | --- |
-| `EVENT_TYPE` | The event id, such as `gateway.created` |
+| `EVENT_TYPE` | The event's type, such as `gateway.created` |
 | `EVENT_NAME` | Its name, such as `Gateway Created` |
 | `EVENT_SUMMARY` | One line on what happened, such as `Gateway edge was created` |
 | `EVENT_DATA` | The event's own variables as a JSON object with lower-case keys; for an audit event, the audit record |
-| `TIMESTAMP` | RFC 3339 |
+| `EVENT_ID` | The event id: the UUID the gateway gives the event when it creates it, the same on every delivery and retry of it. For an audit event, the record's `event_id`; empty for an audit record stored before records had one |
+| `OCCURRED_AT` | When the event happened, RFC 3339, the same on every delivery and retry of it. For an audit event, the record's own `timestamp`; for `connection_point.connected`, when the connection-setup message was received |
+| `TIMESTAMP` | Deprecated: the same value as `OCCURRED_AT`. Use `OCCURRED_AT` |
 | `APPLIANCE_ID` | The **Appliance ID** set in Settings › System Settings (`appliance_id` in `settings.json`), such as the appliance's id in Agent Watch. It never comes from event values, is never the appliance DID, and is unrelated to any Kafka topic name. Empty while unset. |
 
-The computed variables (`EVENT_TYPE`, `EVENT_NAME`, `EVENT_SUMMARY`, `EVENT_DATA`,
-`APPLIANCE_ID`) are always set by the gateway, never by the code that raised the event. Each
+These variables are always set by the gateway, never by the code that raised the event. Each
 event's own variables, such as `GATEWAY_ID`, `GATEWAY_NAME`, `GATEWAY_DID`,
 `GATEWAY_ROLE` (`Peer` or `Payment`) and `GATEWAY_STATUS` for a gateway event, are listed in the catalog. Gateway and user events, and
 the connection point `created`, `updated` and `deleted` events, also carry `OLD_STATE` and
@@ -275,6 +276,21 @@ of `${SECRET}` stays literal. For `webhook` and `stream`, a string that is exact
 `slack` and `email`, and inside other text, these JSON-valued variables are inserted as JSON
 text and escaped like any other value.
 
+A `webhook` or `stream` delivery carries the event's `event_id` and `occurred_at` at its top
+level, set by the gateway after the template is filled
+([`delivery/values.rs`](../src/integrations/delivery/values.rs)): whatever the template wrote
+under those keys is replaced, an event without an id gets no `event_id` key, and a top-level
+`timestamp` key is removed. Keys inside the message, such as a `timestamp` an operator nests in
+their own object or the audit record's own `timestamp`, are sent as rendered. A webhook's
+signature covers the body as sent. `slack` and `email` messages are sent as rendered. A Kafka
+record carries the message as its payload, keyed by the integration id, and no record header.
+
+`${TIMESTAMP}` is deprecated: it renders the occurrence time, the same value as
+`${OCCURRED_AT}`, so a saved template that uses it keeps working. At startup the gateway logs a
+`warn` (`integrations.template.timestamp_deprecated`) once for each integration whose template
+uses `${TIMESTAMP}` or writes a top-level `timestamp` key, naming the integration id; write
+`${OCCURRED_AT}` instead, or leave the key out.
+
 Values, never the template, are escaped for the transport. Slack messages are sent as mrkdwn,
 with `&`, `<`, and `>` escaped, so caller-supplied text such as a JWT `name` claim cannot
 produce mentions (`<!channel>`) or links. HTML email bodies have `&`, `<`, `>`, `"`, and `'`
@@ -297,8 +313,18 @@ behind them, from Kafka:
 - an integration joining the two with this template, so `record` is the full audit record:
 
   ```json
-  {"event_type":"${EVENT_TYPE}","timestamp":"${TIMESTAMP}","appliance_id":"${APPLIANCE_ID}","record":"${EVENT_DATA}"}
+  {"event_type":"${EVENT_TYPE}","appliance_id":"${APPLIANCE_ID}","record":"${EVENT_DATA}"}
   ```
+
+  The gateway adds the record's `event_id` and its time as `occurred_at` at the top level, so
+  each message is:
+
+  ```json
+  {"event_type":"audit.policy_decision","appliance_id":"<appliance id>","record":{"event_id":"…","timestamp":"…","event":{"policy_decision":{…}},…},"event_id":"…","occurred_at":"…"}
+  ```
+
+  A template saved earlier with `"timestamp":"${TIMESTAMP}"` keeps working: the delivered message
+  is the same, without `timestamp`, and the gateway warns about it at startup.
 
 Set the **Appliance ID** to the gateway's appliance id in Agent Watch, and bind the topic in
 Agent Watch with the `integration_json` format for that appliance. Agent Watch counts a record

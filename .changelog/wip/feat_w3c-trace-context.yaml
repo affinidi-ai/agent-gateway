@@ -48,7 +48,38 @@ changes:
         surface, the target and the verified caller, with the caller grouped as on a policy
         decision, and transit_request_forwarded records as Transit request forwarded, naming the
         Transit Point and no caller. They were shown as generic events.
+    - timestamp: '2026-11-24T14:00:00Z'
+      title: Add EVENT_ID and OCCURRED_AT to every integration event
+      description: >-
+        Every integration event now has an event id, given when the gateway creates the event and
+        the same on every delivery and retry of it, and an occurrence time, when it happened.
+        Templates can use them as ${EVENT_ID} and ${OCCURRED_AT}. Gateway, user, connection point
+        and payment events had no id before; an audit record's id is its own event_id, and an
+        audit record stored before records had one has none. A non-audit event's id is kept in
+        memory only, while the gateway delivers it.
+    - timestamp: '2026-11-24T14:00:00Z'
+      title: Add occurred_at to the event hook body beside timestamp
+      description: >-
+        The event hook's body now carries occurred_at, when the Connection Point event happened.
+        timestamp stays, with the same value, for receivers that read it; occurred_at is the field
+        to use. Both are the same on every retry, as event_id is.
   changed:
+    - timestamp: '2026-11-24T14:00:00Z'
+      title: Place connection_point.connected at the time its message arrived
+      description: >-
+        A connection_point.connected event now happened when its connection-setup message was
+        received: its occurrence time, and its DATE, TIME and DATETIME, are that time, the same as
+        RECEIVED_AT. They were the time the gateway raised the event, and DATE, TIME and DATETIME
+        were described as delivery times.
+    - timestamp: '2026-11-24T14:00:00Z'
+      title: Deprecate the TIMESTAMP template variable for OCCURRED_AT
+      description: >-
+        ${TIMESTAMP} now renders the event's occurrence time, the same value as ${OCCURRED_AT},
+        for every event and on every retry, and is marked deprecated in the variable catalogue.
+        Saved templates that use it keep working. At startup the gateway warns once for each
+        integration whose template uses ${TIMESTAMP} or writes a top-level timestamp key, naming
+        the integration and what to change. The startup warning for a stored definition that
+        fails its checks no longer says its deliveries will fail.
     - timestamp: '2026-11-23T14:00:00Z'
       title: Send the Managed Agent one set of trace headers
       description: >-
@@ -107,3 +138,13 @@ changes:
         otherwise starts a 32 hex trace. The records it writes before its transit token is checked
         for the last time (a refused caller, a rate limit, a refused body) no longer carry a
         trace id, only their span, so a token refused later never names their trace.
+    - timestamp: '2026-11-24T14:00:00Z'
+      title: ⭐ Deliver webhook and stream events with event_id and occurred_at
+      description: >-
+        Every webhook and stream delivery now carries the event's event_id and occurred_at at its
+        top level, set by the gateway whatever the integration's template wrote there, and no
+        top-level timestamp: a template's top-level timestamp key is removed. The default envelope
+        sends event_id and occurred_at in place of timestamp. A receiver that read timestamp must
+        read occurred_at. A key named timestamp inside the message, such as the audit record's own
+        field, is unchanged. Slack and email messages are sent as before, and no Kafka record
+        carries a header.
