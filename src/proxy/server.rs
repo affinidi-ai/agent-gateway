@@ -873,8 +873,10 @@ fn claims_a_channel_prefix(
 
 /// What tells one Transit Point's `listen_path` from another's: the variant
 /// that defines the point, the point's alias, and the path itself. The same
-/// path on another point, or copied into a variant, registers routes of its
-/// own and forwards to that point's own Target, so it is not the same claim.
+/// path on another point registers routes of its own and forwards to that
+/// point's own Target, so it is not the same claim. The same point's path under
+/// a variant is, since the listener builds that variant's routes from the base
+/// point and its path, and adds none for the copy.
 pub(crate) type ListenPathClaim<'a> = (Option<&'a str>, &'a str, &'a str);
 
 /// What `stored`, the surface as the gateway holds it, already claims, so a
@@ -4245,8 +4247,8 @@ mod tests {
                     LISTEN_PATH_NOT_A_CHANNEL_PREFIX,
                     "Transit Point 'other-prefix' has listen_path '/outbound/other/b', under no surface prefix this \
                      gateway serves Transit Points on. Set a listen_path with a segment of its own under one of \
-                     '/outbound/example/', '/example/', '/outbound/transit/', '/transit/', or leave it unset to \
-                     take '/outbound/example/other-prefix'."
+                     '/outbound/example/', '/outbound/transit/', or add the prefix it needs to 'channels' in \
+                     gateway.json, or leave it unset to take '/outbound/example/other-prefix'."
                 ),
                 (
                     LISTEN_PATH_IS_OUTBOUND_PREFIX,
@@ -4264,8 +4266,8 @@ mod tests {
                     LISTEN_PATH_NOT_A_CHANNEL_PREFIX,
                     "Transit Point 'lookalike' has listen_path '/outbound-partner', under no surface prefix this \
                      gateway serves Transit Points on. Set a listen_path with a segment of its own under one of \
-                     '/outbound/example/', '/example/', '/outbound/transit/', '/transit/', or leave it unset to \
-                     take '/outbound/example/lookalike'."
+                     '/outbound/example/', '/outbound/transit/', or add the prefix it needs to 'channels' in \
+                     gateway.json, or leave it unset to take '/outbound/example/lookalike'."
                 ),
                 (
                     LISTEN_PATH_NOT_SERVED,
@@ -4308,18 +4310,47 @@ mod tests {
 
     #[test]
     fn a_surface_served_under_the_outbound_prefix_has_no_listen_path_problem() {
+        // The variant overrides a base alias, so its path is one the listener
+        // registers; an alias only the variant defines has no route to add one
+        // to, which is the test below.
         let served = surface_with_points(
             serde_json::json!([
                 { "alias": "inside", "target_endpoint": "https://b.example", "listen_path": "/outbound/example/b" },
                 { "alias": "derived", "target_endpoint": "https://d.example" }
             ]),
             serde_json::json!([
-                { "alias": "variant-inside", "target_endpoint": "https://e.example",
+                { "alias": "inside", "target_endpoint": "https://e.example",
                     "listen_path": "/outbound/example/v" }
             ]),
         );
 
         assert!(listen_path_problems(&served, &channel_config()).is_empty());
+    }
+
+    /// Under the prefix every address serves, so the first three checks pass,
+    /// and still unreachable: the listener registers routes for the base
+    /// surface's Transit Points alone, so a path on an alias only a variant
+    /// defines is stored and nothing answers it.
+    #[test]
+    fn a_variant_only_alias_under_the_outbound_prefix_is_told_no_route_serves_it() {
+        let surface = surface_with_points(
+            serde_json::json!([{ "alias": "inside", "target_endpoint": "https://b.example" }]),
+            serde_json::json!([
+                { "alias": "variant-inside", "target_endpoint": "https://e.example",
+                    "listen_path": "/outbound/example/v" }
+            ]),
+        );
+
+        let problems = listen_path_problems(&surface, &channel_config());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].code, LISTEN_PATH_VARIANT_ONLY);
+        assert!(
+            problems[0]
+                .message
+                .ends_with(VARIANT_ONLY_REMEDY),
+            "{}",
+            problems[0].message
+        );
     }
 
     /// A gateway configuring the surface prefixes `/example` and `/transit`,
@@ -4506,11 +4537,16 @@ mod tests {
 
         let kept = kept_listen_path_claims(Some(&stored));
 
-        assert_eq!(kept.len(), 1, "a point with no listen_path claims nothing: {kept:?}");
         assert!(kept.contains(&(None, "outside", "/partner-a-webhook")));
         assert!(
-            !kept.contains(&(Some("candidate"), "outside", "/partner-a-webhook")),
-            "a copy into a variant is a claim of its own"
+            kept.contains(&(Some("candidate"), "outside", "/partner-a-webhook")),
+            "the same point's path under a variant adds no route: the listener builds the variant's routes from \
+             the base point, and a dashboard save writes that inherited copy into every variant"
+        );
+        assert_eq!(kept.len(), 2, "a point with no listen_path claims nothing: {kept:?}");
+        assert!(
+            !kept.contains(&(Some("candidate"), "elsewhere", "/partner-a-webhook")),
+            "the same path on another Transit Point is a claim of its own, in a variant as on the base surface"
         );
         assert!(
             !kept.contains(&(None, "elsewhere", "/partner-a-webhook")),

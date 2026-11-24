@@ -9697,7 +9697,7 @@ mod validation_tests {
         );
 
         let message = match check_listen_path_shadowing(&surface, None, &[], &no_ports) {
-            Err(SurfaceApiError::BadRequest(message)) => message,
+            Err(SurfaceApiError::BadRequestCode(_, message)) => message,
             other => panic!("expected a refusal, got {other:?}"),
         };
         assert!(message.contains("'/outbound/api/pb'") && message.contains("'pb'"), "{message}");
@@ -9718,7 +9718,7 @@ mod validation_tests {
         );
 
         let message = match check_listen_path_shadowing(&surface, None, std::slice::from_ref(&other), &no_ports) {
-            Err(SurfaceApiError::BadRequest(message)) => message,
+            Err(SurfaceApiError::BadRequestCode(_, message)) => message,
             other => panic!("expected a refusal, got {other:?}"),
         };
         assert!(message.contains("surface 'one'"), "{message}");
@@ -9753,7 +9753,7 @@ mod validation_tests {
                 .points[1]
                 .listen_path = Some(route.to_string());
             let message = match check_listen_path_shadowing(&claiming, None, &[], &no_ports) {
-                Err(SurfaceApiError::BadRequest(message)) => message,
+                Err(SurfaceApiError::BadRequestCode(_, message)) => message,
                 other => panic!("expected a refusal for {route}, got {other:?}"),
             };
             assert!(message.contains("'alpha'") && message.contains(route), "{message}");
@@ -9872,7 +9872,7 @@ mod validation_tests {
         surface.access_point.route = "/agents/b".to_string();
 
         let message = match check_listen_path_shadowing(&surface, None, std::slice::from_ref(&other), &no_ports) {
-            Err(SurfaceApiError::BadRequest(message)) => message,
+            Err(SurfaceApiError::BadRequestCode(_, message)) => message,
             other => panic!("expected a refusal, got {other:?}"),
         };
         assert!(message.contains("surface 'Orders'"), "{message}");
@@ -9913,7 +9913,7 @@ mod validation_tests {
             .points[0]
             .listen_path = Some("/outbound/agents/orders$beta/alpha".to_string());
         let message = match check_listen_path_shadowing(&own_variant, None, &[], &no_ports) {
-            Err(SurfaceApiError::BadRequest(message)) => message,
+            Err(SurfaceApiError::BadRequestCode(_, message)) => message,
             other => panic!("expected a refusal, got {other:?}"),
         };
         assert!(message.contains("default variant's Target"), "{message}");
@@ -10229,8 +10229,13 @@ mod validation_tests {
         assert_eq!(code, "listen_path_is_outbound_prefix");
         assert!(msg.starts_with("Transit Point 'pb' in variant 'candidate': "), "{msg}");
 
-        let served = surface_with_a_variant_only_listen_path("/outbound/api/partner-b");
-        listen_path_check(&served, None).expect("a variant path under the prefix is served");
+        // Under the prefix every address serves, and still unreachable: the
+        // listener registers routes from the base surface's Transit Points
+        // alone, so this alias has none and the path adds none.
+        let under_the_prefix = surface_with_a_variant_only_listen_path("/outbound/api/partner-b");
+        let (code, msg) = listen_path_refusal(&under_the_prefix, None);
+        assert_eq!(code, crate::proxy::server::LISTEN_PATH_VARIANT_ONLY);
+        assert!(msg.contains("Define the alias in the base surface too"), "{msg}");
     }
 
     #[test]
