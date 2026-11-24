@@ -125,7 +125,9 @@ changes:
         time the surface was stored and the operator none the wiser. The admin API now refuses the
         save that introduces either, with 400 and the code listen_path_is_outbound_prefix or
         listen_path_invalid, naming the Transit Point, its variant and what to do instead, on the
-        base surface and in every variant. A brace, which axum reads as a path parameter so the
+        base surface and in every variant, except that a variant path on an alias the base surface
+        defines that differs from the base point's path is told listen_path_variant_unserved
+        instead. A brace, which axum reads as a path parameter so the
         point silently answers every value in that position, is now one of the paths the gateway
         calls malformed, as is a segment starting with ':' or '*', the parameter syntax axum used
         before 0.8 and refuses now. This refuses saves every deployment accepted until now:
@@ -148,7 +150,11 @@ changes:
         by nothing: one on an alias only a variant defines, which has no route at all, and one a
         variant sets where its base point holds a different path or none. Both are now refused with
         400 and the code listen_path_variant_unserved, naming the base point's path and asking for
-        the alias, or the path, on the base surface. This refuses saves accepted until now.
+        the alias, or the path, on the base surface, when the save introduces that path. For an
+        alias the base surface defines, this is told before any other problem with the path, since
+        the listener never registers it. A variant path equal to the stored base point's path, kept
+        or set in that save, is stored with a Warning header and not refused, even when the same
+        save moves the base point's path. This refuses saves accepted until now.
         Migration: set the path on the base Transit Point, or leave the variant's copy as the base
         point has it. The refusal also names the prefixes the point's own listener serves, rather
         than every configured form, and offers adding the prefix to channels in gateway.json as the

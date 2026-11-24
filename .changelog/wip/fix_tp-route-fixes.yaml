@@ -1,0 +1,18 @@
+branch: fix/tp-route-fixes
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-24T18:05:00Z'
+      title: Carry a base Transit Point's Listen Path edit into its variants
+      description: >-
+        A variant in the Surface Builder holds its own copy of each Transit Point, taken from the
+        base surface when it was created or first opened. Changing a base Transit Point's Listen
+        Path left that copy on the base's old path, which no route serves, since the outbound
+        listener builds a variant's routes from the base point's path, so the variant's stored
+        configuration disagreed with where it answers. The copy now follows the base path, together
+        with the prefix and custom path the picker shows, in every variant whose copy held the
+        base's previous path; a variant that had set a different path keeps it.
+  removed: []
+  security: []
+  breaking: []

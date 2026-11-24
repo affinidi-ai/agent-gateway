@@ -128,26 +128,36 @@ a segment of its own after that prefix: `/<channel>/<name>` or `/outbound/<chann
 Those are the prefixes the Surface Builder's **Listen Path** picker offers: both forms on an
 outbound address with a hostname of its own, the `/outbound` ones alone on an address shared with
 an inbound listener. These are the paths the gateway cannot serve as the Transit Point means it,
-on the base surface and in every variant alike:
+on the base surface and in every variant. A path is told the first row it matches, except that a
+variant path on an alias the base surface defines that differs from the base point's path is told
+the variant row first:
 
 | Path | What happens | On save |
 | --- | --- | --- |
-| One the outbound router cannot register as written: no leading `/`, `/` or `//` alone, a `..` segment, `{` or `}` (axum reads a balanced pair as a path parameter, so the Transit Point silently answers every value in that position, and the listener build panics on a conflict there), or a segment starting with `:` or `*` (axum's pre-0.8 parameter syntax, which it refuses outright) | The outbound listener build panics, taking the gateway down, once the surface is stored | Refused, `400` with the code `listen_path_invalid` |
+| One the outbound router cannot register as written: no leading `/`, `/` or `//` alone, a `..` segment, `{` or `}` (axum reads a balanced pair as a path parameter, so the Transit Point silently answers every value in that position, and the listener build panics on a conflict there), or a segment starting with `:` or `*` (axum's pre-0.8 parameter syntax, which it refuses outright) | The outbound listener build panics, taking the gateway down, once the surface is stored; a variant path on an alias the base surface defines that differs from the base point's path is never registered, so it is told the variant row below instead | Refused, `400` with the code `listen_path_invalid` |
 | `/outbound` itself, bare or with a trailing slash | The point answers every `/outbound` request no more specific route matches, the derived routes of other Transit Points still winning | Refused, `400` with the code `listen_path_is_outbound_prefix` |
 | Under no configured surface prefix, or a bare prefix with no segment of its own: `/partner-a-webhook`, `/outbound/not-a-channel/x`, `/<channel>`, `/<channel>/`, `/<channel>//` (the listener trims every trailing slash, so slashes are no segment) | The dashboard cannot compose it, and it claims a route outside the space the gateway serves Transit Points on, or the whole prefix and its wildcard | Refused, `400` with the code `listen_path_not_a_channel_prefix`, naming the prefixes this gateway does offer |
-| A path a variant sets that no route serves, wherever it sits: on an alias only that variant defines, or where the base point holds a different path or none | The outbound listener registers routes from the base surface's Transit Points alone, and builds each variant's from a base point's alias and path, so nothing answers the variant's own path | Refused, `400` with the code `listen_path_variant_unserved`, asking for the alias, or the path, on the base surface rather than naming a path to set |
+| A path a variant sets that no route serves, wherever it sits: on an alias only that variant defines, or where the base point holds a different path or none | The outbound listener registers routes from the base surface's Transit Points alone, and builds each variant's from a base point's alias and path, so nothing answers the variant's own path | Refused when the save introduces the path, `400` with the code `listen_path_variant_unserved`, asking for the alias, or the path, on the base surface rather than naming a path to set. For an alias the base surface defines, this is told before any other problem with the path, since the listener never registers it. A variant path equal to the stored base point's path, kept or set in that save, is stored with a `Warning` header and not refused, even when the same save moves the base point's path |
 | A path outside `/outbound`, under a configured prefix: `/<channel>/<name>` | The point answers it on its outbound listener's own address. An inbound listener that shares a hostname with that listener forwards `/outbound` and nothing else, so the path is not reachable through the inbound address | Refused where **the point's own outbound listener** shares a hostname with an inbound listener, `400` with the code `listen_path_not_served`, which is also where the Surface Builder offers the `/outbound` prefixes alone. The listener is the point's `listen_address`, or the surface's `outbound_listen_address`, so one point may be held to the outbound prefix while another on a listener of its own is not. Where that listener has a hostname of its own the path is reachable, the picker offers it, and the save stores it; a path already stored gets a `Warning` header naming the point, its variant and the route it would otherwise answer on |
 
 Each refusal names the Transit Point, its variant and what to do instead, and applies only to a
 path the save introduces or changes; a path a surface already holds is answered with a `Warning`
 header of the same text instead. The same Transit Point, in the same variant, keeping the same
 path is exempt, so a surface stored with such a path before this release stays editable, as is a
-variant that repeats its base point's path, which adds no route of its own. Moving the path to
+variant path equal to the stored base point's path, kept or set in that save, which adds no route
+of its own. That holds when the same save moves the base point's path: such a variant path is
+then answered with a `Warning` header rather than refused. Moving the path to
 another Transit Point, renaming the point, or
 renaming the variant (which re-introduces every path that variant holds) is a new claim. A
 disabled surface reserves no route, so saving one is never refused and, claiming nothing while
 disabled, enabling it introduces every path it names: a surface disabled with a refused path
 cannot be enabled until the path changes.
+
+Accepted risk: a save that moves a base Transit Point's `listen_path` stores a variant path equal
+to the base point's previous path, kept or set in that save, with a `Warning` header rather than
+refusing it. The variant's stored copy then disagrees with where it answers, and nothing serves
+that path: the variant answers at the base point's new path with `$<variant>` after it. Set the
+variant's path to the base point's, as the Surface Builder does when the base path changes.
 
 A `listen_path` is also refused when it is a route another Transit Point already answers on,
 whether that point belongs to this surface or another on the same outbound listener. Those are

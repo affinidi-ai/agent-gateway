@@ -383,7 +383,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   already stored with such a path stays editable and its save is answered with a `Warning` header.
   That comparison is why the rule cannot live in the node's `incompleteReason`, which sees no
   stored surface. Clearing the path saves, and `validateSurfacePayload` warns that the stored path
-  stops answering. What the gateway
+  stops answering. A base Transit Point's Listen Path edit is carried into every variant snapshot
+  whose copy of that alias held the base's previous path (`propagateBaseListenPaths`), since a
+  variant path that differs from its base point's is never served (`listen_path_variant_unserved`
+  on a save that introduces it); a variant whose path already differed keeps it. What the gateway
   stores and what it refuses is in
   [`docs/CONFIGURATION_REFERENCE.md`](../../docs/CONFIGURATION_REFERENCE.md#transit-point-listen-paths).
 - **Entry point URL** is the label for an Access Point's composed URL, with "The URL used to

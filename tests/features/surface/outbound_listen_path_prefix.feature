@@ -14,7 +14,7 @@ Feature: A Transit Point's listen_path is held to the routes the gateway serves
   a deployment whose outbound listener has a hostname of its own serves such a
   path and stores it without a word. A path a surface already holds is answered
   with a Warning rather than refused, and a path that is a route another Transit
-  Point answers on is refused whoever holds it.
+  Point answers on is refused when a save introduces it.
 
   Background:
     Given A2A surface "example-surface" is defined for route "/example" with managed agent "example-agent" as its target

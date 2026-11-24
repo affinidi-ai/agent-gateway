@@ -905,6 +905,11 @@ pub(crate) fn kept_listen_path_claims(
 /// unrelated field would be refused for a path nobody touched. The variant need
 /// not be one the gateway already stores, since a variant added in the same
 /// save copies the same path.
+///
+/// `kept` is the stored surface's, so a variant path equal to the stored base
+/// point's path, kept or set in this save, is exempt even when the same save
+/// moves the base point's path: it is stored with a `Warning` that no route
+/// serves it rather than refused.
 pub(crate) fn inherits_a_kept_base_claim(
     claim: &ListenPathClaim<'_>,
     kept: &std::collections::HashSet<ListenPathClaim<'_>>,
@@ -1048,10 +1053,14 @@ fn named_transit_point(
 /// serve as the Transit Point means it: one the outbound router cannot
 /// register as written, one that is [`TP_OUTBOUND_PATH_PREFIX`] itself and so
 /// answers every outbound request no more specific route matches, one under no
-/// prefix the gateway serves Transit Points on ([`listen_path_prefixes`]), and
+/// prefix the gateway serves Transit Points on ([`listen_path_prefixes`]), one
+/// a variant sets that no route serves ([`variant_path_no_route_serves`]), and
 /// one outside [`TP_OUTBOUND_PATH_PREFIX`], which the shared-hostname inbound
-/// listener never forwards. A path is reported as the first of the four it
-/// matches, so each Transit Point appears at most once.
+/// listener never forwards. A path is reported as the first of the five it
+/// matches, in that order, except that a variant path on an alias the base
+/// surface defines that differs from the base point's path is told it is
+/// unserved before any other check, since the listener never registers it.
+/// Each Transit Point appears at most once.
 pub(crate) fn listen_path_problems<'a>(
     surface: &'a crate::config::agent_surface::AgentSurface,
     network_config: &crate::config::NetworkConfig,
@@ -1077,6 +1086,18 @@ pub(crate) fn listen_path_problems<'a>(
                          of its own under it"
                     .to_string(),
             };
+            let unserved = |reason: String| ListenPathProblem {
+                claim,
+                code: LISTEN_PATH_VARIANT_UNSERVED,
+                message: format!("{named} has listen_path '{path}', which no route serves. {reason}"),
+            };
+            // A variant's own path on an alias the base defines is never
+            // registered, so what is wrong with its form is beside the point.
+            if derived_outbound_route(surface, variant, &point.alias).is_some()
+                && let Some(reason) = variant_path_no_route_serves(surface, variant, point)
+            {
+                return Some(unserved(reason));
+            }
             if let Err(refusal) = crate::config::types::validate_outbound_listen_path_format(path) {
                 return Some(ListenPathProblem {
                     claim,
@@ -1108,18 +1129,11 @@ pub(crate) fn listen_path_problems<'a>(
                     ),
                 });
             }
-            // A path a variant sets that the listener never registers, wherever
-            // it sits: `group_outbound_vcs_by_port` reads the base surface's
-            // Transit Points, so an alias only a variant defines has no route to
-            // add one to, and a variant that overrides a base point's path is
-            // registered at the base point's path with `$<variant>` after it,
-            // never at its own.
-            if let Some(unserved) = variant_path_no_route_serves(surface, variant, point) {
-                return Some(ListenPathProblem {
-                    claim,
-                    code: LISTEN_PATH_VARIANT_UNSERVED,
-                    message: format!("{named} has listen_path '{path}', which no route serves. {unserved}"),
-                });
+            // An alias only a variant defines: `group_outbound_vcs_by_port`
+            // reads the base surface's Transit Points, so it has no route to
+            // add a path to.
+            if let Some(reason) = variant_path_no_route_serves(surface, variant, point) {
+                return Some(unserved(reason));
             }
             if is_under_outbound_prefix(path) {
                 return None;
@@ -4267,6 +4281,10 @@ mod tests {
     fn listen_path_problems_name_every_path_the_gateway_cannot_serve_as_meant() {
         let surface = surface_with_mixed_listen_paths();
         let problems = listen_path_problems(&surface, &channel_config());
+        let variant_only_unserved = format!(
+            "Transit Point 'variant-outside' in variant 'candidate' has listen_path '/transit/variant-hook', which \
+             no route serves. {VARIANT_ONLY_REMEDY}"
+        );
 
         let told: Vec<(&str, &str)> = problems
             .iter()
@@ -4308,16 +4326,7 @@ mod tests {
                      '/outbound/example/', '/outbound/transit/', or add the prefix it needs to 'channels' in \
                      gateway.json, or leave it unset to take '/outbound/example/lookalike'."
                 ),
-                (
-                    LISTEN_PATH_NOT_SERVED,
-                    "Transit Point 'variant-outside' in variant 'candidate' has listen_path '/transit/variant-hook', \
-                     outside '/outbound'. It answers on the outbound listener alone, and an inbound listener \
-                     shares that listener's hostname, so it is not reached there. No listen_path reaches this \
-                     Transit Point at all: the outbound listener registers routes for the base surface's Transit \
-                     Points alone, and builds a variant's routes from a base point's alias and path. Define the \
-                     alias in the base surface too, and this variant answers at that point's routes with \
-                     '$<variant>' in them."
-                ),
+                (LISTEN_PATH_VARIANT_UNSERVED, variant_only_unserved.as_str()),
             ]
         );
         assert_eq!(problems[0].claim, (None, "outside", "/transit/outside"));
@@ -4393,6 +4402,24 @@ mod tests {
         );
     }
 
+    /// The listener never registers that path, so a form check on it would
+    /// name a fault the operator need not fix.
+    #[test]
+    fn a_malformed_variant_path_its_base_point_does_not_hold_is_told_no_route_serves_it() {
+        let surface = surface_with_points(
+            serde_json::json!([
+                { "alias": "inside", "target_endpoint": "https://b.example", "listen_path": "/outbound/example/b" }
+            ]),
+            serde_json::json!([
+                { "alias": "inside", "target_endpoint": "https://e.example", "listen_path": "partner-v" }
+            ]),
+        );
+
+        let problems = listen_path_problems(&surface, &channel_config());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].code, LISTEN_PATH_VARIANT_UNSERVED);
+    }
+
     /// Under the prefix every address serves, so the first three checks pass,
     /// and still unreachable: the listener registers routes for the base
     /// surface's Transit Points alone, so a path on an alias only a variant
@@ -4444,11 +4471,13 @@ mod tests {
 
         assert_eq!(listen_path_warnings(&shared, &surface).len(), 6, "every problem is told on a shared hostname");
         let told = listen_path_warnings(&separate, &surface);
-        assert_eq!(told.len(), 4, "a path outside the prefix is reachable here: {told:?}");
+        assert_eq!(told.len(), 5, "a path outside the prefix is reachable here: {told:?}");
         assert!(told[0].starts_with("Transit Point 'other-prefix' "), "{told:?}");
         assert!(told[1].starts_with("Transit Point 'prefix': "), "{told:?}");
         assert!(told[2].starts_with("Transit Point 'malformed': "), "{told:?}");
         assert!(told[3].starts_with("Transit Point 'lookalike' "), "{told:?}");
+        // No route serves it on either kind of deployment.
+        assert!(told[4].starts_with("Transit Point 'variant-outside' in variant 'candidate' "), "{told:?}");
     }
 
     /// A gateway whose inbound listener shares a hostname with one outbound

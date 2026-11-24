@@ -5,6 +5,7 @@ import {
   BASE_VARIANT_ID,
   baseSurfaceFromSnapshot,
   patchAccessPointCanvasNode,
+  propagateBaseListenPaths,
   syncAccessPointIdentifiers,
   useVariantSnapshots,
 } from '../useVariantSnapshots';
@@ -1007,5 +1008,74 @@ describe('syncAccessPointIdentifiers', () => {
     // Snapshot without access_point is untouched (no access_point injected).
     expect(out.noAp).toEqual({ target: { endpoint: 'x' } });
     expect(out.noAp.access_point).toBeUndefined();
+  });
+});
+
+describe('propagateBaseListenPaths', () => {
+  const withPath = (listenPath: string | undefined, suffix?: string) => ({
+    transit: {
+      points: [{ id: 'tp1', alias: 'alpha', ...(listenPath ? { listen_path: listenPath } : {}) }],
+    },
+    canvas: {
+      nodes: [
+        {
+          id: 'n1',
+          type: 'transit-point-a2a',
+          config: {
+            id: 'tp1',
+            ...(listenPath ? { listen_path: listenPath } : {}),
+            ...(suffix ? { route_prefix: '/outbound/example', route_suffix: suffix } : {}),
+          },
+        },
+      ],
+    },
+  });
+
+  it('moves a variant copy that equalled the old base path to the new one', () => {
+    const before = withPath('/outbound/example/old', 'old');
+    const after = withPath('/outbound/example/new', 'new');
+    const out = propagateBaseListenPaths(
+      { [BASE_VARIANT_ID]: before, v1: before, v2: withPath(undefined) },
+      before,
+      after
+    );
+    expect(out.v1.transit.points[0].listen_path).toBe('/outbound/example/new');
+    expect(out.v1.canvas.nodes[0].config.route_suffix).toBe('new');
+    expect(out.v1.canvas.nodes[0].config.listen_path).toBe('/outbound/example/new');
+    expect(out[BASE_VARIANT_ID]).toBe(before);
+  });
+
+  it('keeps a variant path that differed from the old base path', () => {
+    const before = withPath('/outbound/example/old', 'old');
+    const after = withPath('/outbound/example/new', 'new');
+    const own = withPath('/outbound/example/own', 'own');
+    const out = propagateBaseListenPaths({ v1: own }, before, after);
+    expect(out.v1).toBe(own);
+  });
+
+  it('gives a variant that copied an unset base path the path the base now sets', () => {
+    const out = propagateBaseListenPaths(
+      { v1: withPath(undefined) },
+      withPath(undefined),
+      withPath('/outbound/example/new', 'new')
+    );
+    expect(out.v1.transit.points[0].listen_path).toBe('/outbound/example/new');
+    expect(out.v1.canvas.nodes[0].config.route_prefix).toBe('/outbound/example');
+  });
+
+  it('carries a base edit into a frozen variant snapshot when the canvas leaves the base', () => {
+    const { result } = renderHook(() => useVariantSnapshots());
+    act(() => {
+      result.current.hydrateFromPayload({
+        ...withPath('/outbound/example/old'),
+        variants: [{ id: 'v1', alias: 'cand', name: 'Candidate', overrides: {} }],
+      });
+    });
+    expect(result.current.activeVariantId).toBe(BASE_VARIANT_ID);
+    act(() => {
+      result.current.switchVariant('v1', withPath('/outbound/example/new'));
+    });
+    const { variants } = result.current.buildVariantsWireSlice(result.current.getSnapshot('v1'));
+    expect(variants[0].overrides.transit?.points?.[0]?.listen_path).toBe('/outbound/example/new');
   });
 });
