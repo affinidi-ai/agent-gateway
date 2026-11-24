@@ -98,6 +98,40 @@ describe('AuditEventPicker', () => {
     expect(onChange).toHaveBeenCalledWith(['policy_decision', 'auth_failed']);
   });
 
+  it('lists the forwarded request events under Requests in the order the catalog gives', () => {
+    const requests = ['request_rejected', 'request_forwarded', 'transit_request_forwarded'];
+    const onChange = jest.fn();
+    render(
+      <AuditEventPicker
+        testIdPrefix="picker"
+        catalog={[
+          CATALOG[2],
+          {
+            event: 'request_forwarded',
+            label: 'Request Forwarded',
+            description: 'An Access Point request was forwarded to its target',
+            group: 'requests',
+            group_label: 'Requests',
+          },
+          {
+            event: 'transit_request_forwarded',
+            label: 'Transit Request Forwarded',
+            description: 'A Transit Point request was forwarded to its target',
+            group: 'requests',
+            group_label: 'Requests',
+          },
+        ]}
+        selected={[]}
+        onChange={onChange}
+      />
+    );
+
+    expect(screen.getByText('Transit Request Forwarded')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('picker-group-requests'));
+
+    expect(onChange).toHaveBeenCalledWith(requests);
+  });
+
   it('keeps selected events the catalog does not list', () => {
     const onChange = showPicker(['retired_event', 'policy_decision']);
 

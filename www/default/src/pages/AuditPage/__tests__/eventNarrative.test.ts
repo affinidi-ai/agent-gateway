@@ -312,6 +312,59 @@ describe('eventNarrative', () => {
     });
   });
 
+  describe('forwarded requests', () => {
+    it('says which surface forwarded a request to which target, and its caller', () => {
+      const n = describeEntry(
+        at(
+          { request_forwarded: { flow: 'access_point', caller_did: 'did:web:caller.example' } },
+          {
+            channel_name: 'Orders',
+            surface_variant: 'beta',
+            protocol: 'mcp',
+            target_endpoint: 'https://agent.example/mcp?key=<redacted>',
+          }
+        )
+      );
+      expect(n).toEqual({
+        title: 'Request forwarded',
+        tone: 'neutral',
+        summary:
+          'The Access Point of Orders forwarded the request to https://agent.example/mcp?key=<redacted>, on variant beta.',
+        detail: 'Caller did:web:caller.example (mcp).',
+      });
+    });
+
+    it('says a forwarded request had no verified caller, and when it went over Fabric', () => {
+      const n = describeEntry(
+        at(
+          { request_forwarded: { flow: 'access_point' } },
+          { channel_name: 'Orders', target_endpoint: 'fabric://gw-2/orders', via_fabric: true }
+        )
+      );
+      expect(n.summary).toBe(
+        'The Access Point of Orders forwarded the request to fabric://gw-2/orders over Fabric.'
+      );
+      expect(n.detail).toBe('No verified caller.');
+    });
+
+    it('names the Transit Point that forwarded a request, and no caller', () => {
+      const n = describeEntry(
+        at(
+          { transit_request_forwarded: { transit_point: 'tools' } },
+          { channel_name: 'Orders', protocol: 'mcp', target_endpoint: 'https://tools.example/mcp' }
+        )
+      );
+      expect(n).toEqual({
+        title: 'Transit request forwarded',
+        tone: 'neutral',
+        summary:
+          'Transit Point tools of Orders forwarded the request to https://tools.example/mcp.',
+        detail:
+          'The original caller is on the Access Point’s Request Forwarded record of the same trace.',
+      });
+    });
+  });
+
   it('tones unit events semantically', () => {
     expect(eventTone(at('token_injected'))).toBe('allow');
     expect(eventTone(at('consent_required'))).toBe('warn');

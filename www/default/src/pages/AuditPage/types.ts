@@ -60,6 +60,20 @@ export interface RequestRejectedData {
   } | null;
 }
 
+/** An Access Point request handed to its target. */
+export interface RequestForwardedData {
+  /** `access_point`. */
+  flow: string;
+  /** The caller's DID, only when source authentication verified the caller. */
+  caller_did?: string | null;
+}
+
+/** A Transit Point request handed to its target. It names no caller. */
+export interface TransitRequestForwardedData {
+  /** The Transit Point's alias. */
+  transit_point: string;
+}
+
 export interface TraceTerminatedData {
   /** This gateway's own trace for the request (its audit + caller-facing leg). */
   own_trace_id: string;
@@ -136,6 +150,8 @@ export type AuditEventField =
   | { trust_check: TrustCheckData }
   | { trace_terminated: TraceTerminatedData }
   | { request_rejected: RequestRejectedData }
+  | { request_forwarded: RequestForwardedData }
+  | { transit_request_forwarded: TransitRequestForwardedData }
   | Partial<Record<PolicyChangeEvent, PolicyChangeData>>
   | Record<string, unknown>;
 

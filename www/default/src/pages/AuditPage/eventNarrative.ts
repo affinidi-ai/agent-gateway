@@ -3,18 +3,21 @@ import {
   categoryLabel,
   changedPartsLabel,
   eventTypeName,
+  fieldStr,
   flowLabel,
   modeLabel,
   policyChange,
   policyChangeTitle,
   policyDecision,
   isTargetAuthPassthrough,
+  requestForwarded,
   requestRejected,
   scopeLabel,
   slotLabel,
   surfaceIdOf,
   targetLabel,
   traceTerminated,
+  transitRequestForwarded,
   trustCheck,
 } from './auditHelpers';
 import type { AuditEntry, PolicyChangeActor, PolicyChangeData, PolicyChangeEvent } from './types';
@@ -221,6 +224,17 @@ function describePolicyChange(
   }
 }
 
+/**
+ * Where a forwarded request went, as its record names it, e.g.
+ * "https://agent.example/mcp over Fabric, on variant beta".
+ */
+function forwardedTo(entry: AuditEntry): string {
+  const variantPhrase = surfaceVariantPhrase(entry.surface_variant);
+  return `${fieldStr(entry.target_endpoint) ?? 'its target'}${entry.via_fabric ? ' over Fabric' : ''}${
+    variantPhrase ? `, ${variantPhrase}` : ''
+  }`;
+}
+
 /** A surface slot as the policy a surface holds, e.g. "its inbound policy". */
 function surfaceSlotPhrase(change: PolicyChangeData, slot: string): string {
   if (change.slot === 'transit_point' && change.transit_point) {
@@ -364,6 +378,28 @@ export function describeEntry(entry: AuditEntry, userName?: UserNameResolver): E
         surface ? ` to ${surface}` : ''
       }.`,
       detail: `own ${tt.own_trace_id} → downstream ${tt.downstream_trace_id}`,
+    };
+  }
+
+  if (requestForwarded(entry)) {
+    return {
+      title: 'Request forwarded',
+      tone,
+      summary: `The Access Point${surface ? ` of ${surface}` : ''} forwarded the request to ${forwardedTo(entry)}.`,
+      detail: caller
+        ? `Caller ${caller}${entry.protocol ? ` (${entry.protocol})` : ''}.`
+        : 'No verified caller.',
+    };
+  }
+
+  const transitForwarded = transitRequestForwarded(entry);
+  if (transitForwarded) {
+    return {
+      title: 'Transit request forwarded',
+      tone,
+      summary: `Transit Point ${transitForwarded.transit_point}${surface ? ` of ${surface}` : ''} forwarded the request to ${forwardedTo(entry)}.`,
+      detail:
+        'The original caller is on the Access Point’s Request Forwarded record of the same trace.',
     };
   }
 

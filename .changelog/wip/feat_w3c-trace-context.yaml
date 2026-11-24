@@ -41,6 +41,13 @@ changes:
         credentials and whether it crossed the Fabric. It names no caller: Agent Watch reaches the
         original caller through the Access Point's request_forwarded of the same trace. A refused
         request writes none.
+    - timestamp: '2026-11-24T10:00:00Z'
+      title: Show forwarded requests in the Audit Log
+      description: >-
+        The Audit Log now describes request_forwarded records as Request forwarded, naming the
+        surface, the target and the verified caller, with the caller grouped as on a policy
+        decision, and transit_request_forwarded records as Transit request forwarded, naming the
+        Transit Point and no caller. They were shown as generic events.
   changed:
     - timestamp: '2026-11-23T14:00:00Z'
       title: Send the Managed Agent one set of trace headers

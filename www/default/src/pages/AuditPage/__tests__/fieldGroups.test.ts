@@ -123,6 +123,90 @@ describe('fieldGroups', () => {
     expect(groups['Identity'].map(item => item.term)).not.toContain('Caller DID');
   });
 
+  describe('forwarded requests', () => {
+    const caller = {
+      auth_method: 'jwt_bearer',
+      iss: 'https://issuer.example',
+      aud: 'orders',
+      sub: 'abc-123',
+      principal: 'alice',
+      email: 'alice@example.com',
+      name: 'Alice',
+    };
+
+    it('groups the caller of a forwarded request as for a policy decision', () => {
+      const pd: PolicyDecisionData = {
+        scope: 'surface',
+        policy_id: 'p',
+        decision: 'allow',
+        caller_did: 'did:web:caller.example',
+      };
+      const decided = groupByLabel(baseEntry({ event: { policy_decision: pd }, caller }), pd, null);
+      const forwarded = groupByLabel(
+        baseEntry({
+          event: {
+            request_forwarded: { flow: 'access_point', caller_did: 'did:web:caller.example' },
+          },
+          caller,
+        }),
+        null,
+        null
+      );
+
+      expect(forwarded['Identity']).toEqual(decided['Identity']);
+    });
+
+    it('lays out where an Access Point forwarded a request', () => {
+      const groups = groupByLabel(
+        baseEntry({
+          event: { request_forwarded: { flow: 'access_point' } },
+          channel_name: 'Orders',
+          surface_id: 'orders',
+          protocol: 'mcp',
+          target_endpoint: 'https://agent.example/mcp',
+          agent_identity_did: 'did:web:agent.example',
+        }),
+        null,
+        null
+      );
+
+      expect(groups['Surface & routing']).toEqual([
+        { term: 'Agent surface', value: 'Orders', href: '/surfaces/orders' },
+        { term: 'Flow', value: 'Access Point' },
+        { term: 'Target', value: 'https://agent.example/mcp', mono: true },
+        { term: 'Protocol', value: 'mcp' },
+        { term: 'Via fabric', value: 'No' },
+      ]);
+    });
+
+    it('lays out the Transit Point that forwarded a request, with no caller', () => {
+      const groups = groupByLabel(
+        baseEntry({
+          event: { transit_request_forwarded: { transit_point: 'tools' } },
+          channel_name: 'Orders',
+          surface_id: 'orders',
+          protocol: 'mcp',
+          target_endpoint: 'fabric://gw-2/tools',
+          via_fabric: true,
+          agent_identity_did: 'did:web:agent.example',
+        }),
+        null,
+        null
+      );
+
+      expect(groups['Surface & routing']).toEqual([
+        { term: 'Agent surface', value: 'Orders', href: '/surfaces/orders' },
+        { term: 'Transit Point', value: 'tools', mono: true },
+        { term: 'Target', value: 'fabric://gw-2/tools', mono: true },
+        { term: 'Protocol', value: 'mcp' },
+        { term: 'Via fabric', value: 'Yes (G2G)' },
+      ]);
+      expect(groups['Identity']).toEqual([
+        { term: 'Agent identity', value: 'did:web:agent.example', mono: true },
+      ]);
+    });
+  });
+
   describe('surface variants', () => {
     it('shows the variant of a surface request under Surface & routing', () => {
       const routing = (surface_variant?: string) =>

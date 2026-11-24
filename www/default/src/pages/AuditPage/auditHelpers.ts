@@ -6,8 +6,10 @@ import {
   type PolicyChangeData,
   type PolicyChangeEvent,
   type PolicyDecisionData,
+  type RequestForwardedData,
   type RequestRejectedData,
   type TraceTerminatedData,
+  type TransitRequestForwardedData,
   type TrustCheckData,
   type WorkloadIntent,
 } from './types';
@@ -312,6 +314,31 @@ export function requestRejected(entry: AuditEntry): RequestRejectedData | null {
   return null;
 }
 
+/** Extracts the RequestForwarded payload if present, else null */
+export function requestForwarded(entry: AuditEntry): RequestForwardedData | null {
+  if (
+    typeof entry.event === 'object' &&
+    entry.event !== null &&
+    'request_forwarded' in entry.event
+  ) {
+    return (entry.event as { request_forwarded: RequestForwardedData }).request_forwarded;
+  }
+  return null;
+}
+
+/** Extracts the TransitRequestForwarded payload if present, else null */
+export function transitRequestForwarded(entry: AuditEntry): TransitRequestForwardedData | null {
+  if (
+    typeof entry.event === 'object' &&
+    entry.event !== null &&
+    'transit_request_forwarded' in entry.event
+  ) {
+    return (entry.event as { transit_request_forwarded: TransitRequestForwardedData })
+      .transit_request_forwarded;
+  }
+  return null;
+}
+
 /** Extracts a policy change event's name and body if present, else null */
 export function policyChange(
   entry: AuditEntry
@@ -450,7 +477,12 @@ export function extractEmbeddedDecisions(entry: AuditEntry): EmbeddedDecision[] 
 /** The effective caller DID for an entry, across every identity mode. */
 export function callerDidOf(entry: AuditEntry): string | null {
   const pd = policyDecision(entry);
-  return pd?.caller_did ?? (entry.caller?.did as string | undefined) ?? null;
+  return (
+    pd?.caller_did ??
+    requestForwarded(entry)?.caller_did ??
+    (entry.caller?.did as string | undefined) ??
+    null
+  );
 }
 
 /** The surface id an entry refers to, from the policy decision or the entry itself. */

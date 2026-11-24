@@ -2437,6 +2437,14 @@ word it only through `utils/surfaceVariant.ts`, which the Metrics page uses too.
   failing credential is a Transit Point's, `target_auth.transit_point` carries its alias: both
   summaries name that Transit Point in place of the Target, and it shows as **Transit Point**
   in the Refusal group.
+- `request_forwarded` is read with `requestForwarded` and `transit_request_forwarded` with
+  `transitRequestForwarded` (`auditHelpers.ts`), in the neutral tone. **Request forwarded** names
+  the surface and the `target_endpoint` as the record carries it (over Fabric when `via_fabric`),
+  and the caller or "No verified caller"; its `caller` and `event.request_forwarded.caller_did`
+  fill the Identity group as a `policy_decision`'s do (`callerDidOf`), and Surface & routing gains
+  **Flow**. **Transit request forwarded** names the Transit Point by its alias, shows it as
+  **Transit Point** under Surface & routing, and shows no caller: the record names none, and its
+  detail points to the Access Point's record of the same trace.
 - `requested_variant` is caller-chosen text: render it as React text only.
 - The Metrics page shows the `$alias` badge for a configured alias only, never for `_base_`.
 

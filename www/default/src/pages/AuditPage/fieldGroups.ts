@@ -7,6 +7,7 @@ import {
   planeLabel,
   policyChange,
   policyChangeTitle,
+  requestForwarded,
   requestRejected,
   scopeLabel,
   slotLabel,
@@ -14,6 +15,7 @@ import {
   targetHref,
   targetLabel,
   traceTerminated,
+  transitRequestForwarded,
 } from './auditHelpers';
 import { actorLabel, trustErrorClause, type UserNameResolver } from './eventNarrative';
 import { surfaceVariantLabel } from '../../utils/surfaceVariant';
@@ -96,6 +98,11 @@ export function fieldGroups(
     });
   }
   add(routing, 'Variant', surfaceVariantLabel(fieldStr(entry.surface_variant)));
+  const forwarded = requestForwarded(entry);
+  if (forwarded) add(routing, 'Flow', flowLabel(forwarded.flow));
+  add(routing, 'Transit Point', fieldStr(transitRequestForwarded(entry)?.transit_point), {
+    mono: true,
+  });
   add(routing, 'Target', fieldStr(entry.target_endpoint), { mono: true });
   add(routing, 'Protocol', fieldStr(entry.protocol));
   add(routing, 'MCP tool', fieldStr(entry.mcp_tool_name), { mono: true });

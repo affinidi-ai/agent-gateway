@@ -327,8 +327,9 @@ A Trust Check query that lists several authorities (`query.authority_ids`) keeps
 multi-select of the Issuers and Authorities registers; see _Authority lists_ under _Trust Check_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-check).
 
-The Audit Log names the surface variant of each request record and describes `request_rejected`
-records, and the Metrics page badges configured variant aliases only; see _Audit page: surface
+The Audit Log names the surface variant of each request record and describes `request_rejected`,
+`request_forwarded` and `transit_request_forwarded` records, and the Metrics page badges
+configured variant aliases only; see _Audit page: surface
 variants and refusals_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#audit-page-surface-variants-and-refusals).
 
 An audit response says what a read did not return in two fields: `truncated` (it stopped before
