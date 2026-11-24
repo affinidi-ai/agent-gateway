@@ -71,6 +71,12 @@ changes:
         restart or a standby node notices an ended consent late. It is in the VP Audit Log, in the
         audit APIs and in the record delivered to integrations, and is omitted when the end is not
         known. No other record carries it, and a consent_expired record stored earlier has none.
+    - timestamp: '2026-11-24T17:00:00Z'
+      title: Show when an expired consent ended in the Audit Log
+      description: >-
+        The Audit Log's details of a consent_expired record now list Consent ended, the time the
+        consent ended, under Credentials. The record's own time is when the gateway removed the
+        consent, which can be later. A record stored before expired_at existed shows no end.
   changed:
     - timestamp: '2026-11-24T14:00:00Z'
       title: Place connection_point.connected at the time its message arrived

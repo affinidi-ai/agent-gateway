@@ -1,3 +1,4 @@
+import { formatTimestamp } from '../auditHelpers';
 import { fieldGroups } from '../fieldGroups';
 import type { AuditEntry, PolicyDecisionData, TrustCheckData } from '../types';
 
@@ -204,6 +205,42 @@ describe('fieldGroups', () => {
       expect(groups['Identity']).toEqual([
         { term: 'Agent identity', value: 'did:web:agent.example', mono: true },
       ]);
+    });
+  });
+
+  describe('consent expiry', () => {
+    it('lists when the consent ended under Credentials', () => {
+      const groups = groupByLabel(
+        baseEntry({
+          event: 'consent_expired',
+          occurred_at: '2026-11-24T10:00:00Z',
+          expired_at: '2026-11-24T08:00:00Z',
+          provider_id: 'github',
+          provider_name: 'GitHub',
+          token_id: 't1',
+        }),
+        null,
+        null
+      );
+
+      expect(groups['Credentials']).toEqual([
+        { term: 'Provider', value: 'GitHub', href: '/credential-providers/github' },
+        { term: 'Token ID', value: 't1', mono: true },
+        { term: 'Consent ended', value: formatTimestamp('2026-11-24T08:00:00Z') },
+      ]);
+    });
+
+    it('shows no end for an expiry stored without one, nor for another record', () => {
+      const stored = groupByLabel(
+        baseEntry({ event: 'consent_expired', provider_id: 'github' }),
+        null,
+        null
+      );
+      const other = groupByLabel(baseEntry({ expired_at: '2026-11-24T08:00:00Z' }), null, null);
+
+      for (const groups of [stored, other]) {
+        expect(groups['Credentials'].map(item => item.term)).not.toContain('Consent ended');
+      }
     });
   });
 

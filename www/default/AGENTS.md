@@ -1517,6 +1517,10 @@ for is named in title case from its event name (`auth_failed` as "Auth Failed"),
   with its new end and the one before it from the record's `detail`, and it was not revoked),
   and shows them with the other delegation events. The narrative of a `consent_granted` record
   given under a time limit adds "It ends <date>.", from the `consent_expires_at` in its `detail`.
+- A `consent_expired` record's time (`occurred_at`) is when the gateway removed the consent, which
+  can be long after it ended. Its Credentials group shows **Consent ended**, the record's
+  `expired_at` formatted with `formatTimestamp`, only on `consent_expired` and only when the
+  record carries it; a record stored before the field existed shows none.
 - Its Identity group shows **Subject**, the token's own `sub`, and a **Principal** row with the
   value the caller's grants are keyed by, `caller.principal`, only when the JWT strategy names a
   claim other than `sub`.

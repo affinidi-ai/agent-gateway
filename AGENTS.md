@@ -253,7 +253,9 @@ Audit Log filtered to the delegation categories, the audited ones
 call, such as a token injected or refreshed, is in its log (nowhere while
 `[logging] delegation_events` is `false`) and has no category, which the **About the Audit Log**
 panel says. The Audit Log
-shows a caller's Principal beside Subject when its strategy names a claim other than `sub`; see
+shows a caller's Principal beside Subject when its strategy names a claim other than `sub`, and
+a `consent_expired` record's **Consent ended** (its `expired_at`) beside its time, which is when
+the gateway removed the consent; see
 _Credential delegation audit_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-delegation-audit).
 

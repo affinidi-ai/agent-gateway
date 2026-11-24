@@ -200,6 +200,11 @@ export interface AuditEntry {
   trace_id?: string | null;
   /** SHA-256 fingerprint of the VP JWT — populated on vp_injected */
   vp_fingerprint?: string | null;
+  /**
+   * On consent_expired only: when the consent ended, RFC 3339. `occurred_at` is when the gateway
+   * removed it. Absent when the end is not known and on records stored before it existed.
+   */
+  expired_at?: string | null;
   [key: string]: unknown;
 }
 

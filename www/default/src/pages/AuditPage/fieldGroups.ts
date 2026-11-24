@@ -1,8 +1,10 @@
 import {
   callerDidOf,
   changedPartsLabel,
+  eventTypeName,
   fieldStr,
   flowLabel,
+  formatTimestamp,
   modeLabel,
   planeLabel,
   policyChange,
@@ -119,6 +121,9 @@ export function fieldGroups(
   }
   add(credentials, 'Token ID', fieldStr(entry.token_id), { mono: true });
   if (scopes.length) add(credentials, 'Scopes', scopes.join(', '));
+  const consentEnd =
+    eventTypeName(entry) === 'consent_expired' ? fieldStr(entry.expired_at) : undefined;
+  if (consentEnd) add(credentials, 'Consent ended', formatTimestamp(consentEnd));
 
   const policy: FieldItem[] = [];
   if (pd) {
