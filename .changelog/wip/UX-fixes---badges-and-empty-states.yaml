@@ -9,6 +9,9 @@ changes:
       title: Remove duplicate CTA from STS Clients empty state
       description: Removed the duplicate "Add your first STS client" button from the STS Clients empty state. The "Add STS Client" button in the header is now the only CTA, following the design pattern used in other empty states like Agents and Surfaces.
     - timestamp: '2024-11-24T17:00:00Z'
+      title: Move surface creation action to Agents page header
+      description: Relocated the "Add Surface" button from the empty-state text to the Agents page header, following the design pattern used in other empty states. Updated the empty-state documentation link to point to the first-surface creation guide for new users.
+    - timestamp: '2024-11-24T17:05:00Z'
       title: Keep indication when payment list is capped at 500 rows
       description: Added a truncation notice on the Payments page when the ledger response contains more than 500 matching payments. The notice informs operators that only the newest 500 payments are shown and that older matching payments were not searched, preventing silent failures when searching for older payments.
   fixed:
