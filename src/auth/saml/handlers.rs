@@ -631,6 +631,21 @@ mod tests {
     }
 
     #[test]
+    fn acs_html_encodes_a_hostile_target_as_a_script_safe_string_literal() {
+        let html = acs_success_html("/a\"</script><script>x()</script>&\u{2029}", "tok-1", "n");
+
+        assert!(!html.contains("</script><script>x()"));
+        assert!(html.contains(
+            "window.location.href = \"/a\\\"\\u003c/script\\u003e\\u003cscript\\u003ex()\\u003c/script\\u003e\\u0026\\u2029\";"
+        ));
+        assert_eq!(
+            html.matches("</script>")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn acs_content_security_policy_allows_only_the_nonced_script() {
         let policy = acs_content_security_policy("abc");
 
