@@ -37,7 +37,7 @@ changes:
       title: Check the identity presentation on MCP answers over Fabric
       description: >-
         On an Access Point whose Target is `fabric://`, the calling gateway now checks the
-        presentation in an MCP answer's `result._meta` or top-level `_meta`, which it did not
+        presentation in an MCP answer's `result._meta`, top-level `_meta` or `params._meta`, which it did not
         check before, as it does on A2A answers: an MCP answer whose presentation fails
         verification, is addressed to another recipient, or comes from an issuer the connection
         does not trust is refused with `502`. This includes a Managed Agent's own credential

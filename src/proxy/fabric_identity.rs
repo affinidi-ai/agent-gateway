@@ -205,12 +205,14 @@ async fn extract_fabric_backend_agent_identity(
 }
 
 /// Find the credential in the answer's `result._meta`, where GW2 places it
-/// (see `crate::mcp::inject_vp_into_mcp_response`), or in the top-level
-/// `_meta` of the historical envelope, under its canonical key or the
-/// historical alias, and verify its presentation. Both locations are read
-/// whatever else the body holds, so a stray `params` cannot hide the
-/// credential. An answer with neither `_meta` carries none; a `_meta` that is
-/// not an object, or copies of the credential that differ, are refused.
+/// (see `crate::mcp::inject_vp_into_mcp_response`), in the top-level `_meta`
+/// of the historical envelope, or in `params._meta`, where canonical metadata
+/// output moves a top-level `_meta` when the body has `params`, under its
+/// canonical key or the historical alias, and verify its presentation. All
+/// three locations are read whatever else the body holds, so normalisation or
+/// a stray `params` cannot hide the credential. An answer with no `_meta`
+/// carries none; a `_meta` that is not an object, or copies of the credential
+/// that differ, are refused.
 async fn extract_mcp_fabric_identity(
     response_json: &JsonValue,
     vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
@@ -232,13 +234,14 @@ async fn extract_mcp_fabric_identity(
     }
 }
 
-/// The identity credential an MCP answer carries in its top-level `_meta` or
-/// its `result._meta`, under any key that canonicalises to
-/// [`crate::config::MCP_AGENT_IDENTITY_CREDENTIAL_KEY`]. A `null` `_meta`
-/// counts as absent.
+/// The identity credential an MCP answer carries in its top-level `_meta`,
+/// its `params._meta` (where canonical normalisation moves a top-level `_meta`
+/// when the body has `params`) or its `result._meta`, under any key that
+/// canonicalises to [`crate::config::MCP_AGENT_IDENTITY_CREDENTIAL_KEY`]. A
+/// `null` `_meta` counts as absent.
 fn mcp_answer_credential(response_json: &JsonValue) -> Result<Option<&JsonValue>, &'static str> {
     let mut found: Option<&JsonValue> = None;
-    for path in ["/_meta", "/result/_meta"] {
+    for path in ["/_meta", "/params/_meta", "/result/_meta"] {
         let Some(meta) = response_json
             .pointer(path)
             .filter(|meta| !meta.is_null())
@@ -1270,6 +1273,54 @@ mod tests {
 
         assert!(matches!(result, Err(AnswerIdentityRefusal::Invalid(_))), "{result:?}");
         assert_eq!(failed_outcome(&events), Some(crate::audit::events::IdentityBindingFailure::Invalid));
+    }
+
+    #[tokio::test]
+    async fn a_wrong_recipient_presentation_moved_into_params_by_normalisation_is_still_refused() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation_bound_to("did:example:other-cp").await;
+        let raw = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "content": [] },
+            "params": {},
+            "_meta": {
+                crate::config::MCP_AGENT_IDENTITY_CREDENTIAL_KEY: {
+                    "verifiablePresentation": signed.presentation.to_string(),
+                    "did": signed.holder_did
+                }
+            }
+        });
+        let normalized = crate::mcp::meta::normalize_text(
+            &raw.to_string(),
+            crate::mcp::meta::McpMetadataContext::legacy(Some(crate::config::McpLegacyMetadataOutput::Canonical)),
+        )
+        .unwrap();
+        let response: JsonValue = serde_json::from_str(&normalized).unwrap();
+        assert!(
+            response
+                .pointer("/_meta")
+                .is_none(),
+            "{response}"
+        );
+        assert!(
+            response
+                .pointer("/params/_meta")
+                .is_some(),
+            "{response}"
+        );
+
+        let (result, events) = checked_mcp_answer(&signed, &response).await;
+
+        assert!(matches!(result, Err(AnswerIdentityRefusal::Invalid(_))), "{result:?}");
+        assert_eq!(failed_outcome(&events), Some(crate::audit::events::IdentityBindingFailure::Invalid));
+    }
+
+    #[test]
+    fn mcp_answer_credential_finds_a_credential_in_params_meta() {
+        let credential = json!({ "did": "did:example:a" });
+        let answer = json!({ "result": {}, "params": { "_meta": { CREDENTIAL_URI: credential.clone() } } });
+
+        assert_eq!(mcp_answer_credential(&answer), Ok(Some(&credential)));
     }
 
     #[test]

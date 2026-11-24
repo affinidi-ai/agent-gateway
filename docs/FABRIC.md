@@ -272,7 +272,8 @@ stored, and the VP Audit Log records `identity_binding_failed` with outcome `unt
 one records `identity_binding_verified` and the received presentation (`vp_injected`, detail
 `response_path_fabric_received`), both with `via_fabric: true` and the request's trace id. On an
 A2A answer the calling gateway reads the presentation from the status message; on an MCP answer,
-from the credential in `result._meta` or the top-level `_meta`
+from the credential in `result._meta`, the top-level `_meta` or `params._meta` (where canonical
+metadata output moves a top-level `_meta` when the answer has `params`)
 (`io.affinidi.fabric/agent-identity-credential`, or its historical extension URI key). An answer to
 a modern MCP request, which travels on a framed Fabric stream, is checked the same way, message by
 message. Answers to a Transit Point over Fabric and agent cards fetched over Fabric are not
