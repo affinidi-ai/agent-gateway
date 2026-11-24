@@ -1,0 +1,14 @@
+branch: UX-fixes---badges-and-empty-states
+changes:
+  added: []
+  changed:
+    - timestamp: '2024-11-24T15:30:00Z'
+      title: Remove count badges from dashboard pages
+      description: Removed count badges from Credentials (STS Clients tab), Policies (Gateway and Surface Policies tabs), JWT Verification Strategies, Access Tokens (PAT), Payments, Proxies page, and Payment Gateway detail surfaces section. These count badges appeared next to page titles and were displaying the number of items in each section.
+    - timestamp: '2024-11-24T16:45:00Z'
+      title: Remove duplicate CTA from STS Clients empty state
+      description: Removed the duplicate "Add your first STS client" button from the STS Clients empty state. The "Add STS Client" button in the header is now the only CTA, following the design pattern used in other empty states like Agents and Surfaces.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

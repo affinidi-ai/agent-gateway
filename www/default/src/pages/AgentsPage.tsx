@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AgentRecord, apiClient } from '../api';
 import { AppButton } from '../components/shared/AppButton';
-import { Badge } from '../components/shared/Badge';
 import { EmptyState } from '../components/shared/EmptyState';
 import SearchInput from '../components/shared/SearchInput';
 import { DOCS_URL } from '../config/docs';
@@ -102,16 +101,23 @@ const AgentsPage: React.FC = () => {
 
       <div className="card shadow mb-4">
         <div className="card-header py-3">
-          <h6 className="m-0 font-weight-bold text-primary">
-            <i className="fas fa-robot me-2" aria-hidden="true" />
-            Agents
-            <Badge
-              value={visible.length}
-              suffix={filtered ? ` of ${agents.length}` : undefined}
-              className="ms-2"
-              ariaLabel={`${visible.length}${filtered ? ` of ${agents.length}` : ''} agents`}
-              data-testid="agents-count"
-            />
+          <h6 className="m-0 font-weight-bold text-primary d-flex justify-content-between align-items-center">
+            <span>
+              <i className="fas fa-robot me-2" aria-hidden="true" />
+              Agents
+            </span>
+            {canAddSurface && !error && (
+              <AppButton
+                data-testid="agents-add-surface-button"
+                variant="primary"
+                size="md"
+                className="shadow-sm"
+                onClick={() => navigate('/surfaces/new')}
+                iconStart={<i className="fas fa-plus fa-sm me-1" aria-hidden="true" />}
+              >
+                Add Surface
+              </AppButton>
+            )}
           </h6>
         </div>
         <div className="card-body">
@@ -119,18 +125,10 @@ const AgentsPage: React.FC = () => {
             !error && (
               <EmptyState
                 icon="fa-robot"
-                title="No managed agents yet"
-                body="Agents show up here once they’re connected through a surface. Create a surface in Agent GW to start routing, securing, and monitoring your agents in one place."
-                {...(canAddSurface
-                  ? {
-                      ctaLabel: 'Create a surface',
-                      ctaTo: '/surfaces/new',
-                      ctaTestId: 'agents-add-surface-link',
-                    }
-                  : {})}
-                docsHref={DOCS_URL.surfaces}
-                docsLabel="What’s a surface?"
-                docsPlacement="actions"
+                title="Get started with Agents"
+                body="Agents show up here once they're connected through a surface. Create a surface to start routing, securing, and monitoring your agents."
+                docsHref={DOCS_URL.createFirstAgent}
+                docsLabel="View Docs"
               />
             )
           ) : visible.length === 0 ? (

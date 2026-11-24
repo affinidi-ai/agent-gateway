@@ -1,7 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { AppButton } from '../components/shared/AppButton';
-import { Badge } from '../components/shared/Badge';
 import { EmptyState } from '../components/shared/EmptyState';
 import SearchInput from '../components/shared/SearchInput';
 import InfoBanner from '../components/shared/InfoBanner';
@@ -56,20 +55,6 @@ const PaymentsPage: React.FC = () => {
           <h6 className="m-0 font-weight-bold text-primary">
             <i className="fas fa-money-bill-wave me-2" aria-hidden="true" />
             Payments
-            <Badge
-              value={visibleRows.length}
-              className="ms-2"
-              ariaLabel={`${visibleRows.length} payments shown`}
-            />
-            {total > rows.length && (
-              <Badge
-                value={total}
-                tone="secondary"
-                prefix="of "
-                className="ms-1"
-                ariaLabel={`${rows.length} of ${total} payments loaded`}
-              />
-            )}
           </h6>
         </div>
         <div className="card-body">

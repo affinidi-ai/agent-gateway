@@ -1,6 +1,5 @@
 import React from 'react';
 import { AppButton } from '../../components/shared/AppButton';
-import { Badge } from '../../components/shared/Badge';
 import { EmptyState } from '../../components/shared/EmptyState';
 import AccessTokenRow from './AccessTokenRow';
 import { useAccessTokenList } from './useAccessTokenList';
@@ -17,11 +16,6 @@ const AccessTokensTab: React.FC<AccessTokensTabProps> = ({ searchTerm }) => {
       <div className="card-header py-3 d-flex justify-content-between align-items-center">
         <h6 className="m-0 font-weight-bold text-primary">
           <i className="fas fa-user-lock me-1" aria-hidden="true" /> Access Tokens (PAT)
-          <Badge
-            value={list.filtered.length}
-            className="ms-2"
-            ariaLabel={`${list.filtered.length} access tokens`}
-          />
         </h6>
         <div className="d-flex align-items-center gap-3">
           <div className="form-check form-switch m-0">

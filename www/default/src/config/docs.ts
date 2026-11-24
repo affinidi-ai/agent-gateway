@@ -4,6 +4,8 @@ const catalogUrl = (kb: string) => `https://docs.affinidi.com/catalog?t=docs&kb=
 export const DOCS_URL = {
   home: catalogUrl('1066'),
   createFirstSurface: catalogUrl('1094'),
+  createFirstAgent:
+    'https://docs.affinidi.com/products/affinidi-trust-fabric/agent-gateway/get-started/create-first-surface/',
   identity: catalogUrl('1098'),
   credentials: catalogUrl('1072'),
   credentialDelegation: catalogUrl('1112'),
