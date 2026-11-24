@@ -1569,7 +1569,8 @@ to compare, so it accepts any other `domain`. A presentation with no `domain`, f
 client that sets none, is still accepted. A refused presentation is refused with the fixed error
 `VP is not addressed to this gateway` and logged with up to four of its domains (128 characters
 each) and the recipient DID; the request is then treated as one whose presentation failed, and
-an answer is refused with `502` and recorded as an `invalid` identity binding.
+an answer to an Access Point's `fabric://` Target is refused with `502` and recorded as an
+`invalid` identity binding (answers to a Transit Point over Fabric are not checked).
 
 A presentation's proof may expire at most 5 minutes after it is verified, plus 2 minutes of
 clock skew, and a proof without `expires` may not be created more than 2 minutes ahead of the

@@ -11,7 +11,8 @@ changes:
         after it is verified, and a proof without `expires` may not be created more than 2
         minutes ahead of the gateway's clock. Before, the gateway accepted any `expires` the
         holder signed, so a presentation minted with a far-future expiry could be replayed for
-        as long as its credential lasted.
+        as long as its credential lasted. Agents and STS clients that sign their own
+        presentations with an `expires` more than 7 minutes ahead are now refused.
     - timestamp: '2026-11-24T00:00:00Z'
       title: Bind identity presentations to their recipient to limit replay
       description: >-
@@ -28,16 +29,25 @@ changes:
       title: Address Fabric answers' identity presentations to the calling gateway
       description: >-
         The identity presentation on an answer sent back over Fabric now names the calling
-        gateway's Connection Point, and the calling gateway refuses an answer whose presentation
-        names another recipient with `502`, recorded as an `invalid` identity binding. The
-        calling gateway now also checks the presentation in an MCP answer's `result._meta` or
-        top-level `_meta`, which it did not check before, as it does on A2A answers: an MCP answer whose
-        presentation fails verification, is addressed to another recipient, or comes from an
-        issuer the connection does not trust is refused with `502`. This includes a Managed
-        Agent's own credential passed through when the paired gateway adds none (its surface
-        has no managed identity, or the result is not complete). On an MCP surface that takes
-        the agent's identity from the payload, a verified presentation now supplies that
-        identity.
+        gateway's Connection Point. On an Access Point whose Target is `fabric://`, the calling
+        gateway refuses an answer whose presentation names another recipient with `502`,
+        recorded as an `invalid` identity binding. Answers to a Transit Point over Fabric are
+        not checked.
+    - timestamp: '2026-11-24T00:00:00Z'
+      title: Check the identity presentation on MCP answers over Fabric
+      description: >-
+        On an Access Point whose Target is `fabric://`, the calling gateway now checks the
+        presentation in an MCP answer's `result._meta` or top-level `_meta`, which it did not
+        check before, as it does on A2A answers: an MCP answer whose presentation fails
+        verification, is addressed to another recipient, or comes from an issuer the connection
+        does not trust is refused with `502`. This includes a Managed Agent's own credential
+        passed through when the paired gateway adds none (its surface has no managed identity,
+        or the result is not complete).
+    - timestamp: '2026-11-24T00:00:00Z'
+      title: Take an MCP surface's payload identity from a verified Fabric answer
+      description: >-
+        On an MCP surface that takes the agent's identity from the payload, a verified
+        presentation on an answer over Fabric now supplies that identity.
   added:
     - timestamp: '2026-11-24T00:00:00Z'
       title: Let a Remote gateway connection refuse relayed identity presentations

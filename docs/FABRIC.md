@@ -185,7 +185,8 @@ gateway refuses one that names another (see
 anyway while the record's `require_addressed_presentations` is `false` (the default). Set it to
 `true` with `PUT /v1/gateways/{id}` (`gateways.edit`, Remote gateways only; the self gateway
 answers `400`) to refuse such relays on this connection, including relayed presentations that
-name no recipient.
+name no recipient. The setting is API-only: the Edit Gateway page does not show it, and a
+dashboard save keeps the stored value.
 
 Accepted risk: a presentation with no `domain` is still accepted, and the gateway mints such
 presentations on public agent cards and direct answers; with `require_addressed_presentations`
