@@ -2814,11 +2814,15 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
   agent never replaces it.
 - The list filters client-side by text only: the display name (**Unnamed agent** included), every
   surface name in the record, and the route label (`agentMatchesFilter`).
-- With no agents and no load error, the list shows the "No managed agents yet" `EmptyState`. For a
-  user with `surfaces.edit` it has a **Create a surface** in-app link (`agents-add-surface-link`,
-  `ctaTo`) that opens `/surfaces/new`, followed by a **What’s a surface?** docs link
-  (`DOCS_URL.surfaces`, `docsPlacement="actions"`); without `surfaces.edit` only the docs link
+- With no agents and no load error, the list shows an `EmptyState` with title **Get started with
+  Agents**, body "Agents show up here once they're connected through a surface. Create a surface
+  to start routing, securing, and monitoring your agents.", and a docs link
+  (`DOCS_URL.createFirstAgent`). The header holds an **Add Surface** button (`agents-add-surface-button`)
+  for users with `surfaces.edit`; without `surfaces.edit` only the docs link in the empty state
   shows, since the page needs only `surfaces.view` and `/surfaces/new` needs `surfaces.edit`.
+  The button uses the same `useLimitGuard` as the Surfaces page to show a balloon when at capacity
+  before opening the builder, preventing operators from spending time configuring a surface the
+  server will refuse to create.
 - Columns: Agent, Route, Protocol, Identities, Used by surfaces, Trust registry, Last activity.
   The protocol badge (`agents-protocol-badge`) is the shared `ProtocolBadge`
   (`components/shared/ProtocolBadge.tsx`), the one the Surfaces page uses: A2A

@@ -6,6 +6,7 @@ import { EmptyState } from '../components/shared/EmptyState';
 import SearchInput from '../components/shared/SearchInput';
 import { DOCS_URL } from '../config/docs';
 import { usePermissions } from '../context/PermissionsContext';
+import { useLimitGuard } from '../hooks/useLimitGuard';
 import AgentsTable from './AgentsPage/AgentsTable';
 import { agentMatchesFilter } from './AgentsPage/agentLabels';
 import './AgentsPage/AgentRegistry.css';
@@ -17,6 +18,7 @@ import './AgentsPage/AgentRegistry.css';
 const AgentsPage: React.FC = () => {
   const navigate = useNavigate();
   const { hasPermission } = usePermissions();
+  const { guard, balloonNode } = useLimitGuard();
   const canAddSurface = hasPermission('surfaces.edit');
 
   const [agents, setAgents] = useState<AgentRecord[]>([]);
@@ -72,6 +74,7 @@ const AgentsPage: React.FC = () => {
 
   return (
     <div className="container-fluid" data-testid="page-agents">
+      {balloonNode}
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
         <div>
           <SearchInput
@@ -112,7 +115,7 @@ const AgentsPage: React.FC = () => {
                 variant="primary"
                 size="md"
                 className="shadow-sm"
-                onClick={() => navigate('/surfaces/new')}
+                onClick={e => guard('surfaces.agent', () => navigate('/surfaces/new'), e)}
                 iconStart={<i className="fas fa-plus fa-sm me-1" aria-hidden="true" />}
               >
                 Add Surface
