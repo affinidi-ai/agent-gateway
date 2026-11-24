@@ -51,7 +51,9 @@ changes:
         is refused with a 409 naming them, unless the request acknowledges it.
         Connections are tenant-owned records, managed with the new
         vta_connections permissions; a tenant token can read but not change an
-        appliance-wide one. The gateway refuses to forward any surface or proxy
+        appliance-wide one. An access token with explicit scopes reaches the
+        connection and key management routes with the permission each one
+        checks. The gateway refuses to forward any surface or proxy
         request to a verified trust agent's address.
     - timestamp: '2026-11-16T12:10:00Z'
       title: Choose the signing key source per surface, issuer or whole gateway

@@ -373,6 +373,8 @@ reveals whether another tenant's connection exists. The key inventory
 (`GET /v1/key-management/inventory`) lists only the connections the caller may read. The
 gateway-wide default signing key source and the `[vta]` block's control key are appliance-wide
 settings, not tenant records. See [`TRUST_AGENT_SIGNING.md`](TRUST_AGENT_SIGNING.md#tenancy).
+A token with explicit scopes reaches these routes with the permission each one checks, listed
+in [`RBAC.md`](RBAC.md).
 
 ### References between records
 

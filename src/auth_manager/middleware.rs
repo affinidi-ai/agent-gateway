@@ -1954,6 +1954,9 @@ mod tests {
         "/issuers/{id}/did.jsonl",
         "/departments/{id}/did.json",
         "/departments/{id}/did.jsonl",
+        "/vta-auth/did.jsonl",
+        "/vta-auth/{connection_id}/did.jsonl",
+        "/vta-issuer/{token}/did.jsonl",
     ];
 
     fn route_file_prefix(file: &str) -> &'static str {
