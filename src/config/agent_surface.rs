@@ -2048,6 +2048,11 @@ pub struct TransitPoint {
     /// ignores it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trust_check_migrated: bool,
+
+    /// Writes the records of the managed agent calling out through this Transit
+    /// Point, by the DID it calls out under, before its Trust Check runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_recorder: Option<crate::config::types::TrustRecorderConfig>,
 }
 
 impl TransitPoint {
@@ -3484,6 +3489,11 @@ use crate::trust_registry_verification::trust_check_element::TrustCheckElementVa
 pub enum TrustCheckValidationError {
     #[error("{leg} trust_check_list contains duplicate element id '{id}'")]
     TrustCheckDuplicateId { leg: &'static str, id: String },
+    #[error(
+        "{leg} trust_check_list element '{id}' sets subject \"managed_agent\", which only a Transit Point's \
+         trust_check_list may hold"
+    )]
+    TrustCheckSubjectNotAllowed { leg: &'static str, id: String },
     #[error("{leg} trust_check_list[{index}] (id '{id}'): {source}")]
     TrustCheckElementInvalid {
         leg: &'static str,
@@ -3513,6 +3523,8 @@ pub enum TrustCheckValidationError {
     },
     #[error("access_point.trust_recorder has {got} entries (max {max})")]
     TrustRecorderTooManyEntries { got: usize, max: usize },
+    #[error("transit point '{alias}': trust_recorder has {got} entries (max {max})")]
+    TransitPointTrustRecorderTooManyEntries { alias: String, got: usize, max: usize },
     #[error("transit point '{alias}': {source}")]
     TransitPointTrustCheckInvalid {
         alias: String,
@@ -3526,15 +3538,33 @@ pub enum TrustCheckValidationError {
 /// [`TrustCheckElement::validate`]. Neither the number of elements nor the
 /// authorities they query is capped. The `leg` label rides into every error
 /// variant so the API surface can echo `caller` / `target` back to the
-/// operator.
+/// operator. Refuses managed-agent elements, which only
+/// [`validate_transit_point_trust_check_list`] accepts.
 pub fn validate_trust_check_list(
     leg: &'static str,
     list: &[TrustCheckElement],
+) -> Result<(), TrustCheckValidationError> {
+    walk_trust_check_list(leg, list, false)
+}
+
+/// [`validate_trust_check_list`] for a Transit Point's list, which may also
+/// hold managed-agent elements.
+pub fn validate_transit_point_trust_check_list(list: &[TrustCheckElement]) -> Result<(), TrustCheckValidationError> {
+    walk_trust_check_list("target", list, true)
+}
+
+fn walk_trust_check_list(
+    leg: &'static str,
+    list: &[TrustCheckElement],
+    allows_managed_agent: bool,
 ) -> Result<(), TrustCheckValidationError> {
     let mut seen = std::collections::HashSet::with_capacity(list.len());
     for (index, elem) in list.iter().enumerate() {
         if !seen.insert(elem.id.as_str()) {
             return Err(TrustCheckValidationError::TrustCheckDuplicateId { leg, id: elem.id.clone() });
+        }
+        if !allows_managed_agent && !elem.subject.is_target() {
+            return Err(TrustCheckValidationError::TrustCheckSubjectNotAllowed { leg, id: elem.id.clone() });
         }
         if let Err(source) = elem.validate() {
             return Err(TrustCheckValidationError::TrustCheckElementInvalid {
@@ -3548,6 +3578,14 @@ pub fn validate_trust_check_list(
     Ok(())
 }
 
+/// The number of entries of `recorder` when it holds more than
+/// [`crate::config::types::TRUST_RECORDER_ENTRIES_MAX`].
+fn trust_recorder_entries_over_cap(recorder: Option<&crate::config::types::TrustRecorderConfig>) -> Option<usize> {
+    recorder
+        .map(|recorder| recorder.entries.len())
+        .filter(|got| *got > crate::config::types::TRUST_RECORDER_ENTRIES_MAX)
+}
+
 impl AccessPoint {
     /// Validate caller-leg trust_check_list and header metadata mapping invariants.
     pub fn validate(&self) -> Result<(), TrustCheckValidationError> {
@@ -3557,14 +3595,11 @@ impl AccessPoint {
                 .validate(&self.protocol)
                 .map_err(|source| TrustCheckValidationError::HeaderMetadataMappingInvalid { source })?;
         }
-        if let Some(cfg) = &self.trust_recorder {
-            let got = cfg.entries.len();
-            if got > crate::config::types::TRUST_RECORDER_ENTRIES_MAX {
-                return Err(TrustCheckValidationError::TrustRecorderTooManyEntries {
-                    got,
-                    max: crate::config::types::TRUST_RECORDER_ENTRIES_MAX,
-                });
-            }
+        if let Some(got) = trust_recorder_entries_over_cap(self.trust_recorder.as_ref()) {
+            return Err(TrustCheckValidationError::TrustRecorderTooManyEntries {
+                got,
+                max: crate::config::types::TRUST_RECORDER_ENTRIES_MAX,
+            });
         }
         Ok(())
     }
@@ -4350,10 +4385,17 @@ impl AgentSurface {
             return Ok(());
         };
         for tp in &transit.points {
+            if let Some(got) = trust_recorder_entries_over_cap(tp.trust_recorder.as_ref()) {
+                return Err(TrustCheckValidationError::TransitPointTrustRecorderTooManyEntries {
+                    alias: tp.alias.clone(),
+                    got,
+                    max: crate::config::types::TRUST_RECORDER_ENTRIES_MAX,
+                });
+            }
             if tp.trust_check_list.is_empty() {
                 continue;
             }
-            validate_trust_check_list("target", &tp.trust_check_list).map_err(|source| {
+            validate_transit_point_trust_check_list(&tp.trust_check_list).map_err(|source| {
                 TrustCheckValidationError::TransitPointTrustCheckInvalid {
                     alias: tp.alias.clone(),
                     source: Box::new(source),
@@ -6949,6 +6991,7 @@ mod tests {
                         delegated_credentials_for_fabric_callers: false,
                         trust_check_list: Vec::new(),
                         trust_check_migrated: false,
+                        trust_recorder: None,
                     },
                     TransitPoint {
                         id: uuid::Uuid::new_v4().to_string(),
@@ -6982,6 +7025,7 @@ mod tests {
                         delegated_credentials_for_fabric_callers: false,
                         trust_check_list: Vec::new(),
                         trust_check_migrated: false,
+                        trust_recorder: None,
                     },
                 ],
                 outbound_listen_address: None,
@@ -7518,6 +7562,76 @@ mod tests {
     }
 
     #[test]
+    fn only_a_transit_point_list_holds_managed_agent_elements() {
+        use crate::trust_registry_verification::trust_check_element::TrustCheckSubject;
+        let mut managed = transit_trust_check("self");
+        managed["subject"] = serde_json::json!("managed_agent");
+        let surface = surface_with_transit_points(serde_json::json!([transit_point_json(
+            "tp-mcp",
+            "mcp",
+            vec![managed, transit_trust_check("destination")]
+        )]));
+
+        assert_eq!(surface.validate(), Ok(()));
+        let list = &surface
+            .transit
+            .as_ref()
+            .expect("transit")
+            .points[0]
+            .trust_check_list;
+        assert_eq!(
+            list.iter()
+                .map(|element| element.subject)
+                .collect::<Vec<_>>(),
+            [TrustCheckSubject::ManagedAgent, TrustCheckSubject::Target]
+        );
+        let wire = serde_json::to_value(&surface).expect("serialize");
+        let wire_list = &wire["transit"]["points"][0]["trust_check_list"];
+        assert_eq!(wire_list[0]["subject"], "managed_agent");
+        assert!(
+            wire_list[1]
+                .get("subject")
+                .is_none(),
+            "the default subject stays off the wire: {wire_list}"
+        );
+
+        let mut variant_surface = serde_json::to_value(&surface).expect("serialize");
+        let mut managed_in_variant = transit_trust_check("variant-self");
+        managed_in_variant["subject"] = serde_json::json!("managed_agent");
+        variant_surface["variants"] = serde_json::json!([{
+            "id": "variant-dev", "alias": "dev", "name": "Development", "enabled": true,
+            "overrides": {"target": {"endpoint": "a2a-proxy://worker", "trust_check_list": [managed_in_variant.clone()]}}
+        }]);
+        let variant_surface: AgentSurface = serde_json::from_value(variant_surface).expect("deserialize");
+        assert!(
+            matches!(
+                variant_surface.validate(),
+                Err(TrustCheckValidationError::VariantInvalid { ref source, .. })
+                    if matches!(**source, TrustCheckValidationError::TrustCheckSubjectNotAllowed { .. })
+            ),
+            "{:?}",
+            variant_surface.validate()
+        );
+
+        let mut variant_point = serde_json::to_value(&surface).expect("serialize");
+        variant_point["variants"] = serde_json::json!([{
+            "id": "variant-dev", "alias": "dev", "name": "Development", "enabled": true,
+            "overrides": {"transit": {"points": [transit_point_json("tp-mcp", "mcp", vec![managed_in_variant])]}}
+        }]);
+        let variant_point: AgentSurface = serde_json::from_value(variant_point).expect("deserialize");
+        assert_eq!(variant_point.validate(), Ok(()), "a variant's Transit Point may hold one");
+
+        let mut element = elem("self");
+        element.subject = TrustCheckSubject::ManagedAgent;
+        for leg in ["caller", "target"] {
+            assert_eq!(
+                validate_trust_check_list(leg, std::slice::from_ref(&element)),
+                Err(TrustCheckValidationError::TrustCheckSubjectNotAllowed { leg, id: "self".to_string() })
+            );
+        }
+    }
+
+    #[test]
     fn validate_accepts_a_long_transit_point_trust_check_list() {
         let list = (0..30)
             .map(|i| transit_trust_check(&format!("check-{i}")))
@@ -7968,6 +8082,7 @@ mod tests {
             },
             timeout_secs: None,
             name: None,
+            subject: Default::default(),
         }
     }
 
@@ -8179,6 +8294,69 @@ mod tests {
             }
             other => panic!("expected TrustRecorderTooManyEntries, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn validate_caps_a_transit_point_trust_recorder_like_the_surface_one() {
+        use crate::config::types::{TRUST_RECORDER_ENTRIES_MAX, TrustRecorderConfig, TrustRecorderEntry};
+        let entry = TrustRecorderEntry {
+            trust_registry_id: "tr-1".to_string(),
+            issuer_did: "did:example:issuer".to_string(),
+            authority_did: "did:example:authority".to_string(),
+            authority_source: None,
+            include_owned_agent: true,
+            custom_resources: Vec::new(),
+        };
+        let with_entries = |count: usize| {
+            let mut surface =
+                surface_with_transit_points(serde_json::json!([transit_point_json("partner", "a2a", Vec::new())]));
+            surface
+                .transit
+                .as_mut()
+                .expect("transit")
+                .points[0]
+                .trust_recorder = Some(TrustRecorderConfig {
+                entries: vec![entry.clone(); count],
+            });
+            surface
+        };
+
+        assert_eq!(with_entries(TRUST_RECORDER_ENTRIES_MAX).validate(), Ok(()));
+        assert_eq!(
+            with_entries(TRUST_RECORDER_ENTRIES_MAX + 1).validate(),
+            Err(TrustCheckValidationError::TransitPointTrustRecorderTooManyEntries {
+                alias: "partner".to_string(),
+                got: TRUST_RECORDER_ENTRIES_MAX + 1,
+                max: TRUST_RECORDER_ENTRIES_MAX,
+            })
+        );
+        assert!(with_entries(1).has_trust_recorder_entries(), "a Transit Point's entries count");
+        assert!(!with_entries(0).has_trust_recorder_entries());
+    }
+
+    #[test]
+    fn a_trust_recorder_only_on_a_variants_transit_point_counts() {
+        let base = surface_with_transit_points(serde_json::json!([transit_point_json("partner", "a2a", Vec::new())]));
+        let with_variant_recorder = |entries: serde_json::Value| {
+            let mut point = transit_point_json("partner", "a2a", Vec::new());
+            point["trust_recorder"] = serde_json::json!({ "entries": entries });
+            let mut surface = serde_json::to_value(&base).expect("serialize");
+            surface["variants"] = serde_json::json!([{
+                "id": "variant-dev", "alias": "dev", "name": "Development", "enabled": true,
+                "overrides": {"transit": {"points": [point]}}
+            }]);
+            serde_json::from_value::<AgentSurface>(surface).expect("deserialize")
+        };
+        let entry = serde_json::json!({
+            "trust_registry_id": "tr-1",
+            "issuer_did": "did:example:issuer",
+            "authority_did": "did:example:authority",
+            "include_owned_agent": true
+        });
+
+        assert!(!base.has_trust_recorder_entries());
+        assert!(with_variant_recorder(serde_json::json!([entry])).has_trust_recorder_entries());
+        assert!(!with_variant_recorder(serde_json::json!([])).has_trust_recorder_entries());
     }
 
     #[test]

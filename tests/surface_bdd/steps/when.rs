@@ -3509,6 +3509,19 @@ async fn managed_agent_sends_identity_request_through_transit_point_with_header(
 }
 
 #[when(
+    regex = r#"^managed agent \"([^\"]+)\" sends an A2A message/send request with the agent-identity extension through Transit Point \"([^\"]+)\"$"#
+)]
+async fn managed_agent_sends_identity_request_through_transit_point(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    transit_point: String,
+) {
+    let mut body = build_a2a_message_send_body("hello");
+    crate::bdd_support::json_rpc::attach_agent_identity_payload(&mut body);
+    send_a2a_body_through_transit_point(world, &agent_name, &transit_point, Vec::new(), body).await;
+}
+
+#[when(
     expr = "managed agent {string} fetches the agent card of Transit Point {string} with header {string} set to {string}"
 )]
 async fn managed_agent_fetches_transit_point_card_with_header(

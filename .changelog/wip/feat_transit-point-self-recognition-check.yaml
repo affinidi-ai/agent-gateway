@@ -1,0 +1,57 @@
+branch: feat/transit-point-self-recognition-check
+changes:
+  added:
+    - timestamp: '2026-11-19T12:00:00Z'
+      title: ⭐ Let Transit Point policy refuse a managed agent no longer recognised
+      description: >-
+        A Transit Point Trust Check element with subject managed_agent asks a trust registry
+        whether it still recognises the managed agent calling out through the Transit Point,
+        by the DID it calls out under, instead of the destination. Results reach policy at
+        input.trust_check_results.managed_agent, so policy can refuse an agent whose
+        recognition was turned off; MANAGED_AGENT_IDENTITY_UNAVAILABLE reports a request with
+        no managed agent DID. Each query is audited as a trust_check on the managed_agent leg,
+        which the Audit Log names and places before policy in the request journey.
+    - timestamp: '2026-11-20T09:00:00Z'
+      title: Record the managed agent calling out through a Transit Point
+      description: >-
+        A Transit Point can have its own trust_recorder, with the same entries and rules as the
+        surface's. It writes in the background on every request except a discovery read the
+        records of the DID the Transit Point calls out under, so a managed-agent Trust Check
+        can recognise that agent. The status shows in the Identities page's Version History and
+        in trust-recorder-status, keeping each registry's outcome when several recorders write
+        the same DID; an Authority delete refusal names the Transit Point, and a surface rename
+        republishes the name to the registries of every Transit Point recorder, variants included.
+    - timestamp: '2026-11-20T11:00:00Z'
+      title: Pick in the Trust Check editor whether a query checks the managed agent
+      description: >-
+        Each query of a Transit Point's Trust Check has a Checks select: the destination agent
+        or this surface's managed agent, the self recognition check. A save keeps the
+        managed_agent subject and its blank entity; an explicit entity is shown as replacing
+        the calling agent's DID, with a Clear button, and the editor warns when the Transit
+        Point presents no managed identity. MCP Transit Points now take Trust Checks for their
+        managed agent, while a migrated destination copy there stays read-only.
+    - timestamp: '2026-11-20T16:00:00Z'
+      title: Drop a Trust Recorder on the Managed Agent to Transit Point arrow
+      description: >-
+        The Surface Builder offers a Trust Recorder on each Managed Agent to Transit Point
+        arrow, edited with the same panels as the surface's and saved as that Transit Point's
+        trust_recorder, so an operator can record the managed agent a self recognition check
+        asks about without the API. The panels say which leg a recorder writes on.
+  changed:
+    - timestamp: '2026-11-20T17:00:00Z'
+      title: Tell a managed agent why its Transit Point policy refused it
+      description: >-
+        When a Transit Point's own policy denies a request and sets a deny_reason, the 403
+        detail now ends with that reason, for example "Request blocked by surface policy:
+        Calling agent is not recognised", so the managed agent learns why it was refused.
+        Without a deny_reason the detail is unchanged. The reason now reaches the caller, so
+        review the deny_reason of existing Transit Point policies and keep request data out of it.
+  fixed:
+    - timestamp: '2026-11-20T10:00:00Z'
+      title: Keep a Transit Point's VP injection settings across dashboard saves
+      description: >-
+        A Surface Builder save keeps a Transit Point's stored identity_injection while
+        inject_vp is on, instead of dropping it.
+  removed: []
+  security: []
+  breaking: []
