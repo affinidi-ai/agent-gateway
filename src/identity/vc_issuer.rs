@@ -1691,29 +1691,14 @@ impl VCIssuer {
             .await
             .as_ref()
         {
-            Some(provisioner) if provisioner.available() => match provisioner
-                .provision(&identity_hash)
-                .await
-            {
-                Ok(provisioned) => Some(provisioned),
-                // An inferred provisioner may simply lack the grant to create
-                // contexts, which cannot be known before trying. When the agent
-                // refuses it, falling back to the key this would have minted
-                // anyway keeps onboarding working. Any other failure, such as an
-                // unreachable agent, fails as an explicitly configured
-                // provisioner does, so a passing outage never leaves an agent
-                // with a gateway-held key for good.
-                Err(e) if provisioner.optional() && crate::vta::agent_contexts::is_capability_refusal(&e) => {
-                    warn!(
-                        target: "vta_audit",
-                        error = %e,
-                        "could not mint this agent's key in the trust agent; \
-                         falling back to a gateway-held key",
-                    );
-                    None
-                }
-                Err(e) => return Err(e),
-            },
+            // A trust agent signs for the gateway, so the agent's key belongs
+            // in it: a failure, a refusal included, fails the onboarding rather
+            // than leaving a key on this host for good.
+            Some(provisioner) if provisioner.available() => Some(
+                provisioner
+                    .provision(&identity_hash)
+                    .await?,
+            ),
             // No provisioner, or no trust agent configured for it to use: the
             // gateway mints the key, exactly as it always did.
             _ => None,
@@ -4659,24 +4644,31 @@ mod tests {
         assert_eq!(key_ids(&document, "assertionMethod"), vec![format!("{did}#key-1")]);
     }
 
-    /// An inferred provisioner that fails with `error`.
-    struct FailingInferredProvisioner(fn() -> crate::vta::VtaError);
+    /// A provisioner that fails with `error`, or has no trust agent to use.
+    struct FailingProvisioner {
+        error: fn() -> crate::vta::VtaError,
+        available: bool,
+    }
 
     #[async_trait::async_trait]
-    impl crate::vta::agent_contexts::AgentKeyProvisioner for FailingInferredProvisioner {
+    impl crate::vta::agent_contexts::AgentKeyProvisioner for FailingProvisioner {
         async fn provision(
             &self,
             _identity_hash: &str,
         ) -> Result<crate::vta::agent_contexts::ProvisionedAgent> {
-            Err(anyhow::Error::new((self.0)()).context("provisioning a VTA context for agent"))
+            Err(anyhow::Error::new((self.error)()).context("provisioning a VTA context for agent"))
         }
 
-        fn optional(&self) -> bool {
-            true
+        fn available(&self) -> bool {
+            self.available
         }
     }
 
-    async fn onboard_with(provisioner: FailingInferredProvisioner) -> Result<AgentIdentityResponse> {
+    fn failing(error: fn() -> crate::vta::VtaError) -> FailingProvisioner {
+        FailingProvisioner { error, available: true }
+    }
+
+    async fn onboard_with(provisioner: FailingProvisioner) -> Result<AgentIdentityResponse> {
         crate::gateways::did_cache::init_shared_resolver()
             .await
             .unwrap();
@@ -4696,16 +4688,31 @@ mod tests {
             .await
     }
 
-    /// A trust agent that refuses to create the agent's context leaves the
-    /// agent with the key the gateway would have minted anyway.
+    /// While a trust agent signs for the gateway, a refusal to create the
+    /// agent's context fails the onboarding rather than leaving the agent with
+    /// a key on this host for good.
     #[tokio::test]
-    async fn an_agent_is_onboarded_with_a_gateway_held_key_when_the_trust_agent_refuses() {
-        let response = onboard_with(FailingInferredProvisioner(|| crate::vta::VtaError::Http {
-            status: 403,
-            body: r#"{"payload":{"code":"permissionDenied"}}"#.to_string(),
-        }))
+    async fn a_trust_agent_that_refuses_to_mint_the_key_fails_the_onboarding() {
+        assert!(
+            onboard_with(failing(|| crate::vta::VtaError::Http {
+                status: 403,
+                body: r#"{"payload":{"code":"permissionDenied"}}"#.to_string(),
+            }))
+            .await
+            .is_err()
+        );
+    }
+
+    /// With no trust agent signing, the gateway mints the agent's key itself,
+    /// exactly as before trust agents existed.
+    #[tokio::test]
+    async fn without_a_trust_agent_an_agent_is_onboarded_with_a_gateway_held_key() {
+        let response = onboard_with(FailingProvisioner {
+            error: || crate::vta::VtaError::Config("never asked".to_string()),
+            available: false,
+        })
         .await
-        .expect("a refusal falls back");
+        .expect("onboarded as before");
         assert!(!response.credential.is_empty());
     }
 
@@ -4722,7 +4729,7 @@ mod tests {
             || crate::vta::VtaError::QuotaExceeded("spent".to_string()),
         ] {
             assert!(
-                onboard_with(FailingInferredProvisioner(error))
+                onboard_with(failing(error))
                     .await
                     .is_err(),
                 "{:?}",

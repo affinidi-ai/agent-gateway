@@ -51,26 +51,6 @@ pub trait AgentKeyProvisioner: Send + Sync {
         identity_hash: &str,
     ) -> Result<ProvisionedAgent>;
 
-    /// Whether onboarding may fall back to a gateway-held key when
-    /// [`Self::provision`] fails.
-    ///
-    /// `false` — the default — is for a provisioner the operator asked for
-    /// explicitly (`[vta] auto_provision_contexts`): they demanded that agent
-    /// keys live in the agent, so quietly minting one here instead would hand
-    /// back a weaker guarantee than the one they configured. Onboarding fails
-    /// and says why.
-    ///
-    /// `true` is for a provisioner the gateway *inferred* it could use, from
-    /// an agent being the appliance default. The grant may simply not carry
-    /// `context-create`, and that cannot be known in advance — the agent
-    /// deliberately keeps capabilities out of the session token so a narrowing
-    /// takes effect on the next call rather than the next login. Refusing to
-    /// onboard any agent at all over an inference would be far worse than
-    /// continuing with the key the gateway would have minted anyway.
-    fn optional(&self) -> bool {
-        false
-    }
-
     /// Whether there is anything to provision into right now.
     ///
     /// `false` means "no trust agent is configured", which is the ordinary
@@ -111,15 +91,6 @@ impl VtaAgentProvisioner {
     ) -> Self {
         Self { creator, connection_id }
     }
-}
-
-/// Whether provisioning failed because the trust agent refused it (`403`), such
-/// as a grant without `context-create`, rather than for a reason that may pass:
-/// an unreachable agent, an open circuit, a timeout or a spent quota.
-pub fn is_capability_refusal(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        matches!(cause.downcast_ref::<crate::vta::VtaError>(), Some(crate::vta::VtaError::Http { status: 403, .. }))
-    })
 }
 
 #[async_trait]

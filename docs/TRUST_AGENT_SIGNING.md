@@ -107,7 +107,7 @@ oracle. A scope nobody chose a trust agent for issues under the gateway-wide sig
 | --- | --- |
 | Tokens and credentials the gateway signs | Signed by the trust agent |
 | The Fabric issuer attestation | Signs as, and claims, the trust agent context |
-| Agents onboarded from then on | Their key is created inside the trust agent; the gateway never holds the private half. When the agent refuses (`403`, such as a grant without `context-create`) the agent gets a gateway-held key instead; any other failure, such as an unreachable agent, fails onboarding |
+| Agents onboarded from then on | Their key is created inside the trust agent that signs for the gateway at that moment (the one Gateway signing names, else the `[vta]` block's, whether or not it auto-provisions contexts); the gateway never holds the private half. When that agent cannot create it (a refusal such as a grant without `context-create`, an unreachable agent, or a Gateway signing choice that names no context) onboarding fails with the reason; the gateway never mints the key itself instead. A gateway signing with its own key mints agents' keys as before |
 | Agents that already exist | Unchanged: they keep their gateway-held keys, since moving them would change their DIDs |
 | TLS, SAML, x402 and DIDComm keys | Unchanged; `vta::key_surfaces` computes which keys stay local and why |
 

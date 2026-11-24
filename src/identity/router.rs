@@ -2804,15 +2804,11 @@ pub async fn create_identity_api_router(
         }
     }
 
-    // The agent's **holder** proof signs in the agent's own VTA context
-    //, so the gateway stops custodying other parties' private keys.
-    // Both halves are set together: the provisioner is what gives a newly
-    // onboarded agent a context, and the issuer is what finds it again at
-    // signing time. Setting only one would either onboard agents whose key
-    // nothing can reach, or look for contexts nothing creates.
-    if let Some(agent_provisioner) = agent_provisioner
-        && let Some(vta_client) = vta_client_for_holder
-    {
+    // The agent's **holder** proof signs in the agent's own trust agent
+    // context, so the gateway stops custodying other parties' private keys.
+    // This issuer finds an agent's context again at signing time; the
+    // provisioner below gives a newly onboarded agent one.
+    if let Some(vta_client) = vta_client_for_holder {
         let agent_contexts = std::sync::Arc::new(crate::vta::agent_contexts::StoredAgentContexts::new(
             sts_vc_issuer.get_identity_store(),
         ));
@@ -2832,16 +2828,9 @@ pub async fn create_identity_api_router(
         sts_vc_issuer
             .set_di_vp_issuer(holder_issuer)
             .await;
-        sts_vc_issuer
-            .set_agent_provisioner(agent_provisioner)
-            .await;
     } else if let Some(registry) = vta_connection_registry.clone() {
-        // Same two halves, resolved from the dashboard's appliance default
-        // instead of `[vta]`. The provisioner reports itself optional, so a
-        // grant that turns out not to carry `context-create` falls back to a
-        // gateway-held key rather than refusing to onboard the agent — the
-        // capability cannot be known in advance, because the agent keeps it
-        // out of the session token so a narrowing bites on the next call.
+        // The same issuer, resolving an agent's trust agent from the
+        // dashboard's appliance default when there is no `[vta]` block.
         let appliance_default: std::sync::Arc<dyn crate::vta::key_directory::ApplianceSigningDefault> =
             std::sync::Arc::new(crate::vta::key_directory::SettingsApplianceDefault);
         let agent_contexts = std::sync::Arc::new(crate::vta::agent_contexts::StoredAgentContexts::new(
@@ -2863,11 +2852,30 @@ pub async fn create_identity_api_router(
         sts_vc_issuer
             .set_di_vp_issuer(holder_issuer)
             .await;
+    }
+
+    // A newly onboarded agent's key is minted in the trust agent that signs
+    // for the gateway at that moment, read per onboarding so a change of
+    // Gateway signing applies to the next agent. With no trust agent the
+    // gateway mints it, as it always did.
+    if let Some(registry) = vta_connection_registry.clone() {
         sts_vc_issuer
             .set_agent_provisioner(std::sync::Arc::new(crate::vta::appliance_di::ApplianceAgentProvisioner::new(
                 registry,
-                appliance_default,
+                std::sync::Arc::new(crate::vta::key_directory::SettingsApplianceDefault),
+                sts_vta_config
+                    .enabled
+                    .then(|| {
+                        sts_vta_config
+                            .context_id
+                            .clone()
+                    })
+                    .flatten(),
             )))
+            .await;
+    } else if let Some(agent_provisioner) = agent_provisioner {
+        sts_vc_issuer
+            .set_agent_provisioner(agent_provisioner)
             .await;
     }
 

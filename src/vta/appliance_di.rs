@@ -199,25 +199,71 @@ impl crate::vta::vp_issuer::VtaClients for ApplianceVtaClients {
     }
 }
 
-/// Mints an agent's key inside the appliance's current agent.
+/// Mints a newly onboarded agent's key inside the trust agent that signs for
+/// the gateway right now: the one Gateway signing names, else the `[vta]`
+/// block's. When the gateway signs with its own key there is nothing to
+/// provision into, and the gateway mints the agent's key as it always did.
 ///
-/// Unlike the `[vta]`-configured provisioner this is **inferred** from an agent
-/// being the default, so it reports itself optional: the grant may not carry
-/// `context-create`, and that cannot be known before trying — the agent keeps
-/// capabilities out of the session token on purpose, so a narrowing bites on
-/// the next call rather than the next login. Onboarding falls back to a
-/// gateway-held key rather than failing outright.
+/// Once a trust agent signs, its agents' keys belong in it, so a failure, a
+/// refusal included, fails the onboarding with the reason rather than leaving
+/// the agent with a key on this host for good.
 pub struct ApplianceAgentProvisioner {
     registry: Arc<VtaConnectionRegistry>,
     appliance_default: Arc<dyn ApplianceSigningDefault>,
+    /// The `[vta]` block's context, when the block is enabled.
+    bootstrap_context: Option<String>,
 }
 
 impl ApplianceAgentProvisioner {
     pub fn new(
         registry: Arc<VtaConnectionRegistry>,
         appliance_default: Arc<dyn ApplianceSigningDefault>,
+        bootstrap_context: Option<String>,
     ) -> Self {
-        Self { registry, appliance_default }
+        Self {
+            registry,
+            appliance_default,
+            bootstrap_context,
+        }
+    }
+
+    /// The connection and parent context a new agent's key is minted under:
+    /// `None` when the gateway signs with its own key, an error when the trust
+    /// agent that signs names nowhere to mint it.
+    fn target(&self) -> Option<Result<(String, String)>> {
+        use crate::config::agent_surface::SigningBackendKind;
+        let bootstrap = crate::vta::connections::BOOTSTRAP_CONNECTION_ID;
+        match self
+            .appliance_default
+            .signing()
+            .filter(|signing| !signing.is_empty())
+        {
+            Some(signing) if signing.backend == Some(SigningBackendKind::Vta) => {
+                let connection_id = signing
+                    .connection_id
+                    .filter(|id| id != crate::vta::key_directory::DEFAULT_CONNECTION_ID)
+                    .unwrap_or_else(|| bootstrap.to_string());
+                let context_id = signing
+                    .context_id
+                    .or_else(|| {
+                        (connection_id == bootstrap)
+                            .then(|| self.bootstrap_context.clone())
+                            .flatten()
+                    });
+                Some(
+                    context_id
+                        .map(|context_id| (connection_id, context_id))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Gateway signing names no trust agent context to mint agent keys in")
+                        }),
+                )
+            }
+            Some(_) => None,
+            None => self
+                .bootstrap_context
+                .clone()
+                .map(|context_id| Ok((bootstrap.to_string(), context_id))),
+        }
     }
 }
 
@@ -227,19 +273,11 @@ impl crate::vta::agent_contexts::AgentKeyProvisioner for ApplianceAgentProvision
         &self,
         identity_hash: &str,
     ) -> Result<crate::vta::agent_contexts::ProvisionedAgent> {
-        let signing = self
-            .appliance_default
-            .signing()
-            .ok_or_else(|| anyhow::anyhow!("no appliance signing default is set"))?;
-        if signing.backend != Some(crate::config::agent_surface::SigningBackendKind::Vta) {
-            anyhow::bail!("the appliance default is not a trust agent");
-        }
-        let connection_id = signing
-            .connection_id
-            .ok_or_else(|| anyhow::anyhow!("the appliance default names no connection"))?;
-        let context_id = signing
-            .context_id
-            .ok_or_else(|| anyhow::anyhow!("the appliance default names no context"))?;
+        let (connection_id, context_id) = self
+            .target()
+            .ok_or_else(|| {
+                anyhow::anyhow!("the gateway signs with its own key, so no trust agent mints agent keys")
+            })??;
         let client = self
             .registry
             .client(&connection_id)
@@ -254,25 +292,11 @@ impl crate::vta::agent_contexts::AgentKeyProvisioner for ApplianceAgentProvision
         .await
     }
 
-    fn optional(&self) -> bool {
-        true
-    }
-
-    /// Only attempt when an agent is actually the appliance default.
-    ///
-    /// This provisioner is installed unconditionally, because the default can
-    /// be set while the gateway runs. On an install that never adopted an
-    /// agent that would otherwise mean an attempt, a failure and a warning on
-    /// every single onboarding — alarming logs describing nothing wrong.
+    /// Only when a trust agent signs for the gateway. An install that never
+    /// adopted one, or chose its own key, onboards agents as it always did,
+    /// with no attempt and no warning.
     fn available(&self) -> bool {
-        self.appliance_default
-            .signing()
-            .is_some_and(|signing| {
-                signing.backend == Some(crate::config::agent_surface::SigningBackendKind::Vta)
-                    && signing
-                        .connection_id
-                        .is_some()
-            })
+        self.target().is_some()
     }
 }
 
@@ -577,111 +601,88 @@ mod live_tests {
 #[cfg(test)]
 mod fallback_tests {
     use super::*;
-    use crate::vta::agent_contexts::{AgentKeyProvisioner, ProvisionedAgent};
-    use anyhow::Context as _;
+    use crate::vta::agent_contexts::AgentKeyProvisioner;
 
-    struct AlwaysFails(bool);
-
-    #[async_trait]
-    impl AgentKeyProvisioner for AlwaysFails {
-        async fn provision(
-            &self,
-            _identity_hash: &str,
-        ) -> Result<ProvisionedAgent> {
-            Err(crate::vta::VtaError::Http {
-                status: 403,
-                body: r#"{"payload":{"code":"permissionDenied"}}"#.to_string(),
-            })
-            .context("provisioning a VTA context for agent")
-        }
-
-        fn optional(&self) -> bool {
-            self.0
-        }
-    }
-
-    /// A gateway that never adopted a trust agent must not attempt, fail and
-    /// warn on every onboarding. The behaviour was always correct — it fell
-    /// back to a gateway-held key — but the logs described a fault that was
-    /// not happening, on an install that never asked for an agent at all.
-    #[tokio::test]
-    async fn no_trust_agent_means_no_attempt_and_no_warning() {
+    async fn registry() -> (Arc<VtaConnectionRegistry>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(
             crate::vta::connections::FileSystemVtaConnectionStore::new(tmp.path().join("c"))
                 .await
                 .expect("store"),
         );
-        let registry =
-            Arc::new(VtaConnectionRegistry::new(store, None, None, None, std::time::Duration::from_secs(5), 4));
-
-        // Pre-VTA install: no appliance default at all.
-        let untouched = ApplianceAgentProvisioner::new(Arc::clone(&registry), Arc::new(tests::Fixed(None)));
-        assert!(!untouched.available(), "an install with no trust agent must be left alone entirely");
-
-        // An explicit local default is also "no agent".
-        let local = ApplianceAgentProvisioner::new(
-            Arc::clone(&registry),
-            Arc::new(tests::Fixed(Some(crate::config::agent_surface::SurfaceSigningConfig {
-                backend: Some(crate::config::agent_surface::SigningBackendKind::Local),
-                ..Default::default()
-            }))),
-        );
-        assert!(!local.available(), "signing locally is a choice, not an agent");
-
-        // An agent as the default is the only case that should be attempted.
-        let agent = ApplianceAgentProvisioner::new(
-            registry,
-            Arc::new(tests::Fixed(Some(tests::vta_signing(Some("vta-a"), Some("ctx"))))),
-        );
-        assert!(agent.available(), "an agent is the default, so provisioning applies");
+        (Arc::new(VtaConnectionRegistry::new(store, None, None, None, std::time::Duration::from_secs(5), 4)), tmp)
     }
 
-    /// An inferred provisioner must be optional, or a grant without
-    /// `context-create` would stop every agent from onboarding — and that
-    /// grant cannot be inspected in advance.
+    fn provisioner(
+        registry: &Arc<VtaConnectionRegistry>,
+        default: Option<crate::config::agent_surface::SurfaceSigningConfig>,
+        bootstrap_context: Option<&str>,
+    ) -> ApplianceAgentProvisioner {
+        ApplianceAgentProvisioner::new(
+            Arc::clone(registry),
+            Arc::new(tests::Fixed(default)),
+            bootstrap_context.map(str::to_string),
+        )
+    }
+
+    fn local() -> Option<crate::config::agent_surface::SurfaceSigningConfig> {
+        Some(crate::config::agent_surface::SurfaceSigningConfig {
+            backend: Some(crate::config::agent_surface::SigningBackendKind::Local),
+            ..Default::default()
+        })
+    }
+
+    /// A gateway that signs with its own key, with or without a `[vta]` block
+    /// behind a local choice, onboards agents as it always did: no attempt,
+    /// no warning.
     #[tokio::test]
-    async fn the_inferred_provisioner_is_optional() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(
-            crate::vta::connections::FileSystemVtaConnectionStore::new(tmp.path().join("c"))
-                .await
-                .expect("store"),
-        );
-        let provisioner = ApplianceAgentProvisioner::new(
-            Arc::new(VtaConnectionRegistry::new(store, None, None, None, std::time::Duration::from_secs(5), 4)),
-            Arc::new(tests::Fixed(None)),
-        );
-        assert!(provisioner.optional(), "onboarding must survive a grant that cannot create contexts");
+    async fn a_gateway_signing_with_its_own_key_mints_agent_keys_itself() {
+        let (registry, _tmp) = registry().await;
+        assert!(!provisioner(&registry, None, None).available(), "no trust agent at all");
+        assert!(!provisioner(&registry, local(), None).available(), "its own key chosen");
+        assert!(!provisioner(&registry, local(), Some("gw")).available(), "its own key chosen over [vta]");
     }
 
-    /// An explicitly configured provisioner must stay fail-closed: the
-    /// operator asked for agent-held keys, so silently minting one here would
-    /// hand back a weaker guarantee than the one they configured.
-    #[test]
-    fn an_explicit_provisioner_defaults_to_required() {
-        assert!(!AlwaysFails(false).optional());
-        assert!(AlwaysFails(true).optional());
-    }
-
-    /// With no appliance default there is nothing to provision into, and the
-    /// error must say so rather than surfacing a transport failure.
+    /// Whatever trust agent signs for the gateway right now mints new agents'
+    /// keys: the one Gateway signing names, else the `[vta]` block's.
     #[tokio::test]
-    async fn provisioning_without_an_appliance_default_explains_itself() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(
-            crate::vta::connections::FileSystemVtaConnectionStore::new(tmp.path().join("c"))
-                .await
-                .expect("store"),
+    async fn new_agent_keys_follow_the_trust_agent_that_signs_now() {
+        let (registry, _tmp) = registry().await;
+        let bootstrap = crate::vta::connections::BOOTSTRAP_CONNECTION_ID.to_string();
+        let target = |p: ApplianceAgentProvisioner| {
+            p.target()
+                .expect("a trust agent signs")
+                .expect("it names a context")
+        };
+
+        assert_eq!(
+            target(provisioner(&registry, None, Some("gw"))),
+            (bootstrap.clone(), "gw".to_string()),
+            "the [vta] block signs, whether or not it auto-provisions contexts"
         );
-        let provisioner = ApplianceAgentProvisioner::new(
-            Arc::new(VtaConnectionRegistry::new(store, None, None, None, std::time::Duration::from_secs(5), 4)),
-            Arc::new(tests::Fixed(None)),
+        assert_eq!(
+            target(provisioner(&registry, Some(tests::vta_signing(Some("vta-b"), Some("ctx-b"))), Some("gw"))),
+            ("vta-b".to_string(), "ctx-b".to_string()),
+            "Gateway signing moved to another agent, so new keys go there"
         );
-        let err = provisioner
+        assert_eq!(
+            target(provisioner(&registry, Some(tests::vta_signing(None, None)), Some("gw"))),
+            (bootstrap, "gw".to_string()),
+            "a choice naming no connection is the [vta] block"
+        );
+    }
+
+    /// A trust agent that signs but names nowhere to mint keys fails the
+    /// onboarding with that reason, never a gateway-held key.
+    #[tokio::test]
+    async fn a_trust_agent_naming_no_context_refuses_to_onboard() {
+        let (registry, _tmp) = registry().await;
+        let p = provisioner(&registry, Some(tests::vta_signing(Some("vta-b"), None)), None);
+        assert!(p.available(), "a trust agent signs, so the gateway mints no key itself");
+        let err = p
             .provision("agent-1")
             .await
-            .expect_err("nothing to provision into");
-        assert!(format!("{err}").contains("appliance signing default"), "names the missing piece: {err}");
+            .expect_err("nowhere to mint");
+        assert!(format!("{err}").contains("no trust agent context"), "names the missing piece: {err}");
     }
 }

@@ -182,9 +182,12 @@ changes:
         under another tenant with a deleted surface's id never signs in that
         surface's context. For a tenant token, GET /v1/vta/status lists only the
         trust agent addresses of the connections it may see, without the
-        appliance control DID or control key. Onboarding an agent falls back to
-        a gateway-held key only when the trust agent refuses with 403, and
-        fails while the agent cannot be reached. A tenant's connection may name only a
+        appliance control DID or control key. A newly onboarded agent's key is
+        created in the trust agent that signs for the gateway at that moment,
+        the one Gateway signing names or else the [vta] block's, and onboarding
+        fails with the reason when that agent cannot create it, instead of
+        leaving the agent with a key on the gateway. A gateway that signs with
+        its own key onboards agents as before. A tenant's connection may name only a
         public https address, checked when it is saved and before each dial,
         and no connection endpoint carries a query or a fragment.
     - timestamp: '2026-11-24T10:15:00Z'
