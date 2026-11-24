@@ -149,6 +149,18 @@ A Transit Point's Rate Limit panel has a **Per caller** section that writes
 `transit.points[].per_caller_rate_limit` beside the point's shared `rate_limit`; see _Surface
 Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+The Surface Builder's **Listen Path** offers the surface prefixes `GET /config/surface-routing`
+reports, with `/outbound` in front on an outbound address the gateway lists in
+`shared_hostname_outbound_addresses`, never on a guess from the two address lists, so the picker
+offers what the save gate accepts. It reads a stored route against that offered list alone: a node
+whose route is under none of the offered prefixes keeps **Surface Prefix** and **Custom Path**
+unresolved and marked after a save attempt, rather than being relabelled under a prefix its path
+does not start with, and a Transit Point whose Listen Path the gateway would refuse blocks Save. A
+Transit Point with no Listen Path at all is neither marked nor blocked, since it answers at its
+derived `/outbound` route. See _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder) and _Transit Point listen paths_
+in [`docs/CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#transit-point-listen-paths).
+
 The Surface Builder palette offers the A2A Transit Point only on A2A and AP2 surfaces and the MCP
 Transit Point only on MCP surfaces; existing Transit Points stay editable; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).

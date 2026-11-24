@@ -84,7 +84,10 @@ describe('ConfirmPopover', () => {
   it('focuses Cancel when it opens and returns focus to the anchor when it closes', async () => {
     const { anchor, unmount } = renderPopover();
 
-    expect(await screen.findByTestId('thing-delete-confirm-cancel')).toHaveFocus();
+    // Cancel is focused by an effect that runs after the balloon is placed, and
+    // findByTestId resolves as soon as it is in the DOM, so wait for the focus.
+    const cancel = await screen.findByTestId('thing-delete-confirm-cancel');
+    await waitFor(() => expect(cancel).toHaveFocus());
     unmount();
 
     expect(anchor).toHaveFocus();

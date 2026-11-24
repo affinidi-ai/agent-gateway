@@ -221,6 +221,10 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
         return null;
       }
       if (!config.target_endpoint) return 'Target endpoint URL is required';
+      // The Listen Path is not checked here: the gateway refuses only a path a
+      // save introduces or changes, so whether this one blocks depends on what
+      // the surface already holds, which this node cannot see. That check lives
+      // in `validateSurfacePayload`, which is given the stored surface.
       return null;
     },
     validate: c => {
