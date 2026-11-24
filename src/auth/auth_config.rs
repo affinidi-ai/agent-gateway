@@ -268,6 +268,17 @@ impl SamlConfig {
                 "SAML role_mapping is empty and default_role is unset: every sign-in except the first user's is refused",
             );
         }
+        if self.default_role.is_none()
+            && !self.role_mapping.is_empty()
+            && self
+                .role_mapping
+                .keys()
+                .all(|key| key.starts_with('<') && key.ends_with('>'))
+        {
+            warnings.push(
+                "SAML role_mapping still holds only the <...> placeholder names of the example: every sign-in except the first user's is refused",
+            );
+        }
         warnings
     }
 }
@@ -405,6 +416,57 @@ mod tests {
                 .role_warnings()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_role_mapping_made_only_of_example_placeholders_warns() {
+        let placeholders = config_with(
+            serde_json::json!({ "<idp-admin-group>": "administrator", "<idp-user-group>": "user" }),
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            placeholders
+                .role_warnings()
+                .len(),
+            1
+        );
+        assert!(placeholders.role_warnings()[0].contains("placeholder"));
+
+        let edited = config_with(
+            serde_json::json!({ "<idp-admin-group>": "administrator", "gw-all": "user" }),
+            serde_json::Value::Null,
+        );
+        assert!(
+            edited
+                .role_warnings()
+                .is_empty()
+        );
+        let with_default = config_with(serde_json::json!({ "<idp-user-group>": "user" }), serde_json::json!("user"));
+        assert!(
+            with_default
+                .role_warnings()
+                .is_empty()
+        );
+    }
+
+    fn saml_json_with_roles(role_mapping: &str) -> String {
+        format!(
+            r#"{{"idp_entity_id":"idp","idp_sso_url":"https://idp.example/sso","sp_entity_id":"sp","sp_acs_url":"https://sp.example/acs","idp_cert_path":"idp.crt","sp_key_path":null,"sp_cert_path":null,"role_mapping":{role_mapping}}}"#
+        )
+    }
+
+    #[test]
+    fn loading_saml_json_refuses_an_unknown_role_name_and_accepts_a_known_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("saml.json");
+
+        std::fs::write(&path, saml_json_with_roles(r#"{"x":"Administrator"}"#)).unwrap();
+        let err = SamlConfig::load_from_file(&path).unwrap_err();
+        assert!(err.contains("'x'") && err.contains("Administrator"), "{err}");
+
+        std::fs::write(&path, saml_json_with_roles(r#"{"x":"administrator"}"#)).unwrap();
+        let config = SamlConfig::load_from_file(&path).unwrap();
+        assert_eq!(config.role_mapping["x"], "administrator");
     }
 
     #[test]

@@ -339,6 +339,24 @@ async fn first_user_has_signed_in_with_saml(
     receive_sign_in_payload(world, EVENT_TOPIC, "data", "user.login", &[("login_method", "saml")]).await;
 }
 
+#[given(
+    expr = "{string} has signed in with SAML carrying the identity provider roles {string} and that event was received"
+)]
+async fn a_user_has_signed_in_with_saml_roles(
+    world: &mut SurfaceWorld,
+    subject: String,
+    roles: String,
+) {
+    sign_in_with_saml_roles(world, subject.clone(), roles).await;
+    let status = world
+        .caller_response
+        .as_ref()
+        .expect("the user's answer")
+        .status;
+    assert_eq!(status, 200, "the SAML sign-in succeeds: {:?}", world.caller_response);
+    receive_sign_in_payload(world, EVENT_TOPIC, "data", "user.login", &[("login_method", "saml")]).await;
+}
+
 #[when(expr = "{string} signs in with SAML carrying the identity provider roles {string}")]
 async fn sign_in_with_saml_roles(
     world: &mut SurfaceWorld,

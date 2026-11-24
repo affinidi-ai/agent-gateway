@@ -639,7 +639,7 @@ claim is shown as none) and raises a `user.login_failed` event with failure reas
 The first user to sign in to an appliance with no users is still the primary administrator, and
 the primary administrator signs in and is updated as usual, keeping that role, even when the role
 is unmapped. A `role_mapping` value or `default_role` that is not `administrator`, `poweruser` or
-`user` (spelled exactly so, in lower case) stops the gateway at startup, naming the entry. At
+`user` (spelled exactly so, in lower case) stops the gateway at startup, naming the entry. `saml.json` is read only at startup, so a change to `role_mapping` or `default_role` takes effect after a restart. At
 startup the gateway warns when `default_role` is `administrator`, since every unmapped sign-in
 then becomes an administrator, and when `role_mapping` is empty and `default_role` is unset, since
 every sign-in but the first user's is then refused.

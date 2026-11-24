@@ -57,6 +57,32 @@ fn changes_reported_state(
     old.role != new.role || old.status != new.status || old.is_primary != new.is_primary
 }
 
+/// Refuse an assertion whose user-id attribute carries more than one distinct value, since which
+/// one identifies the user would depend on the identity provider's ordering.
+fn ensure_single_user_id(
+    all_attributes: &SamlAttributes,
+    config: &SamlConfig,
+) -> Result<()> {
+    let user_id_attribute = if all_attributes.contains_key(
+        &config
+            .attribute_mapping
+            .user_id,
+    ) {
+        &config
+            .attribute_mapping
+            .user_id
+    } else {
+        "NameID"
+    };
+    let distinct: std::collections::HashSet<&String> = all_attributes
+        .get(user_id_attribute)
+        .into_iter()
+        .flatten()
+        .collect();
+    anyhow::ensure!(distinct.len() <= 1, "The SAML user ID attribute carries more than one value");
+    Ok(())
+}
+
 /// Provision or update a user from SAML attributes
 pub async fn provision_user_from_saml(
     storage: &PasskeyStorage,
@@ -81,6 +107,7 @@ pub async fn provision_user_from_saml(
         )
         .or_else(|| attributes.get("NameID"))
         .context("User ID not found in SAML attributes")?;
+    ensure_single_user_id(all_attributes, config)?;
 
     let username = attributes
         .get(
@@ -172,6 +199,15 @@ pub async fn provision_user_from_saml(
             .await?
             .is_empty();
 
+        let final_role = if is_first_user {
+            if let Err(refused) = &role {
+                warn!(idp_role = ?refused.idp_role, "Created the first user as administrator; the IdP role maps to no gateway role");
+            }
+            UserRole::Administrator
+        } else {
+            role?
+        };
+
         // Enforce the appliance user limit for JIT-provisioned users. The first
         // user always bootstraps admin access regardless of the configured cap.
         if !is_first_user {
@@ -184,15 +220,6 @@ pub async fn provision_user_from_saml(
                 return Err(anyhow::Error::new(e));
             }
         }
-
-        let final_role = if is_first_user {
-            if let Err(refused) = &role {
-                warn!(idp_role = ?refused.idp_role, "Created the first user as administrator; the IdP role maps to no gateway role");
-            }
-            UserRole::Administrator
-        } else {
-            role?
-        };
         let status = UserStatus::Approved; // SAML users auto-approved (including first user)
 
         let now = chrono::Utc::now();
@@ -635,6 +662,88 @@ mod tests {
             assert_eq!(again.user.role, UserRole::Administrator);
             assert!(again.user.is_primary);
         }
+    }
+
+    #[tokio::test]
+    async fn the_user_id_username_and_email_take_the_first_value_of_their_attribute() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mapping = SamlAttributeMapping::default();
+        let attributes: SamlAttributes = HashMap::from([
+            (mapping.user_id, vec!["saml-1".to_string()]),
+            (mapping.username, vec!["first-name".to_string(), "second-name".to_string()]),
+            (mapping.email, vec!["first@example.test".to_string(), "second@example.test".to_string()]),
+        ]);
+
+        let provisioned = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            provisioned
+                .user
+                .saml_id
+                .as_deref(),
+            Some("saml-1")
+        );
+        assert_eq!(provisioned.user.username, "first-name");
+        assert_eq!(
+            provisioned
+                .user
+                .email
+                .as_deref(),
+            Some("first@example.test")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_assertion_whose_user_id_attribute_has_two_distinct_values_is_refused() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mut attributes = saml_attributes("saml-1", "jane");
+        attributes
+            .get_mut(&SamlAttributeMapping::default().user_id)
+            .unwrap()
+            .push("saml-2".to_string());
+
+        let err = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("more than one value")
+        );
+        assert!(
+            storage
+                .list_users()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_user_id_attribute_repeating_one_value_is_accepted() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mut attributes = saml_attributes("saml-1", "jane");
+        attributes
+            .get_mut(&SamlAttributeMapping::default().user_id)
+            .unwrap()
+            .push("saml-1".to_string());
+
+        let provisioned = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            provisioned
+                .user
+                .saml_id
+                .as_deref(),
+            Some("saml-1")
+        );
     }
 
     fn mapped_config() -> SamlConfig {

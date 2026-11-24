@@ -74,7 +74,7 @@ Feature: Sign-in integration events
   Scenario: A SAML sign-in with several roles gets the highest mapped one whatever their order
     Given human users sign in with SAML
     And "alpha" has signed in with SAML as the first user and that event was received
-    When "mallory" signs in with SAML carrying the identity provider roles "contractors,gw-power,gw-all"
+    When "mallory" signs in with SAML carrying the identity provider roles "contractors,gw-all,gw-power"
     Then the response status is 200
     And the integration receives a "user.login" event with login method "saml" for user "mallory"
     And that event reports the user role "poweruser"
@@ -97,6 +97,24 @@ Feature: Sign-in integration events
     And the integration receives a "user.login" event with login method "saml" for user "mallory"
     And that event reports the user role "administrator"
     And the integration receives no other sign-in event besides the first user's
+
+  Scenario: A SAML sign-in whose role is not mapped gets the default role
+    Given human users sign in with SAML
+    And saml.json sets "default_role" to "user"
+    And "alpha" has signed in with SAML as the first user and that event was received
+    When "mallory" signs in with SAML carrying the identity provider roles "contractors"
+    Then the response status is 200
+    And the integration receives a "user.login" event with login method "saml" for user "mallory"
+    And that event reports the user role "user"
+    And the integration receives no other sign-in event besides the first user's
+
+  Scenario: A user who signed in with a mapped role is refused when the role is no longer mapped
+    Given human users sign in with SAML
+    And "alpha" has signed in with SAML as the first user and that event was received
+    And "mallory" has signed in with SAML carrying the identity provider roles "gw-admins" and that event was received
+    When "mallory" signs in with SAML carrying the identity provider roles "contractors"
+    Then the response status is 403
+    And the integration receives a "user.login_failed" event with login method "saml" and failure reason "role_not_mapped"
 
   Scenario: A SAML sign-in whose role is named like a gateway role but not mapped is refused
     Given human users sign in with SAML
