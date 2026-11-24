@@ -2849,7 +2849,8 @@ async fn proxy_charged_request(
     // A caller verified by a method the inbound identity does not read (an API
     // key beside `from_jwt_claim`, a token beside `from_api_key`) gets no
     // inbound identity: none its request body asserts or proves either.
-    let caller_identified = caller_gets_inbound_identity(&state.surface, authenticated_identity.as_ref());
+    let caller_identified =
+        caller_gets_inbound_identity(&state.surface, authenticated_identity.as_ref(), source_auth_failed);
     if !caller_identified {
         body_bytes = strip_caller_identity_proofs(
             &body_bytes,
@@ -11151,7 +11152,8 @@ async fn handle_fabric_request_inner(
     } = request;
     let source_auth_failed =
         matches!(source_auth_context, Some(crate::surface_context::SourceAuthContext::Failed { .. }));
-    let caller_identified = caller_gets_inbound_identity(&state.surface, authenticated_identity.as_ref());
+    let caller_identified =
+        caller_gets_inbound_identity(&state.surface, authenticated_identity.as_ref(), source_auth_failed);
     let body_bytes = if caller_identified {
         body_bytes
     } else {
@@ -16631,12 +16633,19 @@ fn has_vp_injection_prerequisites(
 
 /// Whether a caller verified as `caller` gets an inbound identity: always,
 /// unless the inbound identity reads a credential of another kind (see
-/// [`crate::config::agent_surface::AgentSurface::inbound_identity_reads`]).
+/// [`crate::config::agent_surface::AgentSurface::inbound_identity_reads`]). A
+/// caller whose credential failed gets none from an identity read from a
+/// credential either, so it keeps no more of its own than a verified caller of
+/// another method.
 fn caller_gets_inbound_identity(
     surface: &crate::config::agent_surface::AgentSurface,
     caller: Option<&crate::source_auth::AuthenticatedIdentity>,
+    source_auth_failed: bool,
 ) -> bool {
-    caller.is_none_or(|caller| surface.inbound_identity_reads(caller))
+    match caller {
+        Some(caller) => surface.inbound_identity_reads(caller),
+        None => !(source_auth_failed && surface.inbound_identity_reads_a_credential()),
+    }
 }
 
 /// The identity proofs a caller can put in its request body: the identity
@@ -16646,11 +16655,13 @@ const CALLER_IDENTITY_PROOFS: [&str; 2] = [
     crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION,
 ];
 
-/// `body_bytes` without the identity proofs its caller put in it (MCP `_meta`
-/// entries, A2A and AP2 message metadata and extension URIs), for a caller that
-/// gets no inbound identity, so none of its own reaches the Target. A body that
-/// is not JSON, or of another protocol, carries no such proof and is returned
-/// as it is.
+/// `body_bytes` without the identity proofs its caller put in it, for a caller
+/// that gets no inbound identity, so none of its own reaches the Target: the
+/// MCP `_meta` entries, and the A2A and AP2 message `metadata` entries (in
+/// `params.message`, `message` or a bare message), of a request or of each
+/// request of a JSON-RPC batch. The extension URIs in `extensions` stay: they
+/// also ask for the responding agent's credential. A body with no proof, one
+/// that is not JSON, or one of another protocol is returned byte for byte.
 fn strip_caller_identity_proofs(
     body_bytes: &bytes::Bytes,
     protocol: &crate::config::ChannelProtocol,
@@ -16658,42 +16669,48 @@ fn strip_caller_identity_proofs(
     let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
         return body_bytes.clone();
     };
-    match protocol {
-        crate::config::ChannelProtocol::Mcp => {
-            for key in CALLER_IDENTITY_PROOFS {
-                crate::mcp::meta::remove_metadata_key(&mut body, key);
-            }
-        }
-        crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2 => {
-            for pointer in ["/params/message", "/message"] {
-                let Some(message) = body
-                    .pointer_mut(pointer)
-                    .and_then(serde_json::Value::as_object_mut)
-                else {
-                    continue;
-                };
-                if let Some(metadata) = message
-                    .get_mut("metadata")
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    for key in CALLER_IDENTITY_PROOFS {
-                        metadata.remove(key);
-                    }
-                }
-                if let Some(extensions) = message
-                    .get_mut("extensions")
-                    .and_then(serde_json::Value::as_array_mut)
-                {
-                    extensions.retain(|uri| {
-                        !uri.as_str()
-                            .is_some_and(|uri| CALLER_IDENTITY_PROOFS.contains(&uri))
-                    });
-                }
-            }
-        }
+    let remove: fn(&mut serde_json::Value) -> bool = match protocol {
+        crate::config::ChannelProtocol::Mcp => remove_mcp_identity_proofs,
+        crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2 => remove_a2a_identity_proofs,
         _ => return body_bytes.clone(),
+    };
+    let removed = match &mut body {
+        serde_json::Value::Array(requests) => requests
+            .iter_mut()
+            .fold(false, |removed, request| remove(request) | removed),
+        request => remove(request),
+    };
+    if !removed {
+        return body_bytes.clone();
     }
     serde_json::to_vec(&body).map_or_else(|_| body_bytes.clone(), bytes::Bytes::from)
+}
+
+/// Remove the caller identity proofs from an MCP request's `_meta`; whether any was there.
+fn remove_mcp_identity_proofs(request: &mut serde_json::Value) -> bool {
+    let before = request.clone();
+    for key in CALLER_IDENTITY_PROOFS {
+        crate::mcp::meta::remove_metadata_key(request, key);
+    }
+    *request != before
+}
+
+/// Remove the caller identity proofs from an A2A or AP2 message's `metadata`;
+/// whether any was there.
+fn remove_a2a_identity_proofs(request: &mut serde_json::Value) -> bool {
+    let mut removed = false;
+    for pointer in ["/params/message", "/message", ""] {
+        if let Some(metadata) = request
+            .pointer_mut(pointer)
+            .and_then(|message| message.get_mut("metadata"))
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for key in CALLER_IDENTITY_PROOFS {
+                removed |= metadata.remove(key).is_some();
+            }
+        }
+    }
+    removed
 }
 
 /// Inject an identity binding VP into an outbound request body.
@@ -23869,7 +23886,10 @@ allow if {
             let stripped: serde_json::Value = serde_json::from_slice(&stripped).unwrap();
 
             let message = &stripped["params"]["message"];
-            assert_eq!(message["extensions"], serde_json::json!(["https://example.com/other/v1"]));
+            assert_eq!(
+                message["extensions"], body["params"]["message"]["extensions"],
+                "the extension URIs stay: they ask for the responding agent's credential"
+            );
             assert_eq!(message["metadata"], serde_json::json!({"https://example.com/other/v1": {"kept": true}}));
             assert_eq!(message["parts"], body["params"]["message"]["parts"]);
         }
@@ -23904,6 +23924,70 @@ allow if {
                     .get(crate::config::MCP_TRUST_REGISTRY_KEY)
                     .is_some()
             );
+        }
+
+        #[test]
+        fn a_body_without_an_identity_proof_is_forwarded_byte_for_byte() {
+            let body = axum::body::Bytes::from_static(
+                br#"{"jsonrpc":"2.0", "id":1, "method":"message/send", "params":{"message":{"role":"user","messageId":"m1","parts":[{"kind":"text","text":"hi"}],"metadata":{"n":12345678901234567890123}}}}"#,
+            );
+            assert_eq!(super::super::strip_caller_identity_proofs(&body, &crate::config::ChannelProtocol::A2a), body);
+        }
+
+        #[test]
+        fn every_request_of_a_batch_and_a_bare_message_lose_their_identity_proofs() {
+            let binding = crate::config::AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION;
+            let request = |id: u32| {
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "message/send",
+                    "params": {"message": {"role": "user", "messageId": "m", "parts": [],
+                        "metadata": {binding: {"verifiablePresentation": "caller-made"}}}}})
+            };
+            let batch = serde_json::json!([request(1), request(2)]);
+            let stripped: serde_json::Value = serde_json::from_slice(&super::super::strip_caller_identity_proofs(
+                &serde_json::to_vec(&batch)
+                    .unwrap()
+                    .into(),
+                &crate::config::ChannelProtocol::A2a,
+            ))
+            .unwrap();
+            for request in stripped.as_array().unwrap() {
+                assert!(
+                    request["params"]["message"]["metadata"]
+                        .get(binding)
+                        .is_none(),
+                    "{request}"
+                );
+            }
+
+            let bare = serde_json::json!({"role": "user", "messageId": "m", "parts": [],
+                "metadata": {binding: {"verifiablePresentation": "caller-made"}}});
+            let stripped: serde_json::Value = serde_json::from_slice(&super::super::strip_caller_identity_proofs(
+                &serde_json::to_vec(&bare)
+                    .unwrap()
+                    .into(),
+                &crate::config::ChannelProtocol::A2a,
+            ))
+            .unwrap();
+            assert!(
+                stripped["metadata"]
+                    .get(binding)
+                    .is_none(),
+                "{stripped}"
+            );
+        }
+
+        #[test]
+        fn a_failed_caller_gets_no_identity_read_from_a_credential() {
+            let api_key = surface_with(
+                "failed-beside-api-key",
+                Some(ManagedIdentityConfig::FromApiKey { api_key_id: None }),
+                None,
+            );
+            assert!(!super::super::caller_gets_inbound_identity(&api_key, None, true));
+            assert!(super::super::caller_gets_inbound_identity(&api_key, None, false), "no source authentication");
+
+            let payload = surface_with("failed-beside-payload", None, None);
+            assert!(super::super::caller_gets_inbound_identity(&payload, None, true));
         }
 
         #[test]
@@ -24819,6 +24903,85 @@ mod fabric_send_tests {
                 .unwrap_or_default();
             assert!(url.starts_with("https://gateway.example"), "{body}");
         });
+    }
+
+    #[tokio::test]
+    async fn fabric_send_forwards_no_identity_proof_of_a_caller_that_gets_no_inbound_identity() {
+        let peer = fabric_peer_fronted_by(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}}), |peer_id| {
+            json!({
+                "surface_id": "fabric-a2a", "name": "Fabric A2A",
+                "access_point": {
+                    "listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a",
+                    "caller_authentication": {"methods": [
+                        {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": ["aud"]},
+                        {"type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "keys"}
+                    ]}
+                },
+                "identity_slots": {"inbound": {"type": "from_jwt_claim", "claim": "sub"}},
+                "target": {"endpoint": format!("fabric://{peer_id}/remote-surface")}
+            })
+        })
+        .await;
+        let binding = crate::config::AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION;
+        let body = json!({
+            "jsonrpc": "2.0", "id": "m-1", "method": "message/send",
+            "params": {"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}], "messageId": "m-1",
+                "extensions": [binding],
+                "metadata": {
+                    binding: {"verifiablePresentation": "caller-made-presentation"},
+                    crate::config::TRUST_REGISTRY_EXTENSION: {"agent_did": "did:web:asserted.example"}
+                }}}
+        });
+        let caller = crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "keys".to_string(),
+            provider_agent_id: None,
+        };
+
+        let result = Box::pin(super::handle_fabric_request(
+            peer.state.clone(),
+            super::FabricSend {
+                channel_name: "Fabric A2A",
+                method: axum::http::Method::POST,
+                uri: "https://gateway.example/a2a"
+                    .parse()
+                    .unwrap(),
+                headers: axum::http::HeaderMap::new(),
+                source_addr: "127.0.0.1:12345".to_string(),
+                start_time: std::time::Instant::now(),
+                connection_guard: super::ConnectionGuard::new(None, None),
+                body_bytes: axum::body::Bytes::from(body.to_string()),
+                trace_id: "trace-1".to_string(),
+                ucp_operation: None,
+                authenticated_identity: Some(caller),
+                source_auth_context: None,
+                payment_context: None,
+                mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
+                mcp_verified_binding: None,
+                mcp_classification: None,
+                subscription_lifetime: None,
+                mcp_continuations: None,
+                payment: None,
+            },
+        ))
+        .await;
+
+        if let Err(refused) = result {
+            panic!("refused with {}", refused.status());
+        }
+        let sent = peer
+            .forwards
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(sent.len(), 1);
+        let message = &sent[0]["body"]["params"]["message"];
+        assert!(
+            message["metadata"]
+                .get(binding)
+                .is_none(),
+            "the caller's own proof reached the peer: {message}"
+        );
+        assert_eq!(message["extensions"], json!([binding]), "the request for the response credential stays");
     }
 
     #[tokio::test]

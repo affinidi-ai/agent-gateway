@@ -1,8 +1,7 @@
 Feature: Inbound identity derived from a JWT claim
-  An Access Point whose inbound identity comes from a JWT claim cannot derive a
-  caller identity without a valid JWT, so it refuses the caller before policy.
-  A caller authenticated by another Caller Context method is served with no
-  identity.
+  An Access Point whose inbound identity comes from a JWT claim refuses a caller
+  whose credential is missing or invalid before policy. A caller authenticated
+  by another source authentication method is served with no identity.
 
   Scenario Outline: An Access Point deriving the inbound identity from a JWT claim refuses a caller whose token is missing or invalid
     Given an A2A surface targeting managed agent "bravo"
@@ -75,6 +74,25 @@ Feature: Inbound identity derived from a JWT claim
     Given an A2A surface targeting managed agent "bravo"
     And the surface requires "API Key" source authentication
     And the surface derives the inbound identity from a JWT claim
-    When the operator tries to create the surface for route "/example"
+    When the operator attempts to create the surface for route "/example"
     Then the admin API response status is 400
     And the admin API error response mentions "inbound from_jwt_claim identity needs a jwt_bearer source authentication method"
+
+  Scenario: A surface deriving the inbound identity from a JWT claim tells the Target no DID an API key caller asserts
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface accepts "JWT Bearer" and "API Key" source authentication
+    And the surface derives the inbound identity from a JWT claim
+    And the surface accepts JWT audience "bdd-test-audience"
+    And the surface has a request policy that allows all requests
+    When the caller sends a request to the surface with a valid API key and a trust-registry agent DID "did:web:asserted.example"
+    Then the response status is 200
+    And managed agent "bravo" received header "x-caller-did" with value "anonymous"
+
+  Scenario: An MCP surface deriving the inbound identity from a JWT claim forwards no identity proof of an API key caller
+    Given MCP surface "alpha" targets MCP server "bravo"
+    And the surface accepts "JWT Bearer" and "API Key" source authentication
+    And the surface derives the inbound identity from a JWT claim
+    And the surface accepts JWT audience "bdd-test-audience"
+    When the caller asks the MCP surface for available tools with a valid API key and an identity proof of its own
+    Then the response status is 200
+    And MCP server "bravo" did not receive MCP _meta key "https://fabric.affinidi.io/extensions/agent-identity-binding/v1"

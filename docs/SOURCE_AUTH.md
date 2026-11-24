@@ -204,17 +204,29 @@ Creating or saving a surface, and each of its enabled variants as resolved, refu
 Both identity rules follow from the caller: `from_jwt_claim` needs a verified JWT and
 `from_api_key` a verified key. On a surface that mixes JWT and API key callers, an inbound
 `from_jwt_claim` identity identifies the callers of a `jwt_bearer` method and an inbound
-`from_api_key` identity those of an API key method. A caller authenticated by any other method
-is served with no inbound identity: none is derived from its credential or taken from its request
-body, `input.agent.did` is absent, and the identity binding VP and identity credential it puts in
-its request are removed, so the Target receives no identity proof for it, on direct requests and
-Fabric send. Policy tells these callers apart by `input.source_auth.method` and `key_name`;
-to keep them out, deny the methods that get no identity, for example
-`input.source_auth.method != "jwt_bearer"` beside `from_jwt_claim`. Fabric receive does not read
-these identities; the request body sets the caller there. A `from_jwt_claim` DID is derived from
-the claim's value and the values of `namespace_claims` only, so when several `jwt_bearer` methods
-trust different identity providers, set `namespace_claims` to `["iss"]`: a user of one provider
-then can't get the DID of a user of another whose claim has the same value.
+`from_api_key` identity those of an API key method. A caller authenticated by any other method,
+or whose credential failed on a public Access Point, is served with no inbound identity, on direct
+requests and Fabric send: none is derived from its credential or taken from its request body,
+`input.agent.did` and the trust-registry claims its body makes are absent from policy input, and
+the identity binding VP and identity credential it puts in its request are removed before the
+Target, in a single request, each request of a batch, or a bare message. The extension URIs that
+name them stay, since they also ask for the responding agent's credential, and other metadata the
+caller sends, such as a trust-registry `agent_did`, is forwarded unsigned as it came. A body that
+carries no proof is forwarded byte for byte. Policy tells these callers apart by
+`input.source_auth.method` and `key_name`. Fabric receive does not read these identities; the
+request body sets the caller there.
+
+A stored surface whose inbound `from_jwt_claim` or `from_api_key` identity has no method of its
+kind, which a save refuses, refuses its callers as earlier releases did (`500`) rather than
+serving them without an identity.
+
+**Accepted risk:** a caller of another method is admitted with no identity by any policy that
+does not check it. To keep such callers out, deny the methods that get no identity, for example
+`input.source_auth.method != "jwt_bearer"` beside `from_jwt_claim`. A `from_jwt_claim` DID is
+derived from the claim's value and the values of `namespace_claims` only, so with several
+`jwt_bearer` methods trusting different identity providers and no `iss` in `namespace_claims`,
+a user of one provider gets the DID of a user of another whose claim has the same value; set
+`namespace_claims` to `["iss"]` there.
 
 On an Access Point that publishes protected resource metadata, every caller-attributable
 failure is refused before policy: a failed JWT with the discovery challenge, and a failed
@@ -242,7 +254,8 @@ storage ([`fall_back_to_first_source_auth_methods`](../src/surfaces/store.rs)); 
 node, a storage event and a DynamoDB-sourced surface are corrected in memory only. A stored
 `from_jwt_claim` identity on another slot without `jwt_bearer` as its only method, and an
 inbound `from_jwt_claim` or `from_api_key` identity with no method of its kind to read, are
-logged as a warning at startup and refused on the next save.
+logged as a warning at startup, which says their callers are refused until the surface is fixed,
+and refused on the next save.
 
 Before rolling back to a release that enforces only the first method, remove every method but
 the first. That release strips only the first method's header, so it would forward a later
@@ -1969,9 +1982,11 @@ decides, as for a failed key.
 
 ### `from_jwt_claim`
 
-Requires `jwt_bearer` source auth on the same surface, so the token is cryptographically
-verified before the DID is derived. On a direct or fabric-routed Access Point, a missing or
-invalid bearer token is refused with `401` before the target is called.
+Requires a `jwt_bearer` source auth method on the same surface, so the token is cryptographically
+verified before the DID is derived. On a direct or fabric-routed Access Point, a caller whose
+credential is missing or invalid, for any method, is refused with `401` before the target is
+called; a caller verified by another method, such as an API key, is served with no identity (see
+[Several methods on one Access Point](#several-methods-on-one-access-point)).
 
 | Field | Default | Effect |
 | --- | --- | --- |

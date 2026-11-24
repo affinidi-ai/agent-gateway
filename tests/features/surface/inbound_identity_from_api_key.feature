@@ -1,7 +1,7 @@
 Feature: Inbound identity derived from the API key a caller presents
   An Access Point whose inbound identity comes from the API key a caller
   presents identifies each API key caller by its key. A caller authenticated by
-  another Caller Context method is served with no identity.
+  another source authentication method is served with no identity.
 
   Scenario: A surface deriving the inbound identity from the API key gives an API key caller beside a JWT method its identity
     Given an A2A surface targeting managed agent "bravo"
@@ -22,3 +22,12 @@ Feature: Inbound identity derived from the API key a caller presents
     When the caller sends a request to the surface with a valid token and an identity proof of its own
     Then the response status is 200
     And managed agent "bravo" received the forwarded request with no caller identity
+
+  Scenario: A surface deriving the inbound identity from the API key without an API key method is refused at save
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface requires "JWT Bearer" source authentication
+    And the surface derives the inbound identity from the API key the caller presents
+    And the surface accepts JWT audience "bdd-test-audience"
+    When the operator attempts to create the surface for route "/example"
+    Then the admin API response status is 400
+    And the admin API error response mentions "needs an API Key or API Key Provider Caller Context method"

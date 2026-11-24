@@ -2011,7 +2011,7 @@ async fn send_preflight_for_post(
     });
 }
 
-#[when(expr = "the operator tries to create the surface for route {string}")]
+#[when(expr = "the operator attempts to create the surface for route {string}")]
 async fn operator_tries_to_create_the_surface(
     world: &mut SurfaceWorld,
     route: String,
@@ -2743,24 +2743,50 @@ async fn request_with_valid_api_key(world: &mut SurfaceWorld) {
     send_request_and_record(world, vec![header]).await;
 }
 
+const AGENT_IDENTITY_BINDING_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity-binding/v1";
+const TRUST_REGISTRY_EXTENSION_URI: &str = "https://fabric.affinidi.io/extensions/trust-registry";
+
 /// `body`, an A2A message, carrying the caller's own identity proofs: an
 /// identity binding VP and an identity credential naming a DID it asserts.
 fn with_caller_identity_proof(mut body: serde_json::Value) -> serde_json::Value {
-    const BINDING: &str = "https://fabric.affinidi.io/extensions/agent-identity-binding/v1";
-    const CREDENTIAL: &str = "https://fabric.affinidi.io/extensions/agent-identity-credential/v1";
     let message = body
         .pointer_mut("/params/message")
         .and_then(serde_json::Value::as_object_mut)
         .expect("an A2A message/send request");
-    message.insert("extensions".to_string(), serde_json::json!([BINDING, CREDENTIAL]));
+    message.insert(
+        "extensions".to_string(),
+        serde_json::json!([AGENT_IDENTITY_BINDING_URI, AGENT_IDENTITY_CREDENTIAL_URI]),
+    );
     message.insert(
         "metadata".to_string(),
         serde_json::json!({
-            BINDING: {"verifiablePresentation": "caller-made-presentation"},
-            CREDENTIAL: {"did": "did:web:asserted.example", "verifiablePresentation": "caller-made-presentation"}
+            AGENT_IDENTITY_BINDING_URI: {"verifiablePresentation": "caller-made-presentation"},
+            AGENT_IDENTITY_CREDENTIAL_URI: {"did": "did:web:asserted.example", "verifiablePresentation": "caller-made-presentation"}
         }),
     );
     body
+}
+
+#[when(expr = "the caller sends a request to the surface with a valid API key and a trust-registry agent DID {string}")]
+async fn request_with_valid_api_key_and_trust_registry_agent_did(
+    world: &mut SurfaceWorld,
+    agent_did: String,
+) {
+    let header = build_valid_api_key_source_auth_header(world);
+    let mut body = build_request_body(&world.surface_config.protocol);
+    body["params"]["message"]["metadata"] =
+        serde_json::json!({ TRUST_REGISTRY_EXTENSION_URI: { "agent_did": agent_did } });
+    send_json_request_and_record(world, body, vec![header]).await;
+}
+
+#[when("the caller asks the MCP surface for available tools with a valid API key and an identity proof of its own")]
+async fn caller_asks_mcp_surface_with_valid_api_key_and_own_identity_proof(world: &mut SurfaceWorld) {
+    let header = build_valid_api_key_source_auth_header(world);
+    let mut body = build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha"));
+    body["params"]["_meta"] = serde_json::json!({
+        AGENT_IDENTITY_BINDING_URI: {"verifiablePresentation": "caller-made-presentation"}
+    });
+    send_json_request_and_record(world, body, vec![header]).await;
 }
 
 #[when("the caller sends a request to the surface with a valid API key and an identity proof of its own")]

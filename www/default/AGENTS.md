@@ -572,9 +572,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `role="status"`); `serving` and `not_judged` show nothing. The gateway gives no reason, so the
   notice names none. An error-level dependency blocks
   Save unless a Caller Context method is API Key or API Key Provider, with the gateway's own
-  message; an inbound From JWT Claims likewise needs a JWT Bearer method, while on the protected
-  or external Identity or a Transit Point every method must be JWT Bearer. Callers of the other
-  methods get no identity. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
+  message (`INBOUND_API_KEY_NEEDS_API_KEY_CALLER`). An inbound From JWT Claims blocks Save unless
+  a Caller Context method is JWT Bearer, with the dashboard's own message
+  (`INBOUND_JWT_CLAIM_NEEDS_JWT_CALLER`); on the protected or external Identity or a Transit
+  Point every method must be JWT Bearer. Callers of the other methods get no identity. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
   apart. Rules only the gateway enforces (an MCP `proxy://` target, `mcp_http.authorization`)
   and rules on inactive variants show as the save-error banner.
 - **Caller Context methods**: the caller-auth element's config holds `methods`, saved as

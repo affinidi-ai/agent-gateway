@@ -3073,6 +3073,14 @@ fn surface_has_deny_all_request_policy(world: &mut SurfaceWorld) {
         .request_policy = Some(RequestPolicyFixture::new("bdd-deny-all", "BDD deny-all surface policy", rego));
 }
 
+#[given("the surface has a request policy that allows all requests")]
+fn surface_has_allow_all_request_policy(world: &mut SurfaceWorld) {
+    let rego = "package surface.policy\n\ndefault allow := true\n".to_string();
+    world
+        .surface_config
+        .request_policy = Some(RequestPolicyFixture::new("bdd-allow-all", "BDD allow-all surface policy", rego));
+}
+
 #[given(expr = "the MCP surface has a request policy that allows all requests")]
 fn mcp_surface_has_allow_all_request_policy(world: &mut SurfaceWorld) {
     let rego = "package surface.policy\n\ndefault allow := true\n".to_string();

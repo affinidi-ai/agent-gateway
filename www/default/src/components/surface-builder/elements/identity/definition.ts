@@ -73,7 +73,7 @@ export const identityDefinition: NodeDefinition = {
         and an optional JSON schema to validate the extracted block.</li>
         <li><strong>From API key</strong>: on the Access Point → Managed
         Agent request edge, each caller is identified by the API key it
-        presents (the Caller Context must use API Key or API Key Provider);
+        presents (the Caller Context needs an API Key or API Key Provider method);
         elsewhere, derive identity from the configured API key id.</li>
         <li><strong>From mTLS</strong>: take the identity from the other
         side's TLS client certificate (the caller's certificate on an

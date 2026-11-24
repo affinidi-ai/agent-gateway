@@ -700,7 +700,9 @@ surface it creates unless it is public), a legacy one stored without `public`, a
 `caller_authentication.on_failure` is `reject`, see
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#closed-and-public-access-points). An Access Point whose
 inbound identity is `from_jwt_claim`, public or not, direct or over fabric, refuses one the
-same way, because no caller identity can be derived without a valid JWT. These refusals run
+same way, whatever method it failed; a caller verified by a method other than JWT Bearer is
+served there with no identity (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#several-methods-on-one-access-point)). These refusals run
 before gateway policy, so a gateway deny does not apply to them, and surface policy never sees
 the request. Their body is the generic `Caller credential missing or invalid`; the reason is
 logged. Only on any other public Access Point (`public: true`) does source auth hand a request
@@ -763,12 +765,6 @@ receive does not read this mode; the request body sets the caller there (see
 - `input.extension_identity` and `input.agent.did`, `did_verified` and
   `did_verification` are the key's DID, replacing any DID or identity
   presentation in the request body.
-- A caller verified by another method beside the API key method, and likewise
-  a caller of a method other than JWT Bearer beside an inbound `from_jwt_claim`
-  identity, gets no caller identity: `input.extension_identity` and
-  `input.agent.did` are absent, with the trust-registry claims below; tell it
-  apart by `input.source_auth.method` (see
-  [`SOURCE_AUTH.md`](SOURCE_AUTH.md#several-methods-on-one-access-point)).
 - When the body does not assert the key's own DID, including when it names no DID,
   the trust-registry claims it made are dropped: `provider_did`, `trust_registry_did`,
   `authority_did`, `identity_issuer_did`, `agent_dna` and the trust verifications. A Trust Check
@@ -785,6 +781,14 @@ receive does not read this mode; the request body sets the caller there (see
 - A key that also identifies a Managed Agent gives its callers the Managed Agent's DID; see
   [One key in both roles](SOURCE_AUTH.md#one-key-in-both-roles) for the surface policy that
   refuses it.
+
+On a surface whose inbound identity is `from_api_key` or `from_jwt_claim`, a caller verified by
+a method that identity does not read (any method but an API key for `from_api_key`, any but
+JWT Bearer for `from_jwt_claim`), or whose credential failed on a public Access Point, gets no
+caller identity, on direct requests and Fabric send: `input.extension_identity` and
+`input.agent.did` are absent, and so are the trust-registry claims its body makes. Tell it apart
+by `input.source_auth.method`; see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#several-methods-on-one-access-point).
 
 A DID copied from the request body or an agent card into `input.agent.did` that
 differs from `extension_identity.did`, or when there is none, carries

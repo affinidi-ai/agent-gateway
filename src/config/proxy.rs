@@ -405,7 +405,9 @@ fn validate_source_auth_surface(surface: &crate::config::agent_surface::AgentSur
 
     validate_stored_source_auth_methods(surface)?;
     if let Err(error) = validate_jwt_claim_identity(surface) {
-        warn!("{error}; it is refused on the next save");
+        warn!(
+            "{error}; callers it cannot identify are refused until the surface is fixed, and the next save refuses it"
+        );
     }
     if surface.inbound_identity_from_api_key()
         && !surface
@@ -415,7 +417,7 @@ fn validate_source_auth_surface(surface: &crate::config::agent_surface::AgentSur
     {
         warn!(
             "Channel '{}': inbound identity from_api_key needs an api_key or api_key_provider source authentication \
-             method; no caller gets an identity until the surface is fixed",
+             method; its callers are refused until the surface is fixed, and the next save refuses it",
             surface.name
         );
     }
