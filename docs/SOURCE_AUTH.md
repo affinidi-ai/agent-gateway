@@ -1569,12 +1569,14 @@ to compare, so it accepts any other `domain`. A presentation with no `domain`, f
 client that sets none, is still accepted. A refused presentation is refused with the fixed error
 `VP is not addressed to this gateway` and logged with up to four of its domains (128 characters
 each) and the recipient DID; the request is then treated as one whose presentation failed, and
-an answer to an Access Point's `fabric://` Target is refused with `502` and recorded as an
-`invalid` identity binding (answers to a Transit Point over Fabric are not checked).
+an answer to an Access Point with a managed identity whose Target is `fabric://` is refused with
+`502` and recorded as an `invalid` identity binding (answers to a Transit Point over Fabric, and
+to an Access Point without a managed identity, are not checked).
 
 A presentation's proof may expire at most 5 minutes after it is verified, plus 2 minutes of
-clock skew, and a proof without `expires` may not be created more than 2 minutes ahead of the
-gateway's clock. The gateway mints its own presentations with a 5 minute lifetime.
+clock skew. A proof with both `created` and `expires` may span at most 5 minutes plus 2 minutes
+of clock skew between them. No proof may be created more than 2 minutes ahead of the gateway's
+clock. The gateway mints its own presentations with a 5 minute lifetime.
 
 A paired gateway may relay a presentation another gateway issued, which names that other
 gateway's recipient. Over Fabric such a presentation is accepted when its issuer is one the
@@ -1583,7 +1585,10 @@ the connection's `require_addressed_presentations` is `true`; see
 [`FABRIC.md`](FABRIC.md#peer-issuer-dids). With `require_addressed_presentations` on, such a
 relayed presentation must name this gateway and one with no `domain` is refused. A presentation
 the peer itself issued must name this gateway when it names anyone, and
-`urn:affinidi:audit-only` is never accepted.
+`urn:affinidi:audit-only` is never accepted. Without an attested peer issuer, no issuer counts as
+relayed, so every presentation must be addressed to this gateway when it names a recipient; with
+`require_addressed_presentations` on, one from a `trusted_issuer_dids` issuer with no `domain` is
+still refused.
 
 Accepted risk: binding is partial. A presentation with no `domain` is accepted everywhere, and
 the gateway itself mints such presentations on public agent cards and direct answers, so a copy

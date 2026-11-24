@@ -185,7 +185,8 @@ gateway refuses one that names another (see
 anyway while the record's `require_addressed_presentations` is `false` (the default). Set it to
 `true` with `PUT /v1/gateways/{id}` (`gateways.edit`, Remote gateways only; the self gateway
 answers `400`) to refuse such relays on this connection, including relayed presentations that
-name no recipient. The setting is API-only: the Edit Gateway page does not show it, and a
+name no recipient. Without an attested peer issuer, no issuer counts as relayed, so every
+presentation must be addressed to this gateway when it names a recipient. The setting is API-only: the Edit Gateway page does not show it, and a
 dashboard save keeps the stored value.
 
 Accepted risk: a presentation with no `domain` is still accepted, and the gateway mints such
@@ -274,7 +275,8 @@ one records `identity_binding_verified` and the received presentation (`vp_injec
 A2A answer the calling gateway reads the presentation from the status message; on an MCP answer,
 from the credential in `result._meta`, the top-level `_meta` or `params._meta` (where canonical
 metadata output moves a top-level `_meta` when the answer has `params`)
-(`io.affinidi.fabric/agent-identity-credential`, or its historical extension URI key). An answer to
+(`io.affinidi.fabric/agent-identity-credential`, or its historical extension URI key); a `did`
+beside that presentation must name its verified holder, or the answer is refused as `invalid`. An answer to
 a modern MCP request, which travels on a framed Fabric stream, is checked the same way, message by
 message. Answers to a Transit Point over Fabric and agent cards fetched over Fabric are not
 checked.

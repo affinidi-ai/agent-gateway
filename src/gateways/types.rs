@@ -126,11 +126,15 @@ impl PeerIssuers {
 
     /// Whether `issuer_did` is one the peer relays for: an issuer an operator
     /// trusts for the connection that is not the peer's own attested issuer.
+    /// Without an attested issuer the peer's own issuer cannot be told apart
+    /// from a relay, so no issuer counts as relayed.
     pub fn is_relay_issuer(
         &self,
         issuer_did: &str,
     ) -> bool {
-        self.attested.as_deref() != Some(issuer_did)
+        self.attested
+            .as_deref()
+            .is_some_and(|attested| attested != issuer_did)
             && self
                 .trusted
                 .iter()
@@ -612,7 +616,9 @@ mod tests {
         assert!(!issuers.is_relay_issuer("did:web:other.example"));
 
         let unattested = PeerIssuers { attested: None, ..issuers };
-        assert!(unattested.is_relay_issuer("did:web:peer.example"));
+        assert!(!unattested.is_relay_issuer("did:web:peer.example"));
+        assert!(!unattested.is_relay_issuer("did:web:relay.example"));
+        assert!(!unattested.admits_relayed_presentation("did:web:relay.example"));
     }
 
     #[test]

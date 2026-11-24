@@ -285,6 +285,27 @@ fn verify_vp_proof_lifetime(proof: &Value) -> Result<()> {
                 VP_LIFETIME_MINUTES
             );
         }
+        // A signed created bounds the whole window, so a long-lived proof
+        // does not become acceptable once enough of it has elapsed.
+        if let Some(created) = proof
+            .get("created")
+            .and_then(|v| v.as_str())
+        {
+            let created_dt: DateTime<Utc> = created
+                .parse()
+                .context("Invalid proof created date format")?;
+            if created_dt > now + skew {
+                anyhow::bail!("VP proof is created in the future (created: {})", created);
+            }
+            if expires_dt - created_dt > Duration::minutes(VP_LIFETIME_MINUTES) + skew {
+                anyhow::bail!(
+                    "VP proof lifetime is too long (created: {}, expires: {}, at most {} minutes allowed)",
+                    created,
+                    expires,
+                    VP_LIFETIME_MINUTES
+                );
+            }
+        }
         return Ok(());
     }
 
@@ -1156,6 +1177,37 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("too far ahead"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn proof_lifetime_rejects_long_window_once_mostly_elapsed() {
+        let created = (Utc::now() - Duration::minutes(25)).to_rfc3339();
+        let expires = (Utc::now() + Duration::minutes(5)).to_rfc3339();
+        let err = verify_vp_proof_lifetime(&json!({ "created": created, "expires": expires })).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("lifetime is too long"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn proof_lifetime_accepts_created_and_expires_within_lifetime() {
+        let created = Utc::now().to_rfc3339();
+        let expires = (Utc::now() + Duration::minutes(VP_LIFETIME_MINUTES)).to_rfc3339();
+        verify_vp_proof_lifetime(&json!({ "created": created, "expires": expires })).unwrap();
+    }
+
+    #[test]
+    fn proof_lifetime_rejects_created_in_the_future_with_expires() {
+        let created = (Utc::now() + Duration::minutes(10)).to_rfc3339();
+        let expires = (Utc::now() + Duration::minutes(VP_LIFETIME_MINUTES)).to_rfc3339();
+        let err = verify_vp_proof_lifetime(&json!({ "created": created, "expires": expires })).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("in the future"),
             "{err}"
         );
     }

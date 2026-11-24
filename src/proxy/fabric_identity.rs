@@ -225,7 +225,27 @@ async fn extract_mcp_fabric_identity(
     match credential {
         Some(credential) => {
             info!(channel = channel_name, "Fabric: Found VP credential in MCP answer _meta from GW2");
-            verify_fabric_credential(credential, vc_issuer, channel_name).await
+            let presentation = verify_fabric_credential(credential, vc_issuer, channel_name).await?;
+            // The `did` beside the presentation must name its verified holder,
+            // as on an MCP request (see `verify_identity_binding_presentation`).
+            if let (Some(claimed), Some(presentation)) = (credential.get("did"), &presentation)
+                && claimed.as_str()
+                    != Some(
+                        presentation
+                            .agent_did
+                            .as_str(),
+                    )
+            {
+                warn!(
+                    channel = channel_name,
+                    "✗ Fabric: MCP answer DID does not match the verified presentation holder"
+                );
+                return Err(
+                    "VP verification failed for server agent identity: MCP identity credential DID does not match the verified presentation holder"
+                        .into(),
+                );
+            }
+            Ok(presentation)
         }
         None => {
             debug!(channel = channel_name, "Fabric: No VP credential in MCP answer _meta");
@@ -1246,6 +1266,35 @@ mod tests {
 
         assert!(matches!(result, Err(AnswerIdentityRefusal::Invalid(_))), "{result:?}");
         assert_eq!(failed_outcome(&events), Some(crate::audit::events::IdentityBindingFailure::Invalid));
+    }
+
+    #[tokio::test]
+    async fn an_mcp_answer_whose_did_is_not_the_presentation_holder_is_refused_as_invalid_and_recorded() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation_bound_to("did:example:local-cp").await;
+        for claimed in [json!("did:web:someone-else"), json!(7)] {
+            let response = mcp_answer(
+                crate::config::MCP_AGENT_IDENTITY_CREDENTIAL_KEY,
+                json!({ "verifiablePresentation": signed.presentation.to_string(), "did": claimed }),
+            );
+
+            let (result, events) = checked_mcp_answer(&signed, &response).await;
+
+            assert!(matches!(result, Err(AnswerIdentityRefusal::Invalid(_))), "{claimed}: {result:?}");
+            assert_eq!(failed_outcome(&events), Some(crate::audit::events::IdentityBindingFailure::Invalid));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_mcp_answer_without_a_did_is_attributed_by_its_presentation() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation_bound_to("did:example:local-cp").await;
+        let response = mcp_answer(
+            crate::config::MCP_AGENT_IDENTITY_CREDENTIAL_KEY,
+            json!({ "verifiablePresentation": signed.presentation.to_string() }),
+        );
+
+        let (result, _events) = checked_mcp_answer(&signed, &response).await;
+
+        assert!(matches!(result, Ok(Some(_))), "{result:?}");
     }
 
     #[tokio::test]

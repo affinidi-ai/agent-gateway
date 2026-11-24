@@ -116,9 +116,11 @@ fn ensure_vp_audience(
 /// presentation from an issuer `connection` admits as relayed (see
 /// [`crate::gateways::types::PeerIssuers::admits_relayed_presentation`]) may
 /// name another recipient. A connection that requires addressed
-/// presentations refuses one with no `domain` from a relay issuer (see
-/// [`crate::gateways::types::PeerIssuers::is_relay_issuer`]); the peer's own
-/// may still name none.
+/// presentations refuses one with no `domain` from any trusted issuer other
+/// than the attested one, which is wider than
+/// [`crate::gateways::types::PeerIssuers::is_relay_issuer`] when nothing is
+/// attested (no issuer counts as relayed then); the peer's own may still name
+/// none.
 pub fn check_presentation_audience(
     domains: &[String],
     issuer_did: Option<&str>,
@@ -135,10 +137,14 @@ pub fn check_presentation_audience(
     {
         return Ok(());
     }
+    // Without an attested issuer no issuer is a relay, yet any trusted one
+    // could be: the setting still requires a domain from each of them.
     let require_domain = connection
         .zip(issuer_did)
         .is_some_and(|(connection, issuer)| {
-            connection.require_addressed_presentations && connection.is_relay_issuer(issuer)
+            connection.require_addressed_presentations
+                && connection.attested.as_deref() != Some(issuer)
+                && connection.accepts(issuer)
         });
     ensure_vp_audience(domains, recipient_did, require_domain)
 }
