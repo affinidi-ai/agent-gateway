@@ -9,6 +9,12 @@ use super::render::{Escaping, render};
 use crate::delegation_vault::audit::new_event_id;
 use crate::integrations::events::{COMMON_VARIABLES, IntegrationEvent};
 
+/// The variable holding the event's id.
+const EVENT_ID: &str = "EVENT_ID";
+
+/// The variable holding when the event happened.
+const OCCURRED_AT: &str = "OCCURRED_AT";
+
 /// When an event happened and the id it was given when it was created. Every delivery of the
 /// event, to each integration and on each retry, carries the same.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,9 +53,9 @@ impl Occurrence {
         values: &mut HashMap<String, String>,
     ) {
         if let Some(event_id) = &self.event_id {
-            values.insert("EVENT_ID".to_string(), event_id.clone());
+            values.insert(EVENT_ID.to_string(), event_id.clone());
         }
-        values.insert("OCCURRED_AT".to_string(), self.occurred_at.clone());
+        values.insert(OCCURRED_AT.to_string(), self.occurred_at.clone());
         values.insert("TIMESTAMP".to_string(), self.occurred_at.clone());
     }
 }
@@ -66,7 +72,7 @@ pub fn delivered_form(
         return content;
     };
     fields.retain(|name, _| name != "timestamp");
-    for (key, variable) in [("event_id", "EVENT_ID"), ("occurred_at", "OCCURRED_AT")] {
+    for (key, variable) in [("event_id", EVENT_ID), ("occurred_at", OCCURRED_AT)] {
         match values.get(variable) {
             Some(value) => {
                 fields.insert(key.to_string(), JsonValue::String(value.clone()));
