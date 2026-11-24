@@ -30,17 +30,7 @@ pub async fn test_endpoint(
     Path(id): Path<String>,
 ) -> Result<Json<TestResult>, ApiError> {
     let endpoint = load(&stores.endpoints, &id, "endpoint").await?;
-    let values = HashMap::from([
-        ("EVENT_TYPE".to_string(), TEST_EVENT.to_string()),
-        ("EVENT_NAME".to_string(), "Test message".to_string()),
-        ("EVENT_SUMMARY".to_string(), format!("Test message for endpoint {}", endpoint.name)),
-        ("EVENT_DATA".to_string(), "{}".to_string()),
-        ("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339()),
-        (
-            "APPLIANCE_ID".to_string(),
-            crate::storage::settings_store::global_appliance_id_override().unwrap_or_default(),
-        ),
-    ]);
+    let values = endpoint_test_values(&endpoint.name);
     let route = Route {
         integration: Integration::new(
             "Endpoint test".to_string(),
@@ -78,6 +68,22 @@ pub async fn test_draft(
 
 /// The event a test of an endpoint alone stands for.
 const TEST_EVENT: &str = "integration.test";
+
+/// The values of a test message for the endpoint `endpoint_name`.
+fn endpoint_test_values(endpoint_name: &str) -> HashMap<String, String> {
+    let mut values = HashMap::from([
+        ("EVENT_TYPE".to_string(), TEST_EVENT.to_string()),
+        ("EVENT_NAME".to_string(), "Test message".to_string()),
+        ("EVENT_SUMMARY".to_string(), format!("Test message for endpoint {endpoint_name}")),
+        ("EVENT_DATA".to_string(), "{}".to_string()),
+        (
+            "APPLIANCE_ID".to_string(),
+            crate::storage::settings_store::global_appliance_id_override().unwrap_or_default(),
+        ),
+    ]);
+    Occurrence::now().fill(&mut values);
+    values
+}
 
 async fn send_sample(
     stores: &DefinitionStores,
@@ -259,6 +265,20 @@ mod tests {
             assert!(message.contains("webhook_url rejected"), "{message}");
             assert!(!message.contains("s3cr3t"), "{message}");
         }
+    }
+
+    #[test]
+    fn an_endpoint_test_message_is_an_event_with_its_own_id_and_time() {
+        let values = endpoint_test_values("Ops");
+
+        assert!(
+            values
+                .get("EVENT_ID")
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()),
+            "{values:?}"
+        );
+        assert!(values.contains_key("OCCURRED_AT"), "{values:?}");
+        assert_eq!(values.get("TIMESTAMP"), values.get("OCCURRED_AT"));
     }
 
     #[tokio::test]

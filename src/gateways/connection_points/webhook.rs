@@ -41,7 +41,7 @@ fn message_values(
     connection_point: &GatewayConnectionPoint,
     message: &ReceivedMessage,
 ) -> HashMap<String, String> {
-    let now = chrono::Utc::now();
+    let received_at = message.received_at;
     HashMap::from([
         ("CP_ID".to_string(), connection_point.id.clone()),
         ("CP_NAME".to_string(), connection_point.name.clone()),
@@ -84,26 +84,23 @@ fn message_values(
                 .message_body
                 .to_string(),
         ),
-        (
-            "RECEIVED_AT".to_string(),
-            message
-                .received_at
-                .to_rfc3339(),
-        ),
-        ("TIMESTAMP".to_string(), now.to_rfc3339()),
+        ("RECEIVED_AT".to_string(), received_at.to_rfc3339()),
         (
             "DATE".to_string(),
-            now.format("%Y-%m-%d")
+            received_at
+                .format("%Y-%m-%d")
                 .to_string(),
         ),
         (
             "TIME".to_string(),
-            now.format("%H:%M:%S")
+            received_at
+                .format("%H:%M:%S")
                 .to_string(),
         ),
         (
             "DATETIME".to_string(),
-            now.format("%Y-%m-%d %H:%M:%S")
+            received_at
+                .format("%Y-%m-%d %H:%M:%S")
                 .to_string(),
         ),
     ])
@@ -179,9 +176,26 @@ mod tests {
                 .received_at
                 .to_rfc3339()
         );
-        for name in ["TIMESTAMP", "DATE", "TIME", "DATETIME"] {
-            assert!(!values[name].is_empty(), "{name}");
-        }
+    }
+
+    #[test]
+    fn a_connections_date_and_time_are_when_its_message_arrived() {
+        let mut message = message();
+        message.received_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .expect("time")
+            .with_timezone(&chrono::Utc);
+
+        let values = message_values(&connection_point(), &message);
+
+        let value = |name: &str| {
+            values
+                .get(name)
+                .map(String::as_str)
+        };
+        assert_eq!(
+            [value("DATE"), value("TIME"), value("DATETIME"), value("TIMESTAMP")],
+            [Some("2026-01-02"), Some("03:04:05"), Some("2026-01-02 03:04:05"), None]
+        );
     }
 
     #[tokio::test]

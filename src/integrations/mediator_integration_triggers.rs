@@ -25,7 +25,6 @@ pub async fn trigger_mediator_created(
     runtime_values.insert("NEW_STATE".to_string(), serde_json::to_string(&mediator).unwrap_or_default());
     runtime_values.insert("OLD_STATE".to_string(), String::new());
     runtime_values.insert("EVENT_TYPE".to_string(), "mediator.created".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
     runtime_values.insert("MEDIATOR_ID".to_string(), mediator.id.clone());
     runtime_values.insert("MEDIATOR_NAME".to_string(), mediator.name.clone());
     runtime_values.insert("MEDIATOR_DID".to_string(), mediator.did.clone());
@@ -44,7 +43,6 @@ pub async fn trigger_mediator_updated(
     runtime_values.insert("OLD_STATE".to_string(), serde_json::to_string(&old_mediator).unwrap_or_default());
     runtime_values.insert("NEW_STATE".to_string(), serde_json::to_string(&new_mediator).unwrap_or_default());
     runtime_values.insert("EVENT_TYPE".to_string(), "mediator.updated".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
     runtime_values.insert("MEDIATOR_ID".to_string(), new_mediator.id.clone());
     runtime_values.insert("MEDIATOR_NAME".to_string(), new_mediator.name.clone());
     runtime_values.insert("MEDIATOR_DID".to_string(), new_mediator.did.clone());
@@ -62,7 +60,6 @@ pub async fn trigger_mediator_deleted(
     runtime_values.insert("OLD_STATE".to_string(), serde_json::to_string(&mediator).unwrap_or_default());
     runtime_values.insert("NEW_STATE".to_string(), String::new());
     runtime_values.insert("EVENT_TYPE".to_string(), "mediator.deleted".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
     runtime_values.insert("MEDIATOR_ID".to_string(), mediator.id.clone());
     runtime_values.insert("MEDIATOR_NAME".to_string(), mediator.name.clone());
     runtime_values.insert("MEDIATOR_DID".to_string(), mediator.did.clone());
@@ -83,7 +80,6 @@ pub async fn trigger_mediator_status_changed(
     runtime_values.insert("NEW_STATE".to_string(), serde_json::to_string(&mediator).unwrap_or_default());
     runtime_values.insert("OLD_STATE".to_string(), String::new());
     runtime_values.insert("EVENT_TYPE".to_string(), "mediator.status_changed".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
     runtime_values.insert("MEDIATOR_ID".to_string(), mediator.id.clone());
     runtime_values.insert("MEDIATOR_NAME".to_string(), mediator.name.clone());
     runtime_values.insert("MEDIATOR_DID".to_string(), mediator.did.clone());

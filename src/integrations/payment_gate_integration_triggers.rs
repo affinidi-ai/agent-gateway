@@ -86,7 +86,6 @@ fn runtime_values(
 ) -> HashMap<String, String> {
     HashMap::from([
         ("EVENT_TYPE".to_string(), event.as_str().to_string()),
-        ("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339()),
         ("SURFACE_ID".to_string(), facts.surface_id),
         (
             "VARIANT".to_string(),
@@ -253,7 +252,6 @@ mod tests {
                 "RESOURCE",
                 "SEVERITY",
                 "SURFACE_ID",
-                "TIMESTAMP",
                 "TRACE_ID",
                 "VARIANT"
             ]
@@ -277,7 +275,6 @@ mod tests {
         assert_eq!(values["QUOTED_CURRENCY"], "USD");
         assert_eq!(values["PRICE_MISMATCH"], "true");
         assert_eq!(values["REASON"], "risk_review");
-        assert!(chrono::DateTime::parse_from_rfc3339(&values["TIMESTAMP"]).is_ok());
     }
 
     #[test]
@@ -324,7 +321,7 @@ mod tests {
             let values = runtime_values(event, PaymentGateEventFacts::default());
             for name in values
                 .keys()
-                .filter(|name| !["EVENT_TYPE", "TIMESTAMP"].contains(&name.as_str()))
+                .filter(|name| name.as_str() != "EVENT_TYPE")
             {
                 assert!(
                     listed

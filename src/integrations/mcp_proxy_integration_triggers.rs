@@ -26,7 +26,6 @@ pub async fn trigger_mcp_proxy_created(
     runtime_values.insert("NEW_STATE".to_string(), serde_json::to_string(&mcp_proxy).unwrap_or_default());
     runtime_values.insert("OLD_STATE".to_string(), String::new());
     runtime_values.insert("EVENT_TYPE".to_string(), "mcp_proxy.created".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
     runtime_values.insert("MCP_PROXY_ID".to_string(), mcp_proxy.id.clone());
     runtime_values.insert("MCP_PROXY_NAME".to_string(), mcp_proxy.name.clone());
 
@@ -44,7 +43,6 @@ pub async fn trigger_mcp_proxy_updated(
     runtime_values.insert("OLD_STATE".to_string(), serde_json::to_string(&old_mcp_proxy).unwrap_or_default());
     runtime_values.insert("NEW_STATE".to_string(), serde_json::to_string(&new_mcp_proxy).unwrap_or_default());
     runtime_values.insert("EVENT_TYPE".to_string(), "mcp_proxy.updated".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
     runtime_values.insert("MCP_PROXY_ID".to_string(), new_mcp_proxy.id.clone());
     runtime_values.insert("MCP_PROXY_NAME".to_string(), new_mcp_proxy.name.clone());
 
@@ -61,7 +59,6 @@ pub async fn trigger_mcp_proxy_deleted(
     runtime_values.insert("OLD_STATE".to_string(), serde_json::to_string(&mcp_proxy).unwrap_or_default());
     runtime_values.insert("NEW_STATE".to_string(), String::new());
     runtime_values.insert("EVENT_TYPE".to_string(), "mcp_proxy.deleted".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
     runtime_values.insert("MCP_PROXY_ID".to_string(), mcp_proxy.id.clone());
     runtime_values.insert("MCP_PROXY_NAME".to_string(), mcp_proxy.name.clone());
 
@@ -81,7 +78,6 @@ pub async fn trigger_mcp_proxy_status_changed(
     runtime_values.insert("NEW_STATE".to_string(), serde_json::to_string(&mcp_proxy).unwrap_or_default());
     runtime_values.insert("OLD_STATE".to_string(), String::new());
     runtime_values.insert("EVENT_TYPE".to_string(), "mcp_proxy.status_changed".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
     runtime_values.insert("MCP_PROXY_ID".to_string(), mcp_proxy.id.clone());
     runtime_values.insert("MCP_PROXY_NAME".to_string(), mcp_proxy.name.clone());
     runtime_values.insert("OLD_STATUS".to_string(), old_status.to_string());

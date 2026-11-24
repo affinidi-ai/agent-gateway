@@ -22,7 +22,6 @@ pub async fn trigger_identity_created(
     runtime_values.insert("NEW_STATE".to_string(), serde_json::to_string(&identity).unwrap_or_default());
     runtime_values.insert("OLD_STATE".to_string(), String::new());
     runtime_values.insert("EVENT_TYPE".to_string(), "identity.created".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
 
     trigger_identity_integrations(integration_store, &runtime_values, "identity.created").await;
 }
@@ -39,7 +38,6 @@ pub async fn trigger_identity_updated(
     runtime_values.insert("OLD_STATE".to_string(), serde_json::to_string(&old_identity).unwrap_or_default());
     runtime_values.insert("NEW_STATE".to_string(), serde_json::to_string(&new_identity).unwrap_or_default());
     runtime_values.insert("EVENT_TYPE".to_string(), "identity.updated".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
 
     trigger_identity_integrations(integration_store, &runtime_values, "identity.updated").await;
 }
@@ -55,7 +53,6 @@ pub async fn trigger_identity_deleted(
     runtime_values.insert("OLD_STATE".to_string(), serde_json::to_string(&identity).unwrap_or_default());
     runtime_values.insert("NEW_STATE".to_string(), String::new());
     runtime_values.insert("EVENT_TYPE".to_string(), "identity.deleted".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
 
     trigger_identity_integrations(integration_store, &runtime_values, "identity.deleted").await;
 }
@@ -77,7 +74,6 @@ pub async fn trigger_identity_appeared(
     runtime_values.insert("NEW_STATE".to_string(), serde_json::to_string(&identity_with_surface).unwrap_or_default());
     runtime_values.insert("OLD_STATE".to_string(), String::new());
     runtime_values.insert("EVENT_TYPE".to_string(), "identity.appeared".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
 
     trigger_identity_integrations(integration_store, &runtime_values, "identity.appeared").await;
 }
@@ -92,7 +88,6 @@ pub async fn trigger_identity_accessed(
     runtime_values.insert("NEW_STATE".to_string(), serde_json::to_string(&identity).unwrap_or_default());
     runtime_values.insert("OLD_STATE".to_string(), String::new());
     runtime_values.insert("EVENT_TYPE".to_string(), "identity.accessed".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
 
     trigger_identity_integrations(integration_store, &runtime_values, "identity.accessed").await;
 }

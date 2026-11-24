@@ -13,7 +13,6 @@ pub async fn trigger_transaction_settlement_failed(
     let mut runtime_values = HashMap::new();
 
     runtime_values.insert("EVENT_TYPE".to_string(), "x402.settlement.failed".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
     runtime_values.insert("CORRELATION_ID".to_string(), correlation_id.to_string());
     runtime_values.insert("SURFACE_ID".to_string(), surface_id.to_string());
     runtime_values.insert("TX_HASH".to_string(), tx_hash.to_string());
@@ -32,7 +31,6 @@ pub async fn trigger_cleanup_completed(
     let mut runtime_values = HashMap::new();
 
     runtime_values.insert("EVENT_TYPE".to_string(), "x402.cleanup.completed".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
     runtime_values.insert("TRANSACTIONS_DELETED".to_string(), transactions_deleted.to_string());
     runtime_values.insert("RETENTION_DAYS".to_string(), retention_days.to_string());
     runtime_values.insert("SEVERITY".to_string(), "info".to_string());
@@ -52,7 +50,6 @@ pub async fn trigger_transaction_completed(
     let mut runtime_values = HashMap::new();
 
     runtime_values.insert("EVENT_TYPE".to_string(), "x402.transaction.completed".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
     runtime_values.insert("CORRELATION_ID".to_string(), correlation_id.to_string());
     runtime_values.insert("SURFACE_ID".to_string(), surface_id.to_string());
     runtime_values.insert("TX_HASH".to_string(), tx_hash.to_string());

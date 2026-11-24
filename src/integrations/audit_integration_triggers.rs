@@ -73,7 +73,6 @@ pub fn audit_variables(event: &DelegationAuditEvent) -> HashMap<String, String> 
 
     HashMap::from([
         ("EVENT_TYPE".to_string(), audit_event_type(event)),
-        ("TIMESTAMP".to_string(), event.timestamp.clone()),
         ("AUDIT_RECORD".to_string(), serde_json::to_string(event).unwrap_or_default()),
         ("AUDIT_CATEGORY".to_string(), action_category(&event.event).to_string()),
         ("AUDIT_TRACE_ID".to_string(), text(&event.trace_id)),
@@ -145,7 +144,7 @@ impl AuditDelivery {
     /// The record's values, as the event it records: its id and the time it was recorded.
     pub(crate) fn from_event(event: &DelegationAuditEvent) -> Self {
         let occurrence = Occurrence::recorded(event.event_id.clone(), event.timestamp.clone());
-        let variables = audit_variables(event);
+        let mut variables = audit_variables(event);
         let values = match find_event(&audit_event_type(event)) {
             Some(catalog_event) => event_values(
                 catalog_event,
@@ -153,7 +152,10 @@ impl AuditDelivery {
                 variables,
                 crate::storage::settings_store::global_appliance_id_override(),
             ),
-            None => variables,
+            None => {
+                occurrence.fill(&mut variables);
+                variables
+            }
         };
         Self { values }
     }
@@ -343,7 +345,7 @@ mod tests {
         let variables = audit_variables(&event);
 
         assert_eq!(variables["EVENT_TYPE"], "audit.policy_decision");
-        assert_eq!(variables["TIMESTAMP"], event.timestamp);
+        assert_eq!(variables.get("TIMESTAMP"), None, "the delivery fills the record's time");
         assert_eq!(variables["AUDIT_CATEGORY"], "policy_decision");
         assert_eq!(variables["AUDIT_TRACE_ID"], "trace-1");
         assert_eq!(variables["AUDIT_SURFACE_ID"], "surface-1");

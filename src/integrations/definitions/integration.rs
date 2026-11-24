@@ -178,6 +178,14 @@ mod tests {
     }
 
     #[test]
+    fn a_template_using_the_deprecated_timestamp_is_still_accepted() {
+        let mut deprecated = integration();
+        deprecated.content = json!({"at": "${TIMESTAMP}", "occurred_at": "${OCCURRED_AT}", "id": "${EVENT_ID}"});
+
+        assert_eq!(deprecated.check_against(&event_set(&["gateway.created", "audit.policy_decision"])), Ok(()));
+    }
+
+    #[test]
     fn needs_a_template_object() {
         let mut text = integration();
         text.content = json!("${EVENT_SUMMARY}");

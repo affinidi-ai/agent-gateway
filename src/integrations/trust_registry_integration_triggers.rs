@@ -29,7 +29,6 @@ pub async fn trigger_trust_registry_created(
     runtime_values.insert("NEW_STATE".to_string(), serde_json::to_string(&trust_registry).unwrap_or_default());
     runtime_values.insert("OLD_STATE".to_string(), String::new());
     runtime_values.insert("EVENT_TYPE".to_string(), "trust_registry.created".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
 
     runtime_values.insert("TRUST_REGISTRY_ID".to_string(), trust_registry.id.clone());
     runtime_values.insert("TRUST_REGISTRY_NAME".to_string(), trust_registry.name.clone());
@@ -56,7 +55,6 @@ pub async fn trigger_trust_registry_updated(
     runtime_values.insert("OLD_STATE".to_string(), serde_json::to_string(&old_trust_registry).unwrap_or_default());
     runtime_values.insert("NEW_STATE".to_string(), serde_json::to_string(&new_trust_registry).unwrap_or_default());
     runtime_values.insert("EVENT_TYPE".to_string(), "trust_registry.updated".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
 
     runtime_values.insert("TRUST_REGISTRY_ID".to_string(), new_trust_registry.id.clone());
     runtime_values.insert(
@@ -92,7 +90,6 @@ pub async fn trigger_trust_registry_deleted(
     runtime_values.insert("OLD_STATE".to_string(), serde_json::to_string(&trust_registry).unwrap_or_default());
     runtime_values.insert("NEW_STATE".to_string(), String::new());
     runtime_values.insert("EVENT_TYPE".to_string(), "trust_registry.deleted".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
 
     runtime_values.insert("TRUST_REGISTRY_ID".to_string(), trust_registry.id.clone());
     runtime_values.insert("TRUST_REGISTRY_NAME".to_string(), trust_registry.name.clone());
@@ -119,7 +116,6 @@ pub async fn trigger_trust_registry_status_changed(
     runtime_values.insert("OLD_STATE".to_string(), serde_json::to_string(&old_trust_registry).unwrap_or_default());
     runtime_values.insert("NEW_STATE".to_string(), serde_json::to_string(&new_trust_registry).unwrap_or_default());
     runtime_values.insert("EVENT_TYPE".to_string(), "trust_registry.status_changed".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
 
     runtime_values.insert("TRUST_REGISTRY_ID".to_string(), new_trust_registry.id.clone());
     runtime_values.insert(

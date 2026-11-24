@@ -62,7 +62,11 @@ const VARIABLES: &[VariableSpec] = &[
         "The id the gateway gave the event when it was created, the same on every delivery of it. Empty for an audit record stored before records had one",
     ),
     var("OCCURRED_AT", "Occurred At", "RFC 3339 time the event happened, the same on every delivery of it"),
-    var("TIMESTAMP", "Timestamp", "RFC 3339 time the event occurred"),
+    var(
+        "TIMESTAMP",
+        "Timestamp (deprecated)",
+        "Deprecated: the same value as OCCURRED_AT, the RFC 3339 time the event happened. Use OCCURRED_AT. A webhook or stream delivery carries no top-level timestamp key",
+    ),
     var(
         "APPLIANCE_ID",
         "Appliance ID",
@@ -100,9 +104,13 @@ const VARIABLES: &[VariableSpec] = &[
     var("FROM_DID", "Connecting DID", "DID of whoever connected"),
     var("MESSAGE_BODY", "Message Body", "Body of the connection-setup message, as JSON"),
     var("RECEIVED_AT", "Received At", "RFC 3339 time the connection-setup message was received"),
-    var("DATE", "Date", "Delivery date, YYYY-MM-DD"),
-    var("TIME", "Time", "Delivery time, HH:MM:SS"),
-    var("DATETIME", "Date and Time", "Delivery date and time, YYYY-MM-DD HH:MM:SS"),
+    var("DATE", "Date", "UTC date the connection-setup message was received, YYYY-MM-DD"),
+    var("TIME", "Time", "UTC time the connection-setup message was received, HH:MM:SS"),
+    var(
+        "DATETIME",
+        "Date and Time",
+        "UTC date and time the connection-setup message was received, YYYY-MM-DD HH:MM:SS",
+    ),
     var("CORRELATION_ID", "Correlation ID", "ID correlating the payment's requests"),
     var("SURFACE_ID", "Surface ID", "ID of the Agent Surface that took the payment"),
     var("SURFACE_NAME", "Surface Name", "Name of the Agent Surface that took the payment"),
@@ -733,6 +741,35 @@ mod tests {
                 "{} lists a variable twice",
                 event.id
             );
+        }
+    }
+
+    fn described(name: &str) -> (&'static str, &'static str) {
+        variables()
+            .iter()
+            .find(|variable| variable.name == name)
+            .map(|variable| (variable.label, variable.description))
+            .unwrap_or_else(|| panic!("{name} is described"))
+    }
+
+    #[test]
+    fn the_timestamp_variable_is_the_deprecated_alias_of_the_occurrence_time() {
+        let (label, description) = described("TIMESTAMP");
+
+        assert!(
+            label.contains("deprecated")
+                && description.starts_with("Deprecated")
+                && description.contains("OCCURRED_AT"),
+            "{label}: {description}"
+        );
+    }
+
+    #[test]
+    fn a_connections_date_and_time_say_when_its_message_was_received() {
+        for name in ["DATE", "TIME", "DATETIME"] {
+            let (_, description) = described(name);
+
+            assert!(description.contains("connection-setup message was received"), "{name}: {description}");
         }
     }
 

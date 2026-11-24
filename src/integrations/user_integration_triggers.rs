@@ -165,7 +165,6 @@ fn user_runtime_values(
         ("OLD_STATE".to_string(), state(old)),
         ("NEW_STATE".to_string(), state(new)),
         ("EVENT_TYPE".to_string(), event_type.to_string()),
-        ("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339()),
     ]);
     if let Some(user) = new.or(old) {
         values.extend([
@@ -371,6 +370,6 @@ mod tests {
         assert_eq!(values["USER_EMAIL"], "jane@example.test");
         assert_eq!(values["USER_ROLE"], "poweruser");
         assert_eq!(values["USER_STATUS"], "approved");
-        assert!(chrono::DateTime::parse_from_rfc3339(&values["TIMESTAMP"]).is_ok());
+        assert_eq!(value(&values, "TIMESTAMP"), None, "the delivery fills the event's time");
     }
 }

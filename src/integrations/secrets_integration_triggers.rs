@@ -28,7 +28,6 @@ pub async fn trigger_secret_created(
     runtime_values.insert("NEW_STATE".to_string(), serde_json::to_string(&secret).unwrap_or_default());
     runtime_values.insert("OLD_STATE".to_string(), String::new());
     runtime_values.insert("EVENT_TYPE".to_string(), "secret.created".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
 
     runtime_values.insert("SECRET_ID".to_string(), secret.id.clone());
     runtime_values.insert("SECRET_NAME".to_string(), secret.name.clone());
@@ -49,7 +48,6 @@ pub async fn trigger_secret_updated(
     runtime_values.insert("OLD_STATE".to_string(), serde_json::to_string(&old_secret).unwrap_or_default());
     runtime_values.insert("NEW_STATE".to_string(), serde_json::to_string(&new_secret).unwrap_or_default());
     runtime_values.insert("EVENT_TYPE".to_string(), "secret.updated".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
 
     runtime_values.insert("SECRET_ID".to_string(), new_secret.id.clone());
     runtime_values.insert("SECRET_NAME".to_string(), new_secret.name.clone());
@@ -69,7 +67,6 @@ pub async fn trigger_secret_deleted(
     runtime_values.insert("OLD_STATE".to_string(), serde_json::to_string(&secret).unwrap_or_default());
     runtime_values.insert("NEW_STATE".to_string(), String::new());
     runtime_values.insert("EVENT_TYPE".to_string(), "secret.deleted".to_string());
-    runtime_values.insert("TIMESTAMP".to_string(), chrono::Utc::now().to_rfc3339());
 
     runtime_values.insert("SECRET_ID".to_string(), secret.id.clone());
     runtime_values.insert("SECRET_NAME".to_string(), secret.name.clone());
