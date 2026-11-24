@@ -1932,6 +1932,50 @@ async fn a_caller_without_a_grant_of_a_deactivated_provider_is_not_told_to_conne
     assert_eq!(fixture.vendor_saw(), [(Some("Bearer my-access".to_string()), false)]);
 }
 
+/// A grant whose consent ended is never sent to the Target, though the vault
+/// still holds it, no sweep has run and its access token has not expired: the
+/// call is refused `connect_required` with the cause `consent_expired`, and the
+/// grant is removed and audited as an expiry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_whose_consent_ended_is_not_sent_though_the_vault_still_holds_it() {
+    let fixture = Fixture::new(vec![Answer::status(200), Answer::status(200)], vec![vendor_result()]).await;
+    let mut ended = crate::delegation_vault::grants::tests::grant(&owner_key(), "owner-access");
+    ended.created_at = chrono::Utc::now() - chrono::Duration::hours(2);
+    ended.consent_expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+    fixture
+        .vault
+        .store_grant(ended)
+        .await
+        .unwrap();
+
+    let ((status, headers, body), events) = crate::audit::producer::capture(fixture.send(mcp_call(Some(KEY)))).await;
+
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        body["error"]["data"],
+        json!({"reason": "connect_required", "subject": "owner", "cause": "consent_expired"})
+    );
+    assert_eq!(headers["cache-control"], "no-store");
+    assert!(
+        fixture
+            .vendor
+            .requests()
+            .is_empty(),
+        "nothing is sent to the Target"
+    );
+    assert!(
+        !fixture
+            .kept(&owner_key())
+            .await,
+        "the ended grant is removed"
+    );
+    let expiries = events
+        .iter()
+        .filter(|event| matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::ConsentExpired))
+        .count();
+    assert_eq!(expiries, 1);
+}
+
 /// A Target that authenticates its responses by API key has every answer checked before the
 /// grant acts on it: a refusal of the token without the key is answered `502` and never
 /// refreshes the grant or retries, and a retry without the key is answered `502` too. A
