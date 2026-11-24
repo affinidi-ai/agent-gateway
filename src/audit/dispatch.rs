@@ -1695,6 +1695,35 @@ mod tests {
         reader.abort();
     }
 
+    /// A consent the gateway removes long after it ended, as the hourly pass
+    /// finds it, is delivered under a drop policy shorter than that delay: its
+    /// age is the time since it was removed.
+    #[tokio::test]
+    async fn a_consent_expiry_noticed_late_is_delivered_under_a_shorter_drop_policy() {
+        let mut f = Fixture::new();
+        f.cursors
+            .set(&siem(), 0)
+            .unwrap();
+        let sink = RecordingSink::default();
+        let reader = f.spawn_dropping(siem(), sink.clone(), Some(Duration::from_secs(600)));
+        let mut expiry = audit_event(DelegationAuditAction::ConsentExpired, None, None, Some("cp-1"), None);
+        expiry.expired_at = Some(chrono::Utc::now() - chrono::Duration::hours(2));
+
+        let last = f
+            .writer
+            .append(&[Pending {
+                recipients: vec![siem()],
+                record: expiry,
+            }])
+            .unwrap()
+            .unwrap();
+        f.durable.send_replace(last);
+        wait_until(|| f.cursors.get(&siem()) == Some(1)).await;
+
+        assert_eq!(*sink.delivered.lock(), vec![1]);
+        reader.abort();
+    }
+
     #[test]
     fn a_records_age_is_read_from_its_occurrence_time_whichever_name_it_was_journalled_under() {
         let journalled = |name: &str, age: chrono::Duration| {
