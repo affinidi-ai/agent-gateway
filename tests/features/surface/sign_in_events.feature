@@ -116,6 +116,27 @@ Feature: Sign-in integration events
     Then the response status is 403
     And the integration receives a "user.login_failed" event with login method "saml" and failure reason "role_not_mapped"
 
+  Scenario: A SAML sign-in with two different user IDs as repeated attributes is refused and creates no user
+    Given human users sign in with SAML
+    And "alpha" has signed in with SAML as the first user and that event was received
+    When "mallory" signs in with SAML carrying two different user IDs as repeated attributes
+    Then the response status is 500
+    And the integration receives no other sign-in event
+
+  Scenario: A SAML sign-in with two different user IDs in separate attribute statements is refused and creates no user
+    Given human users sign in with SAML
+    And "alpha" has signed in with SAML as the first user and that event was received
+    When "mallory" signs in with SAML carrying two different user IDs in separate attribute statements
+    Then the response status is 500
+    And the integration receives no other sign-in event
+
+  Scenario: A SAML sign-in with two different usernames as repeated attributes is refused and creates no user
+    Given human users sign in with SAML
+    And "alpha" has signed in with SAML as the first user and that event was received
+    When "mallory" signs in with SAML carrying two different usernames as repeated attributes
+    Then the response status is 500
+    And the integration receives no other sign-in event
+
   Scenario: A SAML sign-in whose role is named like a gateway role but not mapped is refused
     Given human users sign in with SAML
     And "alpha" has signed in with SAML as the first user and that event was received

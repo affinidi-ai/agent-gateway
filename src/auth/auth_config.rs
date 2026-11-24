@@ -268,16 +268,17 @@ impl SamlConfig {
                 "SAML role_mapping is empty and default_role is unset: every sign-in except the first user's is refused",
             );
         }
-        if self.default_role.is_none()
-            && !self.role_mapping.is_empty()
+        if !self.role_mapping.is_empty()
             && self
                 .role_mapping
                 .keys()
                 .all(|key| key.starts_with('<') && key.ends_with('>'))
         {
-            warnings.push(
-                "SAML role_mapping still holds only the <...> placeholder names of the example: every sign-in except the first user's is refused",
-            );
+            warnings.push(if self.default_role.is_none() {
+                "SAML role_mapping still holds only the <...> placeholder names of the example: every sign-in except the first user's is refused"
+            } else {
+                "SAML role_mapping still holds only the <...> placeholder names of the example: no identity-provider role is mapped, so every sign-in gets default_role"
+            });
         }
         warnings
     }
@@ -442,11 +443,13 @@ mod tests {
                 .is_empty()
         );
         let with_default = config_with(serde_json::json!({ "<idp-user-group>": "user" }), serde_json::json!("user"));
-        assert!(
+        assert_eq!(
             with_default
                 .role_warnings()
-                .is_empty()
+                .len(),
+            1
         );
+        assert!(with_default.role_warnings()[0].contains("default_role"));
     }
 
     fn saml_json_with_roles(role_mapping: &str) -> String {

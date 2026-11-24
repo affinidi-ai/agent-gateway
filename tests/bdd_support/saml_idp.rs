@@ -78,10 +78,13 @@ fn attribute(
 }
 
 #[derive(Clone, Copy)]
-pub enum RoleLayout {
+pub enum AssertionLayout {
     SameStatement,
     SecondStatement,
     RepeatedAttribute,
+    RepeatedUserId,
+    UserIdInSecondStatement,
+    RepeatedUsername,
 }
 
 fn template(
@@ -89,7 +92,7 @@ fn template(
     in_response_to: &str,
     subject: &str,
     roles: &[String],
-    layout: RoleLayout,
+    layout: AssertionLayout,
 ) -> String {
     let now = chrono::Utc::now();
     let issued = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -101,14 +104,27 @@ fn template(
         attribute(EMAIL_CLAIM, &[format!("{subject}@example.test")]),
     ];
     let mut second_statement = String::new();
+    let other = [format!("{subject}-other")];
+    match layout {
+        AssertionLayout::RepeatedUserId => attributes.push(attribute(NAME_ID_CLAIM, &other)),
+        AssertionLayout::UserIdInSecondStatement => {
+            second_statement =
+                format!("<saml:AttributeStatement>{}</saml:AttributeStatement>", attribute(NAME_ID_CLAIM, &other));
+        }
+        AssertionLayout::RepeatedUsername => attributes.push(attribute(NAME_CLAIM, &other)),
+        _ => {}
+    }
     if !roles.is_empty() {
         match layout {
-            RoleLayout::SameStatement => attributes.push(attribute(ROLE_CLAIM, roles)),
-            RoleLayout::SecondStatement => {
+            AssertionLayout::SameStatement => attributes.push(attribute(ROLE_CLAIM, roles)),
+            AssertionLayout::SecondStatement => {
                 second_statement =
                     format!("<saml:AttributeStatement>{}</saml:AttributeStatement>", attribute(ROLE_CLAIM, roles));
             }
-            RoleLayout::RepeatedAttribute => {
+            AssertionLayout::RepeatedUserId
+            | AssertionLayout::UserIdInSecondStatement
+            | AssertionLayout::RepeatedUsername => attributes.push(attribute(ROLE_CLAIM, roles)),
+            AssertionLayout::RepeatedAttribute => {
                 attributes.extend(
                     roles
                         .iter()
@@ -164,7 +180,7 @@ pub async fn sign_in(
     port: u16,
     subject: &str,
     roles: &[String],
-    layout: RoleLayout,
+    layout: AssertionLayout,
 ) -> AcsAnswer {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())

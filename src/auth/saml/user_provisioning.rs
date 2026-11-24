@@ -57,29 +57,42 @@ fn changes_reported_state(
     old.role != new.role || old.status != new.status || old.is_primary != new.is_primary
 }
 
-/// Refuse an assertion whose user-id attribute carries more than one distinct value, since which
-/// one identifies the user would depend on the identity provider's ordering.
-fn ensure_single_user_id(
+/// The first value of `attribute` when present, else of `fallback`, and whether the one used carries
+/// more than one distinct value.
+fn carries_several_values(
+    all_attributes: &SamlAttributes,
+    attribute: &str,
+    fallback: &str,
+) -> bool {
+    let used = if all_attributes.contains_key(attribute) {
+        attribute
+    } else {
+        fallback
+    };
+    all_attributes
+        .get(used)
+        .into_iter()
+        .flatten()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        > 1
+}
+
+/// Refuse an assertion whose user-id or username attribute carries more than one distinct value,
+/// since which one names the user would depend on the identity provider's ordering.
+fn ensure_single_valued_identity(
     all_attributes: &SamlAttributes,
     config: &SamlConfig,
 ) -> Result<()> {
-    let user_id_attribute = if all_attributes.contains_key(
-        &config
-            .attribute_mapping
-            .user_id,
-    ) {
-        &config
-            .attribute_mapping
-            .user_id
-    } else {
-        "NameID"
-    };
-    let distinct: std::collections::HashSet<&String> = all_attributes
-        .get(user_id_attribute)
-        .into_iter()
-        .flatten()
-        .collect();
-    anyhow::ensure!(distinct.len() <= 1, "The SAML user ID attribute carries more than one value");
+    let mapping = &config.attribute_mapping;
+    anyhow::ensure!(
+        !carries_several_values(all_attributes, &mapping.user_id, "NameID"),
+        "The SAML user ID attribute carries more than one value"
+    );
+    anyhow::ensure!(
+        !carries_several_values(all_attributes, &mapping.username, &mapping.email),
+        "The SAML username attribute carries more than one value"
+    );
     Ok(())
 }
 
@@ -107,7 +120,7 @@ pub async fn provision_user_from_saml(
         )
         .or_else(|| attributes.get("NameID"))
         .context("User ID not found in SAML attributes")?;
-    ensure_single_user_id(all_attributes, config)?;
+    ensure_single_valued_identity(all_attributes, config)?;
 
     let username = attributes
         .get(
@@ -155,7 +168,13 @@ pub async fn provision_user_from_saml(
         .map(|s| s.to_string());
 
     // Determine role from SAML attributes
-    let role = determine_role(all_attributes, config).map_err(|refused| refused.for_subject(user_id_attr));
+    let role = determine_role(all_attributes, config).map_err(|refused| {
+        refused.for_subject(
+            attributes
+                .get("NameID")
+                .map(String::as_str),
+        )
+    });
 
     let user_write_guard = storage
         .user_write_guard()
@@ -303,10 +322,10 @@ pub struct RoleRefused {
 impl RoleRefused {
     fn for_subject(
         self,
-        subject: &str,
+        subject: Option<&str>,
     ) -> Self {
         Self {
-            subject: Some(subject.to_string()),
+            subject: subject.map(str::to_string),
             ..self
         }
     }
@@ -665,13 +684,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_user_id_username_and_email_take_the_first_value_of_their_attribute() {
+    async fn the_email_takes_the_first_value_of_its_attribute_beside_a_single_user_id_and_username() {
         let dir = tempdir().unwrap();
         let (storage, avatars) = user_storage(&dir).await;
         let mapping = SamlAttributeMapping::default();
         let attributes: SamlAttributes = HashMap::from([
             (mapping.user_id, vec!["saml-1".to_string()]),
-            (mapping.username, vec!["first-name".to_string(), "second-name".to_string()]),
+            (mapping.username, vec!["first-name".to_string()]),
             (mapping.email, vec!["first@example.test".to_string(), "second@example.test".to_string()]),
         ]);
 
@@ -721,6 +740,54 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn an_assertion_whose_username_attribute_has_two_distinct_values_is_refused() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mut attributes = saml_attributes("saml-1", "jane");
+        attributes
+            .get_mut(&SamlAttributeMapping::default().username)
+            .unwrap()
+            .push("sam".to_string());
+
+        let err = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("username attribute")
+        );
+        assert!(
+            storage
+                .list_users()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_names_the_assertion_subject_not_the_mapped_user_id() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let config = mapped_config();
+        provision_user_from_saml(&storage, &saml_attributes("saml-first", "first"), &config, &avatars)
+            .await
+            .unwrap();
+        let mut attributes = with_role(saml_attributes("mapped-id", "mallory"), "admin");
+        attributes.insert("NameID".to_string(), vec!["name-id-subject".to_string()]);
+
+        let err = provision_user_from_saml(&storage, &attributes, &config, &avatars)
+            .await
+            .unwrap_err();
+
+        let refused = err
+            .downcast_ref::<RoleRefused>()
+            .unwrap();
+        assert_eq!(refused.subject.as_deref(), Some("name-id-subject"));
     }
 
     #[tokio::test]
@@ -921,14 +988,12 @@ mod tests {
             .await
             .unwrap();
 
-        let err = provision_user_from_saml(
-            &storage,
-            &with_role(saml_attributes("saml-2", "jane"), "contractors"),
-            &config,
-            &avatars,
-        )
-        .await
-        .unwrap_err();
+        let mut attributes = with_role(saml_attributes("saml-2", "jane"), "contractors");
+        attributes.insert("NameID".to_string(), vec!["saml-2".to_string()]);
+
+        let err = provision_user_from_saml(&storage, &attributes, &config, &avatars)
+            .await
+            .unwrap_err();
 
         let refused = err
             .downcast_ref::<RoleRefused>()

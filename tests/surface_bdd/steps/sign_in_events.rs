@@ -9,7 +9,7 @@ use crate::bdd_support::admin_client::{AdminApiClient, recorded_response};
 use crate::bdd_support::gateway_process::SURFACE_TEST_AUTH_TOKEN;
 use crate::bdd_support::passkey::SoftPasskey;
 use crate::bdd_support::redis_stream::RedisStreamStandIn;
-use crate::bdd_support::saml_idp::RoleLayout;
+use crate::bdd_support::saml_idp::AssertionLayout;
 use crate::bdd_support::sign_in_events::{
     ACCOUNT_DATA_FIELDS, APPLIANCE_ID, ENVELOPE_FIELDS, EVENT_TOPIC, NO_ACCOUNT_DATA_FIELDS, RECORD_FIELDS,
     RECORD_TOPIC, STATE_FIELDS, golden, golden_path, keys, names, normalise, updates_golden, write_golden,
@@ -354,7 +354,14 @@ async fn a_user_has_signed_in_with_saml_roles(
         .expect("the user's answer")
         .status;
     assert_eq!(status, 200, "the SAML sign-in succeeds: {:?}", world.caller_response);
-    receive_sign_in_payload(world, EVENT_TOPIC, "data", "user.login", &[("login_method", "saml")]).await;
+    receive_sign_in_payload(
+        world,
+        EVENT_TOPIC,
+        "data",
+        "user.login",
+        &[("login_method", "saml"), ("username", subject.as_str())],
+    )
+    .await;
 }
 
 #[when(expr = "{string} signs in with SAML carrying the identity provider roles {string}")]
@@ -363,7 +370,7 @@ async fn sign_in_with_saml_roles(
     subject: String,
     roles: String,
 ) {
-    sign_in_with_saml_layout(world, subject, roles, RoleLayout::SameStatement).await;
+    sign_in_with_saml_layout(world, subject, roles, AssertionLayout::SameStatement).await;
 }
 
 #[when(
@@ -374,7 +381,7 @@ async fn sign_in_with_saml_roles_in_a_second_statement(
     subject: String,
     roles: String,
 ) {
-    sign_in_with_saml_layout(world, subject, roles, RoleLayout::SecondStatement).await;
+    sign_in_with_saml_layout(world, subject, roles, AssertionLayout::SecondStatement).await;
 }
 
 #[when(expr = "{string} signs in with SAML carrying the identity provider roles {string} as repeated attributes")]
@@ -383,14 +390,38 @@ async fn sign_in_with_saml_roles_as_repeated_attributes(
     subject: String,
     roles: String,
 ) {
-    sign_in_with_saml_layout(world, subject, roles, RoleLayout::RepeatedAttribute).await;
+    sign_in_with_saml_layout(world, subject, roles, AssertionLayout::RepeatedAttribute).await;
+}
+
+#[when(expr = "{string} signs in with SAML carrying two different user IDs as repeated attributes")]
+async fn sign_in_with_saml_repeated_user_ids(
+    world: &mut SurfaceWorld,
+    subject: String,
+) {
+    sign_in_with_saml_layout(world, subject, "gw-all".to_string(), AssertionLayout::RepeatedUserId).await;
+}
+
+#[when(expr = "{string} signs in with SAML carrying two different user IDs in separate attribute statements")]
+async fn sign_in_with_saml_user_ids_in_two_statements(
+    world: &mut SurfaceWorld,
+    subject: String,
+) {
+    sign_in_with_saml_layout(world, subject, "gw-all".to_string(), AssertionLayout::UserIdInSecondStatement).await;
+}
+
+#[when(expr = "{string} signs in with SAML carrying two different usernames as repeated attributes")]
+async fn sign_in_with_saml_repeated_usernames(
+    world: &mut SurfaceWorld,
+    subject: String,
+) {
+    sign_in_with_saml_layout(world, subject, "gw-all".to_string(), AssertionLayout::RepeatedUsername).await;
 }
 
 async fn sign_in_with_saml_layout(
     world: &mut SurfaceWorld,
     subject: String,
     roles: String,
-    layout: RoleLayout,
+    layout: AssertionLayout,
 ) {
     ensure_gateway_running(world).await;
     let roles: Vec<String> = roles

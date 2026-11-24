@@ -636,6 +636,10 @@ is not mapped. A refusal is logged with the SAML subject and the role values rec
 claim is shown as none) and raises a `user.login_failed` event with failure reason
 `role_not_mapped` ([`docs/INTEGRATIONS.md`](INTEGRATIONS.md#sign-in-events)).
 
+The configured user ID and username attributes must not carry more than one distinct value, including
+across repeated attributes or attribute statements. Such an assertion is refused before any user is
+created or updated.
+
 The first user to sign in to an appliance with no users is still the primary administrator, and
 the primary administrator signs in and is updated as usual, keeping that role, even when the role
 is unmapped. A `role_mapping` value or `default_role` that is not `administrator`, `poweruser` or
