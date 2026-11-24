@@ -111,4 +111,52 @@ describe('ConnectStep', () => {
     );
     expect(mockedPost).toHaveBeenCalledWith('/gateways/gw-1/continue', {});
   });
+
+  it.each(['succeeds', 'is refused'])(
+    'calls nothing back when Continue %s after the step has left the screen',
+    async outcome => {
+      let answer: { resolve: (v: unknown) => void; reject: (e: Error) => void } | undefined;
+      mockedPost.mockImplementation(
+        () => new Promise((resolve, reject) => (answer = { resolve, reject }))
+      );
+      const onConnected = jest.fn();
+      const onRefused = jest.fn();
+      const { unmount } = render(
+        <ConnectStep
+          continueGatewayId="gw-1"
+          onRefused={onRefused}
+          oobLink="https://mediator.example.com/oob?_oobid=abc"
+          secret="secret"
+          name="Partner"
+          description=""
+          onConnected={onConnected}
+          onCancel={jest.fn()}
+        />
+      );
+      await waitFor(() => expect(mockedPost).toHaveBeenCalled(), { timeout: 2000 });
+
+      unmount();
+      if (outcome === 'succeeds') {
+        answer!.resolve({ data: { gateway: { id: 'gw-1' } } });
+      } else {
+        answer!.reject(
+          new ApiError(
+            'refused',
+            409,
+            'mediator_access_refused',
+            JSON.stringify({
+              code: 'mediator_access_refused',
+              role: 'temporary',
+              did: 'did:peer:2.tmp',
+            })
+          )
+        );
+      }
+      // Longer than the step's own pauses after a successful answer.
+      await new Promise(resolve => setTimeout(resolve, 1500));
+
+      expect(onConnected).not.toHaveBeenCalled();
+      expect(onRefused).not.toHaveBeenCalled();
+    }
+  );
 });

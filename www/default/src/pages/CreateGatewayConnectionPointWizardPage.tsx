@@ -64,6 +64,15 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
   const [firstTryError, setFirstTryError] = useState('');
   const [retrying, setRetrying] = useState(false);
   const autoTried = useRef<string | null>(null);
+  // Changes whenever the pairing on screen does (another `?resume=` id, or leaving the
+  // page), so an answer that arrives for an earlier pairing changes nothing.
+  const pairing = useRef(0);
+  useEffect(
+    () => () => {
+      pairing.current += 1;
+    },
+    []
+  );
 
   /**
    * Continues a paused connection point. `auto` is the wizard's own first try,
@@ -73,12 +82,14 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
    * the first try offers to try again, since nothing says the DIDs are refused.
    */
   const tryContinue = async (connectionPointId: string, auto: boolean) => {
+    const generation = pairing.current;
     try {
       if (!auto) setContinuing(true);
       setRefusal(null);
       setContinueError('');
       setFirstTryError('');
       const response = await apiClient.post(`/connection-points/${connectionPointId}/continue`, {});
+      if (generation !== pairing.current) return;
       setWizardState(prev => ({
         ...prev,
         connectionPoint: response.data.connection_point,
@@ -86,6 +97,7 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
         currentStep: 'complete',
       }));
     } catch (err: any) {
+      if (generation !== pairing.current) return;
       const refused = mediatorAccessRefusal(err, CONNECTION_POINT_DID_LABELS);
       const message = err.message || 'Failed to continue. Please try again.';
       if (refused) {
@@ -97,7 +109,7 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
         setContinueError(message);
       }
     } finally {
-      setContinuing(false);
+      if (generation === pairing.current) setContinuing(false);
     }
   };
 
@@ -116,7 +128,9 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
   useEffect(() => {
     if (!resumeId) return;
     let current = true;
+    pairing.current += 1;
     setResumeUnavailable('');
+    setContinuing(false);
     setRefusal(null);
     setContinueError('');
     setFirstTryError('');
@@ -153,6 +167,7 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
     resume();
     return () => {
       current = false;
+      pairing.current += 1;
     };
   }, [resumeId]);
 

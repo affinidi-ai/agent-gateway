@@ -294,3 +294,57 @@ test.each(['answers', 'fails'])(
     await waitFor(() => expect(post).toHaveBeenCalledWith('/connection-points/cp-2/continue', {}));
   }
 );
+
+test.each(['succeeds', 'is refused'])(
+  'a Continue for the previous connection point that %s late changes nothing',
+  async outcome => {
+    (apiClient.get as jest.Mock).mockImplementation((url: string) => {
+      const id = url.includes('cp-2') ? 'cp-2' : 'cp-1';
+      return Promise.resolve(
+        url.endsWith('/mediator-access')
+          ? {
+              data: {
+                ...paused.data.mediator_access,
+                dids: [
+                  {
+                    role: 'connection_point',
+                    did: `did:peer:2.${id}`,
+                    mediator_did: 'did:web:mediator',
+                  },
+                ],
+              },
+            }
+          : { data: { id, mediator_id: 'mediator-1' } }
+      );
+    });
+    let answer: { resolve: (v: unknown) => void; reject: (e: Error) => void } | undefined;
+    post.mockImplementation(() => new Promise((resolve, reject) => (answer = { resolve, reject })));
+    render(
+      <MemoryRouter initialEntries={['/gateways/publish?resume=cp-1']}>
+        <GoTo to="/gateways/publish?resume=cp-2" />
+        <CreateGatewayConnectionPointWizardPage />
+      </MemoryRouter>
+    );
+    fireEvent.click(await screen.findByTestId('mediator-access-continue-button'));
+    expect(post).toHaveBeenCalledWith('/connection-points/cp-1/continue', {});
+
+    fireEvent.click(screen.getByText('switch pairing'));
+    expect(await screen.findByTestId('mediator-access-did-connection_point')).toHaveTextContent(
+      'did:peer:2.cp-2'
+    );
+    await act(async () => {
+      if (outcome === 'succeeds') {
+        answer!.resolve({ data: { connection_point: { id: 'cp-1', name: 'First' } } });
+      } else {
+        answer!.reject(refused());
+      }
+    });
+
+    expect(screen.queryByText('created First')).not.toBeInTheDocument();
+    expect(screen.getByTestId('mediator-access-did-connection_point')).toHaveTextContent(
+      'did:peer:2.cp-2'
+    );
+    expect(screen.queryByTestId('mediator-access-refused')).not.toBeInTheDocument();
+    expect(screen.getByTestId('mediator-access-continue-button')).not.toBeDisabled();
+  }
+);

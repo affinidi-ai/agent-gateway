@@ -45,6 +45,15 @@ const ConnectStep: React.FC<ConnectStepProps> = ({
   const [statusMessage, setStatusMessage] = useState('Initializing connection...');
 
   const connectCalledRef = useRef(false);
+  // A request that finishes after this step has left the screen (the wizard moved to
+  // another pairing or page) must not call its callbacks or set its state.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (connectCalledRef.current) return;
@@ -75,6 +84,7 @@ const ConnectStep: React.FC<ConnectStepProps> = ({
             acceptor_mediator_id: acceptorMediatorId || undefined,
           });
 
+      if (!mountedRef.current) return;
       setProgress(70);
       setStatusMessage('Retrieving gateway details...');
 
@@ -85,8 +95,10 @@ const ConnectStep: React.FC<ConnectStepProps> = ({
       // Wait a moment before transitioning
       await new Promise(resolve => setTimeout(resolve, 800));
 
+      if (!mountedRef.current) return;
       onConnected(response.data.gateway);
     } catch (err: any) {
+      if (!mountedRef.current) return;
       console.error('Failed to connect to gateway:', err);
       const refusal = onRefused ? mediatorAccessRefusal(err, ADD_GATEWAY_DID_LABELS) : null;
       if (refusal && onRefused) {
