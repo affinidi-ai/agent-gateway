@@ -395,6 +395,7 @@ Each is announced before the gateway first contacts the mediator and followed by
   "event": "connection_point.created",
   "event_id": "b4a782b8-f640-41cf-81ef-951898ca0a6f",
   "sequence": 1781000000000001,
+  "occurred_at": "2026-10-20T09:54:18.904121+00:00",
   "timestamp": "2026-10-20T09:54:18.904121+00:00",
   "connection_point": {
     "id": "c0ffee00-1111-4222-8333-444455556666",
@@ -410,7 +411,10 @@ Each is announced before the gateway first contacts the mediator and followed by
 }
 ```
 
-`description` is omitted when empty. `created_at` is present on events built from a stored record
+`occurred_at` is when the event happened, set once when the gateway raises it, and the field to
+use. `timestamp` holds the same value and is kept for receivers that read it. Both, like
+`event_id`, are the same on every retry of the event. `description` is omitted when empty.
+`created_at` is present on events built from a stored record
 (`created`, `connected`, `deleted`) and absent on `creation_started` and `creation_failed`, which
 happen before the record exists. `mediator_did` is stored on the Connection Point when it is
 created, so `deleted` still carries it after the mediator record is removed; a record created
@@ -465,7 +469,7 @@ Guarantees, stated plainly:
 - Within a process an event is delivered at least once while retries last; a retried delivery may
   arrive more than once.
 - Events are retried independently, so their delivery order across events is not guaranteed.
-  Receivers must order by `sequence` (or `timestamp`), be idempotent, and tolerate `created` or `connected`
+  Receivers must order by `sequence` (or `occurred_at`), be idempotent, and tolerate `created` or `connected`
   arriving before `creation_started`.
 - `creation_started` is emitted before the first mediator contact but delivered in the
   background, so it can still reach the receiver after the gateway's first call. A mediator listed

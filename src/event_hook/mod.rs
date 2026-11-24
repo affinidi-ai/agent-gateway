@@ -161,11 +161,13 @@ impl EventHook {
             );
             return;
         };
+        let occurred_at = chrono::Utc::now().to_rfc3339();
         let event = HookEvent {
             event: kind,
             event_id: uuid::Uuid::new_v4().to_string(),
             sequence: self.next_sequence(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: occurred_at.clone(),
+            occurred_at,
             connection_point,
         };
         let hook = self.clone();
@@ -351,6 +353,7 @@ mod tests {
             event: kind,
             event_id: "id".into(),
             sequence: 1,
+            occurred_at: "now".into(),
             timestamp: "now".into(),
             connection_point: payload(),
         }
@@ -477,6 +480,25 @@ mod tests {
         assert_eq!(cp["mediator_did"], "did:web:m.example");
         assert_eq!(cp["did"], "did:peer:2.abc");
         assert_eq!(cp["did_method"], "peer");
+    }
+
+    #[tokio::test]
+    async fn the_body_carries_occurred_at_beside_timestamp_and_both_hold_on_every_retry() {
+        let (url, captured) = serve(503, "").await;
+        let hook = hook(url, None);
+
+        hook.emit(EventKind::Created, payload());
+
+        wait_for(&captured, 2).await;
+        let bodies: Vec<serde_json::Value> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| serde_json::from_str(&request.body).unwrap())
+            .collect();
+        assert_eq!(bodies[0], bodies[1], "a retry sends the same body");
+        assert!(bodies[0]["timestamp"].is_string(), "{}", bodies[0]);
+        assert_eq!(bodies[0]["occurred_at"], bodies[0]["timestamp"], "{}", bodies[0]);
     }
 
     #[tokio::test]

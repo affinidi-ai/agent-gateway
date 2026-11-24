@@ -96,6 +96,9 @@ pub struct HookEvent {
     pub event: EventKind,
     pub event_id: String,
     pub sequence: u64,
+    /// When the event happened, set once when it is raised.
+    pub occurred_at: String,
+    /// The same value as `occurred_at`, kept for receivers that read it.
     pub timestamp: String,
     pub connection_point: ConnectionPointPayload,
 }
