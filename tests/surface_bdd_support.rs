@@ -583,10 +583,12 @@ fn normalising_an_event_replaces_only_the_values_that_differ_between_runs() {
         "user_id": "u-7", "username": "alpha", "new_state": state, "old_state": null, "login_method": "passkey"
     });
     let envelope = serde_json::json!({
-        "event_type": "user.login", "timestamp": "2026-11-10T12:00:02Z", "appliance_id": "aw-1", "data": data
+        "event_type": "user.login", "event_id": "4c66df2d-93b5-405d-90d4-ca949af251fa",
+        "occurred_at": "2026-11-10T12:00:02Z", "appliance_id": "aw-1", "data": data
     });
     let record = serde_json::json!({
-        "event_type": "user.login", "timestamp": "2026-11-10T12:00:02Z", "appliance_id": "aw-1", "record": data
+        "event_type": "user.login", "appliance_id": "aw-1", "record": data,
+        "event_id": "4c66df2d-93b5-405d-90d4-ca949af251fa", "occurred_at": "2026-11-10T12:00:02Z"
     });
     let normalised_data = serde_json::json!({
         "user_id": "<user_id>", "username": "alpha", "old_state": null, "login_method": "passkey",
@@ -599,13 +601,19 @@ fn normalising_an_event_replaces_only_the_values_that_differ_between_runs() {
     assert_eq!(
         normalise(&envelope),
         serde_json::json!({
-            "event_type": "user.login", "timestamp": "<timestamp>", "appliance_id": "<appliance_id>",
-            "data": normalised_data
+            "event_type": "user.login", "event_id": "<event_id>", "occurred_at": "<occurred_at>",
+            "appliance_id": "<appliance_id>", "data": normalised_data
         })
     );
-    assert_eq!(normalise(&record)["record"], normalised_data);
+    assert_eq!(
+        normalise(&record),
+        serde_json::json!({
+            "event_type": "user.login", "appliance_id": "<appliance_id>", "record": normalised_data,
+            "event_id": "<event_id>", "occurred_at": "<occurred_at>"
+        })
+    );
     let no_account =
-        serde_json::json!({"timestamp": "t", "data": {"new_state": null, "failure_reason": "unknown_user"}});
+        serde_json::json!({"occurred_at": "t", "data": {"new_state": null, "failure_reason": "unknown_user"}});
     assert_eq!(
         normalise(&no_account)["data"],
         serde_json::json!({"new_state": null, "failure_reason": "unknown_user"})

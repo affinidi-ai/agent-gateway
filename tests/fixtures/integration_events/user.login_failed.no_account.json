@@ -1,7 +1,8 @@
 {
   "event_type": "user.login_failed",
   "event_name": "User Login Failed",
-  "timestamp": "<timestamp>",
+  "event_id": "<event_id>",
+  "occurred_at": "<occurred_at>",
   "appliance_id": "<appliance_id>",
   "summary": "A passkey sign-in failed: unknown_user",
   "data": {

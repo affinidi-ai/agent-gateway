@@ -389,15 +389,19 @@ fn sign_in_event(world: &SurfaceWorld) -> &Value {
         .expect("a sign-in event found on the stream")
 }
 
-/// Asserts the envelope fields every streamed payload carries: an RFC 3339 `timestamp` and the
-/// gateway's Appliance ID.
+/// Asserts the envelope fields every streamed payload carries: the event's id, a UUID, its RFC
+/// 3339 occurrence time, and the gateway's Appliance ID.
 fn assert_envelope_values(payload: &Value) {
-    let timestamp = payload["timestamp"]
+    let event_id = payload["event_id"]
         .as_str()
-        .unwrap_or_else(|| panic!("expected a timestamp; the payload is {payload}"));
+        .unwrap_or_else(|| panic!("expected an event_id; the payload is {payload}"));
+    assert!(uuid::Uuid::parse_str(event_id).is_ok(), "expected a UUID event_id; it is {event_id:?}");
+    let occurred_at = payload["occurred_at"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected an occurred_at; the payload is {payload}"));
     assert!(
-        chrono::DateTime::parse_from_rfc3339(timestamp).is_ok(),
-        "expected an RFC 3339 timestamp; it is {timestamp:?}"
+        chrono::DateTime::parse_from_rfc3339(occurred_at).is_ok(),
+        "expected an RFC 3339 occurred_at; it is {occurred_at:?}"
     );
     assert_eq!(payload["appliance_id"], APPLIANCE_ID, "expected the Appliance ID; the payload is {payload}");
 }
@@ -511,7 +515,7 @@ fn record_matches_golden(
     assert_envelope_values(record);
     let golden = golden(&name);
     let normalised = normalise(record);
-    for field in ["event_type", "timestamp", "appliance_id"] {
+    for field in ["event_type", "event_id", "occurred_at", "appliance_id"] {
         assert_eq!(normalised[field], golden[field], "{field} of {record} against {name}");
     }
     assert_eq!(normalised["record"], golden["data"], "the record of {record} against the data of {name}");

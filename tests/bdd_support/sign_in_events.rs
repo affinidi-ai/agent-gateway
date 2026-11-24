@@ -2,7 +2,8 @@
 //! `tests/fixtures/integration_events/`.
 //!
 //! A golden file holds one event in the default `webhook`/`stream` envelope, with the values that
-//! differ between runs (times, user ids, the Appliance ID) replaced by fixed placeholders.
+//! differ between runs (the event id, times, user ids, the Appliance ID) replaced by fixed
+//! placeholders.
 //! Setting `BDD_UPDATE_GOLDEN=1` writes each compared event to its golden file instead.
 
 use std::collections::BTreeSet;
@@ -18,11 +19,14 @@ pub const EVENT_TOPIC: &str = "sign-ins";
 /// The topic Agent Watch's record content is streamed to.
 pub const RECORD_TOPIC: &str = "sign-in-records";
 
-/// Agent Watch's template: the event data under `record`.
-pub const RECORD_TEMPLATE: &str = r#"{"event_type":"${EVENT_TYPE}","timestamp":"${TIMESTAMP}","appliance_id":"${APPLIANCE_ID}","record":"${EVENT_DATA}"}"#;
+/// Agent Watch's template: the event data under `record`. The gateway adds the event's
+/// `event_id` and `occurred_at`.
+pub const RECORD_TEMPLATE: &str =
+    r#"{"event_type":"${EVENT_TYPE}","appliance_id":"${APPLIANCE_ID}","record":"${EVENT_DATA}"}"#;
 
-pub const ENVELOPE_FIELDS: [&str; 6] = ["event_type", "event_name", "timestamp", "appliance_id", "summary", "data"];
-pub const RECORD_FIELDS: [&str; 4] = ["event_type", "timestamp", "appliance_id", "record"];
+pub const ENVELOPE_FIELDS: [&str; 7] =
+    ["event_type", "event_name", "event_id", "occurred_at", "appliance_id", "summary", "data"];
+pub const RECORD_FIELDS: [&str; 5] = ["event_type", "appliance_id", "record", "event_id", "occurred_at"];
 /// The event data of a sign-in by an existing account, besides `failure_reason`.
 pub const ACCOUNT_DATA_FIELDS: [&str; 8] =
     ["old_state", "new_state", "user_id", "username", "user_email", "user_role", "user_status", "login_method"];
@@ -54,11 +58,12 @@ pub fn names(fields: &[&str]) -> BTreeSet<String> {
 }
 
 /// `event` with every value that differs between runs replaced by a fixed placeholder: the
-/// envelope's `timestamp` and `appliance_id`, and in the event data (`data` or `record`) the
-/// `user_id` and the user id and times of `new_state`.
+/// envelope's `event_id`, `occurred_at` and `appliance_id`, and in the event data (`data` or
+/// `record`) the `user_id` and the user id and times of `new_state`.
 pub fn normalise(event: &Value) -> Value {
     let mut event = event.clone();
-    replace(&mut event, "timestamp", TIME);
+    replace(&mut event, "event_id", "<event_id>");
+    replace(&mut event, "occurred_at", "<occurred_at>");
     replace(&mut event, "appliance_id", "<appliance_id>");
     for data in ["data", "record"] {
         if let Some(data) = event.get_mut(data) {
