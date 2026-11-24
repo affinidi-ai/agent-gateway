@@ -1253,6 +1253,14 @@ async fn surface_has_deny_all_request_policy(
     attach_request_policy(world, &surface_name, "deny-all", "default allow := false").await;
 }
 
+#[given(expr = "surface {string} has a request policy that allows all requests")]
+async fn surface_has_allow_all_request_policy(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    attach_request_policy(world, &surface_name, "allow-all", "default allow := true").await;
+}
+
 async fn attach_request_policy(
     world: &mut G2gWorld,
     surface_name: &str,

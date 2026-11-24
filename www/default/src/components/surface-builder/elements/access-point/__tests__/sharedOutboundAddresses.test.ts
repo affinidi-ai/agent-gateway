@@ -1,6 +1,8 @@
 import {
   computeSharedOutboundAddresses,
+  listenPathProblem,
   meaningfulListenerAddresses,
+  offeredChannelPrefixes,
   shouldHideListenerPicker,
   type RoutingConfig,
 } from '../defaults';
@@ -82,6 +84,177 @@ describe('computeSharedOutboundAddresses', () => {
   it('returns empty set when available_listen_addresses is empty', () => {
     const config = makeConfig([], ['https://outbound.example.com']);
     expect(computeSharedOutboundAddresses(config).size).toBe(0);
+  });
+
+  // The gateway classifies by listener, which no comparison of the two address
+  // lists can reproduce: neither a differing port nor an alias URL shows up in
+  // both lists.
+  it('takes the gateway classification over equal URLs, across ports', () => {
+    const config = makeConfig(
+      ['https://gateway.example.com'],
+      ['https://gateway.example.com:9443']
+    );
+    expect(computeSharedOutboundAddresses(config).size).toBe(0);
+
+    config.shared_hostname_outbound_addresses = ['https://gateway.example.com:9443'];
+    const shared = computeSharedOutboundAddresses(config);
+    expect(shared.has('https://gateway.example.com:9443')).toBe(true);
+  });
+
+  it('shares an alias URL of a listener the gateway classified as shared', () => {
+    const config = makeConfig(
+      ['https://gateway.example.com'],
+      ['https://gateway.example.com:9443', 'https://alias.example.net']
+    );
+    config.shared_hostname_outbound_addresses = [
+      'https://gateway.example.com:9443',
+      'https://alias.example.net',
+    ];
+    const shared = computeSharedOutboundAddresses(config);
+    expect(shared.has('https://alias.example.net')).toBe(true);
+  });
+
+  it('keeps an outbound address the gateway left out of the classification', () => {
+    const config = makeConfig(
+      ['https://gateway.example.com'],
+      ['https://gateway.example.com', 'https://own.example.net']
+    );
+    config.shared_hostname_outbound_addresses = ['https://gateway.example.com'];
+    const shared = computeSharedOutboundAddresses(config);
+    expect(shared.has('https://gateway.example.com')).toBe(true);
+    expect(shared.has('https://own.example.net')).toBe(false);
+  });
+});
+
+describe('offeredChannelPrefixes', () => {
+  const channels = [{ id: 'agents', name: 'agents', prefix: '/agents' }];
+
+  it('offers the plain prefixes for an inbound address', () => {
+    const config = makeConfig(['https://gateway.example.com'], [], channels);
+    expect(
+      offeredChannelPrefixes(config, 'inbound', 'https://gateway.example.com').map(p => p.prefix)
+    ).toEqual(['/agents']);
+  });
+
+  it('offers the /outbound prefixes on an address the gateway called shared', () => {
+    const config = makeConfig(
+      ['https://gateway.example.com'],
+      ['https://gateway.example.com:9443'],
+      channels
+    );
+    config.shared_hostname_outbound_addresses = ['https://gateway.example.com:9443'];
+    expect(
+      offeredChannelPrefixes(config, 'outbound', 'https://gateway.example.com:9443').map(
+        p => p.prefix
+      )
+    ).toEqual(['/outbound/agents']);
+  });
+
+  // The admin API accepts both forms wherever the path is reachable, so both are
+  // offered there and a path stored in either resolves in the picker.
+  it('offers both forms on an outbound address of its own', () => {
+    const config = makeConfig(
+      ['https://gateway.example.com'],
+      ['https://own.example.net'],
+      channels
+    );
+    config.shared_hostname_outbound_addresses = [];
+    expect(
+      offeredChannelPrefixes(config, 'outbound', 'https://own.example.net').map(p => p.prefix)
+    ).toEqual(['/agents', '/outbound/agents']);
+  });
+
+  // A root surface prefix has no usable plain form: it is the whole listener, which the
+  // gateway does not accept a Listen Path directly under, so the picker would otherwise
+  // offer nothing a save would take on such a deployment.
+  it('offers the /outbound form of a root prefix even on a dedicated listener', () => {
+    const root = [{ id: 'root', name: 'root', prefix: '/' }];
+    const config = makeConfig(['https://gateway.example.com'], ['https://own.example.net'], root);
+    config.shared_hostname_outbound_addresses = [];
+    const offered = offeredChannelPrefixes(config, 'outbound', 'https://own.example.net');
+    expect(offered.map(p => p.prefix)).toEqual(['/outbound']);
+    expect(
+      listenPathProblem(
+        { listen_address: 'https://own.example.net', listen_path: '/outbound/partner-a' },
+        config
+      )
+    ).toBeNull();
+  });
+
+  it('prefers the outbound prefixes the gateway advertises', () => {
+    const config = makeConfig(
+      ['https://gateway.example.com'],
+      ['https://gateway.example.com'],
+      channels
+    );
+    config.shared_hostname_outbound_addresses = ['https://gateway.example.com'];
+    config.outbound_channel_path_prefix = [
+      { id: 'agents', name: 'agents', prefix: '/outbound/agents' },
+    ];
+    expect(
+      offeredChannelPrefixes(config, 'outbound', 'https://gateway.example.com').map(p => p.prefix)
+    ).toEqual(['/outbound/agents']);
+  });
+});
+
+describe('listenPathProblem', () => {
+  const channels = [{ id: 'agents', name: 'agents', prefix: '/agents' }];
+  const shared = (): RoutingConfig => {
+    const config = makeConfig(
+      ['https://gateway.example.com'],
+      ['https://gateway.example.com:9443'],
+      channels
+    );
+    config.shared_hostname_outbound_addresses = ['https://gateway.example.com:9443'];
+    return config;
+  };
+  const point = (listen_path?: string) => ({
+    listen_address: 'https://gateway.example.com:9443',
+    ...(listen_path === undefined ? {} : { listen_path }),
+  });
+
+  it('passes a Transit Point with no Listen Path, which takes its derived route', () => {
+    expect(listenPathProblem(point(), shared())).toBeNull();
+    expect(listenPathProblem(point(''), shared())).toBeNull();
+  });
+
+  it('passes a path under an offered prefix', () => {
+    expect(listenPathProblem(point('/outbound/agents/partner-a'), shared())).toBeNull();
+  });
+
+  it('blocks a path under no configured surface prefix', () => {
+    const problem = listenPathProblem(point('/nowhere/partner-a'), shared());
+    expect(problem).toContain('claims no segment of its own');
+    expect(problem).toContain('/outbound/agents/');
+  });
+
+  it('blocks a bare prefix, which claims no segment of its own', () => {
+    expect(listenPathProblem(point('/outbound/agents'), shared())).toContain(
+      'claims no segment of its own'
+    );
+    expect(listenPathProblem(point('/agents'), shared())).toContain('claims no segment of its own');
+  });
+
+  // The two forms the admin API accepts, narrowed only by the listener's hostname:
+  // what the picker offers is a subset, so checking against it blocked a good path.
+  it('blocks a path outside /outbound only on a shared-hostname address', () => {
+    expect(listenPathProblem(point('/agents/partner-a'), shared())).toContain('outside /outbound');
+
+    const ownHostname = makeConfig(
+      ['https://gateway.example.com'],
+      ['https://own.example.net'],
+      channels
+    );
+    ownHostname.shared_hostname_outbound_addresses = [];
+    const onOwn = { listen_address: 'https://own.example.net', listen_path: '/agents/partner-a' };
+    expect(listenPathProblem(onOwn, ownHostname)).toBeNull();
+    expect(
+      listenPathProblem({ ...onOwn, listen_path: '/outbound/agents/partner-a' }, ownHostname)
+    ).toBeNull();
+  });
+
+  it('says nothing while the routing config has not loaded', () => {
+    expect(listenPathProblem(point('/agents/partner-a'), null)).toBeNull();
   });
 });
 

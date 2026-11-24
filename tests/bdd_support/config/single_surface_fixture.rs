@@ -163,6 +163,11 @@ pub struct SurfaceConfigBuilder {
     pub streams_sign_in_records: bool,
     /// Console users sign in with SAML rather than passkeys.
     pub signs_in_with_saml: bool,
+    /// Further `saml.json` settings, key to JSON value, written over the SAML fixture's.
+    pub saml_settings: serde_json::Map<String, serde_json::Value>,
+    /// The gateway is expected to exit at startup, so the harness waits for it to exit
+    /// instead of waiting for it to serve.
+    pub refuses_to_start: bool,
     /// `rbac.json` permissions the gateway starts with, feature name to required role,
     /// on top of the defaults.
     pub rbac_permissions: Vec<(String, String)>,
@@ -355,6 +360,8 @@ impl Default for SurfaceConfigBuilder {
             sign_in_event_stream: None,
             streams_sign_in_records: false,
             signs_in_with_saml: false,
+            saml_settings: serde_json::Map::new(),
+            refuses_to_start: false,
             rbac_permissions: Vec::new(),
             caller_key: None,
             response_auth: None,

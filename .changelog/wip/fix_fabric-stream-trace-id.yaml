@@ -1,0 +1,16 @@
+branch: fix/fabric-stream-trace-id
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-24T14:50:02Z'
+      title: Keep the sender's trace id on records of a modern MCP request over Fabric
+      description: >-
+        A 2026-07-28 MCP request received over Fabric as a framed stream now continues the trace id
+        the sending gateway named, as a buffered forward-request already did. Its policy decisions
+        and trust checks in the VP Audit Log carry that trace id, and the agent's transit token and
+        X-Gateway-Trace-Id header continue it, so an operator can follow the request from one
+        gateway's Audit Log to the other's by trace id.
+  removed: []
+  security: []
+  breaking: []

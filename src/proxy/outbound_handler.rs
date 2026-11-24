@@ -15,6 +15,89 @@
 /// Changing this value renames the prefix everywhere without a search-and-replace.
 pub const TP_OUTBOUND_PATH_PREFIX: &str = "/outbound";
 
+/// The path a Transit Point answers on, from its surface's `route` and its own
+/// `alias`. Registered for every Transit Point whatever its `listen_path`, and
+/// the only form an inbound listener sharing a hostname with the outbound one
+/// forwards, so it is what a caller on another host can rely on.
+pub fn transit_point_outbound_path(
+    route: &str,
+    alias: &str,
+) -> String {
+    // A route of `/` trims to empty, so one branch covers both.
+    let route = route.trim_end_matches('/');
+    format!("{TP_OUTBOUND_PATH_PREFIX}{route}/{alias}")
+}
+
+/// The path a Transit Point a variant defines answers on: the surface's
+/// `route` with the variant alias behind `$`, then the point's own `alias`.
+/// The outbound listener registers this form for every variant of the surface,
+/// so it, not the base [`transit_point_outbound_path`], is what a caller of
+/// that variant can rely on.
+pub fn transit_point_variant_outbound_path(
+    route: &str,
+    variant: &str,
+    alias: &str,
+) -> String {
+    transit_point_variant_outbound_route(route, "$", variant, alias)
+}
+
+/// The separators a variant route is registered under: the literal `$` and its
+/// percent-encoded form, which axum matches as two distinct paths. Read by the
+/// listener build and by the save-time clash check, so neither can miss a form
+/// the other registers.
+pub const VARIANT_ROUTE_SEPARATORS: [&str; 2] = ["$", "%24"];
+
+/// [`transit_point_variant_outbound_path`] under one of the two separators the
+/// outbound listener registers a variant route with, `$` and its
+/// percent-encoded `%24`: axum matches them as distinct paths, so both are
+/// registered and both are routes a `listen_path` must not claim.
+pub fn transit_point_variant_outbound_route(
+    route: &str,
+    separator: &str,
+    variant: &str,
+    alias: &str,
+) -> String {
+    let route = route.trim_end_matches('/');
+    format!("{TP_OUTBOUND_PATH_PREFIX}{route}{separator}{variant}/{alias}")
+}
+
+#[cfg(test)]
+mod transit_point_outbound_path_tests {
+    use super::{transit_point_outbound_path, transit_point_variant_outbound_path};
+
+    #[test]
+    fn a_route_is_kept_between_the_prefix_and_the_alias() {
+        assert_eq!(transit_point_outbound_path("/agents", "pricing"), "/outbound/agents/pricing");
+        assert_eq!(transit_point_outbound_path("/agents/", "pricing"), "/outbound/agents/pricing");
+    }
+
+    #[test]
+    fn a_root_route_leaves_the_prefix_beside_the_alias() {
+        for route in ["", "/"] {
+            assert_eq!(transit_point_outbound_path(route, "pricing"), "/outbound/pricing", "{route:?}");
+        }
+    }
+
+    #[test]
+    fn a_variant_names_itself_behind_a_dollar_after_the_route() {
+        assert_eq!(
+            transit_point_variant_outbound_path("/agents", "candidate", "pricing"),
+            "/outbound/agents$candidate/pricing"
+        );
+        assert_eq!(
+            transit_point_variant_outbound_path("/agents/", "candidate", "pricing"),
+            "/outbound/agents$candidate/pricing"
+        );
+        for route in ["", "/"] {
+            assert_eq!(
+                transit_point_variant_outbound_path(route, "candidate", "pricing"),
+                "/outbound$candidate/pricing",
+                "{route:?}"
+            );
+        }
+    }
+}
+
 use axum::{
     extract::{ConnectInfo, Request, State},
     http::{HeaderMap, Method, StatusCode},

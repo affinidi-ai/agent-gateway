@@ -344,6 +344,7 @@ fn agent_card_points_callers_at_transit_point(
     transit_point: String,
 ) {
     let url = served_card_url(world);
+    let path = crate::steps::when::transit_point_path(world, &transit_point);
     let outbound_port = world
         .infra
         .as_ref()
@@ -351,7 +352,7 @@ fn agent_card_points_callers_at_transit_point(
         .outbound_port;
     assert_eq!(
         url,
-        format!("http://localhost:{outbound_port}/transit/{transit_point}"),
+        format!("http://localhost:{outbound_port}{path}"),
         "agent card url should be Transit Point '{transit_point}'"
     );
 }

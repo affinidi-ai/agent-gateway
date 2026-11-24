@@ -844,7 +844,9 @@ request back and forth without end. A hop count bounds them.
   pass the limit refuses the call itself with `508`, before anything is resolved or forwarded,
   recorded as a `request_rejected` audit event (stage `forward`, reason
   `fabric_chain_too_long`).
-- The trace continues along the chain: the receiving gateway's onward trace id rides in the
+- The trace continues along the chain: a receiving gateway continues the trace id the sender
+  named, on a buffered forward-request and a framed stream alike, so its audit records carry it;
+  its onward trace id rides in the
   token, and the Transit Point sends it on the next hop, so caller to A to C to B is one trace
   unless a surface sets `terminate_trace_id`. The hop count crosses a terminated trace too.
 

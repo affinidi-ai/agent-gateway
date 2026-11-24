@@ -360,6 +360,21 @@ async fn operator_downloads_server_logs(
     record(world, Caller::Operator(&operator), Method::GET, "/v1/logs/download", None).await;
 }
 
+#[when("the personal access token reads the gateway settings")]
+async fn personal_access_token_reads_gateway_settings(world: &mut SurfaceWorld) {
+    record(world, Caller::PersonalAccessToken, Method::GET, "/v1/settings", None).await;
+}
+
+#[when("the personal access token reads its own token info")]
+async fn personal_access_token_reads_its_token_info(world: &mut SurfaceWorld) {
+    record(world, Caller::PersonalAccessToken, Method::GET, "/v1/token-info", None).await;
+}
+
+#[when("the personal access token reads the operator profile")]
+async fn personal_access_token_reads_operator_profile(world: &mut SurfaceWorld) {
+    record(world, Caller::PersonalAccessToken, Method::GET, "/v1/profile", None).await;
+}
+
 #[when(expr = "operator {string} truncates stored metrics")]
 async fn operator_truncates_stored_metrics(
     world: &mut SurfaceWorld,
@@ -509,6 +524,19 @@ fn agents_list_names_surface(world: &mut SurfaceWorld) {
     let body = &management_response(world).body;
     assert!(agent_of_surface(body).is_some(), "the agents list has no agent of {SURFACE_ID}: {body}");
     assert!(body["window_minutes"].is_u64(), "the agents list names its window: {body}");
+}
+
+#[then(expr = "the token info lists the scopes {string}")]
+fn token_info_lists_scopes(
+    world: &mut SurfaceWorld,
+    scopes: String,
+) {
+    let body = &management_response(world).body;
+    let scopes: Vec<&str> = scopes
+        .split(',')
+        .map(str::trim)
+        .collect();
+    assert_eq!(body["scopes"], json!(scopes), "the token info: {body}");
 }
 
 #[then("the agents list is empty")]

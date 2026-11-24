@@ -137,7 +137,6 @@ fn transit_point_json(
         "alias": transit_point.alias,
         "target_endpoint": target_endpoint,
         "protocol": transit_point.protocol,
-        "listen_path": format!("/transit/{}", transit_point.alias),
         "require_transit_token": transit_point.require_transit_token
     });
     if let Some(source_auth) = &transit_point.source_auth {
@@ -684,7 +683,7 @@ fn write_single_surface_config_inner(
         );
     }
     if surface_config.signs_in_with_saml {
-        crate::bdd_support::config::sign_in::sign_in_with_saml(base_dir, gateway_port);
+        crate::bdd_support::config::sign_in::sign_in_with_saml(base_dir, gateway_port, &surface_config.saml_settings);
     }
     if !surface_config
         .rbac_permissions

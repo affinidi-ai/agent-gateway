@@ -415,7 +415,7 @@ run-debug: config-certs ## Run in debug mode; x=name for named instance; o=1 for
 		./scripts/_prepare.sh debug envs/local || exit 1; \
 		echo "$(GREEN)✅ Debug dev environment ready!$(NC)"; \
 	fi
-	@[ "$(auth)" = "saml" ] && ./scripts/_saml-setup.sh "envs/local$(if $(x),-$(x),)" "$(AZURE_TENANT)" || true
+	@if [ "$(auth)" = "saml" ]; then ./scripts/_saml-setup.sh "envs/local$(if $(x),-$(x),)" "$(AZURE_TENANT)"; fi
 	@[ "$(auth)" = "passkey" ] && ./scripts/_passkey-setup.sh "envs/local$(if $(x),-$(x),)" || true
 	@if [ -n "$(x)" ]; then \
 		RUST_LOG="$(RUST_LOG)" AG_IDENTITY_HASH_PEPPER="$(AG_IDENTITY_HASH_PEPPER)" AG_BACKUP_ENCRYPTION_KEY="$(AG_BACKUP_ENCRYPTION_KEY)" ./scripts/l-run-debug.sh $(x); \
@@ -436,7 +436,7 @@ run-watch: config-certs ## Run with cargo watch (auto-rebuild/restart on Rust ch
 		./scripts/_prepare.sh debug envs/local || exit 1; \
 		echo "$(GREEN)✅ Watch dev environment ready!$(NC)"; \
 	fi
-	@[ "$(auth)" = "saml" ] && ./scripts/_saml-setup.sh "envs/local$(if $(x),-$(x),)" "$(AZURE_TENANT)" || true
+	@if [ "$(auth)" = "saml" ]; then ./scripts/_saml-setup.sh "envs/local$(if $(x),-$(x),)" "$(AZURE_TENANT)"; fi
 	@[ "$(auth)" = "passkey" ] && ./scripts/_passkey-setup.sh "envs/local$(if $(x),-$(x),)" || true
 	@if [ -n "$(x)" ]; then \
 		RUST_LOG="$(RUST_LOG)" AG_IDENTITY_HASH_PEPPER="$(AG_IDENTITY_HASH_PEPPER)" AG_BACKUP_ENCRYPTION_KEY="$(AG_BACKUP_ENCRYPTION_KEY)" ./scripts/l-run-watch.sh $(x); \
