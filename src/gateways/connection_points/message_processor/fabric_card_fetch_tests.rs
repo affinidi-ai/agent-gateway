@@ -1092,7 +1092,7 @@ async fn a_refused_provider_token_fails_a_card_fetch_over_fabric_with_target_aut
     let root = tempfile::tempdir().unwrap();
     let _receiver = receiver(root.path(), &provider_surface(&target.url)).await;
     install_target_provider(root.path(), &token_endpoint.url).await;
-    let logs = super::mcp_receive_tests::CapturedLogs::default();
+    let logs = crate::observability::log_redact::CapturedLogs::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(logs.clone())
         .with_ansi(false)
@@ -1140,7 +1140,7 @@ async fn a_refused_provider_token_fails_a_card_fetch_over_fabric_with_target_aut
         rejections,
         [(Some(TARGET_PROVIDER), crate::audit::request_events::TargetAuthOutcome::Rejected, Some("invalid_client"))]
     );
-    let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    let logs = logs.text();
     assert!(logs.contains("invalid_client"), "the OAuth error code was not logged:\n{logs}");
     for (sink, text) in
         [("response", response.to_string()), ("audit record", serde_json::to_string(&events).unwrap()), ("logs", logs)]
@@ -1332,7 +1332,7 @@ async fn the_policy_card_read_logs_the_card_location_and_the_cards_url_redacted(
             .await
             .ok();
     });
-    let logs = super::mcp_receive_tests::CapturedLogs::default();
+    let logs = crate::observability::log_redact::CapturedLogs::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(logs.clone())
         .with_ansi(false)
@@ -1343,7 +1343,7 @@ async fn the_policy_card_read_logs_the_card_location_and_the_cards_url_redacted(
         .await;
 
     assert_eq!(card.unwrap()["name"], "agent");
-    let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    let logs = logs.text();
     assert!(logs.contains("/.well-known/agent.json?token="), "the card location was not logged:\n{logs}");
     assert!(logs.contains("agent.example/a2a"), "the card url was not logged:\n{logs}");
     for (what, value) in [

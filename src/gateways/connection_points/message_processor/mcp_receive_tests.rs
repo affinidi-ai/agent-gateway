@@ -3085,34 +3085,6 @@ async fn closed_access_point_fabric_flow() {
     }
 }
 
-#[derive(Clone, Default)]
-pub(super) struct CapturedLogs(pub(super) std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for CapturedLogs {
-    fn write(
-        &mut self,
-        buf: &[u8],
-    ) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .unwrap()
-            .extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
 #[tokio::test]
 async fn fabric_receive_logs_forwarded_header_names_without_values() {
     use tracing::instrument::WithSubscriber;
@@ -3203,7 +3175,7 @@ async fn fabric_receive_logs_forwarded_header_names_without_values() {
     )
     .with_context("agent_surface_storage_path", json!(storage_path));
 
-    let logs = CapturedLogs::default();
+    let logs = crate::observability::log_redact::CapturedLogs::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(logs.clone())
         .with_ansi(false)
@@ -3219,7 +3191,7 @@ async fn fabric_receive_logs_forwarded_header_names_without_values() {
         .borrow()
         .clone()
         .expect("request reached the Target");
-    let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    let logs = logs.text();
     for (name, value) in credentials {
         assert_eq!(forwarded.headers[name], value, "{name} was not forwarded");
         assert!(logs.contains(&format!("Header: {name}\n")), "header name {name} was not logged:\n{logs}");
