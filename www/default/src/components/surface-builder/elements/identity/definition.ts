@@ -119,8 +119,7 @@ export const identityDefinition: NodeDefinition = {
       message: 'Extension rules with default_action=reject need an identity extraction type',
     },
     {
-      description:
-        'Inbound from_jwt_claim derives the DID from a validated JWT, so the surface needs a JWT Bearer method; callers of the other methods get no identity',
+      description: 'Inbound from_jwt_claim needs a JWT Bearer method',
       condition: (c, _ctx, node) => c.type === 'from_jwt_claim' && isInboundIdentity(node),
       check: (_c, ctx) => callerMethods(ctx.allNodes).some(m => m.method_type === 'jwt_bearer'),
       severity: 'error',
@@ -128,7 +127,7 @@ export const identityDefinition: NodeDefinition = {
     },
     {
       description:
-        'from_jwt_claim on the protected or external identity or a Transit Point derives the DID from a validated JWT, so the surface must authenticate every caller with JWT Bearer',
+        'from_jwt_claim outside the inbound slot needs every caller method to be JWT Bearer',
       condition: (c, _ctx, node) => c.type === 'from_jwt_claim' && !isInboundIdentity(node),
       check: (_c, ctx) =>
         ctx.allNodes.some(n => {
@@ -140,8 +139,7 @@ export const identityDefinition: NodeDefinition = {
         'From JWT Claims requires a Caller Context whose methods are all JWT Bearer. Remove the other methods, or change this extraction type.',
     },
     {
-      description:
-        'Inbound from_api_key identifies each caller by the key it presents, so the surface needs an API Key or API Key Provider method; callers of the other methods get no identity',
+      description: 'Inbound from_api_key needs an API Key or API Key Provider method',
       condition: (c, _ctx, node) => c.type === 'from_api_key' && isInboundIdentity(node),
       check: (_c, ctx) =>
         callerMethods(ctx.allNodes).some(method =>
