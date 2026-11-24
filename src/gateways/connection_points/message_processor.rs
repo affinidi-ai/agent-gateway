@@ -558,15 +558,9 @@ pub async fn process_message_internal(
             // share it. Trace-id termination is applied at EGRESS (the onward
             // forward), not here, so this gateway's own VP/audit stay on the
             // incoming trace (past stays traceable).
-            let req_trace_id = message
-                .message_body
-                .get("trace_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
             crate::observability::policy_audit::REQUEST_TRACE_ID
                 .scope(
-                    req_trace_id,
+                    peer_trace_id(message),
                     crate::observability::policy_audit::POLICY_DECISION_COLLECTOR.scope(
                         std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                         Box::pin(process_forward_request(message)),
@@ -4287,7 +4281,23 @@ pub(crate) async fn process_stream_forward_request(
     versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
 ) -> ProcessingResult {
-    Box::pin(process_forward_request_with_mcp_runtime(message, Some(request), versions, continuations)).await
+    crate::observability::policy_audit::REQUEST_TRACE_ID
+        .scope(
+            peer_trace_id(message),
+            Box::pin(process_forward_request_with_mcp_runtime(message, Some(request), versions, continuations)),
+        )
+        .await
+}
+
+/// The trace the peer named in its forward-request or framed stream Open,
+/// empty when it named none.
+fn peer_trace_id(message: &ReceivedMessage) -> String {
+    message
+        .message_body
+        .get("trace_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 async fn process_forward_request_inner(
