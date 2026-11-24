@@ -590,6 +590,47 @@ pub(crate) fn example_redactor() -> Arc<LogRedactor> {
     redactor
 }
 
+/// A log writer that keeps everything written to it, shared by its clones, so
+/// a test can read what was logged.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl CapturedLogs {
+    /// Everything logged so far.
+    pub(crate) fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+    }
+}
+
+#[cfg(test)]
+impl std::io::Write for CapturedLogs {
+    fn write(
+        &mut self,
+        bytes: &[u8],
+    ) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap()
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl<'a> MakeWriter<'a> for CapturedLogs {
+    type Writer = CapturedLogs;
+
+    fn make_writer(&'a self) -> CapturedLogs {
+        self.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

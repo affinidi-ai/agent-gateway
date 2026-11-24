@@ -25882,32 +25882,7 @@ mod fabric_send_tests {
             "name": "paid_tool", "arguments": {"q": 1, "payment_signature": SECRET},
             "_meta": {"org.paymentauth/credential": SECRET}
         }});
-        #[derive(Clone, Default)]
-        struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Logs {
-            fn write(
-                &mut self,
-                bytes: &[u8],
-            ) -> std::io::Result<usize> {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
-            type Writer = Logs;
-
-            fn make_writer(&'a self) -> Logs {
-                self.clone()
-            }
-        }
-        let logs = Logs::default();
+        let logs = crate::observability::log_redact::CapturedLogs::default();
         let logging = tracing::subscriber::set_default(
             tracing_subscriber::fmt()
                 .with_writer(logs.clone())
@@ -25918,8 +25893,7 @@ mod fabric_send_tests {
         drop(logging);
         assert_eq!(status, axum::http::StatusCode::OK, "{body}");
         assert_eq!(gate.calls(), 1);
-        let logged = String::from_utf8_lossy(&logs.0.lock().unwrap()).to_string();
-        assert!(!logged.contains(SECRET), "a credential was logged");
+        assert!(!logs.text().contains(SECRET), "a credential was logged");
         let forwards = peer.forwards.lock().unwrap();
         assert!(
             !forwards
