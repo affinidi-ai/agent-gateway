@@ -113,7 +113,10 @@ const ApiKeyDetailPage: React.FC = () => {
   return (
     <div className="container-fluid">
       <div className="mb-3">
-        <button className="btn btn-sm btn-secondary" onClick={() => navigate('/secrets?tab=api-keys')}>
+        <button
+          className="btn btn-sm btn-secondary"
+          onClick={() => navigate('/secrets?tab=api-keys')}
+        >
           <i className="fas fa-arrow-left"></i>
         </button>
       </div>
