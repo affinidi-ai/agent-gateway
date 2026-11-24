@@ -74,7 +74,7 @@ const ApiKeyDetailPage: React.FC = () => {
   };
 
   const { request: requestDelete, dialog: deleteDialog } = useApiKeyAction('delete', () =>
-    navigate('/secrets')
+    navigate('/secrets?tab=api-keys')
   );
 
   const handleDelete = () => {
@@ -103,7 +103,7 @@ const ApiKeyDetailPage: React.FC = () => {
     return (
       <div className="container-fluid">
         <div className="alert alert-danger">API key not found.</div>
-        <button className="btn btn-secondary" onClick={() => navigate('/secrets')}>
+        <button className="btn btn-secondary" onClick={() => navigate('/secrets?tab=api-keys')}>
           Back to Secrets
         </button>
       </div>
@@ -113,7 +113,7 @@ const ApiKeyDetailPage: React.FC = () => {
   return (
     <div className="container-fluid">
       <div className="mb-3">
-        <button className="btn btn-sm btn-secondary" onClick={() => navigate('/secrets')}>
+        <button className="btn btn-sm btn-secondary" onClick={() => navigate('/secrets?tab=api-keys')}>
           <i className="fas fa-arrow-left"></i>
         </button>
       </div>
