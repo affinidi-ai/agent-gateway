@@ -88,11 +88,14 @@ module.exports = {
                 priority: 20,
               },
               // Common code shared across multiple routes
+              // Split into parts of about 500 KiB once it grows past that, so it
+              // stays under the 1 MB asset limit below as shared code grows.
               common: {
                 minChunks: 2,
                 priority: 10,
                 reuseExistingChunk: true,
                 name: "common",
+                maxSize: 512000,
               },
             },
           },
