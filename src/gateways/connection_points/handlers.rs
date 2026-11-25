@@ -606,9 +606,10 @@ async fn load_accessible_connection_point<S: ConnectionPointStore>(
     Ok((connection_point, gateway))
 }
 
-/// Loads a User connection point for the by-id routes that return or change the record.
-/// System points are the gateway's own, as in the lists: a paused acceptance's point holds
-/// the inviter's invitation secret, which a caller must not read and redeem first.
+/// Loads a User connection point for the by-id routes that return or change the record:
+/// get, use, update, exposed-surfaces, mediator-access and continue. They answer 404 for a
+/// System point, as the lists leave it out: a System point is the gateway's own, and a paused
+/// acceptance's temporary point holds the inviter's invitation URL and secret.
 async fn load_user_connection_point<S: ConnectionPointStore>(
     store: &S,
     gateway_store: &crate::gateways::FileSystemGatewayStore,
@@ -1162,7 +1163,7 @@ pub async fn get_connection_point_mediator_access<S: ConnectionPointStore, M: Me
     scope: Option<Extension<PatResourceScope>>,
 ) -> Result<Json<crate::gateways::mediator_access::MediatorAccess>, (StatusCode, String)> {
     let (connection_point, _) =
-        load_accessible_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, false).await?;
+        load_user_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, false).await?;
     if !connection_point.awaiting_mediator_access {
         return Err((StatusCode::NOT_FOUND, "Connection point is not waiting for mediator access".to_string()));
     }
@@ -1189,10 +1190,10 @@ pub async fn continue_connection_point<P: ConnectionPointStore + 'static, M: Med
 ) -> Result<Json<CreateConnectionPointResponse>, crate::gateways::mediator_access::ContinueError> {
     use crate::gateways::mediator_access::{ContinueError, require_admitted};
 
-    load_accessible_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, true).await?;
+    load_user_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, true).await?;
     let _continuing = crate::gateways::mediator_access::lock(&id).await;
     let (mut connection_point, _) =
-        load_accessible_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, true).await?;
+        load_user_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, true).await?;
     if !connection_point.awaiting_mediator_access {
         return Ok(Json(CreateConnectionPointResponse {
             connection_point,
@@ -3678,5 +3679,38 @@ mod tests {
             1,
             "only the connection point's own keys"
         );
+    }
+
+    /// A paused acceptance's temporary point is a System point holding the inviter's
+    /// invitation URL and secret. Once its setup is sent it is no longer paused, and Continue
+    /// would return the whole record; both pause routes must answer 404 for it instead.
+    #[tokio::test]
+    async fn the_pause_routes_neither_return_nor_continue_a_system_connection_point() {
+        use crate::gateways::connection_points::ConnectionPointStore;
+        let fixture = pause_fixture("did:web:system-cp.mediator-access.example").await;
+        let mut sent = connection_point_for(&fixture.gateway_id);
+        sent.cp_type = crate::gateways::connection_points::ConnectionPointType::System;
+        sent.oob_url = "https://mediator.example/oob?_oobid=inviter-oob".to_string();
+        sent.secret = "inviter-invitation-secret".to_string();
+        let mut paused = sent.clone();
+        paused.id = uuid::Uuid::new_v4().to_string();
+        paused.awaiting_mediator_access = true;
+        for point in [&sent, &paused] {
+            fixture
+                .points
+                .create(point)
+                .await
+                .unwrap();
+        }
+
+        for point in [&sent, &paused] {
+            for (method, route) in [("POST", "continue"), ("GET", "mediator-access")] {
+                let (status, body) =
+                    call(&fixture.router, method, &format!("/v1/connection-points/{}/{route}", point.id), None).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{method} {route}: {body}");
+                let body = body.to_string();
+                assert!(!body.contains("inviter-oob") && !body.contains("inviter-invitation-secret"), "{body}");
+            }
+        }
     }
 }

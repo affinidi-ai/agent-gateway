@@ -21,7 +21,16 @@ changes:
         dashboard always asks for the pause, every Connection Point it creates reserves its
         permanent DID at creation and announces it, whatever the mediator's mode. Approval uses
         the reserved permanent DID, so pings work as soon as the pairing completes. The event hook
-        announces every DID at the pause.
+        announces every DID at the pause. Continue and the use, edit, exposed-surfaces and delete
+        routes of the same Connection Point take one lock, so none undoes another's change. A
+        reserved permanent record is stored only while the point that reserved it is, so a delete
+        during pairing makes the pairing fail cleanly instead of leaving a record without keys.
+        While a stored Connection Point record cannot be read, the startup sweeps and the
+        orphaned-key cleanup remove neither pauses nor keys, and a delete keeps the keys of a
+        reserved DID whose record cannot be read. The startup listener pass re-reads each
+        Connection Point before it starts its listener, so a pairing finished just after boot
+        leaves no listener on its deleted temporary point. The dashboard ignores a Continue answer
+        for a pairing its wizard has already left.
   changed:
     - timestamp: '2026-11-12T20:05:00Z'
       title: Let an accepted invitation wait for approval until the invitation expires
@@ -77,49 +86,13 @@ changes:
         page, which says the connection is pending, keeps Gateway Enabled off until the inviter
         accepts, and shows the issuer DIDs and surfaces only once it does. Rows waiting for
         approval or mediator access keep their own action.
-    - timestamp: '2026-11-23T16:00:00Z'
-      title: Keep a pairing finished just after a restart from leaving a stale listener
-      description: >-
-        The startup pass that restarts Connection Point listeners lists them once, about half a
-        second after boot. A pairing that a Continue finished in between deleted its temporary
-        Connection Point, but the pass still started a listener for it from that list, and a ping
-        could then go out from the temporary DID, which the peer's mediator refuses, so it timed
-        out. The pass now re-reads each Connection Point before starting its listener, skips one
-        that is gone or paused, and stops a listener whose Connection Point was deleted while it
-        started.
-    - timestamp: '2026-11-24T10:00:00Z'
-      title: Keep a Connection Point edit and a Continue from undoing each other
-      description: >-
-        Use, edit and exposed-surfaces changes of a Connection Point now wait for a Continue of
-        the same point, as a delete already did. Both rewrite the whole record, so an edit made
-        while Continue waited on the mediator could restore the pause, or Continue could undo the
-        edit.
-    - timestamp: '2026-11-24T10:00:00Z'
-      title: Keep a pairing finished as its Connection Point is deleted from losing its keys
-      description: >-
-        Deleting a paused Connection Point removes the keys of the permanent DID it reserved
-        when no record names them. A pairing that stored that permanent record at the same moment
-        could be left without keys. The permanent record is now stored only while the reserving
-        point still is, under the lock its delete holds, so the pairing fails cleanly instead.
-    - timestamp: '2026-11-24T10:00:00Z'
-      title: Keep pauses and reserved keys when a stored Connection Point cannot be read
-      description: >-
-        A Connection Point record that cannot be decrypted is left out of the list. The startup
-        sweeps took that list as complete, so they could remove a paused gateway or the reserved
-        keys that record names. They now keep both until every stored record can be read.
-    - timestamp: '2026-11-24T10:00:00Z'
-      title: Ignore a Continue answer for a pairing the wizard has already left
-      description: >-
-        Switching the dashboard's Connection Point wizard to another paused point, or leaving the
-        Add Gateway step, while a Continue was still running let its late answer move the new
-        pairing to Complete or show the old pairing's refusal. Such an answer is now dropped.
   removed: []
   security:
     - timestamp: '2026-11-20T11:00:00Z'
-      title: Stop serving System Connection Points by id
+      title: Answer 404 for a System Connection Point on the by-id read and edit routes
       description: >-
-        GET /v1/connection-points/{id} now answers 404 for a System Connection Point, as the
-        Connection Point lists already leave them out. A paused acceptance's temporary point holds
-        the inviter's invitation secret, which a caller with view access could otherwise read and
-        redeem first.
+        The by-id Connection Point routes (get, use, update, exposed-surfaces, mediator-access and
+        continue) answer 404 for a System Connection Point, as the Connection Point lists leave
+        them out. A System point is the gateway's own: a paused acceptance's temporary point holds
+        the inviter's invitation URL and secret.
   breaking: []

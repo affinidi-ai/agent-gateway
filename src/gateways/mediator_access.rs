@@ -132,9 +132,13 @@ fn refuses_admission(error: &ATMError) -> bool {
     matches!(error, ATMError::ACLDenied(_))
 }
 
-/// Authenticates `awaited.did` on its mediator over the live stream, which the
-/// mediator's replies arrive on, and reads its own account. A mediator that does
-/// not admit the DID refuses the authentication, so the stream does not open.
+/// Authenticates `awaited.did` on its mediator, then opens the live stream, which the
+/// mediator's replies arrive on, and reads its own account.
+///
+/// The authentication runs over HTTP first. On the live stream the SDK authenticates
+/// inside its websocket task, which only logs a refusal and retries, so the caller would
+/// get a socket timeout with no status. Over HTTP the mediator's `403` comes back as the
+/// error, which [`classify`] reads as a refusal.
 async fn admission(
     awaited: &AwaitedDid,
     secrets: Vec<Secret>,
@@ -161,6 +165,11 @@ async fn admission(
     .await?;
     let atm = client.atm();
     let checked = async {
+        client
+            .tdk_state()
+            .authentication()
+            .authenticate(awaited.did.clone(), awaited.mediator_did.clone(), 3, None)
+            .await?;
         let profile = atm
             .profile_add(client.profile(), true)
             .await?;
@@ -308,6 +317,46 @@ mod tests {
             mediator_did: "did:web:mediator.example".to_string(),
             mediator_name: String::new(),
         }
+    }
+
+    /// Drives the real SDK against a mediator that refuses every authentication with `403`,
+    /// as a live explicit_allow mediator does for a DID it has not admitted. The refusal must
+    /// come back as such, not as the live stream's 10-second timeout.
+    #[tokio::test]
+    async fn a_mediator_that_refuses_the_authentication_refuses_admission() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let refusing = axum::Router::new().fallback(|| async { StatusCode::FORBIDDEN });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, refusing)
+                .await
+                .unwrap();
+        });
+
+        let mediator_did = format!("did:web:refusing-mediator-{}.test", uuid::Uuid::new_v4());
+        let mediator_document = serde_json::json!({
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "id": mediator_did,
+            "verificationMethod": [],
+            "service": [{
+                "id": format!("{mediator_did}#auth"),
+                "type": "Authentication",
+                "serviceEndpoint": format!("http://{address}/authenticate"),
+            }],
+        });
+        let awaited = AwaitedDid {
+            mediator_did: mediator_did.clone(),
+            ..awaited()
+        };
+
+        let started = std::time::Instant::now();
+        let result = admission(&awaited, Vec::new(), Some(mediator_document)).await;
+        server.abort();
+
+        assert!(matches!(result, Ok(Admission::Refused)), "{:?}", result.err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(9), "took {:?}", started.elapsed());
     }
 
     #[test]

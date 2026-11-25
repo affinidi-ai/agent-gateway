@@ -393,10 +393,10 @@ mediator that admits them, pairing looks as it did before.
 
 A paused Connection Point is stored with `awaiting_mediator_access: true`, no invitation and no
 listener. A paused acceptance is a gateway with status `awaiting-mediator-access` and a temporary
-Connection Point that keeps the invitation, its secret and the reserved permanent DID; like every
-System Connection Point, `GET /v1/connection-points/{id}` answers `404` for it, so a viewer cannot
-read the secret and redeem the invitation first. Both keep
-their keys and state on disk, survive a restart, and last until the invitation expires: the
+Connection Point that keeps the invitation, its secret and the reserved permanent DID. It is a
+System Connection Point, so the by-id Connection Point routes (get, use, update,
+exposed-surfaces, mediator-access and continue) answer `404` for it, as the lists leave it out.
+Both keep their keys and state on disk, survive a restart, and last until the invitation expires: the
 Connection Point's own expiry, and for an acceptance the invitation's `expires_time`, capped at
 seven days, or seven days without one. The startup cleanup of orphaned key directories keeps the
 keys of a permanent DID minted ahead of the pairing, a reservation or an acceptance's

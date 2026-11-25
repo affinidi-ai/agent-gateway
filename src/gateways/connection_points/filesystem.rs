@@ -327,15 +327,25 @@ impl ConnectionPointStore for FileSystemConnectionPointStore {
             .delete(id)
             .await?;
         // A reservation never paired leaves keys with no record of their own: remove them,
-        // and report its DID failed unless the pairing consumed it.
+        // and report its DID failed unless the pairing consumed it. A permanent record that
+        // is stored but cannot be read keeps its keys, as the orphaned-key cleanup does.
         if let Ok(Some(record)) = &previous
             && let Some(reserved) = &record.reserved_permanent
-            && matches!(
-                self.storage
-                    .get(&reserved.cp_id)
-                    .await,
-                Ok(None)
-            )
+            && match self
+                .storage
+                .get_checked(&reserved.cp_id)
+                .await
+            {
+                Ok(permanent) => permanent.is_none(),
+                Err(error) => {
+                    tracing::warn!(
+                        connection_point_id = %reserved.cp_id,
+                        %error,
+                        "Keeping the keys of a reserved permanent DID whose record cannot be read"
+                    );
+                    false
+                }
+            }
         {
             match tokio::fs::remove_dir_all(
                 self.base_path
@@ -1366,6 +1376,45 @@ mod tests {
                 .await
                 .unwrap(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_reserving_point_keeps_the_keys_of_an_unreadable_permanent_record() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("cps");
+        let store = FileSystemConnectionPointStore::new(base.clone())
+            .await
+            .unwrap();
+        let mut reserving = sample_cp();
+        reserving.reserved_permanent = Some(super::super::types::ReservedPermanent {
+            cp_id: "paired-cp".to_string(),
+            did: "did:peer:2.reserved".to_string(),
+            mediator_id: "med-1".to_string(),
+            mediator_did: "did:example:mediator".to_string(),
+            consumed: true,
+        });
+        store
+            .create(&reserving)
+            .await
+            .unwrap();
+        // The paired permanent record is stored, but cannot be read right now.
+        tokio::fs::write(base.join("paired-cp.json"), b"not json")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(base.join("paired-cp"))
+            .await
+            .unwrap();
+
+        store
+            .delete(&reserving.id)
+            .await
+            .unwrap();
+
+        assert!(
+            base.join("paired-cp")
+                .is_dir(),
+            "the paired DID's keys must survive until its record can be read"
         );
     }
 }
