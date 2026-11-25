@@ -86,11 +86,12 @@ function variantTransitPoints(variant: unknown): StoredTransitPoint[] {
  * variants that held the old one (`propagateBaseListenPaths`), since a per-view check runs
  * before that and would read those copies as stale.
  */
-export function variantListenPathProblem(payload: any, stored: unknown): string | null {
-  if (!payload || typeof payload !== 'object' || text(payload.status) === 'disabled') return null;
-  const base: StoredTransitPoint[] = Array.isArray(payload?.transit?.points)
-    ? payload.transit.points
-    : [];
+export function variantListenPathProblem(payload: unknown, stored: unknown): string | null {
+  if (!payload || typeof payload !== 'object') return null;
+  const draft = payload as { status?: unknown; transit?: unknown; variants?: unknown };
+  if (text(draft.status) === 'disabled') return null;
+  const basePoints = (draft.transit as { points?: unknown } | null | undefined)?.points;
+  const base: StoredTransitPoint[] = Array.isArray(basePoints) ? basePoints : [];
   const storedActive =
     !!stored &&
     typeof stored === 'object' &&
@@ -99,7 +100,7 @@ export function variantListenPathProblem(payload: any, stored: unknown): string 
     storedActive && Array.isArray((stored as { variants?: unknown }).variants)
       ? (stored as { variants: unknown[] }).variants
       : [];
-  const variants: unknown[] = Array.isArray(payload.variants) ? payload.variants : [];
+  const variants: unknown[] = Array.isArray(draft.variants) ? draft.variants : [];
   for (const variant of variants) {
     const variantAlias = text((variant as { alias?: unknown } | null)?.alias);
     const before = storedVariants.find(

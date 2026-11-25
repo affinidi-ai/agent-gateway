@@ -217,6 +217,11 @@ pub struct StoredSurfaceFixture {
     pub route: String,
     /// `active` or `disabled`.
     pub status: String,
+    /// A Transit Point of its own, as `(alias, listen_path)`, copied from the
+    /// surface under test's first one and on the same outbound listener.
+    pub transit_point: Option<(String, String)>,
+    /// The tenant that owns it, or none for an operator's surface.
+    pub tenant_id: Option<String>,
 }
 
 /// An API key record stored before the gateway starts.

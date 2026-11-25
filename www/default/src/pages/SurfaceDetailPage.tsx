@@ -48,6 +48,7 @@ import {
 import {
   useVariantSnapshots,
   BASE_VARIANT_ID,
+  propagateBaseListenPaths,
 } from '../components/surface-builder/variants/useVariantSnapshots';
 import {
   resolveVariant,
@@ -991,9 +992,22 @@ const SurfaceDetailPage: React.FC = () => {
       // returns the last resolved payload for each id; for the active
       // variant we already used the live `draftPayload` above.
       const ids: string[] = [BASE_VARIANT_ID, ...variantSnapshots.variants.map(v => v.id)];
+      // Each inactive snapshot as the save will send it. A base Listen Path edit on the
+      // live canvas reaches the variants that held the old path only in
+      // `buildVariantsWireSlice`, so it is carried in here first: checked before it, a
+      // variant's stale copy of a path the base is repairing would block a save that
+      // never sends it. With a variant active, switching away from the base already did.
+      const snapshotsAsSaved: Record<string, unknown> =
+        activeId === BASE_VARIANT_ID
+          ? propagateBaseListenPaths(
+              Object.fromEntries(ids.map(id => [id, getVariantSnapshot(id)])),
+              getVariantSnapshot(BASE_VARIANT_ID),
+              draftPayload
+            )
+          : Object.fromEntries(ids.map(id => [id, getVariantSnapshot(id)]));
       for (const vid of ids) {
         if (vid === activeId) continue;
-        const snap = getVariantSnapshot(vid);
+        const snap = snapshotsAsSaved[vid];
         if (!snap) continue;
         const label =
           vid === BASE_VARIANT_ID

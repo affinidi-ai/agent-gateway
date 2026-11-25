@@ -325,8 +325,12 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
     const fields: Record<string, any> = { route_prefix: prefix, route_suffix: suffix };
     if (composed || !composedRoute || !trimmed) fields[routeFieldName] = composed;
     // A Transit Point whose path is emptied has no Listen Path at all, so the prefix goes
-    // too: one left behind would mark the empty pair invalid after a save attempt.
-    if (routeFieldName === 'listen_path' && !trimmed) fields.route_prefix = '';
+    // too: one left behind would mark the empty pair invalid after a save attempt. Only
+    // the emptying itself does this: picking a prefix while the path is still empty
+    // keeps the prefix, so the operator may choose it before typing the path.
+    if (routeFieldName === 'listen_path' && !trimmed && customPath.trim()) {
+      fields.route_prefix = '';
+    }
     updateFields(fields);
   };
 

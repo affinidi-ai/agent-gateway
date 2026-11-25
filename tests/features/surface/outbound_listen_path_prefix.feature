@@ -78,6 +78,22 @@ Feature: A Transit Point's listen_path is held to the routes the gateway serves
     And the admin API error response carries the code "listen_path_route_clash"
     And the admin API error response mentions "Transit Point 'charlie'"
 
+  Scenario: Saving a surface stored with a listen_path on another Transit Point's route warns about it
+    Given a surface "legacy-surface" is stored on route "/legacy" with Transit Point "gamma" listening on "/outbound/example/alpha"
+    When the operator changes the description of surface "legacy-surface"
+    Then the admin API response status is 200
+    And the admin API response carries a Warning header containing "listen_path '/outbound/example/alpha'"
+    And the admin API response carries a Warning header containing "Transit Point 'alpha' of surface 'example-surface'"
+
+  Scenario: The warning does not name a surface the saving token cannot read
+    Given the surface belongs to tenant "beta"
+    And a surface "legacy-surface" of tenant "acme" is stored on route "/legacy" with Transit Point "gamma" listening on "/outbound/example/alpha"
+    And a personal access token of tenant "acme"
+    When the personal access token changes the description of surface "legacy-surface"
+    Then the admin API response status is 200
+    And the admin API response carries a Warning header containing "a route a Transit Point of another surface answers on"
+    And the admin API response carries no Warning header containing "example-surface"
+
   Scenario: A variant listen_path its base Transit Point does not hold is refused
     When the operator adds variant "beta" in which Transit Point "alpha" has listen_path "/outbound/example/partner-beta"
     Then the admin API response status is 400

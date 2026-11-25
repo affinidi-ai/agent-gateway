@@ -124,6 +124,22 @@ describe('a Transit Point on an outbound address with a hostname of its own', ()
     expect(held.route_prefix).toBe('');
   });
 
+  it('keeps a prefix picked while Custom Path is still empty', async () => {
+    const { held } = renderTransitPoint({
+      listen_address: OWN,
+      listen_path: '',
+      route_prefix: '',
+      route_suffix: '',
+    });
+
+    await waitFor(() => expect(screen.getAllByRole('option').length).toBeGreaterThan(1));
+    const select = screen.getAllByRole('combobox').at(-1) as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: '/agents' } });
+
+    expect(held.route_prefix).toBe('/agents');
+    expect(select.value).toBe('/agents');
+  });
+
   // A cleared path answers at the derived route: reopening the panel must not seed a
   // random one, nor move the point to the first listener on offer.
   it('keeps a cleared Listen Path unset, on its own listener, when the panel reopens', async () => {

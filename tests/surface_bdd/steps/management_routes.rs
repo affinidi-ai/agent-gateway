@@ -334,6 +334,21 @@ async fn surface_limited_tenant_personal_access_token(
     hold_tenant_token(world, &tenant, &regex::escape(&surface)).await;
 }
 
+/// The personal access token reads surface `id` and saves it back with only its
+/// description changed.
+#[when(expr = "the personal access token changes the description of surface {string}")]
+async fn personal_access_token_changes_surface_description(
+    world: &mut SurfaceWorld,
+    id: String,
+) {
+    let path = format!("/v1/surfaces/{id}");
+    let read = send(world, Caller::PersonalAccessToken, Method::GET, &path, None).await;
+    assert_eq!(read.status, 200, "read surface {id} with the token: {read:?}");
+    let mut surface = read.body;
+    surface["description"] = json!("Edited without moving its route");
+    record(world, Caller::PersonalAccessToken, Method::PUT, &path, Some(&surface)).await;
+}
+
 #[given("the operator has looked up the surface's agent")]
 async fn operator_looked_up_surface_agent(world: &mut SurfaceWorld) {
     world.surface_agent_id = Some(agent_id_of_surface(world).await);

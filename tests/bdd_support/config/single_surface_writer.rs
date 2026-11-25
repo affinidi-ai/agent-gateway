@@ -568,6 +568,25 @@ fn write_single_surface_config_inner(
             effective_target_url.clone(),
         );
         surface.status = stored.status.clone();
+        surface.tenant_id = stored.tenant_id.clone();
+        if let Some((alias, listen_path)) = &stored.transit_point {
+            let first = surface_config
+                .transit_points
+                .first()
+                .expect("a stored surface's Transit Point copies the surface under test's first one");
+            let target_endpoint = transit_target_urls
+                .and_then(|urls| urls.get(&first.alias))
+                .unwrap_or_else(|| panic!("no target URL for Transit Point '{}'", first.alias));
+            let mut point = transit_point_json(first, target_endpoint, delegation_binding.as_ref());
+            point["name"] = serde_json::json!(alias);
+            point["alias"] = serde_json::json!(alias);
+            point["listen_path"] = serde_json::json!(listen_path);
+            let outbound_port = outbound_port.expect("outbound_port is required when a Transit Point is configured");
+            surface = surface.with_transit(serde_json::json!({
+                "outbound_listen_address": format!("http://localhost:{outbound_port}"),
+                "points": [point]
+            }));
+        }
         config_tree
             .agent_surfaces
             .insert(stored.id.clone(), surface);
