@@ -1,6 +1,13 @@
 import React from 'react';
 import { formatDateTime, timeAgo } from '../../utils/stringUtils';
-import { callerDidOf, policyChange, policyDecision, trustCheck } from './auditHelpers';
+import {
+  callerDidOf,
+  policyChange,
+  policyDecision,
+  secretForceDelete,
+  targetAuthChange,
+  trustCheck,
+} from './auditHelpers';
 import { actorLabel, describeEntry, type UserNameResolver } from './eventNarrative';
 import type { AuditEntry } from './types';
 
@@ -20,6 +27,8 @@ interface AuditListItemProps {
 function actorOf(entry: AuditEntry, userName?: UserNameResolver): string {
   const change = policyChange(entry);
   if (change) return actorLabel(change.change.actor, userName);
+  const managed = targetAuthChange(entry) ?? secretForceDelete(entry);
+  if (managed) return actorLabel(managed.actor, userName);
   return (
     entry.caller?.name ||
     entry.caller?.name_redacted ||

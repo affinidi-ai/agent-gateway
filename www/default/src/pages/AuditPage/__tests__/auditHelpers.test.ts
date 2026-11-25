@@ -14,6 +14,8 @@ describe('categoryLabel', () => {
     ['token_refreshed', 'Token Refreshed'],
     ['consent_expired', 'Consent Expired'],
     ['consent_limited', 'Consent Limited'],
+    ['target_auth_changed', 'Target Authentication Changed'],
+    ['secret_force_deleted', 'Secret Force-Deleted'],
     ['policy_input_capture_started', 'Policy Input Capture Started'],
     ['policy_input_capture_stopped', 'Policy Input Capture Stopped'],
   ])('labels %s as %s', (name, label) => {
@@ -27,6 +29,14 @@ describe('categoryLabel', () => {
     ['vp_audit_note', 'VP Audit Note'],
   ])('names an event it has no label for, %s, in title case', (name, label) => {
     expect(categoryLabel(name)).toBe(label);
+  });
+});
+
+describe('Target authentication and forced secret delete records in the Audit Log', () => {
+  it('offers both as category filters', () => {
+    const offered: string[] = CATEGORY_OPTIONS.map(option => option.value);
+    expect(offered).toContain('target_auth_changed');
+    expect(offered).toContain('secret_force_deleted');
   });
 });
 

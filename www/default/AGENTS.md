@@ -2526,6 +2526,27 @@ in components. It fills `surface_variant` from `variant` on records written befo
   tab of its type, the target to its surface or gateway page.
 - Every value is rendered as React text; record fields come from the gateway and are untrusted.
 
+## Audit page: Target authentication changes and forced secret deletes
+
+`target_auth_changed` and `secret_force_deleted` records are read with `targetAuthChange` and
+`secretForceDelete` (`pages/AuditPage/auditHelpers.ts`), never by indexing `entry.event`, and
+both are offered as filters in the Category menu (low frequency).
+
+- `target_auth_changed` is titled **Target authentication changed** in the neutral tone. The
+  summary names the leg (the Target, or Transit Point `<alias>`), the surface by name (its id
+  when no name is recorded), the variant when it is not the base surface, and what changed:
+  added (with the method and provider id), removed, replaced method, or the changed parts by
+  name. The Details list shows Change, Where (surface link, Variant, Leg, Transit point) and
+  Authentication (Method, Provider linking to its page, Changed). The record holds no secret id,
+  header name, format or value, so none is shown; a provider is shown by id.
+- `secret_force_deleted` is titled **Secret force-deleted** in the warn tone. The summary names
+  the secret id and how many records still used it; Details shows Change (with Secret) and a
+  **Records still using it** group, one row per referrer by kind and id. A record with no
+  referrers has no such rows.
+- Both show the actor (`actorLabel`, resolved through `userName`) in the footnote and the detail
+  line, and the evidence pane shows only **Details**, as for a policy change.
+- Every value is rendered as React text; record fields come from the gateway and are untrusted.
+
 ## Audit page: surface variants and refusals
 
 Records of a surface request carry `surface_variant`: a configured alias, `_base_` (the base
