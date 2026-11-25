@@ -60,4 +60,14 @@ changes:
         an issuer the operator trusts for the connection; on, such a presentation must be
         addressed to this gateway, and one with no `domain` is refused. A connection without an
         attested peer issuer admits no relayed presentation.
-  breaking: []
+  breaking:
+    - timestamp: '2026-11-25T00:00:00Z'
+      title: Refuse presentations whose proof lives longer than 7 minutes
+      description: >-
+        The gateway now refuses an identity presentation whose proof `expires` is more than 5
+        minutes plus 2 minutes of clock skew after verification, whose `created` and `expires`
+        span more than 7 minutes, or whose `created` is more than 2 minutes ahead of the
+        gateway's clock. This applies to agents that send their own presentation and to STS
+        clients presenting one at the token endpoint. Migration: sign each presentation just
+        before sending it with a proof `expires` of 5 minutes or less after `created`, and keep
+        the signer's clock in sync; presentations the gateway signs already meet this.
