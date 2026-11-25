@@ -1,0 +1,16 @@
+branch: fix/mcp-target-error
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-25T12:00:00Z'
+      title: Answer an MCP request the Target can't serve with a JSON-RPC error
+      description: >-
+        When the Target behind an MCP Access Point is unreachable or its Target authentication
+        fails, the gateway now replies with a JSON-RPC -32603 error that echoes the request id and
+        names the cause in error.data.reason, under the same HTTP status as before, instead of an
+        A2A problem document an MCP client could not parse. The message names no Target URL or
+        secret, and a notification gets the status and no body. A2A surfaces are unchanged.
+  removed: []
+  security: []
+  breaking: []

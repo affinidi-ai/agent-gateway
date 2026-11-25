@@ -3759,6 +3759,19 @@ fn named_mcp_surface_targeting_mock(
     configure_mcp_surface_protocol(world);
 }
 
+#[given(expr = "MCP server {string} is unreachable")]
+fn mcp_server_is_unreachable(
+    world: &mut SurfaceWorld,
+    server_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&server_name, TargetActorKind::McpServer);
+    world
+        .surface_config
+        .override_target_url = Some("http://127.0.0.1:1".to_string());
+}
+
 #[given(expr = "REST API {string} exposes a Weather OpenAPI")]
 fn rest_api_exposes_weather_openapi(
     world: &mut SurfaceWorld,

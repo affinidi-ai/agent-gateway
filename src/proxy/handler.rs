@@ -1018,6 +1018,20 @@ impl TargetAuthFailure {
         crate::a2a::create_error_response_with_reason(self.status(), TARGET_AUTH_FAILED, self.reason())
     }
 
+    /// [`Self::response`], or on an MCP surface a JSON-RPC error that echoes the id of
+    /// `request_body`.
+    pub(crate) fn response_for(
+        self,
+        surface: &crate::config::agent_surface::AgentSurface,
+        request_body: &[u8],
+    ) -> Response {
+        if surface.access_point.protocol == crate::config::agent_surface::SurfaceProtocol::Mcp {
+            crate::mcp::errors::target_failure_response(self.status(), request_body, self.reason(), TARGET_AUTH_FAILED)
+        } else {
+            self.response()
+        }
+    }
+
     /// The failure a peer gateway refused with over Fabric: its problem JSON `body` names one
     /// of these reasons with the matching `status`. Any other answer is `None`.
     pub(crate) fn relayed(
@@ -6867,7 +6881,7 @@ async fn proxy_charged_request(
             );
             let refusal = TargetAuthFailure::PathRefused;
             record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
-            return Ok(refusal.response());
+            return Ok(refusal.response_for(&state.surface, &body_bytes));
         }
         let caller_assertion = CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed);
         let mcp_proxy_base_url = match state.mcp_proxy_store.as_ref() {
@@ -6902,7 +6916,9 @@ async fn proxy_charged_request(
                 record_target_auth_failure(&audit_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return Ok(e.failure().response());
+                        return Ok(e
+                            .failure()
+                            .response_for(&state.surface, &body_bytes));
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -7878,7 +7894,15 @@ async fn proxy_charged_request(
     let send_failed =
         |error: reqwest::Error| match crate::proxy::response_auth::handshake_failure(&state.surface, &error) {
             Some(failure) => crate::proxy::response_auth::refuse(failure, &audit_facts, &body_bytes),
-            None => handle_upstream_error(error, &state, &source_addr, &identity_hash, &channel_name, &ucp_operation),
+            None => handle_upstream_error(
+                error,
+                &state,
+                &source_addr,
+                &identity_hash,
+                &channel_name,
+                &ucp_operation,
+                &body_bytes,
+            ),
         };
 
     // Implement retry logic if configured
@@ -10455,6 +10479,7 @@ fn handle_upstream_error(
     identity_hash: &Option<String>,
     channel_name: &str,
     ucp_operation: &Option<String>,
+    request_body: &[u8],
 ) -> Response {
     // Check if this is a placeholder/example domain that's expected to fail
     let is_example_domain = state
@@ -10543,6 +10568,19 @@ fn handle_upstream_error(
     } else {
         StatusCode::BAD_GATEWAY
     };
+    if state
+        .surface
+        .access_point
+        .protocol
+        == crate::config::agent_surface::SurfaceProtocol::Mcp
+    {
+        return crate::mcp::errors::target_failure_response(
+            status_code,
+            request_body,
+            "target_unreachable",
+            "Target unavailable",
+        );
+    }
     create_error_response(status_code, error_message)
 }
 
@@ -24245,6 +24283,99 @@ allow if {
         assert!(!text.contains("tool-argument-marker"), "a log holds the request body: {text}");
     }
 
+    async fn unreachable_endpoint() -> String {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        format!("http://127.0.0.1:{port}/agent")
+    }
+
+    async fn body_of(response: axum::response::Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_target_on_an_mcp_surface_answers_a_json_rpc_error_with_the_request_id() {
+        let endpoint = unreachable_endpoint().await;
+        let surface = mcp_surface("mcp-down", &endpoint, None);
+        let state = bare_proxy_state(surface.clone(), None);
+        let request = serde_json::json!({"jsonrpc": "2.0", "id": "req-9", "method": "tools/list"});
+
+        let response = send_to_surface(&state, surface, legacy_mcp_request("/mcp-down", &request)).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        let body = body_of(response).await;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "req-9",
+                "error": {"code": -32603, "message": "Target unavailable", "data": {"reason": "target_unreachable"}},
+            })
+        );
+        assert!(!String::from_utf8_lossy(&body).contains("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_target_on_an_mcp_surface_answers_a_notification_with_no_body() {
+        let endpoint = unreachable_endpoint().await;
+        let state = bare_proxy_state(mcp_surface("mcp-down-note", &endpoint, None), None);
+        let error = reqwest::Client::new()
+            .get(&endpoint)
+            .send()
+            .await
+            .expect_err("nothing listens on the port");
+
+        let response = super::handle_upstream_error(
+            error,
+            &state,
+            "127.0.0.1:12345",
+            &None,
+            "mcp-down-note",
+            &None,
+            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        );
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+        assert!(
+            body_of(response)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_target_on_an_a2a_surface_keeps_the_problem_document() {
+        let endpoint = unreachable_endpoint().await;
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "a2a-down", "name": "a2a-down",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/a2a-down", "protocol": "a2a"},
+            "target": {"endpoint": endpoint}
+        }))
+        .unwrap();
+        let state = bare_proxy_state(surface.clone(), None);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/a2a-down")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{}}"#))
+            .unwrap();
+
+        let response = send_to_surface(&state, surface, request).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+        assert_eq!(response.headers()["content-type"], "application/problem+json");
+        let problem: serde_json::Value = serde_json::from_slice(&body_of(response).await).unwrap();
+        assert_eq!(problem["type"], "https://a2a-protocol.org/errors/proxy-error");
+        assert_eq!(problem["detail"], "Connection failed to target endpoint");
+    }
+
     #[tokio::test]
     async fn an_unreachable_target_answers_a_generic_error_and_logs_no_target_url() {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -24261,15 +24392,23 @@ allow if {
             .expect_err("nothing listens on the port");
         let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
 
-        let response =
-            super::handle_upstream_error(error, &state, "127.0.0.1:12345", &None, "unreachable-target", &None);
+        let response = super::handle_upstream_error(
+            error,
+            &state,
+            "127.0.0.1:12345",
+            &None,
+            "unreachable-target",
+            &None,
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        );
 
         assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
-        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(problem["detail"], "Connection failed to target endpoint");
+        let rpc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rpc["error"]["message"], "Target unavailable");
+        assert!(!String::from_utf8_lossy(&body).contains("127.0.0.1"), "{rpc}");
         let text = logs.text();
         assert!(text.contains("Failed to forward request to upstream - bad gateway"), "{text}");
         assert!(text.contains(&format!("target=http://127.0.0.1:{port}/agent?api_key=<redacted>")), "{text}");
