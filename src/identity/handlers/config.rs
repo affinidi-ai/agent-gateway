@@ -55,7 +55,6 @@ struct ErrorResponse {
 pub struct ReloadConfigResponse {
     pub channels_count: usize,
     pub surfaces_count: usize,
-    pub is_fallback: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
@@ -73,11 +72,15 @@ pub async fn reload_configuration(
             .await
             .map_err(|e| AppError::InternalError(format!("Failed to reload channels: {}", e)))?
     };
+    if is_fallback {
+        return Err(AppError::InternalError(
+            warning.unwrap_or_else(|| "The configuration could not be loaded and was not reloaded".to_string()),
+        ));
+    }
 
     Ok(Json(ReloadConfigResponse {
         channels_count,
         surfaces_count,
-        is_fallback,
         warning,
     }))
 }
@@ -149,7 +152,7 @@ async fn reload(state: &IdentityApiState) -> anyhow::Result<(usize, usize, bool,
         .await?;
 
     if is_fallback {
-        warn!("Using cached configuration as fallback after DynamoDB load failure");
+        warn!("Kept the configuration already running after a failed configuration load");
     } else {
         info!("Successfully reloaded {} channels + {} surfaces", channels_count, surfaces_count);
     }
@@ -208,9 +211,6 @@ async fn load_base_gateway_config(state: &IdentityApiState) -> anyhow::Result<Ar
                 Ok(Arc::new(config))
             }
             .await
-        }
-        "file" => {
-            Err(anyhow::anyhow!("File-based configuration loading is deprecated. Use DynamoDB configuration source."))
         }
         "local" => {
             info!(
@@ -295,7 +295,7 @@ async fn load_base_gateway_config(state: &IdentityApiState) -> anyhow::Result<Ar
                     .iter()
                     .filter(|surface| given.contains(&surface.surface_id))
                 {
-                    if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
+                    if !surface.status.is_live() {
                         continue;
                     }
                     if let Err(error) = state
@@ -376,7 +376,7 @@ async fn inject_surfaces_into_config(
                             .collect();
                         let active: Vec<_> = surfaces
                             .iter()
-                            .filter(|surface| surface.status == crate::config::agent_surface::SurfaceStatus::Active)
+                            .filter(|surface| surface.status.is_live())
                             .collect();
                         provider_key_listing = crate::identity::provider_key_gate::gate()
                             .admit_all(active.iter().copied())
@@ -393,10 +393,7 @@ async fn inject_surfaces_into_config(
                         updated_config.surfaces = channels;
                         Ok(Arc::new(updated_config))
                     }
-                    Err(e) => {
-                        warn!("Failed to load surfaces during reload: {}", e);
-                        Ok(config)
-                    }
+                    Err(e) => Err(anyhow::anyhow!("Failed to load surfaces during reload: {}", e)),
                 }
             } else {
                 Ok(config)
@@ -463,9 +460,6 @@ pub async fn reload_single_channel(
                 Ok(surface)
             }
             .await
-        }
-        "file" => {
-            Err(anyhow::anyhow!("File-based configuration loading is deprecated. Use DynamoDB configuration source."))
         }
         "local" => {
             async {
@@ -772,7 +766,6 @@ pub struct X402DefaultsConfig {
     pub verification_mode: String,
     pub settlement_mode: String,
     pub min_confirmations: u32,
-    pub facilitator_timeout_secs: u64,
 }
 
 /// x402 configuration response

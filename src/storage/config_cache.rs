@@ -57,7 +57,7 @@ impl ConfigCache {
 
         let json = serde_json::to_string_pretty(&cached).context("Failed to serialize configuration")?;
 
-        fs::write(&self.cache_path, json)
+        crate::storage::did_artifacts::replace_file(&self.cache_path, json.as_bytes())
             .await
             .context("Failed to write configuration cache")?;
 

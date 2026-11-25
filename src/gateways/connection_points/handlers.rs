@@ -167,6 +167,7 @@ pub async fn generate_connection_point_identity_webvh(
         metadata.insert("connection_point_id".to_string(), serde_json::Value::String(connection_point_id.to_string()));
 
         let identity = DidWebVhIdentity {
+            pending_key_pair: None,
             id,
             did: final_did.clone(),
             key_pair: Some(ed25519_key_pair),

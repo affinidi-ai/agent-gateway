@@ -809,7 +809,7 @@ pub async fn serve_gateway_did_document(
         if surface
             .access_point
             .publish_to_did_document
-            && surface.status == crate::config::agent_surface::SurfaceStatus::Active
+            && surface.status.is_live()
         {
             let channel_id = surface
                 .config_id()

@@ -308,6 +308,14 @@ pub enum SurfaceStatus {
     Deleted,
 }
 
+impl SurfaceStatus {
+    /// Whether a surface in this status serves traffic and claims its route.
+    /// Only `Active` does; a `Disabled` or `Deleted` surface does neither.
+    pub fn is_live(&self) -> bool {
+        matches!(self, Self::Active)
+    }
+}
+
 // ─── Access Point ───────────────────────────────────────────────────────────
 
 /// Defines the front door of an Agent Surface — how callers discover,
@@ -4611,6 +4619,14 @@ impl AgentSurface {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_an_active_surface_is_live() {
+        use super::SurfaceStatus;
+        assert!(SurfaceStatus::Active.is_live());
+        assert!(!SurfaceStatus::Disabled.is_live());
+        assert!(!SurfaceStatus::Deleted.is_live());
+    }
+
     #[test]
     fn browser_origins_are_stored_as_the_url_parser_normalises_them() {
         let mut origins = vec![

@@ -63,6 +63,16 @@ Feature: Security Token Service token exchange
     And the response is an "invalid_grant" error
     And no token is issued
 
+  Scenario: An ID-JAG that expires later than the gateway accepts cannot be redeemed
+    Given the gateway redeems only ID-JAGs that expire within 60 seconds
+    And the operator has a managed connection for agent "alpha" that can issue ID-JAG
+    And agent "alpha" holds an identity assertion for subject "did:example:user"
+    And agent "alpha" has obtained an ID-JAG redeemable at the gateway
+    When agent "alpha" redeems the ID-JAG for a token scoped to audience "/reports"
+    Then the response status is 400
+    And the response is an "invalid_grant" error
+    And no token is issued
+
   Scenario: An agent cannot redeem an ID-JAG issued to another agent
     Given the operator has a managed connection for agent "alpha" that can issue ID-JAG
     And the operator has a managed connection for agent "beta" that can issue ID-JAG

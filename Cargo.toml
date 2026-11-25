@@ -188,22 +188,6 @@ ring = "0.17"
 # RAII scope guard for cleanup
 scopeguard = "1.2"
 
-# x402 protocol implementation
-x402-types = "1.1"
-x402-facilitator-local = { version = "1.1.2", features = ["telemetry"] }
-x402-chain-eip155 = { version = "1.1.1", features = [
-    "facilitator",
-    "telemetry",
-] }
-x402-chain-solana = { version = "1.1.3", features = [
-    "facilitator",
-    "telemetry",
-] }
-
-# x402 settlement: payment amounts and the Solana facilitator key
-alloy = "2.5"
-solana-sdk = "3.0.0"
-
 # Model types and the server side only. The gateway serves MCP through rmcp-openapi and
 # calls MCP endpoints with its own Streamable HTTP client (eventsource-stream, below), so
 # rmcp's client transports are left off.

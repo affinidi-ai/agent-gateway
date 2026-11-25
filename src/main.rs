@@ -462,10 +462,6 @@ async fn async_main() -> Result<()> {
         }
     }
 
-    // Initialize gateway facilitator service for DIDComm-based settlement of stored x402 payments
-    x402::init_gateway_facilitator_service().await;
-    info!("Gateway facilitator service initialized - ready for ATM infrastructure");
-
     // Load local surfaces after logging is initialized so errors are logged;
     // other sources loaded theirs with the configuration, before logging, so
     // their legacy Access Point notices are logged here.
@@ -905,16 +901,17 @@ fn log_startup_summary(
     let surfaces = &gateway_config.surfaces;
     let active_count = surfaces
         .iter()
-        .filter(|s| s.status == crate::config::agent_surface::SurfaceStatus::Active)
+        .filter(|s| s.status.is_live())
         .count();
-    let disabled_count = surfaces
-        .iter()
-        .filter(|s| s.status == crate::config::agent_surface::SurfaceStatus::Disabled)
-        .count();
-    info!("Configured {} channel(s) ({} active, {} disabled)", surfaces.len(), active_count, disabled_count);
+    info!(
+        "Configured {} channel(s) ({} active, {} inactive)",
+        surfaces.len(),
+        active_count,
+        surfaces.len() - active_count
+    );
     for surface in surfaces
         .iter()
-        .filter(|s| s.status == crate::config::agent_surface::SurfaceStatus::Active)
+        .filter(|s| s.status.is_live())
     {
         info!(
             "  Channel '{}': {} -> {}",
@@ -1031,7 +1028,7 @@ async fn disable_duplicate_route_surfaces(
     let combos: Vec<Option<String>> = channels
         .iter()
         .map(|surface| {
-            (surface.status != crate::config::agent_surface::SurfaceStatus::Disabled).then(|| {
+            (surface.status.is_live()).then(|| {
                 let listen_address = surface.listen_address();
                 let listener = match network_config.map_url_to_port(listen_address) {
                     Some(port) => format!("port {}", port),
@@ -1670,6 +1667,22 @@ mod duplicate_route_surface_tests {
         assert_eq!(channels[0].status, SurfaceStatus::Disabled);
         assert_eq!(channels[1].status, SurfaceStatus::Active, "an already-disabled surface must not claim the route");
     }
+
+    #[tokio::test]
+    async fn test_disable_duplicate_route_surfaces_deleted_surface_claims_no_route() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let mut deleted = surface("s-a", "/api");
+        deleted.status = SurfaceStatus::Deleted;
+        let mut channels = vec![deleted, surface("s-b", "/api")];
+
+        disable_duplicate_route_surfaces(&store, &mut channels, &network_config())
+            .await
+            .expect("dedup should succeed");
+
+        assert_eq!(channels[0].status, SurfaceStatus::Deleted);
+        assert_eq!(channels[1].status, SurfaceStatus::Active, "a deleted surface must not take a live one's route");
+    }
 }
 
 #[cfg(test)]
@@ -1788,7 +1801,7 @@ mod startup_logging_tests {
             ),
             "{text}"
         );
-        assert!(text.contains("Configured 2 channel(s) (2 active, 0 disabled)"), "{text}");
+        assert!(text.contains("Configured 2 channel(s) (2 active, 0 inactive)"), "{text}");
         assert!(
             text.contains("Channel 'mpp-surface': 0.0.0.0:8443 -> https://upstream.example.com/v1?api_key=<redacted>"),
             "{text}"

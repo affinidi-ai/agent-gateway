@@ -14,7 +14,10 @@
 //! whatever the request timeout, so a receiver whose clock runs up to
 //! [`CREATED_TIME_SKEW_SECS`] behind still accepts it.
 //!
-//! The set lives in memory only.
+//! The in-memory set is the fast first check. An admitted envelope is also
+//! recorded in the single-use store ([`crate::storage::single_use`]), so a
+//! restart, or with a shared store another node, refuses its replay. An
+//! envelope the store cannot record is refused.
 
 use std::fmt;
 use std::sync::OnceLock;
@@ -26,6 +29,7 @@ use dashmap::mapref::entry::Entry;
 use sha2::{Digest, Sha256};
 
 use super::messages::ReceivedMessage;
+use crate::storage::single_use::{Namespace, SingleUseStore};
 
 /// Clock skew tolerated on `created_time`, in seconds, and the slack between
 /// the lifetime a sender puts on an envelope and the lifetime a receiver
@@ -53,6 +57,7 @@ pub enum EnvelopeRejection {
     ExpiryTooFar { expires_time: u64, now: u64 },
     CreatedInFuture { created_time: u64, now: u64 },
     Duplicate { sender: String, message_id: String },
+    Unrecorded,
 }
 
 impl fmt::Display for EnvelopeRejection {
@@ -77,6 +82,7 @@ impl fmt::Display for EnvelopeRejection {
             Self::Duplicate { sender, message_id } => {
                 write!(f, "envelope {message_id} from {sender} was already processed")
             }
+            Self::Unrecorded => write!(f, "envelope could not be recorded as processed"),
         }
     }
 }
@@ -186,6 +192,16 @@ impl SeenSet {
             .is_some_and(|retain_until| *retain_until > now)
     }
 
+    /// Forgets `(sender, message_id)`, so its next sight is a first sight.
+    pub fn forget(
+        &self,
+        sender: &str,
+        message_id: &str,
+    ) {
+        self.entries
+            .remove(&digest(sender, message_id));
+    }
+
     /// Number of envelopes currently remembered, expired entries included
     /// until the next sweep.
     #[allow(clippy::len_without_is_empty)]
@@ -231,15 +247,62 @@ fn seen() -> &'static SeenSet {
     SEEN.get_or_init(SeenSet::new)
 }
 
-fn remember(
+/// Remembers `(sender, message_id)` until `retain_until` in `seen` and in
+/// `store`. A pair either one already holds is a duplicate; a pair `store`
+/// cannot record is refused and forgotten again.
+async fn remember_in(
+    seen: &SeenSet,
+    store: &SingleUseStore,
     sender: &str,
     message_id: &str,
     retain_until: u64,
     now: u64,
 ) -> Result<(), EnvelopeRejection> {
-    let outcome = seen().record_first_sight(sender, message_id, retain_until, now);
+    seen.record_first_sight(sender, message_id, retain_until, now)?;
+    match store
+        .record_unique(Namespace::FabricEnvelope, &digest(sender, message_id), retain_until, now)
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(EnvelopeRejection::Duplicate {
+            sender: sender.to_string(),
+            message_id: message_id.to_string(),
+        }),
+        Err(error) => {
+            tracing::error!(%sender, %message_id, %error, "Refusing a Fabric envelope the single-use store could not record");
+            seen.forget(sender, message_id);
+            Err(EnvelopeRejection::Unrecorded)
+        }
+    }
+}
+
+async fn remember(
+    sender: &str,
+    message_id: &str,
+    retain_until: u64,
+    now: u64,
+) -> Result<(), EnvelopeRejection> {
+    let outcome = match crate::storage::single_use::global() {
+        Ok(store) => remember_in(seen(), &store, sender, message_id, retain_until, now).await,
+        Err(error) => {
+            tracing::error!(%sender, %message_id, %error, "Refusing a Fabric envelope: the single-use store is not open");
+            Err(EnvelopeRejection::Unrecorded)
+        }
+    };
     crate::metrics::backends::prometheus::set_fabric_envelope_seen_entries(seen().len() as i64);
     outcome
+}
+
+/// Whether `(sender, message_id)` is remembered at `now`, in memory or by
+/// this node's single-use store, without recording it.
+fn remembered(
+    sender: &str,
+    message_id: &str,
+    now: u64,
+) -> bool {
+    seen().is_remembered(sender, message_id, now)
+        || crate::storage::single_use::global()
+            .is_ok_and(|store| store.holds(Namespace::FabricEnvelope, &digest(sender, message_id), now))
 }
 
 /// The authenticated sender the envelope is keyed on. An envelope without one
@@ -252,13 +315,33 @@ fn sender_of(message: &ReceivedMessage) -> Result<&str, EnvelopeRejection> {
         .ok_or(EnvelopeRejection::MissingSender)
 }
 
+/// Whether `message` is already remembered, so admitting it now would refuse
+/// it as a duplicate.
+pub fn is_remembered(message: &ReceivedMessage) -> bool {
+    sender_of(message).is_ok_and(|sender| remembered(sender, &message.didcomm_message_id, now_secs()))
+}
+
+/// Forgets `message`, admitted but never answered, so the mediator's
+/// redelivery of it is processed instead of being dropped as a duplicate. The
+/// single-use store forgets it in the background; an admission of the
+/// redelivery waits for that.
+pub fn forget_unanswered(message: &ReceivedMessage) {
+    if let Ok(sender) = sender_of(message) {
+        seen().forget(sender, &message.didcomm_message_id);
+        if let Ok(store) = crate::storage::single_use::global() {
+            store.forget_in_background(Namespace::FabricEnvelope, &digest(sender, &message.didcomm_message_id));
+        }
+        crate::metrics::backends::prometheus::set_fabric_envelope_seen_entries(seen().len() as i64);
+    }
+}
+
 /// Checks a `forward-request` as `admit_forward_request` does, without
 /// remembering it, so the admission that later records it still runs once.
 pub fn check_forward_request(message: &ReceivedMessage) -> Result<(), EnvelopeRejection> {
     let sender = sender_of(message)?;
     let now = now_secs();
     validate_envelope_times(message.created_time, message.expires_time, now)?;
-    if seen().is_remembered(sender, &message.didcomm_message_id, now) {
+    if remembered(sender, &message.didcomm_message_id, now) {
         return Err(EnvelopeRejection::Duplicate {
             sender: sender.to_string(),
             message_id: message
@@ -271,11 +354,11 @@ pub fn check_forward_request(message: &ReceivedMessage) -> Result<(), EnvelopeRe
 
 /// Admits a `forward-request`: its `expires_time` is required and validated,
 /// then the envelope is remembered until it expires.
-pub fn admit_forward_request(message: &ReceivedMessage) -> Result<(), EnvelopeRejection> {
+pub async fn admit_forward_request(message: &ReceivedMessage) -> Result<(), EnvelopeRejection> {
     let sender = sender_of(message)?;
     let now = now_secs();
     let retain_until = validate_envelope_times(message.created_time, message.expires_time, now)?;
-    remember(sender, &message.didcomm_message_id, retain_until, now)
+    remember(sender, &message.didcomm_message_id, retain_until, now).await
 }
 
 /// Checks a Fabric capability query as `admit_capability_query` does, without
@@ -288,14 +371,14 @@ pub fn check_capability_query(message: &ReceivedMessage) -> Result<(), EnvelopeR
 /// `expires_time` is required and validated, then the envelope is remembered
 /// until it expires. A replayed query can then never recreate an offer that
 /// has expired, so an `Open` bound to that offer stays refused.
-pub fn admit_capability_query(message: &ReceivedMessage) -> Result<(), EnvelopeRejection> {
-    admit_forward_request(message)
+pub async fn admit_capability_query(message: &ReceivedMessage) -> Result<(), EnvelopeRejection> {
+    admit_forward_request(message).await
 }
 
 /// Admits a pairing message (`connection-setup`, `connection-accepted`): an
 /// expired envelope is refused, and the envelope is remembered until its
 /// `expires_time` or for [`MAX_ENVELOPE_LIFETIME_SECS`] when it has none.
-pub fn admit_pairing_message(message: &ReceivedMessage) -> Result<(), EnvelopeRejection> {
+pub async fn admit_pairing_message(message: &ReceivedMessage) -> Result<(), EnvelopeRejection> {
     let sender = sender_of(message)?;
     let now = now_secs();
     if let Some(expires_time) = message.expires_time
@@ -307,7 +390,7 @@ pub fn admit_pairing_message(message: &ReceivedMessage) -> Result<(), EnvelopeRe
         .expires_time
         .unwrap_or(now + MAX_ENVELOPE_LIFETIME_SECS)
         .min(now + MAX_ENVELOPE_LIFETIME_SECS);
-    remember(sender, &message.didcomm_message_id, retain_until, now)
+    remember(sender, &message.didcomm_message_id, retain_until, now).await
 }
 
 #[cfg(test)]
@@ -462,34 +545,114 @@ mod tests {
         assert_eq!(digest("did:web:a", "b"), digest("did:web:a", "b"));
     }
 
-    #[test]
-    fn forward_request_is_admitted_once_and_needs_an_expiry() {
+    #[tokio::test]
+    async fn a_forgotten_envelope_is_admitted_again() {
         let now = now_secs();
         let message = envelope(MessageType::ForwardRequest, Some(now), Some(now + 60));
-        assert_eq!(admit_forward_request(&message), Ok(()));
-        assert!(matches!(admit_forward_request(&message), Err(EnvelopeRejection::Duplicate { .. })));
+        assert!(!is_remembered(&message));
+        assert_eq!(admit_forward_request(&message).await, Ok(()));
+        assert!(is_remembered(&message));
+
+        forget_unanswered(&message);
+
+        assert!(!is_remembered(&message));
+        assert_eq!(admit_forward_request(&message).await, Ok(()));
+        assert!(matches!(admit_forward_request(&message).await, Err(EnvelopeRejection::Duplicate { .. })));
+    }
+
+    #[tokio::test]
+    async fn forward_request_is_admitted_once_and_needs_an_expiry() {
+        let now = now_secs();
+        let message = envelope(MessageType::ForwardRequest, Some(now), Some(now + 60));
+        assert_eq!(admit_forward_request(&message).await, Ok(()));
+        assert!(matches!(admit_forward_request(&message).await, Err(EnvelopeRejection::Duplicate { .. })));
 
         let without_expiry = envelope(MessageType::ForwardRequest, None, None);
-        assert_eq!(admit_forward_request(&without_expiry), Err(EnvelopeRejection::MissingExpiry));
+        assert_eq!(admit_forward_request(&without_expiry).await, Err(EnvelopeRejection::MissingExpiry));
     }
 
-    #[test]
-    fn envelopes_without_an_authenticated_sender_are_refused() {
+    #[tokio::test]
+    async fn envelopes_without_an_authenticated_sender_are_refused() {
         let now = now_secs();
         let anonymous = envelope_from(None, MessageType::ForwardRequest, None, Some(now + 60));
-        assert_eq!(admit_forward_request(&anonymous), Err(EnvelopeRejection::MissingSender));
+        assert_eq!(admit_forward_request(&anonymous).await, Err(EnvelopeRejection::MissingSender));
         let blank = envelope_from(Some(String::new()), MessageType::ConnectionSetup, None, None);
-        assert_eq!(admit_pairing_message(&blank), Err(EnvelopeRejection::MissingSender));
+        assert_eq!(admit_pairing_message(&blank).await, Err(EnvelopeRejection::MissingSender));
     }
 
-    #[test]
-    fn pairing_message_without_expiry_is_admitted_once() {
+    #[tokio::test]
+    async fn pairing_message_without_expiry_is_admitted_once() {
         let message = envelope(MessageType::ConnectionSetup, None, None);
-        assert_eq!(admit_pairing_message(&message), Ok(()));
-        assert!(matches!(admit_pairing_message(&message), Err(EnvelopeRejection::Duplicate { .. })));
+        assert_eq!(admit_pairing_message(&message).await, Ok(()));
+        assert!(matches!(admit_pairing_message(&message).await, Err(EnvelopeRejection::Duplicate { .. })));
 
         let now = now_secs();
         let expired = envelope(MessageType::ConnectionAccepted, None, Some(now - 1));
-        assert!(matches!(admit_pairing_message(&expired), Err(EnvelopeRejection::Expired { .. })));
+        assert!(matches!(admit_pairing_message(&expired).await, Err(EnvelopeRejection::Expired { .. })));
+    }
+
+    async fn disk_store(dir: &std::path::Path) -> SingleUseStore {
+        SingleUseStore::open(&crate::storage::single_use::SingleUseStoreConfig::Disk {}, dir, None, NOW)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_admitted_envelope_is_refused_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let sender = unique("did:web:sender");
+        let id = unique("msg");
+        let store = disk_store(dir.path()).await;
+        assert_eq!(remember_in(&SeenSet::new(), &store, &sender, &id, NOW + 60, NOW).await, Ok(()));
+        drop(store);
+
+        let restarted = disk_store(dir.path()).await;
+        let seen = SeenSet::new();
+        assert_eq!(
+            remember_in(&seen, &restarted, &sender, &id, NOW + 60, NOW + 1).await,
+            Err(EnvelopeRejection::Duplicate {
+                sender: sender.clone(),
+                message_id: id.clone()
+            })
+        );
+        assert!(seen.is_remembered(&sender, &id, NOW + 1), "the duplicate stays refused in memory");
+        assert_eq!(
+            remember_in(&SeenSet::new(), &restarted, &sender, &unique("msg"), NOW + 60, NOW + 1).await,
+            Ok(()),
+            "another envelope is still admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_envelope_is_admitted_again_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let sender = unique("did:web:sender");
+        let id = unique("msg");
+        let store = std::sync::Arc::new(disk_store(dir.path()).await);
+        assert_eq!(remember_in(&SeenSet::new(), &store, &sender, &id, NOW + 60, NOW).await, Ok(()));
+        store.forget_in_background(Namespace::FabricEnvelope, &digest(&sender, &id));
+        assert!(
+            !store
+                .is_recorded(Namespace::FabricEnvelope, &digest(&sender, &id), NOW)
+                .await
+                .unwrap()
+        );
+        drop(store);
+
+        let restarted = disk_store(dir.path()).await;
+        assert_eq!(remember_in(&SeenSet::new(), &restarted, &sender, &id, NOW + 60, NOW + 1).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn an_envelope_the_store_cannot_record_is_refused() {
+        let seen = SeenSet::new();
+        let sender = unique("did:web:sender");
+        let id = unique("msg");
+        assert_eq!(
+            remember_in(&seen, &SingleUseStore::failing(), &sender, &id, NOW + 60, NOW).await,
+            Err(EnvelopeRejection::Unrecorded)
+        );
+        assert!(!seen.is_remembered(&sender, &id, NOW), "a refused envelope is not held as processed");
+        assert_eq!(remember_in(&seen, &SingleUseStore::in_memory(), &sender, &id, NOW + 60, NOW).await, Ok(()));
     }
 }

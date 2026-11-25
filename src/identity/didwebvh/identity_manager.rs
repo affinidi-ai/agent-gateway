@@ -28,6 +28,13 @@ pub struct DidWebVhIdentity {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_pair: Option<KeyPair>,
 
+    /// The key a rotation in progress moves to, saved before its log entry is
+    /// written so the new private key is never only in memory. It becomes
+    /// `key_pair` once the log names it as update key, and is dropped if the
+    /// log never does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_key_pair: Option<KeyPair>,
+
     /// Current version number
     pub version: u64,
 
@@ -628,6 +635,7 @@ mod tests {
 
         let id = Uuid::new_v4();
         let identity = DidWebVhIdentity {
+            pending_key_pair: None,
             id,
             did: "did:webvh:example.com:alice".to_string(),
             key_pair: None,
@@ -661,6 +669,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let id = Uuid::new_v4();
         let identity = DidWebVhIdentity {
+            pending_key_pair: None,
             id,
             did: "did:webvh:example.com:secret".to_string(),
             key_pair: Some(super::super::types::KeyPair {
@@ -730,6 +739,7 @@ mod tests {
             .unwrap();
 
         let identity = DidWebVhIdentity {
+            pending_key_pair: None,
             id: Uuid::new_v4(),
             did: "did:webvh:example.com:bob".to_string(),
             key_pair: None,
@@ -761,6 +771,7 @@ mod tests {
             .unwrap();
 
         let identity = DidWebVhIdentity {
+            pending_key_pair: None,
             id: Uuid::new_v4(),
             did: "did:webvh:example.com:agents:123".to_string(),
             key_pair: None,
@@ -786,6 +797,7 @@ mod tests {
 
         // Test simple path
         let identity2 = DidWebVhIdentity {
+            pending_key_pair: None,
             id: Uuid::new_v4(),
             did: "did:webvh:example.com:alice".to_string(),
             key_pair: None,
@@ -811,6 +823,7 @@ mod tests {
         // Test SCID-based format: did:webvh:<scid>:<domain>:<path>
         // The SCID (valid multihash) should be skipped so path = "agents/456"
         let identity3 = DidWebVhIdentity {
+            pending_key_pair: None,
             id: Uuid::new_v4(),
             did: "did:webvh:QmYwAPJzv5CZsnAzt8auVZRnGzr1sM4KroPvLoM6P6sQKz:localhost%3A8080:agents:456".to_string(),
             key_pair: None,
@@ -841,6 +854,7 @@ mod tests {
 
         for i in 0..3 {
             let identity = DidWebVhIdentity {
+                pending_key_pair: None,
                 id: Uuid::new_v4(),
                 did: format!("did:webvh:example.com:user{}", i),
                 key_pair: None,
@@ -869,6 +883,7 @@ mod tests {
 
         let id = Uuid::new_v4();
         let mut identity = DidWebVhIdentity {
+            pending_key_pair: None,
             id,
             did: "did:webvh:example.com:charlie".to_string(),
             key_pair: None,
@@ -908,6 +923,7 @@ mod tests {
 
         let id = Uuid::new_v4();
         let identity = DidWebVhIdentity {
+            pending_key_pair: None,
             id,
             did: "did:webvh:example.com:dave".to_string(),
             key_pair: None,
@@ -941,6 +957,7 @@ mod tests {
                 .await
                 .unwrap();
             let identity = DidWebVhIdentity {
+                pending_key_pair: None,
                 id,
                 did: "did:webvh:example.com:eve".to_string(),
                 key_pair: None,
