@@ -7610,7 +7610,7 @@ async fn proxy_charged_request(
         connection_guard
             .decrement()
             .await;
-        return Err(circuit_open_response(retry_after));
+        return Err(circuit_open_response(&state.surface, &body_bytes, retry_after));
     }
     match inbound_payment
         .charge(
@@ -7860,7 +7860,12 @@ async fn proxy_charged_request(
                         gate_receipt
                             .iter()
                             .for_each(|receipt| receipt.revoke());
-                        create_error_response(StatusCode::SERVICE_UNAVAILABLE, "MCP proxy circuit breaker is open")
+                        target_unreachable_response(
+                            &state.surface,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &body_bytes,
+                            "MCP proxy circuit breaker is open",
+                        )
                     }
                     crate::policies::CircuitBreakerError::Inner(response) => response,
                 })?
@@ -8051,7 +8056,7 @@ async fn proxy_charged_request(
                     gate_receipt
                         .iter()
                         .for_each(|receipt| receipt.revoke());
-                    return Err(circuit_open_response(retry_after));
+                    return Err(circuit_open_response(&state.surface, &body_bytes, retry_after));
                 }
                 Err(crate::policies::CircuitBreakerError::Inner(e)) => {
                     if sent_nothing(&e) {
@@ -16395,10 +16400,17 @@ async fn load_owned_proxy(
         .ok_or_else(crate::protocols::no_mcp_proxy_response)
 }
 
-/// What a request gets when the Target's circuit breaker is open.
-fn circuit_open_response(retry_after: std::time::Duration) -> Response {
-    create_error_response(
+/// What a request gets when the Target's circuit breaker is open: on an MCP surface the
+/// JSON-RPC `target_unreachable` error, otherwise the problem JSON.
+fn circuit_open_response(
+    surface: &crate::config::agent_surface::AgentSurface,
+    request_body: &[u8],
+    retry_after: std::time::Duration,
+) -> Response {
+    target_unreachable_response(
+        surface,
         StatusCode::SERVICE_UNAVAILABLE,
+        request_body,
         &format!("Service temporarily unavailable. Retry after {:?}", retry_after),
     )
 }
@@ -24384,6 +24396,43 @@ allow if {
             })
         );
         assert!(!String::from_utf8_lossy(&body).contains("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn an_open_circuit_answers_an_mcp_request_with_a_json_rpc_error_and_others_with_the_problem_document() {
+        let surface = mcp_surface("mcp-open", "http://127.0.0.1:9/agent", None);
+        let request = br#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#;
+        let retry_after = std::time::Duration::from_secs(30);
+
+        let response = super::circuit_open_response(&surface, request, retry_after);
+        assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body_of(response).await).unwrap(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "error": {"code": -32603, "message": "Target unavailable", "data": {"reason": "target_unreachable"}},
+            })
+        );
+
+        let notification = super::circuit_open_response(
+            &surface,
+            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            retry_after,
+        );
+        assert_eq!(notification.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body_of(notification)
+                .await
+                .is_empty()
+        );
+
+        let mut a2a = surface;
+        a2a.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::A2a;
+        let problem =
+            String::from_utf8(body_of(super::circuit_open_response(&a2a, request, retry_after)).await).unwrap();
+        assert!(problem.contains("Service temporarily unavailable"), "{problem}");
+        assert!(!problem.contains("jsonrpc"), "{problem}");
     }
 
     #[tokio::test]

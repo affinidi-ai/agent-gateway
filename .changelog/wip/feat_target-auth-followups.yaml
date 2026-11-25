@@ -56,8 +56,8 @@ changes:
         A2A problem document an MCP client could not parse. A Target authentication failure is
         answered this way on the direct path, through an MCP Proxy Target and over Fabric,
         including a refusal the peer gateway relays. target_unreachable also answers a Target that
-        does not answer in time (504), including a 2026-07-28 request and an owned MCP Proxy, and
-        a peer gateway this gateway cannot reach or that does not answer, under the status each
+        does not answer in time (504), including a 2026-07-28 request and an owned MCP Proxy, a
+        request held back while the Target's circuit breaker is open (503), and a peer gateway this gateway cannot reach or that does not answer, under the status each
         had (502, 503 or 504), on the legacy and the modern Fabric path. A legacy MCP Proxy tool
         call that fails keeps its earlier JSON-RPC error. The message names no Target URL or
         secret, and a notification gets the status and no body. A2A surfaces are unchanged.
