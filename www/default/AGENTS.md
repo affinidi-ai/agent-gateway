@@ -739,9 +739,14 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
     (`mergeTargetAuth`), so a field the editor does not show survives. That holds while the edit
     keeps the stored credential: another method kind, secret or provider replaces the stored
     setting, so nothing unseen follows a credential it was not set for. A Transit Point whose
-    auth form was never opened sends the stored `target_auth` unchanged, and so does a Managed
+    auth form was never edited sends the stored `target_auth` unchanged, and so does a Managed
     Agent or Transit Point whose stored method the editor cannot show, until the operator
     chooses a secret or a provider.
+  - **Opening a Transit Point writes nothing.** The Transit Point panel shows a stored static
+    secret or credential provider from the stored `target_auth` while it renders
+    (`storedTransitPointAuthForm`), and writes those form fields only with the operator's first
+    edit of the section. A mount-time write would be lost to a later write made from the config
+    as loaded, such as the listener's first seed, and the panel would show **None**.
   - **Never in the canvas data.** The Target authentication form fields, the stored copy and a
     Transit Point's `target_auth` are left out of the canvas blob on save and ignored when one
     is read (`withoutTargetAuth` in `elements/registry.ts`; the key lists are

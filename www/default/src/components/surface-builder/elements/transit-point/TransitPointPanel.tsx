@@ -14,12 +14,8 @@ import FabricDelegatedCredentialsSection, {
 import { AgentCardLocationHelp } from '../_shared/AgentCardLocationHelp';
 import TargetAuthProviderSelect from '../_shared/TargetAuthProviderSelect';
 import TargetAuthProblemNotice, { targetAuthErrorsId } from '../_shared/TargetAuthProblemNotice';
-import { staticSecretAuthType, transitPointTargetAuthProblems } from './targetAuth';
-import {
-  PROVIDER_TARGET_AUTH_DEFAULTS,
-  providerTargetAuthFromApi,
-  storedHeaderValue,
-} from '../_shared/providerTargetAuth';
+import { storedTransitPointAuthForm, transitPointTargetAuthProblems } from './targetAuth';
+import { PROVIDER_TARGET_AUTH_DEFAULTS } from '../_shared/providerTargetAuth';
 import TransitCallerSection from './TransitCallerSection';
 import TargetAuthSecretField from './TargetAuthSecretField';
 import { newTransitPointId, deriveTransitPointAlias } from './factory';
@@ -78,52 +74,12 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // One-shot hydration of the panel's auth_* form fields from the
-  // backend `target_auth` shape (externally-tagged TargetAuthConfig).
-  // The canvas blob keeps the form fields intact across reloads, but
-  // when a surface is opened that was authored elsewhere (or by an
-  // older blob version) only `target_auth` is present — derive the
-  // friendly auth_type / auth_secret / etc. so the user sees their
-  // configuration instead of an empty section.
-  const authHydratedRef = React.useRef(false);
-  useEffect(() => {
-    if (authHydratedRef.current) return;
-    if (config.auth_type) {
-      authHydratedRef.current = true;
-      return;
-    }
-    const ta = config.target_auth;
-    if (!ta || typeof ta !== 'object') return;
-    const provider = providerTargetAuthFromApi(ta);
-    if (provider) {
-      authHydratedRef.current = true;
-      updateFields({
-        auth_type: 'credential_provider',
-        auth_provider_id: provider.providerId,
-        auth_header_name: provider.headerName,
-        auth_header_format: provider.headerFormat,
-        auth_fallback: provider.fallback,
-        auth_scopes: (provider.scopes ?? []).join(' '),
-      });
-      return;
-    }
-    const ss =
-      (ta.method && typeof ta.method === 'object' && (ta.method as any).static_secret) ||
-      (ta.method === 'static_secret' ? ta : null);
-    if (!ss) return;
-    const headerName = storedHeaderValue(ss.header_name, 'Authorization');
-    const headerFormat = storedHeaderValue(ss.header_format, '{value}');
-    const authType = staticSecretAuthType(headerName, headerFormat);
-    authHydratedRef.current = true;
-    updateFields({
-      auth_type: authType,
-      auth_secret: ss.secret_id || '',
-      auth_header_name: headerName,
-      auth_header_format: headerFormat,
-      auth_fallback: ta.fallback || 'reject',
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // The stored Target authentication is shown, not written, on opening: a later write made from
+  // the config as loaded, such as the listener's first seed, would replace it.
+  const storedAuthForm = config.auth_type ? null : storedTransitPointAuthForm(config.target_auth);
+  const auth = { ...config, ...storedAuthForm };
+  const updateAuth = (field: string, value: unknown) =>
+    updateFields({ ...storedAuthForm, [field]: value });
 
   const alias: string = useMemo(
     () => deriveTransitPointAlias(config.name, config.id),
@@ -398,8 +354,8 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
         <Form.Select
           size="sm"
           data-testid="transit-point-target-auth-type"
-          value={config.auth_type || 'none'}
-          onChange={e => updateField('auth_type', e.target.value)}
+          value={auth.auth_type || 'none'}
+          onChange={e => updateAuth('auth_type', e.target.value)}
         >
           <option value="none">None</option>
           <option value="bearer">Bearer Token</option>
@@ -407,7 +363,7 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
           <option value="custom_header">Custom Header</option>
           <option value="credential_provider">Credential Provider</option>
         </Form.Select>
-        {config.auth_type === 'credential_provider' && (
+        {auth.auth_type === 'credential_provider' && (
           <>
             <Form.Group className="mt-2">
               <Form.Label className="small text-muted mb-1" htmlFor="transit-point-auth-provider">
@@ -416,8 +372,8 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
               <TargetAuthProviderSelect
                 id="transit-point-auth-provider"
                 testId="transit-point-target-auth-provider"
-                value={config.auth_provider_id || ''}
-                onChange={providerId => updateField('auth_provider_id', providerId)}
+                value={auth.auth_provider_id || ''}
+                onChange={providerId => updateAuth('auth_provider_id', providerId)}
                 small
               />
             </Form.Group>
@@ -428,8 +384,8 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
                 type="text"
                 data-testid="transit-point-target-auth-provider-header-name"
                 placeholder={PROVIDER_TARGET_AUTH_DEFAULTS.headerName}
-                value={config.auth_header_name || ''}
-                onChange={e => updateField('auth_header_name', e.target.value)}
+                value={auth.auth_header_name || ''}
+                onChange={e => updateAuth('auth_header_name', e.target.value)}
                 {...targetAuthFieldAria('auth_header_name')}
               />
             </Form.Group>
@@ -440,8 +396,8 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
                 type="text"
                 data-testid="transit-point-target-auth-provider-header-format"
                 placeholder={PROVIDER_TARGET_AUTH_DEFAULTS.headerFormat}
-                value={config.auth_header_format || ''}
-                onChange={e => updateField('auth_header_format', e.target.value)}
+                value={auth.auth_header_format || ''}
+                onChange={e => updateAuth('auth_header_format', e.target.value)}
                 {...targetAuthFieldAria('auth_header_format')}
               />
               <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
@@ -458,43 +414,43 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
                 type="text"
                 data-testid="transit-point-target-auth-provider-scopes"
                 placeholder="Space-separated; the provider's default scopes when empty"
-                value={config.auth_scopes || ''}
-                onChange={e => updateField('auth_scopes', e.target.value)}
+                value={auth.auth_scopes || ''}
+                onChange={e => updateAuth('auth_scopes', e.target.value)}
               />
             </Form.Group>
           </>
         )}
-        {config.auth_type &&
-          config.auth_type !== 'none' &&
-          config.auth_type !== 'credential_provider' && (
+        {auth.auth_type &&
+          auth.auth_type !== 'none' &&
+          auth.auth_type !== 'credential_provider' && (
             <TargetAuthSecretField
-              value={config.auth_secret || ''}
-              onChange={secretId => updateField('auth_secret', secretId)}
+              value={auth.auth_secret || ''}
+              onChange={secretId => updateAuth('auth_secret', secretId)}
               error={errorByField?.auth_secret}
             />
           )}
-        {(config.auth_type === 'api_key' || config.auth_type === 'custom_header') && (
+        {(auth.auth_type === 'api_key' || auth.auth_type === 'custom_header') && (
           <Form.Group className="mt-2">
             <Form.Label className="small text-muted mb-1">Header Name</Form.Label>
             <Form.Control
               size="sm"
               type="text"
-              placeholder={config.auth_type === 'api_key' ? 'X-API-Key' : 'X-Auth'}
-              value={config.auth_header_name || ''}
-              onChange={e => updateField('auth_header_name', e.target.value)}
+              placeholder={auth.auth_type === 'api_key' ? 'X-API-Key' : 'X-Auth'}
+              value={auth.auth_header_name || ''}
+              onChange={e => updateAuth('auth_header_name', e.target.value)}
               {...targetAuthFieldAria('auth_header_name')}
             />
           </Form.Group>
         )}
-        {config.auth_type === 'custom_header' && (
+        {auth.auth_type === 'custom_header' && (
           <Form.Group className="mt-2">
             <Form.Label className="small text-muted mb-1">Header Format</Form.Label>
             <Form.Control
               size="sm"
               type="text"
               placeholder="{value}"
-              value={config.auth_header_format || ''}
-              onChange={e => updateField('auth_header_format', e.target.value)}
+              value={auth.auth_header_format || ''}
+              onChange={e => updateAuth('auth_header_format', e.target.value)}
               {...targetAuthFieldAria('auth_header_format')}
             />
             <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
@@ -502,15 +458,15 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
             </Form.Text>
           </Form.Group>
         )}
-        {config.auth_type && config.auth_type !== 'none' && (
+        {auth.auth_type && auth.auth_type !== 'none' && (
           <Form.Group className="mt-2">
             <Form.Label className="small text-muted mb-1">
               Fallback when the credential is missing
             </Form.Label>
             <Form.Select
               size="sm"
-              value={config.auth_fallback || 'reject'}
-              onChange={e => updateField('auth_fallback', e.target.value)}
+              value={auth.auth_fallback || 'reject'}
+              onChange={e => updateAuth('auth_fallback', e.target.value)}
             >
               <option value="reject">Reject request</option>
               <option value="passthrough">Passthrough (no credential injected)</option>

@@ -10,7 +10,10 @@ import {
   mergedTargetAuth,
   noTargetAuthProblems,
   parseScopes,
+  providerTargetAuthFromApi,
   providerTargetAuthToApi,
+  record,
+  storedHeaderValue,
   trimSpaces,
 } from '../_shared/providerTargetAuth';
 import { authenticatesCallers } from './callerAuth';
@@ -118,7 +121,39 @@ export function staticSecretAuthType(
 }
 
 /**
- * The Transit Point's wire `target_auth`. A Transit Point whose auth form was never opened
+ * The auth form fields the panel shows for a stored `target_auth`, or null for a method it
+ * cannot show. The panel writes them only with the operator's first edit.
+ */
+export function storedTransitPointAuthForm(targetAuth: unknown): Record<string, unknown> | null {
+  const ta = record(targetAuth);
+  if (!ta) return null;
+  const provider = providerTargetAuthFromApi(ta);
+  if (provider) {
+    return {
+      auth_type: 'credential_provider',
+      auth_provider_id: provider.providerId,
+      auth_header_name: provider.headerName,
+      auth_header_format: provider.headerFormat,
+      auth_fallback: provider.fallback,
+      auth_scopes: (provider.scopes ?? []).join(' '),
+    };
+  }
+  const ss =
+    record(record(ta.method)?.static_secret) ?? (ta.method === 'static_secret' ? ta : null);
+  if (!ss) return null;
+  const headerName = storedHeaderValue(ss.header_name, 'Authorization');
+  const headerFormat = storedHeaderValue(ss.header_format, '{value}');
+  return {
+    auth_type: staticSecretAuthType(headerName, headerFormat),
+    auth_secret: ss.secret_id || '',
+    auth_header_name: headerName,
+    auth_header_format: headerFormat,
+    auth_fallback: ta.fallback || 'reject',
+  };
+}
+
+/**
+ * The Transit Point's wire `target_auth`. A Transit Point whose auth form was never edited
  * sends the stored one unchanged, whatever its method; an edited one is laid over the stored
  * one, so a field the panel does not show survives. `undefined` when none is set.
  */
