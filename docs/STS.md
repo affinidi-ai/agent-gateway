@@ -75,10 +75,7 @@ VP (`urn:affinidi:params:oauth:token-type:vp`).
   signer's DID document lists under the proof's purpose (`assertionMethod` for a
   credential, `assertionMethod` or `authentication` for the presentation); a VP
   that breaks this is refused like one with a bad signature (see
-  [Peer issuer DIDs](FABRIC.md#peer-issuer-dids)). A credential that carries a
-  `credentialStatus` is refused: the gateway does not resolve status lists, so it
-  cannot tell a revoked credential from a valid one. This applies wherever the
-  gateway verifies an agent presentation (STS, Fabric, MCP and A2A identity).
+  [Peer issuer DIDs](FABRIC.md#peer-issuer-dids)).
 - **Issued tokens** are EdDSA-signed via `VCIssuer::sign_jwt_with_gateway_key`, which signs through the VTA signing library (see [Local signing](TRUST_AGENT_SIGNING.md#local-signing)),
   verifiable by resolving the gateway DID document or the JWKS endpoint. An
   issued **ID-JAG additionally carries the explicit JOSE `typ:

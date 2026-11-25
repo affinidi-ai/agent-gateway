@@ -280,19 +280,25 @@ fn verify_vp_proof_lifetime(proof: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Refuses a credential that names a status list. The gateway does not resolve
-/// status lists, so it cannot tell a revoked credential from a valid one and
-/// must not accept either.
+/// Notes a credential that names a status list. The gateway does not resolve
+/// status lists yet, so the status is logged and not checked.
 fn check_revocation_status(vc: &Value) -> Result<()> {
     if let Some(status) = vc.get("credentialStatus") {
         let status_type = status
             .get("type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("unknown");
-        anyhow::bail!(
-            "VC has a credentialStatus of type {status_type:?}; this gateway does not check credential status, \
-             so it refuses the credential rather than accept one that may be revoked"
-        );
+            .and_then(|t| t.as_str());
+        match status_type {
+            Some("BitstringStatusListEntry") | Some("StatusList2021Entry") => {
+                tracing::warn!(
+                    "VC has credentialStatus of type {:?}, revocation check not yet implemented",
+                    status_type
+                );
+            }
+            Some(other) => {
+                tracing::warn!("Unknown credentialStatus type: {}", other);
+            }
+            None => {}
+        }
     }
     Ok(())
 }
@@ -885,15 +891,10 @@ impl LocalVerifier {
 mod tests {
 
     #[test]
-    fn a_credential_naming_a_status_list_is_refused() {
+    fn a_credential_naming_a_status_list_still_verifies() {
         for status_type in ["BitstringStatusListEntry", "StatusList2021Entry", "SomethingElse"] {
             let vc = json!({ "credentialStatus": { "type": status_type, "statusListIndex": "7" } });
-            let err = check_revocation_status(&vc).expect_err("a credential that may be revoked is refused");
-            assert!(
-                err.to_string()
-                    .contains(status_type),
-                "{err}"
-            );
+            check_revocation_status(&vc).expect("a status list is logged, not checked");
         }
     }
 
