@@ -1290,6 +1290,7 @@ async fn outbound_proxy_handler_in_request_scope(
 
     // [11] Credential Injection (§5.3 / §6.2 step 12)
     // Inject delegated OAuth tokens from the credential vault, or signal consent_required.
+    step_refuse_delegated_credential_outside_target_base(&ctx)?;
     if let Some(response) = step_prepare_modern_credentials(&state, &mut ctx, subscription_lifetime.as_mut()).await? {
         return Ok(response);
     }
@@ -5483,16 +5484,79 @@ pub(crate) fn delegation_agent_did(ctx: &OutboundPipelineContext) -> Option<&str
     })
 }
 
+/// Whether a delegated credential was put into a Transit Point request, legacy or `2026-07-28`.
+fn carries_delegated_transit_credential(ctx: &OutboundPipelineContext) -> bool {
+    ctx.carries_delegated_credential
+        || ctx
+            .modern_delegation
+            .as_ref()
+            .is_some_and(|prepared| prepared.attaches_credentials())
+}
+
 /// Whether a Transit Point request carries a Target credential or a delegated credential.
 fn carries_transit_credential(ctx: &OutboundPipelineContext) -> bool {
     ctx.virtual_channel
         .target_auth
         .is_some()
-        || ctx.carries_delegated_credential
-        || ctx
-            .modern_delegation
-            .as_ref()
-            .is_some_and(|prepared| prepared.attaches_credentials())
+        || carries_delegated_transit_credential(ctx)
+}
+
+/// Whether a delegated credential binding applies to a Transit Point request, so that
+/// [`step_inject_credentials`] or [`step_prepare_modern_credentials`] would put one into it: a
+/// binding for every request (tool-scoped bindings never apply on a Transit Point), on a
+/// request that is not a discovery read, to a destination that does not withhold them.
+fn delegated_transit_binding_applies(ctx: &OutboundPipelineContext) -> bool {
+    transit_caller_assertion(ctx).permits_target_credential()
+        && !ctx
+            .virtual_channel
+            .withholds_delegated_credentials()
+        && ctx
+            .surface
+            .transit_point_outbound_credentials(&ctx.virtual_channel)
+            .iter()
+            .any(|binding| matches!(binding.required_for, crate::config::types::CredentialRequirement::All))
+}
+
+/// Whether a Transit Point request would leave its destination's base path: the path a
+/// `fabric://` destination appends, or the URL an `http(s)` one is sent, which may be the
+/// configured agent card location only when `card_location_allowed`. A `proxy://` destination
+/// builds its own URL and is checked there.
+fn transit_request_leaves_target_base(
+    ctx: &OutboundPipelineContext,
+    card_location_allowed: bool,
+) -> bool {
+    let endpoint = &ctx
+        .virtual_channel
+        .target_endpoint;
+    if endpoint.starts_with("fabric://") {
+        return !crate::proxy::paths::appended_path_stays_below_base(&transit_fabric_path(ctx));
+    }
+    if crate::mcp_proxies::types::endpoint_proxy_id(endpoint).is_some() {
+        return false;
+    }
+    !crate::proxy::paths::is_target_credential_destination(
+        endpoint,
+        ctx.original_method.as_str(),
+        &transit_http_target_url(ctx),
+        ctx.virtual_channel
+            .agent_card_path
+            .as_deref()
+            .filter(|_| card_location_allowed),
+    )
+}
+
+/// Refuses a Transit Point request that leaves its destination's base path while a delegated
+/// credential binding applies to it, before any grant is read, token requested or consent
+/// started. A delegated credential never goes to the agent card location outside the base
+/// path: a discovery read carries none.
+fn step_refuse_delegated_credential_outside_target_base(
+    ctx: &OutboundPipelineContext
+) -> Result<(), OutboundPipelineError> {
+    if delegated_transit_binding_applies(ctx) && transit_request_leaves_target_base(ctx, false) {
+        warn!(request_id = %ctx.request_id, "Refusing a Transit Point request outside its base path: it would carry a delegated credential");
+        return Err(refuse_path_outside_target_base(ctx));
+    }
+    Ok(())
 }
 
 /// Records and refuses with `400 target_path_refused` a Transit Point request whose path
@@ -6978,6 +7042,37 @@ async fn fabric_forward_headers(
     Ok((headers_map, stream_headers))
 }
 
+/// The path a `fabric://` Transit Point destination's gateway appends to its channel target
+/// endpoint, identical to what a direct HTTP target would receive.
+fn transit_fabric_path(ctx: &OutboundPipelineContext) -> String {
+    let remainder = compute_outbound_remainder_path(
+        &ctx.request_path,
+        &ctx.surface.access_point.route,
+        &ctx.virtual_channel.alias,
+        ctx.virtual_channel
+            .listen_path
+            .as_deref(),
+    );
+    format!("/{remainder}")
+}
+
+/// The URL an `http(s)` Transit Point destination is sent the request on.
+fn transit_http_target_url(ctx: &OutboundPipelineContext) -> String {
+    build_outbound_target_url(
+        &ctx.virtual_channel
+            .target_endpoint,
+        &ctx.request_path,
+        &ctx.surface.access_point.route,
+        &ctx.virtual_channel.alias,
+        ctx.virtual_channel
+            .listen_path
+            .as_deref(),
+        ctx.virtual_channel
+            .agent_card_path
+            .as_deref(),
+    )
+}
+
 /// Forward the prepared request to a remote gateway channel over `fabric://`.
 async fn step_forward_request_fabric(
     state: &OutboundProxyState,
@@ -6990,22 +7085,8 @@ async fn step_forward_request_fabric(
         .target_endpoint
         .clone();
 
-    // Path suffix the remote gateway appends to its channel target endpoint —
-    // identical to what a direct HTTP target would receive.
-    let remainder = compute_outbound_remainder_path(
-        &ctx.request_path,
-        &ctx.surface.access_point.route,
-        &ctx.virtual_channel.alias,
-        ctx.virtual_channel
-            .listen_path
-            .as_deref(),
-    );
-    let path = if remainder.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", remainder)
-    };
-    if carries_transit_credential(ctx) && !crate::proxy::paths::appended_path_stays_below_base(&path) {
+    let path = transit_fabric_path(ctx);
+    if carries_transit_credential(ctx) && transit_request_leaves_target_base(ctx, false) {
         warn!(request_id = %ctx.request_id, "Refusing a Transit Point request that climbs out of its path: it would carry a Target or delegated credential");
         return Err(refuse_path_outside_target_base(ctx));
     }
@@ -7158,30 +7239,10 @@ async fn step_forward_request_http(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<reqwest::Response, OutboundPipelineError> {
-    let target_url = build_outbound_target_url(
-        &ctx.virtual_channel
-            .target_endpoint,
-        &ctx.request_path,
-        &ctx.surface.access_point.route,
-        &ctx.virtual_channel.alias,
-        ctx.virtual_channel
-            .listen_path
-            .as_deref(),
-        ctx.virtual_channel
-            .agent_card_path
-            .as_deref(),
-    );
+    let target_url = transit_http_target_url(ctx);
 
     if carries_transit_credential(ctx)
-        && !crate::proxy::paths::is_target_credential_destination(
-            &ctx.virtual_channel
-                .target_endpoint,
-            ctx.original_method.as_str(),
-            &target_url,
-            ctx.virtual_channel
-                .agent_card_path
-                .as_deref(),
-        )
+        && transit_request_leaves_target_base(ctx, !carries_delegated_transit_credential(ctx))
     {
         warn!(request_id = %ctx.request_id, "Refusing a Transit Point request outside its base path: it would carry a Target or delegated credential");
         return Err(refuse_path_outside_target_base(ctx));
@@ -24623,6 +24684,150 @@ mod tests {
                     assert_eq!(records, Vec::new(), "{endpoint}");
                 }
             }
+        }
+    }
+
+    /// A Transit Point context whose surface has one delegated credential binding,
+    /// `required_for`, for a `method` request to `remainder` below the Transit Point.
+    fn delegated_binding_case(
+        endpoint: &str,
+        required_for: serde_json::Value,
+        method: Method,
+        remainder: &str,
+    ) -> OutboundPipelineContext {
+        let mut ctx = test_pipeline_context();
+        Arc::make_mut(&mut ctx.surface).outbound_credentials = vec![
+            serde_json::from_value(json!({"credential_provider_id": "provider", "required_for": required_for}))
+                .unwrap(),
+        ];
+        ctx.virtual_channel
+            .target_endpoint = endpoint.to_string();
+        ctx.virtual_channel
+            .fabric_delegated_credentials = true;
+        ctx.original_method = method;
+        ctx.request_path = format!("/outbound/surfaces/order/partner-a/{remainder}");
+        ctx
+    }
+
+    fn path_refusal_records(events: &[crate::delegation_vault::audit::DelegationAuditEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event,
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        reason: crate::audit::request_events::RejectionReason::TargetPathRefused,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_transit_point_request_outside_its_base_path_is_refused_before_any_delegated_credential_is_resolved() {
+        for endpoint in ["http://127.0.0.1:9/base", "fabric://peer-gateway/partner"] {
+            let ctx = delegated_binding_case(endpoint, json!("all"), Method::POST, "%2e%2e/admin");
+            assert!(
+                ctx.modern_delegation
+                    .is_none()
+                    && !ctx.carries_delegated_credential
+            );
+            let (result, events) =
+                crate::audit::producer::capture(async { step_refuse_delegated_credential_outside_target_base(&ctx) })
+                    .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(OutboundPipelineError::TargetAuthFailed {
+                        failure: crate::proxy::handler::TargetAuthFailure::PathRefused,
+                        ..
+                    })
+                ),
+                "{endpoint}: {result:?}"
+            );
+            assert_eq!(path_refusal_records(&events), 1, "{endpoint}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transit_point_request_no_delegated_credential_would_follow_is_not_refused_for_its_path_early() {
+        let cases = [
+            ("http://127.0.0.1:9/base", json!("all"), Method::POST, "rpc"),
+            ("fabric://peer-gateway/partner", json!("all"), Method::POST, "rpc"),
+            ("http://127.0.0.1:9/base", json!({"tools": ["read"]}), Method::POST, "%2e%2e/admin"),
+            ("http://127.0.0.1:9/base", json!("all"), Method::GET, ".well-known/agent-card.json"),
+        ];
+        for (endpoint, required_for, method, remainder) in cases {
+            let mut ctx = delegated_binding_case(endpoint, required_for.clone(), method.clone(), remainder);
+            ctx.virtual_channel
+                .agent_card_path = Some("/card".to_string());
+            let (result, events) =
+                crate::audit::producer::capture(async { step_refuse_delegated_credential_outside_target_base(&ctx) })
+                    .await;
+            assert!(result.is_ok(), "{endpoint} {required_for} {method} {remainder}: {result:?}");
+            assert_eq!(path_refusal_records(&events), 0, "{endpoint} {remainder}");
+        }
+        let mut withheld =
+            delegated_binding_case("fabric://peer-gateway/partner", json!("all"), Method::POST, "%2e%2e/admin");
+        withheld
+            .virtual_channel
+            .fabric_delegated_credentials = false;
+        assert!(step_refuse_delegated_credential_outside_target_base(&withheld).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_sends_no_delegated_credential_to_its_agent_card_location_but_for_a_discovery_read() {
+        let mut early = delegated_binding_case(
+            "http://127.0.0.1:9/base",
+            json!("all"),
+            Method::GET,
+            "x/.well-known/agent-card.json",
+        );
+        early
+            .virtual_channel
+            .agent_card_path = Some("/card".to_string());
+        assert!(matches!(
+            step_refuse_delegated_credential_outside_target_base(&early),
+            Err(OutboundPipelineError::TargetAuthFailed {
+                failure: crate::proxy::handler::TargetAuthFailure::PathRefused,
+                ..
+            })
+        ));
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        for (target_auth_header, delegated, refused) in [
+            (None, &[("authorization", "Bearer person-token")][..], true),
+            (Some("x-target-key"), &[("authorization", "Bearer person-token")][..], true),
+            (Some("x-target-key"), &[][..], false),
+        ] {
+            let mut ctx = credential_header_case(
+                &state,
+                target_auth_header,
+                delegated,
+                Method::GET,
+                "/outbound/surfaces/order/partner-a/x/.well-known/agent-card.json",
+            )
+            .await;
+            ctx.virtual_channel
+                .target_endpoint = "http://127.0.0.1:9/base".to_string();
+            ctx.virtual_channel
+                .agent_card_path = Some("/card".to_string());
+            let result = step_forward_request_http(&state, &mut ctx)
+                .await
+                .map(drop);
+            assert_eq!(
+                matches!(
+                    result,
+                    Err(OutboundPipelineError::TargetAuthFailed {
+                        failure: crate::proxy::handler::TargetAuthFailure::PathRefused,
+                        ..
+                    })
+                ),
+                refused,
+                "{target_auth_header:?} {delegated:?}: {result:?}"
+            );
         }
     }
 

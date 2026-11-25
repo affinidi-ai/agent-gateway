@@ -1638,14 +1638,22 @@ any grant is read, token requested or consent started, for legacy and `2026-07-2
 alike on the direct path and Fabric receive, and for `2026-07-28` requests on a Fabric send
 whose Target has `fabric_delegated_credentials` on: the request would carry one when a binding
 applies to it, that is a binding for every request, or a binding scoped to tools when the
-request is a `tools/call` of one of them. On a Transit Point it happens after the credential is
-resolved and before anything is sent, and only when a credential was attached, in a header or
-`_meta`. A request that carries no delegated credential, such as a `2026-07-28` `tools/list`
-against a binding scoped to tools, is not refused for its path. It is recorded as a `request_rejected` record at `forward` with reason
+request is a `tools/call` of one of them. On a Transit Point it also happens before any grant
+is read, token requested or consent started, legacy or `2026-07-28`, when a binding for every
+request applies (a binding scoped to tools never applies on a Transit Point) and the request is
+not a discovery read, on a destination that does not withhold delegated credentials; the
+forward step refuses again any request a credential was attached to, in a header or `_meta`. A
+request that carries no delegated credential, such as a `2026-07-28` `tools/list` against a
+binding scoped to tools, is not refused for its path. It is recorded as a `request_rejected` record at `forward` with reason
 `target_path_refused`, or as `target_auth_failed` when the leg also has a Target credential. On
 Fabric receive a discovery read (the agent card) is not counted as carrying a delegated
 credential, since that leg injects none into it; the direct path counts every request a binding
-applies to. A
+applies to. The configured agent card location outside the base path takes only the Target
+credential, never a delegated one: the direct path serves the card read itself and a Transit
+Point sends a discovery read no delegated credential, so a request routed there for another
+path, such as a direct `GET {route}/.well-known/not-a-card` or a Transit Point
+`GET {listen path}/x/.well-known/agent-card.json`, is refused with `400 target_path_refused` when
+a binding applies to it. A
 `2026-07-28` MCP proxy call is held by its REST client's own base-path check (400). A Target
 bound by external consent keeps its stricter admission check (400).
 

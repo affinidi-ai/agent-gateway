@@ -10,6 +10,7 @@ use crate::steps::given::transit_point_config_mut;
 use crate::steps::when::{
     build_request_body, ensure_admin_session, ensure_gateway_running, record_mock_observation,
     record_replacement_mock_observation, send_mcp_request_through_transit_point, send_request_and_record,
+    valid_caller_token, with_transit_token,
 };
 use crate::world::{RecordedResponse, SurfaceSourceAuthConfig, SurfaceTargetAuthConfig, SurfaceWorld};
 
@@ -45,8 +46,9 @@ async fn send_raw_and_record(
     port: u16,
     path: &str,
     body: Value,
+    headers: &[(String, String)],
 ) {
-    let response = post_raw_path(port, path, &body.to_string(), &[])
+    let response = post_raw_path(port, path, &body.to_string(), headers)
         .await
         .unwrap_or_else(|error| panic!("POST {path} exactly as written: {error:#}"));
     world.sent_body = Some(body);
@@ -336,10 +338,10 @@ async fn managed_agent_has_asked_through_transit_point(
     );
 }
 
-#[when(expr = "the caller sends a request to the surface path {string} exactly as written")]
-async fn caller_sends_raw_request(
+async fn caller_sends_raw_request_with_headers(
     world: &mut SurfaceWorld,
-    path: String,
+    path: &str,
+    headers: &[(String, String)],
 ) {
     ensure_gateway_running(world).await;
     let port = world
@@ -348,7 +350,45 @@ async fn caller_sends_raw_request(
         .expect("the gateway is running")
         .gateway_port;
     let body = build_request_body(&world.surface_config.protocol);
-    send_raw_and_record(world, port, &path, body).await;
+    send_raw_and_record(world, port, path, body, headers).await;
+}
+
+#[when(expr = "the caller sends a request to the surface path {string} exactly as written")]
+async fn caller_sends_raw_request(
+    world: &mut SurfaceWorld,
+    path: String,
+) {
+    caller_sends_raw_request_with_headers(world, &path, &[]).await;
+}
+
+#[when(expr = "the caller sends a request to the surface path {string} exactly as written with a valid token")]
+async fn caller_sends_raw_request_with_valid_token(
+    world: &mut SurfaceWorld,
+    path: String,
+) {
+    ensure_gateway_running(world).await;
+    let token = valid_caller_token(world);
+    caller_sends_raw_request_with_headers(world, &path, &[("authorization".to_string(), format!("Bearer {token}"))])
+        .await;
+}
+
+async fn managed_agent_sends_raw_transit_request_with_headers(
+    world: &mut SurfaceWorld,
+    agent_name: &str,
+    path: &str,
+    headers: &[(String, String)],
+) {
+    world
+        .actors
+        .expect_target_kind(agent_name, TargetActorKind::ManagedAgent);
+    ensure_gateway_running(world).await;
+    let port = world
+        .infra
+        .as_ref()
+        .expect("the gateway is running")
+        .outbound_port;
+    let body = build_mcp_list_tools_body_with_id(json!("mcp-tools-list-alpha"));
+    send_raw_and_record(world, port, path, body, headers).await;
 }
 
 #[when(
@@ -359,17 +399,19 @@ async fn managed_agent_sends_raw_transit_request(
     agent_name: String,
     path: String,
 ) {
-    world
-        .actors
-        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
-    ensure_gateway_running(world).await;
-    let port = world
-        .infra
-        .as_ref()
-        .expect("the gateway is running")
-        .outbound_port;
-    let body = build_mcp_list_tools_body_with_id(json!("mcp-tools-list-alpha"));
-    send_raw_and_record(world, port, &path, body).await;
+    managed_agent_sends_raw_transit_request_with_headers(world, &agent_name, &path, &[]).await;
+}
+
+#[when(
+    expr = "managed agent {string} asks for available tools through the Transit Point path {string} exactly as written with its transit token"
+)]
+async fn managed_agent_sends_raw_transit_request_with_its_token(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    path: String,
+) {
+    let headers = with_transit_token(world, Vec::new());
+    managed_agent_sends_raw_transit_request_with_headers(world, &agent_name, &path, &headers).await;
 }
 
 #[when(expr = "the caller sends a request to the surface with header {string} set to {string}")]

@@ -6525,20 +6525,22 @@ async fn proxy_charged_request(
             },
             |request| request.called_tool_name(),
         );
+    let carries_delegated_credential = state
+        .surface
+        .agent_keyed_binding_applies(called_tool);
     if (state
         .surface
         .target_auth()
         .is_some()
-        || state
-            .surface
-            .agent_keyed_binding_applies(called_tool))
+        || carries_delegated_credential)
         && !crate::proxy::paths::is_target_credential_destination(
             &state.surface.target.endpoint,
             method.as_str(),
             &target_url,
             state
                 .surface
-                .agent_card_location_path(),
+                .agent_card_location_path()
+                .filter(|_| !carries_delegated_credential),
         )
     {
         warn!(

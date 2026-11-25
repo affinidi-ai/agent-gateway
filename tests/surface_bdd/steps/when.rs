@@ -2606,10 +2606,13 @@ async fn request_with_tampered_token(world: &mut SurfaceWorld) {
 #[when("the caller sends a request to the surface with a valid token")]
 async fn request_with_valid_token(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
-    let issuer = get_jwt_source_auth_issuer(world);
-    let audience = caller_token_audience(world);
-    let token = create_valid_jwt_for_issuer_with_audience(issuer, audience);
+    let token = valid_caller_token(world);
     send_request_with_bearer_token(world, token).await;
+}
+
+/// A JWT the surface's JWT Bearer source authentication accepts.
+pub(crate) fn valid_caller_token(world: &SurfaceWorld) -> String {
+    create_valid_jwt_for_issuer_with_audience(get_jwt_source_auth_issuer(world), caller_token_audience(world))
 }
 
 #[when(expr = "the caller sends a request to the surface with a valid token and header {string} set to {string}")]
@@ -2836,6 +2839,20 @@ async fn caller_sends_method_request_to_route_path(
     }
     let method = reqwest::Method::from_bytes(method.as_bytes()).expect("step method must be a valid HTTP method");
     request_path_and_record(world, method, &full_path, vec![]).await;
+}
+
+#[when(expr = "the caller sends a {word} request to the surface route path {string} with a valid token")]
+async fn caller_sends_method_request_to_route_path_with_valid_token(
+    world: &mut SurfaceWorld,
+    method: String,
+    path: String,
+) {
+    let full_path = format!("{}{}", world.surface_config.route, path);
+    let method = reqwest::Method::from_bytes(method.as_bytes()).expect("step method must be a valid HTTP method");
+    ensure_gateway_running(world).await;
+    let token = valid_caller_token(world);
+    request_path_and_record(world, method, &full_path, vec![("authorization".to_string(), format!("Bearer {token}"))])
+        .await;
 }
 
 async fn request_path_and_record(
@@ -3191,7 +3208,7 @@ pub(crate) fn reissued_transit_token(
 
 /// The headers a managed agent's Transit Point call carries: its transit token,
 /// and `extra`.
-fn with_transit_token(
+pub(crate) fn with_transit_token(
     world: &SurfaceWorld,
     extra: Vec<(String, String)>,
 ) -> Vec<(String, String)> {

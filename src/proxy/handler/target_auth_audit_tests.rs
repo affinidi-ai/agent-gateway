@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-use super::variant_routing_tests::{router, send};
+use super::variant_routing_tests::{router, send, send_method};
 use crate::audit::events::TargetAuthRejection;
 use crate::audit::request_events::{RejectionReason, RejectionStage, TargetAuthOutcome};
 use crate::component_tests::helpers::MockServer;
@@ -363,4 +363,50 @@ async fn a_request_with_a_target_credential_and_a_binding_outside_the_base_path_
         )]
     );
     assert_eq!(path_records(&events), Vec::new());
+}
+
+/// The direct router sends any `/.well-known/` path to the configured agent card location;
+/// the gateway serves the card read itself, so no other path takes a delegated credential there.
+#[tokio::test]
+async fn a_get_routed_to_the_agent_card_location_is_refused_when_a_delegated_credential_applies() {
+    let target = agent().await;
+    let mut surface = delegated_surface(&format!("{}/base", target.url()), None, json!("all"));
+    surface
+        .access_point
+        .agent_card_path = Some("/card".to_string());
+    let (answered, events) = send_method(router(surface), axum::http::Method::GET, "/a2a/.well-known/not-a-card").await;
+    assert_eq!(answered.as_u16(), 400);
+    assert_eq!(path_records(&events), vec![(RejectionStage::Forward, Some(400))]);
+    assert_eq!(
+        target
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_get_routed_to_the_agent_card_location_is_not_refused_for_a_target_credential_alone() {
+    let target = agent().await;
+    let mut surface = surface(
+        &format!("{}/base", target.url()),
+        json!({"method": {"static_secret": {"secret_id": "absent", "header_name": "x-key"}}, "fallback": "passthrough"}),
+    );
+    surface
+        .access_point
+        .agent_card_path = Some("/card".to_string());
+    let (answered, events) = send_method(router(surface), axum::http::Method::GET, "/a2a/.well-known/not-a-card").await;
+    assert_ne!(answered.as_u16(), 400);
+    assert_eq!(path_records(&events), Vec::new());
+    assert!(
+        target_auth_records(&events)
+            .iter()
+            .all(|record| record.1 != Some(400))
+    );
+    assert_eq!(
+        target
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
 }

@@ -864,7 +864,8 @@ with `%00`, a `%u` escape, or a `%25` left after three rounds of decoding. `%2F`
 (`/base/x;v=1`) stay allowed. The query is ignored, and a Target with an empty or `/` path allows
 every path on its origin. A `GET` or `HEAD` of the configured agent card location
 (`access_point.agent_card_path`, or the Transit Point's `agent_card_path`) on the destination's
-origin is also allowed; any other method there is refused.
+origin is also allowed for the Target credential; any other method there is refused, and a
+request that would carry a delegated credential there is refused whatever its method.
 
 A path the caller sent is the caller's error, so it is refused with `400` and reason
 `target_path_refused`. On an MCP proxy the tool URL is built from the caller's tool arguments,

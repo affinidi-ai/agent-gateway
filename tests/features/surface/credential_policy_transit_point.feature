@@ -205,6 +205,17 @@ Feature: Credential policy on a Transit Point
       | /outbound/example/alpha/%2E%2E/%2e%2e/admin |
       | /outbound/example/alpha/..;/admin           |
 
+  Scenario: A Transit Point request whose path leaves its target endpoint's base path is refused before its delegated credential is fetched
+    Given Transit Point "alpha" requires a transit token
+    And Transit Point "alpha" injects delegated credentials from a client credentials provider
+    And the target endpoint of Transit Point "alpha" has the base path "/base"
+    And managed agent "example-agent" holds a transit token naming caller "alice"
+    When managed agent "example-agent" asks for available tools through the Transit Point path "/outbound/example/alpha/%2e%2e/admin" exactly as written with its transit token
+    Then the response status is 400
+    And the response reason is "target_path_refused"
+    And the credential provider received 0 token requests
+    And MCP server "bravo" was not called
+
   Scenario: A Transit Point target endpoint's redirect is returned to the managed agent instead of being followed with the credential
     Given the gateway authenticates to the destination of Transit Point "alpha" with a client credentials provider
     And MCP server "bravo" answers every request with a redirect to its path "/elsewhere"

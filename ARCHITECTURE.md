@@ -258,7 +258,7 @@ agent's records in the background on every request except a discovery read, neve
 [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#transit-point-trust-recorder)) → Trust Check (the Transit Point's own list; its
 managed-agent elements ask about the managed agent calling out, see
 [`docs/POLICY.md`](docs/POLICY.md#self-recognition-check)) → gateway OPA →
-surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection →
+surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → delegated credential base path check → credential injection →
 forward (a `proxy://` Transit Point is answered by its MCP Proxy, whose backend gets only a
 `consent_mode: external` grant) → response and agent-card rewrite → metrics. A discovery read (a `GET` or `HEAD` of a discovery document on the Transit Point) runs
 the same stages, transit token validation included, except identity resolution and the self
