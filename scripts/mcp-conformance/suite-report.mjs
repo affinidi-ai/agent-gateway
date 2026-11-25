@@ -1,8 +1,9 @@
 // Reads the suite's saved checks.json files for run.sh.
 //
-//   counts  one summary fragment for a target: checks passed, failures its
-//           baseline expects, and failures in scenarios the requirement set
-//           runs but does not score, which the suite never fails a run on
+//   counts  one summary fragment for a target, or for the scenarios named by
+//           --scenarios: checks passed, failures its baseline expects, and
+//           failures in scenarios the requirement set runs but does not score,
+//           which the suite never fails a run on
 //   gaps    the report-only file: every failed or warned check per target,
 //           with the suite's message and never the check's details
 import fs from 'node:fs';
@@ -39,17 +40,25 @@ function checkFiles(dir, prefix = '') {
     });
 }
 
+const LEG_PREFIX = { server: /^server-/, authorization: /^authorization-server-/ };
+
 // Scenario name to its checks. A result directory is `<scenario>-<timestamp>`,
-// with `server-` in front on the server leg; the newest run of a scenario wins.
+// with `server-` (`authorization-server-` on the authorization leg) in front on
+// the legs that name it; the newest run of a scenario wins.
 export function loadResults(dir, leg) {
   const byScenario = new Map();
   for (const relative of checkFiles(dir)) {
     const match = relative.match(/^(.+)-\d{4}-\d{2}-\d{2}T[\d-]+Z$/);
     if (!match) continue;
-    const scenario = leg === 'server' ? match[1].replace(/^server-/, '') : match[1];
+    const scenario = LEG_PREFIX[leg] ? match[1].replace(LEG_PREFIX[leg], '') : match[1];
     byScenario.set(scenario, JSON.parse(fs.readFileSync(path.join(dir, relative, 'checks.json'), 'utf8')));
   }
   return byScenario;
+}
+
+export function only(results, names) {
+  const wanted = new Set(names);
+  return new Map([...results].filter(([scenario]) => wanted.has(scenario)));
 }
 
 // The suite applies a baseline to scored scenarios only, so a baseline entry
@@ -75,18 +84,22 @@ export function countsLine({ passed, expected, unscored, unexpected }) {
   return unexpected > 0 ? `${line}; ${unexpected} unexpected failure(s)` : line;
 }
 
-const SECRET_FIELDS =
-  'client_secret|client_assertion|access_token|refresh_token|id_token|subject_token|actor_token|assertion|password|private_key';
-const SCHEME_VALUE = /\b(Bearer|Basic|DPoP)\s+([A-Za-z0-9._~+/=-]{8,})/gi;
+const SECRET_NAME = '[\\w-]*(?:secret|token|password|passwd|key|assertion|authorization|cookie|credential|signature)[\\w-]*';
+const NOT_A_SECRET_NAME = /(?:endpoint|url|uri|type|method|expires|lifetime|age)$/i;
+const FIELD_VALUE = new RegExp(`\\b(${SECRET_NAME})("?\\s*[:=]\\s*"?)((?:(?:Bearer|Basic|DPoP)\\s+)?[^\\s"&,}]+)`, 'gi');
+const TOKEN_SCHEME_VALUE = /\b(Bearer|DPoP)\s+[A-Za-z0-9._~+/=-]+/gi;
+const BASIC_VALUE = /\b(Basic)\s+([A-Za-z0-9._~+/=-]{8,})/gi;
 
-// A scheme name is also an ordinary word ("Basic authentication"), so only a
-// value that looks generated is removed: it has a digit or is long.
+// Bearer and DPoP are followed by a credential, whatever its length. Basic is
+// also an ordinary word ("Basic authentication"), so only a value that looks
+// generated is removed: it has a digit, padding or is long.
 export function redact(text) {
   return text
     .replace(/-----BEGIN [^-]+-----[\s\S]*?(?:-----END [^-]+-----|$)/g, REDACTED)
     .replace(/\beyJ[\w-]+\.[\w-]+\.[\w-]*/g, REDACTED)
-    .replace(SCHEME_VALUE, (whole, scheme, value) => (/\d/.test(value) || value.length >= 20 ? `${scheme} ${REDACTED}` : whole))
-    .replace(new RegExp(`\\b(${SECRET_FIELDS})("?\\s*[:=]\\s*"?)[^\\s"&,}]+`, 'gi'), `$1$2${REDACTED}`);
+    .replace(TOKEN_SCHEME_VALUE, (_whole, scheme) => `${scheme} ${REDACTED}`)
+    .replace(BASIC_VALUE, (whole, scheme, value) => (/\d|=$/.test(value) || value.length >= 20 ? `${scheme} ${REDACTED}` : whole))
+    .replace(FIELD_VALUE, (whole, name, separator) => (NOT_A_SECRET_NAME.test(name) ? whole : `${name}${separator}${REDACTED}`));
 }
 
 export function gapRows(results, failedScenarios) {
@@ -128,7 +141,9 @@ export function renderGaps(targets) {
 
 // The client target's results are the run through the gateway.
 export function targetSource(name) {
-  return name === 'client' ? { dir: 'client-gateway', leg: 'client' } : { dir: name, leg: 'server' };
+  if (name === 'client') return { dir: 'client-gateway', leg: 'client' };
+  if (name === 'authorization') return { dir: name, leg: 'authorization' };
+  return { dir: name, leg: 'server' };
 }
 
 function passedCount(results) {
@@ -152,7 +167,8 @@ function requireOptions(command, values, names) {
 
 function counts(values) {
   requireOptions('counts', values, ['results', 'leg', 'requirements']);
-  const results = loadResults(values.results, values.leg);
+  const loaded = loadResults(values.results, values.leg);
+  const results = values.scenarios ? only(loaded, values.scenarios.split(',').filter(Boolean)) : loaded;
   if (results.size === 0) {
     console.error(`suite-report.mjs counts: no results in ${values.results}`);
     process.exit(1);
@@ -196,6 +212,7 @@ if (import.meta.filename === process.argv[1]) {
       requirements: { type: 'string' },
       baseline: { type: 'string' },
       'expected-scenarios': { type: 'string' },
+      scenarios: { type: 'string' },
       targets: { type: 'string' },
       out: { type: 'string' },
       'failed-dir': { type: 'string' },

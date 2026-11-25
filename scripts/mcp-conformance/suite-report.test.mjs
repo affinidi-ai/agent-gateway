@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { countsLine, gapRows, listSection, loadResults, redact, renderGaps, tally, targetSource } from './suite-report.mjs';
+import { countsLine, gapRows, listSection, loadResults, only, redact, renderGaps, tally, targetSource } from './suite-report.mjs';
 
 function resultsDir(entries) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'suite-report-'));
@@ -64,6 +64,20 @@ test('client results keep their group folder and a missing directory is empty', 
   assert.equal(loadResults(path.join(dir, 'absent'), 'client').size, 0);
 });
 
+test('authorization results drop the authorization-server prefix', () => {
+  const dir = resultsDir({
+    'authorization-server-authorization-code-grant-2026-01-01T00-00-00-000Z': [check('a', 'SKIPPED')],
+    'authorization-server-authorization-server-metadata-endpoint-2026-01-01T00-00-00-000Z': [check('b', 'FAILURE')],
+  });
+  assert.deepEqual([...loadResults(dir, 'authorization').keys()].sort(), ['authorization-code-grant', 'authorization-server-metadata-endpoint']);
+});
+
+test('only the named scenarios are kept', () => {
+  const kept = only(results({ a: [check('x', 'SUCCESS')], b: [check('y', 'FAILURE')], 'auth/c': [] }), ['b', 'auth/c', 'absent']);
+  assert.deepEqual([...kept.keys()], ['b', 'auth/c']);
+  assert.equal(only(results({ a: [] }), []).size, 0);
+});
+
 test('failures are split into expected, unscored and unexpected', () => {
   const counts = tally({
     results: results({
@@ -117,6 +131,47 @@ test('credentials are removed from a message', () => {
     assert.match(cleaned, /\[redacted\]/);
   }
   assert.equal(redact('body grant_type=client_credentials&x=1 kept'), 'body grant_type=client_credentials&x=1 kept');
+});
+
+test('a short Bearer or DPoP value is removed whatever its length or characters', () => {
+  const cases = [
+    ['Authorization: Bearer abc', 'Authorization: [redacted]'],
+    ['got Bearer secret and DPoP proof here', 'got Bearer [redacted] and DPoP [redacted] here'],
+    ['bearer tok', 'bearer [redacted]'],
+    ['DPoP x', 'DPoP [redacted]'],
+  ];
+  for (const [input, expected] of cases) assert.equal(redact(input), expected);
+});
+
+test('a Basic value is removed when it looks generated and the word is kept otherwise', () => {
+  assert.equal(redact('sent Basic dXNlcjpwdw=='), 'sent Basic [redacted]');
+  assert.equal(redact('sent Basic abcdefghijklmnopqrstuvwxyz'), 'sent Basic [redacted]');
+  assert.equal(redact('Basic authentication is required'), 'Basic authentication is required');
+});
+
+test('any field that names a credential has its value removed', () => {
+  const cases = [
+    ['api_key=abc123', 'api_key=[redacted]'],
+    ['{"clientSecret":"plain"}', '{"clientSecret":"[redacted]"}'],
+    ['x-api-key: plain', 'x-api-key: [redacted]'],
+    ['password: hunter2 and more', 'password: [redacted] and more'],
+    ['Cookie: session=plain', 'Cookie: [redacted]'],
+    ['Authorization: Basic plain extra', 'Authorization: [redacted] extra'],
+    ['signing_key_pem: plain', 'signing_key_pem: [redacted]'],
+    ['id_token=plain&state=1', 'id_token=[redacted]&state=1'],
+  ];
+  for (const [input, expected] of cases) assert.equal(redact(input), expected);
+});
+
+test('a field about a credential rather than holding one is kept', () => {
+  for (const text of [
+    'token_endpoint: http://localhost:1/token',
+    'token_type=Bearer',
+    'token_endpoint_auth_method: client_secret_basic',
+    'public_key_url=http://localhost/jwks',
+  ]) {
+    assert.equal(redact(text), text);
+  }
 });
 
 test('a message without credentials is unchanged', () => {
@@ -174,4 +229,5 @@ test('a long message is cut', () => {
 test('the client target reads the run through the gateway', () => {
   assert.deepEqual(targetSource('client'), { dir: 'client-gateway', leg: 'client' });
   assert.deepEqual(targetSource('transit'), { dir: 'transit', leg: 'server' });
+  assert.deepEqual(targetSource('authorization'), { dir: 'authorization', leg: 'authorization' });
 });
