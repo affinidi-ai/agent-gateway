@@ -3,7 +3,6 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useLimitGuard } from '../hooks/useLimitGuard';
 import { Tab, Tabs } from 'react-bootstrap';
 import { AppButton } from '../components/shared/AppButton';
-import { Badge } from '../components/shared/Badge';
 import { DeleteButton } from '../components/shared/DeleteButton';
 import { useApiKeyAction } from '../components/api-keys/ApiKeyActionDialog';
 import { EmptyState } from '../components/shared/EmptyState';
@@ -110,15 +109,12 @@ const SecretsPage: React.FC = () => {
     }
   };
 
-  const loadAllData = async () => {
-    setLoading(true);
-    await Promise.all([loadSecrets(), loadApiKeys(), loadCertificates()]);
-    setLoading(false);
-  };
-
   useEffect(() => {
     loadSurfaces();
-    loadAllData();
+    // Start loading data in parallel without blocking page render
+    Promise.all([loadSecrets(), loadApiKeys(), loadCertificates()]).finally(() => {
+      setLoading(false);
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -315,12 +311,6 @@ const SecretsPage: React.FC = () => {
   const pagedSecrets = paginate(filteredSecrets, secretsPage);
   const pagedCertificates = paginate(filteredCertificates, certsPage);
 
-  const filterActive = searchTerm.trim().length > 0;
-  const tabBadge = (count: number) => {
-    if (!filterActive) return null;
-    return <Badge value={count} className="ms-2" ariaLabel={`${count} matching items`} />;
-  };
-
   return (
     <div className="container-fluid" data-testid="page-secrets">
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
@@ -355,7 +345,7 @@ const SecretsPage: React.FC = () => {
           tabAttrs={{ 'data-testid': 'secrets-secrets-tab-trigger' }}
           title={
             <>
-              <i className="fas fa-key"></i> Secrets {tabBadge(filteredSecrets.length)}
+              <i className="fas fa-key"></i> Secrets
             </>
           }
         >
@@ -363,12 +353,6 @@ const SecretsPage: React.FC = () => {
             <div className="card-header py-3 d-flex justify-content-between align-items-center">
               <h6 className="m-0 font-weight-bold text-primary">
                 <i className="fas fa-key"></i> Secrets
-                <Badge
-                  value={filteredSecrets.length}
-                  suffix={searchTerm ? ` of ${secrets.length}` : undefined}
-                  className="ms-2"
-                  ariaLabel={`${filteredSecrets.length}${searchTerm ? ` of ${secrets.length}` : ''} secrets`}
-                />
               </h6>
               <AppButton
                 variant="primary"
@@ -521,7 +505,7 @@ const SecretsPage: React.FC = () => {
           tabAttrs={{ 'data-testid': 'secrets-api-keys-tab-trigger' }}
           title={
             <>
-              <i className="fas fa-key"></i> API Keys {tabBadge(filteredApiKeys.length)}
+              <i className="fas fa-key"></i> API Keys
             </>
           }
         >
@@ -530,12 +514,6 @@ const SecretsPage: React.FC = () => {
             <div className="card-header py-3 d-flex justify-content-between align-items-center">
               <h6 className="m-0 font-weight-bold text-primary">
                 <i className="fas fa-key"></i> API Keys
-                <Badge
-                  value={filteredApiKeys.length}
-                  suffix={searchTerm ? ` of ${apiKeys.length}` : undefined}
-                  className="ms-2"
-                  ariaLabel={`${filteredApiKeys.length}${searchTerm ? ` of ${apiKeys.length}` : ''} API keys`}
-                />
               </h6>
               <AppButton
                 variant="primary"
@@ -826,8 +804,7 @@ const SecretsPage: React.FC = () => {
           tabAttrs={{ 'data-testid': 'secrets-certificates-tab-trigger' }}
           title={
             <>
-              <i className="fas fa-certificate"></i> Certificates{' '}
-              {tabBadge(filteredCertificates.length)}
+              <i className="fas fa-certificate"></i> Certificates
             </>
           }
         >
@@ -836,16 +813,6 @@ const SecretsPage: React.FC = () => {
             <div className="card-header py-3 d-flex justify-content-between align-items-center">
               <h6 className="m-0 font-weight-bold text-primary">
                 <i className="fas fa-certificate"></i> Client Certificates
-                <Badge
-                  value={filteredCertificates.length}
-                  suffix={
-                    searchTerm || certKindFilter !== 'all'
-                      ? ` of ${certificates.length}`
-                      : undefined
-                  }
-                  className="ms-2"
-                  ariaLabel={`${filteredCertificates.length}${searchTerm || certKindFilter !== 'all' ? ` of ${certificates.length}` : ''} certificates`}
-                />
               </h6>
               <div className="d-flex align-items-center gap-2">
                 <label htmlFor="cert-kind-filter" className="text-muted small mb-0 me-1">

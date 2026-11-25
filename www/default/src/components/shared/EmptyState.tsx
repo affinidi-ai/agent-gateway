@@ -17,6 +17,7 @@ interface EmptyStateProps {
   ctaTestId?: string;
   docsHref?: string;
   docsLabel?: string;
+  docsTestId?: string;
   /** `body` appends the docs link to the body text; `actions` shows it beside the CTA. */
   docsPlacement?: 'body' | 'actions';
   variant?: EmptyStateVariant;
@@ -33,6 +34,7 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
   ctaTestId,
   docsHref,
   docsLabel = 'View Docs',
+  docsTestId,
   docsPlacement = 'body',
   variant = 'inline',
 }) => {
@@ -41,7 +43,7 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
     <i className={`fas ${ctaIcon} fa-sm me-1`} aria-hidden="true" />
   ) : null;
   const docsLink = docsHref ? (
-    <Link href={docsHref} external className="text-muted">
+    <Link href={docsHref} external className="text-muted" testId={docsTestId}>
       {docsLabel}
     </Link>
   ) : null;

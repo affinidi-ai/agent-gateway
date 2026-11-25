@@ -108,7 +108,7 @@ test.describe("Payment Gateways tab", () => {
       page.getByTestId("payment-gateways-empty-state"),
     ).toContainText("agent-pay");
 
-    await page.getByTestId("payment-gateways-empty-connect-button").click();
+    await page.getByTestId("payment-gateways-connect-button").click();
     await expect(page).toHaveURL(/\/payment-gateways\/connect$/);
     await expect(page.getByTestId("wizard-add-payment-gateway")).toBeVisible();
   });

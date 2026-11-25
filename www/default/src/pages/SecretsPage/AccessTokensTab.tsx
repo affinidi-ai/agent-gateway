@@ -1,6 +1,5 @@
 import React from 'react';
 import { AppButton } from '../../components/shared/AppButton';
-import { Badge } from '../../components/shared/Badge';
 import { EmptyState } from '../../components/shared/EmptyState';
 import AccessTokenRow from './AccessTokenRow';
 import { useAccessTokenList } from './useAccessTokenList';
@@ -17,11 +16,6 @@ const AccessTokensTab: React.FC<AccessTokensTabProps> = ({ searchTerm }) => {
       <div className="card-header py-3 d-flex justify-content-between align-items-center">
         <h6 className="m-0 font-weight-bold text-primary">
           <i className="fas fa-user-lock me-1" aria-hidden="true" /> Access Tokens (PAT)
-          <Badge
-            value={list.filtered.length}
-            className="ms-2"
-            ariaLabel={`${list.filtered.length} access tokens`}
-          />
         </h6>
         <div className="d-flex align-items-center gap-3">
           <div className="form-check form-switch m-0">
@@ -63,9 +57,6 @@ const AccessTokensTab: React.FC<AccessTokensTabProps> = ({ searchTerm }) => {
             icon="fa-user-lock"
             title="No access tokens yet"
             body="Access tokens let automation call the management API without an interactive session."
-            ctaLabel={list.canEdit ? 'New Access Token' : undefined}
-            ctaIcon="fa-plus"
-            onCtaClick={list.canEdit ? list.openCreate : undefined}
           />
         ) : list.filtered.length === 0 ? (
           <div className="text-center text-muted py-5" data-testid="access-token-empty-filter">

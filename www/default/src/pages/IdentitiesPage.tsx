@@ -554,16 +554,6 @@ const IdentitiesPage: React.FC = () => {
                   <div className="card-header py-3 d-flex justify-content-between align-items-center">
                     <h6 className="m-0 font-weight-bold text-primary d-flex align-items-center">
                       <i className="fas fa-fingerprint me-2"></i> Agent Identities
-                      <Badge
-                        value={filteredIdentities.length}
-                        className="ms-2"
-                        ariaLabel={`${filteredIdentities.length} agent identities`}
-                        suffix={
-                          searchTerm || (hasRecorderStatus && recorderFilter !== 'all')
-                            ? ` of ${entryCount}`
-                            : undefined
-                        }
-                      />
                     </h6>
                   </div>
                   <div className="card-body">

@@ -2,7 +2,6 @@ import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useLimitGuard } from '../hooks/useLimitGuard';
 import { apiClient } from '../api';
-import { Badge } from '../components/shared/Badge';
 import { useApp } from '../context/AppContext';
 import { usePermissions } from '../context/PermissionsContext';
 import { AppButton } from '../components/shared/AppButton';
@@ -138,12 +137,6 @@ const ProxiesPage: React.FC = () => {
       <div className="card-header py-3 d-flex justify-content-between align-items-center">
         <h6 className="m-0 font-weight-bold text-primary">
           <i className="fas fa-plug"></i> MCP Proxies
-          <Badge
-            value={filteredMcpProxies.length}
-            suffix={searchTerm ? ` of ${mcpProxies.length}` : undefined}
-            className="ms-2"
-            ariaLabel={`${filteredMcpProxies.length}${searchTerm ? ` of ${mcpProxies.length}` : ''} MCP proxies`}
-          />
         </h6>
         {hasPermission('mcp_proxies.edit') && (
           <>
