@@ -91,8 +91,14 @@ settings write (`POST` or `DELETE /v1/settings`) that changes the stored signing
 (`signing`, or the gateway-wide `default_signing`) also needs `key_management.edit`, under the
 caller's role and, for a personal access token, its scopes; without it the save is refused with
 `403` and nothing is stored. Creating a surface or an issuer with a non-empty `signing` counts as
-a change. A save that sends the stored choice back unchanged, as the dashboard does, needs only
-the route's own permission.
+a change. For a surface the choice compared is the one it signs with: its own `signing`, or, when
+it sets none, its issuer's. So creating a surface under an issuer that signs, or moving
+`issuer_id` onto an issuer that signs differently, also needs `key_management.edit`. This check
+runs after the surface's references are checked, so an issuer the caller may not reference is
+refused as one that does not exist, whatever it signs with. Deleting an issuer that has a
+`signing` block (`DELETE /v1/issuers/{id}`) also needs `key_management.edit`, since the surfaces
+that follow it move to the gateway-wide signer. A save that sends the stored choice back
+unchanged, as the dashboard does, needs only the route's own permission.
 
 ## Agent card preview
 

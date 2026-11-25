@@ -159,3 +159,51 @@ async fn operator_adds_connection_at(
     });
     world.admin_response = Some(send(world, Method::POST, "/v1/vta/connections", Some(&body)).await);
 }
+
+#[when(expr = "the operator verifies the trust agent connection {string}")]
+async fn operator_verifies_connection(
+    world: &mut SurfaceWorld,
+    name: String,
+) {
+    let path = format!("/v1/vta/connections/{}/verify", connection_id(world, &name));
+    world.admin_response = Some(send(world, Method::POST, &path, None).await);
+}
+
+#[given(expr = "the operator has revoked the trust agent connection {string}")]
+async fn operator_has_revoked_connection(
+    world: &mut SurfaceWorld,
+    name: String,
+) {
+    operator_revokes_connection(world, name.clone()).await;
+    let revoked = world
+        .admin_response
+        .take()
+        .expect("the gateway answered the revoke");
+    assert_eq!(revoked.status, 200, "revoking {name}: {}", revoked.body);
+}
+
+#[when(expr = "the operator deletes the trust agent connection {string}")]
+async fn operator_deletes_connection(
+    world: &mut SurfaceWorld,
+    name: String,
+) {
+    let path = format!("/v1/vta/connections/{}", connection_id(world, &name));
+    world.admin_response = Some(send(world, Method::DELETE, &path, None).await);
+}
+
+#[when(expr = "the operator adds a trust agent connection for tenant {string} at {string}")]
+async fn operator_adds_tenant_connection_at(
+    world: &mut SurfaceWorld,
+    tenant: String,
+    endpoint: String,
+) {
+    let body = json!({
+        "name": "Tenant trust agent",
+        "tenant_id": tenant,
+        "endpoint": endpoint,
+        "vta_did": "did:key:z6MkvnxZrB5vsAFb8AGaDVAqSYYNoz5y2Rgvhccn7xSvx3Aj",
+        "default_context_id": "gateway",
+        "control_identity": "did_key",
+    });
+    world.admin_response = Some(send(world, Method::POST, "/v1/vta/connections", Some(&body)).await);
+}

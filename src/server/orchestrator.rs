@@ -5033,6 +5033,22 @@ async fn rederive_planes_on_activation(
     {
         warn!("API key store refresh on activation failed: {e}");
     }
+    if let Some(store) = identity_state
+        .vta_connection_store
+        .as_ref()
+        && let Err(e) = store
+            .refresh_from_disk()
+            .await
+    {
+        warn!("Trust agent connection store refresh on activation failed: {e}");
+    }
+    // Gateway signing is read from the dashboard settings on every signing
+    // call, so the settings another node saved apply from the first request.
+    if let Some(settings) = crate::storage::settings_store::global_settings_store()
+        && let Err(e) = settings.load().await
+    {
+        warn!("Dashboard settings reload on activation failed: {e}");
+    }
     crate::payments_ledger::reload_global().await;
     crate::identity::handlers::deleted_surface_api_keys::revoke_api_keys_of_deleted_surfaces(identity_state).await;
 

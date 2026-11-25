@@ -491,6 +491,7 @@ fn to_connection(
         pairing: Default::default(),
         created_at: now,
         updated_at: now,
+        retired_at: None,
     }
 }
 
@@ -498,13 +499,126 @@ fn to_connection(
 /// one it replaces, so a key change saved meanwhile is kept rather than
 /// overwritten. Returns the saved connection and the retired key id, or why
 /// the switch was refused.
+type SurfaceStoreExt = Option<Extension<Arc<dyn crate::surfaces::AgentSurfaceStore>>>;
+type IssuerStoreExt = Option<Extension<Arc<dyn crate::issuers::IssuerStore>>>;
+
+/// Moves every saved signing choice that names key `previous` of connection
+/// `connection_id` (a surface's, an issuer's, Gateway signing) to `next`, so
+/// what is shown and stored is the key that signs. Best effort: one that
+/// cannot be saved is logged and still signs with `next`, since a retired key
+/// signs with the connection's active one.
+async fn follow_key_rotation(
+    surfaces: &SurfaceStoreExt,
+    issuers: &IssuerStoreExt,
+    connection_id: &str,
+    previous: &str,
+    next: &str,
+) {
+    let names_previous = |signing: Option<&crate::config::agent_surface::SurfaceSigningConfig>| {
+        signs_through(signing, connection_id) && signing.and_then(|signing| signing.key_id.as_deref()) == Some(previous)
+    };
+    let moved = |signing: &mut Option<crate::config::agent_surface::SurfaceSigningConfig>| {
+        if let Some(signing) = signing.as_mut() {
+            signing.key_id = Some(next.to_string());
+        }
+    };
+    if let Some(Extension(store)) = surfaces {
+        for mut surface in store
+            .list_all()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|surface| names_previous(surface.signing.as_ref()))
+        {
+            moved(&mut surface.signing);
+            if let Err(e) = store.save(&surface).await {
+                warn!(surface_id = %surface.surface_id, error = %e, "a surface's signing choice still names a rotated key");
+            }
+        }
+    }
+    if let Some(Extension(store)) = issuers {
+        for mut issuer in store
+            .list_all()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|issuer| names_previous(issuer.signing.as_ref()))
+        {
+            moved(&mut issuer.signing);
+            if let Err(e) = store.update(&issuer).await {
+                warn!(issuer_id = %issuer.id, error = %e, "an issuer's signing choice still names a rotated key");
+            }
+        }
+    }
+    if let Some(settings) = crate::storage::settings_store::global_settings_store() {
+        let mut current = settings.get();
+        if names_previous(
+            current
+                .default_signing
+                .as_ref(),
+        ) {
+            moved(&mut current.default_signing);
+            let saved = match settings.update(current) {
+                Ok(()) => settings.save().await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = saved {
+                warn!(error = %e, "Gateway signing still names a rotated key");
+            }
+        }
+    }
+}
+
+/// Whether `stored` is still the agent `basis` was read as: the same endpoint,
+/// agent DID and carrier, and not retired since (disabled, revoked or pointed
+/// elsewhere, even if it was restored after).
+fn same_agent(
+    stored: &VtaConnection,
+    basis: &VtaConnection,
+) -> bool {
+    stored.endpoint == basis.endpoint
+        && stored.vta_did == basis.vta_did
+        && stored.transport == basis.transport
+        && stored.retired_at == basis.retired_at
+}
+
+/// Why a key was not recorded.
+enum KeySwitchRefusal {
+    /// The key cannot become the active one.
+    Invalid(String),
+    /// The connection now names another agent than the one the key is in.
+    Changed,
+}
+
+impl KeySwitchRefusal {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Invalid(message) => (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response(),
+            Self::Changed => (
+                StatusCode::CONFLICT,
+                ErrorBody::json(
+                    "the connection was changed, disabled or revoked meanwhile, so the key was not recorded; try again",
+                ),
+            )
+                .into_response(),
+        }
+    }
+}
+
+/// Makes `next` the active key of connection `id`, as long as it is still the
+/// agent `basis` was read as, which is where the key is.
 async fn switch_active_key(
     state: &VtaConnectionAdminState,
     id: &str,
+    basis: &VtaConnection,
     next: crate::vta::connections::SigningKey,
-) -> anyhow::Result<Result<(VtaConnection, Option<String>), String>> {
+) -> anyhow::Result<Result<(VtaConnection, Option<String>), KeySwitchRefusal>> {
     let mut outcome = Ok(None);
     let updated = crate::vta::connections::modify(state.store.as_ref(), id, |stored| {
+        if !same_agent(stored, basis) {
+            outcome = Err(KeySwitchRefusal::Changed);
+            return;
+        }
         let previous = stored
             .keys
             .active
@@ -513,7 +627,8 @@ async fn switch_active_key(
         outcome = stored
             .keys
             .rotate_to(next, chrono::Utc::now())
-            .map(|()| previous);
+            .map(|()| previous)
+            .map_err(KeySwitchRefusal::Invalid);
     })
     .await?;
     Ok(outcome.map(|previous| (updated, previous)))
@@ -1140,9 +1255,16 @@ async fn save_pairing(
 ) -> Result<VtaConnection, (StatusCode, Json<ErrorBody>)> {
     let id = connection.id.clone();
     let mut revoked = false;
+    let mut changed = false;
     let updated = crate::vta::connections::modify(state.store.as_ref(), &id, |stored| {
         if unless_revoked && stored.pairing.state == crate::vta::pairing::PairingState::Revoked {
             revoked = true;
+            return;
+        }
+        // A Verify judged the agent the record named when it was read; one
+        // pointed elsewhere, or revoked and paired again, since is not that.
+        if unless_revoked && !same_agent(stored, &connection) {
+            changed = true;
             return;
         }
         stored.status = pairing.state.into();
@@ -1155,6 +1277,12 @@ async fn save_pairing(
     })?;
     if revoked {
         return Err(revoked_connection());
+    }
+    if changed {
+        return Err((
+            StatusCode::CONFLICT,
+            ErrorBody::json("the connection was changed while it was being verified; verify it again"),
+        ));
     }
     // Pairing changes whether the connection may sign, so the cached connector
     // must go: a revoke has to take effect on the very next request.
@@ -1637,6 +1765,8 @@ pub async fn vta_status(
     Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
     State(state): State<VtaConnectionAdminState>,
+    surfaces: Option<Extension<Arc<dyn crate::surfaces::AgentSurfaceStore>>>,
+    issuers: Option<Extension<Arc<dyn crate::issuers::IssuerStore>>>,
     pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -1654,20 +1784,29 @@ pub async fn vta_status(
         return e.into_response();
     }
     let config = &state.vta_config;
-    // A tenant sees the addresses of the connections it may see, and nothing
-    // of the appliance's own trust agent.
+    // A tenant, or a token limited to some connections, sees the addresses of
+    // the connections it may see, and the appliance's own trust agent only
+    // when it may see the `[vta]` connection.
     let tenant_view = tenant_context(&context).is_some();
-    let reserved_origins = if tenant_view {
+    let restricted = tenant_view || scope.is_some();
+    let reserved_origins = if restricted {
         visible_connection_origins(&state, &context, &scope).await
     } else {
         crate::vta::isolation::reserved_origins()
     };
+    let sees_bootstrap = !tenant_view
+        && scope_allows_resource(
+            resource_scope(&scope),
+            None,
+            ResourceKind::VtaConnections,
+            crate::vta::connections::BOOTSTRAP_CONNECTION_ID,
+        );
     // The identity an operator grants on their trust agent. Exposed here
     // because it is redacted in logs and encrypted on disk, so this authorised
     // response is the only place it can be read — and an operator cannot grant
     // what they cannot see. `None` when no stable key is configured, which is
     // the case where showing one would be worse than showing nothing.
-    let control_did = if tenant_view {
+    let control_did = if !sees_bootstrap {
         None
     } else {
         bootstrap_control_did(config)
@@ -1677,6 +1816,21 @@ pub async fn vta_status(
     let dashboard_default =
         crate::storage::settings_store::global_settings().and_then(|settings| settings.default_signing);
     let through_trust_agent = crate::vta::inventory::signs_through_trust_agent(config, dashboard_default.as_ref());
+    let surface_list = match surfaces.as_ref() {
+        Some(Extension(store)) => store
+            .list_all()
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let issuer_list = match issuers.as_ref() {
+        Some(Extension(store)) => store
+            .list_all()
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let custody_claim = crate::vta::inventory::custody_claim(through_trust_agent, &surface_list, &issuer_list);
     let default_resolution =
         crate::vta::onboarding_default::effective(&state.default_resolution, dashboard_default.as_ref());
     (
@@ -1684,9 +1838,9 @@ pub async fn vta_status(
         Json(serde_json::json!({
             "enabled": config.enabled,
             "tier": crate::vta::inventory::tier(through_trust_agent),
-            // False for local signing. Nothing in product copy may claim
-            // custody when this is false.
-            "custody_claim": through_trust_agent,
+            // False while anything signs with the gateway's own key. Nothing in
+            // product copy may claim custody when this is false.
+            "custody_claim": custody_claim,
             "auto_provision_contexts": config.auto_provision_contexts,
             "control_did": control_did,
             "control_did_method": config.effective_control_did_method().as_str(),
@@ -1696,7 +1850,7 @@ pub async fn vta_status(
             "context_did_hosting": config.context_did_hosting.as_str(),
             // The control key this gateway rotates with `acl/swap-key`: absent
             // unless it holds a `did:key` control key in a file.
-            "control_key": if tenant_view { None } else { crate::vta::control_key_live::status() },
+            "control_key": if sees_bootstrap { crate::vta::control_key_live::status() } else { None },
             // What this appliance signs with when nobody has said, and why
             //. Reported so "why is it signing with this?" never
             // requires reading config or code.
@@ -2159,6 +2313,11 @@ fn inventory_for_caller(
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
 ) -> crate::vta::inventory::KeyInventory {
+    let custody_claim = crate::vta::inventory::custody_claim(
+        crate::vta::inventory::signs_through_trust_agent(config, default_signing),
+        surfaces,
+        &issuers,
+    );
     issuers.retain(|issuer| {
         can_access(issuer.tenant_id.as_deref(), context)
             && scope_allows_resource(scope, context, ResourceKind::Issuers, &issuer.id)
@@ -2173,6 +2332,7 @@ fn inventory_for_caller(
         .collect();
     let mut inventory =
         crate::vta::inventory::build(config, default_signing, connections, surfaces, &issuers, known_contexts);
+    inventory.custody_claim = custody_claim;
     inventory
         .mappings
         .retain(|mapping| visible.contains(mapping.surface_id.as_str()));
@@ -2209,6 +2369,8 @@ pub async fn rotate_connection_key(
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
     State(state): State<VtaConnectionAdminState>,
     Path(id): Path<String>,
+    surfaces: SurfaceStoreExt,
+    issuers: IssuerStoreExt,
     pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -2246,9 +2408,40 @@ pub async fn rotate_connection_key(
     {
         return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response();
     }
+    // A public key the request supplies is published as the key's and becomes
+    // its issuer `did:key`, so the agent first proves it signs with that key.
+    if let Some(public_key) = next.public_key.as_deref() {
+        let Some(registry) = state.registry.as_ref() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorBody::json("Trust agent connections are not available on this gateway"),
+            )
+                .into_response();
+        };
+        let proved = match registry.client(&id).await {
+            Ok(client) => crate::vta::authority::prove_key_possession(&client, &next.key_id, public_key).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = proved {
+            error!(target: "vta_audit", connection_id = %id, error = %e.log_detail(), "the trust agent did not prove it holds the key");
+            let status = if e.is_unavailable() {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return (
+                status,
+                ErrorBody::json(format!(
+                    "the trust agent did not sign with key `{}` under the public key supplied, so it was not recorded",
+                    next.key_id
+                )),
+            )
+                .into_response();
+        }
+    }
 
-    match switch_active_key(&state, &id, next).await {
-        Ok(Err(message)) => (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response(),
+    match switch_active_key(&state, &id, &connection, next).await {
+        Ok(Err(refusal)) => refusal.into_response(),
         Ok(Ok((updated, previous))) => {
             info!(
                 target: "vta_audit",
@@ -2257,6 +2450,9 @@ pub async fn rotate_connection_key(
                 retired_key_id = previous.as_deref().unwrap_or("none"),
                 "VTA signing key rotated",
             );
+            if let Some(previous) = previous.as_deref() {
+                follow_key_rotation(&surfaces, &issuers, &id, previous, body.key_id.trim()).await;
+            }
             security_records::signing_key_rotated(&updated, previous, body.key_id.trim());
             // Rebuild on next use so the new key signs immediately.
             invalidate(&state, &id).await;
@@ -2342,11 +2538,13 @@ pub async fn provision_connection_key(
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
     State(state): State<VtaConnectionAdminState>,
     Path(id): Path<String>,
+    surfaces: SurfaceStoreExt,
+    issuers: IssuerStoreExt,
     pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
 ) -> impl IntoResponse {
-    if let Err(e) = load_for_pairing(
+    let connection = match load_for_pairing(
         &user_id,
         &passkey_storage,
         &rbac_config,
@@ -2360,8 +2558,9 @@ pub async fn provision_connection_key(
     )
     .await
     {
-        return e.into_response();
-    }
+        Ok(connection) => connection,
+        Err(e) => return e.into_response(),
+    };
 
     let Some(registry) = state.registry.as_ref() else {
         return (
@@ -2387,8 +2586,8 @@ pub async fn provision_connection_key(
     };
     let key_id = created.key_id.clone();
 
-    match switch_active_key(&state, &id, created).await {
-        Ok(Err(message)) => (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response(),
+    match switch_active_key(&state, &id, &connection, created).await {
+        Ok(Err(refusal)) => refusal.into_response(),
         Ok(Ok((updated, previous_key_id))) => {
             info!(
                 target: "vta_audit",
@@ -2396,6 +2595,9 @@ pub async fn provision_connection_key(
                 key_id = %key_id,
                 "minted a signing key in the trust agent",
             );
+            if let Some(previous) = previous_key_id.as_deref() {
+                follow_key_rotation(&surfaces, &issuers, &id, previous, &key_id).await;
+            }
             security_records::signing_key_provisioned(&updated, previous_key_id, &key_id);
             invalidate(&state, &id).await;
             (StatusCode::CREATED, Json(updated)).into_response()
@@ -2538,6 +2740,7 @@ mod tests {
             pairing: Default::default(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            retired_at: None,
         };
         connection
             .control_key_state
@@ -3021,6 +3224,19 @@ mod tests {
         assert!(seen["control_did"].is_null(), "{seen}");
         assert!(seen["control_key"].is_null(), "{seen}");
 
+        let (limited, _limited_users) = admin_router(state.clone(), None).await;
+        let limited = limited.layer(Extension(crate::auth_manager::pat::PatResourceScope(Arc::new(
+            regex::Regex::new("^own$").unwrap(),
+        ))));
+        let seen = status_body(&limited).await;
+        assert_eq!(
+            seen["reserved_origins"],
+            serde_json::json!(["own.example:8443"]),
+            "an appliance token limited to some connections sees only theirs"
+        );
+        assert!(seen["control_did"].is_null(), "{seen}");
+        assert!(seen["control_key"].is_null(), "{seen}");
+
         let (admin, _admin_users) = admin_router(state, None).await;
         assert_eq!(
             status_body(&admin).await["reserved_origins"],
@@ -3431,6 +3647,59 @@ mod tests {
         assert_eq!(kept.pairing.state, crate::vta::pairing::PairingState::Revoked);
     }
 
+    /// A Verify judged the agent the record named when it was read: one
+    /// pointed at another agent meanwhile, or revoked and paired again, keeps
+    /// its own pairing instead of the old agent's Connected and pin.
+    #[tokio::test]
+    async fn a_verify_of_a_connection_changed_meanwhile_is_not_saved() {
+        for change in ["repoint", "revoke and pair again"] {
+            let (state, _dir) = admin_state(None).await;
+            stored(&state, "conn", None).await;
+            let read = state
+                .store
+                .get("conn")
+                .await
+                .unwrap()
+                .unwrap();
+            crate::vta::connections::modify(state.store.as_ref(), "conn", |c| {
+                if change == "repoint" {
+                    c.endpoint = "https://elsewhere.example".to_string();
+                    c.pairing = Default::default();
+                } else {
+                    c.pairing = crate::vta::pairing::revoke(&c.pairing);
+                }
+            })
+            .await
+            .unwrap();
+            if change != "repoint" {
+                crate::vta::connections::modify(state.store.as_ref(), "conn", |c| {
+                    c.pairing = Default::default();
+                })
+                .await
+                .unwrap();
+            }
+            let connected = crate::vta::pairing::PairingRecord {
+                state: crate::vta::pairing::PairingState::Connected,
+                pinned_vta_did: Some("did:webvh:old.example".to_string()),
+                ..read.pairing.clone()
+            };
+
+            let refused = persist_verification(&state, read, connected)
+                .await
+                .expect_err(change);
+
+            assert_eq!(refused.0, StatusCode::CONFLICT, "{change}");
+            let kept = state
+                .store
+                .get("conn")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(kept.pairing.state, crate::vta::pairing::PairingState::Connected, "{change}");
+            assert_eq!(kept.pairing.pinned_vta_did, None, "{change}");
+        }
+    }
+
     #[test]
     fn a_block_naming_no_connection_signs_through_the_bootstrap_one() {
         let bootstrap = crate::vta::connections::BOOTSTRAP_CONNECTION_ID;
@@ -3443,6 +3712,114 @@ mod tests {
         };
         assert!(!signs_through(Some(&local), bootstrap));
         assert!(!signs_through(None, bootstrap));
+    }
+
+    /// After a rotation the saved choices that named the old key name the new
+    /// one, so what the dashboard shows is the key that signs; a choice naming
+    /// another key or connection is left as it is.
+    #[tokio::test]
+    async fn a_rotation_moves_the_choices_that_named_the_old_key() {
+        let keyed = |connection: &str, key: &str| {
+            let mut signing = vta_signing(Some(connection));
+            if let Some(signing) = signing.as_mut() {
+                signing.key_id = Some(key.to_string());
+            }
+            signing
+        };
+        let surfaces_dir = tempfile::tempdir().unwrap();
+        let surface_store = crate::surfaces::FileSystemAgentSurfaceStore::new(
+            surfaces_dir
+                .path()
+                .to_path_buf(),
+        )
+        .await
+        .unwrap();
+        for (id, signing) in [
+            ("s-old", keyed("conn", "key-1")),
+            ("s-other", keyed("conn", "key-9")),
+            ("s-elsewhere", keyed("other", "key-1")),
+        ] {
+            crate::surfaces::AgentSurfaceStore::save(&surface_store, &signing_surface(id, None, signing))
+                .await
+                .unwrap();
+        }
+        let surface_store: Arc<dyn crate::surfaces::AgentSurfaceStore> = Arc::new(surface_store);
+        let issuers_dir = tempfile::tempdir().unwrap();
+        let issuer_store = crate::issuers::FileSystemIssuerStore::new(
+            issuers_dir
+                .path()
+                .to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let mut issuer = crate::issuers::types::Issuer::new(
+            "issuer-a".into(),
+            "Research".into(),
+            "did:example:issuer".into(),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        );
+        issuer.signing = keyed("conn", "key-1");
+        crate::issuers::IssuerStore::create(&issuer_store, &issuer)
+            .await
+            .unwrap();
+        let issuer_store: Arc<dyn crate::issuers::IssuerStore> = Arc::new(issuer_store);
+
+        follow_key_rotation(
+            &Some(Extension(Arc::clone(&surface_store))),
+            &Some(Extension(Arc::clone(&issuer_store))),
+            "conn",
+            "key-1",
+            "key-2",
+        )
+        .await;
+
+        let key_of = |signing: Option<crate::config::agent_surface::SurfaceSigningConfig>| {
+            signing.and_then(|signing| signing.key_id)
+        };
+        let surface_key = |id: &'static str| {
+            let store = Arc::clone(&surface_store);
+            async move {
+                key_of(
+                    store
+                        .get(id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .signing,
+                )
+            }
+        };
+        assert_eq!(
+            surface_key("s-old")
+                .await
+                .as_deref(),
+            Some("key-2")
+        );
+        assert_eq!(
+            surface_key("s-other")
+                .await
+                .as_deref(),
+            Some("key-9")
+        );
+        assert_eq!(
+            surface_key("s-elsewhere")
+                .await
+                .as_deref(),
+            Some("key-1")
+        );
+        assert_eq!(
+            key_of(
+                issuer_store
+                    .get("issuer-a")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .signing
+            )
+            .as_deref(),
+            Some("key-2")
+        );
     }
 
     #[tokio::test]

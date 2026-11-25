@@ -239,54 +239,97 @@ pub async fn verify_jcs_proof(
     proof: &Value,
     did_cache: Arc<DIDCacheClient>,
 ) -> Result<()> {
-    let members = proof
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("proof is not a Data Integrity proof"))?;
-    let text = |name: &str| {
-        members
-            .get(name)
-            .and_then(Value::as_str)
-    };
-    if text("type") != Some("DataIntegrityProof") {
-        anyhow::bail!("proof is not a Data Integrity proof");
-    }
-    if text("cryptosuite") != Some(JCS_CRYPTOSUITE) {
-        anyhow::bail!("eddsa-jcs-2022 verification was given a {:?} proof", text("cryptosuite"));
-    }
-    let verification_method =
-        text("verificationMethod").ok_or_else(|| anyhow::anyhow!("proof names no verification method"))?;
-    let purpose = text("proofPurpose").ok_or_else(|| anyhow::anyhow!("proof names no proofPurpose"))?;
-    let proof_value = text("proofValue").ok_or_else(|| anyhow::anyhow!("proof carries no proofValue"))?;
-
-    let (_, signature) = multibase::decode(proof_value).context("proofValue is not multibase")?;
-    let signature = Signature::from_slice(&signature)
-        .map_err(|e| anyhow::anyhow!("proofValue is not an Ed25519 signature: {e}"))?;
-
-    let mut options = members.clone();
-    options.remove("proofValue");
-    let canonical = |value: &Value| {
-        serde_json_canonicalizer::to_string(value)
-            .map_err(|e| anyhow::anyhow!("canonicalising for eddsa-jcs-2022: {e}"))
-    };
-    let mut hash_data = Vec::with_capacity(64);
-    hash_data.extend_from_slice(&Sha256::digest(canonical(&Value::Object(options))?.as_bytes()));
-    hash_data.extend_from_slice(&Sha256::digest(canonical(document)?.as_bytes()));
-
+    let signed = JcsSigningInput::of(document, proof)?;
     let key = GatewayVmResolver::new(did_cache)
-        .resolve_for_purpose(verification_method, purpose)
+        .resolve_for_purpose(signed.verification_method, signed.purpose)
         .await
         .map_err(|e| anyhow::anyhow!("eddsa-jcs-2022 proof verification failed: {e}"))?;
     if key.key_type != KeyType::Ed25519 {
-        anyhow::bail!("eddsa-jcs-2022 proof verification failed: {verification_method} is not an Ed25519 key");
+        anyhow::bail!("eddsa-jcs-2022 proof verification failed: {} is not an Ed25519 key", signed.verification_method);
     }
-    let key: [u8; 32] = key
-        .public_key_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("eddsa-jcs-2022 proof verification failed: the key is not 32 bytes"))?;
-    VerifyingKey::from_bytes(&key)
-        .and_then(|key| key.verify_strict(&hash_data, &signature))
-        .map_err(|e| anyhow::anyhow!("eddsa-jcs-2022 proof verification failed: {e}"))
+    signed.verify_with(&key.public_key_bytes)
+}
+
+/// Verify an `eddsa-jcs-2022` `proof` over `document` against a known Ed25519
+/// public key (multibase, `z`-prefixed `0xed01 ++ key`), without resolving the
+/// DID it names: for a signer whose key is already known.
+pub fn verify_jcs_proof_with_key(
+    document: &Value,
+    proof: &Value,
+    public_key_multibase: &str,
+) -> Result<()> {
+    let (_, bytes) = multibase::decode(public_key_multibase).context("the public key is not multibase")?;
+    let key = match bytes.as_slice() {
+        [0xed, 0x01, key @ ..] => key,
+        _ => anyhow::bail!("the public key is not an Ed25519 multibase key"),
+    };
+    JcsSigningInput::of(document, proof)?.verify_with(key)
+}
+
+/// What an `eddsa-jcs-2022` proof signs, and its signature.
+struct JcsSigningInput<'a> {
+    verification_method: &'a str,
+    purpose: &'a str,
+    hash_data: Vec<u8>,
+    signature: Signature,
+}
+
+impl<'a> JcsSigningInput<'a> {
+    fn of(
+        document: &Value,
+        proof: &'a Value,
+    ) -> Result<Self> {
+        let members = proof
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("proof is not a Data Integrity proof"))?;
+        let text = |name: &str| {
+            members
+                .get(name)
+                .and_then(Value::as_str)
+        };
+        if text("type") != Some("DataIntegrityProof") {
+            anyhow::bail!("proof is not a Data Integrity proof");
+        }
+        if text("cryptosuite") != Some(JCS_CRYPTOSUITE) {
+            anyhow::bail!("eddsa-jcs-2022 verification was given a {:?} proof", text("cryptosuite"));
+        }
+        let verification_method =
+            text("verificationMethod").ok_or_else(|| anyhow::anyhow!("proof names no verification method"))?;
+        let purpose = text("proofPurpose").ok_or_else(|| anyhow::anyhow!("proof names no proofPurpose"))?;
+        let proof_value = text("proofValue").ok_or_else(|| anyhow::anyhow!("proof carries no proofValue"))?;
+
+        let (_, signature) = multibase::decode(proof_value).context("proofValue is not multibase")?;
+        let signature = Signature::from_slice(&signature)
+            .map_err(|e| anyhow::anyhow!("proofValue is not an Ed25519 signature: {e}"))?;
+
+        let mut options = members.clone();
+        options.remove("proofValue");
+        let canonical = |value: &Value| {
+            serde_json_canonicalizer::to_string(value)
+                .map_err(|e| anyhow::anyhow!("canonicalising for eddsa-jcs-2022: {e}"))
+        };
+        let mut hash_data = Vec::with_capacity(64);
+        hash_data.extend_from_slice(&Sha256::digest(canonical(&Value::Object(options))?.as_bytes()));
+        hash_data.extend_from_slice(&Sha256::digest(canonical(document)?.as_bytes()));
+        Ok(Self {
+            verification_method,
+            purpose,
+            hash_data,
+            signature,
+        })
+    }
+
+    fn verify_with(
+        &self,
+        public_key: &[u8],
+    ) -> Result<()> {
+        let key: [u8; 32] = public_key
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("eddsa-jcs-2022 proof verification failed: the key is not 32 bytes"))?;
+        VerifyingKey::from_bytes(&key)
+            .and_then(|key| key.verify_strict(&self.hash_data, &self.signature))
+            .map_err(|e| anyhow::anyhow!("eddsa-jcs-2022 proof verification failed: {e}"))
+    }
 }
 
 #[cfg(test)]

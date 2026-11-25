@@ -208,6 +208,12 @@ An Issuer's choice applies to every surface it owns that sets none of its own, b
 gateway-wide default. See _Signing key source_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#signing-key-source).
 
+The Secrets page's Key Management tab says the signing keys are held by a separately operated
+trust agent only while `custody_claim` is true, and otherwise that some tokens are still signed
+with the gateway's own key; the connect wizard's Complete step points to **Settings → Security →
+Gateway signing** for changing the default later. See _Key Management tab_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#key-management-tab).
+
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 
 The endpoint editor picks a Kafka endpoint's security protocol (`plaintext`, `ssl`,

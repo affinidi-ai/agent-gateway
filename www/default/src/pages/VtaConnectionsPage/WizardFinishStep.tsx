@@ -172,7 +172,7 @@ export const WizardFinishStep: React.FC<Props> = ({
                 {existingDefault
                   ? 'An agent is already the appliance default; this would replace it.'
                   : 'The appliance signs with its own key today.'}{' '}
-                Change this later in Settings → System → Key management, or per surface in the
+                Change this later in Settings → Security → Gateway signing, or per surface in the
                 surface editor.
               </span>
             </span>

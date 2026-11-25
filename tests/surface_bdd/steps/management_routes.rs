@@ -194,10 +194,19 @@ async fn hold_tenant_token(
     tenant: &str,
     surfaces: &str,
 ) {
+    hold_scoped_tenant_token(world, tenant, surfaces, &[]).await;
+}
+
+async fn hold_scoped_tenant_token(
+    world: &mut SurfaceWorld,
+    tenant: &str,
+    surfaces: &str,
+    scopes: &[&str],
+) {
     ensure_admin_session(world).await;
     let request = json!({
         "name": "agents token",
-        "scopes": [],
+        "scopes": scopes,
         "resource_pattern": format!("TENANT:${{x-external-account}}:surfaces:{surfaces}"),
         "required_headers": [{"name": TENANT_HEADER, "pattern": tenant}],
     });
@@ -323,6 +332,19 @@ async fn tenant_personal_access_token(
     tenant: String,
 ) {
     hold_tenant_token(world, &tenant, ALL_SURFACES).await;
+}
+
+#[given(expr = "a personal access token of tenant {string} with scopes {string}")]
+async fn scoped_tenant_personal_access_token(
+    world: &mut SurfaceWorld,
+    tenant: String,
+    scopes: String,
+) {
+    let scopes: Vec<&str> = scopes
+        .split(',')
+        .map(str::trim)
+        .collect();
+    hold_scoped_tenant_token(world, &tenant, ALL_SURFACES, &scopes).await;
 }
 
 #[given(expr = "a personal access token of tenant {string} limited to surface {string}")]

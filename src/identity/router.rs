@@ -2642,6 +2642,7 @@ pub async fn create_identity_api_router(
         }
     }
     let key_directory = std::sync::Arc::new(key_directory);
+    key_directory.publish_local_key_use();
     let sts_signing_authority: std::sync::Arc<dyn crate::identity::authority::CredentialAuthority> =
         std::sync::Arc::new(
             crate::vta::key_directory::ApplianceAuthority::new(std::sync::Arc::clone(&key_directory))

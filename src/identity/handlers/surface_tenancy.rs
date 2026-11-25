@@ -6753,6 +6753,7 @@ mod tests {
             pairing: Default::default(),
             created_at: now,
             updated_at: now,
+            retired_at: None,
         }
     }
 

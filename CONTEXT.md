@@ -142,6 +142,9 @@ flowchart LR
 | **Local signing** | What the gateway does with its own keys when no trust agent signs for it: the keys and DIDs stay as they are on disk, and every signature is made by the VTA library running inside the gateway process. It holds no custody claim: the keys are on the gateway's own host. _Avoid: embedded trust agent, built-in trust agent._ |
 | **Gateway signing** | The gateway-wide default signing key source (`default_signing` in the settings, Settings → Security → Gateway signing): what signs tokens, ID-JAGs, credentials, payment evidence and the issuer attestation for every surface and issuer that sets no source of its own. Changing it changes the issuer DID of what is issued from then on. _Avoid: audit signing._ |
 | **Control key** | The key the gateway authenticates to a trust agent with. When it is a `did:key` held in a file it is rotated with `acl/swap-key`, on demand or on an optional schedule. _Avoid: auth key, admin key._ |
+| **Signing key source** | What signs for a surface, an issuer or the whole gateway: **Gateway secret** (the gateway's own key) or **Verifiable Trust Agent** (a key in a connected trust agent, named by connection, context and key). A surface that sets none follows its issuer, then Gateway signing. _Avoid: signer type, key backend._ |
+| **Trust agent connection** | The gateway's record of one trust agent: its endpoint, DID, control key, pairing state and signing keys (`/v1/vta/connections`). The `[vta]` block's own agent is the connection `vta-bootstrap`. Tenant-owned or appliance-wide. _Avoid: VTA config, VTA link._ |
+| **Trust agent context** | A namespace inside a trust agent that holds keys and signs as one DID; a credential signed in it names that DID as its issuer. _Avoid: VTA tenant, VTA account._ |
 
 ## Terms and consent
 

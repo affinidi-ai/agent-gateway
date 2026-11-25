@@ -1890,7 +1890,10 @@ surface has been deleted." (`api-key-surface-deleted-info`) at the top of Key In
 The Secrets page's **Key Management** tab (`?tab=key-management`,
 `key-management-tab-trigger`, `pages/SecretsPage/KeyManagementTab.tsx`) is shown only with
 `key_management.view` and reads `GET /v1/key-management/inventory`. It opens with a status alert
-naming the deployment tier and whether keys are held by a separately operated agent, then one card
+naming the deployment tier and, from `custody_claim`, either "Signing keys are held by a
+separately-operated trust agent; the gateway keeps only the key it signs in to that agent with."
+or, while anything still signs with the gateway's own key, "Some tokens are still signed with the
+gateway's own key, so not every signing key is held by a separate party.", then one card
 per trust agent connection the caller may see (its keys with `kid`, status, public key and
 retirement, `KeyManagementTables.tsx`), a **Surface mapping** card (which backend, context and key
 each surface and variant signs with, "inherit" when it sets nothing, and a "via issuer" badge,
@@ -2823,7 +2826,9 @@ with the shared navigation test ids (`wizard-next`, `wizard-back`, `wizard-cance
    the server needs to change Gateway signing) and pre-checked only when `GET /v1/settings` was
    read and holds no `default_signing` at all: connecting a second agent must never silently
    repoint signing away from one, a stored choice of the gateway's own key counts as a default,
-   and a failed read leaves it unchecked. **Done** returns to the tab.
+   and a failed read leaves it unchecked. Its hint says it can be changed later in
+   **Settings → Security → Gateway signing**, or per surface in the surface editor. **Done**
+   returns to the tab.
 
 `?id=` resumes a created connection at the grant step, or at the last step when it is connected.
 A revoked or degraded one opens at the grant step showing its state and reason
@@ -2872,7 +2877,10 @@ stores nothing and says what applies meanwhile (`surface-signing-pick-agent`).
   (`surface-signing-inherited`) saying which. The gateway-wide default is read from
   `default_resolution` in `GET /v1/vta/status`, which reports the dashboard's Gateway signing
   when one is set; when it cannot be read (no `vta_connections.view`) the note says "Following the
-  gateway-wide default, which could not be read." and names no source. **Use the gateway-wide default**
+  gateway-wide default, which could not be read." and names no source. While the default is loading
+  or unreadable, the source select of a surface or issuer that sets nothing shows **Gateway
+  secret**, as the approved design has it; the note beside it is what tells the operator, and
+  nothing is saved until a source is picked. **Use the gateway-wide default**
   (`surface-signing-reset`) takes an own choice back.
 - **Identity → Issuers**: the list has a **Signing key source** column (`issuers-signing-<id>`:
   Default, Gateway secret, or `VTA · <agent name>`), and the issuer editor

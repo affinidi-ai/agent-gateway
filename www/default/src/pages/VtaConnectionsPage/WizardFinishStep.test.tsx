@@ -110,6 +110,21 @@ describe('WizardFinishStep', () => {
     expect(onDefaultChoice).toHaveBeenCalledWith(true);
   });
 
+  it('points to where Gateway signing is changed later', async () => {
+    settingsReturning(null);
+
+    render(
+      <WizardFinishStep
+        connection={connection({ keys: { active: { key_id: 'k' } } })}
+        onProvisionKey={jest.fn()}
+        onSettled={noop}
+        onDefaultChoice={jest.fn()}
+      />
+    );
+
+    expect(await screen.findByText(/Settings → Security → Gateway signing/)).toBeInTheDocument();
+  });
+
   it('leaves the default unchecked when one is already set', async () => {
     // Connecting a second agent must never silently repoint signing for
     // everything already running against the first.

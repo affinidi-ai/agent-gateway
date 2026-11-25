@@ -257,34 +257,21 @@ impl VtaCredentialAuthority {
             .client
             .dispatch_signed(TASK_KEYS_SIGN_JWS, request)
             .await?;
-        if response.jws.trim().is_empty() {
-            return Err(VtaError::Protocol("keys/sign-jws response carried an empty `jws`".to_string()));
-        }
-        // Fail closed on attribution: the token is about to be published under
-        // this gateway's issuer DID, so the VTA must have signed with the key
-        // we named, under the algorithm that key uses. A mismatch is a contract
-        // or configuration fault, never something to sign a token on.
-        if response.key_id != self.signing_key_id {
-            return Err(VtaError::Protocol(format!(
-                "keys/sign-jws echoed key `{}` but `{}` was requested",
-                response.key_id, self.signing_key_id
-            )));
-        }
-        if response.alg != SIGNING_ALGORITHM {
-            return Err(VtaError::Protocol(format!(
-                "keys/sign-jws signed with `{}`; the gateway key uses `{SIGNING_ALGORITHM}`",
-                response.alg
-            )));
-        }
-        // The token is published only once it is the one asked for: its
-        // header names the requested key, algorithm and type, its payload is
-        // the claims sent, and the key's public key (recorded with the key id,
-        // or else read from the agent once) verifies its signature.
-        check_returned_jws(&response.jws, &self.signing_key_id, typ, claims)?;
         let public_key = self
             .signing_key_public_multibase()
             .await?;
-        verify_jws_signature(&response.jws, &public_key)?;
+        verify_returned_token(
+            &ReturnedToken {
+                jws: &response.jws,
+                key_id: &response.key_id,
+                alg: &response.alg,
+            },
+            &self.signing_key_id,
+            &self.signing_key_id,
+            typ,
+            claims,
+            &public_key,
+        )?;
         if let Some(audit) = &self.audit {
             let subject = claims
                 .get("sub")
@@ -299,10 +286,84 @@ impl VtaCredentialAuthority {
     }
 }
 
+/// Has the trust agent sign a fresh nonce with `key_id` and checks the token
+/// against `public_key`, so a key recorded with that public key is one the
+/// agent holds and signs with, never only a value a request supplied.
+pub(crate) async fn prove_key_possession(
+    client: &crate::vta::client::VtaRestClient,
+    key_id: &str,
+    public_key: &str,
+) -> Result<(), VtaError> {
+    let claims = serde_json::json!({ "nonce": uuid::Uuid::new_v4().to_string() });
+    let response: SignJwsResult = client
+        .dispatch_signed(
+            TASK_KEYS_SIGN_JWS,
+            serde_json::json!({
+                "keyId": key_id,
+                "header": { "typ": "JWT", "kid": key_id },
+                "payload": claims,
+            }),
+        )
+        .await?;
+    verify_returned_token(
+        &ReturnedToken {
+            jws: &response.jws,
+            key_id: &response.key_id,
+            alg: &response.alg,
+        },
+        key_id,
+        key_id,
+        "JWT",
+        &claims,
+        public_key,
+    )
+}
+
+/// A token a trust agent returned from `keys/sign-jws`, with the key id and
+/// algorithm it says it signed with.
+pub(crate) struct ReturnedToken<'a> {
+    pub jws: &'a str,
+    pub key_id: &'a str,
+    pub alg: &'a str,
+}
+
+/// The one check every token a trust agent returns passes before it is
+/// published: it names the key `key_id` asked for under the gateway's
+/// algorithm, its protected header names `kid`, that algorithm and `typ`, its
+/// payload is `claims`, and `public_key` (the key's Ed25519 multibase public
+/// key) verifies its signature. Anything else is a contract or configuration
+/// fault, never a token to sign on.
+pub(crate) fn verify_returned_token(
+    returned: &ReturnedToken<'_>,
+    key_id: &str,
+    kid: &str,
+    typ: &str,
+    claims: &Value,
+    public_key: &str,
+) -> Result<(), VtaError> {
+    if returned.jws.trim().is_empty() {
+        return Err(VtaError::Protocol("keys/sign-jws response carried an empty `jws`".to_string()));
+    }
+    if returned.key_id != key_id {
+        return Err(VtaError::Protocol(format!(
+            "keys/sign-jws echoed key `{}` but `{key_id}` was requested",
+            returned.key_id
+        )));
+    }
+    if returned.alg != SIGNING_ALGORITHM {
+        return Err(VtaError::Protocol(format!(
+            "keys/sign-jws signed with `{}`; the key uses `{SIGNING_ALGORITHM}`",
+            returned.alg
+        )));
+    }
+    check_returned_jws(returned.jws, kid, typ, claims)?;
+    verify_jws_signature(returned.jws, public_key)
+}
+
 /// Checks that the compact `jws` an agent returned is the token asked for: its
 /// protected header names `key_id`, the gateway's algorithm and `typ`, and its
 /// payload is `claims`. Other header fields the agent adds are allowed.
-pub(crate) fn check_returned_jws(
+fn check_returned_jws(
     jws: &str,
     key_id: &str,
     typ: &str,
@@ -341,7 +402,7 @@ pub(crate) fn check_returned_jws(
 
 /// Checks that the compact `jws` carries a signature the Ed25519 multibase
 /// public key `public_key_mb` verifies.
-pub(crate) fn verify_jws_signature(
+fn verify_jws_signature(
     jws: &str,
     public_key_mb: &str,
 ) -> Result<(), VtaError> {
@@ -684,6 +745,32 @@ mod live_tests {
             .expect("the JWS verifies against the VTA signing key");
         let decode = |s: &str| serde_json::from_slice::<Value>(&unb64(s)).expect("json part");
         (decode(parts[0]), decode(parts[1]))
+    }
+
+    /// A key recorded with a supplied public key is one the agent signs with:
+    /// the agent signs a nonce with it, under exactly that public key.
+    #[tokio::test]
+    async fn a_supplied_public_key_is_accepted_only_once_the_agent_signs_under_it() {
+        let signing = Arc::new(SigningKey::from_bytes(&[13u8; 32]));
+        let (base, _vta) = spawn(Arc::clone(&signing)).await;
+        let control = Arc::new(ControlKey::from_seed([7u8; 32]));
+        let client = VtaRestClient::new(&base, "did:webvh:vta.example", control, Duration::from_secs(5), 8, None)
+            .expect("build client");
+
+        prove_key_possession(&client, "key-2", &multibase_of(&signing))
+            .await
+            .expect("the agent signs with the key under the public key supplied");
+        let refused = prove_key_possession(&client, "key-2", &multibase_of(&SigningKey::from_bytes(&[14u8; 32])))
+            .await
+            .expect_err("a public key the agent does not sign under is not recorded");
+
+        assert!(
+            refused
+                .log_detail()
+                .contains("does not verify"),
+            "{}",
+            refused.log_detail()
+        );
     }
 
     #[tokio::test]

@@ -7009,7 +7009,7 @@ mod live_connection_tests {
                         added_at: now,
                         retired_at: None,
                     }),
-                    // The second surface names a different key of the same agent.
+                    // The second surface names a key the connection has retired.
                     // The connection records both halves, as provisioning does,
                     // because an internal key's record is never returned again.
                     retiring: vec![SigningKey {
@@ -7027,6 +7027,7 @@ mod live_connection_tests {
                 },
                 created_at: now,
                 updated_at: now,
+                retired_at: None,
             })
             .await
             .expect("store the connection");
@@ -7091,23 +7092,19 @@ mod live_connection_tests {
         assert_ne!(payload(&first)["issuer"], local_did);
         assert_eq!(header(&first)["kid"], active_key, "it must sign with the connection's key, never its context");
 
-        // The property the `key_id` fix exists for: a second surface on the
-        // *same* connection signs with a different key, so rotating or
-        // revoking one cannot affect the other.
+        // A surface naming a key the connection has retired signs with the
+        // connection's active key, so a rotation moves every choice that named
+        // the old one; the retired key stays published for tokens it signed.
         let second = issuer
             .create_credential("did:example:live-b", &fields, None, Some("s-other"))
             .await
             .expect("the second surface signs");
         assert_eq!(
             header(&second)["kid"],
-            other_key,
-            "a surface's key_id must be honoured, not replaced by the connection's active key"
+            active_key,
+            "a retired key no longer signs; the connection's active key does"
         );
-        assert_ne!(
-            header(&first)["kid"],
-            header(&second)["kid"],
-            "two surfaces on one connection must be able to use different keys"
-        );
+        assert_eq!(payload(&second)["issuer"], format!("did:key:{active_public_key}"));
     }
 }
 
@@ -7194,6 +7191,7 @@ mod surface_injection_tests {
                 },
                 created_at: now,
                 updated_at: now,
+                retired_at: None,
             },
         )
         .await

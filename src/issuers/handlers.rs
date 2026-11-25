@@ -433,6 +433,7 @@ pub async fn delete_issuer<S: IssuerStore>(
     Path(id): Path<String>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    signing_editor: crate::identity::handlers::signing_choice::SigningEditor,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let issuer = store
         .get(&id)
@@ -445,6 +446,9 @@ pub async fn delete_issuer<S: IssuerStore>(
     if !issuer_writable(&issuer, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Issuer is outside this token's permitted scope".into()));
     }
+    // The surfaces that follow a signing issuer move to the gateway-wide
+    // signer once it is gone, so deleting one is a signing change.
+    require_signing_permission(Some(&issuer.id), issuer.signing.as_ref(), None, &signing_editor).await?;
 
     store
         .delete(&id)
@@ -1341,8 +1345,18 @@ mod tests {
             Some(StatusCode::FORBIDDEN)
         );
 
-        let delete =
-            delete_issuer(Extension(store.clone()), Extension(None), Path(issuer.id.clone()), tenant_a(), None).await;
+        let delete = delete_issuer(
+            Extension(store.clone()),
+            Extension(None),
+            Path(issuer.id.clone()),
+            tenant_a(),
+            None,
+            crate::identity::handlers::signing_choice::SigningEditor::signed_in_as(
+                crate::auth::types::UserRole::Administrator,
+            )
+            .await,
+        )
+        .await;
         assert_eq!(
             delete
                 .err()
@@ -1402,8 +1416,18 @@ mod tests {
             Some(StatusCode::NOT_FOUND)
         );
 
-        let delete =
-            delete_issuer(Extension(store.clone()), Extension(None), Path(issuer.id.clone()), tenant_a(), None).await;
+        let delete = delete_issuer(
+            Extension(store.clone()),
+            Extension(None),
+            Path(issuer.id.clone()),
+            tenant_a(),
+            None,
+            crate::identity::handlers::signing_choice::SigningEditor::signed_in_as(
+                crate::auth::types::UserRole::Administrator,
+            )
+            .await,
+        )
+        .await;
         assert_eq!(
             delete
                 .err()
@@ -1459,10 +1483,19 @@ mod tests {
         .unwrap();
         assert_eq!(updated.name, "Tenant issuer");
 
-        let status =
-            delete_issuer(Extension(store.clone()), Extension(None), Path(issuer.id.clone()), tenant_a(), None)
-                .await
-                .unwrap();
+        let status = delete_issuer(
+            Extension(store.clone()),
+            Extension(None),
+            Path(issuer.id.clone()),
+            tenant_a(),
+            None,
+            crate::identity::handlers::signing_choice::SigningEditor::signed_in_as(
+                crate::auth::types::UserRole::Administrator,
+            )
+            .await,
+        )
+        .await
+        .unwrap();
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert!(
             store
@@ -1509,6 +1542,7 @@ mod tests {
                     pairing: Default::default(),
                     created_at: now,
                     updated_at: now,
+                    retired_at: None,
                 },
             )
             .await
@@ -1523,6 +1557,56 @@ mod tests {
             description: None,
             signing: Some(signing),
         })
+    }
+
+    /// The surfaces that follow a signing issuer would move to the gateway-wide
+    /// signer, so deleting it needs `key_management.edit`; an issuer that signs
+    /// nothing deletes as before.
+    #[tokio::test]
+    async fn deleting_a_signing_issuer_needs_key_management_edit() {
+        let (store, mut issuer, _dir) = stored_issuer(None).await;
+        issuer.signing = Some(agent_signing("agent-1"));
+        store
+            .update(&issuer)
+            .await
+            .unwrap();
+        let power_user = || {
+            crate::identity::handlers::signing_choice::SigningEditor::signed_in_as(
+                crate::auth::types::UserRole::PowerUser,
+            )
+        };
+
+        let refused = delete_issuer(
+            Extension(store.clone()),
+            Extension(None),
+            Path(issuer.id.clone()),
+            None,
+            None,
+            power_user().await,
+        )
+        .await;
+        issuer.signing = None;
+        store
+            .update(&issuer)
+            .await
+            .unwrap();
+        let deleted = delete_issuer(
+            Extension(store.clone()),
+            Extension(None),
+            Path(issuer.id.clone()),
+            None,
+            None,
+            power_user().await,
+        )
+        .await;
+
+        assert_eq!(
+            refused
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(deleted, Ok(StatusCode::NO_CONTENT));
     }
 
     #[tokio::test]

@@ -370,7 +370,10 @@ may name only a public `https` endpoint, checked when saved and again before eac
 `signing.connection_id` (a variant sets none; it signs with its surface's) must name a connection of its own
 tenant or an appliance-wide one, and an unknown id is refused the same way, so a save never
 reveals whether another tenant's connection exists. The key inventory
-(`GET /v1/key-management/inventory`) lists only the connections the caller may read. The
+(`GET /v1/key-management/inventory`) lists only the connections the caller may read. The status
+(`GET /v1/vta/status`) lists the reserved addresses of only those connections for a tenant token
+or a token limited to some connections, and shows the `[vta]` block's control DID and key only to
+an appliance token that may read the `vta-bootstrap` connection. The
 gateway-wide default signing key source and the `[vta]` block's control key are appliance-wide
 settings, not tenant records. See [`TRUST_AGENT_SIGNING.md`](TRUST_AGENT_SIGNING.md#tenancy).
 A token with explicit scopes reaches these routes with the permission each one checks, listed

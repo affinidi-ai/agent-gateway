@@ -150,6 +150,17 @@ async fn operator_saves_issuer_signing_as(
     save_issuer_as(world, &operator, &issuer, body).await;
 }
 
+#[when(expr = "operator {string} deletes the issuer {string}")]
+async fn operator_deletes_issuer_as(
+    world: &mut SurfaceWorld,
+    operator: String,
+    issuer: String,
+) {
+    let path = format!("/v1/issuers/{}", issuer_id(world, &issuer));
+    let response = management_routes::send(world, Caller::Operator(&operator), Method::DELETE, &path, None).await;
+    world.admin_response = Some(response);
+}
+
 #[when(expr = "operator {string} renames the issuer {string} to {string} leaving its signing as it is")]
 async fn operator_renames_issuer_as(
     world: &mut SurfaceWorld,
@@ -193,6 +204,24 @@ async fn token_moves_surface_to_issuer(
     let mut surface = stored_surface(world).await;
     surface["issuer_id"] = json!(id);
     save_surface_with_token(world, &surface).await;
+}
+
+#[then("the answer is the one for an issuer that does not exist")]
+async fn answered_as_for_a_missing_issuer(world: &mut SurfaceWorld) {
+    let refused = world
+        .admin_response
+        .take()
+        .expect("the save was answered");
+    let mut surface = stored_surface(world).await;
+    surface["issuer_id"] = json!(uuid::Uuid::new_v4().to_string());
+    save_surface_with_token(world, &surface).await;
+    let missing = world
+        .admin_response
+        .as_ref()
+        .expect("the save was answered");
+
+    assert_eq!(refused.status, missing.status, "{} / {}", refused.body, missing.body);
+    assert_eq!(refused.body, missing.body);
 }
 
 #[when(expr = "the personal access token saves the surface with the description {string}")]

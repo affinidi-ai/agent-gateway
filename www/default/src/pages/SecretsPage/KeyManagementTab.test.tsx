@@ -95,3 +95,38 @@ describe('KeyManagementTab rotation', () => {
     expect(rotations[0].body).toEqual({ key_id: 'key-a-2x' });
   });
 });
+
+describe('KeyManagementTab custody', () => {
+  const inventory = (custodyClaim: boolean) =>
+    mockFetch.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            tier: 'self-hosted',
+            custody_claim: custodyClaim,
+            connections: [],
+            mappings: [],
+            orphaned_contexts: [],
+          }),
+      })
+    );
+
+  it('says the trust agent holds the signing keys only while the gateway signs nothing with its own', async () => {
+    inventory(true);
+    render(<KeyManagementTab />);
+
+    expect(
+      await screen.findByText(/Signing keys are held by a separately-operated trust agent/)
+    ).toBeInTheDocument();
+  });
+
+  it("says the gateway's own key still signs while it does", async () => {
+    inventory(false);
+    render(<KeyManagementTab />);
+
+    expect(
+      await screen.findByText(/Some tokens are still signed with the gateway's own key/)
+    ).toBeInTheDocument();
+  });
+});

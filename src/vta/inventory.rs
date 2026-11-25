@@ -196,6 +196,50 @@ pub fn signs_through_trust_agent(
     }
 }
 
+/// Whether a surface signs with the gateway's own key by choice: its own
+/// signing block, or else its issuer's, names the gateway secret.
+pub fn chooses_gateway_key(
+    surfaces: &[AgentSurface],
+    issuers: &[crate::issuers::types::Issuer],
+) -> bool {
+    let local = |signing: Option<&crate::config::agent_surface::SurfaceSigningConfig>| {
+        signing.is_some_and(|signing| signing.backend == Some(crate::config::agent_surface::SigningBackendKind::Local))
+    };
+    surfaces
+        .iter()
+        .any(|surface| {
+            match surface
+                .signing
+                .as_ref()
+                .filter(|signing| !signing.is_empty())
+            {
+                Some(own) => local(Some(own)),
+                None => local(
+                    surface
+                        .issuer_id
+                        .as_deref()
+                        .and_then(|id| {
+                            issuers
+                                .iter()
+                                .find(|issuer| issuer.id == id)
+                        })
+                        .and_then(|issuer| issuer.signing.as_ref()),
+                ),
+            }
+        })
+}
+
+/// Whether the gateway may claim that a separately operated trust agent holds
+/// its signing keys: it signs through one, no surface chooses the gateway's
+/// own key, and no token that key signed may still be outstanding.
+pub fn custody_claim(
+    through_trust_agent: bool,
+    surfaces: &[AgentSurface],
+    issuers: &[crate::issuers::types::Issuer],
+) -> bool {
+    through_trust_agent && !chooses_gateway_key(surfaces, issuers) && !crate::vta::key_directory::local_key_in_use()
+}
+
 /// Build the inventory from the live records.
 ///
 /// `default_signing` is the gateway-wide default from Settings. `known_contexts`
@@ -233,7 +277,15 @@ pub fn build(
                             .overrides
                             .signing
                             .as_ref(),
-                        None,
+                        if surface
+                            .signing
+                            .as_ref()
+                            .is_some_and(|signing| !signing.is_empty())
+                        {
+                            None
+                        } else {
+                            owner
+                        },
                     )
                 })
                 .collect::<Vec<_>>();
@@ -255,7 +307,7 @@ pub fn build(
     let through_trust_agent = signs_through_trust_agent(config, default_signing);
     KeyInventory {
         tier: tier(through_trust_agent).to_string(),
-        custody_claim: through_trust_agent,
+        custody_claim: custody_claim(through_trust_agent, surfaces, issuers),
         context_did_method: config
             .context_did_method
             .as_str()
@@ -321,6 +373,7 @@ mod tests {
             keys: Default::default(),
             created_at: now,
             updated_at: now,
+            retired_at: None,
         }
     }
 
@@ -571,6 +624,53 @@ mod tests {
         assert_eq!(mapping.backend, "local");
         assert_eq!(mapping.via_issuer, None);
         assert!(!mapping.inherits);
+    }
+
+    /// A surface or issuer that chooses the gateway secret still signs with the
+    /// gateway's own key, so no custody is claimed while one does.
+    #[test]
+    fn no_custody_is_claimed_while_a_surface_or_its_issuer_chooses_the_gateway_secret() {
+        let gateway_secret = || SurfaceSigningConfig {
+            backend: Some(SigningBackendKind::Local),
+            ..Default::default()
+        };
+
+        let own = build(&vta_config(), None, &[], &[surface("s1", Some(gateway_secret()))], &[], &[]);
+        let via_issuer =
+            build(&vta_config(), None, &[], &[owned_by_issuer(None)], &[issuer_with(Some(gateway_secret()))], &[]);
+        let through_the_agent =
+            build(&vta_config(), None, &[], &[owned_by_issuer(None)], &[issuer_with(Some(remote("c1")))], &[]);
+
+        assert!(!own.custody_claim);
+        assert!(!via_issuer.custody_claim);
+        assert!(through_the_agent.custody_claim);
+    }
+
+    /// A variant signs with its surface's choice, so when the surface follows
+    /// its issuer the variant's row names that issuer too.
+    #[test]
+    fn a_variant_of_a_surface_that_follows_its_issuer_names_that_issuer() {
+        let mut owned = owned_by_issuer(None);
+        owned
+            .variants
+            .push(crate::config::agent_surface_variants::SurfaceVariant {
+                id: "v1".to_string(),
+                alias: "beta".to_string(),
+                name: "Beta".to_string(),
+                description: String::new(),
+                enabled: true,
+                overrides: Default::default(),
+            });
+
+        let inventory = build(&vta_config(), None, &[], &[owned], &[issuer_with(Some(remote("c1")))], &[]);
+
+        let variant = inventory
+            .mappings
+            .iter()
+            .find(|mapping| mapping.variant_id.as_deref() == Some("v1"))
+            .expect("the variant's row");
+        assert_eq!(variant.via_issuer.as_deref(), Some("Research"));
+        assert_eq!(variant.context_id.as_deref(), Some("ctx-issuer"));
     }
 
     #[test]

@@ -186,6 +186,10 @@ impl Drop for Running {
     }
 }
 
+/// How often a driver that woke to retry asks again for a slot a Rotate or
+/// Cancel holds.
+const SLOT_RETRY: Duration = Duration::from_millis(50);
+
 fn backoff(attempts: u32) -> Duration {
     Duration::from_secs(
         10u64
@@ -213,6 +217,9 @@ pub struct ConnectionKeyRotator {
     clock: Arc<dyn Clock>,
     switch_timeout: Duration,
     running: RunningSet,
+    /// Rotations whose driver is waiting to retry. Their driver still owns
+    /// them, so no second driver starts one while it waits.
+    waiting: RunningSet,
 }
 
 impl ConnectionKeyRotator {
@@ -232,6 +239,7 @@ impl ConnectionKeyRotator {
             clock,
             switch_timeout,
             running: Arc::default(),
+            waiting: Arc::default(),
         }
     }
 
@@ -427,6 +435,14 @@ impl ConnectionKeyRotator {
         &self,
         id: &str,
     ) -> Result<Outcome, Stalled> {
+        if self
+            .waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(id)
+        {
+            return Ok(Outcome::Busy);
+        }
         let Some(mut running) = Running::begin(&self.running, id) else {
             return Ok(Outcome::Busy);
         };
@@ -464,13 +480,19 @@ impl ConnectionKeyRotator {
                 Ok(None) => {}
                 Ok(Some(Step::Wait(wait))) => {
                     // Released while waiting, so a cancel can go through; the
-                    // next round reloads the record and sees it.
+                    // next round reloads the record and sees it. The driver
+                    // keeps the rotation meanwhile, and a Rotate or Cancel
+                    // holding the slot when it wakes only delays it.
+                    let waiting = Running::begin(&self.waiting, id);
                     drop(running);
                     self.clock.sleep(wait).await;
-                    running = match Running::begin(&self.running, id) {
-                        Some(running) => running,
-                        None => return Ok(Outcome::Busy),
+                    running = loop {
+                        if let Some(running) = Running::begin(&self.running, id) {
+                            break running;
+                        }
+                        tokio::time::sleep(SLOT_RETRY).await;
                     };
+                    drop(waiting);
                 }
                 Ok(Some(Step::RolledBack)) => return Ok(Outcome::RolledBack),
                 Err(e) => return Err(Stalled(e.log_detail().to_string())),
@@ -1116,6 +1138,7 @@ mod tests {
             pairing,
             created_at: now,
             updated_at: now,
+            retired_at: None,
         };
         let store = Arc::new(FakeStore(Mutex::new(Default::default())));
         store
@@ -1318,6 +1341,53 @@ mod tests {
                 .expect("drive"),
             Outcome::NothingToDo,
             "the driver sees the cancel and stops"
+        );
+    }
+
+    /// A driver that wakes while a Rotate or Cancel holds the rotation's slot
+    /// waits for it rather than leaving the rotation with no driver, and no
+    /// second driver starts while it waits.
+    #[tokio::test]
+    async fn a_waiting_driver_that_wakes_while_its_slot_is_held_keeps_driving() {
+        let clock = Arc::new(ParkedClock {
+            parked: tokio::sync::Notify::new(),
+            released: tokio::sync::Notify::new(),
+        });
+        let f = fixture_with_clock(&["key-1"], clock.clone()).await;
+        f.rotator
+            .start(ID, None)
+            .await
+            .unwrap();
+        let rotator = Arc::clone(&f.rotator);
+        let drive = tokio::spawn(async move { rotator.drive(ID).await });
+        clock.parked.notified().await;
+
+        assert_eq!(
+            f.rotator
+                .drive(ID)
+                .await
+                .expect("drive"),
+            Outcome::Busy,
+            "the waiting driver still owns the rotation"
+        );
+        let held = Running::begin(&f.rotator.running, ID).expect("the slot is free while the driver waits");
+        clock.released.notify_one();
+        tokio::time::sleep(SLOT_RETRY * 4).await;
+        assert!(!drive.is_finished(), "the driver waits for the slot instead of giving up");
+        drop(held);
+
+        clock.parked.notified().await;
+        f.rotator
+            .cancel(ID)
+            .await
+            .expect("cancel");
+        clock.released.notify_one();
+        assert_eq!(
+            drive
+                .await
+                .unwrap()
+                .expect("drive"),
+            Outcome::NothingToDo
         );
     }
 

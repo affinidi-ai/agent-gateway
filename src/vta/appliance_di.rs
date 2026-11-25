@@ -36,7 +36,7 @@ pub struct ApplianceVcIssuer {
     local: Arc<dyn VcIssuer>,
     /// Contexts already known to carry a signing identity, so the check costs
     /// one round trip per context per process rather than one per request.
-    identified: tokio::sync::RwLock<std::collections::HashSet<String>>,
+    identified: crate::vta::context_creator::IdentifiedContexts,
 }
 
 impl ApplianceVcIssuer {
@@ -49,7 +49,7 @@ impl ApplianceVcIssuer {
             registry,
             appliance_default,
             local,
-            identified: tokio::sync::RwLock::new(std::collections::HashSet::new()),
+            identified: Default::default(),
         }
     }
 
@@ -67,22 +67,12 @@ impl ApplianceVcIssuer {
     async fn ensure_can_issue(
         &self,
         client: &Arc<crate::vta::client::VtaRestClient>,
+        connection_id: &str,
         context_id: &str,
     ) {
-        if self
-            .identified
-            .read()
-            .await
-            .contains(context_id)
-        {
-            return;
-        }
-        if crate::vta::context_creator::ensure_context_can_issue(client, context_id).await {
-            self.identified
-                .write()
-                .await
-                .insert(context_id.to_string());
-        }
+        self.identified
+            .ensure(client, connection_id, context_id)
+            .await;
     }
 
     /// The agent-backed issuer for the current appliance default, or `None`
@@ -124,7 +114,7 @@ impl ApplianceVcIssuer {
                 );
                 anyhow::anyhow!("the trust agent Gateway signing names cannot be used: {e}")
             })?;
-        self.ensure_can_issue(&client, context_id)
+        self.ensure_can_issue(&client, connection_id, context_id)
             .await;
         Ok(Some(Arc::new(crate::vta::vc_issuer::VtaVcIssuer::new(client, context_id.to_string())) as Arc<dyn VcIssuer>))
     }
@@ -511,6 +501,7 @@ mod live_tests {
                 },
                 created_at: now,
                 updated_at: now,
+                retired_at: None,
             })
             .await
             .expect("store the connection");

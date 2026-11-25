@@ -50,6 +50,15 @@ async fn answer_signer(
         .filter(|did| !did.is_empty())
         .ok_or_else(|| VtaError::Protocol("the trust agent's answer names no signing key".to_string()))?
         .to_string();
+    // A DID that cannot be resolved now says nothing about the grant, so it
+    // is a transport failure, like an agent that cannot be reached; a document
+    // that resolves and does not back the proof is a refusal.
+    if !signer.starts_with("did:key:") {
+        did_cache
+            .resolve(&signer)
+            .await
+            .map_err(|e| VtaError::Transport(format!("resolving the trust agent's DID `{signer}`: {e}")))?;
+    }
     let mut unsigned = answer.clone();
     if let Some(members) = unsigned.as_object_mut() {
         members.remove("proof");
@@ -113,6 +122,10 @@ pub struct VtaConnectionRegistry {
     /// together, so an edited or disabled connection stops being reachable by
     /// either path at the same moment.
     client_cache: RwLock<HashMap<String, Arc<VtaRestClient>>>,
+    /// The activation the caches were filled in. A node promoted to Active
+    /// may hold clients built from records another node has changed since,
+    /// so a new activation empties both caches before their next use.
+    cached_in_activation: std::sync::atomic::AtomicU64,
 }
 
 impl VtaConnectionRegistry {
@@ -134,7 +147,31 @@ impl VtaConnectionRegistry {
             didcomm: None,
             cache: RwLock::new(HashMap::new()),
             client_cache: RwLock::new(HashMap::new()),
+            cached_in_activation: std::sync::atomic::AtomicU64::new(
+                crate::server::mode::current_activation_generation(),
+            ),
         }
+    }
+
+    /// Empties both caches once after the node is activated again, so a
+    /// promoted node builds its clients from the records as stored now.
+    async fn forget_caches_of_an_earlier_activation(&self) {
+        let now = crate::server::mode::current_activation_generation();
+        if self
+            .cached_in_activation
+            .swap(now, std::sync::atomic::Ordering::SeqCst)
+            == now
+        {
+            return;
+        }
+        self.cache
+            .write()
+            .await
+            .clear();
+        self.client_cache
+            .write()
+            .await
+            .clear();
     }
 
     /// Attach the mediator channel that carries Trust Tasks over DIDComm,
@@ -162,6 +199,8 @@ impl VtaConnectionRegistry {
         connection_id: &str,
         key_id: Option<&str>,
     ) -> Result<Arc<dyn CredentialAuthority>, VtaError> {
+        self.forget_caches_of_an_earlier_activation()
+            .await;
         let cache_key = connector_cache_key(connection_id, key_id);
         if let Some(hit) = self
             .cache
@@ -207,6 +246,8 @@ impl VtaConnectionRegistry {
         } else {
             connection_id
         };
+        self.forget_caches_of_an_earlier_activation()
+            .await;
         if let Some(hit) = self
             .client_cache
             .read()
@@ -234,43 +275,74 @@ impl VtaConnectionRegistry {
         Ok(client)
     }
 
-    /// A tenant's connection is dialled only while its endpoint's host resolves
-    /// to public addresses, so a name re-pointed at an internal address after
-    /// it was saved is refused before the gateway connects.
-    async fn assert_tenant_endpoint_public(connection: &VtaConnection) -> Result<(), VtaError> {
+    /// A tenant's connection is dialled only at public addresses: its
+    /// endpoint's host is resolved and checked when its client is built, and
+    /// the client connects to those addresses only, so a name re-pointed at an
+    /// internal address is never dialled. A lookup that fails is a transport
+    /// error, as for an agent that cannot be reached.
+    async fn tenant_endpoint_pin(
+        connection: &VtaConnection
+    ) -> Result<Option<crate::vta::transport::PinnedEndpoint>, VtaError> {
         if connection.tenant_id.is_none() || connection.transport != VtaConnectionTransport::Https {
-            return Ok(());
+            return Ok(None);
         }
-        let endpoint = connection
-            .endpoint
-            .trim()
+        let refused = |e: String| {
+            VtaError::Config(format!(
+                "VTA connection `{}` is not usable: a tenant's trust agent endpoint must resolve to public addresses: {e}",
+                connection.id
+            ))
+        };
+        let url = crate::url_validation::validate_webhook_url(connection.endpoint.trim()).map_err(refused)?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| refused("the endpoint names no host".to_string()))?
             .to_string();
-        tokio::task::spawn_blocking(move || crate::url_validation::validate_resolved_webhook_url(&endpoint))
-            .await
-            .map_err(|e| VtaError::Config(format!("the endpoint check did not finish: {e}")))?
-            .map(|_| ())
-            .map_err(|e| {
-                VtaError::Config(format!(
-                    "VTA connection `{}` is not usable: a tenant's trust agent endpoint must resolve to public addresses: {e}",
-                    connection.id
-                ))
-            })
+        let port = url
+            .port_or_known_default()
+            .unwrap_or(443);
+        let lookup = host.clone();
+        let addrs: Vec<std::net::SocketAddr> = tokio::task::spawn_blocking(move || {
+            use std::net::ToSocketAddrs;
+            (lookup.as_str(), port)
+                .to_socket_addrs()
+                .map(Iterator::collect)
+        })
+        .await
+        .map_err(|e| VtaError::Transport(format!("the endpoint lookup did not finish: {e}")))?
+        .map_err(|e| VtaError::Transport(format!("resolving `{host}`: {e}")))?;
+        if addrs.is_empty() {
+            return Err(VtaError::Transport(format!("resolving `{host}` returned no addresses")));
+        }
+        if let Some(blocked) = addrs
+            .iter()
+            .find(|addr| crate::url_validation::is_blocked_resolved_webhook_ip(addr.ip()))
+        {
+            return Err(refused(format!("`{host}` resolves to `{}`", blocked.ip())));
+        }
+        Ok(Some(crate::vta::transport::PinnedEndpoint { host, addrs }))
     }
 
-    /// What the record of `connection_id` says about its use: in use, retired
-    /// (deleted, disabled or revoked), or unknown when it cannot be read, whose
-    /// keys stop being trusted rather than staying trusted on an error.
+    /// What the record of `connection_id` says about the keys a signer used
+    /// through it from `since` on: in use, retired (deleted, disabled or
+    /// revoked now, or retired at any point since), or unknown when the record
+    /// is stored but cannot be read, whose keys stop being trusted for now
+    /// rather than being forgotten.
     pub async fn retirement(
         &self,
         connection_id: &str,
+        since: chrono::DateTime<chrono::Utc>,
     ) -> Retirement {
         match self
             .store
-            .get(connection_id)
+            .get_checked(connection_id)
             .await
         {
             Ok(Some(connection))
-                if !connection.enabled || connection.pairing.state == crate::vta::pairing::PairingState::Revoked =>
+                if !connection.enabled
+                    || connection.pairing.state == crate::vta::pairing::PairingState::Revoked
+                    || connection
+                        .retired_at
+                        .is_some_and(|retired| retired >= since) =>
             {
                 Retirement::Retired
             }
@@ -320,19 +392,18 @@ impl VtaConnectionRegistry {
         connection
             .validate()
             .map_err(|e| VtaError::Config(format!("VTA connection `{}` is not usable: {e}", connection.id)))?;
-        Self::assert_tenant_endpoint_public(connection).await?;
+        let pin = Self::tenant_endpoint_pin(connection).await?;
 
         let control_key = self
             .control_key(connection)
             .await?;
-        let client = VtaRestClient::new(
-            &connection.endpoint,
+        let client = VtaRestClient::with_transport(
+            Arc::new(crate::vta::transport::HttpsTransport::pinned(&connection.endpoint, self.timeout, pin.as_ref())?),
             &connection.vta_did,
             control_key,
-            self.timeout,
             self.max_concurrent,
             None,
-        )?;
+        );
         // The session token states the role and contexts the customer granted.
         // It arrives inside the agent's signed answer, so the DID whose key
         // signed that answer is the agent that issued it.
@@ -454,7 +525,7 @@ impl VtaConnectionRegistry {
         connection: &VtaConnection,
     ) -> Result<Arc<VtaRestClient>, VtaError> {
         Self::assert_record_usable(connection)?;
-        Self::assert_tenant_endpoint_public(connection).await?;
+        let pin = Self::tenant_endpoint_pin(connection).await?;
 
         // Same exemption as `build`: the bootstrap connection's client is the
         // one `[vta]` already dialled, and re-dialling it would open a second
@@ -490,7 +561,7 @@ impl VtaConnectionRegistry {
         // — is identical, so two connections may use different carriers at the
         // same time without any code path diverging.
         Ok(Arc::new(VtaRestClient::with_transport(
-            self.transport_for(connection)?,
+            self.transport_for(connection, pin.as_ref())?,
             &connection.vta_did,
             control_key,
             self.max_concurrent,
@@ -522,10 +593,11 @@ impl VtaConnectionRegistry {
     fn transport_for(
         &self,
         connection: &VtaConnection,
+        pin: Option<&crate::vta::transport::PinnedEndpoint>,
     ) -> Result<Arc<dyn crate::vta::transport::TrustTaskTransport>, VtaError> {
         match connection.transport {
             VtaConnectionTransport::Https => {
-                Ok(Arc::new(crate::vta::transport::HttpsTransport::new(&connection.endpoint, self.timeout)?))
+                Ok(Arc::new(crate::vta::transport::HttpsTransport::pinned(&connection.endpoint, self.timeout, pin)?))
             }
             VtaConnectionTransport::Didcomm => {
                 let channel = self
@@ -810,6 +882,7 @@ mod tests {
             pairing: Default::default(),
             created_at: now,
             updated_at: now,
+            retired_at: None,
         }
     }
 
@@ -822,6 +895,58 @@ mod tests {
 
     fn detail(err: VtaError) -> String {
         err.log_detail().to_string()
+    }
+
+    fn tenant_connection(endpoint: &str) -> VtaConnection {
+        let mut connection = connection("t1", true);
+        connection.tenant_id = Some("tenant-a".to_string());
+        connection.endpoint = endpoint.to_string();
+        connection
+    }
+
+    #[tokio::test]
+    async fn a_tenant_connection_is_pinned_to_the_public_addresses_it_was_checked_at() {
+        let pin = VtaConnectionRegistry::tenant_endpoint_pin(&tenant_connection("https://203.0.113.7"))
+            .await
+            .expect("a public address")
+            .expect("a tenant connection is pinned");
+
+        assert_eq!(pin.host, "203.0.113.7");
+        assert_eq!(
+            pin.addrs,
+            vec![
+                "203.0.113.7:443"
+                    .parse()
+                    .unwrap()
+            ]
+        );
+        assert_eq!(
+            VtaConnectionRegistry::tenant_endpoint_pin(&connection("c1", true))
+                .await
+                .unwrap(),
+            None,
+            "an appliance-wide connection may reach a private agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_connection_at_a_private_address_is_refused() {
+        for endpoint in ["https://10.0.0.5", "https://127.0.0.1", "https://localhost"] {
+            let err = VtaConnectionRegistry::tenant_endpoint_pin(&tenant_connection(endpoint))
+                .await
+                .expect_err("a private address is never dialled for a tenant");
+            assert!(matches!(err, VtaError::Config(_)), "{endpoint}: {err:?}");
+            assert!(!err.is_unavailable(), "{endpoint}: a refused address is not an outage");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tenant_endpoint_that_does_not_resolve_is_unavailable_not_misconfigured() {
+        let err = VtaConnectionRegistry::tenant_endpoint_pin(&tenant_connection("https://agent.invalid"))
+            .await
+            .expect_err("nothing to dial");
+
+        assert!(err.is_unavailable(), "a failed lookup keeps the stored state, like an unreachable agent: {err:?}");
     }
 
     #[tokio::test]
@@ -963,6 +1088,42 @@ mod tests {
                 .err()
                 .expect("disabling must take effect without a restart"),
         );
+        assert!(msg.contains("disabled"), "unexpected error: {msg}");
+    }
+
+    /// A node promoted from Standby may hold a connector built before another
+    /// node disabled the connection; the new activation drops it, so the
+    /// disable applies from the first use.
+    #[tokio::test]
+    async fn a_promoted_node_rebuilds_its_connectors_from_the_records_as_stored_now() {
+        let store = MemoryStore::new(vec![{
+            let mut c = connection(BOOTSTRAP_CONNECTION_ID, true);
+            c.control_key_ref = Some("unused".to_string());
+            c
+        }]);
+        let registry = registry(Arc::clone(&store) as Arc<dyn VtaConnectionStorage>, None);
+        registry
+            .authority_for_key(BOOTSTRAP_CONNECTION_ID, None)
+            .await
+            .expect("usable before the disable");
+        let mut disabled = connection(BOOTSTRAP_CONNECTION_ID, false);
+        disabled.control_key_ref = Some("unused".to_string());
+        store.replace(disabled);
+
+        registry
+            .cached_in_activation
+            .store(
+                crate::server::mode::current_activation_generation().wrapping_sub(1),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        let msg = detail(
+            registry
+                .authority_for_key(BOOTSTRAP_CONNECTION_ID, None)
+                .await
+                .err()
+                .expect("a new activation reads the record again"),
+        );
+
         assert!(msg.contains("disabled"), "unexpected error: {msg}");
     }
 
@@ -1224,14 +1385,14 @@ mod tests {
 
         assert_eq!(
             registry
-                .transport_for(&over_https)
+                .transport_for(&over_https, None)
                 .unwrap()
                 .carrier(),
             "https"
         );
         assert_eq!(
             registry
-                .transport_for(&over_didcomm)
+                .transport_for(&over_didcomm, None)
                 .unwrap()
                 .carrier(),
             "didcomm"
@@ -1248,7 +1409,7 @@ mod tests {
 
         let msg = detail(
             registry
-                .transport_for(&over_didcomm)
+                .transport_for(&over_didcomm, None)
                 .err()
                 .expect("there is no mediator to reach the VTA through"),
         );
@@ -1321,7 +1482,22 @@ mod tests {
             .await
             .expect_err("tampered");
 
+        assert!(!err.is_unavailable(), "a forged answer is a refusal, not an outage");
         assert!(detail(err).contains(agent.did()));
+    }
+
+    /// A DID that cannot be resolved now leaves the grant unjudged, so Verify
+    /// keeps the stored state as it does for an agent it cannot reach.
+    #[tokio::test]
+    async fn an_answer_whose_signer_cannot_be_resolved_now_is_unavailable() {
+        let mut answer = signed_answer(&ControlKey::from_seed([21u8; 32])).await;
+        answer["proof"]["verificationMethod"] = serde_json::json!("did:web:agent.invalid#key-1");
+
+        let err = answer_signer(&answer, resolver().await)
+            .await
+            .expect_err("nothing to verify against");
+
+        assert!(err.is_unavailable(), "{err:?}");
     }
 
     #[tokio::test]

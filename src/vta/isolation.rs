@@ -281,6 +281,7 @@ mod tests {
             pairing: crate::vta::pairing::PairingRecord { state, ..Default::default() },
             created_at: now,
             updated_at: now,
+            retired_at: None,
         }
     }
 

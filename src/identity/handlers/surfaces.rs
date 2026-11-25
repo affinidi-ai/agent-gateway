@@ -3716,7 +3716,6 @@ pub async fn create_surface(
     refuse_a2a_settings_sent_on_other_protocols(&surface)?;
     convert_old_shape_body(&mut surface)?;
     drop_inbound_api_key_ids(&mut surface);
-    require_signing_permission(&state, None, &surface, &signing_editor).await?;
 
     // Assign a new ID if not provided
     if surface.surface_id.is_empty() {
@@ -3788,6 +3787,9 @@ pub async fn create_surface(
         resource_scope(&scope),
     )
     .await?;
+    // After the references are checked, so an issuer the caller may not
+    // reference is refused the same way whether or not it signs.
+    require_signing_permission(&state, None, &surface, &signing_editor).await?;
     validate_trust_checks(&surface)?;
     super::surface_tenancy::validate_authority_sources(&state, &mut surface, None).await?;
     super::surface_tenancy::validate_external_consent_bindings(&state, &mut surface, None).await?;
@@ -4770,7 +4772,6 @@ async fn validate_and_save_surface(
     signing_editor: &super::signing_choice::SigningEditor,
 ) -> Result<(AgentSurface, Vec<SurfaceWarning>), SurfaceApiError> {
     drop_inbound_api_key_ids(&mut surface);
-    require_signing_permission(state, existing, &surface, signing_editor).await?;
     // Normalize the route BEFORE the shape check so the historical "missing
     // slash is auto-fixed" behaviour is preserved.
     normalize_saved_route(&mut surface, existing);
@@ -4816,6 +4817,7 @@ async fn validate_and_save_surface(
         existing,
     )?;
     super::surface_tenancy::validate_surface_references(state, &surface, existing, context, scope).await?;
+    require_signing_permission(state, existing, &surface, signing_editor).await?;
     validate_trust_checks(&surface)?;
     super::surface_tenancy::validate_authority_sources(state, &mut surface, existing).await?;
     super::surface_tenancy::validate_external_consent_bindings(state, &mut surface, existing).await?;

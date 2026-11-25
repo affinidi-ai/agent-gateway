@@ -327,7 +327,7 @@ pub struct KeyDirectory {
     /// Contexts already given a signing identity, by connection and context,
     /// so the bootstrap costs one round trip per context rather than one per
     /// request, and a same-named context on another agent gets its own.
-    identified: tokio::sync::RwLock<std::collections::HashSet<(String, String)>>,
+    identified: crate::vta::context_creator::IdentifiedContexts,
     /// Attestation signers by client and context, so a context's identity is
     /// read once per connection client rather than on every attestation.
     context_signers: RwLock<HashMap<(usize, String), Arc<dyn crate::vta::context_signer::ContextSigner>>>,
@@ -374,6 +374,9 @@ pub struct KeyDirectory {
     /// Lazy context provisioning. When present, a VTA-backed `KeyRef`
     /// that names no context has one derived and created on first use.
     provisioner: Option<Arc<crate::vta::provisioning::ContextProvisioner>>,
+    /// When this directory last handed out the gateway's own key to sign a
+    /// token.
+    local_use: Arc<LocalKeyUse>,
     /// Connectors are reusable across requests; cache per `KeyRef` so a
     /// per-request resolution costs a map lookup, not a reconnect.
     ///
@@ -448,7 +451,7 @@ impl KeyDirectory {
         }
 
         Ok(Self {
-            identified: tokio::sync::RwLock::new(std::collections::HashSet::new()),
+            identified: Default::default(),
             context_signers: RwLock::new(HashMap::new()),
             defaults,
             mappings: Vec::new(),
@@ -463,8 +466,15 @@ impl KeyDirectory {
             issuers: None,
             provisioner: None,
             appliance_default: None,
+            local_use: Arc::new(LocalKeyUse::default()),
             cache: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Makes this directory's record of the gateway's own key use the one
+    /// [`local_key_in_use`] reads.
+    pub fn publish_local_key_use(&self) {
+        let _ = LOCAL_KEY_USE.set(Arc::clone(&self.local_use));
     }
 
     /// Install the appliance-wide override source (the dashboard setting).
@@ -492,21 +502,9 @@ impl KeyDirectory {
         connection_id: &str,
         context_id: &str,
     ) {
-        let key = (connection_id.to_string(), context_id.to_string());
-        if self
-            .identified
-            .read()
-            .await
-            .contains(&key)
-        {
-            return;
-        }
-        if crate::vta::context_creator::ensure_context_can_issue(client, context_id).await {
-            self.identified
-                .write()
-                .await
-                .insert(key);
-        }
+        self.identified
+            .ensure(client, connection_id, context_id)
+            .await;
     }
 
     /// The Data-Integrity credential issuer for one request's coordinates, or
@@ -1006,11 +1004,12 @@ impl KeyDirectory {
     pub async fn connection_retirement(
         &self,
         connection_id: &str,
+        since: chrono::DateTime<chrono::Utc>,
     ) -> crate::vta::registry::Retirement {
         match &self.connections {
             Some(connections) => {
                 connections
-                    .retirement(connection_id)
+                    .retirement(connection_id, since)
                     .await
             }
             None => crate::vta::registry::Retirement::InUse,
@@ -1110,6 +1109,9 @@ impl KeyDirectory {
             )));
         }
         key_ref.validate()?;
+        if key_ref.backend == KeyBackend::Local && purpose == KeyPurpose::Jwt {
+            self.local_use.note();
+        }
 
         // A registry-backed connection is resolved every time: the registry
         // owns its lifecycle, so caching it here would keep a disabled
@@ -1176,6 +1178,64 @@ impl KeyDirectory {
     }
 }
 
+/// When the gateway's own key was last handed out to sign a token.
+#[derive(Debug)]
+pub struct LocalKeyUse(std::sync::atomic::AtomicI64);
+
+impl Default for LocalKeyUse {
+    fn default() -> Self {
+        Self(std::sync::atomic::AtomicI64::new(i64::MIN))
+    }
+}
+
+impl LocalKeyUse {
+    fn note(&self) {
+        self.note_at(chrono::Utc::now());
+    }
+
+    fn note_at(
+        &self,
+        at: chrono::DateTime<chrono::Utc>,
+    ) {
+        self.0
+            .fetch_max(at.timestamp(), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn signed_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self
+            .0
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            i64::MIN => None,
+            at => chrono::DateTime::from_timestamp(at, 0),
+        }
+    }
+
+    /// Whether a token the gateway's own key signed may still be outstanding:
+    /// it signed one within the longest token lifetime, plus the time its use
+    /// is saved within. While it is not, a gateway that signs through a trust
+    /// agent neither publishes nor trusts that key.
+    pub fn in_use(&self) -> bool {
+        self.signed_at()
+            .is_some_and(|at| {
+                at + chrono::Duration::seconds(SIGNER_SEEN_REFRESH_SECS + EARLIER_SIGNER_GRACE_SECS)
+                    > chrono::Utc::now()
+            })
+    }
+}
+
+/// The gateway's own key use, as the signing key directory records it.
+static LOCAL_KEY_USE: std::sync::OnceLock<Arc<LocalKeyUse>> = std::sync::OnceLock::new();
+
+/// Whether the gateway's own key has signed a token that may still be
+/// outstanding, as the gateway's key directory recorded it; `false` when no
+/// key directory is installed.
+pub fn local_key_in_use() -> bool {
+    LOCAL_KEY_USE
+        .get()
+        .is_some_and(|local_use| local_use.in_use())
+}
+
 /// Connection id of the `[vta]` block's own connection.
 pub const DEFAULT_CONNECTION_ID: &str = "default";
 
@@ -1232,6 +1292,11 @@ struct SignerHistory {
     current: Option<CurrentSigner>,
     #[serde(default)]
     signers: Vec<EarlierSigner>,
+    /// When the gateway's own key last signed a token, saved at most every
+    /// [`SIGNER_SEEN_REFRESH_SECS`], so a restart or another node keeps it
+    /// published for as long as those tokens may be outstanding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_signed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// The signer the default last resolved to. It is saved the first time it
@@ -1247,8 +1312,16 @@ struct CurrentSigner {
     keys: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     issuer_did: Option<String>,
+    /// When it first signed: a retirement of its connection from then on
+    /// retires it.
+    #[serde(default = "the_epoch")]
+    since: chrono::DateTime<chrono::Utc>,
     /// When it last signed, to within [`SIGNER_SEEN_REFRESH_SECS`].
     seen_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn the_epoch() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::UNIX_EPOCH
 }
 
 impl CurrentSigner {
@@ -1266,6 +1339,7 @@ impl CurrentSigner {
             connection_id: self.connection_id,
             keys: self.keys,
             issuer_did: self.issuer_did,
+            since: self.since,
             not_after: now + chrono::Duration::seconds(EARLIER_SIGNER_GRACE_SECS),
         }
     }
@@ -1282,6 +1356,8 @@ struct EarlierSigner {
     keys: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     issuer_did: Option<String>,
+    #[serde(default = "the_epoch")]
+    since: chrono::DateTime<chrono::Utc>,
     not_after: chrono::DateTime<chrono::Utc>,
 }
 
@@ -1379,18 +1455,29 @@ impl ApplianceAuthority {
         mut self,
         path: std::path::PathBuf,
     ) -> Self {
-        *self.history.get_mut() = read_history_file(&path).await;
+        let history = read_history_file(&path).await;
+        if let Some(at) = history.local_signed_at {
+            self.directory
+                .local_use
+                .note_at(at);
+        }
+        *self.history.get_mut() = history;
         self.history_path = Some(path);
         self
     }
 
     async fn save_history(
         &self,
-        history: &SignerHistory,
+        history: &mut SignerHistory,
     ) {
         let Some(path) = &self.history_path else {
             return;
         };
+        history.local_signed_at = history.local_signed_at.max(
+            self.directory
+                .local_use
+                .signed_at(),
+        );
         let written = match serde_json::to_vec_pretty(history) {
             Ok(bytes) => crate::storage::filesystem::atomic_write_file_with_mode(path, &bytes, None)
                 .await
@@ -1438,7 +1525,7 @@ impl ApplianceAuthority {
         }
         if let Some(connection) = &last.connection_id
             && !self
-                .still_in_use(connection)
+                .still_in_use(connection, last.since)
                 .await
         {
             return None;
@@ -1446,17 +1533,20 @@ impl ApplianceAuthority {
         Some(last)
     }
 
-    /// Whether keys `connection_id` signed with are still this gateway's. One
-    /// seen deleted, disabled or revoked is removed from the history for good,
-    /// so enabling or pairing it again does not bring its earlier keys back;
-    /// one that cannot be read is left out without being forgotten.
+    /// Whether keys `connection_id` signed with from `since` on are still this
+    /// gateway's. A connection retired since then (deleted, disabled, revoked
+    /// or pointed at another agent, as its record keeps even once it is enabled
+    /// or paired again) retires them for good, and they are removed from the
+    /// history; one whose record cannot be read is left out without being
+    /// forgotten.
     async fn still_in_use(
         &self,
         connection_id: &str,
+        since: chrono::DateTime<chrono::Utc>,
     ) -> bool {
         match self
             .directory
-            .connection_retirement(connection_id)
+            .connection_retirement(connection_id, since)
             .await
         {
             crate::vta::registry::Retirement::InUse => true,
@@ -1469,26 +1559,56 @@ impl ApplianceAuthority {
         }
     }
 
+    /// Removes the signers of a retired connection, from this process's
+    /// history and from what another process saved, which is merged in first
+    /// so the save keeps that process's other signers.
     async fn forget_connection(
         &self,
         connection_id: &str,
     ) {
         let mut history = self.history.write().await;
-        let before = history.signers.len();
-        history
+        let saved = match &self.history_path {
+            Some(path) => read_history_file(path).await,
+            None => SignerHistory::default(),
+        };
+        let retired = |id: &Option<String>| id.as_deref() == Some(connection_id);
+        let held = history
             .signers
-            .retain(|s| s.connection_id.as_deref() != Some(connection_id));
-        let current_retired = history
+            .iter()
+            .any(|s| retired(&s.connection_id))
+            || history
+                .current
+                .as_ref()
+                .is_some_and(|c| retired(&c.connection_id));
+        let on_disk = saved
+            .signers
+            .iter()
+            .any(|s| retired(&s.connection_id))
+            || saved
+                .current
+                .as_ref()
+                .is_some_and(|c| retired(&c.connection_id));
+        if !held && !on_disk {
+            return;
+        }
+        let mut signers = std::mem::take(&mut history.signers);
+        signers.extend(saved.signers);
+        signers.retain(|s| !retired(&s.connection_id));
+        history.signers = unexpired(signers, chrono::Utc::now());
+        if history
             .current
             .as_ref()
-            .is_some_and(|c| c.connection_id.as_deref() == Some(connection_id));
-        if current_retired {
+            .is_some_and(|c| retired(&c.connection_id))
+        {
             history.current = None;
         }
-        if current_retired || history.signers.len() != before {
-            self.save_history(&history)
-                .await;
+        if history.current.is_none() {
+            history.current = saved
+                .current
+                .filter(|c| !retired(&c.connection_id));
         }
+        self.save_history(&mut history)
+            .await;
     }
 
     /// The earlier signers tokens may still carry: not yet past their
@@ -1508,7 +1628,7 @@ impl ApplianceAuthority {
             }
             if let Some(connection) = &signer.connection_id
                 && !self
-                    .still_in_use(connection)
+                    .still_in_use(connection, signer.since)
                     .await
             {
                 continue;
@@ -1535,6 +1655,13 @@ impl ApplianceAuthority {
             .await
             .as_ref()
             == Some(&key_ref);
+        // A key rotation keeps the choice and changes the key it signs with,
+        // and with it the issuer DID, so a saved signer that names another one
+        // is refreshed.
+        let issuer_did = authority
+            .issuer_did()
+            .await
+            .ok();
         let saved = self
             .history
             .read()
@@ -1542,14 +1669,17 @@ impl ApplianceAuthority {
             .current
             .clone()
             .filter(|c| c.signer == name);
+        let saved_matches = saved
+            .as_ref()
+            .is_some_and(|saved| saved.issuer_did == issuer_did);
         let current = match saved {
-            Some(saved) if known => {
+            Some(saved) if known && saved_matches => {
                 if (now - saved.seen_at).num_seconds() < SIGNER_SEEN_REFRESH_SECS {
                     return;
                 }
                 CurrentSigner { seen_at: now, ..saved }
             }
-            _ => CurrentSigner {
+            saved => CurrentSigner {
                 signer: name,
                 connection_id: managed_connection(&key_ref),
                 keys: match authority.issuer_jwks().await {
@@ -1563,10 +1693,8 @@ impl ApplianceAuthority {
                         Vec::new()
                     }
                 },
-                issuer_did: authority
-                    .issuer_did()
-                    .await
-                    .ok(),
+                issuer_did,
+                since: saved.map_or(now, |saved| saved.since),
                 seen_at: now,
             },
         };
@@ -1586,7 +1714,12 @@ impl ApplianceAuthority {
         if history
             .current
             .as_ref()
-            .is_some_and(|c| c.signer == current.signer && (now - c.seen_at).num_seconds() < SIGNER_SEEN_REFRESH_SECS)
+            .is_some_and(|c| {
+                c.signer == current.signer
+                    && c.keys == current.keys
+                    && c.issuer_did == current.issuer_did
+                    && (now - c.seen_at).num_seconds() < SIGNER_SEEN_REFRESH_SECS
+            })
         {
             return;
         }
@@ -1594,6 +1727,11 @@ impl ApplianceAuthority {
             Some(path) => read_history_file(path).await,
             None => SignerHistory::default(),
         };
+        if let Some(at) = saved.local_signed_at {
+            self.directory
+                .local_use
+                .note_at(at);
+        }
         let mut signers = std::mem::take(&mut history.signers);
         signers.extend(saved.signers);
         for other in history
@@ -1606,13 +1744,74 @@ impl ApplianceAuthority {
                 current.seen_at = current
                     .seen_at
                     .max(other.seen_at);
+                current.since = current.since.min(other.since);
             } else {
                 signers.push(other.replaced_at(now));
             }
         }
         history.signers = unexpired(signers, now);
         history.current = Some(current);
-        self.save_history(&history)
+        self.save_history(&mut history)
+            .await;
+    }
+
+    /// The signers built into this appliance that tokens may carry: the `[vta]`
+    /// block's, and the gateway's own key while a token it signed may still be
+    /// outstanding (see [`LocalKeyUse::in_use`]). Its use is saved first, so a
+    /// restart or another node keeps publishing it for as long.
+    async fn built_in_signers(&self) -> Vec<&Arc<dyn CredentialAuthority>> {
+        self.remember_local_use()
+            .await;
+        self.directory
+            .local_use
+            .in_use()
+            .then_some(&self.directory.local)
+            .into_iter()
+            .chain(self.directory.vta.as_ref())
+            .collect()
+    }
+
+    /// Saves when the gateway's own key last signed a token, at most every
+    /// [`SIGNER_SEEN_REFRESH_SECS`], merged with what another process saved.
+    async fn remember_local_use(&self) {
+        let Some(at) = self
+            .directory
+            .local_use
+            .signed_at()
+        else {
+            return;
+        };
+        let stale = |saved: Option<chrono::DateTime<chrono::Utc>>| {
+            saved.is_none_or(|saved| (at - saved).num_seconds() >= SIGNER_SEEN_REFRESH_SECS)
+        };
+        if self.history_path.is_none()
+            || !stale(
+                self.history
+                    .read()
+                    .await
+                    .local_signed_at,
+            )
+        {
+            return;
+        }
+        let mut history = self.history.write().await;
+        if !stale(history.local_signed_at) {
+            return;
+        }
+        let saved = match &self.history_path {
+            Some(path) => read_history_file(path).await,
+            None => SignerHistory::default(),
+        };
+        let mut signers = std::mem::take(&mut history.signers);
+        signers.extend(saved.signers);
+        history.signers = unexpired(signers, chrono::Utc::now());
+        if history.current.is_none() {
+            history.current = saved.current;
+        }
+        history.local_signed_at = history
+            .local_signed_at
+            .max(saved.local_signed_at);
+        self.save_history(&mut history)
             .await;
     }
 
@@ -1620,8 +1819,7 @@ impl ApplianceAuthority {
     /// an earlier default may carry.
     async fn built_in_keys(&self) -> Vec<serde_json::Value> {
         let mut keys = Vec::new();
-        let built_in = std::iter::once(&self.directory.local).chain(self.directory.vta.as_ref());
-        for authority in built_in {
+        for authority in self.built_in_signers().await {
             match authority.issuer_jwks().await {
                 Ok(jwks) => merge_keys(&mut keys, jwks_keys(&jwks)),
                 Err(e) => tracing::debug!(
@@ -1711,8 +1909,7 @@ impl CredentialAuthority for ApplianceAuthority {
                 dids.push(did);
             }
         }
-        let built_in = std::iter::once(&self.directory.local).chain(self.directory.vta.as_ref());
-        for authority in built_in {
+        for authority in self.built_in_signers().await {
             if let Ok(did) = authority.issuer_did().await
                 && !dids.contains(&did)
             {
@@ -1854,7 +2051,7 @@ mod tests {
 
     fn directory_with(vta: Option<Arc<dyn CredentialAuthority>>) -> KeyDirectory {
         KeyDirectory {
-            identified: tokio::sync::RwLock::new(std::collections::HashSet::new()),
+            identified: Default::default(),
             context_signers: RwLock::new(HashMap::new()),
             di_vc_issuer: None,
             context_creator: None,
@@ -1869,6 +2066,7 @@ mod tests {
             issuers: None,
             provisioner: None,
             appliance_default: None,
+            local_use: Arc::new(LocalKeyUse::default()),
             cache: RwLock::new(HashMap::new()),
         }
     }
@@ -2069,6 +2267,7 @@ mod tests {
                 },
                 created_at: now,
                 updated_at: now,
+                retired_at: None,
             }
         }
 
@@ -3288,7 +3487,7 @@ mod tests {
                     .await
                     .unwrap()
             ),
-            vec!["b-1", "a-1", "local-1"],
+            vec!["b-1", "a-1"],
             "the signing key first, then the earlier signer's and the gateway's own"
         );
     }
@@ -3326,7 +3525,7 @@ mod tests {
                     .await
                     .expect("the JWKS is still served")
             ),
-            vec!["a-1", "local-1"]
+            vec!["a-1"]
         );
     }
 
@@ -3377,14 +3576,14 @@ mod tests {
                     .await
                     .unwrap()
             ),
-            vec!["b-1", "a-1", "local-1"],
+            vec!["b-1", "a-1"],
             "the key that signed before the switch is still published"
         );
         assert_eq!(
             after
                 .earlier_issuer_dids()
                 .await,
-            vec!["did:key:b".to_string(), "did:key:a".to_string(), "did:key:local".to_string()],
+            vec!["did:key:b".to_string(), "did:key:a".to_string()],
             "the current signer's, though it has not resolved since the restart, then the earlier one's"
         );
     }
@@ -3430,6 +3629,7 @@ mod tests {
                     },
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
+                    retired_at: None,
                 })
                 .await
                 .unwrap();
@@ -3548,6 +3748,163 @@ mod tests {
         }
     }
 
+    async fn switched_off(store: &Arc<dyn crate::vta::connections::VtaConnectionStorage>) -> ApplianceAuthority {
+        let registry = Arc::new(crate::vta::registry::VtaConnectionRegistry::new(
+            Arc::clone(store),
+            None,
+            None,
+            None,
+            std::time::Duration::from_secs(5),
+            4,
+        ));
+        let authority = ApplianceAuthority::new(Arc::new(directory_with(None).with_connections(registry)));
+        authority
+            .note_signer(
+                managed_jwt_ref("vta-a"),
+                &(StubAuthority::new("did:key:a", vec!["a-1"]) as Arc<dyn CredentialAuthority>),
+            )
+            .await;
+        authority
+            .note_signer(
+                managed_jwt_ref("vta-b"),
+                &(StubAuthority::new("did:key:b", vec!["b-1"]) as Arc<dyn CredentialAuthority>),
+            )
+            .await;
+        authority
+    }
+
+    /// A connection disabled, revoked or pointed at another agent and then
+    /// restored before anything read the signer history still retires the
+    /// signer that used it: the record keeps when it was retired.
+    #[tokio::test]
+    async fn a_retirement_undone_before_any_read_still_retires_the_earlier_signer() {
+        for retire in ["disable", "revoke", "repoint"] {
+            let (store, _tmp) = connected_store(&["vta-a", "vta-b"]).await;
+            let authority = switched_off(&store).await;
+
+            crate::vta::connections::modify(store.as_ref(), "vta-a", |c| match retire {
+                "disable" => c.enabled = false,
+                "revoke" => c.pairing.state = crate::vta::pairing::PairingState::Revoked,
+                _ => c.endpoint = "https://elsewhere.example".to_string(),
+            })
+            .await
+            .unwrap();
+            crate::vta::connections::modify(store.as_ref(), "vta-a", |c| {
+                c.enabled = true;
+                c.pairing.state = crate::vta::pairing::PairingState::Connected;
+            })
+            .await
+            .unwrap();
+
+            assert!(
+                !authority
+                    .earlier_issuer_dids()
+                    .await
+                    .contains(&"did:key:a".to_string()),
+                "{retire}"
+            );
+            assert!(
+                !kids(
+                    &authority
+                        .issuer_jwks()
+                        .await
+                        .unwrap()
+                )
+                .contains(&"a-1".to_string()),
+                "{retire}"
+            );
+        }
+    }
+
+    /// A record that is stored but cannot be read leaves its signer out for
+    /// now without forgetting it; a deleted one would retire it for good.
+    #[tokio::test]
+    async fn an_unreadable_connection_record_does_not_retire_its_earlier_signer() {
+        let (store, tmp) = connected_store(&["vta-a", "vta-b"]).await;
+        let authority = switched_off(&store).await;
+        let record = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("vta-a"))
+            })
+            .expect("the record file");
+        let readable = std::fs::read(&record).unwrap();
+
+        std::fs::write(&record, b"not json").unwrap();
+        store
+            .refresh_from_disk()
+            .await
+            .unwrap();
+        let while_unreadable = authority
+            .earlier_issuer_dids()
+            .await;
+        std::fs::write(&record, readable).unwrap();
+        store
+            .refresh_from_disk()
+            .await
+            .unwrap();
+
+        assert!(!while_unreadable.contains(&"did:key:a".to_string()), "not trusted while unreadable");
+        assert!(
+            authority
+                .earlier_issuer_dids()
+                .await
+                .contains(&"did:key:a".to_string()),
+            "and not forgotten either"
+        );
+    }
+
+    /// A key rotation replaces the authority the default signs with while the
+    /// choice stays the same; the saved current signer follows it, so a switch
+    /// right after keeps the rotated-in key published.
+    #[tokio::test]
+    async fn the_current_signer_follows_a_key_rotation() {
+        let (store, _tmp) = connected_store(&["vta-a", "vta-b"]).await;
+        let registry = Arc::new(crate::vta::registry::VtaConnectionRegistry::new(
+            Arc::clone(&store),
+            None,
+            None,
+            None,
+            std::time::Duration::from_secs(5),
+            4,
+        ));
+        let authority = ApplianceAuthority::new(Arc::new(directory_with(None).with_connections(registry)));
+        for (did, kid) in [("did:key:k1", "k1"), ("did:key:k2", "k2")] {
+            authority
+                .note_signer(
+                    managed_jwt_ref("vta-a"),
+                    &(StubAuthority::new(did, vec![kid]) as Arc<dyn CredentialAuthority>),
+                )
+                .await;
+        }
+        authority
+            .note_signer(
+                managed_jwt_ref("vta-b"),
+                &(StubAuthority::new("did:key:b", vec!["b-1"]) as Arc<dyn CredentialAuthority>),
+            )
+            .await;
+
+        assert!(
+            kids(
+                &authority
+                    .issuer_jwks()
+                    .await
+                    .unwrap()
+            )
+            .contains(&"k2".to_string())
+        );
+        assert!(
+            authority
+                .earlier_issuer_dids()
+                .await
+                .contains(&"did:key:k2".to_string())
+        );
+    }
+
     /// An earlier signer stays published only until every token it signed has
     /// expired, including across a restart.
     #[tokio::test]
@@ -3560,12 +3917,14 @@ mod tests {
             connection_id: None,
             keys: vec![serde_json::json!({ "kid": kid })],
             issuer_did: Some(did.to_string()),
+            since: the_epoch(),
             not_after,
         };
         let now = chrono::Utc::now();
         std::fs::write(
             &path,
             serde_json::to_vec(&SignerHistory {
+                local_signed_at: None,
                 current: None,
                 signers: vec![
                     signer("did:key:old", "old-1", now - chrono::Duration::seconds(1)),
@@ -3584,7 +3943,7 @@ mod tests {
             authority
                 .earlier_issuer_dids()
                 .await,
-            vec!["did:key:recent".to_string(), "did:key:local".to_string()]
+            vec!["did:key:recent".to_string()]
         );
         assert_eq!(
             kids(
@@ -3594,6 +3953,93 @@ mod tests {
                     .unwrap()
             ),
             vec!["local-1", "recent-1"]
+        );
+    }
+
+    fn local_jwt_ref() -> KeyRef {
+        KeyRef {
+            backend: KeyBackend::Local,
+            context: None,
+            key_id: None,
+            purpose: KeyPurpose::Jwt,
+        }
+    }
+
+    /// Once the gateway signs through a trust agent, its own key is published
+    /// and trusted only while something it signed may be outstanding: here
+    /// nothing has signed with it, then a surface that chose it signs.
+    #[tokio::test]
+    async fn the_gateway_key_is_published_only_while_it_signs_tokens() {
+        let history = tempfile::tempdir().unwrap();
+        let authority = restarted(
+            Arc::new(StubApplianceDefault(default_signing_with("key-a"))),
+            &history
+                .path()
+                .join(SIGNER_HISTORY_FILE),
+        )
+        .await;
+
+        let before = kids(
+            &authority
+                .issuer_jwks()
+                .await
+                .unwrap(),
+        );
+        let trusted_before = authority
+            .earlier_issuer_dids()
+            .await;
+        authority
+            .directory
+            .authority_for(&local_jwt_ref(), KeyPurpose::Jwt)
+            .await
+            .unwrap();
+
+        assert!(!before.contains(&"local-1".to_string()), "{before:?}");
+        assert!(!trusted_before.contains(&"did:key:local".to_string()), "{trusted_before:?}");
+        assert!(
+            kids(
+                &authority
+                    .issuer_jwks()
+                    .await
+                    .unwrap()
+            )
+            .contains(&"local-1".to_string())
+        );
+        assert!(
+            authority
+                .earlier_issuer_dids()
+                .await
+                .contains(&"did:key:local".to_string())
+        );
+    }
+
+    /// The last use is saved, so after a restart the key stays published for as
+    /// long as a token it signed may be outstanding.
+    #[tokio::test]
+    async fn the_gateway_key_stays_published_across_a_restart_while_its_tokens_may_be_outstanding() {
+        let history = tempfile::tempdir().unwrap();
+        let path = history
+            .path()
+            .join(SIGNER_HISTORY_FILE);
+        let trust_agent = || Arc::new(StubApplianceDefault(default_signing_with("key-a")));
+        let before = restarted(trust_agent(), &path).await;
+        before
+            .directory
+            .authority_for(&local_jwt_ref(), KeyPurpose::Jwt)
+            .await
+            .unwrap();
+        before
+            .issuer_jwks()
+            .await
+            .unwrap();
+
+        let after = restarted(trust_agent(), &path).await;
+
+        assert!(
+            after
+                .earlier_issuer_dids()
+                .await
+                .contains(&"did:key:local".to_string())
         );
     }
 
@@ -3682,7 +4128,7 @@ mod tests {
                     .await
                     .unwrap()
             ),
-            vec!["b-1", "a-1", "local-1"]
+            vec!["b-1", "a-1"]
         );
         assert!(
             after
@@ -3716,7 +4162,7 @@ mod tests {
                     .await
                     .unwrap()
             ),
-            vec!["a-1", "local-1"]
+            vec!["a-1"]
         );
         assert!(
             after
@@ -3742,7 +4188,8 @@ mod tests {
                     .await
                     .unwrap()
             ),
-            vec!["local-1"]
+            Vec::<String>::new(),
+            "nothing it signed is outstanding, and the gateway's own key signed nothing"
         );
         assert!(
             !later
@@ -3799,11 +4246,13 @@ mod tests {
         std::fs::write(
             &path,
             serde_json::to_vec(&SignerHistory {
+                local_signed_at: None,
                 current: None,
                 signers: vec![EarlierSigner {
                     connection_id: None,
                     keys: vec![serde_json::json!({ "kid": "other-1" })],
                     issuer_did: Some("did:key:other".to_string()),
+                    since: the_epoch(),
                     not_after: chrono::Utc::now() + chrono::Duration::seconds(60),
                 }],
             })
@@ -3854,7 +4303,7 @@ mod tests {
                     .await
                     .unwrap()
             ),
-            vec!["a-1", "local-1"]
+            vec!["a-1"]
         );
     }
 

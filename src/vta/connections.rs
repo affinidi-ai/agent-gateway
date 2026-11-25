@@ -131,6 +131,13 @@ pub struct VtaConnection {
 
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+
+    /// When the connection last stopped being usable: disabled, revoked, or
+    /// pointed at another agent. Set by the store on such a write and never
+    /// cleared, so a signer that signed through it before then stays retired
+    /// even once the connection is enabled or paired again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<DateTime<Utc>>,
 }
 
 /// Where a connection's control key stands: which verification method of its
@@ -413,6 +420,7 @@ impl VtaConnection {
             pairing: Default::default(),
             created_at: now,
             updated_at: now,
+            retired_at: None,
         })
     }
 
@@ -443,6 +451,20 @@ pub trait VtaConnectionStorage: Send + Sync {
         id: &str,
     ) -> Result<Option<VtaConnection>>;
     async fn list(&self) -> Result<Vec<VtaConnection>>;
+    /// [`Self::get`], except that a record that is stored but cannot be read is
+    /// an error rather than `None`, so it is never taken for a deleted one.
+    async fn get_checked(
+        &self,
+        id: &str,
+    ) -> Result<Option<VtaConnection>> {
+        self.get(id).await
+    }
+
+    /// Reconcile a cached store with disk; a no-op for a store that always
+    /// reads from it.
+    async fn refresh_from_disk(&self) -> Result<()> {
+        Ok(())
+    }
     async fn update(
         &self,
         connection: VtaConnection,
@@ -451,6 +473,18 @@ pub trait VtaConnectionStorage: Send + Sync {
         &self,
         id: &str,
     ) -> Result<()>;
+}
+
+/// Whether saving `next` over `existing` stops the connection being usable as
+/// the agent it was: it is disabled, revoked, or pointed at another agent.
+fn retires(
+    existing: &VtaConnection,
+    next: &VtaConnection,
+) -> bool {
+    let revoked = |c: &VtaConnection| c.pairing.state == crate::vta::pairing::PairingState::Revoked;
+    let repointed =
+        existing.endpoint != next.endpoint || existing.vta_did != next.vta_did || existing.transport != next.transport;
+    (existing.enabled && !next.enabled) || (!revoked(existing) && revoked(next)) || repointed
 }
 
 /// Filesystem-backed connection store (`{storage_dir}/{id}.json`), inheriting
@@ -496,6 +530,7 @@ impl VtaConnectionStorage for FileSystemVtaConnectionStore {
         }
         connection.created_at = now;
         connection.updated_at = now;
+        connection.retired_at = None;
         self.storage
             .save(&connection)
             .await?;
@@ -514,6 +549,21 @@ impl VtaConnectionStorage for FileSystemVtaConnectionStore {
         self.storage.list_all().await
     }
 
+    async fn get_checked(
+        &self,
+        id: &str,
+    ) -> Result<Option<VtaConnection>> {
+        self.storage
+            .get_checked(id)
+            .await
+    }
+
+    async fn refresh_from_disk(&self) -> Result<()> {
+        self.storage
+            .refresh_from_disk()
+            .await
+    }
+
     async fn update(
         &self,
         mut connection: VtaConnection,
@@ -525,6 +575,11 @@ impl VtaConnectionStorage for FileSystemVtaConnectionStore {
             .ok_or_else(|| anyhow::anyhow!("VTA connection {} not found", connection.id))?;
         connection.created_at = existing.created_at;
         connection.updated_at = Utc::now();
+        connection.retired_at = if retires(&existing, &connection) {
+            Some(connection.updated_at)
+        } else {
+            existing.retired_at
+        };
         self.storage
             .save(&connection)
             .await?;
@@ -629,6 +684,7 @@ mod tests {
             pairing: Default::default(),
             created_at: now,
             updated_at: now,
+            retired_at: None,
         }
     }
 

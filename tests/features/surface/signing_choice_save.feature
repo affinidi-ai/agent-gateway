@@ -67,6 +67,21 @@ Feature: A signing choice is checked the same way wherever it is saved
     Then the admin API response status is 200
     And the issuer "Research" signs through the trust agent connection "shared-agent"
 
+  Scenario: A power user cannot delete an issuer that signs through a trust agent
+    Given the appliance holds the trust agent connection "shared-agent"
+    And the operator has created the issuer "Research"
+    And the operator has saved the issuer "Research" signing through the trust agent connection "shared-agent"
+    And operator "pete" has the "poweruser" role
+    When operator "pete" deletes the issuer "Research"
+    Then the admin API response status is 403
+    And the issuer "Research" signs through the trust agent connection "shared-agent"
+
+  Scenario: A power user can delete an issuer that signs nothing itself
+    Given the operator has created the issuer "Research"
+    And operator "pete" has the "poweruser" role
+    When operator "pete" deletes the issuer "Research"
+    Then the admin API response status is 204
+
   Scenario: An access token without key_management.edit cannot change a surface's signing
     Given the appliance holds the trust agent connection "shared-agent"
     And the appliance holds the secret "orders-key"
@@ -109,6 +124,17 @@ Feature: A signing choice is checked the same way wherever it is saved
     And operator "ada" holds a personal access token with scopes "surfaces.view,surfaces.edit"
     When the personal access token moves the surface to the issuer "Sales"
     Then the admin API response status is 200
+
+  Scenario: A tenant's surface naming another tenant's signing issuer is refused as if it did not exist
+    Given tenant "tenant-b" holds the trust agent connection "agent-b"
+    And the operator has created the issuer "Orders" owned by tenant "tenant-b"
+    And the operator has saved the issuer "Orders" signing through the trust agent connection "agent-b"
+    And tenant "tenant-a" holds the secret "orders-key"
+    And the operator has created the surface for route "/orders" owned by tenant "tenant-a" authenticating its target with secret "orders-key"
+    And a personal access token of tenant "tenant-a" with scopes "surfaces.view,surfaces.edit"
+    When the personal access token moves the surface to the issuer "Orders"
+    Then the admin API response status is 400
+    And the answer is the one for an issuer that does not exist
 
   Scenario: A variant that sets its own signing is refused
     Given the appliance holds the trust agent connection "shared-agent"

@@ -60,3 +60,23 @@ Feature: A trust agent connection is not cut off from what signs through it unno
     When the operator adds a trust agent connection at "http://trust-agent.example.test"
     Then the admin API response status is 400
     And the admin API error response mentions "https"
+
+  Scenario: Verifying a revoked connection is refused until it is paired again
+    Given the appliance holds the trust agent connection "idle-agent"
+    And the operator has revoked the trust agent connection "idle-agent"
+    When the operator verifies the trust agent connection "idle-agent"
+    Then the admin API response status is 409
+    And the admin API error response mentions "pair it again"
+
+  Scenario: Deleting a connection a surface signs through is refused and names the surface
+    Given the appliance holds the trust agent connection "shared-agent"
+    And the appliance holds the secret "orders-key"
+    And the operator has created the appliance-wide surface for route "/orders" authenticating its target with secret "orders-key"
+    And the surface signs through the trust agent connection "shared-agent"
+    When the operator deletes the trust agent connection "shared-agent"
+    Then the admin API response status is 409
+    And the admin API error response mentions "still signs for surface"
+
+  Scenario: A tenant's connection at a private address is refused
+    When the operator adds a trust agent connection for tenant "tenant-a" at "https://10.0.0.5"
+    Then the admin API response status is 400

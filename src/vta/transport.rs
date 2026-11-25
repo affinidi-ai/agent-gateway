@@ -53,13 +53,38 @@ pub struct HttpsTransport {
     trust_tasks_url: String,
 }
 
+/// A host and the addresses it was checked to resolve to, which the transport
+/// connects to instead of resolving the host again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedEndpoint {
+    pub host: String,
+    pub addrs: Vec<std::net::SocketAddr>,
+}
+
 impl HttpsTransport {
     pub fn new(
         base_url: &str,
         timeout: Duration,
     ) -> Result<Self, VtaError> {
-        let http = crate::http_client::with_timeout(timeout)
-            .map_err(|e| VtaError::Config(format!("build HTTP client: {e}")))?;
+        Self::pinned(base_url, timeout, None)
+    }
+
+    /// A transport that, given `pin`, connects only to its addresses.
+    pub fn pinned(
+        base_url: &str,
+        timeout: Duration,
+        pin: Option<&PinnedEndpoint>,
+    ) -> Result<Self, VtaError> {
+        let http = match pin {
+            None => crate::http_client::with_timeout(timeout).map_err(|e| e.to_string()),
+            Some(pin) => reqwest::Client::builder()
+                .timeout(timeout)
+                .redirect(reqwest::redirect::Policy::none())
+                .resolve_to_addrs(&pin.host, &pin.addrs)
+                .build()
+                .map_err(|e| e.to_string()),
+        }
+        .map_err(|e| VtaError::Config(format!("build HTTP client: {e}")))?;
         Ok(Self {
             http,
             trust_tasks_url: format!("{}{}", base_url.trim_end_matches('/'), super::client::TRUST_TASKS_PATH),
@@ -299,6 +324,49 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use serde_json::json;
+
+    /// A pinned transport connects to the checked address, whatever the
+    /// endpoint's host would resolve to now.
+    #[tokio::test]
+    async fn a_pinned_transport_connects_only_to_the_checked_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            super::super::client::TRUST_TASKS_PATH,
+            axum::routing::post(|| async { "reached the pinned address" }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let pin = PinnedEndpoint {
+            host: "agent.invalid".to_string(),
+            addrs: vec![addr],
+        };
+
+        let transport = HttpsTransport::pinned(
+            &format!("http://agent.invalid:{}", addr.port()),
+            Duration::from_secs(5),
+            Some(&pin),
+        )
+        .unwrap();
+        let unpinned =
+            HttpsTransport::new(&format!("http://agent.invalid:{}", addr.port()), Duration::from_secs(5)).unwrap();
+
+        assert_eq!(
+            transport
+                .deliver(&json!({}), None)
+                .await
+                .expect("the pinned address answers"),
+            "reached the pinned address"
+        );
+        assert!(
+            unpinned
+                .deliver(&json!({}), None)
+                .await
+                .is_err(),
+            "without the pin the host is resolved, and `.invalid` never resolves"
+        );
+    }
 
     struct RecordingChannel {
         ready: bool,

@@ -406,6 +406,38 @@ impl GatewayContextCreator {
 
 /// Give `context_id` an identity so it can issue, best effort.
 ///
+/// The contexts already given an identity they can issue as, by connection and
+/// context: the same context id on two trust agents names two contexts.
+#[derive(Default)]
+pub(crate) struct IdentifiedContexts(tokio::sync::RwLock<std::collections::HashSet<(String, String)>>);
+
+impl IdentifiedContexts {
+    /// [`ensure_context_can_issue`] for `context_id` on `connection_id`, once
+    /// per process for each context it succeeds for.
+    pub(crate) async fn ensure(
+        &self,
+        client: &Arc<VtaRestClient>,
+        connection_id: &str,
+        context_id: &str,
+    ) {
+        let key = (connection_id.to_string(), context_id.to_string());
+        if self
+            .0
+            .read()
+            .await
+            .contains(&key)
+        {
+            return;
+        }
+        if ensure_context_can_issue(client, context_id).await {
+            self.0
+                .write()
+                .await
+                .insert(key);
+        }
+    }
+}
+
 /// Shared by every path that builds a context-scoped credential issuer, so the
 /// appliance default and a per-surface mapping bootstrap a context identically
 /// — a surface that resolved its own agent used to skip this and hit the

@@ -1346,6 +1346,7 @@ mod live_tests {
             pairing: Default::default(),
             created_at: now,
             updated_at: now,
+            retired_at: None,
         };
         let records = tempfile::tempdir().expect("records");
         let store: Arc<dyn VtaConnectionStorage> = Arc::new(

@@ -39,11 +39,6 @@ const TASK_KEYS_SIGN_DOCUMENT: &str = "https://trusttasks.org/spec/keys/sign-doc
 /// `keys/sign-jws/0.1`.
 const TASK_KEYS_SIGN_JWS: &str = "https://trusttasks.org/spec/keys/sign-jws/0.1";
 
-/// The JOSE algorithm a context's `did:key` signs with. The VTA echoes the
-/// algorithm it chose; the gateway checks it so a JWS it attributes to the
-/// context DID cannot have been made under a different one.
-const SIGNING_ALGORITHM: &str = "EdDSA";
-
 /// The `keys/sign-jws` result. `alg` and `keyId` are echoed by the VTA and
 /// verified before the signature is attributed to the context DID.
 #[derive(Debug, Deserialize)]
@@ -361,7 +356,8 @@ fn verify_signed_document(
     if &secured != requested {
         bail!("the signed document is not the document that was sent");
     }
-    Ok(())
+    crate::identity::ssi::di_jcs::verify_jcs_proof_with_key(&secured, &result.proof, &identity.public_key)
+        .map_err(|e| anyhow!("the proof does not verify under the context's key: {e}"))
 }
 
 /// Resolves, and signs as, one VTA context.
@@ -627,28 +623,21 @@ impl ContextIdentityResolver {
             .await
             .map_err(|e| anyhow!("signing as context `{}`: {e}", self.context_id))?;
         // Fail closed on attribution: a verifier resolves the claimed DID and
-        // demands the signing key be declared there, so the VTA must have used
-        // exactly the key this context designates, under its algorithm.
-        if response.key_id != identity.key_id {
-            bail!(
-                "signing as context `{}`: VTA echoed key `{}` but `{}` was requested",
-                self.context_id,
-                response.key_id,
-                identity.key_id
-            );
-        }
-        if response.alg != SIGNING_ALGORITHM {
-            bail!(
-                "signing as context `{}`: VTA signed with `{}`; the context key uses `{SIGNING_ALGORITHM}`",
-                self.context_id,
-                response.alg
-            );
-        }
-        // The echoed fields say nothing about the token itself, so the token
-        // must be the one asked for and verify under the context's own key.
-        crate::vta::authority::check_returned_jws(&response.jws, &identity.verification_method, typ, claims)
-            .and_then(|()| crate::vta::authority::verify_jws_signature(&response.jws, &identity.public_key))
-            .map_err(|e| anyhow!("signing as context `{}`: {}", self.context_id, e.log_detail()))?;
+        // demands the signing key be declared there, so the token must be the
+        // one asked for, signed by exactly the key this context designates.
+        crate::vta::authority::verify_returned_token(
+            &crate::vta::authority::ReturnedToken {
+                jws: &response.jws,
+                key_id: &response.key_id,
+                alg: &response.alg,
+            },
+            &identity.key_id,
+            &identity.verification_method,
+            typ,
+            claims,
+            &identity.public_key,
+        )
+        .map_err(|e| anyhow!("signing as context `{}`: {}", self.context_id, e.log_detail()))?;
         Ok(response.jws)
     }
 }
@@ -891,7 +880,12 @@ pub(crate) mod mock {
             let mut hash_data = Vec::with_capacity(64);
             hash_data.extend_from_slice(&Sha256::digest(jcs(&config).as_bytes()));
             hash_data.extend_from_slice(&Sha256::digest(jcs(&document).as_bytes()));
-            let signature = ed25519_dalek::Signer::sign(&*vta.signing, &hash_data);
+            let other_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+            let signing = match *vta.tamper_jws.lock().unwrap() {
+                Some(JwsTamper::Key) => &other_key,
+                _ => &*vta.signing,
+            };
+            let signature = ed25519_dalek::Signer::sign(signing, &hash_data);
             let mut proof = config;
             proof["proofValue"] = json!(multibase::encode(multibase::Base::Base58Btc, signature.to_bytes()));
             document["proof"] = proof.clone();
@@ -1221,9 +1215,37 @@ mod tests {
             .await
             .expect("a token the context's key signed");
 
-        crate::vta::authority::check_returned_jws(&jws, &vta.verification_method(), "JWT", &claims)
-            .expect("the token asked for");
-        crate::vta::authority::verify_jws_signature(&jws, &vta.public_key).expect("signed by the context's key");
+        crate::vta::authority::verify_returned_token(
+            &crate::vta::authority::ReturnedToken {
+                jws: &jws,
+                key_id: "ctx-issuer",
+                alg: "EdDSA",
+            },
+            "ctx-issuer",
+            &vta.verification_method(),
+            "JWT",
+            &claims,
+            &vta.public_key,
+        )
+        .expect("the token asked for, signed by the context's key");
+    }
+
+    /// A proof that names the context's key and the document sent, but that
+    /// the context's key did not make, is refused rather than published.
+    #[tokio::test]
+    async fn a_document_proof_another_key_made_is_refused() {
+        let vta = MockContextVta::new("gw/ctx", "ctx-issuer");
+        *vta.tamper_jws.lock().unwrap() = Some(super::mock::JwsTamper::Key);
+        let url = vta.spawn().await;
+        let resolver = ContextIdentityResolver::new(vta.client(&url), "gw/ctx".to_string());
+
+        let err = resolver
+            .sign_document(credential(&vta.did()), PURPOSE_ASSERTION_METHOD, None, None)
+            .await
+            .expect_err("a proof the context's key did not make must not be passed on")
+            .to_string();
+
+        assert!(err.contains("does not verify"), "{err}");
     }
 
     #[tokio::test]
