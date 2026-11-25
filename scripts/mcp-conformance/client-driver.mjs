@@ -33,10 +33,15 @@ export function settings(env, argv) {
     ...base,
     binary: required('MCP_CONFORMANCE_DRIVER_BINARY'),
     workDir: required('MCP_CONFORMANCE_DRIVER_WORK'),
+    logDir: required('MCP_CONFORMANCE_DRIVER_LOGS'),
     inboundPort: Number(required('MCP_CONFORMANCE_DRIVER_INBOUND_PORT')),
     outboundPort: Number(required('MCP_CONFORMANCE_DRIVER_OUTBOUND_PORT')),
     fixtureUrl: required('MCP_CONFORMANCE_DRIVER_FIXTURE_URL'),
   };
+}
+
+export function hasExited(child) {
+  return child.exitCode !== null || child.signalCode !== null;
 }
 
 export function accessPointUrl(inboundPort) {
@@ -75,7 +80,7 @@ function portOpen(port) {
 async function waitForPort(port, child) {
   const deadline = Date.now() + START_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    if (child.exitCode !== null) throw new Error(`gateway exited with ${child.exitCode} before listening`);
+    if (hasExited(child)) throw new Error(`gateway exited with ${child.exitCode ?? child.signalCode} before listening`);
     if (await portOpen(port)) return;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
@@ -100,7 +105,8 @@ async function startGateway(config, { seed, tokenEndpoint } = {}) {
   );
   seed?.(envDir);
   const backupKeyVar = fs.readFileSync(path.join(envDir, 'backup-key-var'), 'utf8').trim();
-  const log = fs.openSync(path.join(envDir, 'gateway.log'), 'w');
+  fs.mkdirSync(config.logDir, { recursive: true });
+  const log = fs.openSync(path.join(config.logDir, `gateway-${scenario}.log`), 'w');
   const child = track(spawn(config.binary, ['--config', 'config.toml'], {
     cwd: path.join(envDir, 'config'),
     env: {
@@ -120,13 +126,15 @@ async function startGateway(config, { seed, tokenEndpoint } = {}) {
   } catch (error) {
     child.kill('SIGKILL');
     throw error;
+  } finally {
+    fs.closeSync(log);
   }
   return child;
 }
 
 function stop(child) {
   return new Promise((resolve) => {
-    if (child.exitCode !== null) return resolve();
+    if (hasExited(child)) return resolve();
     child.once('exit', resolve);
     child.kill('SIGTERM');
     setTimeout(() => child.kill('SIGKILL'), 5_000).unref();

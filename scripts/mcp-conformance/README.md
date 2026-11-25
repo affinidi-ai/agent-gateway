@@ -40,7 +40,7 @@ prebuilt binary without `--unit-tests`.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `MCP_CONFORMANCE_PORT_BASE` | `18760` | First local port; the harness uses base+0, +1, +2, +10, +11, +20, +21, +30 and +31 (the `fabric` gateways and the client adapter take free ports) |
+| `MCP_CONFORMANCE_PORT_BASE` | `18760` | First local port; the harness uses base+0, +1, +2, +10, +11, +20 and +21, and +30 and +31 when the `client` target runs (the `fabric` gateways and the client adapter take free ports) |
 | `MCP_CONFORMANCE_REFERENCE_REPO` | GitHub `modelcontextprotocol/conformance` | Git URL or mirror holding the pinned reference commit |
 
 Exit codes: `0` pass, `1` failure, `2` invalid options or precondition not met
@@ -98,9 +98,11 @@ not be fetched, `130` interrupted (SIGINT), `143` terminated (SIGTERM).
    packages are installed with `npm ci --ignore-scripts`) twice per scenario:
    straight at the suite's server, and through a gateway it starts on a fresh
    env whose Target is that server. `client-parity.mjs` requires the same
-   checks with the same statuses both ways, and `tools_call`,
-   `request-metadata`, `sep-2322-client-request-state` and
-   `json-schema-2020-12-preservation` to pass through the gateway. The
+   suite verdict (the suite's exit status of each scenario run, which can be a
+   failure without a failed check) and the same checks with the same statuses
+   both ways, and `tools_call`, `request-metadata`,
+   `sep-2322-client-request-state` and `json-schema-2020-12-preservation` to
+   pass through the gateway: a passing verdict and no failed or warned check. The
    reference client has no handler for the other four scenarios, so they fail
    the same way on both sides. Between the reference client and the gateway
    sits `client-shim.mjs`: the reference client omits the `Mcp-Method` and
@@ -114,7 +116,9 @@ not be fetched, `130` interrupted (SIGINT), `143` terminated (SIGTERM).
    `client-auth.mjs` follows the suite server's `401` challenge to the token
    endpoint, writes a credential provider and its secrets into the env and
    binds the provider to the Target, and the gateway signs the assertion,
-   fetches the token and attaches it.
+   fetches the token and attaches it. The driver follows and stores only URLs
+   on the origin of the suite's server or on loopback, and writes the secrets
+   with mode `0600` in a `0700` directory.
 6. **Legacy phase.** Starts the same binary on another fresh env and runs
    `compat.mjs rejected` (every endpoint answers the unmodelled `2099-01-01`
    with `-32022` and a `supported` list offering `2024-11-05`) and
@@ -149,7 +153,9 @@ Outputs, all under the ignored `target/mcp-conformance/`:
 | `run/logs/` | Build, npm, gateway, fixture, suite and check logs; `g2g-fabric.log` is the `fabric` target's BDD run |
 | `run/results/<target>/` | The suite's `checks.json` per scenario; the `client` target writes `client-direct/` and `client-gateway/` |
 | `env/<modern\|legacy>/` | The generated gateway envs and `targets.json` |
-| `env/client/<scenario>/` | The env and `gateway.log` of the gateway started for one client scenario |
+| `env/client/<scenario>/` | The env of the gateway started for one client scenario |
+| `run/logs/client-gateway/gateway-<scenario>.log` | The log of that gateway, kept with the other run logs |
+| `run/logs/client-<direct\|gateway>.verdicts` | The suite's verdict (`pass` or `fail`) of each client scenario run, which `client-parity.mjs` compares |
 
 ### Reading a suite line
 
@@ -159,6 +165,9 @@ suite saved:
 ```text
 PASS  suite direct: 50 scenarios run; 147 passed; 1 expected failure(s); 42 unscored failure(s)
 ```
+
+The `client` target shows one such line for the eight parity scenarios and one
+for `auth/client-credentials-jwt`.
 
 - **passed**: checks with status `SUCCESS`.
 - **expected failure(s)**: failed or warned checks of scored scenarios that the
@@ -189,7 +198,8 @@ make mcp-conformance ARGS="--report --only client"
 | --- | --- |
 | `direct`, `access-point`, `transit`, `owned-proxy`, `proxy-surface` | Every scenario of `conformance list --server`, one at a time, including the ones outside the `2026-07-28` requirement set and, for the owned targets, outside their tool subset |
 | `client` | Every scenario of `conformance list --client`, one at a time, through the gateway only. This includes every `auth/*` scenario, the ones the normal run leaves out among them |
-| `fabric` | The scenarios of the `2026-07-28` requirement set, scored and unscored. The BDD step runs the suite once, so the scenarios of older revisions are not run over the Fabric |
+| `fabric` | Every scenario of `conformance list --server`, as for the other server targets, without the requirement set or the baseline: the BDD step runs `report-cli.sh` in place of the suite's command |
+| `authorization` | Every scenario of `conformance list --authorization`, against the gateway's modern listener, which is not an authorization server. Run with the modern phase only, and never in a normal run |
 | `legacy` | None: it runs no suite scenario, so `--report` leaves it out. `--report --only legacy` exits `2` |
 
 A scenario that applies to `2026-07-28`, or that is an extension, runs on the
@@ -214,8 +224,12 @@ INFO  report: the open gaps are in target/mcp-conformance/run/gaps.md
 ```
 
 The file takes the suite's message of a check and never its `details`, and
-bearer, Basic and DPoP values, JWTs, PEM blocks and the values of token and
-secret fields in a message are replaced with `[redacted]`. A gap of the
+Bearer and DPoP values (whatever their length), Basic values that look
+generated, JWTs, PEM blocks and the values of fields whose name contains
+`secret`, `token`, `password`, `key`, `assertion`, `authorization`, `cookie`,
+`credential` or `signature` in a message are replaced with `[redacted]`. A
+field that names an endpoint, URL, type or method of a credential keeps its
+value. A gap of the
 `client` target is not always the gateway's: the reference client has no
 handler for some scenarios and fails them without the gateway too, which only
 the normal run's parity check tells apart.
@@ -232,6 +246,7 @@ MCP_CONFORMANCE_DRIVER_MODE=gateway \
 MCP_CONFORMANCE_DRIVER_REFERENCE="$PWD/target/mcp-conformance/reference" \
 MCP_CONFORMANCE_DRIVER_BINARY="$PWD/target/debug/agent-gateway" \
 MCP_CONFORMANCE_DRIVER_WORK="$PWD/target/mcp-conformance/env/client" \
+MCP_CONFORMANCE_DRIVER_LOGS="$PWD/target/mcp-conformance/run/logs/client-gateway" \
 MCP_CONFORMANCE_DRIVER_INBOUND_PORT=18790 MCP_CONFORMANCE_DRIVER_OUTBOUND_PORT=18791 \
 MCP_CONFORMANCE_DRIVER_FIXTURE_URL=http://127.0.0.1:18761 \
 scripts/mcp-conformance/node_modules/.bin/conformance client \

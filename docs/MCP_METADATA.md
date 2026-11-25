@@ -2144,9 +2144,11 @@ That command is `client-driver.mjs`. It runs the suite's reference client
 (`examples/clients/typescript/everything-client.ts` of the pinned checkout)
 twice: straight at the suite's server, and at the Access Point of a gateway it
 starts with that server as the Target. `client-parity.mjs` then requires each
-scenario to report the same checks with the same statuses both ways, and four
-scenarios (`tools_call`, `request-metadata`, `sep-2322-client-request-state`,
-`json-schema-2020-12-preservation`) to pass through the gateway. The other
+scenario to have the same suite verdict (the suite's exit status, which can be a
+failure without a failed check) and to report the same checks with the same
+statuses both ways, and four scenarios (`tools_call`, `request-metadata`,
+`sep-2322-client-request-state`, `json-schema-2020-12-preservation`) to pass
+through the gateway: a passing verdict and no failed or warned check. The other
 four fail the same way with and without the gateway, because the reference
 client has no handler for them. The scenarios are the suite's `2026-07-28`
 client scenarios that need no authorization.
@@ -2173,7 +2175,10 @@ the gateway signs the client assertion, fetches the token and attaches it, and
 the suite judges that token request and the bearer token on the forwarded call.
 The scenario's metadata checks are satisfied by `client-auth.mjs`, not by the
 gateway. The suite's token endpoint is plain http on loopback, so the gateway
-runs with `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` naming it.
+runs with `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` naming it. Because the provider
+sends the scenario's credentials to that endpoint, `client-auth.mjs` follows and
+stores only URLs on the origin of the server under test or on loopback, and
+writes the scenario's secrets readable by the running user only.
 
 The other `auth/*` scenarios are not run: they need an authorization-code flow,
 discovery or scope step-up at request time, dynamic or metadata-document client
@@ -2183,8 +2188,10 @@ an `oauth2_client_credentials` provider sends the client secret in the form
 body, not as HTTP Basic; `client-driver.mjs` accepts the scenario so the gap can
 be reproduced by hand or listed by a report-only run (see the harness README).
 The suite's `authorization`
-command is not run: its scenarios require an authorization-code server, which
-the STS profile is not (see [MCP Resource Authorization](#mcp-resource-authorization)).
+command is not run by a normal run: its scenarios require an authorization-code
+server, which the STS profile is not (see
+[MCP Resource Authorization](#mcp-resource-authorization)). A report-only run
+runs it against the gateway's modern listener so those gaps are listed.
 
 **Legacy compatibility.** `compat.mjs` runs a `2024-11-05` client session
 (`initialize`, `notifications/initialized`, `tools/list`, `tools/call`) in
