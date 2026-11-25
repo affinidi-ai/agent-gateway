@@ -1326,6 +1326,30 @@ pub fn inject_delegated_credential_into_mcp_meta(
     Ok(serde_json::to_vec(&json_body)?)
 }
 
+/// `body` without the `_meta` `fields` a delegated credential is injected into, for a copy
+/// of the request that must carry no credential, such as a mirrored one. A body that is not
+/// JSON, or has none of the fields, is returned unchanged.
+pub fn without_delegated_credentials_in_mcp_meta(
+    body: &bytes::Bytes,
+    fields: &[&str],
+) -> bytes::Bytes {
+    if fields.is_empty() {
+        return body.clone();
+    }
+    let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    let original = json_body.clone();
+    for field in fields {
+        crate::mcp::meta::remove_metadata_key(&mut json_body, field);
+    }
+    if json_body == original {
+        body.clone()
+    } else {
+        bytes::Bytes::from(json_body.to_string())
+    }
+}
+
 /// Why a binding with no stored credential is refused without asking for
 /// consent: its provider was deactivated and takes no new consent.
 const PROVIDER_DEACTIVATED: &str = "provider_deactivated";
@@ -2068,6 +2092,31 @@ mod tests {
             matches!(result, Err(super::McpMetaInjectionError::RootNotObject)),
             "expected non-object JSON roots to fail injection, got {result:?}"
         );
+    }
+
+    #[test]
+    fn without_delegated_credentials_in_mcp_meta_removes_only_the_credential_fields() {
+        let body = bytes::Bytes::from_static(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"schedule_meeting","_meta":{"calendar":"bdd-token","maps":"bdd-maps-token","region":"eu"}}}"#,
+        );
+
+        let stripped = super::without_delegated_credentials_in_mcp_meta(&body, &["calendar", "maps"]);
+        let parsed: serde_json::Value = serde_json::from_slice(&stripped).expect("valid JSON");
+
+        assert_eq!(parsed["params"]["_meta"], serde_json::json!({ "region": "eu" }));
+        assert_eq!(parsed["params"]["name"].as_str(), Some("schedule_meeting"));
+    }
+
+    #[test]
+    fn without_delegated_credentials_in_mcp_meta_leaves_a_body_without_them_unchanged() {
+        let body = bytes::Bytes::from_static(br#"{"params": {"_meta": {"region": "eu"}}}"#);
+        assert_eq!(super::without_delegated_credentials_in_mcp_meta(&body, &["calendar"]), body);
+
+        let not_json = bytes::Bytes::from_static(b"calendar=bdd-token");
+        assert_eq!(super::without_delegated_credentials_in_mcp_meta(&not_json, &["calendar"]), not_json);
+
+        let with_credential = bytes::Bytes::from_static(br#"{"params": {"_meta": {"calendar": "bdd-token"}}}"#);
+        assert_eq!(super::without_delegated_credentials_in_mcp_meta(&with_credential, &[]), with_credential);
     }
 
     #[test]

@@ -255,6 +255,18 @@ pub(crate) fn target_credential_header_names(surface: &crate::config::agent_surf
         .collect()
 }
 
+/// The `_meta` fields that carry an Access Point Target's delegated credentials: the field of
+/// each delegated credential binding that can apply to it and injects into `_meta`.
+fn target_credential_meta_fields(surface: &crate::config::agent_surface::AgentSurface) -> Vec<&str> {
+    surface
+        .agent_keyed_outbound_credentials()
+        .filter_map(|binding| match &binding.inject_as {
+            crate::config::types::CredentialInjection::Meta { field } => Some(field.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Extract UCP operation type from request path and method
 /// Supports UCP REST, MCP, and A2A transport bindings per spec
 pub(crate) fn extract_ucp_operation(
@@ -7682,7 +7694,11 @@ async fn proxy_charged_request(
         && mirror::selected(mirror_config.percentage)
     {
         let mirror_endpoint_for_log = loggable::url(&mirror_config.endpoint);
-        let mirror_request = mirror::MirrorRequest::new(mirror_config, method.clone(), body_bytes.clone())
+        let mirror_body = crate::proxy::credential_delegation::without_delegated_credentials_in_mcp_meta(
+            &body_bytes,
+            &target_credential_meta_fields(&state.surface),
+        );
+        let mirror_request = mirror::MirrorRequest::new(mirror_config, method.clone(), mirror_body)
             .headers_from(&headers, |name| {
                 forwards_target_header(
                     name,

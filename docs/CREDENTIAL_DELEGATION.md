@@ -1645,6 +1645,14 @@ not refused for its path. It is recorded as a `request_rejected` record at `forw
 `2026-07-28` MCP proxy call is held by its REST client's own base-path check (400). A Target
 bound by external consent keeps its stricter admission check (400).
 
+A surface's traffic mirror (`target.networking.mirror`) never receives the Target credential or a
+delegated credential, on the direct path or on Fabric send. The mirrored copy carries the
+caller's headers without the caller's own credentials or any header named like a credential
+header. On the direct path its body has none of the `_meta` fields delegated credentials go
+into, even when the caller set them; custom metadata, DID identity and the identity binding VP
+stay in the body. On Fabric send the copy is taken before the gateway adds any credential to
+the body.
+
 ## Caller keys
 
 A Target that keeps data for each caller, such as an agent's memory of each signed-in user,

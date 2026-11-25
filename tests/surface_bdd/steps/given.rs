@@ -26,10 +26,10 @@ use crate::bdd_support::policies::{
 };
 use crate::world::{
     ApiKeyProviderSourceAuthConfig, ApiKeySourceAuthConfig, CallerKeyFixture, CredentialProviderKind,
-    DelegatedCredentialInjection, JwtSourceAuthConfig, RequestPolicyFixture, SurfaceCredentialDelegationConfig,
-    SurfaceSourceAuthConfig, SurfaceTargetAuthConfig, SurfaceTransitPointConfig, SurfaceWorld,
-    TransitPointHeaderMetadataMappingRow, TransitPointManagedIdentityConfig, mcp_identity_schema_with_field,
-    select_identity_schema_field,
+    DelegatedCredentialInjection, JwtSourceAuthConfig, MIRROR_COLLABORATOR_KEY, RequestPolicyFixture,
+    SurfaceCredentialDelegationConfig, SurfaceSourceAuthConfig, SurfaceTargetAuthConfig, SurfaceTransitPointConfig,
+    SurfaceWorld, TransitPointHeaderMetadataMappingRow, TransitPointManagedIdentityConfig,
+    mcp_identity_schema_with_field, select_identity_schema_field,
 };
 use tracing::log::Level;
 
@@ -4305,6 +4305,17 @@ fn surface_injects_delegated_credentials_into_meta(
     field: String,
 ) {
     delegation_config_mut(world).inject_as = DelegatedCredentialInjection::Meta { field };
+}
+
+#[given(expr = "the surface mirrors every request to MCP server {string}")]
+fn surface_mirrors_every_request_to_mcp_server(
+    world: &mut SurfaceWorld,
+    server_name: String,
+) {
+    world
+        .actors
+        .register_target_with_key(&server_name, TargetActorKind::McpServer, MIRROR_COLLABORATOR_KEY);
+    world.register_collaborator(MIRROR_COLLABORATOR_KEY, &server_name, TargetActorKind::McpServer);
 }
 
 #[given(expr = "the surface admits {int} request(s) per minute")]

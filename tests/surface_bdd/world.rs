@@ -36,6 +36,9 @@ pub use crate::bdd_support::config::single_surface_fixture::{
 
 use tempfile::TempDir;
 
+/// The collaborator key of the server a surface mirrors its requests to.
+pub const MIRROR_COLLABORATOR_KEY: &str = "mirror";
+
 #[derive(Debug, Clone, Default)]
 pub struct TargetObservations {
     pub requests: Vec<ReceivedRequest>,
@@ -597,7 +600,8 @@ pub struct ScenarioInfra {
     pub replacement_mock: Option<MockServer>,
     /// The token endpoint of the Target's credential provider.
     pub target_token_endpoint: Option<MockServer>,
-    /// Destinations of the second and later Transit Points, by collaborator key.
+    /// Destinations of the second and later Transit Points, and the mirror server, by
+    /// collaborator key.
     pub transit_point_mocks: HashMap<String, MockServer>,
     pub affinidi_well: Option<MockServer>,
     pub _jwks_server: Option<JwksServer>,

@@ -20,8 +20,8 @@ use crate::bdd_support::mock_server::MockServer;
 use crate::bdd_support::oidc::OidcProvider;
 use crate::bdd_support::temp::{TempDirGuard, create_project_temp_dir};
 use crate::world::{
-    JwtSourceAuthConfig, RecordedResponse, ScenarioInfra, SurfaceSourceAuthConfig, SurfaceWorld, TargetObservations,
-    debug_line, mcp_identity_schema_with_field,
+    JwtSourceAuthConfig, MIRROR_COLLABORATOR_KEY, RecordedResponse, ScenarioInfra, SurfaceSourceAuthConfig,
+    SurfaceWorld, TargetObservations, debug_line, mcp_identity_schema_with_field,
 };
 
 /// The identity hash pepper of a gateway whose callers can sign in at their identity provider.
@@ -292,6 +292,22 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         } else {
             transit_point_mocks.insert(collaborator_key, mock);
         }
+    }
+    if world
+        .collaborators
+        .contains_key(MIRROR_COLLABORATOR_KEY)
+    {
+        let mirror = MockServer::start(
+            world
+                .collaborator_target(MIRROR_COLLABORATOR_KEY)
+                .configured_response
+                .clone(),
+        )
+        .await;
+        world
+            .surface_config
+            .mirror_endpoint = Some(mirror.url());
+        transit_point_mocks.insert(MIRROR_COLLABORATOR_KEY.to_string(), mirror);
     }
     for collaborator_key in &world.plain_http_collaborators {
         let url = collaborator_urls
