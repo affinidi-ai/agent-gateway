@@ -186,4 +186,6 @@ changes:
         recorded and sent on hyphenated. A message naming no trace id, or one that is not valid,
         starts a new trace shared by its records, token and header; any text was passed on as sent
         before. The records carry the message's trace id, no longer the trace of the span the
-        sending gateway exports, and a surface with terminate_trace_id sends a 32 hex onward id.
+        sending gateway exports, and a surface with terminate_trace_id sends a 32 hex onward id. An
+        MCP Proxy Target's records carry it too: its audit records carried the exported span's
+        trace id, or none, and its connection metrics a random id each.
