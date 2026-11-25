@@ -1,0 +1,105 @@
+branch: feat/target-auth-followups
+changes:
+  added:
+    - timestamp: '2026-11-25T00:34:00Z'
+      title: Let client secret credential providers authenticate with HTTP Basic
+      description: >-
+        An oauth2_client_credentials provider, or an oauth2_authorization_code provider without an
+        issuer, can now set client_authentication to client_secret_basic, and then sends its client
+        ID and secret by HTTP Basic, each form-urlencoded as RFC 6749 section 2.3.1 requires, on
+        the client credentials grant, the code exchange and every refresh. RFC 6749 requires
+        token endpoints to accept HTTP Basic and some accept nothing else, so such a provider got
+        401 invalid_client before. Unset, or client_secret_post, keeps sending them in the form
+        body, so stored providers work as before. The dashboard offers Form body (default) and
+        HTTP Basic for these types, and the provider list badges the choice.
+    - timestamp: '2026-11-25T12:00:00Z'
+      title: Show Target authentication changes and forced secret deletes in the Audit Log
+      description: >-
+        The Audit Log now words target_auth_changed and secret_force_deleted records, naming the
+        surface, Transit Point, methods, provider, secret id and referrers with the actor, and
+        offers both as Category filters. No secret value is shown.
+  changed:
+    - timestamp: '2026-11-25T00:35:00Z'
+      title: Explain when a signed assertion's audience must be the issuer
+      description: >-
+        The credential provider editor's Audience help and the credential delegation docs now say
+        that an empty audience means the token endpoint, which Google, Entra and Ory Hydra accept,
+        and that an authorization server following RFC 7523bis wants its issuer identifier there
+        instead. The default is unchanged, so providers that work today keep their audience.
+  fixed:
+    - timestamp: '2026-11-25T00:16:00Z'
+      title: Accept ES256 for credential providers that sign a client assertion
+      description: >-
+        The admin API and the dashboard now accept ES256 as the signing algorithm of an
+        oauth2_client_credentials_jwt_auth provider and of an external consent provider whose client
+        authenticates with private_key_jwt, beside PS256 and RS256. The gateway already signed such
+        assertions correctly when a stored record named ES256, so the save rule now matches what
+        the gateway does. The key is still checked on save, and an ES256 provider whose key is not
+        an EC P-256 key is refused.
+    - timestamp: '2026-11-25T01:01:18Z'
+      title: Renew a renewed service token half its own lifetime before it expires
+      description: >-
+        A service token from a credential provider is renewed half its own lifetime before it
+        expires, between 60 seconds and 5 minutes early, every time and not only the first. The
+        lifetime was counted from when the token's vault row was first written, which a renewal
+        keeps, so later tokens of the same key were renewed early: one living between 300 and 600
+        seconds 5 minutes before it expired, and one living 300 seconds or less on almost every
+        request, which could reach the issuer's rate limit. The lifetime is now counted from when
+        the provider issued the current token.
+    - timestamp: '2026-11-25T12:00:00Z'
+      title: Answer an MCP request the Target can't serve with a JSON-RPC error
+      description: >-
+        When the Target behind an MCP Access Point is unreachable or its Target authentication
+        fails, the gateway now replies with a JSON-RPC -32603 error that echoes the request id and
+        names the cause in error.data.reason, under the same HTTP status as before, instead of an
+        A2A problem document an MCP client could not parse. The message names no Target URL or
+        secret, and a notification gets the status and no body. A2A surfaces are unchanged.
+    - timestamp: '2026-11-25T00:05:03Z'
+      title: Show a saved Transit Point's stored Target authentication when it is opened
+      description: >-
+        Opening a saved Transit Point in the Surface Builder showed its Target authentication as
+        None when it used a stored static secret or credential provider, so the secret, header and
+        provider were not shown and could not be edited from what was stored. The panel filled its
+        form with a write as it opened, and the listener's first seed, made from the config as
+        loaded, replaced that write. The panel now shows the stored setting without writing it and
+        writes it only with the operator's first edit, so a Transit Point opened and saved without
+        an edit sends its stored target_auth unchanged.
+    - timestamp: '2026-11-25T00:02:02Z'
+      title: Show a stored Target header as one type on Managed Agents and Transit Points
+      description: >-
+        The Managed Agent and Transit Point editors read a stored Target authentication header by
+        different rules, so the same header could open as Bearer Token in one and Custom in the
+        other (for example `authorization: Bearer {value}`, `X-Partner: Bearer {value}` or
+        `x-api-key: {value}`). Both now use one rule that reads a header as the gateway does:
+        Bearer or Basic for an Authorization header whose format starts with that scheme in any
+        letter case, API Key for an X-API-Key header, Custom for any other, with names compared in
+        any letter case and with `_` read as `-`. A Transit Point opened as Bearer Token keeps a
+        stored `authorization` spelling on save, so opening and saving changes no header.
+  removed: []
+  security:
+    - timestamp: '2026-11-25T00:11:10Z'
+      title: Refresh a legacy grant only through the provider the request checked
+      description: >-
+        A legacy binding read its credential provider a second time before refreshing an
+        expired grant and sent the client ID, client secret and the person's refresh token to
+        whatever that second read held, with no type check. A provider retyped to api_key
+        meanwhile, with an http token endpoint, received them in warn mode. The refresh now
+        uses the provider the request read and checked, as the 2026-07-28 and verified consent
+        refreshes already do.
+    - timestamp: '2026-11-25T00:11:10Z'
+      title: Store no token endpoint or client references on an API key provider
+      description: >-
+        An api_key provider sends nothing to a token endpoint, yet a create or update kept a
+        token endpoint and client ID and secret references on one, and a retype to api_key kept
+        the stored ones while skipping the https token endpoint rule. A create or update of an
+        api_key provider now drops them, so no later read of the provider finds a client to send.
+    - timestamp: '2026-11-25T00:11:10Z'
+      title: Refuse a token request that would send a client secret its provider never sends
+      description: >-
+        Each token request read and sent the provider's client secret whatever the provider's
+        type, trusting its caller to hand it the type it was written for. The legacy code
+        exchange and refresh, the scoped refresh and the client credentials and JWT Bearer grants
+        now refuse, before the secret is read, a provider that sends no client secret, such as an
+        api_key provider, a JWT Bearer provider without secret client authentication or one
+        authenticating with a signed JWT.
+  breaking: []
