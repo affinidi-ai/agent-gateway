@@ -2739,7 +2739,7 @@ fn build_api_key_source_auth_header(
     (api_key_source_auth(world).0, key_value)
 }
 
-fn build_valid_api_key_source_auth_header(world: &SurfaceWorld) -> (String, String) {
+pub(crate) fn build_valid_api_key_source_auth_header(world: &SurfaceWorld) -> (String, String) {
     api_key_source_auth(world)
 }
 
@@ -2807,6 +2807,20 @@ async fn caller_asks_mcp_surface_with_valid_api_key_and_own_identity_proof(world
 async fn request_with_valid_api_key_and_own_identity_proof(world: &mut SurfaceWorld) {
     let header = build_valid_api_key_source_auth_header(world);
     let body = with_caller_identity_proof(build_request_body(&world.surface_config.protocol));
+    send_json_request_and_record(world, body, vec![header]).await;
+}
+
+#[when(
+    "the caller sends a request to the surface with a valid API key and an identity proof of its own beside a value nested too deeply to read"
+)]
+async fn request_with_valid_api_key_and_own_identity_proof_nested_too_deeply(world: &mut SurfaceWorld) {
+    let header = build_valid_api_key_source_auth_header(world);
+    let mut body = with_caller_identity_proof(build_request_body(&world.surface_config.protocol));
+    let mut nested = serde_json::json!(1);
+    for _ in 0..200 {
+        nested = serde_json::json!([nested]);
+    }
+    body["params"]["message"]["metadata"]["nested"] = nested;
     send_json_request_and_record(world, body, vec![header]).await;
 }
 

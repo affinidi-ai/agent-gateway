@@ -13,14 +13,16 @@ changes:
         identity: none is derived from their credential or taken from their request body, policy
         input carries no agent DID or trust-registry claims for them, and the identity binding VP
         and identity credential they put in their request, or that Header Metadata Mapping copies
-        from their headers, are removed before the Target.
+        from their headers, are removed before the Target. A body of theirs the gateway cannot read
+        to remove them is refused with 400.
   fixed: []
   removed: []
   security:
     - timestamp: '2026-11-24T16:00:00Z'
       title: Bind only verified JWT claims into an Access Point Target's Workload Binding
       description: >-
-        A Target Workload Binding with caller_source authorization_bearer_jwt took the caller
+        A Target Workload Binding with caller_source authorization_bearer_jwt or transit_token (the
+        default) took the caller
         claims it signs from the request's Authorization header without verifying it, whichever
         method verified the caller, so on a surface whose JWT Bearer method reads another header
         an API key caller could have claims of its choosing signed into the gateway's

@@ -81,6 +81,28 @@ Feature: Inbound identity derived from a JWT claim
     Then the response status is 200
     And managed agent "bravo" received the forwarded request with no caller identity
 
+  Scenario: A surface deriving the inbound identity from a JWT claim gives an API key caller no identity from a presentation it signed
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface accepts "JWT Bearer" and "API Key" source authentication
+    And the surface derives the inbound identity from a JWT claim
+    And the surface accepts JWT audience "bdd-test-audience"
+    And the surface has managed identity enabled
+    And the surface has a request policy that requires a verified caller identity
+    And the caller's DID document lists its key for assertions
+    When the caller sends a request to the surface with a valid API key and a presentation of a credential it issued itself
+    Then the response status is 403
+    And managed agent "bravo" was not called
+
+  Scenario: A surface deriving the inbound identity from a JWT claim refuses an API key caller's body it cannot read
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface accepts "JWT Bearer" and "API Key" source authentication
+    And the surface derives the inbound identity from a JWT claim
+    And the surface accepts JWT audience "bdd-test-audience"
+    And the surface's A2A validation is "off"
+    When the caller sends a request to the surface with a valid API key and an identity proof of its own beside a value nested too deeply to read
+    Then the response status is 400
+    And managed agent "bravo" was not called
+
   Scenario: A surface deriving the inbound identity from a JWT claim without a JWT Bearer method is refused at save
     Given an A2A surface targeting managed agent "bravo"
     And the surface requires "API Key" source authentication

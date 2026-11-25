@@ -2854,12 +2854,20 @@ async fn proxy_charged_request(
         caller_gets_inbound_identity(&state.surface, authenticated_identity.as_ref(), source_auth_failed);
     let mcp_admits_the_body = mcp_http.is_some() && method == Method::POST;
     if !caller_identified && !mcp_admits_the_body {
-        body_bytes = strip_caller_identity_proofs(
+        body_bytes = match strip_caller_identity_proofs(
             &body_bytes,
             &state
                 .surface
                 .channel_protocol(),
-        );
+        ) {
+            Ok(body) => body,
+            Err(refusal) => {
+                connection_guard
+                    .decrement()
+                    .await;
+                return Err(refusal);
+            }
+        };
     }
     if let Some(policy) = &mcp_http
         && let Some(response) = policy.non_post_body_response(&method, &body_bytes)
@@ -2909,12 +2917,20 @@ async fn proxy_charged_request(
                 return Ok(refusal.into_response_for(&classification, &body_bytes));
             }
             if !caller_identified {
-                body_bytes = strip_caller_identity_proofs(
+                body_bytes = match strip_caller_identity_proofs(
                     &body_bytes,
                     &state
                         .surface
                         .channel_protocol(),
-                );
+                ) {
+                    Ok(body) => body,
+                    Err(refusal) => {
+                        connection_guard
+                            .decrement()
+                            .await;
+                        return Err(refusal);
+                    }
+                };
             }
             let mcp_metadata_context = crate::mcp::meta::McpMetadataContext::from_classification(
                 &classification,
@@ -3150,12 +3166,20 @@ async fn proxy_charged_request(
                     body_bytes = if caller_identified {
                         modified_body
                     } else {
-                        strip_caller_identity_proofs(
+                        match strip_caller_identity_proofs(
                             &modified_body,
                             &state
                                 .surface
                                 .channel_protocol(),
-                        )
+                        ) {
+                            Ok(body) => body,
+                            Err(refusal) => {
+                                connection_guard
+                                    .decrement()
+                                    .await;
+                                return Err(refusal);
+                            }
+                        }
                     };
                 }
             }
@@ -11186,12 +11210,20 @@ async fn handle_fabric_request_inner(
     let body_bytes = if caller_identified {
         body_bytes
     } else {
-        strip_caller_identity_proofs(
+        match strip_caller_identity_proofs(
             &body_bytes,
             &state
                 .surface
                 .channel_protocol(),
-        )
+        ) {
+            Ok(body) => body,
+            Err(refusal) => {
+                connection_guard
+                    .decrement()
+                    .await;
+                return Err(refusal);
+            }
+        }
     };
     let modern_mcp_context = mcp_classification.and_then(crate::mcp::modern_mcp_context);
     let mut modern_request = match mcp_classification {
@@ -16689,20 +16721,24 @@ const CALLER_IDENTITY_PROOFS: [&str; 2] = [
 /// MCP `_meta` entries, and the A2A and AP2 message `metadata` entries (in
 /// `params.message`, `message` or a bare message), of a request or of each
 /// request of a JSON-RPC batch. The extension URIs in `extensions` stay: they
-/// also ask for the responding agent's credential. A body with no proof, one
-/// that is not JSON, or one of another protocol is returned byte for byte.
+/// also ask for the responding agent's credential. A body with no proof, an
+/// empty one, or one of another protocol is returned byte for byte. A body the
+/// gateway cannot read (not JSON, or nested past what the parser reads) is
+/// refused with a JSON-RPC parse error, since its proofs cannot be removed.
 fn strip_caller_identity_proofs(
     body_bytes: &bytes::Bytes,
     protocol: &crate::config::ChannelProtocol,
-) -> bytes::Bytes {
-    let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
-        return body_bytes.clone();
-    };
+) -> Result<bytes::Bytes, Response> {
     let remove: fn(&mut serde_json::Value) -> bool = match protocol {
         crate::config::ChannelProtocol::Mcp => remove_mcp_identity_proofs,
         crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2 => remove_a2a_identity_proofs,
-        _ => return body_bytes.clone(),
+        _ => return Ok(body_bytes.clone()),
     };
+    if body_bytes.is_empty() {
+        return Ok(body_bytes.clone());
+    }
+    let unreadable = || create_jsonrpc_error_response(StatusCode::BAD_REQUEST, -32700, "Parse error: invalid JSON");
+    let mut body = serde_json::from_slice::<serde_json::Value>(body_bytes).map_err(|_| unreadable())?;
     let removed = match &mut body {
         serde_json::Value::Array(requests) => requests
             .iter_mut()
@@ -16710,9 +16746,11 @@ fn strip_caller_identity_proofs(
         request => remove(request),
     };
     if !removed {
-        return body_bytes.clone();
+        return Ok(body_bytes.clone());
     }
-    serde_json::to_vec(&body).map_or_else(|_| body_bytes.clone(), bytes::Bytes::from)
+    serde_json::to_vec(&body)
+        .map(bytes::Bytes::from)
+        .map_err(|_| unreadable())
 }
 
 /// Remove the caller identity proofs from an MCP request's `_meta`; whether any was there.
@@ -16833,8 +16871,9 @@ fn inject_identity_binding_vp_into_request(
 /// Build the request-leg `workloadBinding` credential-subject for the MA→EXT
 /// VP. Only produced when the primary target configures an enabled Workload
 /// Binding element: the configurable subject binds the managed-agent identity to
-/// caller context, plus the resolved `delegationAction`. A bearer JWT source
-/// reads the claims source authentication verified for a JWT Bearer caller,
+/// caller context, plus the resolved `delegationAction`. A bearer JWT source,
+/// and `transit_token` (the default; this leg carries no transit token), reads
+/// the claims source authentication verified for a JWT Bearer caller,
 /// nothing for a caller of another method or one whose credential failed, and
 /// the raw `Authorization` header only on a surface that authenticates no
 /// caller, as a Transit Point does. Returns
@@ -16860,7 +16899,8 @@ fn build_target_request_workload_binding(
             })
     };
     let captured = match cfg.caller_source {
-        crate::config::types::CallerContextSource::AuthorizationBearerJwt => match authenticated_identity {
+        crate::config::types::CallerContextSource::AuthorizationBearerJwt
+        | crate::config::types::CallerContextSource::TransitToken => match authenticated_identity {
             Some(crate::source_auth::AuthenticatedIdentity::JwtBearer { claims, .. }) => {
                 crate::proxy::workload_binding::capture_from_verified_claims(claims, &cfg.caller_context_fields).ok()
             }
@@ -16873,7 +16913,6 @@ fn build_target_request_workload_binding(
             }
             None => None,
         },
-        crate::config::types::CallerContextSource::TransitToken => unverified_bearer(),
         crate::config::types::CallerContextSource::Did => authenticated_identity.and_then(|id| {
             crate::proxy::workload_binding::capture_from_did(
                 id,
@@ -23243,7 +23282,14 @@ allow if {
     mod target_workload_binding {
         use serde_json::json;
 
-        fn surface(methods: serde_json::Value) -> crate::config::agent_surface::AgentSurface {
+        /// Both caller sources read the caller's bearer JWT on the Target leg,
+        /// which carries no transit token; `transit_token` is the default.
+        const BEARER_SOURCES: [&str; 2] = ["authorization_bearer_jwt", "transit_token"];
+
+        fn surface(
+            methods: serde_json::Value,
+            caller_source: &str,
+        ) -> crate::config::agent_surface::AgentSurface {
             serde_json::from_value(json!({
                 "surface_id": "bound", "name": "Bound",
                 "access_point": {
@@ -23252,7 +23298,7 @@ allow if {
                 },
                 "target": {
                     "endpoint": "https://agent.example/a2a",
-                    "workload_binding": {"enabled": true, "caller_source": "authorization_bearer_jwt", "caller_context_fields": ["tid"]}
+                    "workload_binding": {"enabled": true, "caller_source": caller_source, "caller_context_fields": ["tid"]}
                 }
             }))
             .unwrap()
@@ -23303,10 +23349,12 @@ allow if {
                 verification: Default::default(),
             };
 
-            let binding = binding_for(&surface(jwt_and_api_key()), Some(&caller));
+            for source in BEARER_SOURCES {
+                let binding = binding_for(&surface(jwt_and_api_key(), source), Some(&caller));
 
-            assert!(binding.contains("contoso"), "{binding}");
-            assert!(!binding.contains("forged"), "{binding}");
+                assert!(binding.contains("contoso"), "{source}: {binding}");
+                assert!(!binding.contains("forged"), "{source}: {binding}");
+            }
         }
 
         #[test]
@@ -23316,22 +23364,26 @@ allow if {
                 provider_agent_id: None,
             };
 
-            for caller in [Some(&api_key_caller), None] {
-                let binding = binding_for(&surface(jwt_and_api_key()), caller);
-                assert!(!binding.contains("forged"), "{binding}");
+            for source in BEARER_SOURCES {
+                for caller in [Some(&api_key_caller), None] {
+                    let binding = binding_for(&surface(jwt_and_api_key(), source), caller);
+                    assert!(!binding.contains("forged"), "{source}: {binding}");
+                }
             }
         }
 
         #[test]
         fn a_surface_that_authenticates_no_caller_binds_the_authorization_header() {
-            let mut surface = surface(jwt_and_api_key());
-            surface
-                .access_point
-                .caller_authentication = None;
+            for source in BEARER_SOURCES {
+                let mut surface = surface(jwt_and_api_key(), source);
+                surface
+                    .access_point
+                    .caller_authentication = None;
 
-            let binding = binding_for(&surface, None);
+                let binding = binding_for(&surface, None);
 
-            assert!(binding.contains("forged"), "{binding}");
+                assert!(binding.contains("forged"), "{source}: {binding}");
+            }
         }
     }
 
@@ -24045,7 +24097,7 @@ allow if {
                 }}
             });
 
-            let stripped = super::super::strip_caller_identity_proofs(
+            let stripped = strip_readable(
                 &serde_json::to_vec(&body)
                     .unwrap()
                     .into(),
@@ -24073,7 +24125,7 @@ allow if {
                 }}
             });
 
-            let stripped = super::super::strip_caller_identity_proofs(
+            let stripped = strip_readable(
                 &serde_json::to_vec(&body)
                     .unwrap()
                     .into(),
@@ -24099,7 +24151,7 @@ allow if {
             let body = axum::body::Bytes::from_static(
                 br#"{"jsonrpc":"2.0", "id":1, "method":"message/send", "params":{"message":{"role":"user","messageId":"m1","parts":[{"kind":"text","text":"hi"}],"metadata":{"n":12345678901234567890123}}}}"#,
             );
-            assert_eq!(super::super::strip_caller_identity_proofs(&body, &crate::config::ChannelProtocol::A2a), body);
+            assert_eq!(strip_readable(&body, &crate::config::ChannelProtocol::A2a), body);
         }
 
         #[test]
@@ -24111,7 +24163,7 @@ allow if {
                         "metadata": {binding: {"verifiablePresentation": "caller-made"}}}}})
             };
             let batch = serde_json::json!([request(1), request(2)]);
-            let stripped: serde_json::Value = serde_json::from_slice(&super::super::strip_caller_identity_proofs(
+            let stripped: serde_json::Value = serde_json::from_slice(&strip_readable(
                 &serde_json::to_vec(&batch)
                     .unwrap()
                     .into(),
@@ -24129,7 +24181,7 @@ allow if {
 
             let bare = serde_json::json!({"role": "user", "messageId": "m", "parts": [],
                 "metadata": {binding: {"verifiablePresentation": "caller-made"}}});
-            let stripped: serde_json::Value = serde_json::from_slice(&super::super::strip_caller_identity_proofs(
+            let stripped: serde_json::Value = serde_json::from_slice(&strip_readable(
                 &serde_json::to_vec(&bare)
                     .unwrap()
                     .into(),
@@ -24158,10 +24210,36 @@ allow if {
             assert!(super::super::caller_gets_inbound_identity(&payload, None, true));
         }
 
+        /// The body `strip_caller_identity_proofs` forwards for a body it can read.
+        fn strip_readable(
+            body: &axum::body::Bytes,
+            protocol: &crate::config::ChannelProtocol,
+        ) -> axum::body::Bytes {
+            super::super::strip_caller_identity_proofs(body, protocol).expect("a body the gateway can read")
+        }
+
         #[test]
-        fn a_body_that_is_not_json_is_forwarded_as_it_is() {
-            let body = axum::body::Bytes::from_static(b"not json");
-            assert_eq!(super::super::strip_caller_identity_proofs(&body, &crate::config::ChannelProtocol::A2a), body);
+        fn a_body_the_gateway_cannot_read_is_refused_rather_than_forwarded_with_its_proofs() {
+            let nested = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+            let deep = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"message/send","params":{{"message":{{"metadata":{{"{}":{{"verifiablePresentation":"caller-made"}},"deep":{nested}}}}}}}}}"#,
+                crate::config::AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION
+            );
+            for body in [axum::body::Bytes::from_static(b"not json"), axum::body::Bytes::from(deep)] {
+                for protocol in [crate::config::ChannelProtocol::A2a, crate::config::ChannelProtocol::Mcp] {
+                    let refused = super::super::strip_caller_identity_proofs(&body, &protocol)
+                        .expect_err("an unreadable body cannot lose its proofs");
+                    assert_eq!(refused.status(), axum::http::StatusCode::BAD_REQUEST);
+                }
+            }
+        }
+
+        #[test]
+        fn an_empty_body_or_one_of_another_protocol_is_forwarded_as_it_is() {
+            let empty = axum::body::Bytes::new();
+            assert_eq!(strip_readable(&empty, &crate::config::ChannelProtocol::A2a), empty);
+            let text = axum::body::Bytes::from_static(b"not json");
+            assert_eq!(strip_readable(&text, &crate::config::ChannelProtocol::DIDComm), text);
         }
     }
 

@@ -210,10 +210,13 @@ requests and Fabric send: none is derived from its credential or taken from its 
 `input.agent.did` and the trust-registry claims its body makes are absent from policy input, and
 the identity binding VP and identity credential it puts in its request, or that Header Metadata
 Mapping copies from its headers, are removed before the Target, in a single request, each request
-of a batch, or a bare message. The extension URIs that
-name them stay, since they also ask for the responding agent's credential, and other metadata the
-caller sends, such as a trust-registry `agent_did`, is forwarded unsigned as it came. A body that
-carries no proof is forwarded byte for byte. Policy tells these callers apart by
+of a batch, or a bare message. A body the gateway cannot read to remove them (not JSON, or nested
+deeper than it parses) is refused with `400` and a JSON-RPC parse error (`-32700`), even with A2A
+validation `off`. The extension URIs that name them stay, since they also ask for the responding
+agent's credential, and other metadata the caller sends, such as a trust-registry `agent_did`, is
+forwarded unsigned as it came. On a direct request, a body that carries no proof is forwarded byte
+for byte; Fabric send carries every caller's body as a JSON value, as it always has. Policy tells
+these callers apart by
 `input.source_auth.method` and `key_name`. Fabric receive does not read these identities; the
 request body sets the caller there.
 
@@ -982,9 +985,11 @@ whichever header carried it. A caller verified another way (API key, mTLS) binds
 Transit Point that authenticated no caller reads the `Authorization` header as sent, which the
 gateway has not verified, so give such a Transit Point `source_auth` before binding its claims.
 The Target's Workload Binding on an Access Point (`target.workload_binding`) follows the same
-rule: it binds the claims source authentication verified for a JWT Bearer caller, no claims for
-a caller verified another way or one whose credential failed, and reads the `Authorization`
-header as sent only on an Access Point that authenticates no caller.
+rule, with `caller_source: authorization_bearer_jwt` or `transit_token` (the default, read the same
+way since this leg carries no transit token): it binds the claims source authentication verified
+for a JWT Bearer caller, no claims for a caller verified another way or one whose credential
+failed, and reads the `Authorization` header as sent only on an Access Point that authenticates
+no caller.
 
 The identity hash covers the method, the issuer (the JWT `iss`, the API Key Provider agent,
 a hash of the subject and public key of the CA an mTLS client certificate was verified against), the
