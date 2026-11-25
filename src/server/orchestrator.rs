@@ -1021,6 +1021,43 @@ pub async fn run_axum_proxy(
     }
     crate::config::network::warn_about_unparsed_external_urls(&network_config.listeners);
 
+    network_config
+        .sts
+        .validate()
+        .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+    {
+        let config = &network_config.single_use_store;
+        config.check_shared_with(
+            bootstrap_config
+                .mcp
+                .continuations
+                .as_ref()
+                .map(|continuations| &continuations.storage),
+        )?;
+        let dynamodb = match config {
+            crate::storage::single_use::SingleUseStoreConfig::Dynamodb { .. } => Some(
+                crate::storage::dynamodb_generic_repository::build_dynamodb_client(
+                    bootstrap_config
+                        .aws_region
+                        .as_deref(),
+                    bootstrap_config
+                        .aws_profile
+                        .as_deref(),
+                )
+                .await?,
+            ),
+            crate::storage::single_use::SingleUseStoreConfig::Disk {} => None,
+        };
+        let dir = crate::storage::single_use::journal_dir(&bootstrap_config.storage_paths);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        crate::storage::single_use::install(
+            crate::storage::single_use::SingleUseStore::open(config, &dir, dynamodb, now).await?,
+        )?;
+        info!(path = ?dir, store = ?config, "✓ Single-use store opened");
+    }
+
     // Initialize settings store and load settings from disk
     info!(
         "Initializing settings store with path: {}",
@@ -1045,7 +1082,7 @@ pub async fn run_axum_proxy(
     // Register the settings store globally so the audit vault can read categories.
     crate::storage::settings_store::set_global_settings_store(settings_store.clone());
 
-    // Store gateways storage path globally for x402 gateway facilitator resolution
+    // Store gateways storage path globally for payment gateway logo resolution
     crate::storage::init_gateways_storage_path(
         bootstrap_config
             .storage_paths
@@ -1281,14 +1318,9 @@ pub async fn run_axum_proxy(
         warn!("facilitator_mode.facilitator_via_fabric is ignored: peer x402 verify and settle requests are refused");
     }
 
-    // Initialize transaction store for unified x402 lifecycle tracking
-    // EVERY gateway needs this - it handles BOTH roles:
-    // - GW1 role: receives HTTP payments, sends DIDComm verify/settle requests
-    // - GW2 role: receives DIDComm verify/settle requests from other gateways
-    // Load path from x402.json configuration (cached at startup)
+    // Load the recorded x402 transactions, kept readable for the admin API and
+    // completable by their facilitator gateway's settlement-complete message.
     if let Ok(x402_config) = crate::x402::config_cache::get_or_load_x402_config().await {
-        // Initialize transaction store from x402.json configuration
-        // This is the unified store for verification → settlement lifecycle tracking
         let transaction_storage_path = x402_config
             .transaction_storage
             .as_ref()
@@ -1305,39 +1337,15 @@ pub async fn run_axum_proxy(
             Ok(store) => {
                 let store_arc = Arc::new(store);
 
-                // Store globally for access by ALL components (DIDComm, HTTP middleware, Admin API, workers)
                 crate::gateways::init_transaction_store(Arc::clone(&store_arc)).await;
-                info!(path = ?transaction_storage_path, "✓ Transaction store initialized - handles both GW1 and GW2 roles");
-
-                // Recover unsettled payments on startup (crash recovery)
-                // Worker checks facilitator_gateway_id to determine what to settle
-                info!("Starting crash recovery for unsettled payments...");
-                let txn_store_rec = Arc::clone(&store_arc);
-                let recovery_bootstrap_config = Arc::clone(&bootstrap_config);
-                let facilitator_enabled = config
-                    .facilitator_mode
-                    .facilitator_via_fabric
-                    || config
-                        .facilitator_mode
-                        .facilitator_via_http;
-                tokio::spawn(async move {
-                    crate::x402::recover_unsettled_on_startup(
-                        txn_store_rec,
-                        recovery_bootstrap_config,
-                        facilitator_enabled,
-                    )
-                    .await;
-                });
-
-                // Note: Settlement worker will be started later after gateway_store is available
-                // (needs gateway_store to determine local_gateway_id for facilitator delegation logic)
+                info!(path = ?transaction_storage_path, "✓ x402 transaction store initialized");
             }
             Err(e) => {
-                error!(error = %e, "Failed to initialize transaction store - x402 payment processing will fail");
+                error!(error = %e, "Failed to initialize x402 transaction store - recorded x402 transactions are unavailable");
             }
         }
     } else {
-        warn!("Failed to load x402.json config - x402 payment processing disabled");
+        warn!("Failed to load x402.json config - recorded x402 transactions are unavailable");
     }
 
     // Initialize MPP transaction store for payment audit trail
@@ -1524,8 +1532,8 @@ pub async fn run_axum_proxy(
     let mut channels_by_port: HashMap<u16, Vec<crate::config::agent_surface::AgentSurface>> = HashMap::new();
     for surface in config.surfaces.iter() {
         // Skip disabled channels at startup
-        if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
-            info!("Skipping disabled channel '{}' at startup", surface.name);
+        if !surface.status.is_live() {
+            info!("Skipping inactive surface '{}' ({:?}) at startup", surface.name, surface.status);
             continue;
         }
 
@@ -1555,7 +1563,7 @@ pub async fn run_axum_proxy(
     let active_count = config
         .surfaces
         .iter()
-        .filter(|s| s.status == crate::config::agent_surface::SurfaceStatus::Active)
+        .filter(|s| s.status.is_live())
         .count();
     info!(
         "Initial startup: Mapped {} active channels across {} configured ports",
@@ -1713,7 +1721,7 @@ pub async fn run_axum_proxy(
             match surface_store.list_all().await {
                 Ok(surfaces) => {
                     for surface in &surfaces {
-                        if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
+                        if !surface.status.is_live() {
                             continue;
                         }
                         if let Err(e) = policy_manager
@@ -1853,9 +1861,7 @@ pub async fn run_axum_proxy(
                         .admit_all(
                             surfaces
                                 .iter()
-                                .filter(|surface| {
-                                    surface.status == crate::config::agent_surface::SurfaceStatus::Active
-                                }),
+                                .filter(|surface| surface.status.is_live()),
                         )
                         .await;
                 }
@@ -3233,8 +3239,20 @@ pub async fn run_axum_proxy(
                     }
 
                     match result {
-                        Ok(_) => {
+                        Ok(crate::gateways::connection_points::ListenerStart::Connected) => {
                             info!("✅ Listener started successfully for connection point {}", cmd.connection_point.id);
+                        }
+                        Ok(crate::gateways::connection_points::ListenerStart::Pending) => {
+                            warn!(
+                                "Listener for connection point {} is still connecting to its mediator",
+                                cmd.connection_point.id
+                            );
+                        }
+                        Ok(crate::gateways::connection_points::ListenerStart::Paused) => {
+                            info!(
+                                "Listener for connection point {} not started: it waits for mediator access",
+                                cmd.connection_point.id
+                            );
                         }
                         Err(e) => {
                             error!(
@@ -3574,45 +3592,6 @@ pub async fn run_axum_proxy(
             *slot = Some(listener_mgr.clone());
             crate::gateways::init_listener_manager(listener_mgr.clone()).await;
             info!("✓ Listener manager set in shared slot - fabric:// protocol now available for all channels");
-
-            // Start settlement workers now that listener manager and gateway_store are available
-            // 1. Settlement worker: Processes pending settlements from transaction store
-            // 2. Settlement sync worker: Sends settlement completion notifications via DIDComm
-            if let Ok(x402_config) = crate::x402::config_cache::get_or_load_x402_config().await
-                && x402_config
-                    .settlement_storage
-                    .is_some()
-                && let Some(txn_store) = crate::gateways::connection_points::message_processor::get_transaction_store()
-            {
-                // Convert gateway_store to trait object
-                let gateway_store_trait: Option<Arc<dyn crate::gateways::filesystem::GatewayStore>> = gateway_store
-                    .as_ref()
-                    .map(|s| s.clone() as Arc<dyn crate::gateways::filesystem::GatewayStore>);
-
-                // Start settlement worker WITH gateway_store (needed for local_gateway_id)
-                if let Some(worker_config) = crate::x402::settlement_worker::get_worker_config_from_x402_config(
-                    txn_store.clone(),
-                    x402_config.clone(),
-                    Arc::clone(&bootstrap_config),
-                    gateway_store_trait.clone(),
-                )
-                .await
-                {
-                    let _worker_handle = crate::x402::settlement_worker::start_settlement_worker(worker_config);
-                    info!(
-                        "✓ Settlement worker started (processes local transactions + those where we are the facilitator)"
-                    );
-                }
-
-                // Start settlement sync worker (sends settlement-complete notifications)
-                let _sync_worker_handle = crate::x402::settlement_worker::start_settlement_sync_worker(
-                    txn_store,
-                    Some(listener_mgr.clone()),
-                    gateway_store.clone(), // Use original FileSystemGatewayStore for sync worker
-                    60,                    // Poll every 60 seconds
-                );
-                info!("✓ Settlement sync worker started (sends completion notifications via DIDComm)");
-            }
         }
 
         // Update channel manager with listener_manager (for fabric:// protocol support in new channels)
@@ -4305,7 +4284,7 @@ pub async fn run_axum_proxy(
                     .map(|s| s.surface_id.clone())
                     .collect();
                 for surface in surfaces {
-                    if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
+                    if !surface.status.is_live() {
                         continue;
                     }
                     if existing_surface_ids.contains(&surface.surface_id) {
@@ -4498,7 +4477,7 @@ pub async fn run_axum_proxy(
                     .map(|s| s.surface_id.clone())
                     .collect();
                 for surface in surfaces {
-                    if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
+                    if !surface.status.is_live() {
                         continue;
                     }
                     if existing_surface_ids.contains(&surface.surface_id) {
@@ -4995,7 +4974,7 @@ async fn rederive_planes_on_activation(
         match store.list_all().await {
             Ok(surfaces) => {
                 for surface in &surfaces {
-                    if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
+                    if !surface.status.is_live() {
                         continue;
                     }
                     if let Err(e) = identity_state

@@ -55,6 +55,117 @@ describe('validateSurfacePayload', () => {
     });
   });
 
+  describe('a Transit Point that loses its stored Listen Path', () => {
+    const point = (listen_path?: string) => ({
+      id: '11111111-1111-4111-8111-111111111111',
+      alias: 'partner-a',
+      target_endpoint: 'https://partner.example/a',
+      ...(listen_path === undefined ? {} : { listen_path }),
+    });
+    const surface = (listen_path?: string) => ({
+      ...ok(),
+      transit: { points: [point(listen_path)] },
+    });
+
+    it('warns that the derived route answers now, without blocking the save', () => {
+      const issues = validateSurfacePayload(surface(), {
+        stored: surface('/outbound/agents/partner-a'),
+      });
+      const dropped = issues.find(i => i.message.includes('no longer has a Listen Path'));
+      expect(dropped).toMatchObject({ severity: 'warning' });
+      expect(dropped?.message).toContain('/outbound/agents/partner-a');
+      expect(hasBlockingIssues(issues)).toBe(false);
+    });
+
+    it('says nothing when the path is kept, changed, or was never set', () => {
+      for (const [now, before] of [
+        ['/outbound/agents/partner-a', '/outbound/agents/partner-a'],
+        ['/outbound/agents/partner-b', '/outbound/agents/partner-a'],
+        [undefined, undefined],
+      ] as Array<[string | undefined, string | undefined]>) {
+        const issues = validateSurfacePayload(surface(now), { stored: surface(before) });
+        expect(issues.find(i => i.message.includes('no longer has a Listen Path'))).toBeUndefined();
+      }
+    });
+
+    it('says nothing when the Transit Point itself is gone, which the canvas shows', () => {
+      const issues = validateSurfacePayload(
+        { ...ok(), transit: { points: [] } },
+        { stored: surface('/outbound/agents/partner-a') }
+      );
+      expect(issues.find(i => i.message.includes('no longer has a Listen Path'))).toBeUndefined();
+    });
+  });
+
+  describe('a Listen Path the gateway will not serve', () => {
+    const routing = {
+      available_listen_addresses: ['https://gateway.example.com'],
+      available_outbound_listen_addresses: ['https://gateway.example.com'],
+      shared_hostname_outbound_addresses: ['https://gateway.example.com'],
+      channel_path_prefix: [{ id: 'agents', name: 'agents', prefix: '/agents' }],
+    };
+    const surface = (listen_path?: string) => ({
+      ...ok(),
+      transit: {
+        points: [
+          {
+            id: '11111111-1111-4111-8111-111111111111',
+            alias: 'partner-a',
+            target_endpoint: 'https://partner.example/a',
+            listen_address: 'https://gateway.example.com',
+            ...(listen_path === undefined ? {} : { listen_path }),
+          },
+        ],
+      },
+    });
+    const refused = '/agents/partner-a';
+
+    it('blocks a save that introduces or changes it', () => {
+      for (const stored of [surface(), surface('/outbound/agents/partner-a'), undefined]) {
+        const issues = validateSurfacePayload(surface(refused), { stored, routing });
+        expect(hasBlockingIssues(issues)).toBe(true);
+        expect(issues.find(i => i.path?.endsWith('listen_path'))?.message).toContain(
+          'outside /outbound'
+        );
+      }
+    });
+
+    it('leaves a surface already stored with it editable, as the gateway does', () => {
+      const issues = validateSurfacePayload(surface(refused), {
+        stored: surface(refused),
+        routing,
+      });
+      expect(issues.find(i => i.path?.endsWith('listen_path'))).toBeUndefined();
+      expect(hasBlockingIssues(issues)).toBe(false);
+    });
+
+    it('judges nothing while the routing config has not loaded', () => {
+      const issues = validateSurfacePayload(surface(refused), { stored: surface(), routing: null });
+      expect(issues.find(i => i.path?.endsWith('listen_path'))).toBeUndefined();
+    });
+
+    // What the page passes for a variant view: the stored surface resolved through that
+    // variant's overrides, not the base surface and not nothing. Against either of those
+    // an untouched legacy path reads as newly introduced and blocks an unrelated save.
+    it('exempts a legacy path a variant view already holds', () => {
+      const base = surface('/outbound/agents/partner-a');
+      const variantView = surface(refused);
+      expect(
+        validateSurfacePayload(variantView, { stored: variantView, routing }).find(i =>
+          i.path?.endsWith('listen_path')
+        )
+      ).toBeUndefined();
+      // The base surface, and nothing, are the wrong views to compare against.
+      for (const stored of [base, null]) {
+        expect(
+          validateSurfacePayload(variantView, { stored, routing }).find(i =>
+            i.path?.endsWith('listen_path')
+          )
+        ).toMatchObject({ severity: 'error' });
+      }
+    });
+  });
+
   it('flags missing surface name as an error', () => {
     const issues = validateSurfacePayload({ ...ok(), name: '' });
     expect(issues.find(i => i.path === 'name')).toMatchObject({ severity: 'error' });

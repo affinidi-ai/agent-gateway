@@ -185,7 +185,7 @@ Feature: Credential policy on a Transit Point
   Scenario: A Transit Point request below its target endpoint's base path carries the Target credential
     Given the gateway authenticates to the destination of Transit Point "alpha" with a client credentials provider
     And the target endpoint of Transit Point "alpha" has the base path "/base"
-    When managed agent "example-agent" asks for available tools through the Transit Point path "/transit/alpha/rpc" exactly as written
+    When managed agent "example-agent" asks for available tools through the Transit Point path "/outbound/example/alpha/rpc" exactly as written
     Then the response status is 200
     And MCP server "bravo" received the forwarded path "/base/rpc"
     And MCP server "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
@@ -199,16 +199,16 @@ Feature: Credential policy on a Transit Point
     And MCP server "bravo" was not called
 
     Examples:
-      | path                               |
-      | /transit/alpha/../admin            |
-      | /transit/alpha/%2e%2e/admin        |
-      | /transit/alpha/%2E%2E/%2e%2e/admin |
-      | /transit/alpha/..;/admin           |
+      | path                                        |
+      | /outbound/example/alpha/../admin            |
+      | /outbound/example/alpha/%2e%2e/admin        |
+      | /outbound/example/alpha/%2E%2E/%2e%2e/admin |
+      | /outbound/example/alpha/..;/admin           |
 
   Scenario: A Transit Point target endpoint's redirect is returned to the managed agent instead of being followed with the credential
     Given the gateway authenticates to the destination of Transit Point "alpha" with a client credentials provider
     And MCP server "bravo" answers every request with a redirect to its path "/elsewhere"
-    When managed agent "example-agent" asks for available tools through the Transit Point path "/transit/alpha/rpc" exactly as written
+    When managed agent "example-agent" asks for available tools through the Transit Point path "/outbound/example/alpha/rpc" exactly as written
     Then the response status is 302
     And MCP server "bravo" received exactly 1 request
     And MCP server "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"

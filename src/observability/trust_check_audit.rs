@@ -20,10 +20,11 @@ const RESULT_OK: &str = "ok";
 const RESULT_DENIED: &str = "denied";
 const RESULT_ERROR: &str = "error";
 
-fn leg_label(leg: TrustCheckLeg) -> &'static str {
+pub(crate) fn leg_label(leg: TrustCheckLeg) -> &'static str {
     match leg {
         TrustCheckLeg::Caller => "caller",
         TrustCheckLeg::Target => "target",
+        TrustCheckLeg::ManagedAgent => "managed_agent",
     }
 }
 
@@ -367,6 +368,7 @@ mod tests {
     fn leg_labels_are_stable() {
         assert_eq!(leg_label(TrustCheckLeg::Caller), "caller");
         assert_eq!(leg_label(TrustCheckLeg::Target), "target");
+        assert_eq!(leg_label(TrustCheckLeg::ManagedAgent), "managed_agent");
     }
 
     #[test]

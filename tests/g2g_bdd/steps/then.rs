@@ -681,6 +681,46 @@ async fn vp_audit_log_records_answer_identity_under_request_trace_id(
     );
 }
 
+#[then(
+    expr = "the VP Audit Log of gateway {int} records its policy decision on the Fabric request under the trace id the request carried"
+)]
+async fn vp_audit_log_records_fabric_policy_decision_under_request_trace_id(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let is_fabric_decision = |event: &Value| event["event"]["policy_decision"]["flow"] == "fabric";
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(is_fabric_decision)
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
+    assert!(found, "expected gateway {gateway} to record a policy decision on the Fabric request, got {events:?}");
+    let request_trace = events
+        .iter()
+        .find(|event| {
+            event["via_fabric"] == true
+                && (event["event"]
+                    .get("identity_binding_failed")
+                    .is_some()
+                    || event["event"]
+                        .get("identity_binding_verified")
+                        .is_some())
+        })
+        .and_then(|event| event["trace_id"].as_str())
+        .unwrap_or_else(|| panic!("gateway {gateway} should record the Fabric request's trace id: {events:?}"));
+    let decision = events
+        .iter()
+        .find(|event| is_fabric_decision(event))
+        .unwrap();
+    assert_eq!(
+        decision["trace_id"].as_str(),
+        Some(request_trace),
+        "the policy decision on the Fabric request should carry the trace id the request carried, got {decision}"
+    );
+}
+
 /// The audit outcome for a failed identity binding, as the step names it.
 fn audited_identity_binding_failure(reason: &str) -> &'static str {
     match reason {
@@ -1192,6 +1232,25 @@ pub async fn managed_agent_served_its_agent_card_once(
         world.response_status,
         world.response_body
     );
+}
+
+#[then(expr = "managed agent {string} received the forwarded message with no caller identity")]
+pub async fn actor_received_the_forwarded_message_with_no_caller_identity(
+    world: &mut G2gWorld,
+    target_name: String,
+) {
+    use crate::bdd_support::json_rpc::{AGENT_IDENTITY_BINDING_EXTENSION_URI, AGENT_IDENTITY_CREDENTIAL_EXTENSION_URI};
+    let messages = forwarded_messages_for(world, &target_name).await;
+    assert_eq!(messages.len(), 1, "managed agent '{target_name}' should receive one forwarded message: {messages:?}");
+    let body = messages[0].json_body();
+    for uri in [AGENT_IDENTITY_BINDING_EXTENSION_URI, AGENT_IDENTITY_CREDENTIAL_EXTENSION_URI] {
+        let pointer = format!("/params/message/metadata/{}", uri.replace('/', "~1"));
+        assert!(
+            body.pointer(&pointer)
+                .is_none(),
+            "managed agent '{target_name}' should receive no caller identity proof '{uri}', got body: {body}"
+        );
+    }
 }
 
 #[then(expr = "managed agent {string} received one forwarded message")]

@@ -118,9 +118,10 @@ fields; and `variable_pattern`, the placeholder syntax in use (see _Templates_)
 | Payment | `payment.challenge_issued`, `paid`, `held`, `rejected`, `unconfirmed`, `unavailable`, `authorized`, `voided`, `capture_failed`, `reconcile_failed`: the outcomes of payments delegated to a connected agent-pay gateway |
 | Audit | `audit.<event>` for every event of the audit catalog ([`src/audit/catalog.rs`](../src/audit/catalog.rs)) |
 
-This gateway verifies no x402 or MPP payment itself, so `x402.verification.failed` and the three
-`mpp.*` events stay in the catalog, where existing integrations name them, but are never raised.
-The other x402 events come from settling and pruning x402 payments recorded before.
+This gateway verifies and settles no x402 or MPP payment itself, so `x402.verification.failed`,
+`x402.settlement.failed`, `x402.transaction.completed` and the three `mpp.*` events stay in the
+catalog, where existing integrations name them, but are never raised. Only
+`x402.cleanup.completed` still fires, when the daily cleanup prunes x402 payments recorded before.
 
 A passkey registration that creates an account raises `user.created` (registering a username that
 already has an account creates nothing and raises nothing), and an administrator's approval `user.approved`. A

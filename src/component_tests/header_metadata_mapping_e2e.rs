@@ -219,6 +219,7 @@ async fn header_metadata_mapping_is_available_to_trust_check_templates() {
             },
             timeout_secs: None,
             name: None,
+            subject: Default::default(),
         }];
         surface.target.policy = Some(crate::config::agent_surface::PolicyRef {
             policy_definition_id: TRUST_CHECK_TEMPLATE_POLICY_ID.to_string(),

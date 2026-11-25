@@ -23,7 +23,7 @@ SHELL := /bin/bash
         www www-dev \
         clean clean-all clear-storage clear-storage-local \
 		demo-multi-tenancy \
-        generate-cert trust-cert derive-x402-addresses \
+        generate-cert trust-cert \
         ngrok pre-commit pre-commit-rust pre-commit-node dev full-setup release \
         ui-test ui-test-headed ui-test-report \
 		itest-a2a itest-a2a-setup itest-a2a-run itest-a2a-teardown itest-a2a-clean itest-a2a-shopping \
@@ -415,7 +415,7 @@ run-debug: config-certs ## Run in debug mode; x=name for named instance; o=1 for
 		./scripts/_prepare.sh debug envs/local || exit 1; \
 		echo "$(GREEN)✅ Debug dev environment ready!$(NC)"; \
 	fi
-	@[ "$(auth)" = "saml" ] && ./scripts/_saml-setup.sh "envs/local$(if $(x),-$(x),)" "$(AZURE_TENANT)" || true
+	@if [ "$(auth)" = "saml" ]; then ./scripts/_saml-setup.sh "envs/local$(if $(x),-$(x),)" "$(AZURE_TENANT)"; fi
 	@[ "$(auth)" = "passkey" ] && ./scripts/_passkey-setup.sh "envs/local$(if $(x),-$(x),)" || true
 	@if [ -n "$(x)" ]; then \
 		RUST_LOG="$(RUST_LOG)" AG_IDENTITY_HASH_PEPPER="$(AG_IDENTITY_HASH_PEPPER)" AG_BACKUP_ENCRYPTION_KEY="$(AG_BACKUP_ENCRYPTION_KEY)" ./scripts/l-run-debug.sh $(x); \
@@ -436,7 +436,7 @@ run-watch: config-certs ## Run with cargo watch (auto-rebuild/restart on Rust ch
 		./scripts/_prepare.sh debug envs/local || exit 1; \
 		echo "$(GREEN)✅ Watch dev environment ready!$(NC)"; \
 	fi
-	@[ "$(auth)" = "saml" ] && ./scripts/_saml-setup.sh "envs/local$(if $(x),-$(x),)" "$(AZURE_TENANT)" || true
+	@if [ "$(auth)" = "saml" ]; then ./scripts/_saml-setup.sh "envs/local$(if $(x),-$(x),)" "$(AZURE_TENANT)"; fi
 	@[ "$(auth)" = "passkey" ] && ./scripts/_passkey-setup.sh "envs/local$(if $(x),-$(x),)" || true
 	@if [ -n "$(x)" ]; then \
 		RUST_LOG="$(RUST_LOG)" AG_IDENTITY_HASH_PEPPER="$(AG_IDENTITY_HASH_PEPPER)" AG_BACKUP_ENCRYPTION_KEY="$(AG_BACKUP_ENCRYPTION_KEY)" ./scripts/l-run-watch.sh $(x); \
@@ -859,11 +859,6 @@ trust-cert: ## Add self-signed cert to system trust store
 	@echo "$(BLUE)🔐 Adding certificate to system trust store...$(NC)"
 	@./scripts/certs/trust-cert.sh $(CERT_PATH)
 	@echo "$(GREEN)✅ Certificate trusted!$(NC)"
-
-derive-x402-addresses: ## Derive Ethereum addresses from x402.json facilitator keys
-	@echo "$(BLUE)🔐 Deriving x402 facilitator addresses...$(NC)"
-	@./scripts/x402/derive-facilitator-addresses.sh $(or $(X402_CONFIG),envs/local/config/x402.json) $(if $(UPDATE),--update)
-	@echo "$(GREEN)✅ x402 addresses derived!$(NC)"
 
 # ==============================================================================
 # Mediator Commands

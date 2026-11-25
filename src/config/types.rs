@@ -863,13 +863,42 @@ pub fn validate_outbound_alias(alias: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate a per-VC `listen_path` override.
-///
-/// Path must:
-/// - Start with `/`
-/// - Contain no `..` segments (path traversal guard)
-/// - Have at least one non-empty segment after the leading `/`
+/// Refuse a `listen_path` that is the gateway's outbound prefix itself, bare
+/// or with a trailing slash. Such a path registers the prefix and its wildcard
+/// on the outbound listener, so that one transit point answers every outbound
+/// request no route of its own matches more closely.
+pub fn refuse_outbound_prefix_as_listen_path(path: &str) -> Result<(), String> {
+    let prefix = crate::proxy::outbound_handler::TP_OUTBOUND_PATH_PREFIX;
+    if path.trim_end_matches('/') != prefix {
+        return Ok(());
+    }
+    Err(format!(
+        "listen_path '{path}' is the gateway's own outbound prefix, so this transit point would answer every \
+         '{prefix}' request no more specific route matches; leave listen_path unset to take the derived \
+         '{prefix}/<surface route>/<alias>', or set a path under '{prefix}/'"
+    ))
+}
+
+/// Validate a per-VC `listen_path` override: its shape
+/// ([`validate_outbound_listen_path_format`]), and that it is not the outbound
+/// prefix itself ([`refuse_outbound_prefix_as_listen_path`]).
 pub fn validate_outbound_listen_path(path: &str) -> Result<(), String> {
+    validate_outbound_listen_path_format(path)?;
+    refuse_outbound_prefix_as_listen_path(path)
+}
+
+/// The shape the outbound router cannot bend. Path must:
+/// - Start with `/`; axum refuses anything else, panicking the listener build
+/// - Contain no `..` segments (path traversal guard)
+/// - Contain no `{` or `}`: axum reads a balanced pair as a path parameter, so
+///   the transit point quietly answers every value in that position, and an
+///   unbalanced one panics the listener build
+/// - Contain no segment starting with `:` or `*`: axum rejects the pre-0.8
+///   parameter syntax unless the router opts out of that check, which the
+///   outbound router does not, so it panics the listener build
+/// - Have at least one non-empty segment after the leading `/`, so the point
+///   claims a path of its own rather than the listener's root
+pub fn validate_outbound_listen_path_format(path: &str) -> Result<(), String> {
     if !path.starts_with('/') {
         return Err(format!("listen_path '{}' must start with '/'", path));
     }
@@ -878,6 +907,18 @@ pub fn validate_outbound_listen_path(path: &str) -> Result<(), String> {
         .any(|seg| seg == "..")
     {
         return Err(format!("listen_path '{}' must not contain '..' segments", path));
+    }
+    if path.contains(['{', '}']) {
+        return Err(format!("listen_path '{}' must not contain '{{' or '}}'", path));
+    }
+    if let Some(segment) = path
+        .split('/')
+        .find(|segment| segment.starts_with(':') || segment.starts_with('*'))
+    {
+        return Err(format!(
+            "listen_path '{}' must not contain a segment starting with ':' or '*' ('{}')",
+            path, segment
+        ));
     }
     if path
         .trim_start_matches('/')
@@ -913,7 +954,7 @@ pub fn group_outbound_vcs_by_port(
         std::collections::HashMap::new();
 
     for surface in surfaces {
-        if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
+        if !surface.status.is_live() {
             continue;
         }
         let Some(ref transit) = surface.transit else {
@@ -1013,7 +1054,7 @@ pub fn find_unresolved_outbound_transit_points(
     let mut problems = Vec::new();
 
     for surface in surfaces {
-        if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
+        if !surface.status.is_live() {
             continue;
         }
         let Some(ref transit) = surface.transit else {
@@ -1372,11 +1413,16 @@ pub struct RateLimitConfig {
 /// STS (`/oauth2/token`) runtime controls. All fields have safe defaults, so a
 /// gateway configuration without an `sts` block behaves as if these defaults
 /// were set.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StsRuntimeConfig {
-    /// Replay-protection backend selection for single-use ID-JAG redemption.
+    /// Accepted for compatibility and not used: redeemed ID-JAGs are recorded
+    /// in the single-use store (`single_use_store`).
     #[serde(default)]
     pub replay_protection: ReplayProtectionConfig,
+    /// The longest remaining lifetime, in seconds, an ID-JAG presented for
+    /// redemption may have; from 1 to 3600, 900 when unset.
+    #[serde(default = "default_id_jag_max_lifetime_secs")]
+    pub id_jag_max_lifetime_secs: u64,
     /// Brute-force throttle for the token endpoint.
     #[serde(default)]
     pub token_endpoint_throttle: TokenEndpointThrottleConfig,
@@ -1386,6 +1432,42 @@ pub struct StsRuntimeConfig {
 
     #[serde(default, skip_serializing_if = "crate::sts::replay::McpReplayConfig::is_default")]
     pub mcp_replay: crate::sts::replay::McpReplayConfig,
+}
+
+impl Default for StsRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            replay_protection: ReplayProtectionConfig::default(),
+            id_jag_max_lifetime_secs: default_id_jag_max_lifetime_secs(),
+            token_endpoint_throttle: TokenEndpointThrottleConfig::default(),
+            mcp_issuer: None,
+            mcp_replay: crate::sts::replay::McpReplayConfig::default(),
+        }
+    }
+}
+
+impl StsRuntimeConfig {
+    /// Refuses an `id_jag_max_lifetime_secs` outside 1 to 3600 and warns when
+    /// the unused `replay_protection.backend` is set to anything but its default.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=3600).contains(&self.id_jag_max_lifetime_secs) {
+            return Err(format!(
+                "sts.id_jag_max_lifetime_secs must be from 1 to 3600, not {}",
+                self.id_jag_max_lifetime_secs
+            ));
+        }
+        if self.replay_protection.backend != default_replay_backend() {
+            tracing::warn!(
+                backend = %self.replay_protection.backend,
+                "sts.replay_protection.backend is no longer used: redeemed ID-JAGs are recorded in single_use_store"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn default_id_jag_max_lifetime_secs() -> u64 {
+    900
 }
 
 /// Per-client-IP throttle for a sign-in endpoint (SAML login, CLI login, passkey sign-in and
@@ -1518,8 +1600,7 @@ fn default_login_throttle_per_ip() -> RateLimitConfig {
     }
 }
 
-/// Selects the replay-protection backend by name. The built-in backend is
-/// `in_process`; additional backends may be registered at startup.
+/// `sts.replay_protection`, accepted for compatibility and not used.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayProtectionConfig {
     #[serde(default = "default_replay_backend")]
@@ -1864,32 +1945,6 @@ pub struct X402PaymentRequirement {
     pub extra: Option<serde_json::Value>,
 }
 
-impl X402PaymentRequirement {
-    /// Token contract address, or `None` when the requirement is for the network's native currency
-    pub fn token_address(&self) -> Option<&str> {
-        if self.asset.is_empty() || self.asset == "native" {
-            None
-        } else {
-            Some(&self.asset)
-        }
-    }
-
-    /// Asset transfer method from `extra` (`assetTransferMethod`, or legacy `asset_transfer_method`),
-    /// defaulting to `transaction`
-    pub fn asset_transfer_method(&self) -> String {
-        self.extra
-            .as_ref()
-            .and_then(|extra| {
-                extra
-                    .get("assetTransferMethod")
-                    .or_else(|| extra.get("asset_transfer_method"))
-            })
-            .and_then(|v| v.as_str())
-            .unwrap_or("transaction")
-            .to_string()
-    }
-}
-
 /// x402 payment provider of a stored `x402` policy. An enabled `AgentPay`
 /// policy loads as [`crate::config::agent_surface::PaymentPolicy::AgentPay`];
 /// `Local` is the unsupported local paywall.
@@ -2221,6 +2276,36 @@ fn any_pattern_matches(
         }
     };
     compiled.is_match(s)
+}
+
+#[cfg(test)]
+mod sts_runtime_config_tests {
+    use super::StsRuntimeConfig;
+
+    fn with_lifetime(secs: u64) -> StsRuntimeConfig {
+        StsRuntimeConfig {
+            id_jag_max_lifetime_secs: secs,
+            ..StsRuntimeConfig::default()
+        }
+    }
+
+    #[test]
+    fn an_id_jag_lifetime_cap_from_1_to_3600_is_accepted() {
+        for secs in [1, 900, 3600] {
+            assert_eq!(with_lifetime(secs).validate(), Ok(()), "{secs}");
+        }
+        assert_eq!(StsRuntimeConfig::default().id_jag_max_lifetime_secs, 900);
+    }
+
+    #[test]
+    fn an_id_jag_lifetime_cap_outside_1_to_3600_is_refused() {
+        for secs in [0, 3601] {
+            assert_eq!(
+                with_lifetime(secs).validate(),
+                Err(format!("sts.id_jag_max_lifetime_secs must be from 1 to 3600, not {secs}"))
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4623,12 +4708,22 @@ mod x402_storage_config_tests {
     }
 
     #[test]
-    fn example_x402_config_parses_settlement_worker_settings() {
+    fn example_x402_config_parses_without_the_facilitator_blocks() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/examples/x402.example.json");
         let contents = std::fs::read_to_string(path).expect("read x402 example");
         let config: X402Config = serde_json::from_str(&contents).expect("parse x402 example");
 
-        assert_eq!(settlement_worker_settings(&config), (100, 60, 3));
+        assert!(
+            config
+                .settlement_storage
+                .is_none()
+        );
+        assert!(
+            config
+                .facilitator_private_keys
+                .is_none()
+        );
+        assert!(config.facilitator.is_none());
         assert!(
             config
                 .transaction_storage

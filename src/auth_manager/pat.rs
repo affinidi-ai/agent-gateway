@@ -25,6 +25,16 @@ pub trait PatAuthenticator: Send + Sync {
 #[derive(Clone)]
 pub struct PatContext(pub Option<Vec<String>>);
 
+/// Whether an access token's explicit `scopes` grant `feature`.
+pub fn scope_grants(
+    scopes: &[String],
+    feature: &crate::rbac::Feature,
+) -> bool {
+    scopes
+        .iter()
+        .any(|scope| scope == feature.as_str())
+}
+
 #[derive(Clone)]
 pub struct PatDelegationContext {
     pub token_id: String,

@@ -4,6 +4,7 @@ import {
   computeSharedOutboundAddresses,
   fetchRoutingConfig,
   meaningfulListenerAddresses,
+  offeredChannelPrefixes,
   shouldHideListenerPicker,
   type RoutingConfig,
 } from '../access-point/defaults';
@@ -63,37 +64,34 @@ function buildRoutePath(customPath: string): string {
   return customPath.startsWith('/') ? customPath : `/${customPath}`;
 }
 
+/**
+ * The same channel's prefix as the new address offers it. Both lists are built by
+ * `offeredChannelPrefixes` and carry the channel's `id`, so the translation follows
+ * the channel rather than the string: a root channel, whose plain form is the whole
+ * listener, keeps its `/outbound` form on every address instead of being stripped to
+ * `/` and composing a path that starts `//`.
+ */
 function translatePrefixForNewAddress({
   selectedPrefix,
   addressSource,
-  isSharedDomain,
-  newIsShared,
+  address,
+  newAddress,
   routingConfig,
 }: {
   selectedPrefix: string;
   addressSource: 'inbound' | 'outbound';
-  isSharedDomain: boolean;
-  newIsShared: boolean;
+  address: string;
+  newAddress: string;
   routingConfig: RoutingConfig | null;
 }): string {
-  if (addressSource !== 'outbound' || !selectedPrefix) return selectedPrefix;
-
-  const prefixes = routingConfig?.channel_path_prefix ?? [];
-
-  if (!isSharedDomain && newIsShared) {
-    const plain = prefixes.find(c => c.prefix === selectedPrefix);
-    if (!plain) return selectedPrefix;
-    return `${OUTBOUND}${plain.prefix.replace(/\/$/, '')}`;
-  }
-
-  if (isSharedDomain && !newIsShared) {
-    if (!selectedPrefix.startsWith(OUTBOUND)) return selectedPrefix;
-    const stripped = selectedPrefix.slice(OUTBOUND.length) || '/';
-    const match = prefixes.find(c => c.prefix === stripped || c.prefix === `${stripped}/`);
-    return match ? match.prefix : selectedPrefix;
-  }
-
-  return selectedPrefix;
+  if (addressSource !== 'outbound' || !selectedPrefix || !routingConfig) return selectedPrefix;
+  const here = offeredChannelPrefixes(routingConfig, addressSource, address);
+  const there = offeredChannelPrefixes(routingConfig, addressSource, newAddress);
+  const channel = here.find(c => c.prefix === selectedPrefix);
+  if (!channel) return selectedPrefix;
+  const sameChannel = (id: string) => id.replace(/^outbound-/, '');
+  const moved = there.find(c => sameChannel(c.id) === sameChannel(channel.id));
+  return moved ? moved.prefix : selectedPrefix;
 }
 
 function HostPortOptions({
@@ -201,24 +199,26 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
 
   const isSharedDomain = selectedHostPort ? sharedOutboundAddresses.has(selectedHostPort) : false;
 
-  const channelPrefixes = useMemo(() => {
-    if (!routingConfig) return [];
-    if (addressSource !== 'outbound') return routingConfig.channel_path_prefix;
-    const plain = routingConfig.channel_path_prefix;
-    const outbound = plain.map(c => ({
-      id: `outbound-${c.id}`,
-      name: `outbound \u2192 ${c.name}`,
-      prefix: `${OUTBOUND}${c.prefix.replace(/\/$/, '')}`,
-    }));
-    // On a shared-domain address the inbound pipeline owns all non-/outbound paths,
-    // so only the /outbound/… prefixes are reachable via the outbound pipeline.
-    return isSharedDomain ? outbound : plain;
-  }, [routingConfig, addressSource, isSharedDomain]);
+  // The one implementation of which prefixes are on offer here, shared with the save
+  // gate (`listenPathProblem`), so the picker cannot offer a path the gateway refuses.
+  const channelPrefixes = useMemo(
+    () =>
+      routingConfig ? offeredChannelPrefixes(routingConfig, addressSource, selectedHostPort) : [],
+    [routingConfig, addressSource, selectedHostPort]
+  );
 
   const composedRoute: string = config[routeFieldName] || '';
 
   const { selectedPrefix, customPath } = useMemo(() => {
-    if (config.route_prefix || config.route_suffix !== undefined) {
+    // A persisted prefix is only trusted while the selector still offers it. One that
+    // is not among the options cannot be shown as selected, so taking it here left the
+    // dropdown on its placeholder and Custom Path empty on a surface whose route was
+    // perfectly good - which is what a stale or wrongly seeded route_prefix looks like
+    // (an inbound /agents on a Transit Point whose path starts /outbound/). Falling
+    // through re-derives both from the route itself.
+    const offersPersistedPrefix =
+      !config.route_prefix || channelPrefixes.some(p => p.prefix === config.route_prefix);
+    if (offersPersistedPrefix && (config.route_prefix || config.route_suffix !== undefined)) {
       return {
         selectedPrefix: config.route_prefix || '',
         customPath: config.route_suffix || '',
@@ -254,19 +254,31 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
       if (!config.listen_address && availableAddresses[0]) {
         patch.listen_address = meaningfulAddresses[0] ?? availableAddresses[0];
       }
-      if (!config.route_prefix && routingConfig.channel_path_prefix[0]) {
-        const matched = routingConfig.channel_path_prefix.find(
+      // Matched against the prefixes offered for the address this node will hold,
+      // which the memo above cannot give while that address is still being written.
+      const seedPrefixes = routingConfig
+        ? offeredChannelPrefixes(
+            routingConfig,
+            addressSource,
+            patch.listen_address ?? config.listen_address ?? ''
+          )
+        : [];
+      if (!config.route_prefix && seedPrefixes[0]) {
+        const matched = seedPrefixes.find(
           p => composedRoute === p.prefix || composedRoute.startsWith(p.prefix + '/')
         );
-        const prefix = matched?.prefix ?? routingConfig.channel_path_prefix[0].prefix;
-        const derivedSuffix = matched ? composedRoute.substring(matched.prefix.length) : '';
-        const suffix = config.route_suffix || derivedSuffix || '';
-        const path = suffix ? (suffix.startsWith('/') ? suffix : `/${suffix}`) : '';
-        patch.route_prefix = prefix;
-        if (suffix) {
-          patch.route_suffix = suffix.startsWith('/') ? suffix.substring(1) : suffix;
+        // Only a prefix the route starts with is persisted; a route under none of them
+        // leaves the field unset, so the selector shows it unresolved.
+        if (matched) {
+          const derivedSuffix = composedRoute.substring(matched.prefix.length);
+          const suffix = config.route_suffix || derivedSuffix || '';
+          const path = suffix ? (suffix.startsWith('/') ? suffix : `/${suffix}`) : '';
+          patch.route_prefix = matched.prefix;
+          if (suffix) {
+            patch.route_suffix = suffix.startsWith('/') ? suffix.substring(1) : suffix;
+          }
+          if (path) patch[routeFieldName] = `${matched.prefix}${path}`;
         }
-        if (path) patch[routeFieldName] = `${prefix}${path}`;
       }
       if (Object.keys(patch).length > 0) updateFields(patch);
       return;
@@ -275,8 +287,13 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
     seededRef.current = true;
     const suffix = generateRandomPath();
     const path = suffix.startsWith('/') ? suffix : `/${suffix}`;
-    const prefix = routingConfig.channel_path_prefix[0]?.prefix ?? '';
     const listen = meaningfulAddresses[0] ?? availableAddresses[0] ?? '';
+    // Offered for the address seeded in this same update, not for the empty one the
+    // node still holds: on a shared-hostname address that is the /outbound form, and
+    // a plain prefix there would be refused by the save as soon as it rendered.
+    const prefix = routingConfig
+      ? (offeredChannelPrefixes(routingConfig, addressSource, listen)[0]?.prefix ?? '')
+      : '';
     updateFields({
       listen_address: listen,
       route_prefix: prefix,
@@ -291,14 +308,31 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
     const trimmed = suffix.trim();
     const path = trimmed ? (trimmed.startsWith('/') ? trimmed : `/${trimmed}`) : '';
     const composed = prefix && path ? `${prefix}${path}` : '';
-    updateFields({
-      route_prefix: prefix,
-      route_suffix: suffix,
-      [routeFieldName]: composed,
-    });
+    // An incomplete pair composes nothing, which must not wipe a route the node
+    // already holds: a stored path the picker cannot place leaves the prefix
+    // unresolved, and typing in the other field would otherwise clear it. The
+    // required-field errors and the save gate report the incomplete pair.
+    const fields: Record<string, any> = { route_prefix: prefix, route_suffix: suffix };
+    if (composed || !composedRoute) fields[routeFieldName] = composed;
+    updateFields(fields);
   };
 
   const pathError = useMemo(() => validatePath(customPath), [customPath]);
+
+  // Both fields are required, and a node whose route the editor cannot place under an
+  // offered prefix renders blank, which is indistinguishable from one nobody filled in.
+  // Gated on hasAttemptedSave like the existing path error,
+  // so a new node is not red before it has been touched.
+  const prefixMissing = !selectedPrefix;
+  const pathMissing = !customPath.trim();
+  // A Transit Point with no Listen Path at all is not missing one: it answers at the
+  // route the gateway derives from its alias, and clearing both fields is how the
+  // dashboard goes back to that. So the pair is required only once something is set,
+  // which is also where `listenPathProblem` blocks the save. An Access Point has no
+  // such fallback, and its own `incompleteReason` blocks an empty route.
+  const routeOptional = routeFieldName === 'listen_path';
+  const routeUnset = !composedRoute && prefixMissing && pathMissing;
+  const showErrors = !!hasAttemptedSave && !(routeOptional && routeUnset);
 
   const fullRouteDisplay = useMemo(() => {
     if (!selectedHostPort || !selectedPrefix) return '';
@@ -307,12 +341,11 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
   }, [selectedHostPort, selectedPrefix, customPath]);
 
   const handleHostPortChange = (newAddr: string) => {
-    const newIsShared = sharedOutboundAddresses.has(newAddr);
     const newPrefix = translatePrefixForNewAddress({
       selectedPrefix,
       addressSource,
-      isSharedDomain,
-      newIsShared,
+      address: selectedHostPort,
+      newAddress: newAddr,
       routingConfig,
     });
     if (newPrefix === selectedPrefix) {
@@ -454,6 +487,7 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
             value={selectedPrefix}
             onChange={e => writeRouteParts(e.target.value, customPath)}
             disabled={!routingConfig || channelPrefixes.length === 0}
+            isInvalid={showErrors && prefixMissing}
           >
             {!routingConfig ? (
               <option value="">Loading...</option>
@@ -470,6 +504,17 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
               </>
             )}
           </Form.Select>
+          {showErrors && prefixMissing && (
+            <Form.Control.Feedback type="invalid" style={{ fontSize: '10px' }}>
+              Pick a surface prefix.
+              {!!composedRoute && (
+                <>
+                  {' '}
+                  This node is stored as <code>{composedRoute}</code>, which is under none of them.
+                </>
+              )}
+            </Form.Control.Feedback>
+          )}
         </Form.Group>
         <Form.Group className="mb-2">
           <div className="d-flex align-items-center gap-1 mb-1">
@@ -489,12 +534,12 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
             type="text"
             placeholder="my-agent/v1"
             value={customPath.startsWith('/') ? customPath.substring(1) : customPath}
-            isInvalid={!!hasAttemptedSave && !!pathError}
+            isInvalid={showErrors && (pathMissing || !!pathError)}
             onChange={e => writeRouteParts(selectedPrefix, e.target.value)}
           />
-          {!!hasAttemptedSave && pathError && (
+          {showErrors && (pathMissing || pathError) && (
             <Form.Control.Feedback type="invalid" style={{ fontSize: '10px' }}>
-              {pathError}
+              {pathError ?? 'Enter a path.'}
             </Form.Control.Feedback>
           )}
           <Form.Text className="text-muted d-block" style={{ fontSize: '10px' }}>

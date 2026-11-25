@@ -3,7 +3,7 @@
 use axum::{Extension, Json, extract::Path, http::StatusCode};
 use serde::Deserialize;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::auth_manager::pat::PatResourceScope;
 use crate::gateways::connection_points::{ConnectionPointListenerManager, ConnectionPointStore};
@@ -344,8 +344,16 @@ pub async fn approve_gateway<
                 // Wait for the listener to actually start (event-driven, no polling)
                 info!("  ⏳ Waiting for listener to start...");
                 match completion_rx.await {
-                    Ok(Ok(())) => {
-                        info!("  ✓ Listener started successfully");
+                    Ok(Ok(crate::gateways::connection_points::ListenerStart::Connected)) => {
+                        info!("✓ Gateway connection point listener started and authenticated with mediator");
+                    }
+                    Ok(Ok(crate::gateways::connection_points::ListenerStart::Pending)) => {
+                        warn!(
+                            "Gateway connection point listener is still connecting to its mediator; the peer's messages wait at the mediator until it connects"
+                        );
+                    }
+                    Ok(Ok(crate::gateways::connection_points::ListenerStart::Paused)) => {
+                        info!("Gateway connection point listener not started: the connection point waits for mediator access");
                     }
                     Ok(Err(e)) => {
                         // Listener failed to start - this is a critical error
@@ -369,8 +377,6 @@ pub async fn approve_gateway<
                 ));
             }
         }
-
-        info!("✓ Gateway connection point listener started and authenticated with mediator");
 
         // Step 5: NOW send connection-accepted with the gateway CP DID (not the OOB secure DID!)
         // The thread id doubles as the attestation nonce so the acceptor can bind

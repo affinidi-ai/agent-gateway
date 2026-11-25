@@ -220,11 +220,34 @@ fn acs_return_target(
         .unwrap_or_else(|| "/".to_string())
 }
 
+fn js_string_literal(value: &str) -> String {
+    serde_json::Value::String(value.to_owned())
+        .to_string()
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+fn acs_script_nonce() -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 16]>())
+}
+
+fn acs_content_security_policy(nonce: &str) -> String {
+    format!(
+        "default-src 'none'; script-src 'nonce-{nonce}'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    )
+}
+
 fn acs_success_html(
     redirect_target: &str,
     session_token: &str,
+    nonce: &str,
 ) -> String {
-    let redirect_target_js = serde_json::to_string(redirect_target).unwrap_or_else(|_| "\"/\"".to_string());
+    let redirect_target_js = js_string_literal(redirect_target);
+    let session_token_js = js_string_literal(session_token);
     let redirect_target_attr = redirect_target
         .replace('&', "&amp;")
         .replace('"', "&quot;")
@@ -237,8 +260,8 @@ fn acs_success_html(
 <head>
     <title>Login Successful</title>
     <meta http-equiv="refresh" content="0;url={redirect_target_attr}">
-    <script>
-        sessionStorage.setItem('session_token', '{session_token}');
+    <script nonce="{nonce}">
+        sessionStorage.setItem('session_token', {session_token_js});
         window.location.href = {redirect_target_js};
     </script>
 </head>
@@ -247,6 +270,21 @@ fn acs_success_html(
 </body>
 </html>"#
     )
+}
+
+fn acs_success_response(
+    mut headers: axum::http::HeaderMap,
+    redirect_target: &str,
+    session_token: &str,
+) -> Result<Response, StatusCode> {
+    let nonce = acs_script_nonce();
+    let html = acs_success_html(redirect_target, session_token, &nonce);
+    let policy = axum::http::HeaderValue::from_str(&acs_content_security_policy(&nonce)).map_err(|e| {
+        error!("Failed to build the SAML success page Content-Security-Policy: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    headers.insert(axum::http::header::CONTENT_SECURITY_POLICY, policy);
+    Ok((headers, Html(html)).into_response())
 }
 
 /// Assertion Consumer Service - receives SAML response from Azure AD
@@ -351,9 +389,7 @@ pub async fn saml_acs(
 
     let redirect_target = acs_return_target(&saml_state.saml_service, form.relay_state.as_deref());
 
-    let html = acs_success_html(&redirect_target, &finalized_session.session_token);
-
-    Ok((finalized_session.headers, Html(html)).into_response())
+    Ok(acs_success_response(finalized_session.headers, &redirect_target, &finalized_session.session_token)?)
 }
 
 /// Serve SAML metadata
@@ -569,16 +605,103 @@ mod tests {
 
     #[test]
     fn acs_html_redirects_to_the_target_in_markup_and_script() {
-        let html = acs_success_html(CLI_TARGET, "tok-1");
+        let html = acs_success_html(CLI_TARGET, "tok-1", "n0nce");
 
         assert!(html.contains("content=\"0;url=/api/auth/cli/authorize?port=52111&amp;state=st&amp;challenge=ch\""));
-        assert!(html.contains("window.location.href = \"/api/auth/cli/authorize?port=52111&state=st&challenge=ch\";"));
-        assert!(html.contains("sessionStorage.setItem('session_token', 'tok-1');"));
+        assert!(html.contains(
+            "window.location.href = \"/api/auth/cli/authorize?port=52111\\u0026state=st\\u0026challenge=ch\";"
+        ));
+        assert!(html.contains("sessionStorage.setItem('session_token', \"tok-1\");"));
+        assert!(html.contains("<script nonce=\"n0nce\">"));
+    }
+
+    #[test]
+    fn acs_html_encodes_a_hostile_token_as_a_script_safe_string_literal() {
+        let html = acs_success_html("/", "a'\"\\</script><script>x()</script>&\u{2028}", "n");
+
+        assert!(!html.contains("</script><script>x()"));
+        assert!(html.contains(
+            "sessionStorage.setItem('session_token', \"a'\\\"\\\\\\u003c/script\\u003e\\u003cscript\\u003ex()\\u003c/script\\u003e\\u0026\\u2028\");"
+        ));
+        assert_eq!(
+            html.matches("</script>")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn acs_html_encodes_a_hostile_target_as_a_script_safe_string_literal() {
+        let html = acs_success_html("/a\"</script><script>x()</script>&\u{2029}", "tok-1", "n");
+
+        assert!(!html.contains("</script><script>x()"));
+        assert!(html.contains(
+            "window.location.href = \"/a\\\"\\u003c/script\\u003e\\u003cscript\\u003ex()\\u003c/script\\u003e\\u0026\\u2029\";"
+        ));
+        assert_eq!(
+            html.matches("</script>")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn acs_content_security_policy_allows_only_the_nonced_script() {
+        let policy = acs_content_security_policy("abc");
+
+        assert!(policy.contains("script-src 'nonce-abc'"));
+        assert!(policy.contains("default-src 'none'"));
+        assert!(policy.contains("frame-ancestors 'none'"));
+        assert!(!policy.contains("unsafe-inline"));
+    }
+
+    #[tokio::test]
+    async fn acs_response_pairs_the_policy_nonce_with_the_script_nonce() {
+        let mut session_headers = axum::http::HeaderMap::new();
+        session_headers.insert(axum::http::header::SET_COOKIE, "session=abc".parse().unwrap());
+        let response = acs_success_response(session_headers, "/", "tok-1").unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::SET_COOKIE)
+                .unwrap(),
+            "session=abc"
+        );
+        let policy = response
+            .headers()
+            .get(axum::http::header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        let nonce = policy
+            .split("'nonce-")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .unwrap();
+
+        assert!(html.contains(&format!("<script nonce=\"{nonce}\">")));
+    }
+
+    #[test]
+    fn acs_script_nonces_are_unique_and_url_safe() {
+        let (a, b) = (acs_script_nonce(), acs_script_nonce());
+
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 22);
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        );
     }
 
     #[test]
     fn acs_html_escapes_a_hostile_target_in_the_meta_refresh() {
-        let html = acs_success_html("/a\"><script>x</script>", "tok-1");
+        let html = acs_success_html("/a\"><script>x</script>", "tok-1", "n");
 
         assert!(html.contains("content=\"0;url=/a&quot;&gt;&lt;script&gt;x&lt;/script&gt;\""));
     }

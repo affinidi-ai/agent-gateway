@@ -123,4 +123,13 @@ describe('describeAuthorityUse', () => {
       )
     ).toBe('Trust Recorder entry for tr-9 in variant beta');
   });
+
+  it('names the Transit Point whose own Trust Recorder holds the entry', () => {
+    expect(
+      describeAuthorityUse(
+        { element: 'trust_recorder', trustRegistryId: 'tr-1', transitPoint: 'partner' },
+        name
+      )
+    ).toBe('Trust Recorder entry for Partner registry on Transit Point partner');
+  });
 });

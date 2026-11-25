@@ -748,6 +748,14 @@ async fn operator_has_closed_the_access_point(
         .expect("close the Access Point");
 }
 
+#[given(expr = "surface {string} derives the inbound identity from the API key the caller presents")]
+fn surface_derives_the_inbound_identity_from_the_api_key(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    surface_spec_mut(world, &surface_name).inbound_identity_from_api_key = true;
+}
+
 /// Its Access Point hands a caller whose credential is missing or invalid to
 /// policy instead of refusing it.
 #[given(expr = "surface {string} is stored with a public Access Point")]
@@ -1273,6 +1281,14 @@ async fn surface_has_deny_all_request_policy(
     surface_name: String,
 ) {
     attach_request_policy(world, &surface_name, "deny-all", "default allow := false").await;
+}
+
+#[given(expr = "surface {string} has a request policy that allows all requests")]
+async fn surface_has_allow_all_request_policy(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    attach_request_policy(world, &surface_name, "allow-all", "default allow := true").await;
 }
 
 async fn attach_request_policy(

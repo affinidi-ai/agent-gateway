@@ -1,5 +1,6 @@
 import * as Cap from '../capabilities';
 import type { NodeDefinition, PayloadSlice } from '../types';
+import { TRUST_RECORDER_TRANSIT_POINT_SLOT_ID } from '../edges/archetypes';
 import TrustRecorderPanel from './TrustRecorderPanel';
 import TrustRecorderFullscreenPanel from './TrustRecorderFullscreenPanel';
 import { DOCS_URL } from '../../../../config/docs';
@@ -126,6 +127,14 @@ export function readEntries(config: any): TrustRecorderEntry[] {
     });
 }
 
+/**
+ * True for the Trust Recorder on a Managed Agent → Transit Point arrow, which
+ * the Transit Point writes as its own `trust_recorder`.
+ */
+export function isTransitPointTrustRecorder(node: { slotId?: string } | undefined): boolean {
+  return node?.slotId === TRUST_RECORDER_TRANSIT_POINT_SLOT_ID;
+}
+
 /** The entries of a Trust Recorder node whose Authority the loaded register no longer has. */
 export function missingTrustRecorderAuthorities(
   config: any,
@@ -160,10 +169,10 @@ export const trustRecorderDefinition: NodeDefinition = {
   paletteCategory: 'policy',
   paletteOrder: 6,
   dropMode: 'edge',
-  directionality: 'response',
+  directionality: 'either',
   edgeSnap: {
     radius: 100000,
-    archetypes: ['ap-ma'],
+    archetypes: ['ap-ma', 'ma-tp'],
   },
   payloadPath: 'access_point.trust_recorder',
   provides: [Cap.PIPELINE_EDGE, Cap.CONFIGURABLE],
@@ -175,9 +184,11 @@ export const trustRecorderDefinition: NodeDefinition = {
     docLink: DOCS_URL.trustElements,
     bodyHtml: `
       <p>Write agent-registration records into one or more
-      <strong>Trust Registries</strong> on the response leg
-      (Managed Agent &rarr; Access Point). Runs after the managed agent
-      responds so the agent's DID from the reply can be recorded.</p>
+      <strong>Trust Registries</strong>. On the response leg
+      (Managed Agent &rarr; Access Point) it runs after the managed agent
+      responds so the agent's DID from the reply can be recorded. On a
+      Managed Agent &rarr; Transit Point arrow it records the DID the
+      managed agent calls out under, in the background.</p>
       <p>Each configured registry may emit the built-in <code>ownedAgent</code>
       triple plus any custom records. Every record is asserted by the entry's
       <strong>authority DID</strong> (the trust anchor):</p>
@@ -222,8 +233,11 @@ export const trustRecorderDefinition: NodeDefinition = {
     if (entries.length === 1) return '1 registry';
     return `${entries.length} registries`;
   },
+  payloadOwnsConfig: true,
+  isBlobPlaceholder: c => readEntries(c).length === 0,
   buildPayload: ctx => {
-    const nodes = ctx.nodesOfType('trust-recorder');
+    // A Transit Point's recorder is written by the Transit Point factory.
+    const nodes = ctx.nodesOfType('trust-recorder').filter(n => !isTransitPointTrustRecorder(n));
     if (nodes.length === 0) return undefined;
     const entries: TrustRecorderEntry[] = [];
     for (const node of nodes) {

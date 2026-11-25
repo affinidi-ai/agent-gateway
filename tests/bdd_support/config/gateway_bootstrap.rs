@@ -2,6 +2,14 @@ use std::path::Path;
 
 use serde_json::json;
 
+/// The surface prefix every BDD gateway configures beside its bootstrap
+/// surfaces'. The fixtures that set one give a Transit Point a `listen_path`
+/// of `/transit/<agent>`, and the admin API serves a Transit Point only under a
+/// configured prefix, so a save that keeps such a path needs this one. The
+/// single-surface fixture sets no `listen_path` at all: its Transit Points
+/// answer at the route the gateway derives, `/outbound<surface route>/<alias>`.
+pub const TRANSIT_CHANNEL_PREFIX: &str = "/transit";
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct GatewayBootstrapSurface {
     pub id: String,
@@ -112,6 +120,11 @@ fn write_gateway_bootstrap_json_inner(
                 "name": surface.name,
                 "prefix": surface.prefix,
             }))
+            .chain(std::iter::once(json!({
+                "id": "transit",
+                "name": "Transit",
+                "prefix": TRANSIT_CHANNEL_PREFIX,
+            })))
             .collect::<Vec<_>>(),
         "routes": {
             identity_route_key: {

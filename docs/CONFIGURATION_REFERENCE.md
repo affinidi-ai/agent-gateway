@@ -82,10 +82,18 @@ Each of these behaves differently from the obvious reading of the field.
 | `server_mode` | Must be a top-level key, before any `[table]` header. Placed after one, TOML nests it under that table and the setting is silently ignored. |
 | `a2a.message_expires_seconds` | Should be strictly greater than `a2a.fabric_gateway_timeout_ms / 1000`. Nothing validates this. When it is not, a fabric message expires at the mediator while the sending gateway is still waiting, and the failure looks like a timeout with no cause. |
 | `backup_encryption_key` | Required. The service does not start without a resolvable value. |
-| Unknown top-level keys | Ignored, not rejected. A misspelled key takes no effect and produces no error. |
+| Unknown top-level keys | Ignored, not rejected. A misspelled key takes no effect and produces no error; in `saml.json` it logs a warning at startup ([`saml.json`](#samljson)). |
 | `encryption.key_source = "local"` | Does not encrypt. It writes plaintext `ENC[0::…]` envelopes and is for development only. It does not count as encryption at rest for delegated grants by binding, so with it, as with `[encryption]` off, a binding with `consent_mode: external`, a Transit Point's or the Access Point Target's, is refused. See [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#grants-by-binding). |
 | `encryption.enabled` | `--generate-bootstrap` writes `[encryption]` with `enabled = false`, and a `config.toml` without the table runs unencrypted. Deployment tooling that builds `config.toml` from `--generate-bootstrap` replaces that table, so its output keeps encryption off and the table's shape stable. The development setup turns encryption on for an environment it creates: a local one reads the master key from `envs/master_encryption_key` (`key_source = "file"`), a Docker one from `AG_MASTER_KEY`. When it regenerates an existing `config.toml`, it keeps that file's `[encryption]` table. An existing environment that runs unencrypted stays unencrypted. To opt in, set `[encryption]` by hand (`enabled = true`, `key_source = "file"`, `key_file` = the absolute path of `envs/master_encryption_key` or of another file holding a 64-hex or base64 32-byte key) and restart; plaintext records are rewritten as `.json.enc` when they are loaded. |
 | `encryption.field_encryption_enabled` | Reserved and not wired to any field. Leave it false. |
+
+## Surface status
+
+A surface's `status` is `active` (the default), `disabled` or `deleted`. Only an `active`
+surface serves traffic or claims its listener route; a `disabled` or `deleted` one does
+neither, at startup and after a reload, so it never blocks an active surface on the same
+route. The admin API refuses to save a surface with `status: "deleted"` with a `400`: delete the
+surface instead.
 
 ## Surface transit settings that do nothing
 
@@ -103,6 +111,97 @@ A Transit Point's rate limits are surface fields, not configuration files: `rate
 bucket for the point, and `per_caller_rate_limit` gives each caller the point identifies a bucket
 of their own. Both are counted on each gateway node. See
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point).
+
+An element of a Transit Point's `trust_check_list` with `"subject": "managed_agent"` asks a
+trust registry about the managed agent calling out through it, not the destination; its
+results reach policy at `input.trust_check_results.managed_agent`. Elements without `subject`
+check the destination. See [`POLICY.md`](POLICY.md#self-recognition-check).
+
+A Transit Point's `trust_recorder` (absent by default) has the shape of
+`access_point.trust_recorder` and writes, in the background on every request except a discovery read, the records of
+the managed agent calling out through it. See
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-trust-recorder).
+
+## Transit Point listen paths
+
+A Transit Point answers at the route the gateway derives,
+`/outbound/<surface route>/<alias>`, or `/outbound/<surface route>$<variant>/<alias>` for one a
+variant defines. That route is registered whatever the point's `listen_path` and is served at
+every address in `available_outbound_listen_addresses`, so a point that sets no `listen_path`
+needs nothing from this section.
+
+A `listen_path` adds a second route beside the derived one. It is set under one of the surface
+prefixes `gateway.json` configures in `channels`, with or without `/outbound` in front, and needs
+a segment of its own after that prefix: `/<channel>/<name>` or `/outbound/<channel>/<name>`.
+Those are the prefixes the Surface Builder's **Listen Path** picker offers, the plain ones on an
+outbound address of its own and the `/outbound` ones on an address shared with an inbound
+listener, so the admin API stores no Transit Point the dashboard could not have composed. Four
+paths it cannot serve as the Transit Point means it, on the base surface and in every variant
+alike:
+
+| Path | What happens | On save |
+| --- | --- | --- |
+| One the outbound router cannot register as written: no leading `/`, `/` or `//` alone, a `..` segment, `{` or `}` (axum reads a balanced pair as a path parameter, so the Transit Point silently answers every value in that position, and the listener build panics on a conflict there), or a segment starting with `:` or `*` (axum's pre-0.8 parameter syntax, which it refuses outright) | The outbound listener build panics, taking the gateway down, once the surface is stored | Refused, `400` with the code `listen_path_invalid` |
+| `/outbound` itself, bare or with a trailing slash | The point answers every `/outbound` request no more specific route matches, the derived routes of other Transit Points still winning | Refused, `400` with the code `listen_path_is_outbound_prefix` |
+| Under no configured surface prefix, or a bare prefix with no segment of its own: `/partner-a-webhook`, `/outbound/not-a-channel/x`, `/<channel>`, `/<channel>/`, `/<channel>//` (the listener trims every trailing slash, so slashes are no segment) | The dashboard cannot compose it, and it claims a route outside the space the gateway serves Transit Points on, or the whole prefix and its wildcard | Refused, `400` with the code `listen_path_not_a_channel_prefix`, naming the prefixes this gateway does offer |
+| A path on a Transit Point whose alias only a variant defines, wherever it sits | The outbound listener registers routes from the base surface's Transit Points alone, so nothing answers the path | Refused, `400` with the code `listen_path_variant_only`, asking for the alias in the base surface rather than naming a path to set |
+| A path outside `/outbound`, under a configured prefix: `/<channel>/<name>` | The point answers it on its outbound listener's own address. An inbound listener that shares a hostname with that listener forwards `/outbound` and nothing else, so the path is not reachable through the inbound address | Refused where **the point's own outbound listener** shares a hostname with an inbound listener, `400` with the code `listen_path_not_served`, which is also where the Surface Builder offers the `/outbound` prefixes alone. The listener is the point's `listen_address`, or the surface's `outbound_listen_address`, so one point may be held to the outbound prefix while another on a listener of its own is not. Where that listener has a hostname of its own the path is reachable, the picker offers it, and the save stores it; a path already stored gets a `Warning` header naming the point, its variant and the route it would otherwise answer on |
+
+Both refusals name the Transit Point, its variant and what to do instead, and apply only to a
+path the save introduces or changes. The same Transit Point, in the same variant, keeping the
+same path is exempt, so a surface stored with such a path before this release stays editable,
+while moving the path to another Transit Point, copying it into a variant, renaming the point, or
+renaming the variant (which re-introduces every path that variant holds) is a new claim. A
+disabled surface reserves no route, so saving one is never refused and, claiming nothing while
+disabled, enabling it introduces every path it names: a surface disabled with a refused path
+cannot be enabled until the path changes.
+
+A `listen_path` is also refused when it is a route another Transit Point already answers on,
+whether that point belongs to this surface or another on the same outbound listener. Those are
+the derived `/outbound/<surface route>/<alias>`, each variant's
+`/outbound/<surface route>$<variant>/<alias>`, and, for a point that sets a `listen_path` of its
+own, `<listen_path>$<variant>`; the listener registers the `$` forms with `%24` beside them, and
+both are refused. A variant route is a path the other checks accept wherever the surface route
+sits below its channel prefix, since the `$` then falls in a later segment: with the prefix
+`/agents` and the route `/agents/orders`, `/outbound/agents/orders$beta/alpha` claims a segment
+of its own under `/outbound/agents`. The two register the same route, and the listener build
+keeps whichever came first and skips the other with an error log, so one point's callers would
+reach the other's Target. A point whose `listen_path` is its **own derived route** is left alone,
+since that route reaches the Target it names either way; its own variant routes are not, because
+the `listen_path` registration wins over the variant one and the request is then read as the
+custom route, so a caller that named the variant is served by the default variant's Target. As
+with the other refusals, only a path a save introduces or changes is refused.
+
+`shared_hostname_outbound_addresses` of `GET /v1/config/surface-routing` names every outbound
+address whose listener the inbound `/outbound` proxy forwards to, which is where the fourth
+refusal applies. An inbound listener forwards to the first outbound listener whose hostname it
+shares, so a second outbound listener carrying that same hostname is not reached through the
+inbound address at all and is treated as having a hostname of its own. The gateway answers that question with the same function on both sides, so a
+client offering the `/outbound` prefixes for exactly these addresses offers what a save accepts.
+The two address lists cannot be compared for it: a listener answers on every one of its
+`external_urls`, so an alias URL in no inbound list is still its listener's, and the same
+hostname on another port is the same hostname.
+
+`outbound_channel_path_prefix` of `GET /v1/config/surface-routing` names each surface prefix
+under `/outbound`: prefixes to build a `listen_path` under, never values to set, since a surface
+prefix of `/` leaves the bare `/outbound` there. A path built under any of them is accepted,
+that root prefix included, so `/outbound/<name>` saves on a gateway whose only channel is `/`;
+the bare `/outbound` itself is still refused. A root channel has no usable plain form, since
+that would be the whole listener, so only its `/outbound` form is a prefix anything may be set
+under.
+
+A Transit Point that sets no `listen_path` is unaffected, except for one case: the outbound
+listener registers routes for the base surface's Transit Points, and builds each variant's `$`
+route from a base point's alias and path, so **an alias only a variant defines has no route of
+its own, and a `listen_path` on it installs none either**. Nothing reaches such a point until the
+base surface defines the alias too, after which the variant answers at that point's routes with
+`$<variant>` in them. A refusal or warning about it says that, rather than naming a route, or a
+path to set, that would not reach it.
+
+Known limitation: a `listen_path` already on disk is served as stored. One the router cannot
+register still panics the outbound listener build, and a stored `/outbound` still answers every
+outbound request no more specific route matches. Both are logged when the listener is built.
+Move any stored path the admin API would now refuse.
 
 ## Browser origins of a surface
 
@@ -196,7 +295,7 @@ The bootstrap file. Startup only; changes need a restart.
 
 | Section | Controls |
 | --- | --- |
-| top level | `channel_config_source`, AWS region and profile, `secrets_backend`, `backup_encryption_key`, `auth_mode`, session timeout, WebSocket auth and buffer, metrics retention and cache, `server_mode` |
+| top level | `channel_config_source` (`local` or `dynamodb`), AWS region and profile, `secrets_backend`, `backup_encryption_key`, `auth_mode`, session timeout, WebSocket auth and buffer, metrics retention and cache, `server_mode` |
 | `[tenancy.trusted_tenant_header]` | Declares that an authenticated edge writes the tenant header. Enables broad header-derived PAT selectors. |
 | `[credential_policy]` | How strictly credential providers and Target credentials are held to four rules. `token_endpoint_https`, `tenant_credential_isolation`, `target_https` and `target_source_auth` are each `"warn"` (default) or `"enforce"`; any other value fails startup. In `"enforce"`, `target_https` and `target_source_auth` also refuse a new or changed Target authentication that breaks them on save (for `target_source_auth`, also a new `a2a-proxy://` Target whose A2A proxy would send its Direct Line credential for unchecked callers); in `"warn"` such a save succeeds with a warning. `insecure_token_endpoints` lists exact token endpoint URLs that may use http deliberately (default empty), relaxing only the https rule, never the refusal of a token endpoint that resolves to loopback or cloud metadata; an entry that is not a valid http URL without a user name or password fails startup. `token_request_timeout_secs` is how long a token request to a credential provider may take, from 1 to 120 seconds (default 30); `0` or a larger value fails startup. `default_max_consent_age_secs` and `max_consent_age_ceiling_secs` limit how long a person's consent may be used, each from 60 to 31,536,000 seconds and unset by default: the default applies to a credential provider that sets no `max_consent_age_secs`, the ceiling applies to such a provider while no default is set, and no provider's or binding's limit reaches past the ceiling. Both reach the consents already stored: setting either ends the stored consents it limits that are older than it, at the latest at the next hourly pass (the first runs ten minutes after startup), and revokes the grants by binding among them at the vendor; a node logs at `WARN`, when it starts active or becomes active, how many consents the two keys end. A value out of range, or a default above the ceiling, fails startup (see [Consent time limit](CREDENTIAL_DELEGATION.md#consent-time-limit)). Absent section means every rule is `warn` and no consent is limited. The report also names a stored JWT Bearer provider without a subject under a fifth rule, `jwt_subject`, which only warns and has no setting. See [Credential policy](CONFIGURATION_RELOAD.md#credential-policy). |
 | `[encryption]` | Encryption at rest: on or off, key source, KMS settings |
@@ -222,7 +321,7 @@ description that exists today.
 | --- | --- |
 | `server_mode` | `active` serves traffic. `standby` drops listeners and returns 503 on `/api/v1/health` while `/api/v1/alive` stays 200. `SIGUSR1` promotes, `SIGUSR2` steps down. |
 | `cache_refresh_interval_secs` | Above 0, DashMap-backed stores reconcile with disk on that interval, so manual `_storage/` edits are picked up without a reload. Policy definitions and global policies do not participate. |
-| `auth_mode` | `passkey` uses WebAuthn. `saml` requires `saml.json` and a configured identity provider. |
+| `auth_mode` | `passkey` uses WebAuthn. `saml` requires `saml.json` and a configured identity provider; it reads `saml.json` and fails startup if it cannot be read or any of its settings is refused ([`saml.json`](#samljson)). |
 | `secrets_backend` | `filesystem` keeps secrets under `_storage/`. `aws` uses AWS. |
 | `encryption.enabled` | Writes whole storage files as `.json.enc`. Losing the master key loses the data. |
 | `metrics_retention_minutes` | Parsed but not used. Retention is the value in `_storage/settings/settings.json`, set from the dashboard, which defaults to 360 minutes whatever this field says. |
@@ -246,14 +345,15 @@ Network topology and the surfaces served. The largest configuration file; the ex
 | `did` | The domain used when generating `did:web` and `did:webvh` identifiers |
 | `webauthn` | Relying-party ID and external origin for passkey registration |
 | `integration` | Notification and webhook integration settings |
-| `sts` | Security Token Service runtime settings. See [`STS.md`](STS.md). |
+| `sts` | Security Token Service runtime settings. `id_jag_max_lifetime_secs` (default `900`, 1 to 3600) is the longest remaining lifetime an ID-JAG presented for redemption may have; a value outside that range stops the gateway at startup. `replay_protection.backend` is accepted but no longer used, and any value other than `in_process` logs a startup warning: redeemed ID-JAGs are recorded in the [single-use store](#single-use-store). See [`STS.md`](STS.md). |
 | `cli_login_throttle` | Optional per-client-IP limit on each `fabric` CLI login endpoint: `enabled` (default `false`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds). Behind a load balancer, set `client_ip.trusted_proxies` first. |
 | `passkey_login_throttle` | Optional per-client-IP limit on starting a passkey sign-in or registration (`POST /api/auth/login/start` and `/api/auth/register/start`, one budget for both): `enabled` (default `false`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds). A client over it gets `429` with `Retry-After`. Behind a load balancer, set `client_ip.trusted_proxies` first: until then every caller shares the balancer's budget, and one client can use it up for all. |
 | `transit_token_max_lifetime_secs` | The longest lifetime, in seconds, a surface may set for its transit tokens in `transit.transit_token_lifetime_secs`, and the longest the Access Point issues, from 30 to 900; 300 when unset. Read once, when the gateway starts: anything but a whole number from 30 to 900 stops it from starting, and a change takes a restart, as a reload keeps the startup value and logs a warning while the file differs from it. A stored surface lifetime above it gets tokens living this long, with a warning; it never stops the gateway. A Transit Point does not read it, so instances with different values accept each other's tokens. The shortest lifetime, 30, is fixed. Upgrade every instance that shares surface storage before raising it above 300 or setting any surface lifetime: an earlier release refuses tokens living longer than 300 seconds and drops a stored surface lifetime when it saves the surface. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token-lifetime). |
 | `payment_gate` | `breaker_failures` (default `5`, 1 to 1000) consecutive failed calls to one agent-pay gateway open its circuit breaker for `breaker_open_secs` (default `30`, 1 to 3600); the gate then answers `503` at once. Read at startup. Opening and closing are logged and counted (see [`OBSERVABILITY.md`](OBSERVABILITY.md#settlement-breaker-and-ledger-metrics)). |
 | `payment_ledger` | `retention_days` (default `7`, 1 to 400): how long the payments ledger keeps its hourly segments. `max_size_mb` (default `2048`, 16 to 1,048,576): the oldest segments are deleted early while the ledger is larger. Neither deletes a segment holding a payment still awaiting capture or void. Read at startup; a value out of range is clamped and logged as a warning. See [Taking the payment](#taking-the-payment). |
+| `single_use_store` | Where single-use records are kept: `{"backend":"disk"}` (the default) or `{"backend":"dynamodb","table":"<name>"}`. Read at startup. See [Single-use store](#single-use-store). |
 | `client_ip` | `trusted_proxies`: proxy CIDRs whose `X-Forwarded-For` gives the client IP for the SAML and CLI login limits and the STS token endpoint throttle, and whose `X-Forwarded-Host` and `X-Forwarded-Proto` (or `Forwarded` `host` and `proto`) STS discovery may use when no inbound `external_urls` is set (default empty, so the TCP peer is the client and forwarded headers are ignored). Behind a load balancer, list it here: until then every caller it forwards counts as one client for these limits. A listed proxy that passes a caller's own `X-Forwarded-Host`, `X-Forwarded-Proto` or `Forwarded` through unchanged lets that caller choose the URLs STS discovery advertises, so have it set or strip them, or set inbound `external_urls`. Each listed proxy must append the address it saw to `X-Forwarded-For` or overwrite it; `Forwarded` is read only when `X-Forwarded-For` is absent. Separate from `tls.client_auth.trusted_proxies`. |
-| `facilitator_mode` | x402 facilitator behaviour. `facilitator_via_fabric`, `facilitator_via_http` and `enable_test_endpoints` are ignored, and a warning is logged when any is set: a peer's fabric x402 verify and settle requests are refused with `facilitator_disabled`, and `/api/x402/*` and the x402 test endpoints are not served. x402 payments already in the transaction store still settle. |
+| `facilitator_mode` | x402 facilitator behaviour. `facilitator_via_fabric`, `facilitator_via_http` and `enable_test_endpoints` are ignored, and a warning is logged when any is set: a peer's fabric x402 verify and settle requests are refused with `facilitator_disabled`, and `/api/x402/*` and the x402 test endpoints are not served. x402 transactions already in the transaction store are kept as they are and do not settle. |
 | `cors` | Exact origins whose pages may call the gateway from a browser: the dashboard, and any surface. Read once, at startup. A surface can allow more origins for itself alone with `browser_origins` (see [Browser origins of a surface](#browser-origins-of-a-surface)). |
 | `terms`, `affinidi_terms_url` | Whether Terms acceptance is enforced, and where metadata is fetched |
 | `logging` | Log redaction, for every configuration source. Only `redaction` is read here; level, JSON output, and directory come from `config.toml`. See [Log redaction](#log-redaction). |
@@ -346,6 +446,38 @@ gives the user and a minute for the answer to arrive; after that the finish is r
 and the passkey ceremony starts again. At most 10,000 unfinished challenges are kept; when full,
 the expired ones are dropped, and then the oldest. Sign-in and registration refuse a username
 longer than 256 bytes with `400`, so no challenge holds a larger one.
+
+### Single-use store
+
+Some things the gateway accepts must be accepted once only: a redeemed ID-JAG (by its issuer
+and `jti`, until its `exp`), an ID-JAG redeemed through `sts.mcp_issuer` when
+`sts.mcp_replay` is `embedded`, a processed Fabric envelope (by sender and message id, until
+the envelope expires), and the receipt of a voided payment authorization, so continuation
+evidence recorded from it pays for no later round (for the longest an MCP continuation
+lives). The gateway records each in the single-use store, which `single_use_store` selects:
+
+| Backend | Behaviour |
+| --- | --- |
+| `disk` (default) | One append-only journal per kind of record, `<kind>.jsonl` in `single_use/` inside the `_storage` folder that holds `[storage_paths].agent_surfaces` (`_storage/single_use/` by default; beside the `agent_surfaces` folder when no `_storage` folder contains it), readable by the owner only. Every record is synced to the disk before it is accepted. When the gateway takes the journals over, they are read back and rewritten with only the records still live; a journal that grows past twice its live records plus 4096 lines is rewritten the same way while the gateway runs. A journal that cannot be read at startup stops the gateway from starting. |
+| `dynamodb` | A conditional put to `table`, keyed by `PK`/`SK` with the expiry in `expires_at` (enable the table's TTL on `expires_at` to remove expired records). Uses `aws_region` and `aws_profile` from `config.toml`. Each call times out after 10 seconds. |
+
+The disk backend is per node: records survive a restart, but a node with its own `_storage`
+never sees another node's. Instances that share one `_storage` volume, such as an Active node
+and its Standby nodes, take turns: the instance holding the journals keeps an exclusive lock on
+`single_use/single-use.lock`, an Active node takes the journals over once the lock is free
+(trying again every 5 seconds) and reads back what the previous holder recorded, and a node
+stepping down to Standby releases them. Until a node holds the journals every single-use check
+on it fails closed, as below. The lock must hold across hosts (see
+[Shared storage for several instances](DEPLOYMENT_REQUIREMENTS.md#shared-storage-for-several-instances)).
+Several nodes serving at once, each with its own `_storage`, need the `dynamodb` backend, and
+the gateway refuses to start when `[mcp.continuations]` keeps continuations in DynamoDB while
+this store is on disk, since a payment voided on one node would still pay on another. A `table`
+that is not 3 to 255 letters, digits, `_`, `-` or `.` stops the gateway from starting.
+
+Every node also keeps the records it has seen in memory, so a duplicate is refused without a
+backend call. A record the store cannot write fails closed: the ID-JAG is not redeemed
+(`server_error`), and the Fabric envelope is refused (a `forward-request` is answered `503`).
+Voided payment evidence the store cannot read is treated as voided.
 
 ### Log redaction
 
@@ -482,9 +614,9 @@ Read when `auth_mode = "saml"`. Ignored otherwise.
 
 | Group | Fields |
 | --- | --- |
-| Identity provider | `idp_entity_id`, `idp_sso_url`, `idp_slo_url`, `idp_cert_path` |
+| Identity provider | `idp_entity_id`, `idp_sso_url`, `idp_cert_path` |
 | Service provider | `sp_entity_id`, `sp_acs_url`, `sp_key_path`, `sp_cert_path` |
-| Security | `sign_requests`, `require_encrypted_assertions` |
+| Security | `sign_requests` |
 | Sign-in throttle | `login_throttle`: `enabled` (default `false`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds) per client IP for `/saml/login`. Behind a load balancer, set `client_ip.trusted_proxies` in `gateway.json` first. |
 | Claims | `attribute_mapping` from SAML claim URI to user field |
 | Roles | `role_mapping` from identity-provider role to gateway role |
@@ -500,26 +632,53 @@ identity provider sends later, so a missing or changed role claim cannot remove 
 guaranteed administrator. A sign-in that would have changed it logs a warning instead
 ([`saml/user_provisioning.rs`](../src/auth/saml/user_provisioning.rs)).
 
+Encrypted assertions and SAML single logout are not supported. `"require_encrypted_assertions": true`
+refuses startup; set it to `false` or remove it, and configure the identity provider to send
+unencrypted signed assertions. A SAML response that carries an encrypted assertion is refused at
+sign-in, and the log says "encrypted SAML assertions are not supported". A non-null
+`"idp_slo_url"` refuses startup; remove it. `false` or absent `require_encrypted_assertions`, and
+`null` or absent `idp_slo_url`, are accepted. Signing out ends the dashboard session only; see the
+accepted risk below.
+
+Accepted risk: SAML single logout is not supported. Signing out ends the dashboard session only
+and does not sign out of the identity provider, so the next SAML sign-in in that browser can
+complete without asking for credentials. Sign out of the identity provider as well, or have it
+require re-authentication.
+
+Startup logs one warning that names up to 20 of the `saml.json` keys that are not read, and how
+many there are, at the top level and inside `attribute_mapping`, `graph_api` and `login_throttle`;
+keys set to `null` are not reported. Only key names are logged, each cut to 64 characters, and
+startup continues.
+`idp_metadata_url` and `graph_api.note` are ignored and not reported.
+
+The page the ACS (`/saml/acs`) returns after a successful sign-in hands the session token to the
+dashboard from one inline script. It writes the token and the return target as JSON string
+literals with `<`, `>`, `&`, U+2028 and U+2029 escaped, and is served with a per-response
+nonce `Content-Security-Policy: default-src 'none'; script-src 'nonce-…'; base-uri 'none';
+form-action 'none'; frame-ancestors 'none'`.
+
 ## `x402.json`
 
 `x402.json` configures payment networks, assets, and facilitator behaviour for the x402
 protocol.
 
-Two `x402.json` sections control x402 storage. If `x402.json` fails to parse, the gateway
-logs a warning and starts neither.
+`transaction_storage` controls where the x402 transactions recorded earlier are kept. When
+present, they are read from `filesystem_path` (default `_storage/x402-transactions`) instead of
+`[storage_paths].x402_transactions`, and `retention_days` (default 7) sets how long the daily
+cleanup keeps them. The cleanup deletes only a final record last updated before that window: one
+whose settlement is completed, failed or refunded, or, with no settlement, whose verification
+failed. A record whose settlement is pending, processing or awaiting a remote or external
+facilitator is never deleted. If `x402.json` fails to parse, the gateway logs a warning and loads
+no transactions. Other `transaction_storage` keys, and `settlement_storage`, are ignored.
 
-| Section | Effect |
-| --- | --- |
-| `settlement_storage` | Its presence starts the settlement worker, using `batch_size` (default 100), `settlement_interval_seconds` (default 60), and `max_retries` (default 3) |
-| `transaction_storage` | When present, transaction records are stored at `filesystem_path` (default `_storage/x402-transactions`) instead of `[storage_paths].x402_transactions`; `retention_days` (default 7) sets how long the daily cleanup keeps them |
-
-Transaction records are always kept on the filesystem; other keys in these sections are
-ignored.
-
-These files only matter to x402 payments that were verified locally earlier: the settlement
-and recovery workers keep running so those payments can still settle. A surface cannot charge
-through local x402; see
-[Surface payment policy](#surface-payment-policy).
+x402 transactions recorded before the upgrade are kept as they are and stay readable through the
+admin API. Nothing writes a new one or settles, retries or recovers them, and only a
+settlement-complete from a transaction's own facilitator gateway completes one whose settlement is
+still in progress (see [FABRIC.md](FABRIC.md)). The daily cleanup deletes only final records, so an
+unsettled record stays on disk until an operator deletes it with `DELETE /api/admin/x402/transactions/{id}`,
+which deletes a record at any stage. `facilitator_private_keys` is ignored
+and dropped when `x402.json` loads, with a warning: remove it from the file. A surface cannot charge through
+local x402; see [Surface payment policy](#surface-payment-policy).
 
 `test-endpoints.json` (`[config_files].test_endpoints`) fed the unauthenticated x402 test
 endpoints. Those endpoints are not served, whatever `facilitator_mode.enable_test_endpoints`
@@ -527,8 +686,7 @@ says, so the file is not read. Nor is `x402-proxy.json` (`[config_files].x402_pr
 held the networks and wallets of the removed MPP auto-pay; a wallet's `private_key` in an old
 copy of the file is never loaded, and the file can be deleted.
 
-A network entry pointing at mainnet moves real value. The demo scripts and a worked walkthrough are in
-[`scripts/x402/README.md`](../scripts/x402/README.md); protocol behaviour is in
+A network entry pointing at mainnet moves real value. Protocol behaviour is in
 [`PROTOCOLS.md`](PROTOCOLS.md).
 
 ## `metrics.json`
@@ -888,7 +1046,7 @@ is handled as before. Neither header is relayed to the caller. With held funds:
    its own task, so a caller that disconnects mid-capture cannot cancel it or turn it into a void.
    The action is written to the row (`settle_intent`) before it is sent; when that write fails
    nothing is sent and the reconciler finishes the row. A void never replaces a recorded capture
-   intent.
+   intent, and nothing is sent for a row that is already closed.
 5. A gate step cancelled after agent-pay was asked and before its answer was recorded leaves an
    `unconfirmed` row under the request's idempotency key, which the reconciler asks agent-pay about
    and voids when funds are held. At most 1,000 such rows without a held payment await the
@@ -990,10 +1148,14 @@ window, or with no surface, is shown to operator callers only.
 The ledger writes and syncs a money row (`paid`, `authorized`, `voided`, `capture_failed`,
 `unconfirmed`) and every change to a row before the request goes on; other rows are written once a
 second. Changes to a row are applied one at a time, and a change is written to the row's segment
-even when that segment is full. The in-memory window never drops a row that is still `authorized`
+even when that segment is full. Each change checks the row as it is then: once a row is closed as
+`paid`, `voided`, `capture_failed` or `rejected`, or superseded by a later row, a late answer or a
+settle attempt leaves it as it is. A row the reconciler gave up on can still be closed by a late
+answer. The in-memory window never drops a row that is still `authorized`
 or `unconfirmed`, and a restart loads such rows from the last eight days of segments even when
 they are older than the window, so the reconciler always sees them. A row the disk did not take stays queued in memory and is counted by
-`agent_gateway_payment_ledger_unwritten_rows_total`.
+`agent_gateway_payment_ledger_unwritten_rows_total`; the queue holds only its newest version, so the
+disk never ends on an older one.
 
 The idempotency keys of payments this node dispatched a request for are written to
 `_storage/payment_claims/dispatched.jsonl` and read back at startup, so a restart does not forward

@@ -107,6 +107,7 @@ async fn handle_message(
         .clone()
         .or_else(|| message.pthid.clone())
         .unwrap_or_else(|| message.id.clone());
+    let sender = message.from.as_deref();
 
     // A mediator from v0.52 refuses with a `trust-task-error` document where an
     // earlier one sent a problem report. Both are routed by the query they
@@ -115,11 +116,18 @@ async fn handle_message(
     // nothing from the arms below.
     let refusal = TrustTaskRefusal::from_document(&message.body);
     if refusal.is_some() || message.typ == MSG_TYPE_PROBLEM_REPORT {
-        handle_refusal(&message, refusal.as_ref(), &thid, connection, store, ws_state).await;
+        if may_reject(connection, sender) {
+            handle_refusal(&message, refusal.as_ref(), &thid, connection, store, ws_state).await;
+        } else {
+            ignore_unverified_signal(connection, &message.typ, sender);
+        }
         return;
     }
 
     match message.typ.as_str() {
+        _ if !sent_by_registry(connection, sender) => {
+            ignore_unverified_signal(connection, &message.typ, sender);
+        }
         connection::SETUP_RECEIVED => {
             info!("TR reader: setup/received for '{}'", connection.trust_registry_id);
             update_status(connection, TrustRegistryConnectionStatus::AwaitingApproval, store, ws_state).await;
@@ -264,8 +272,52 @@ fn refusal_reason(
     )
 }
 
-/// Persist a connection-status change and refresh the dashboard, mirroring the
-/// former worker behavior. A no-op when no store is configured.
+fn sent_by_registry(
+    connection: &TrustRegistryConnection,
+    sender: Option<&str>,
+) -> bool {
+    sender.is_some_and(|did| connection.serves(did))
+}
+
+/// Whether `sender` may refuse on the registry's behalf: the registry itself,
+/// or the mediator that relays its refusals.
+fn may_reject(
+    connection: &TrustRegistryConnection,
+    sender: Option<&str>,
+) -> bool {
+    sent_by_registry(connection, sender) || sender.is_some_and(|did| did == connection.mediator_did)
+}
+
+fn ignore_unverified_signal(
+    connection: &TrustRegistryConnection,
+    message_type: &str,
+    sender: Option<&str>,
+) {
+    warn!(
+        sender = ?sender.map(|did| for_log(did, 64)),
+        message_type = ?for_log(message_type, 128),
+        "TR reader: ignoring a message for '{}' from a sender that is not the registry",
+        connection.trust_registry_id
+    );
+}
+
+/// Whether a registry message may move the connection from `current` to `next`.
+/// Setup messages only move it forward; a rejection may fail it from any state.
+fn may_move(
+    current: &TrustRegistryConnectionStatus,
+    next: &TrustRegistryConnectionStatus,
+) -> bool {
+    use TrustRegistryConnectionStatus::*;
+    match next {
+        AwaitingApproval => matches!(current, Connecting | AwaitingApproval),
+        Connected => matches!(current, Connecting | AwaitingApproval | Connected),
+        Failed => true,
+        Connecting | Disconnected => false,
+    }
+}
+
+/// Persist a connection-status change and refresh the dashboard. A no-op when
+/// no store is configured or the current status does not allow the change.
 async fn update_status(
     connection: &TrustRegistryConnection,
     new_status: TrustRegistryConnectionStatus,
@@ -278,14 +330,24 @@ async fn update_status(
     let tr_id = &connection.trust_registry_id;
 
     let status_label = format!("{:?}", new_status);
+    let applied = new_status.clone();
     let change = Box::new(move |tr: &mut TrustRegistry| {
-        tr.connection_status = new_status;
-        tr.updated_at = chrono::Utc::now();
+        if may_move(&tr.connection_status, &new_status) {
+            tr.connection_status = new_status;
+            tr.updated_at = chrono::Utc::now();
+        }
     });
     match store
         .modify(tr_id, change)
         .await
     {
+        Ok(Some(updated)) if updated.connection_status != applied => {
+            warn!(
+                "TR reader: kept '{}' at {:?}; a registry message cannot move it to {}",
+                tr_id, updated.connection_status, status_label
+            );
+            return;
+        }
         Ok(Some(_)) => {}
         Ok(None) => {
             debug!("TR reader: trust registry '{}' was deleted; its status was not written", tr_id);
@@ -343,6 +405,9 @@ mod tests {
         (connection, Some(Arc::new(store) as Arc<dyn TrustRegistryStore>), dir)
     }
 
+    const REGISTRY: &str = "did:example:registry";
+    const STRANGER: &str = "did:example:stranger";
+
     fn problem_report(thid: &str) -> DIDCommMessage {
         DIDCommMessage::build(
             uuid::Uuid::new_v4().to_string(),
@@ -350,7 +415,16 @@ mod tests {
             serde_json::json!({ "code": "e.p.rejected", "comment": "rejected" }),
         )
         .thid(thid.to_string())
+        .from(REGISTRY.to_string())
         .finalize()
+    }
+
+    fn sent_by(
+        mut message: DIDCommMessage,
+        from: Option<&str>,
+    ) -> DIDCommMessage {
+        message.from = from.map(str::to_string);
+        message
     }
 
     /// The same refusal in the form a mediator from v0.52 sends: a
@@ -370,6 +444,7 @@ mod tests {
             }),
         )
         .thid(thid.to_string())
+        .from(REGISTRY.to_string())
         .finalize()
     }
 
@@ -434,6 +509,7 @@ mod tests {
             serde_json::json!({ "channel_did": "did:example:registry" }),
         )
         .thid(uuid::Uuid::new_v4().to_string())
+        .from(REGISTRY.to_string())
         .finalize()
     }
 
@@ -626,5 +702,148 @@ mod tests {
         )
         .finalize();
         assert_eq!(refusal_reason(&bare, None), ("unknown".to_string(), String::new()));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_relayed_by_the_registry_mediator_marks_the_registry_failed() {
+        for refusal in [problem_report("thid-rejection"), trust_task_error("thid-rejection")] {
+            let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connecting).await;
+            let mediator = connection
+                .mediator_did
+                .clone();
+
+            handle_message(sent_by(refusal, Some(&mediator)), &connection, &store, &None).await;
+
+            assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Failed);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_from_another_sender_or_none_keeps_the_status() {
+        for from in [Some(STRANGER), None] {
+            for refusal in [problem_report("thid-rejection"), trust_task_error("thid-rejection")] {
+                let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connected).await;
+
+                handle_message(sent_by(refusal, from), &connection, &store, &None).await;
+
+                assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connected, "{from:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_messages_from_another_sender_or_none_keep_the_status() {
+        for from in [Some(STRANGER), None] {
+            for message_type in [connection::SETUP_RECEIVED, connection::SETUP_APPROVED] {
+                let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connecting).await;
+
+                handle_message(sent_by(setup_message(message_type), from), &connection, &store, &None).await;
+
+                assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connecting, "{from:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_setup_received_does_not_downgrade_a_connected_registry() {
+        let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connected).await;
+
+        handle_message(setup_message(connection::SETUP_RECEIVED), &connection, &store, &None).await;
+
+        assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connected);
+    }
+
+    #[tokio::test]
+    async fn setup_messages_do_not_revive_a_failed_registry() {
+        for message_type in [connection::SETUP_RECEIVED, connection::SETUP_APPROVED] {
+            let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Failed).await;
+
+            handle_message(setup_message(message_type), &connection, &store, &None).await;
+
+            assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Failed);
+        }
+    }
+
+    #[test]
+    fn registry_messages_cannot_move_a_connection_back_to_connecting_or_disconnected() {
+        for current in [
+            TrustRegistryConnectionStatus::Connecting,
+            TrustRegistryConnectionStatus::AwaitingApproval,
+            TrustRegistryConnectionStatus::Connected,
+            TrustRegistryConnectionStatus::Failed,
+        ] {
+            assert!(!may_move(&current, &TrustRegistryConnectionStatus::Connecting));
+            assert!(!may_move(&current, &TrustRegistryConnectionStatus::Disconnected));
+            assert!(may_move(&current, &TrustRegistryConnectionStatus::Failed));
+        }
+    }
+
+    fn reply(
+        thid: &str,
+        from: &str,
+    ) -> DIDCommMessage {
+        DIDCommMessage::build(
+            uuid::Uuid::new_v4().to_string(),
+            "https://example.org/registry/query-response".to_string(),
+            serde_json::json!({ "recognized": true }),
+        )
+        .thid(thid.to_string())
+        .from(from.to_string())
+        .finalize()
+    }
+
+    async fn awaiting(
+        connection: &TrustRegistryConnection,
+        thid: &str,
+    ) -> tokio::sync::oneshot::Receiver<PollResult> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        connection
+            .response_waiters
+            .lock()
+            .await
+            .insert(thid.to_string(), tx);
+        rx
+    }
+
+    #[tokio::test]
+    async fn only_the_registry_answers_a_pending_query() {
+        let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connected).await;
+        let mediator = connection
+            .mediator_did
+            .clone();
+        let mut pending = awaiting(&connection, "thid-query").await;
+
+        for forger in [STRANGER, mediator.as_str()] {
+            handle_message(reply("thid-query", forger), &connection, &store, &None).await;
+            assert!(pending.try_recv().is_err(), "{forger} answers nothing");
+        }
+
+        handle_message(reply("thid-query", REGISTRY), &connection, &store, &None).await;
+        assert_eq!(
+            pending
+                .try_recv()
+                .unwrap()
+                .body,
+            serde_json::json!({ "recognized": true })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_from_another_sender_answers_no_pending_query() {
+        let (connection, store, _dir) = registry_with(TrustRegistryConnectionStatus::Connected).await;
+        let mut pending = awaiting(&connection, "thid-query").await;
+
+        handle_message(sent_by(problem_report("thid-query"), Some(STRANGER)), &connection, &store, &None).await;
+        assert!(pending.try_recv().is_err());
+
+        handle_message(problem_report("thid-query"), &connection, &store, &None).await;
+        assert_eq!(
+            pending
+                .try_recv()
+                .unwrap()
+                .msg_type,
+            MSG_TYPE_PROBLEM_REPORT
+        );
+        assert_eq!(status_of(&store, &connection).await, TrustRegistryConnectionStatus::Connected);
     }
 }

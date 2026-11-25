@@ -194,16 +194,45 @@ Creating or saving a surface, and each of its enabled variants as resolved, refu
 - a method that reads `mcp_meta` or `a2a_extension` when there is more than one method, since
   it could never be selected;
 - more than one `did_auth` method, because the `/authenticate` endpoints serve one;
-- a `from_jwt_claim` identity, in any identity slot or Transit Point override, unless
-  `jwt_bearer` is the only method;
-- an inbound `from_api_key` identity unless every method is `api_key` or `api_key_provider`;
+- a `from_jwt_claim` identity on the protected or external slot or a Transit Point override
+  unless `jwt_bearer` is the only method;
+- an inbound `from_jwt_claim` identity with no `jwt_bearer` method, and an inbound
+  `from_api_key` identity with no `api_key` or `api_key_provider` method;
 - on an Access Point that publishes protected resource metadata, a JWT bearer method other
   than the primary: the discovery audience and challenge belong to the primary method.
 
 Both identity rules follow from the caller: `from_jwt_claim` needs a verified JWT and
-`from_api_key` a verified key. So a surface mixing JWT and API key callers takes a stored or
-static inbound identity, and policy tells its callers apart by `input.source_auth.method` and
-`key_name`.
+`from_api_key` a verified key. On a surface that mixes JWT and API key callers, an inbound
+`from_jwt_claim` identity identifies the callers of a `jwt_bearer` method and an inbound
+`from_api_key` identity those of an API key method. A caller authenticated by any other method,
+or whose credential failed on a public Access Point, is served with no inbound identity, on direct
+requests and Fabric send: none is derived from its credential or taken from its request body,
+`input.agent.did` and the trust-registry claims its body makes are absent from policy input, and
+the identity binding VP and identity credential it puts in its request, or that Header Metadata
+Mapping copies from its headers, are removed before the Target, in a single request, each request
+of a batch, or a bare message. A body the gateway cannot read to remove them (not JSON, or nested
+deeper than it parses) is refused with `400` and a JSON-RPC parse error (`-32700`), even with A2A
+validation `off`. The extension URIs that name them stay, since they also ask for the responding
+agent's credential, and other metadata the caller sends, such as a trust-registry `agent_did`, is
+forwarded unsigned as it came. On a direct request, a body that carries no proof is forwarded byte
+for byte; Fabric send carries every caller's body as a JSON value, as it always has. Policy tells
+these callers apart by
+`input.source_auth.method` and `key_name`. Fabric receive does not read these identities; the
+request body sets the caller there.
+
+A stored surface whose inbound `from_jwt_claim` or `from_api_key` identity has no method of its
+kind, which a save refuses, refuses its verified callers as earlier releases did (`500`) rather
+than serving them without an identity. A caller whose credential failed is handled as before:
+refused with `401` beside `from_jwt_claim`, and passed to policy with no identity beside
+`from_api_key` on a public Access Point.
+
+**Accepted risk:** a caller of another method is admitted with no identity by any policy that
+does not check it. To keep such callers out, deny the methods that get no identity, for example
+`input.source_auth.method != "jwt_bearer"` beside `from_jwt_claim`. A `from_jwt_claim` DID is
+derived from the claim's value and the values of `namespace_claims` only, so with several
+`jwt_bearer` methods trusting different identity providers and no `iss` in `namespace_claims`,
+a user of one provider gets the DID of a user of another whose claim has the same value; set
+`namespace_claims` to `["iss"]` there.
 
 On an Access Point that publishes protected resource metadata, every caller-attributable
 failure is refused before policy: a failed JWT with the discovery challenge, and a failed
@@ -229,9 +258,10 @@ credential location and non-secret references (strategy, secret, provider agent,
 certificates), so it can be rebuilt. An active node's load persists the correction to local
 storage ([`fall_back_to_first_source_auth_methods`](../src/surfaces/store.rs)); a standby
 node, a storage event and a DynamoDB-sourced surface are corrected in memory only. A stored
-`from_jwt_claim` identity without `jwt_bearer` as its only method, or an inbound
-`from_api_key` identity beside a method other than an API key, is logged as a warning at
-startup and refused on the next save.
+`from_jwt_claim` identity on another slot without `jwt_bearer` as its only method, and an
+inbound `from_jwt_claim` or `from_api_key` identity with no method of its kind to read, are
+logged as a warning at startup, which says their verified callers are refused until the surface
+is fixed, and refused on the next save.
 
 Before rolling back to a release that enforces only the first method, remove every method but
 the first. That release strips only the first method's header, so it would forward a later
@@ -954,6 +984,12 @@ claims of the JWT the Transit Point verified (its `source_auth` or `mcp_http.aut
 whichever header carried it. A caller verified another way (API key, mTLS) binds no claims. A
 Transit Point that authenticated no caller reads the `Authorization` header as sent, which the
 gateway has not verified, so give such a Transit Point `source_auth` before binding its claims.
+The Target's Workload Binding on an Access Point (`target.workload_binding`) follows the same
+rule, with `caller_source: authorization_bearer_jwt` or `transit_token` (the default, read the same
+way since this leg carries no transit token): it binds the claims source authentication verified
+for a JWT Bearer caller, no claims for a caller verified another way or one whose credential
+failed, and reads the `Authorization` header as sent only on an Access Point that authenticates
+no caller.
 
 The identity hash covers the method, the issuer (the JWT `iss`, the API Key Provider agent,
 a hash of the subject and public key of the CA an mTLS client certificate was verified against), the
@@ -1578,6 +1614,10 @@ presents to the surface's caller authentication:
 
 Per-key caller identity therefore needs an API Key Provider.
 
+- A caller authenticated by another method beside the API key method, such as JWT Bearer, gets
+  no caller identity and is served: no DID, `input.agent.did` absent, and no identity binding VP
+  to the Target; see [Several methods on one Access Point](#several-methods-on-one-access-point)
+  for telling such callers apart in policy.
 - A missing, invalid or revoked key resolves no caller identity. On an Access Point that is
   not public (closed or legacy), or with `on_failure: reject`, the request is refused with `401`
   before policy; on a public one policy sees `input.source_auth.method == "failed"` and decides; see
@@ -1619,9 +1659,9 @@ Per-key caller identity therefore needs an API Key Provider.
 A save (`POST`, `PUT`, `PATCH`, and each enabled variant) refuses an inbound `from_api_key`
 with `400` when:
 
-- a Caller Context method is not API Key or API Key Provider: a caller verified another way
-  presents no key to identify it, and the request path refuses it with `500`. At startup a
-  stored surface breaking this rule loads with a warning;
+- no Caller Context method is API Key or API Key Provider, so no caller presents a key to
+  identify it. A caller verified by another method beside one is served with no identity (see
+  above). At startup a stored surface breaking this rule loads with a warning;
 - `mcp_http.authorization` is set, because resource tokens identify those callers;
 - the target is an MCP `proxy://` MCP Proxy.
 
@@ -1943,7 +1983,7 @@ Point's outbound request:
 
 | Condition | Status | `result` |
 | --- | --- | --- |
-| Caller authentication is not API Key or API Key Provider | `500` | `api_key_unavailable` |
+| No caller was authenticated, such as on a stored surface without caller authentication | `500` | `api_key_unavailable` |
 | A plain API Key's secret is not in the secrets store | `500` | `secret_not_found` |
 | The secrets store cannot be read | `503` | `secrets_store_unavailable` or `store_lookup_failed` |
 | A stored `from_api_key` Managed Agent or Transit Point identity has no `api_key_id` | `500` | `api_key_id_missing` |
@@ -1954,9 +1994,11 @@ decides, as for a failed key.
 
 ### `from_jwt_claim`
 
-Requires `jwt_bearer` source auth on the same surface, so the token is cryptographically
-verified before the DID is derived. On a direct or fabric-routed Access Point, a missing or
-invalid bearer token is refused with `401` before the target is called.
+Requires a `jwt_bearer` source auth method on the same surface, so the token is cryptographically
+verified before the DID is derived. On a direct or fabric-routed Access Point, a caller whose
+credential is missing or invalid, for any method, is refused with `401` before the target is
+called; a caller verified by another method, such as an API key, is served with no identity (see
+[Several methods on one Access Point](#several-methods-on-one-access-point)).
 
 | Field | Default | Effect |
 | --- | --- | --- |
@@ -2086,7 +2128,37 @@ restart mints new credential-derived DIDs, which show as versions with no field 
 
 The only writer of agent-in-trust-registry records
 ([`trust_recorder.rs`](../src/trust_registry_verification/trust_recorder.rs)). It fires
-on the response leg and on discovery, and is idempotent.
+on the response leg and on discovery, and is idempotent. The surface's Trust Recorder
+(`access_point.trust_recorder`) records only the Managed Agent's response DID.
+
+### Transit Point Trust Recorder
+
+A Transit Point's own `trust_recorder` has the same entries, cap and save rules as the
+surface's. It fires on every request through the Transit Point except a discovery read, in
+the background (the surface's recorder fires on discovery reads too): it writes its entries' records
+for the DID the Transit Point calls out under (its own managed identity, or the surface's it
+injects), never waits for them and never refuses the request. Writes are idempotent. A request
+with no managed agent DID writes nothing. Because the request does not wait, the Transit
+Point's Trust Check can ask about the agent before its first records exist, so a policy that
+requires recognition can refuse the agent's first call. It writes before the Trust Check and
+policy, so a call policy refuses is recorded too. A record the operator removes is written
+again by the next call through any Transit Point that records the same agent in that registry;
+one made inactive is written again only if the registry accepts the create, and a registry that
+answers with a conflict leaves it inactive. To turn recognition off, remove that recorder entry
+as well. The recorder writes whatever the trust registry lets this gateway write, so the
+registry, not the gateway, decides which records an operator's recorder can create; see
+[_Self recognition check_](POLICY.md#self-recognition-check) for what recognition does and does
+not prove. In the Surface Builder it is the Trust Recorder on the Managed Agent → Transit Point
+arrow.
+
+The outcome is stored as that DID's [recorder status](#recorder-status) on the surface, which
+the surface's recorder and other Transit Points' recorders writing for the same DID also
+update. It shows on the DID's version in the Identities page's Version History and in
+`GET /v1/surfaces/{id}/trust-recorder-status`. On a surface whose only recorders are its
+Transit Points', the Identities page shows a status only for DIDs one was stored for.
+Changing the entries of the surface's or of any Transit Point's recorder, on the surface or in
+a variant, clears the surface's statuses. A Transit Point recorder entry that names an
+Authority is listed with its Transit Point when the Authority's delete is refused.
 
 After writing its records, the Trust Recorder publishes a name for each authority it
 wrote. The name comes from the Authority register entry with that DID, or, failing that,

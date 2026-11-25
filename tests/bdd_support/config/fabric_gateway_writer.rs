@@ -209,6 +209,9 @@ fn build_surface_fixture(
     if let Some(did) = &surface.fixed_managed_identity {
         fixture = fixture.with_identity_slot("protected", serde_json::json!({ "type": "static", "did": did }));
     }
+    if surface.inbound_identity_from_api_key {
+        fixture = fixture.with_identity_slot("inbound", serde_json::json!({ "type": "from_api_key" }));
+    }
     if let Some(proxy) = &surface.mcp_proxy {
         fixture = fixture.with_mcp_proxy_id(proxy.proxy_id.clone());
     }
@@ -264,7 +267,6 @@ fn build_surface_fixture(
                     "alias": tp.alias,
                     "target_endpoint": tp.target_endpoint,
                     "protocol": tp.protocol,
-                    "listen_path": format!("/transit/{}", tp.alias),
                     "require_transit_token": tp.require_transit_token,
                 });
                 if let Some(SourceAuthSpec::ApiKey { header_name, secret_id, .. }) = &tp.source_auth {

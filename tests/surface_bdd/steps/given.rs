@@ -1601,25 +1601,75 @@ fn transit_point_trust_check_lists_authorities(
     query.insert("authority_ids".to_string(), serde_json::json!(authority_list(&authorities)));
 }
 
-#[given(expr = "transit point {string} has a policy that denies unless every target Trust Check succeeded")]
-fn transit_point_has_policy_denying_unless_target_trust_checks_ok(
+#[given(
+    regex = r#"^transit point "([^"]+)" has a policy that denies unless every (target|managed-agent) Trust Check succeeded$"#
+)]
+fn transit_point_has_policy_denying_unless_trust_checks_ok(
     world: &mut SurfaceWorld,
     transit_point: String,
+    leg: String,
 ) {
-    let policy_id = format!("bdd-trust-check-deny-on-target-failure-{}", uuid::Uuid::new_v4());
-    let rego = r#"package surface.policy
+    let results = leg.replace('-', "_");
+    let policy_id = format!("bdd-trust-check-deny-on-{leg}-failure-{}", uuid::Uuid::new_v4());
+    let rego = format!(
+        r#"package surface.policy
 
 default allow := false
 
-allow if {
-    count([r | r := input.trust_check_results.target[_]; r.ok == false]) == 0
-}
-"#;
+allow if {{
+    count([r | r := input.trust_check_results.{results}[_]; r.ok == false]) == 0
+}}
+
+deny_reason := "Calling agent is not recognised" if not allow
+"#
+    );
     transit_point_config_mut(world, &transit_point).policy = Some(PolicyDefinitionFixture::new(
         policy_id,
-        "BDD Transit Point policy: deny unless every target Trust Check succeeded",
-        rego,
+        format!("BDD Transit Point policy: deny unless every {leg} Trust Check succeeded"),
+        &rego,
     ));
+}
+
+#[given(
+    regex = r#"^transit point "([^"]+)" presents (the surface's|no) managed agent identity on its outbound calls$"#
+)]
+fn transit_point_presents_surface_identity(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    presents: String,
+) {
+    let point = transit_point_config_mut(world, &transit_point);
+    point.inject_vp = presents == "the surface's";
+    point.managed_identity = None;
+}
+
+#[given(expr = "transit point {string} has a managed-agent Trust Check for trust registry {string}")]
+fn transit_point_has_managed_agent_trust_check(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    trust_registry_id: String,
+) {
+    let element = serde_json::json!({
+        "id": format!("managed-agent-{}", uuid::Uuid::new_v4()),
+        "trust_registry_id": trust_registry_id,
+        "query_type": "recognition",
+        "query": { "authority_id": "did:example:authority", "entity_id": "" },
+        "subject": "managed_agent",
+    });
+    transit_point_config_mut(world, &transit_point)
+        .trust_check_list
+        .push(element);
+}
+
+#[given(expr = "transit point {string} has a Trust Recorder for trust registry {string}")]
+fn transit_point_has_trust_recorder(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    trust_registry_id: String,
+) {
+    transit_point_config_mut(world, &transit_point)
+        .trust_recorder_entries
+        .push(trust_recorder_entry(&trust_registry_id, "did:web:example.com:issuer"));
 }
 
 #[given(expr = "the surface has a policy that denies a target Trust Check reporting error code {string}")]
@@ -3023,6 +3073,14 @@ fn surface_has_deny_all_request_policy(world: &mut SurfaceWorld) {
         .request_policy = Some(RequestPolicyFixture::new("bdd-deny-all", "BDD deny-all surface policy", rego));
 }
 
+#[given("the surface has a request policy that allows all requests")]
+fn surface_has_allow_all_request_policy(world: &mut SurfaceWorld) {
+    let rego = "package surface.policy\n\ndefault allow := true\n".to_string();
+    world
+        .surface_config
+        .request_policy = Some(RequestPolicyFixture::new("bdd-allow-all", "BDD allow-all surface policy", rego));
+}
+
 #[given(expr = "the MCP surface has a request policy that allows all requests")]
 fn mcp_surface_has_allow_all_request_policy(world: &mut SurfaceWorld) {
     let rego = "package surface.policy\n\ndefault allow := true\n".to_string();
@@ -3389,6 +3447,23 @@ fn surface_derives_inbound_identity_from_jwt_claim(world: &mut SurfaceWorld) {
     world
         .surface_config
         .jwt_claim_inbound_identity = true;
+}
+
+#[given(expr = "the surface maps caller header {string} into the identity binding presentation")]
+fn surface_maps_caller_header_into_the_identity_binding_presentation(
+    world: &mut SurfaceWorld,
+    header: String,
+) {
+    world
+        .surface_config
+        .identity_binding_header = Some(header);
+}
+
+#[given("the surface derives the inbound identity from the API key the caller presents")]
+fn surface_derives_inbound_identity_from_presented_api_key(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .api_key_inbound_identity = true;
 }
 
 #[given(expr = "the surface injects custom metadata key {string} value {string} into {string}")]

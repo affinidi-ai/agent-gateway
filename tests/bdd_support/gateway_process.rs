@@ -143,6 +143,24 @@ impl GatewayProcess {
         wait_for_gateway_process(&mut self.child, port, timeout).await
     }
 
+    /// Polls until the process exits on its own and returns its exit status, failing if it
+    /// is still running after `timeout`.
+    pub async fn wait_for_exit(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<std::process::ExitStatus> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("gateway process still running after {timeout:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Stop the process and wait for it to exit.
     pub fn stop(&mut self) {
         let _ = self.child.kill();

@@ -508,16 +508,48 @@ pub fn spawn_authority_publish(
     });
 }
 
-/// Republish the entity fields of a surface's managed DIDs to the trust registries its
-/// Trust Recorder writes to, after the surface was renamed.
-pub fn spawn_surface_rename_publish(surface: AgentSurface) {
-    let Some(recorder) = surface
+/// The entries of every Trust Recorder of a stored surface: its own, and its Transit
+/// Points', on the surface and in its variants.
+fn rename_publish_entries(surface: &AgentSurface) -> Vec<crate::config::types::TrustRecorderEntry> {
+    let variant_points = surface
+        .variants
+        .iter()
+        .filter_map(|variant| {
+            variant
+                .overrides
+                .transit
+                .as_ref()
+                .and_then(|transit| transit.points.as_deref())
+        })
+        .flatten();
+    surface
         .trust_recorder()
-        .filter(|cfg| !cfg.entries.is_empty())
-        .cloned()
-    else {
+        .into_iter()
+        .chain(
+            surface
+                .transit_points()
+                .iter()
+                .chain(variant_points)
+                .filter_map(|point| point.trust_recorder.as_ref()),
+        )
+        .flat_map(|recorder| {
+            recorder
+                .entries
+                .iter()
+                .cloned()
+        })
+        .collect()
+}
+
+/// Republish the entity fields of a surface's managed DIDs to the trust registries its
+/// Trust Recorders, its own and its Transit Points' (variants included), write to, after the
+/// surface was renamed.
+pub fn spawn_surface_rename_publish(surface: AgentSurface) {
+    let entries = rename_publish_entries(&surface);
+    if entries.is_empty() {
         return;
-    };
+    }
+    let recorder = crate::config::types::TrustRecorderConfig { entries };
     let Some(manager) = crate::gateways::connection_points::get_trust_registry_listener_manager() else {
         return;
     };
@@ -1088,6 +1120,44 @@ mod tests {
             BTreeSet::from(["did:tr:a".to_string(), "did:tr:b".to_string(), "did:tr:c".to_string()])
         );
         assert!(registries_for_authority(&scoped, &issuers).is_empty());
+    }
+
+    #[test]
+    fn a_rename_republishes_to_the_registries_of_variant_transit_point_recorders() {
+        let entry = |registry: &str| {
+            serde_json::json!({
+                "trust_registry_id": registry, "issuer_did": "did:example:issuer",
+                "authority_did": "did:example:authority", "include_owned_agent": true
+            })
+        };
+        let surface: AgentSurface = serde_json::from_value(serde_json::json!({
+            "name": "renamed",
+            "access_point": {
+                "listen_address": "http://localhost:8080", "route": "/a2a", "protocol": "a2a",
+                "trust_recorder": { "entries": [entry("tr-surface")] }
+            },
+            "target": { "endpoint": "https://agent.example.com" },
+            "transit": { "points": [{
+                "alias": "base", "target_endpoint": "https://base.example.com",
+                "trust_recorder": { "entries": [entry("tr-base-point")] }
+            }]},
+            "variants": [{
+                "id": "variant-dev", "alias": "dev", "name": "Development", "enabled": true,
+                "overrides": { "transit": { "points": [{
+                    "alias": "base", "target_endpoint": "https://base.example.com",
+                    "trust_recorder": { "entries": [entry("tr-variant-point")] }
+                }]}}
+            }]
+        }))
+        .expect("surface");
+
+        let registries: Vec<String> = rename_publish_entries(&surface)
+            .into_iter()
+            .map(|entry| entry.trust_registry_id)
+            .collect();
+
+        assert!(registries.contains(&"tr-base-point".to_string()), "{registries:?}");
+        assert!(registries.contains(&"tr-variant-point".to_string()), "{registries:?}");
     }
 
     #[test]

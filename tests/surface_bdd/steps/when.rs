@@ -506,10 +506,23 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     gateway = gateway
         .with_port(gateway_port)
         .with_port_reservation(port_reservation);
-    gateway
-        .wait_until_ready()
-        .await;
-    if has_outbound_listener {
+    let startup_exit = if world
+        .surface_config
+        .refuses_to_start
+    {
+        Some(
+            gateway
+                .wait_for_exit(std::time::Duration::from_secs(60))
+                .await
+                .unwrap_or_else(|error| panic!("the gateway did not refuse to start: {error}")),
+        )
+    } else {
+        gateway
+            .wait_until_ready()
+            .await;
+        None
+    };
+    if has_outbound_listener && startup_exit.is_none() {
         gateway
             .wait_for_secondary_port(outbound_port, std::time::Duration::from_secs(15))
             .await
@@ -530,6 +543,7 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         identity_provider,
         gateway_port,
         outbound_port,
+        startup_exit,
     });
 }
 
@@ -706,10 +720,43 @@ pub(crate) async fn build_new_surface_payload(
         .surface_config
         .source_auth
     {
+        let methods: Vec<serde_json::Value> = std::iter::once(auth)
+            .chain(
+                &world
+                    .surface_config
+                    .additional_source_auth,
+            )
+            .map(config::source_auth::caller_authentication_method_json)
+            .collect();
+        access_point.insert("caller_authentication".to_string(), serde_json::json!({ "methods": methods }));
+    }
+    if let Some(header) = &world
+        .surface_config
+        .identity_binding_header
+    {
         access_point.insert(
-            "caller_authentication".to_string(),
-            serde_json::json!({ "methods": [config::source_auth::caller_authentication_method_json(auth)] }),
+            "header_metadata_mapping".to_string(),
+            serde_json::json!({
+                "extension_uri": AGENT_IDENTITY_BINDING_URI,
+                "headers": [{ "header": header, "field": "verifiablePresentation" }]
+            }),
         );
+    }
+    let inbound = if world
+        .surface_config
+        .jwt_claim_inbound_identity
+    {
+        Some(serde_json::json!({ "type": "from_jwt_claim", "claim": "sub", "namespace_claims": ["iss"] }))
+    } else if world
+        .surface_config
+        .api_key_inbound_identity
+    {
+        Some(serde_json::json!({ "type": "from_api_key" }))
+    } else {
+        None
+    };
+    if let Some(inbound) = inbound {
+        payload["identity_slots"] = serde_json::json!({ "inbound": inbound });
     }
     payload
 }
@@ -1234,7 +1281,6 @@ async fn operator_attempts_create_mcp_transit_point_with_header_metadata_mapping
             "alias": "tr1",
             "target_endpoint": "http://example.invalid/mcp",
             "protocol": "mcp",
-            "listen_path": "/transit/tr1",
             "require_transit_token": false,
             "allow_unauthenticated_callers": true,
             "header_metadata_mapping": {
@@ -1512,6 +1558,24 @@ pub async fn update_transit_point_listen_path(
     transit_point: &str,
     new_path: &str,
 ) {
+    let response = send_transit_point_listen_path(world, transit_point, new_path).await;
+    assert_eq!(
+        response.status, 200,
+        "updating Transit Point listen_path should succeed, got status {} body {}",
+        response.status, response.body
+    );
+    record_admin_response(world, response);
+}
+
+/// The surface saved with `transit_point`'s `listen_path` set to `new_path`,
+/// whatever the appliance answered: a caller that expects the save to succeed
+/// uses [`update_transit_point_listen_path`], one that expects a refusal keeps
+/// the response.
+async fn send_transit_point_listen_path(
+    world: &mut SurfaceWorld,
+    transit_point: &str,
+    new_path: &str,
+) -> crate::world::RecordedResponse {
     ensure_admin_session(world).await;
     let surface_id = get_tracked_surface_id(world, "updating the Transit Point listen_path");
 
@@ -1552,17 +1616,19 @@ pub async fn update_transit_point_listen_path(
         });
     point["listen_path"] = serde_json::json!(new_path);
 
-    let response = client
+    client
         .update_surface_recorded(&surface_id, &payload)
         .await
-        .unwrap_or_else(|error| panic!("update Transit Point listen_path through admin API: {error}"));
+        .unwrap_or_else(|error| panic!("update Transit Point listen_path through admin API: {error}"))
+}
 
-    assert_eq!(
-        response.status, 200,
-        "updating Transit Point listen_path should succeed, got status {} body {}",
-        response.status, response.body
-    );
-
+#[when(expr = "the operator sets Transit Point {string} listen_path to {string}")]
+async fn operator_sets_transit_point_listen_path(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    new_path: String,
+) {
+    let response = send_transit_point_listen_path(world, &transit_point, &new_path).await;
     record_admin_response(world, response);
 }
 
@@ -1955,6 +2021,15 @@ async fn send_preflight_for_post(
         headers: collect_headers(response.headers()),
         body: serde_json::Value::Null,
     });
+}
+
+#[when(expr = "the operator attempts to create the surface for route {string}")]
+async fn operator_tries_to_create_the_surface(
+    world: &mut SurfaceWorld,
+    route: String,
+) {
+    let payload = build_new_surface_payload(world, &route, false).await;
+    create_surface(world, payload).await;
 }
 
 #[when(expr = "the operator attempts to create a surface for route {string} with invalid configuration")]
@@ -2664,7 +2739,7 @@ fn build_api_key_source_auth_header(
     (api_key_source_auth(world).0, key_value)
 }
 
-fn build_valid_api_key_source_auth_header(world: &SurfaceWorld) -> (String, String) {
+pub(crate) fn build_valid_api_key_source_auth_header(world: &SurfaceWorld) -> (String, String) {
     api_key_source_auth(world)
 }
 
@@ -2678,6 +2753,92 @@ async fn request_with_invalid_api_key(world: &mut SurfaceWorld) {
 async fn request_with_valid_api_key(world: &mut SurfaceWorld) {
     let header = build_valid_api_key_source_auth_header(world);
     send_request_and_record(world, vec![header]).await;
+}
+
+const AGENT_IDENTITY_BINDING_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity-binding/v1";
+const TRUST_REGISTRY_EXTENSION_URI: &str = "https://fabric.affinidi.io/extensions/trust-registry";
+
+/// `body`, an A2A message, carrying the caller's own identity proofs (an
+/// identity binding VP and an identity credential naming a DID it asserts) and
+/// a trust-registry `agent_did` asserting the same DID.
+fn with_caller_identity_proof(mut body: serde_json::Value) -> serde_json::Value {
+    let message = body
+        .pointer_mut("/params/message")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("an A2A message/send request");
+    message.insert(
+        "extensions".to_string(),
+        serde_json::json!([AGENT_IDENTITY_BINDING_URI, AGENT_IDENTITY_CREDENTIAL_URI]),
+    );
+    message.insert(
+        "metadata".to_string(),
+        serde_json::json!({
+            AGENT_IDENTITY_BINDING_URI: {"verifiablePresentation": "caller-made-presentation"},
+            AGENT_IDENTITY_CREDENTIAL_URI: {"did": "did:web:asserted.example", "verifiablePresentation": "caller-made-presentation"},
+            TRUST_REGISTRY_EXTENSION_URI: {"agent_did": "did:web:asserted.example"}
+        }),
+    );
+    body
+}
+
+#[when(expr = "the caller sends a request to the surface with a valid API key and a trust-registry agent DID {string}")]
+async fn request_with_valid_api_key_and_trust_registry_agent_did(
+    world: &mut SurfaceWorld,
+    agent_did: String,
+) {
+    let header = build_valid_api_key_source_auth_header(world);
+    let mut body = build_request_body(&world.surface_config.protocol);
+    body["params"]["message"]["metadata"] =
+        serde_json::json!({ TRUST_REGISTRY_EXTENSION_URI: { "agent_did": agent_did } });
+    send_json_request_and_record(world, body, vec![header]).await;
+}
+
+#[when("the caller asks the MCP surface for available tools with a valid API key and an identity proof of its own")]
+async fn caller_asks_mcp_surface_with_valid_api_key_and_own_identity_proof(world: &mut SurfaceWorld) {
+    let header = build_valid_api_key_source_auth_header(world);
+    let mut body = build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha"));
+    body["params"]["_meta"] = serde_json::json!({
+        AGENT_IDENTITY_BINDING_URI: {"verifiablePresentation": "caller-made-presentation"}
+    });
+    send_json_request_and_record(world, body, vec![header]).await;
+}
+
+#[when("the caller sends a request to the surface with a valid API key and an identity proof of its own")]
+async fn request_with_valid_api_key_and_own_identity_proof(world: &mut SurfaceWorld) {
+    let header = build_valid_api_key_source_auth_header(world);
+    let body = with_caller_identity_proof(build_request_body(&world.surface_config.protocol));
+    send_json_request_and_record(world, body, vec![header]).await;
+}
+
+#[when(
+    "the caller sends a request to the surface with a valid API key and an identity proof of its own beside a value nested too deeply to read"
+)]
+async fn request_with_valid_api_key_and_own_identity_proof_nested_too_deeply(world: &mut SurfaceWorld) {
+    let header = build_valid_api_key_source_auth_header(world);
+    let mut body = with_caller_identity_proof(build_request_body(&world.surface_config.protocol));
+    let mut nested = serde_json::json!(1);
+    for _ in 0..200 {
+        nested = serde_json::json!([nested]);
+    }
+    body["params"]["message"]["metadata"]["nested"] = nested;
+    send_json_request_and_record(world, body, vec![header]).await;
+}
+
+#[when("the caller sends a request to the surface with an invalid API key and an identity proof of its own")]
+async fn request_with_invalid_api_key_and_own_identity_proof(world: &mut SurfaceWorld) {
+    let header = build_api_key_source_auth_header(world, "bdd-invalid-api-key".to_string());
+    let body = with_caller_identity_proof(build_request_body(&world.surface_config.protocol));
+    send_json_request_and_record(world, body, vec![header]).await;
+}
+
+#[when("the caller sends a request to the surface with a valid token and an identity proof of its own")]
+async fn request_with_valid_token_and_own_identity_proof(world: &mut SurfaceWorld) {
+    ensure_gateway_running(world).await;
+    let issuer = get_jwt_source_auth_issuer(world);
+    let audience = caller_token_audience(world);
+    let token = create_valid_jwt_for_issuer_with_audience(issuer, audience);
+    let body = with_caller_identity_proof(build_request_body(&world.surface_config.protocol));
+    send_json_request_and_record(world, body, vec![("authorization".to_string(), format!("Bearer {token}"))]).await;
 }
 
 #[when(expr = "the caller sends a request to the surface path {string} with a valid alternate variant API key")]
@@ -3051,7 +3212,7 @@ pub(crate) async fn send_mcp_request_through_transit_point(
     transit_point: &str,
     body: serde_json::Value,
 ) {
-    let path = format!("/transit/{transit_point}");
+    let path = transit_point_path(world, transit_point);
     send_mcp_request_through_transit_point_path(world, agent_name, &path, body).await;
 }
 
@@ -3173,14 +3334,8 @@ pub(crate) async fn ask_for_tools_through_transit_point_with_its_token(
 ) {
     let body = build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha"));
     let headers = with_transit_token(world, Vec::new());
-    send_mcp_request_through_transit_point_path_with_headers(
-        world,
-        agent_name,
-        &format!("/transit/{transit_point}"),
-        body,
-        headers,
-    )
-    .await;
+    let path = transit_point_path(world, transit_point);
+    send_mcp_request_through_transit_point_path_with_headers(world, agent_name, &path, body, headers).await;
 }
 
 #[when(
@@ -3196,14 +3351,8 @@ async fn managed_agent_invokes_tool_through_transit_point_with_its_token_and_hea
 ) {
     let body = build_mcp_tool_call_body(&tool_name, serde_json::json!({ "limit": 3 }));
     let headers = with_transit_token(world, vec![(header, value)]);
-    send_mcp_request_through_transit_point_path_with_headers(
-        world,
-        &agent_name,
-        &format!("/transit/{transit_point}"),
-        body,
-        headers,
-    )
-    .await;
+    let path = transit_point_path(world, &transit_point);
+    send_mcp_request_through_transit_point_path_with_headers(world, &agent_name, &path, body, headers).await;
 }
 
 #[when(
@@ -3217,14 +3366,9 @@ async fn managed_agent_asks_for_tools_through_transit_point_with_header(
     value: String,
 ) {
     let body = build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha"));
-    send_mcp_request_through_transit_point_path_with_headers(
-        world,
-        &agent_name,
-        &format!("/transit/{transit_point}"),
-        body,
-        vec![(header, value)],
-    )
-    .await;
+    let path = transit_point_path(world, &transit_point);
+    send_mcp_request_through_transit_point_path_with_headers(world, &agent_name, &path, body, vec![(header, value)])
+        .await;
 }
 
 #[when(
@@ -3242,10 +3386,11 @@ async fn managed_agent_asks_for_tools_through_transit_point_with_issued_token(
         .cloned()
         .unwrap_or_else(|| panic!("agent '{agent}' must have been issued a token"));
     let body = build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha"));
+    let path = transit_point_path(world, &transit_point);
     send_mcp_request_through_transit_point_path_with_headers(
         world,
         &agent_name,
-        &format!("/transit/{transit_point}"),
+        &path,
         body,
         vec![("authorization".to_string(), format!("Bearer {token}"))],
     )
@@ -3300,7 +3445,7 @@ async fn read_through_transit_point(
         "HEAD" => reqwest::Method::HEAD,
         other => panic!("a discovery read is a GET or HEAD, not {other}"),
     };
-    let path = format!("/transit/{transit_point}/{}", document.trim_start_matches('/'));
+    let path = format!("{}/{}", transit_point_path(world, transit_point), document.trim_start_matches('/'));
     send_through_transit_point_path(world, agent_name, method, &path, None, headers).await;
 }
 
@@ -3370,6 +3515,24 @@ async fn send_a2a_request_through_transit_point(
     .await;
 }
 
+/// The route the gateway derives for a Transit Point of the scenario's
+/// surface: `/outbound<surface route>/<alias>`. It is registered for every
+/// Transit Point whatever its `listen_path`, and it is what the fixtures rely
+/// on, since a `listen_path` is held to the surface prefixes the gateway
+/// configures and, on a shared hostname, to the `/outbound` form of them.
+pub(crate) fn transit_point_path(
+    world: &SurfaceWorld,
+    transit_point: &str,
+) -> String {
+    format!(
+        "/outbound{}/{transit_point}",
+        world
+            .surface_config
+            .route
+            .trim_end_matches('/')
+    )
+}
+
 /// The URL managed agent `agent_name` calls Transit Point `transit_point` at,
 /// once the gateway's outbound listener is ready.
 async fn transit_point_url(
@@ -3382,6 +3545,7 @@ async fn transit_point_url(
         .expect_target_kind(agent_name, TargetActorKind::ManagedAgent);
     ensure_gateway_running(world).await;
 
+    let path = transit_point_path(world, transit_point);
     let infra = world
         .infra
         .as_mut()
@@ -3392,7 +3556,7 @@ async fn transit_point_url(
         .wait_for_secondary_port(outbound_port, std::time::Duration::from_secs(15))
         .await
         .unwrap_or_else(|error| panic!("outbound listener did not become ready on port {outbound_port}: {error}"));
-    format!("http://127.0.0.1:{}/transit/{}", outbound_port, transit_point)
+    format!("http://127.0.0.1:{outbound_port}{path}")
 }
 
 async fn record_transit_point_response(
@@ -3484,6 +3648,19 @@ async fn managed_agent_sends_identity_request_through_transit_point_with_header(
     let mut body = build_a2a_message_send_body("hello");
     crate::bdd_support::json_rpc::attach_agent_identity_payload(&mut body);
     send_a2a_body_through_transit_point(world, &agent_name, &transit_point, vec![(header, value)], body).await;
+}
+
+#[when(
+    regex = r#"^managed agent \"([^\"]+)\" sends an A2A message/send request with the agent-identity extension through Transit Point \"([^\"]+)\"$"#
+)]
+async fn managed_agent_sends_identity_request_through_transit_point(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    transit_point: String,
+) {
+    let mut body = build_a2a_message_send_body("hello");
+    crate::bdd_support::json_rpc::attach_agent_identity_payload(&mut body);
+    send_a2a_body_through_transit_point(world, &agent_name, &transit_point, Vec::new(), body).await;
 }
 
 #[when(

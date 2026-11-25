@@ -53,9 +53,9 @@ pub struct StsConfig {
     /// terminating HTTP proxy/tunnel that rewrites `Host` to `127.0.0.1` and
     /// drops forwarding headers. `None` ⇒ derive from the request.
     pub public_base_url: Option<String>,
-    /// Replay-protection backend name (see `crate::sts::replay`). Defaults to the
-    /// built-in in-process backend.
-    pub replay_backend: String,
+    /// The longest remaining lifetime an ID-JAG presented for redemption may
+    /// have, in seconds.
+    pub id_jag_max_lifetime_secs: u64,
     /// Token-endpoint throttle configuration.
     pub throttle: crate::config::types::TokenEndpointThrottleConfig,
     pub mcp_issuer: Option<crate::sts::mcp_profile::McpIssuerProfile>,
@@ -69,7 +69,7 @@ impl Default for StsConfig {
             max_ttl_secs: 900,
             id_jag_ttl_secs: 120,
             public_base_url: None,
-            replay_backend: crate::sts::replay::IN_PROCESS_BACKEND.to_string(),
+            id_jag_max_lifetime_secs: 900,
             throttle: crate::config::types::TokenEndpointThrottleConfig::default(),
             mcp_issuer: None,
             mcp_replay: None,
@@ -559,8 +559,9 @@ pub struct StsState {
     /// Trust Check: runs a client's `trust_check_list` and merges the verdict
     /// into the OPA input at `input.trust_check_results.caller[]` before the gate.
     pub trust_checker: Arc<dyn StsTrustChecker>,
-    /// Single-use guard: rejects a replayed ID-JAG within its validity window.
-    pub replay: Arc<dyn crate::sts::replay::ReplayProtection>,
+    /// Single-use store: rejects a replayed ID-JAG within its validity window.
+    /// Without one, no ID-JAG is redeemed.
+    pub replay: Option<Arc<crate::storage::single_use::SingleUseStore>>,
     /// Throttle: bounds repeated attempts per client id per source, and per source.
     pub throttle: Arc<crate::sts::throttle::TokenEndpointThrottle>,
     /// Which tenants declare an MCP resource, checked before minting for it.
@@ -940,7 +941,7 @@ pub fn build_sts_router(
         Some(manager) => Arc::new(ListenerTrustChecker::new(manager)),
         None => Arc::new(DisabledTrustChecker),
     };
-    let replay = crate::sts::replay::build_replay_backend(&config.replay_backend);
+    let replay = crate::storage::single_use::global().ok();
     let throttle = Arc::new(crate::sts::throttle::TokenEndpointThrottle::from_config(&config.throttle));
     let state = StsState {
         signer: Arc::new(VcIssuerSigner { vc_issuer }),
@@ -1336,7 +1337,15 @@ async fn handle_jwt_bearer(
     };
     let now = now_secs();
     // The presented assertion must be an ID-JAG addressed to this gateway.
-    let id_jag = validate_id_jag(&claims, &principal_claim, &issuer, now)?;
+    let id_jag = validate_id_jag(
+        &claims,
+        &principal_claim,
+        &issuer,
+        now,
+        state
+            .config
+            .id_jag_max_lifetime_secs,
+    )?;
     let subject = match profile {
         Some(profile) => profile.bound_subject(&claims, &principal_claim)?,
         None => id_jag.subject.clone(),
@@ -1454,12 +1463,23 @@ async fn handle_jwt_bearer(
             .mcp_replay
             .as_ref()
             .ok_or_else(|| StsError::ServerError("MCP replay storage is not configured".into()))?
-            .record_unique(&profile.issuer, &id_jag.issuer, &id_jag.jti, id_jag.expires_at, now)
+            .record_unique(
+                &profile.issuer,
+                &id_jag.issuer,
+                &id_jag.jti,
+                id_jag.expires_at,
+                now,
+                state
+                    .config
+                    .id_jag_max_lifetime_secs,
+            )
             .await?
     } else {
-        state
+        let store = state
             .replay
-            .record_unique(&id_jag.jti, id_jag.expires_at, now)
+            .as_deref()
+            .ok_or_else(|| StsError::ServerError("ID-JAG replay storage is not configured".into()))?;
+        crate::sts::replay::record_id_jag(store, &id_jag.issuer, &id_jag.jti, id_jag.expires_at, now).await?
     };
     if !unique {
         return Err(StsError::InvalidGrant("ID-JAG has already been redeemed".to_string()));
@@ -1976,15 +1996,15 @@ mod tests {
             clients: Arc::new(registry),
             policy: Arc::new(AllowAllPolicyEvaluator),
             trust_checker: Arc::new(DisabledTrustChecker),
-            replay: Arc::new(crate::sts::replay::ReplayGuard::new()),
+            replay: Some(Arc::new(crate::storage::single_use::SingleUseStore::in_memory())),
             throttle: Arc::new(crate::sts::throttle::TokenEndpointThrottle::from_config(
                 &crate::config::types::TokenEndpointThrottleConfig::default(),
             )),
             resource_owners: Arc::new(crate::sts::resource_owners::NoResourceOwners),
             config: StsConfig {
-                mcp_replay: Some(Arc::new(
-                    crate::sts::replay::McpReplay::new(&crate::sts::replay::McpReplayConfig::default(), None).unwrap(),
-                )),
+                mcp_replay: Some(Arc::new(crate::sts::replay::McpReplay::Embedded(Arc::new(
+                    crate::storage::single_use::SingleUseStore::in_memory(),
+                )))),
                 ..StsConfig::default()
             },
         }
@@ -2996,6 +3016,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn jwt_bearer_refuses_an_id_jag_replayed_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = || async {
+            Some(Arc::new(
+                crate::storage::single_use::SingleUseStore::open(
+                    &crate::storage::single_use::SingleUseStoreConfig::Disk {},
+                    dir.path(),
+                    None,
+                    now_secs(),
+                )
+                .await
+                .unwrap(),
+            ))
+        };
+        let id_jag = json!({
+            "iss": "did:webvh:example:gw",
+            "sub": "did:example:user",
+            "aud": "did:webvh:example:gw",
+            "client_id": "agent-client",
+            "jti": "grant-across-restart",
+            "exp": now_secs() + 120
+        });
+        let assertion = id_jag_assertion(&id_jag);
+        let form = TokenEndpointForm {
+            grant_type: Some(GRANT_TYPE_JWT_BEARER.to_string()),
+            assertion: Some(assertion.clone()),
+            client_id: Some("agent-client".to_string()),
+            client_secret: Some("s3cret".to_string()),
+            audience: Some("https://target.example".to_string()),
+            ..Default::default()
+        };
+        let state = |replay| StsState {
+            replay,
+            ..state_with(HashMap::from([(assertion.clone(), id_jag.clone())]), client(base_record(), Some("s3cret")))
+        };
+
+        dispatch(&state(open().await), &HeaderMap::new(), form.clone())
+            .await
+            .expect("first redeem succeeds");
+        let err = dispatch(&state(open().await), &HeaderMap::new(), form.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), "invalid_grant", "a restart must not make the grant redeemable again");
+
+        let err = dispatch(&state(None), &HeaderMap::new(), form)
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), "server_error", "no replay storage means no redemption");
+    }
+
+    #[tokio::test]
+    async fn jwt_bearer_refuses_an_id_jag_living_longer_than_the_cap() {
+        let form = |assertion: &str| TokenEndpointForm {
+            grant_type: Some(GRANT_TYPE_JWT_BEARER.to_string()),
+            assertion: Some(assertion.to_string()),
+            client_id: Some("agent-client".to_string()),
+            client_secret: Some("s3cret".to_string()),
+            audience: Some("https://target.example".to_string()),
+            ..Default::default()
+        };
+        let grant = |jti: &str, lifetime: u64| {
+            json!({
+                "iss": "did:webvh:example:gw",
+                "sub": "did:example:user",
+                "aud": "did:webvh:example:gw",
+                "client_id": "agent-client",
+                "jti": jti,
+                "exp": now_secs() + lifetime
+            })
+        };
+        let too_long = grant("grant-too-long", 1_000);
+        let within = grant("grant-within-cap", 800);
+        let state = state_with(
+            HashMap::from([
+                (id_jag_assertion(&too_long), too_long.clone()),
+                (id_jag_assertion(&within), within.clone()),
+            ]),
+            client(base_record(), Some("s3cret")),
+        );
+
+        let err = dispatch(&state, &HeaderMap::new(), form(&id_jag_assertion(&too_long)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), "invalid_grant");
+        dispatch(&state, &HeaderMap::new(), form(&id_jag_assertion(&within)))
+            .await
+            .expect("a grant within the cap is redeemed");
+    }
+
+    #[tokio::test]
     async fn jwt_bearer_rejects_id_jag_issued_to_another_client() {
         let id_jag = json!({
             "iss": "did:webvh:example:gw",
@@ -3242,6 +3352,7 @@ mod tests {
             query: crate::trust_registry_verification::trust_check_element::TrqpQueryParams::default(),
             timeout_secs: None,
             name: None,
+            subject: Default::default(),
         }
     }
 
@@ -3710,7 +3821,7 @@ mod tests {
             clients: Arc::new(client(base_record(), Some("s3cret"))),
             policy: Arc::new(AllowAllPolicyEvaluator),
             trust_checker: Arc::new(DisabledTrustChecker),
-            replay: Arc::new(crate::sts::replay::ReplayGuard::new()),
+            replay: Some(Arc::new(crate::storage::single_use::SingleUseStore::in_memory())),
             throttle: Arc::new(crate::sts::throttle::TokenEndpointThrottle::from_config(
                 &crate::config::types::TokenEndpointThrottleConfig::default(),
             )),

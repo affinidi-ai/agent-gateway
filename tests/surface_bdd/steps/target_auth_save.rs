@@ -223,9 +223,10 @@ fn draft_has_transit_point(
     secret_id: String,
     header_name: String,
 ) {
+    let listen_path = crate::steps::when::transit_point_path(world, &alias);
     let point = json!({
         "id": format!("{alias}-id"), "alias": alias, "name": alias, "protocol": "a2a",
-        "target_endpoint": UNREACHABLE_HTTP_TARGET, "listen_path": format!("/transit/{alias}"),
+        "target_endpoint": UNREACHABLE_HTTP_TARGET, "listen_path": listen_path,
         "require_transit_token": false, "target_auth": static_secret(&secret_id, &header_name)
     });
     let surface = draft(world);
@@ -281,10 +282,12 @@ fn draft_transit_point_checks_mcp_authorization(
             .outbound_port
     );
     draft(world)["transit"]["outbound_listen_address"] = json!(outbound);
+    // The resource names the route the point answers on, which is the one the
+    // gateway derives for it.
+    let path = crate::steps::when::transit_point_path(world, &alias);
     let point = draft_transit_point(world, &alias);
     point["protocol"] = json!("mcp");
-    point["mcp_http"] =
-        json!({"authorization": {"resource": format!("{PROTECTED_RESOURCE_PUBLIC_ORIGIN}/transit/{alias}")}});
+    point["mcp_http"] = json!({"authorization": {"resource": format!("{PROTECTED_RESOURCE_PUBLIC_ORIGIN}{path}")}});
 }
 
 #[given(expr = "the target endpoint of Transit Point {string} in the draft is an https URL")]

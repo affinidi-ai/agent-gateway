@@ -76,10 +76,11 @@ fn set_appliance_id(storage_dir: &Path) {
 }
 
 /// Switches the gateway written under `base_dir` to SAML sign-in, trusting an identity provider
-/// certificate generated for the scenario.
+/// certificate generated for the scenario, with `settings` written over the fixture's `saml.json`.
 pub fn sign_in_with_saml(
     base_dir: &Path,
     gateway_port: u16,
+    settings: &serde_json::Map<String, serde_json::Value>,
 ) {
     let key = rcgen::KeyPair::generate().expect("an identity provider key");
     let cert = rcgen::CertificateParams::new(vec!["idp.example.test".to_string()])
@@ -89,17 +90,18 @@ pub fn sign_in_with_saml(
     let cert_path = base_dir.join("idp.crt");
     std::fs::write(&cert_path, cert.pem()).expect("write the identity provider certificate");
     let saml_path = base_dir.join("saml.json");
-    write(
-        &saml_path,
-        json!({
-            "idp_entity_id": "https://idp.example.test",
-            "idp_sso_url": "https://idp.example.test/sso",
-            "sp_entity_id": format!("http://localhost:{gateway_port}"),
-            "sp_acs_url": format!("http://localhost:{gateway_port}/api/saml/acs"),
-            "idp_cert_path": cert_path.display().to_string(),
-            "sign_requests": false,
-        }),
-    );
+    let mut saml = json!({
+        "idp_entity_id": "https://idp.example.test",
+        "idp_sso_url": "https://idp.example.test/sso",
+        "sp_entity_id": format!("http://localhost:{gateway_port}"),
+        "sp_acs_url": format!("http://localhost:{gateway_port}/api/saml/acs"),
+        "idp_cert_path": cert_path.display().to_string(),
+        "sign_requests": false,
+    });
+    for (key, value) in settings {
+        saml[key] = value.clone();
+    }
+    write(&saml_path, saml);
 
     let config_path = base_dir.join("config.toml");
     let config = std::fs::read_to_string(&config_path).expect("read config.toml");

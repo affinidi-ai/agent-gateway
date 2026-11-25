@@ -43,7 +43,7 @@ The bootstrap `[a2a]` table maps to `A2aConfig` in [`src/config/types.rs`](../sr
 | `stream_max_lifetime_secs` | `3600` | Longest an A2A event stream from a direct Target is forwarded, in seconds; must be between `1` and `86400`. A stream still open at that point ends with an error event, and a streaming call to the Target is bounded by this plus the request timeout; the Target's headers must arrive within the request timeout. See [Event streams](PROTOCOLS.md#event-streams). |
 | `fabric_gateway_timeout_ms` | `60000` | How long the sending gateway waits for a response over the fabric when the surface sets no request timeout. |
 | `message_expires_seconds` | `90` | DIDComm message lifetime; must be strictly greater than `fabric_gateway_timeout_ms`, or the mediator could drop a response the sender is still waiting for. See [Fabric envelope lifetime](#fabric-envelope-lifetime). |
-| `max_inflight_dispatches` | `256` | Fabric requests one Connection Point listener dispatches concurrently; must be greater than `0`. When every slot is busy, a forward request the listener would admit is answered at once with HTTP `503` and `retry-after: 1`, which the sending gateway returns to its caller; the sender does not retry it. A redelivered or replayed forward request is dropped without a reply, and an expired or unauthorized one gets its usual `504` or `403`. Other messages wait for a slot. |
+| `max_inflight_dispatches` | `256` | Fabric requests one Connection Point listener dispatches concurrently; must be greater than `0`. When every slot is busy, a forward request the listener would admit is answered at once with HTTP `503` and `retry-after: 1`, which the sending gateway returns to its caller; the sender does not retry it. A redelivered or replayed forward request is dropped without a reply, and an expired or unauthorized one gets its usual `504` or `403`. A forward request still being handled when the listener's mediator connection drops is not counted as seen, so the mediator's redelivery after the reconnect is handled again rather than dropped; a Target call it had already made runs twice. Other messages wait for a slot. |
 | `sdk_inbound_cache_count` | `1024` | Unprocessed DIDComm messages the SDK inbound cache holds before it stops draining the websocket; must be greater than `0`. |
 | `sdk_inbound_cache_bytes` | `104857600` (100 MiB) | Bytes the SDK inbound cache holds before applying back-pressure; must be greater than `0`. |
 
@@ -60,7 +60,7 @@ The runtime implementation is in
 | Method | Typical caller | Behavior |
 | --- | --- | --- |
 | `reload_channels` | Full-reload implementation | Replaces the complete runtime surface set and swaps the router of every bound listener. |
-| `reload_channels_with_fallback` | `POST /v1/config/reload` | Loads the requested configuration and uses the cached snapshot only when loading the requested source fails. |
+| `reload_channels_with_fallback` | `POST /v1/config/reload` | Reloads from the requested configuration; when it cannot be loaded, changes nothing and reports the failure (`POST /v1/config/reload` answers `500`). |
 | `reload_single_channel` | `reload_single_channel_with_fallback` | Rebuilds one surface and swaps it into the current inbound listener state. |
 | `reload_single_channel_with_fallback` | `POST /v1/config/reload/{config_id}` and surface mutation paths | Serializes and applies the single-surface update; a source-load error is returned rather than silently substituting another surface. |
 
@@ -71,9 +71,7 @@ flowchart TD
     M --> L["Build the configuration: surfaces from<br/>_storage/agent_surfaces/, the rest from memory"]
     L --> OK{Built?}
     OK -- yes --> R[Full reload]
-    OK -- no --> CC{Cached snapshot?}
-    CC -- yes --> RC["Full reload from the cached<br/>snapshot, with a warning"]
-    CC -- no --> E[Error]
+    OK -- no --> K["Keep the running configuration"] --> E["500 naming the failure"]
 ```
 
 Full and single-surface reloads share a reload lock so they cannot concurrently mutate listener
@@ -125,9 +123,11 @@ configuration. A request already being handled when the router is swapped comple
 router it started on; because that router holds the outbound state updated in step 5, a removed
 Transit Point refuses it with `404`.
 
-If the requested configuration source cannot be loaded,
-`reload_channels_with_fallback` attempts to load the cached `GatewayConfig`. If neither source is
-available, reload returns an error. A port whose router cannot be rebuilt keeps serving the router
+If the requested configuration source or the Agent Surface records cannot be loaded, the reload
+changes nothing: every surface keeps serving from the configuration already running, and
+`POST /v1/config/reload` answers `500` with the failure in `details`. A
+surface whose identity engines or variants fail to build is refused before any change, so a
+single-surface reload that fails leaves the surface as it was served. A port whose router cannot be rebuilt keeps serving the router
 it had and its task-monitor entries, and the error is logged and returned as the reload's
 warning, which `POST /v1/config/reload` answers with; single-surface changes keep updating that
 router, so a surface added or changed on the port afterwards is served.
@@ -217,7 +217,8 @@ A node runs in one of two modes, set by `server_mode` in the bootstrap config (d
 - **Active** serves traffic, runs the fabric and trust listeners, and writes the governance audit
   journal.
 - **Standby** keeps the fabric and trust listeners inactive, keeps no audit records, and reports not
-  ready. It takes over the audit journal when it becomes Active (see
+  ready. Stepping down also cancels a Connection Point listener still connecting to its mediator,
+  so it never registers on the Standby node. It takes over the audit journal when it becomes Active (see
   [Governance audit delivery](OBSERVABILITY.md)). It opens no trust registry connection: creating or
   reconnecting a trust registry returns 503 before anything is written.
 
@@ -225,7 +226,9 @@ On becoming Active, before the audit pipeline starts, a node re-reads the dashbo
 (`settings.json`) from disk and empties its integration cache. The audit sinks are then built from
 those settings and the integrations listed from disk, and deliveries load each integration as it is
 stored now, so a promoted node never forwards with the VP Audit Log selection or integration
-configuration it loaded before the other node changed them. Readiness does not wait for the
+configuration it loaded before the other node changed them. A `settings.json` that cannot be read
+or parsed is left as it is: the gateway refuses to start with it rather than write the defaults
+over it, and a node becoming Active keeps the settings it already has. Readiness does not wait for the
 pipeline: the node admits traffic after one start attempt and, if that start is refused (the
 integrations cannot be listed, or the other node still holds the journal), keeps trying in the
 background.
