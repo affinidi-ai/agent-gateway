@@ -21,4 +21,13 @@ changes:
         token endpoint and client ID and secret references on one, and a retype to api_key kept
         the stored ones while skipping the https token endpoint rule. A create or update of an
         api_key provider now drops them, so no later read of the provider finds a client to send.
+    - timestamp: '2026-11-25T00:11:10Z'
+      title: Refuse a token request that would send a client secret its provider never sends
+      description: >-
+        Each token request read and sent the provider's client secret whatever the provider's
+        type, trusting its caller to hand it the type it was written for. The legacy code
+        exchange and refresh, the scoped refresh and the client credentials and JWT Bearer grants
+        now refuse, before the secret is read, a provider that sends no client secret, such as an
+        api_key provider, a JWT Bearer provider without secret client authentication or one
+        authenticating with a signed JWT.
   breaking: []

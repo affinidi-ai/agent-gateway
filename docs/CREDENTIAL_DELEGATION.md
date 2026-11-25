@@ -221,6 +221,13 @@ reference at another secret of its tenant, which is a rotation and is saved, and
 value can already change through the secrets API without any check by a provider, so pinning the
 reference would not pin what the endpoint receives.
 
+Every token request of a provider without an `issuer` (the legacy code exchange and refresh,
+the verified and `2026-07-28` refresh, and each service token grant) sends a client secret only
+for a provider that sends one by the definition above; an external consent provider's
+`token_endpoint_auth_method` decides its own. Handed any other provider, it is refused before the secret is read, so
+no request sends the secret of a provider whose type does not send one, even one handed a
+provider of another type than the request was made for.
+
 `oauth2_client_credentials` and `oauth2_authorization_code` providers without an `issuer` need
 the reference, so an update that clears it is refused on any endpoint (see
 [Credential providers](#credential-providers)). A provider of these types stored without it,

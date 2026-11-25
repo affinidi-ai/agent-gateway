@@ -509,10 +509,7 @@ async fn exchange_code_for_tokens_with(
         .client_id_secret_ref
         .as_deref()
         .ok_or_else(|| anyhow!("Provider '{}' has no client_id_secret_ref", provider.provider_id))?;
-    let client_secret_ref = provider
-        .client_secret_secret_ref
-        .as_deref()
-        .ok_or_else(|| anyhow!("Provider '{}' has no client_secret_secret_ref", provider.provider_id))?;
+    let client_secret_ref = sent_client_secret_ref(provider)?;
     let client_id = resolve_secret(
         provider,
         secrets_store,
@@ -702,10 +699,7 @@ async fn refresh_access_token_with(
         .client_id_secret_ref
         .as_deref()
         .ok_or_else(|| anyhow!("Provider '{}' has no client_id_secret_ref", provider.provider_id))?;
-    let client_secret_ref = provider
-        .client_secret_secret_ref
-        .as_deref()
-        .ok_or_else(|| anyhow!("Provider '{}' has no client_secret_secret_ref", provider.provider_id))?;
+    let client_secret_ref = sent_client_secret_ref(provider)?;
     let client_id = resolve_secret(
         provider,
         secrets_store,
@@ -899,16 +893,26 @@ async fn provider_client_id(
     Ok(resolve_secret(provider, secrets, reference, mode).await?)
 }
 
+/// The client secret reference a token request of `provider` sends. A provider that sends no
+/// client secret ([`CredentialProvider::sends_client_secret`]) is refused before its secret is
+/// read, so a request handed a provider of another type than it checked never sends one.
+fn sent_client_secret_ref(provider: &CredentialProvider) -> Result<&str> {
+    if !provider.sends_client_secret() {
+        return Err(misconfigured("Provider sends no client secret"));
+    }
+    provider
+        .client_secret_secret_ref
+        .as_deref()
+        .ok_or_else(|| misconfigured("Missing provider client secret"))
+}
+
 /// The client secret the provider's `client_secret_secret_ref` names.
 async fn provider_client_secret(
     provider: &CredentialProvider,
     secrets: &Arc<dyn SecretsStore>,
     mode: RuleMode,
 ) -> Result<zeroize::Zeroizing<String>> {
-    let reference = provider
-        .client_secret_secret_ref
-        .as_deref()
-        .ok_or_else(|| misconfigured("Missing provider client secret"))?;
+    let reference = sent_client_secret_ref(provider)?;
     Ok(zeroize::Zeroizing::new(resolve_secret(provider, secrets, reference, mode).await?))
 }
 
@@ -3551,6 +3555,125 @@ mod tests {
                 .unwrap();
             assert_eq!(form["grant_type"], "refresh_token");
             assert_eq!(form["refresh_token"], "refresh");
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum TokenRequest {
+            CodeExchange,
+            LegacyRefresh,
+            ScopedRefresh,
+            ClientCredentials,
+            JwtBearer,
+            JwtAuth,
+        }
+
+        impl TokenRequest {
+            /// The provider type this request is sent for.
+            fn provider_type(self) -> &'static str {
+                match self {
+                    Self::CodeExchange | Self::LegacyRefresh | Self::ScopedRefresh => "oauth2_authorization_code",
+                    Self::ClientCredentials => "oauth2_client_credentials",
+                    Self::JwtBearer => "oauth2_jwt_bearer",
+                    Self::JwtAuth => "oauth2_client_credentials_jwt_auth",
+                }
+            }
+
+            async fn send(
+                self,
+                provider: &CredentialProvider,
+                fixture: &Fixture,
+                egress: &TokenEgress,
+            ) {
+                let scopes = ["read".to_string()];
+                let secrets = &fixture.secrets;
+                let _ = match self {
+                    Self::CodeExchange => {
+                        exchange_code_for_tokens_with(provider, "code", "https://203.0.113.10", secrets, None, egress)
+                            .await
+                            .map(drop)
+                    }
+                    Self::LegacyRefresh => refresh_access_token_with(provider, "refresh", secrets, egress)
+                        .await
+                        .map(drop),
+                    Self::ScopedRefresh => refresh_scoped_access_token(provider, "refresh", &scopes, secrets, egress)
+                        .await
+                        .map(drop),
+                    Self::ClientCredentials => {
+                        fetch_scoped_client_credentials_token(provider, &scopes, secrets, egress)
+                            .await
+                            .map(drop)
+                    }
+                    Self::JwtBearer => fetch_jwt_bearer_token(provider, &scopes, secrets, egress)
+                        .await
+                        .map(drop),
+                    Self::JwtAuth => fetch_client_credentials_jwt_auth_token(provider, &scopes, secrets, egress)
+                        .await
+                        .map(drop),
+                };
+            }
+        }
+
+        /// Every token request sends a client secret only when the provider it is handed sends
+        /// one, whatever type the request was written for, and each type's own request sends the
+        /// client secret exactly when its provider sends one.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn every_token_request_sends_a_client_secret_only_when_its_provider_sends_one() {
+            let fixture = fixture().await;
+            let mut endpoint = token_endpoint(200, issued()).await;
+            let basic = crate::delegation_vault::revocation::basic_authorization("client-123", "client-secret");
+            let rows = [
+                ("oauth2_authorization_code", None),
+                ("oauth2_client_credentials", None),
+                ("oauth2_jwt_bearer", None),
+                ("oauth2_jwt_bearer", Some("none")),
+                ("oauth2_jwt_bearer", Some("client_secret_basic")),
+                ("oauth2_jwt_bearer", Some("client_secret_post")),
+                ("oauth2_client_credentials_jwt_auth", None),
+                ("api_key", None),
+            ];
+            let requests = [
+                TokenRequest::CodeExchange,
+                TokenRequest::LegacyRefresh,
+                TokenRequest::ScopedRefresh,
+                TokenRequest::ClientCredentials,
+                TokenRequest::JwtBearer,
+                TokenRequest::JwtAuth,
+            ];
+
+            for (provider_type, client_authentication) in rows {
+                let provider = provider(
+                    &endpoint.url,
+                    json!({
+                        "provider_type": provider_type, "client_authentication": client_authentication,
+                        "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+                        "api_key_secret_ref": "CLIENT_SECRET", "jwt_certificate_secret_ref": "CERTIFICATE",
+                        "jwt_issuer": "agent@project.iam.gserviceaccount.com", "jwt_subject": "admin@example.com",
+                        "resource": "https://api.example/"
+                    }),
+                );
+                for request in requests {
+                    request
+                        .send(&provider, &fixture, &endpoint.egress)
+                        .await;
+                    let in_form = endpoint
+                        .requests
+                        .try_recv()
+                        .is_ok_and(|form| form.contains_key("client_secret"));
+                    let in_header = endpoint
+                        .authorizations
+                        .try_recv()
+                        .ok()
+                        .flatten()
+                        .is_some_and(|authorization| authorization == *basic);
+                    let sent = in_form || in_header;
+                    let row =
+                        format!("{request:?} for {provider_type}, client authentication {client_authentication:?}");
+                    assert!(!sent || provider.sends_client_secret(), "{row} sent a client secret");
+                    if request.provider_type() == provider_type {
+                        assert_eq!(sent, provider.sends_client_secret(), "{row}");
+                    }
+                }
+            }
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
