@@ -351,6 +351,16 @@ Feature: Routing through a proxy:// MCP target
     And the response reason is "target_path_refused"
     And REST API "bravo" was not called
 
+  Scenario: A 2026-07-28 tool call whose path leaves the MCP proxy base path is refused before the Target credential is fetched
+    Given the MCP proxy's base URL has the base path "/api/"
+    And the surface requires "API Key" source authentication
+    And the gateway authenticates to the managed agent with a client credentials provider
+    When the caller invokes the MCP tool "get_weather" for city "../../admin" using protocol version "2026-07-28" with a valid API key
+    Then the response status is 400
+    And the response reason is "target_path_refused"
+    And the credential provider received 0 token requests
+    And REST API "bravo" was not called
+
   Scenario: A credentialed tool call with a braced path value is refused as invalid arguments, not as leaving the base path
     Given the MCP proxy's base URL has the base path "/api/"
     And the surface requires "API Key" source authentication

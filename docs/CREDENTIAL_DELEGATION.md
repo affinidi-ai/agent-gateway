@@ -1654,16 +1654,22 @@ Point sends a discovery read no delegated credential, so a request routed there 
 path, such as a direct `GET {route}/.well-known/not-a-card` or a Transit Point
 `GET {listen path}/x/.well-known/agent-card.json`, is refused with `400 target_path_refused` when
 a binding applies to it. A
-`2026-07-28` MCP proxy call is held by its REST client's own base-path check (400). A Target
-bound by external consent keeps its stricter admission check (400).
+`2026-07-28` tool call to an MCP proxy Target, on the direct path and Fabric receive, is checked
+against the REST URL its path arguments build under the proxy's `base_url` (a `.` or `..`
+segment, or a URL outside a base path that is not the root, as for `../admin`), before any grant
+is read, token requested or consent started, and gets the same `400 target_path_refused` and
+audit record; the REST client's own base-path check stays as a second guard. A Target bound by
+external consent keeps its stricter admission check (400).
 
 A surface's traffic mirror (`target.networking.mirror`) never receives the Target credential or a
-delegated credential, on the direct path or on Fabric send. The mirrored copy carries the
-caller's headers without the caller's own credentials or any header named like a credential
-header. On the direct path its body has none of the `_meta` fields delegated credentials go
-into, even when the caller set them; custom metadata, DID identity and the identity binding VP
-stay in the body. On Fabric send the copy is taken before the gateway adds any credential to
-the body.
+delegated credential, on the direct path, on Fabric send or from an MCP proxy Target. The
+mirrored copy carries the caller's headers without the caller's own credentials or any header
+named like a credential header. On the direct path, including a legacy `proxy://` tool call,
+and on a legacy `proxy://` tool call received over Fabric, its body has none of the `_meta`
+fields delegated credentials go into, even when the caller set them; custom metadata, DID
+identity and the identity binding VP stay in the body. On Fabric send the copy is taken before
+the gateway adds any credential to the body. Fabric receive otherwise, and Transit Points, send
+no traffic mirror.
 
 ## Caller keys
 

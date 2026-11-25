@@ -3967,6 +3967,23 @@ fn fabric_target_url(
     }
 }
 
+/// Whether a `2026-07-28` tool call to the MCP proxy `proxy_id` builds a REST URL outside the
+/// proxy's base path ([`crate::mcp_proxies::handlers::modern_tool_call_leaves_base`]). A proxy
+/// that cannot be loaded is `false` here and refused when the request is dispatched.
+async fn modern_proxy_tool_call_leaves_base(
+    proxy_id: &str,
+    request: &crate::mcp::request_validation::ValidatedModernMessage,
+) -> bool {
+    use crate::mcp_proxies::McpProxyStore;
+    let Some(store) = GLOBAL_MCP_PROXY_STORE.get() else {
+        return false;
+    };
+    match store.get(proxy_id).await {
+        Ok(Some(proxy)) => crate::mcp_proxies::handlers::modern_tool_call_leaves_base(&proxy, request).await,
+        _ => false,
+    }
+}
+
 /// Whether a delegated credential binding of the receiving surface's Target
 /// applies to a Fabric request calling `tool`, so the request needs a caller
 /// the surface verified to key it.
@@ -5726,12 +5743,15 @@ async fn process_charged_forward_request(
         && surface.agent_keyed_binding_applies(crate::mcp::tool_analyzer::called_tool_name(&body_bytes).as_deref());
     if forwards_to_target_url
         && (surface.target_auth().is_some() || carries_delegated_credential)
-        && !crate::proxy::paths::is_target_credential_destination(
-            surface.target_endpoint(),
-            method,
-            &target_url,
-            surface.agent_card_location_path(),
-        )
+        && match (modern_request.as_ref(), surface.target_endpoint().strip_prefix("proxy://")) {
+            (Some(request), Some(proxy_id)) => modern_proxy_tool_call_leaves_base(proxy_id, request).await,
+            _ => !crate::proxy::paths::is_target_credential_destination(
+                surface.target_endpoint(),
+                method,
+                &target_url,
+                surface.agent_card_location_path(),
+            ),
+        }
     {
         channel_warn!(
             config_id,

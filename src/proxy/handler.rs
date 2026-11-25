@@ -255,18 +255,6 @@ pub(crate) fn target_credential_header_names(surface: &crate::config::agent_surf
         .collect()
 }
 
-/// The `_meta` fields that carry an Access Point Target's delegated credentials: the field of
-/// each delegated credential binding that can apply to it and injects into `_meta`.
-fn target_credential_meta_fields(surface: &crate::config::agent_surface::AgentSurface) -> Vec<&str> {
-    surface
-        .agent_keyed_outbound_credentials()
-        .filter_map(|binding| match &binding.inject_as {
-            crate::config::types::CredentialInjection::Meta { field } => Some(field.as_str()),
-            _ => None,
-        })
-        .collect()
-}
-
 /// Extract UCP operation type from request path and method
 /// Supports UCP REST, MCP, and A2A transport bindings per spec
 pub(crate) fn extract_ucp_operation(
@@ -6533,15 +6521,28 @@ async fn proxy_charged_request(
         .target_auth()
         .is_some()
         || carries_delegated_credential)
-        && !crate::proxy::paths::is_target_credential_destination(
-            &state.surface.target.endpoint,
-            method.as_str(),
-            &target_url,
+        && match (
+            modern_request.as_ref(),
             state
                 .surface
-                .agent_card_location_path()
-                .filter(|_| !carries_delegated_credential),
-        )
+                .target
+                .endpoint
+                .strip_prefix("proxy://"),
+        ) {
+            (Some(request), Some(proxy_id)) => match load_owned_proxy(&state, proxy_id).await {
+                Ok(proxy) => crate::mcp_proxies::handlers::modern_tool_call_leaves_base(&proxy, request).await,
+                Err(_) => false,
+            },
+            _ => !crate::proxy::paths::is_target_credential_destination(
+                &state.surface.target.endpoint,
+                method.as_str(),
+                &target_url,
+                state
+                    .surface
+                    .agent_card_location_path()
+                    .filter(|_| !carries_delegated_credential),
+            ),
+        }
     {
         warn!(
             channel = channel_name,
@@ -7696,10 +7697,7 @@ async fn proxy_charged_request(
         && mirror::selected(mirror_config.percentage)
     {
         let mirror_endpoint_for_log = loggable::url(&mirror_config.endpoint);
-        let mirror_body = crate::proxy::credential_delegation::without_delegated_credentials_in_mcp_meta(
-            &body_bytes,
-            &target_credential_meta_fields(&state.surface),
-        );
+        let mirror_body = crate::proxy::credential_delegation::mirror_body(&state.surface, &body_bytes);
         let mirror_request = mirror::MirrorRequest::new(mirror_config, method.clone(), mirror_body)
             .headers_from(&headers, |name| {
                 forwards_target_header(
@@ -21244,6 +21242,132 @@ allow if {
         assert!(!status.is_client_error(), "{status} {body}");
     }
 
+    /// A `2026-07-28` tool call to an MCP proxy Target whose path argument takes the REST URL
+    /// out of the proxy's base path is refused with `400` before any grant is read or consent
+    /// is started; the same call with a path argument under the base is asked for consent.
+    async fn modern_proxy_tool_calls_outside_the_proxy_base_path(
+        state: &crate::state::ProxyState,
+        runtime: &std::sync::Arc<crate::mcp::continuations::config::ContinuationRuntime>,
+        bearer: &str,
+    ) {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        use crate::delegation_vault::audit::DelegationAuditAction;
+        use crate::mcp_proxies::filesystem::McpProxyStore;
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            crate::mcp_proxies::FileSystemMcpProxyStore::new(directory.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let proxy = crate::mcp_proxies::types::McpProxy::new(
+            "Items".into(),
+            String::new(),
+            "http://127.0.0.1:9/base".into(),
+            json!({"openapi": "3.0.0", "info": {"title": "Items", "version": "1.0"}, "paths": {
+                "/items/{id}": {"get": {"operationId": "getItem",
+                    "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                    "responses": {"200": {"description": "OK"}}}}
+            }})
+            .to_string(),
+            "/mcp".into(),
+            "/items-base".into(),
+        );
+        store
+            .create(&proxy)
+            .await
+            .unwrap();
+        let mut state = state.clone();
+        state.mcp_proxy_store = Some(store);
+        std::sync::Arc::make_mut(&mut state.surface)
+            .target
+            .endpoint = format!("proxy://{}", proxy.id);
+        let send = |id: &str| {
+            let message = json!({"jsonrpc": "2.0", "id": 30, "method": "tools/call", "params": {
+                "name": "getItem", "arguments": {"id": id}, "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {"elicitation": {"url": {}}}
+                }
+            }});
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("https://gateway.example/mcp")
+                .header("authorization", format!("Bearer {bearer}"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION)
+                .header("mcp-method", "tools/call")
+                .header("mcp-name", "getItem")
+                .body(axum::body::Body::from(serde_json::to_vec(&message).unwrap()))
+                .unwrap();
+            let state = state.clone();
+            let runtime = runtime.clone();
+            async move {
+                let (response, events) =
+                    crate::audit::producer::capture(Box::pin(super::proxy_handler_with_mcp_runtime(
+                        "127.0.0.1:12345"
+                            .parse()
+                            .unwrap(),
+                        state,
+                        request,
+                        crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                        Some(runtime),
+                    )))
+                    .await;
+                let response = response.unwrap_or_else(|response| response);
+                let status = response.status();
+                let body = String::from_utf8_lossy(
+                    &axum::body::to_bytes(response.into_body(), 16384)
+                        .await
+                        .unwrap(),
+                )
+                .into_owned();
+                let path_refusals = events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event.event,
+                            DelegationAuditAction::RequestRejected {
+                                stage: RejectionStage::Forward,
+                                reason: RejectionReason::TargetPathRefused,
+                                ..
+                            }
+                        )
+                    })
+                    .count();
+                let grant_work = events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event.event,
+                            DelegationAuditAction::ConsentRequired
+                                | DelegationAuditAction::ElicitationSent
+                                | DelegationAuditAction::TokenInjected
+                                | DelegationAuditAction::TokenNotFound
+                                | DelegationAuditAction::TokenRefreshed
+                        )
+                    })
+                    .count();
+                (status, body, path_refusals, grant_work)
+            }
+        };
+
+        for climbing in ["../admin", ".."] {
+            let (status, body, path_refusals, grant_work) = send(climbing).await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{climbing}: {body}");
+            assert!(body.contains("target_path_refused"), "{climbing}: {body}");
+            assert!(!body.contains("input_required"), "{climbing}: {body}");
+            assert_eq!(path_refusals, 1, "{climbing}: {body}");
+            assert_eq!(grant_work, 0, "{climbing}: {body}");
+        }
+
+        let (status, body, path_refusals, _) = send("1").await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert!(body.contains("input_required"), "{body}");
+        assert_eq!(path_refusals, 0, "{body}");
+    }
+
     async fn direct_modern_consent_flow() {
         use std::sync::Arc;
 
@@ -21446,6 +21570,7 @@ allow if {
         assert_eq!(status, axum::http::StatusCode::OK, "{response}");
         assert_eq!(response["result"]["resultType"], "input_required");
         modern_requests_outside_the_target_base_path(&state, &runtime, &build_request, &message).await;
+        modern_proxy_tool_calls_outside_the_proxy_base_path(&state, &runtime, &bearer).await;
         // Two surfaces route to the same peer gateway. Only the opted-in one reaches the delegation
         // gate, which stops it without a runtime; the other skips consent, even with a runtime, and
         // goes on to Fabric dispatch (its free tool makes no payment call).

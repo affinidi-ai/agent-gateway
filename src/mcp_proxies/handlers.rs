@@ -2285,6 +2285,57 @@ pub(crate) async fn handle_modern_surface_http_request(
     Ok(response)
 }
 
+/// Whether a `2026-07-28` `tools/call` of `proxy` has path arguments that take its REST URL out
+/// of the proxy's base path, so a credential sent with it would leave the base path. `false`
+/// for any other request, and for a call the REST client refuses for another reason, such as an
+/// unknown tool or arguments it cannot read.
+pub(crate) async fn modern_tool_call_leaves_base(
+    proxy: &McpProxy,
+    request: &crate::mcp::request_validation::ValidatedModernMessage,
+) -> bool {
+    let Some(params) = request
+        .params
+        .as_ref()
+        .filter(|_| request.method == "tools/call")
+    else {
+        return false;
+    };
+    let (Some(name), Some(arguments)) = (
+        params
+            .get("name")
+            .and_then(serde_json::Value::as_str),
+        params
+            .get("arguments")
+            .filter(|arguments| arguments.is_object()),
+    ) else {
+        return false;
+    };
+    let manager = McpServerManager::new();
+    if manager
+        .create_server(proxy)
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let Some(catalogs) = manager
+        .get_catalogs(&proxy.id)
+        .await
+    else {
+        return false;
+    };
+    let server = catalogs.modern.read().await;
+    let Some(tool) = server.get_tool(name) else {
+        return false;
+    };
+    let arguments = if proxy.flatten_post_params {
+        wrap_request_body_if_needed(&server, name, arguments.clone())
+    } else {
+        arguments.clone()
+    };
+    super::modern_rest::path_arguments_leave_base(&proxy.base_url, &tool.metadata, &arguments)
+}
+
 pub(crate) async fn handle_modern_surface_request(
     proxy: &McpProxy,
     surface: &crate::config::agent_surface::AgentSurface,
@@ -3277,6 +3328,7 @@ pub async fn execute_mcp_request(
             {
                 match serde_json::to_vec(&request) {
                     Ok(payload) => {
+                        let payload = crate::proxy::credential_delegation::mirror_body(surface, &payload.into());
                         let mirror_request = mirror::MirrorRequest::new(mirror_config, reqwest::Method::POST, payload)
                             .header("Content-Type", "application/json")
                             .mirrored(None);
@@ -3774,6 +3826,55 @@ mod tests {
         });
         let credential = credential.then(|| ("X-Api-Key".to_string(), "gateway-value".to_string()));
         handle_mcp_request_with_policies(proxy, request, &surface, None, "base-path", credential, None).await
+    }
+
+    /// The mirrored copy of a tool call carries none of the `_meta` fields delegated
+    /// credentials go into, even when the caller set them; other `_meta` stays.
+    #[tokio::test]
+    async fn a_mirrored_tool_call_carries_no_delegated_credential_meta_field() {
+        use serde_json::json;
+
+        let (proxy, _) = recording_items_proxy("/base").await;
+        let mirrored = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let log = mirrored.clone();
+        let mirror = axum::Router::new().fallback(move |body: axum::body::Bytes| {
+            let log = log.clone();
+            async move {
+                log.lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&body).unwrap());
+                StatusCode::OK
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let mirror_url = format!("http://{}/mirror", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, mirror).await });
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "mirrored", "name": "Mirrored",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "proxy://mirrored", "networking": {"mirror": {
+                "endpoint": mirror_url, "percentage": 100, "wait_for_response": true}}},
+            "outbound_credentials": [{"credential_provider_id": "calendar",
+                "inject_as": {"type": "meta", "field": "calendar"}}]
+        }))
+        .unwrap();
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "getItem", "arguments": {"id": "1"},
+                "_meta": {"calendar": "caller-set-token", "trace": "kept"}}
+        });
+        handle_mcp_request_with_policies(&proxy, request, &surface, None, "mirrored", None, None)
+            .await
+            .unwrap();
+        let mirrored = mirrored
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(mirrored.len(), 1);
+        assert_eq!(mirrored[0]["params"]["_meta"], json!({"trace": "kept"}), "{}", mirrored[0]);
+        assert_eq!(mirrored[0]["params"]["arguments"], json!({"id": "1"}));
     }
 
     #[test]

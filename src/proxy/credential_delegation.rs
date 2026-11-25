@@ -1350,6 +1350,23 @@ pub fn without_delegated_credentials_in_mcp_meta(
     }
 }
 
+/// The body a surface's traffic mirror is sent for `body`: without the `_meta` field of any
+/// delegated credential binding of the Access Point Target that injects into `_meta`, whoever
+/// set it.
+pub fn mirror_body(
+    surface: &crate::config::agent_surface::AgentSurface,
+    body: &bytes::Bytes,
+) -> bytes::Bytes {
+    let fields: Vec<&str> = surface
+        .agent_keyed_outbound_credentials()
+        .filter_map(|binding| match &binding.inject_as {
+            crate::config::types::CredentialInjection::Meta { field } => Some(field.as_str()),
+            _ => None,
+        })
+        .collect();
+    without_delegated_credentials_in_mcp_meta(body, &fields)
+}
+
 /// Why a binding with no stored credential is refused without asking for
 /// consent: its provider was deactivated and takes no new consent.
 const PROVIDER_DEACTIVATED: &str = "provider_deactivated";

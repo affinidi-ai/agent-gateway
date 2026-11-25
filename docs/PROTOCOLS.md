@@ -882,8 +882,10 @@ so it is refused the same way. Every refusal carries the detail "Target authenti
 
 Each row applies when the leg attaches either a Target credential or a delegated credential.
 Fabric send checks a delegated credential only on a `2026-07-28` MCP request, the only one that
-carries it to the peer. A delegated credential on a `2026-07-28` MCP proxy call is held by the
-REST client's own base-path check (`400`, JSON-RPC error `-32602`) described below. A request
+carries it to the peer. A `2026-07-28` MCP proxy call, on the direct path and Fabric receive,
+is checked against the REST URL its path arguments build before any credential is resolved or
+consent started, and the REST client's own base-path check (`400`, JSON-RPC error `-32602`)
+described below stays as a second guard. A request
 refused for a delegated credential alone is recorded as a `target_path_refused` refusal at
 `forward`. A surface's traffic mirror is sent neither credential, in a header or in `_meta`
 (see [Target base path](CREDENTIAL_DELEGATION.md#target-base-path)).

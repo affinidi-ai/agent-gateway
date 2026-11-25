@@ -1530,6 +1530,106 @@ async fn fabric_consent_flow() {
         assert!(calls.lock().await.is_empty(), "the Target is not called");
     }
     {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        use crate::delegation_vault::audit::DelegationAuditAction;
+        use crate::mcp_proxies::filesystem::McpProxyStore;
+        let proxies = Arc::new(
+            crate::mcp_proxies::FileSystemMcpProxyStore::new(
+                directory
+                    .path()
+                    .join("proxies"),
+            )
+            .await
+            .unwrap(),
+        );
+        let proxy = crate::mcp_proxies::types::McpProxy::new(
+            "Items".into(),
+            String::new(),
+            format!("http://{target_address}/base"),
+            json!({"openapi": "3.0.0", "info": {"title": "Items", "version": "1.0"}, "paths": {
+                "/items/{id}": {"get": {"operationId": "getItem",
+                    "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                    "responses": {"200": {"description": "OK"}}}}
+            }})
+            .to_string(),
+            "/mcp".into(),
+            "/items-base".into(),
+        );
+        proxies
+            .create(&proxy)
+            .await
+            .unwrap();
+        super::init_mcp_proxy_store(proxies).await;
+        let mut proxied = surface.clone();
+        proxied.target.endpoint = format!("proxy://{}", proxy.id);
+        let call = |id: &str| {
+            let body = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {
+                "name": "getItem", "arguments": {"id": id}, "_meta": body["params"]["_meta"].clone()
+            }});
+            let (message, mut stream) = make_request(&body, &proxied, &sender_did, &bearer);
+            stream
+                .headers
+                .insert("mcp-name", axum::http::HeaderValue::from_static("getItem"));
+            (message, stream)
+        };
+        for climbing in ["../admin", ".."] {
+            let (message, stream) = call(climbing);
+            let (result, events) =
+                crate::audit::producer::capture(Box::pin(super::process_forward_request_with_mcp_runtime(
+                    &message,
+                    Some(stream),
+                    versions,
+                    Some(runtime.clone()),
+                )))
+                .await;
+            let refused = decode(result).await;
+            assert_eq!(refused.0, 400, "{climbing}: {:?}", refused.1);
+            assert_ne!(refused.1["result"]["resultType"], "input_required", "{climbing}: {:?}", refused.1);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event.event,
+                        DelegationAuditAction::RequestRejected {
+                            stage: RejectionStage::Forward,
+                            reason: RejectionReason::TargetPathRefused,
+                            ..
+                        }
+                    ))
+                    .count(),
+                1,
+                "{climbing}: {events:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(
+                        event.event,
+                        DelegationAuditAction::ConsentRequired
+                            | DelegationAuditAction::ElicitationSent
+                            | DelegationAuditAction::TokenInjected
+                            | DelegationAuditAction::TokenNotFound
+                            | DelegationAuditAction::TokenRefreshed
+                    )),
+                "{climbing}: {events:?}"
+            );
+        }
+        let (message, stream) = call("1");
+        let pending = decode(
+            Box::pin(super::process_forward_request_with_mcp_runtime(
+                &message,
+                Some(stream),
+                versions,
+                Some(runtime.clone()),
+            ))
+            .await,
+        )
+        .await;
+        assert_eq!(pending.0, 200, "{:?}", pending.1);
+        assert_eq!(pending.1["result"]["resultType"], "input_required");
+        assert!(calls.lock().await.is_empty(), "the Target is not called");
+    }
+    {
         let send = |body: Value, token: Option<String>, runtime: Arc<ContinuationRuntime>| {
             let token = token.unwrap_or_else(|| bearer.clone());
             let (message, stream) = make_request(&body, &surface, &sender_did, &token);
