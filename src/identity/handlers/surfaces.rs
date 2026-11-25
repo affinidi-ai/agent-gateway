@@ -137,6 +137,73 @@ pub(crate) const INBOUND_API_KEY_WITH_RESOURCE_TOKENS: &str = "Identity 'From AP
 pub(crate) const INBOUND_API_KEY_ON_MCP_PROXY: &str =
     "Identity 'From API Key' is not supported on a proxy:// MCP Proxy target; choose another inbound Identity mode";
 pub(crate) const API_KEY_IDENTITY_NEEDS_ID: &str = "Identity 'From API Key' needs a non-empty api_key_id";
+pub(crate) const TRANSIT_API_KEY_NEEDS_API_KEY_CALLER: &str = "Identity 'From API Key' without an api_key_id needs \
+     the Transit Point's caller authentication (source_auth) to be API Key or API Key Provider";
+pub(crate) const TRANSIT_JWT_CLAIM_NEEDS_JWT_CALLER: &str =
+    "Identity 'From JWT Claims' needs the Transit Point's caller authentication (source_auth) to be JWT Bearer";
+pub(crate) const MTLS_IDENTITY_NEEDS_ID: &str = "Identity 'From mTLS certificate' needs a non-empty certificate_id";
+pub(crate) const TRANSIT_MTLS_NEEDS_MTLS_CALLER: &str = "Identity 'From mTLS certificate' without a certificate_id \
+     needs the Transit Point's caller authentication (source_auth) to be mTLS";
+
+fn labelled_bad_request(
+    label: &str,
+    message: &str,
+) -> SurfaceApiError {
+    if label.is_empty() {
+        SurfaceApiError::BadRequest(message.to_string())
+    } else {
+        SurfaceApiError::BadRequest(format!("{label}: {message}"))
+    }
+}
+
+/// Refuse a `from_mtls` identity without a `certificate_id` outside a Transit
+/// Point: those slots read only a stored certificate.
+fn validate_mtls_identities(
+    surface: &AgentSurface,
+    label: &str,
+) -> Result<(), SurfaceApiError> {
+    let protected = surface.managed_identity();
+    for (slot, identity) in [
+        ("identity_slots.inbound", surface.inbound_identity()),
+        ("identity_slots.protected", protected.as_ref()),
+        ("identity_slots.external", surface.external_identity()),
+    ] {
+        if identity.and_then(crate::source_auth::ManagedIdentityConfig::caller_credential)
+            == Some(crate::source_auth::CallerCredential::Mtls)
+        {
+            return Err(labelled_bad_request(label, &format!("{slot}: {MTLS_IDENTITY_NEEDS_ID}")));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a Transit Point whose own identity takes its DID from a caller
+/// credential its own caller authentication does not verify.
+fn validate_transit_caller_identities(
+    surface: &AgentSurface,
+    label: &str,
+) -> Result<(), SurfaceApiError> {
+    use crate::source_auth::CallerCredential;
+
+    let refused = surface
+        .transit
+        .iter()
+        .flat_map(|transit| transit.points.iter())
+        .find_map(|point| {
+            point
+                .unverified_caller_credential()
+                .map(|credential| (point, credential))
+        });
+    let Some((point, credential)) = refused else {
+        return Ok(());
+    };
+    let needs = match credential {
+        CallerCredential::ApiKey => TRANSIT_API_KEY_NEEDS_API_KEY_CALLER,
+        CallerCredential::JwtBearer => TRANSIT_JWT_CLAIM_NEEDS_JWT_CALLER,
+        CallerCredential::Mtls => TRANSIT_MTLS_NEEDS_MTLS_CALLER,
+    };
+    Err(labelled_bad_request(label, &format!("Transit Point '{}': {needs}", point.alias)))
+}
 
 /// The inbound slot identifies each caller by the key it presents, so a stored
 /// `api_key_id` there is never read. Variants replace `identity_slots`
@@ -174,21 +241,15 @@ fn configured_api_key_id<'a>(
 
 /// Refuse `from_api_key` identities the request path cannot resolve: an
 /// inbound slot on a surface with a caller method other than an API key, whose
-/// callers it could not identify, and a stored slot without a key.
+/// callers it could not identify, and a protected or external slot without a
+/// key. A Transit Point's is checked by [`validate_transit_caller_identities`].
 fn validate_api_key_identities(
     surface: &AgentSurface,
     label: &str,
 ) -> Result<(), SurfaceApiError> {
     use crate::source_auth::SourceAuthConfig;
 
-    let refuse = |message: &str| {
-        let prefix = if label.is_empty() {
-            String::new()
-        } else {
-            format!("{label}: ")
-        };
-        SurfaceApiError::BadRequest(format!("{prefix}{message}"))
-    };
+    let refuse = |message: &str| labelled_bad_request(label, message);
     let inbound_from_api_key = surface.inbound_identity_from_api_key();
     if inbound_from_api_key {
         if !surface
@@ -217,20 +278,6 @@ fn validate_api_key_identities(
 
     let protected = surface.managed_identity();
     configured_api_key_id(protected.as_ref(), "identity_slots.protected").map_err(|message| refuse(&message))?;
-    for point in surface
-        .transit
-        .iter()
-        .flat_map(|transit| transit.points.iter())
-    {
-        let slot = format!("transit.points['{}'].managed_identity", point.alias);
-        configured_api_key_id(
-            point
-                .managed_identity
-                .as_ref(),
-            &slot,
-        )
-        .map_err(|message| refuse(&message))?;
-    }
     configured_api_key_id(surface.external_identity(), "identity_slots.external")
         .map_err(|message| refuse(&message))?;
     Ok(())
@@ -413,6 +460,8 @@ fn validate_resolved_variants(surface: &AgentSurface) -> Result<(), SurfaceApiEr
         validate_required_fields(&resolved, &label)?;
         validate_identity_extraction(&resolved, &label)?;
         validate_api_key_identities(&resolved, &label)?;
+        validate_transit_caller_identities(&resolved, &label)?;
+        validate_mtls_identities(&resolved, &label)?;
 
         // Block cloud-metadata URLs on variant target endpoints (SSRF protection)
         if (resolved
@@ -1292,7 +1341,9 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResp
 /// each Transit Point that serves callers it does not authenticate where other hosts reach it, each
 /// that accepts the Access Point's own tokens ([`shared_audience_warnings`]),
 /// each whose JWT verification strategy names an issuer the surface also
-/// accepts through another ([`shared_issuer_warnings`]), each whose stored
+/// accepts through another ([`shared_issuer_warnings`]), each whose DID comes
+/// from a JWT claim not namespaced by `iss` under a strategy the Access Point
+/// does not use ([`unnamespaced_transit_claim_warnings`]), each whose stored
 /// principal claim names no caller ([`unusable_principal_claim_warnings`]),
 /// each to a peer
 /// gateway that does not require the transit token ([`fabric_hop_limit_warnings`]),
@@ -1338,6 +1389,7 @@ async fn save_warnings(
         .chain(crate::proxy::server::listen_path_warnings(&state.network_config, surface))
         .chain(shared_audience_warnings(surface))
         .chain(shared_issuer_warnings(surface, &issuers))
+        .chain(unnamespaced_transit_claim_warnings(surface))
         .chain(unusable_principal_claim_warnings(surface, &issuers))
         .chain(modern_delegation_warnings(surface))
         .chain(fabric_hop_limit_warnings(surface))
@@ -1639,6 +1691,54 @@ fn shared_issuer_warnings(
     for warning in access_point_claim_warnings(surface, issuers) {
         if !warnings.contains(&warning) {
             warnings.push(warning);
+        }
+    }
+    warnings
+}
+
+/// Each Transit Point, on the surface or in an enabled variant, whose own
+/// identity is `from_jwt_claim` without `iss` in its `namespace_claims` and
+/// whose `jwt_bearer` strategy is not one its view's Access Point accepts. Its
+/// DID is keyed on the claim values alone, so a token from another identity
+/// provider carrying the same values gets the same DID.
+fn unnamespaced_transit_claim_warnings(surface: &AgentSurface) -> Vec<String> {
+    use crate::source_auth::ManagedIdentityConfig;
+    let mut warnings = Vec::new();
+    for (variant, view) in surface_views(surface) {
+        let (access_point, transit_points) = jwt_bearer_methods(&view, variant.as_deref());
+        for (alias, config) in &transit_points {
+            let strategy = config
+                .jwt_verification_strategy_id
+                .as_str();
+            let unnamespaced = view
+                .transit_points()
+                .iter()
+                .find(|point| point.alias == *alias)
+                .and_then(|point| {
+                    point
+                        .managed_identity
+                        .as_ref()
+                })
+                .is_some_and(|identity| {
+                    matches!(identity, ManagedIdentityConfig::FromJwtClaim { namespace_claims, .. }
+                        if !namespace_claims.iter().any(|claim| claim == "iss"))
+                });
+            if !unnamespaced
+                || access_point
+                    .iter()
+                    .any(|method| method.jwt_verification_strategy_id == strategy)
+            {
+                continue;
+            }
+            let warning = format!(
+                "Transit Point {} takes its managed agent's DID from a JWT claim verified through strategy \
+                 '{strategy}', which the Access Point does not use: a token from another identity provider with \
+                 the same claim value gets the same DID; add 'iss' to namespace_claims",
+                transit_point_name(surface, variant.as_deref(), alias)
+            );
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
         }
     }
     warnings
@@ -3743,6 +3843,8 @@ pub async fn create_surface(
     validate_required_fields(&surface, "")?;
     validate_identity_extraction(&surface, "")?;
     validate_api_key_identities(&surface, "")?;
+    validate_transit_caller_identities(&surface, "")?;
+    validate_mtls_identities(&surface, "")?;
     validate_source_auth(&surface, None)?;
     reject_public_predicate_route(&surface)?;
     refuse_unservable_route(&surface, None, &current_network_config(&state.bootstrap_config, &state.network_config))?;
@@ -4782,6 +4884,8 @@ async fn validate_and_save_surface(
     validate_required_fields(&surface, "")?;
     validate_identity_extraction(&surface, "")?;
     validate_api_key_identities(&surface, "")?;
+    validate_transit_caller_identities(&surface, "")?;
+    validate_mtls_identities(&surface, "")?;
     reject_public_predicate_route(&surface)?;
     refuse_unservable_route(
         &surface,
@@ -7176,6 +7280,78 @@ mod validation_tests {
         );
     }
 
+    #[test]
+    fn a_transit_point_claim_identity_from_another_strategy_without_iss_is_warned_of() {
+        let point = |strategy: &str, namespace_claims: serde_json::Value| {
+            serde_json::json!({ "alias": "crm", "target_endpoint": "https://crm.example", "require_transit_token": false,
+                "source_auth": { "type": "jwt_bearer", "jwt_verification_strategy_id": strategy,
+                    "audiences": ["api://crm-transit"] },
+                "managed_identity": { "type": "from_jwt_claim", "claim": "oid", "namespace_claims": namespace_claims } })
+        };
+        let surface_with = |access_point_methods: serde_json::Value,
+                            base: serde_json::Value,
+                            variant_points: Option<serde_json::Value>|
+         -> AgentSurface {
+            let overrides = match variant_points {
+                Some(points) => serde_json::json!({ "transit": { "points": points } }),
+                None => serde_json::json!({}),
+            };
+            serde_json::from_value(serde_json::json!({
+                "name": "agent",
+                "access_point": { "listen_address": "0.0.0.0:8443", "route": "/a2a", "protocol": "a2a",
+                    "caller_authentication": { "methods": access_point_methods } },
+                "target": { "endpoint": "https://agent.internal" },
+                "transit": { "outbound_listen_address": "http://localhost:9111", "points": [base] },
+                "variants": [{ "id": "beta", "alias": "beta", "name": "Beta", "enabled": true,
+                    "overrides": overrides }]
+            }))
+            .unwrap()
+        };
+        let workforce = serde_json::json!([{ "type": "jwt_bearer", "jwt_verification_strategy_id": "workforce",
+            "audiences": ["api://agent"] }]);
+        let warning = |name: &str, strategy: &str| {
+            format!(
+                "Transit Point {name} takes its managed agent's DID from a JWT claim verified through strategy \
+                 '{strategy}', which the Access Point does not use: a token from another identity provider with \
+                 the same claim value gets the same DID; add 'iss' to namespace_claims"
+            )
+        };
+
+        let other_strategy = surface_with(workforce.clone(), point("partner-keys", serde_json::json!(["tid"])), None);
+        assert_eq!(unnamespaced_transit_claim_warnings(&other_strategy), vec![warning("'crm'", "partner-keys")]);
+
+        let no_access_point_jwt = surface_with(
+            serde_json::json!([{ "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" },
+                "secret_id": "agent-key" }]),
+            point("workforce", serde_json::json!([])),
+            None,
+        );
+        assert_eq!(unnamespaced_transit_claim_warnings(&no_access_point_jwt), vec![warning("'crm'", "workforce")]);
+
+        let in_variant = surface_with(
+            workforce.clone(),
+            point("workforce", serde_json::json!([])),
+            Some(serde_json::json!([point("partner-keys", serde_json::json!([]))])),
+        );
+        assert_eq!(
+            unnamespaced_transit_claim_warnings(&in_variant),
+            vec![warning("'crm' in variant 'beta'", "partner-keys")]
+        );
+
+        for (case, surface) in [
+            (
+                "same strategy as the Access Point",
+                surface_with(workforce.clone(), point("workforce", serde_json::json!([])), None),
+            ),
+            (
+                "namespaced by iss",
+                surface_with(workforce.clone(), point("partner-keys", serde_json::json!(["iss"])), None),
+            ),
+        ] {
+            assert!(unnamespaced_transit_claim_warnings(&surface).is_empty(), "{case}");
+        }
+    }
+
     /// The Access Point different-claims warning compares the strategies of
     /// every view: a variant that inherits the Access Point's methods adds no
     /// copy of it, and one that overrides them with a strategy naming another
@@ -7326,13 +7502,19 @@ mod validation_tests {
         for (case, surface) in [
             ("no identity", surface_with(point(true, serde_json::json!({})), false)),
             ("the surface's identity without a VP", surface_with(point(true, serde_json::json!({})), true)),
-            (
-                "an inbound-only identity",
-                surface_with(
-                    point(true, serde_json::json!({ "managed_identity": { "type": "from_jwt_claim" } })),
+            ("the surface's from_jwt_claim with a VP", {
+                let mut surface = surface_with(
+                    point(true, serde_json::json!({ "identity_injection": { "inject_vp": true } })),
                     false,
-                ),
-            ),
+                );
+                surface
+                    .identity_slots
+                    .protected = Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim {
+                    claim: "oid".to_string(),
+                    namespace_claims: Vec::new(),
+                });
+                surface
+            }),
         ] {
             assert_eq!(fabric_delegation_identity_warnings(&surface), warning, "{case}");
         }
@@ -7351,6 +7533,13 @@ mod validation_tests {
                 surface_with(point(true, serde_json::json!({ "identity_injection": { "inject_vp": true } })), true),
             ),
             ("the switch off", surface_with(point(false, serde_json::json!({})), false)),
+            (
+                "its own identity from its caller's JWT",
+                surface_with(
+                    point(true, serde_json::json!({ "managed_identity": { "type": "from_jwt_claim" } })),
+                    false,
+                ),
+            ),
         ] {
             assert!(fabric_delegation_identity_warnings(&surface).is_empty(), "{case}");
         }
@@ -9620,18 +9809,6 @@ mod validation_tests {
             );
         }
 
-        let transit = with_transit(
-            base_surface(),
-            serde_json::json!({ "points": [{
-                "alias": "partner", "target_endpoint": "https://partner.example",
-                "managed_identity": { "type": "from_api_key", "api_key_id": "" }
-            }] }),
-        );
-        assert!(
-            refusal(validate_api_key_identities(&transit, ""))
-                == format!("transit.points['partner'].managed_identity: {API_KEY_IDENTITY_NEEDS_ID}")
-        );
-
         let mut keyed = base_surface();
         keyed.identity_slots.protected = from_api_key(Some("managed-key"));
         keyed.identity_slots.external = from_api_key(Some("external-key"));
@@ -9662,6 +9839,262 @@ mod validation_tests {
             .identity_slots
             .external = from_api_key(Some("shared"));
         assert!(validate_api_key_identities(&transit, "").is_ok(), "Transit Point and external");
+    }
+
+    fn presented_key_transit(
+        source_auth: Option<serde_json::Value>,
+        api_key_id: Option<&str>,
+    ) -> serde_json::Value {
+        let mut point = serde_json::json!({
+            "alias": "tr1", "target_endpoint": "https://partner.example",
+            "managed_identity": { "type": "from_api_key" }
+        });
+        if let Some(source_auth) = source_auth {
+            point["source_auth"] = source_auth;
+        }
+        if let Some(id) = api_key_id {
+            point["managed_identity"]["api_key_id"] = serde_json::json!(id);
+        }
+        serde_json::json!({ "points": [point] })
+    }
+
+    #[test]
+    fn transit_point_from_api_key_without_a_key_id_is_accepted_behind_api_key_caller_authentication() {
+        for (case, source_auth) in [("api key", api_key_caller("caller-keys")), ("api key provider", provider_caller())]
+        {
+            for id in [None, Some(""), Some("  ")] {
+                let s = with_transit(base_surface(), presented_key_transit(Some(source_auth.clone()), id));
+                assert!(validate_transit_caller_identities(&s, "").is_ok(), "{case} {id:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn transit_point_from_api_key_without_a_key_id_is_refused_without_api_key_caller_authentication() {
+        let expected = format!("Transit Point 'tr1': {TRANSIT_API_KEY_NEEDS_API_KEY_CALLER}");
+        for (case, source_auth) in [("no caller authentication", None), ("jwt bearer", Some(jwt_caller()))] {
+            let s = with_transit(base_surface(), presented_key_transit(source_auth, None));
+            assert_eq!(refusal(validate_transit_caller_identities(&s, "")), expected, "{case}");
+        }
+
+        let keyed = with_transit(base_surface(), presented_key_transit(Some(jwt_caller()), Some("managed-key")));
+        assert!(validate_transit_caller_identities(&keyed, "").is_ok(), "a stored key needs no API key caller");
+        assert!(validate_api_key_identities(&keyed, "").is_ok(), "a stored key");
+    }
+
+    #[test]
+    fn transit_point_from_api_key_refusal_names_the_transit_point_and_its_caller_authentication() {
+        assert_eq!(
+            TRANSIT_API_KEY_NEEDS_API_KEY_CALLER,
+            "Identity 'From API Key' without an api_key_id needs the Transit Point's caller authentication \
+             (source_auth) to be API Key or API Key Provider"
+        );
+    }
+
+    #[test]
+    fn a_variant_transit_point_from_api_key_without_a_key_id_needs_api_key_caller_authentication() {
+        let variant = |source_auth: serde_json::Value| SurfaceVariant {
+            id: "v-candidate".to_string(),
+            alias: "candidate".to_string(),
+            name: "candidate".to_string(),
+            description: String::new(),
+            enabled: true,
+            overrides: serde_json::from_value(serde_json::json!({
+                "transit": presented_key_transit(Some(source_auth), None)
+            }))
+            .unwrap(),
+        };
+        let mut s = with_transit(base_surface(), presented_key_transit(Some(provider_caller()), None));
+        s.variants
+            .push(variant(jwt_caller()));
+        assert_eq!(
+            refusal(validate_resolved_variants(&s)),
+            format!("Variant 'candidate': Transit Point 'tr1': {TRANSIT_API_KEY_NEEDS_API_KEY_CALLER}")
+        );
+
+        s.variants[0].enabled = false;
+        assert!(validate_resolved_variants(&s).is_ok(), "a disabled variant is not resolved");
+
+        s.variants[0] = variant(api_key_caller("caller-keys"));
+        assert!(validate_resolved_variants(&s).is_ok(), "an API key variant");
+    }
+
+    fn jwt_claim_transit(source_auth: Option<serde_json::Value>) -> serde_json::Value {
+        let mut point = serde_json::json!({
+            "alias": "tr1", "target_endpoint": "https://partner.example",
+            "managed_identity": { "type": "from_jwt_claim", "claim": "oid", "namespace_claims": ["tid"] }
+        });
+        if let Some(source_auth) = source_auth {
+            point["source_auth"] = source_auth;
+        }
+        serde_json::json!({ "points": [point] })
+    }
+
+    #[test]
+    fn transit_point_from_jwt_claim_is_accepted_behind_jwt_bearer_caller_authentication() {
+        let s = with_transit(base_surface(), jwt_claim_transit(Some(jwt_caller())));
+        assert!(validate_transit_caller_identities(&s, "").is_ok());
+    }
+
+    #[test]
+    fn transit_point_from_jwt_claim_is_refused_without_jwt_bearer_caller_authentication() {
+        let expected = format!("Transit Point 'tr1': {TRANSIT_JWT_CLAIM_NEEDS_JWT_CALLER}");
+        for (case, source_auth) in [
+            ("no caller authentication", None),
+            ("api key", Some(api_key_caller("caller-keys"))),
+            ("api key provider", Some(provider_caller())),
+        ] {
+            let s = with_transit(base_surface(), jwt_claim_transit(source_auth));
+            assert_eq!(refusal(validate_transit_caller_identities(&s, "")), expected, "{case}");
+        }
+        assert_eq!(
+            TRANSIT_JWT_CLAIM_NEEDS_JWT_CALLER,
+            "Identity 'From JWT Claims' needs the Transit Point's caller authentication (source_auth) to be JWT Bearer"
+        );
+    }
+
+    #[test]
+    fn a_variant_transit_point_from_jwt_claim_needs_jwt_bearer_caller_authentication() {
+        let variant = |source_auth: serde_json::Value| SurfaceVariant {
+            id: "v-candidate".to_string(),
+            alias: "candidate".to_string(),
+            name: "candidate".to_string(),
+            description: String::new(),
+            enabled: true,
+            overrides: serde_json::from_value(serde_json::json!({
+                "transit": jwt_claim_transit(Some(source_auth))
+            }))
+            .unwrap(),
+        };
+        let mut s = with_transit(base_surface(), jwt_claim_transit(Some(jwt_caller())));
+        s.variants
+            .push(variant(provider_caller()));
+        assert_eq!(
+            refusal(validate_resolved_variants(&s)),
+            format!("Variant 'candidate': Transit Point 'tr1': {TRANSIT_JWT_CLAIM_NEEDS_JWT_CALLER}")
+        );
+
+        s.variants[0].enabled = false;
+        assert!(validate_resolved_variants(&s).is_ok(), "a disabled variant is not resolved");
+
+        s.variants[0] = variant(jwt_caller());
+        assert!(validate_resolved_variants(&s).is_ok(), "a JWT Bearer variant");
+    }
+
+    fn mtls_caller() -> serde_json::Value {
+        serde_json::json!({
+            "type": "mtls",
+            "trust": { "type": "ca", "ca_certificate_ids": ["agents-ca"] },
+            "identity_binding": { "type": "subject_cn" }
+        })
+    }
+
+    fn caller_certificate_transit(
+        source_auth: Option<serde_json::Value>,
+        certificate_id: Option<&str>,
+    ) -> serde_json::Value {
+        let mut point = serde_json::json!({
+            "alias": "tr1", "target_endpoint": "https://partner.example",
+            "managed_identity": { "type": "from_mtls" }
+        });
+        if let Some(source_auth) = source_auth {
+            point["source_auth"] = source_auth;
+        }
+        if let Some(id) = certificate_id {
+            point["managed_identity"]["certificate_id"] = serde_json::json!(id);
+        }
+        serde_json::json!({ "points": [point] })
+    }
+
+    #[test]
+    fn transit_point_from_mtls_without_a_certificate_id_is_accepted_behind_mtls_caller_authentication() {
+        for id in [None, Some(""), Some("  ")] {
+            let s = with_transit(base_surface(), caller_certificate_transit(Some(mtls_caller()), id));
+            assert!(validate_transit_caller_identities(&s, "").is_ok(), "{id:?}");
+            assert!(validate_mtls_identities(&s, "").is_ok(), "{id:?}");
+        }
+    }
+
+    #[test]
+    fn transit_point_from_mtls_without_a_certificate_id_is_refused_without_mtls_caller_authentication() {
+        let expected = format!("Transit Point 'tr1': {TRANSIT_MTLS_NEEDS_MTLS_CALLER}");
+        for (case, source_auth) in [
+            ("no caller authentication", None),
+            ("api key", Some(api_key_caller("caller-keys"))),
+            ("api key provider", Some(provider_caller())),
+            ("jwt bearer", Some(jwt_caller())),
+        ] {
+            let s = with_transit(base_surface(), caller_certificate_transit(source_auth, None));
+            assert_eq!(refusal(validate_transit_caller_identities(&s, "")), expected, "{case}");
+        }
+        assert_eq!(
+            TRANSIT_MTLS_NEEDS_MTLS_CALLER,
+            "Identity 'From mTLS certificate' without a certificate_id needs the Transit Point's caller \
+             authentication (source_auth) to be mTLS"
+        );
+
+        let stored =
+            with_transit(base_surface(), caller_certificate_transit(Some(api_key_caller("k")), Some("cert-1")));
+        assert!(validate_transit_caller_identities(&stored, "").is_ok(), "a stored certificate needs no mTLS caller");
+    }
+
+    #[test]
+    fn a_variant_transit_point_from_mtls_without_a_certificate_id_needs_mtls_caller_authentication() {
+        let variant = |source_auth: serde_json::Value| SurfaceVariant {
+            id: "v-candidate".to_string(),
+            alias: "candidate".to_string(),
+            name: "candidate".to_string(),
+            description: String::new(),
+            enabled: true,
+            overrides: serde_json::from_value(serde_json::json!({
+                "transit": caller_certificate_transit(Some(source_auth), None)
+            }))
+            .unwrap(),
+        };
+        let mut s = with_transit(base_surface(), caller_certificate_transit(Some(mtls_caller()), None));
+        s.variants
+            .push(variant(api_key_caller("caller-keys")));
+        assert_eq!(
+            refusal(validate_resolved_variants(&s)),
+            format!("Variant 'candidate': Transit Point 'tr1': {TRANSIT_MTLS_NEEDS_MTLS_CALLER}")
+        );
+
+        s.variants[0].enabled = false;
+        assert!(validate_resolved_variants(&s).is_ok(), "a disabled variant is not resolved");
+
+        s.variants[0] = variant(mtls_caller());
+        assert!(validate_resolved_variants(&s).is_ok(), "an mTLS variant");
+    }
+
+    #[test]
+    fn other_slots_refuse_from_mtls_without_a_certificate_id() {
+        let from_mtls = |id: Option<&str>| {
+            Some(crate::source_auth::ManagedIdentityConfig::FromMtls {
+                certificate_id: id.map(str::to_string),
+            })
+        };
+        for slot in ["inbound", "protected", "external"] {
+            for id in [None, Some(""), Some(" ")] {
+                let mut s = base_surface();
+                match slot {
+                    "inbound" => s.identity_slots.inbound = from_mtls(id),
+                    "protected" => s.identity_slots.protected = from_mtls(id),
+                    _ => s.identity_slots.external = from_mtls(id),
+                }
+                assert_eq!(
+                    refusal(validate_mtls_identities(&s, "")),
+                    format!("identity_slots.{slot}: {MTLS_IDENTITY_NEEDS_ID}"),
+                    "{slot} {id:?}"
+                );
+            }
+            let mut s = base_surface();
+            match slot {
+                "inbound" => s.identity_slots.inbound = from_mtls(Some("cert-1")),
+                "protected" => s.identity_slots.protected = from_mtls(Some("cert-1")),
+                _ => s.identity_slots.external = from_mtls(Some("cert-1")),
+            }
+            assert!(validate_mtls_identities(&s, "").is_ok(), "{slot} with a certificate");
+        }
     }
 
     fn variant_with_caller(

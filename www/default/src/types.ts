@@ -223,8 +223,13 @@ export interface ManagedSurfaceRef {
   surface_name: string;
 }
 
-/** The surface slot whose identity setting created a managed identity. */
-export type ManagedSlot = { kind: 'protected' } | { kind: 'transit_point'; alias: string };
+/**
+ * The surface slot whose identity setting created a managed identity. `caller_bound` is
+ * `true` when a Transit Point took the DID from the credential its caller presented.
+ */
+export type ManagedSlot =
+  | { kind: 'protected' }
+  | { kind: 'transit_point'; alias: string; caller_bound?: boolean };
 
 /** A change of the stored certificate or API key behind an identity that kept its DID. */
 export interface CredentialRotation {

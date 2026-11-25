@@ -34,6 +34,7 @@ pub mod tenant_records;
 pub mod terms;
 pub mod then;
 pub mod traffic_mirroring;
+pub mod transit_point_identity;
 pub mod trust_agent_connection_key_rotation;
 pub mod trust_agent_context_did;
 pub mod trust_agent_control_key_rotation;

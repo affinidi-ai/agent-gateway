@@ -6026,7 +6026,10 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 record.slot,
-                Some(crate::identity::filesystem::ManagedSlot::TransitPoint { alias: "tp-1".into() })
+                Some(crate::identity::filesystem::ManagedSlot::TransitPoint {
+                    alias: "tp-1".into(),
+                    caller_bound: false
+                })
             );
             assert_eq!(record.identity_fields, mtls("bb"));
             assert_eq!(record.rotations.len(), 1);

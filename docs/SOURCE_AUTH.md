@@ -194,8 +194,9 @@ Creating or saving a surface, and each of its enabled variants as resolved, refu
 - a method that reads `mcp_meta` or `a2a_extension` when there is more than one method, since
   it could never be selected;
 - more than one `did_auth` method, because the `/authenticate` endpoints serve one;
-- a `from_jwt_claim` identity on the protected or external slot or a Transit Point override
-  unless `jwt_bearer` is the only method;
+- a `from_jwt_claim` identity on the protected or external slot unless `jwt_bearer` is the only
+  method; a Transit Point's own `from_jwt_claim` is held to that Transit Point's `source_auth`
+  instead (see [Transit Point identity from its caller](#transit-point-identity-from-its-caller));
 - an inbound `from_jwt_claim` identity with no `jwt_bearer` method, and an inbound
   `from_api_key` identity with no `api_key` or `api_key_provider` method;
 - on an Access Point that publishes protected resource metadata, a JWT bearer method other
@@ -258,10 +259,11 @@ credential location and non-secret references (strategy, secret, provider agent,
 certificates), so it can be rebuilt. An active node's load persists the correction to local
 storage ([`fall_back_to_first_source_auth_methods`](../src/surfaces/store.rs)); a standby
 node, a storage event and a DynamoDB-sourced surface are corrected in memory only. A stored
-`from_jwt_claim` identity on another slot without `jwt_bearer` as its only method, and an
-inbound `from_jwt_claim` or `from_api_key` identity with no method of its kind to read, are
-logged as a warning at startup, which says their verified callers are refused until the surface
-is fixed, and refused on the next save.
+`from_jwt_claim` identity on the protected or external slot without `jwt_bearer` as its only
+method, and an inbound `from_jwt_claim` or `from_api_key` identity with no method of its kind to
+read, are logged as a warning at startup, which says their verified callers are refused until the
+surface is fixed, and refused on the next save, and so is a Transit Point `from_jwt_claim` whose
+`source_auth` is not `jwt_bearer`.
 
 Before rolling back to a release that enforces only the first method, remove every method but
 the first. That release strips only the first method's header, so it would forward a later
@@ -1570,12 +1572,13 @@ slot on the surface, and a Transit Point may override it for its own outbound le
 | Mode | Derives the DID from | Counts in policy as |
 | --- | --- | --- |
 | `payload_extraction` | A field in the request payload metadata. Also accepted on the wire as `from_payload`. | `unverified` |
-| `from_api_key` | On the other slots, a stored API key named by `api_key_id`. On the inbound slot, the API key the caller presents; see [below](#from_api_key-on-the-inbound-slot). | `unverified`, except an API Key Provider key on the inbound slot: `source_auth` |
-| `from_mtls` | A stored certificate named by `certificate_id` | `unverified` |
+| `from_api_key` | On the other slots, a stored API key named by `api_key_id`. On the inbound slot, the API key the caller presents; see [below](#from_api_key-on-the-inbound-slot). On a Transit Point without `api_key_id`, the API key the Transit Point's caller presents; see [Transit Point identity from its caller](#transit-point-identity-from-its-caller). | `unverified`, except an API Key Provider key the caller presents, on the inbound slot or a Transit Point: `source_auth` |
+| `from_mtls` | A stored certificate named by `certificate_id`. On a Transit Point without `certificate_id`, the client certificate the Transit Point's caller presented; see [Transit Point identity from its caller](#transit-point-identity-from-its-caller). | `unverified`, except a Transit Point caller's client certificate: `source_auth` |
 | `static` | A fixed `did`, for test fixtures and stub agents | `unverified` |
-| `from_jwt_claim` | A claim on a JWT already verified by source auth | `source_auth` |
+| `from_jwt_claim` | A claim on a JWT already verified by source auth: the Access Point's, or on a Transit Point's own identity, the Transit Point's; see [Transit Point identity from its caller](#transit-point-identity-from-its-caller) | `source_auth` |
 
-`from_jwt_claim` and inbound `from_api_key` are request-bound. The other modes read a stored
+`from_jwt_claim`, inbound `from_api_key`, and a Transit Point's `from_api_key` without
+`api_key_id` or `from_mtls` without `certificate_id` are request-bound. The other modes read a stored
 credential or the request body and are independent of the credential authenticated on this
 request, which is why they do not count as verified. A plain API Key on the inbound slot is
 request-bound but still `unverified`, because every holder of the secret shares its DID. An
@@ -1919,8 +1922,10 @@ recreated surface gets new DIDs too. Update whatever is bound to the old DID, su
 Registry and Trust Recorder entries, Trust Check lists, policies that match it, and partners
 that allow it.
 
-`from_api_key` on the protected, external and Transit Point slots needs a non-empty
-`api_key_id`; a stored one without it is refused at request time (see the table below). A surface with no inbound identity whose protected slot is `from_api_key`,
+`from_api_key` on the protected and external slots needs a non-empty `api_key_id`; a stored
+one without it is refused at request time (see the table below). On a Transit Point, one
+without it takes the key its caller presents (see
+[Transit Point identity from its caller](#transit-point-identity-from-its-caller)). A surface with no inbound identity whose protected slot is `from_api_key`,
 `from_mtls` or `static` identifies its callers with the Managed Agent's DID, but only when the
 request body carries no identity, and never on public discovery paths.
 
@@ -1986,11 +1991,131 @@ Point's outbound request:
 | No caller was authenticated, such as on a stored surface without caller authentication | `500` | `api_key_unavailable` |
 | A plain API Key's secret is not in the secrets store | `500` | `secret_not_found` |
 | The secrets store cannot be read | `503` | `secrets_store_unavailable` or `store_lookup_failed` |
-| A stored `from_api_key` Managed Agent or Transit Point identity has no `api_key_id` | `500` | `api_key_id_missing` |
+| A stored `from_api_key` Managed Agent identity has no `api_key_id` | `500` | `api_key_id_missing` |
 
 When no VC issuer is configured (`vc_issuer_missing`) or DID issuance fails
 (`vc_issuer_error`), the request is not refused: it resolves no caller identity and policy
 decides, as for a failed key.
+
+### Transit Point identity from its caller
+
+A Transit Point's own `managed_identity` can take the managed agent's DID from the credential
+its caller presented to the Transit Point's own caller authentication (`source_auth`, see
+[Transit Point source authentication](#transit-point-source-authentication)), instead of from
+the request body or a stored credential:
+
+| Setting | Transit Point `source_auth` | Managed agent DID | Counts as |
+| --- | --- | --- | --- |
+| `from_api_key` without `api_key_id` | API Key Provider | One DID per key, derived from its key id | `source_auth` |
+| | API Key | One DID per secret, shared by every caller holding a value of that secret | `unverified` |
+| `from_jwt_claim` (`claim`, `namespace_claims`) | JWT Bearer | One DID per value of `claim`, namespaced by the values of `namespace_claims`, in the token the Transit Point verified | `source_auth` |
+| `from_mtls` without `certificate_id` | mTLS | One DID per trusted CA, identity binding and principal: the hash of the subject and public key of the CA (or the pinned certificate) the client certificate was verified against, the Transit Point's `identity_binding` (its `type`, and its `oid` for `subject_rdn`), and the principal that binding derives. A renewed certificate with the same principal under the same CA and binding keeps the DID; the same principal under another CA, or one value read through another binding (a CN equal to a DNS SAN or to a leaf fingerprint), gets another. Under pinned trust the anchor is the pinned certificate, which is the presented one, so a renewed certificate that is pinned again gets a new DID | `source_auth` |
+
+The identity fields and hash are the ones the inbound slot derives from a presented key, or
+the Access Point's `from_jwt_claim` from a verified token, and the DID is looked up by that hash,
+so one key or claim value gives the same DID on the Access Point and on a Transit Point. One agent
+using two credentials gets two DIDs. A DID the Transit Point issues first is recorded as its
+managed agent (`origin` `managed`, `slot`
+`{"kind": "transit_point", "alias": …, "caller_bound": true}`), and its credential carries the
+managed agent's display name. The Identities page lists each such DID as its own row, not as a
+version of the Managed Agent (see [Identity versions](#identity-versions)). A record's origin is set once, by its first
+use: a DID first issued to an Access Point caller stays an external caller record, and the
+Transit Point still uses that DID. A client certificate's identity fields are
+`credential_type` `mtls_caller`, `trust_anchor_fingerprint`, `identity_binding` (the binding's
+`type`), `identity_binding_oid` (for `subject_rdn` only) and `principal`; its hash never equals
+that of a stored certificate (`credential_type` `mtls`). Changing the Transit Point's
+`identity_binding` gives its callers new DIDs.
+
+A JWT claim's DID is hashed from the values of `claim` and `namespace_claims` only, not from
+the token's issuer. A Transit Point that verifies tokens from another identity provider than
+the Access Point, or two identity providers that issue the same claim value, give both callers
+one DID. List `iss` in `namespace_claims` to keep them apart; this applies on the Access Point
+too. A save (and each enabled variant as resolved) answers with a `Warning` header for each
+Transit Point whose own `from_jwt_claim` leaves `iss` out of `namespace_claims` while its
+`source_auth` verifies tokens through a JWT verification strategy the Access Point does not
+accept: "Transit Point '<alias>' takes its managed agent's DID from a JWT claim verified through
+strategy '<strategy>', which the Access Point does not use: a token from another identity
+provider with the same claim value gets the same DID; add 'iss' to namespace_claims".
+
+Every Transit Point policy reads the managed agent's DID and its **Counts as** value in
+`input.extension_identity`, as the Access Point reports its caller; see
+[Caller in Transit Point policy input](POLICY.md#caller-in-transit-point-policy-input).
+
+- The credential's DID replaces any identity the request body asserts, such as a copied
+  `agent-identity/v1` extension or identity presentation, for the Transit Point's policies
+  (`input.gateway.source_id`, see [`POLICY.md`](POLICY.md#request-surface-and-direction-inputhttp-inputchannel-inputgateway)),
+  its Trust Check, the identity presentation sent to the destination and the VP Audit Log. The
+  body is otherwise forwarded as for any other identity.
+- A caller whose key, token or client certificate is missing, invalid or revoked is refused with
+  `401` before any identity is derived (see [Transit Point source authentication](#transit-point-source-authentication)).
+- A DID the gateway cannot derive refuses the request before anything is forwarded, with the
+  body `Identity resolution failed: Caller identity could not be resolved`: `422` when the
+  verified token lacks `claim` or a namespace claim, or has a value that is not a non-empty string
+  (`jwt_claim_missing`), as on the Access Point; `500` when the Transit Point verified no API key
+  (`api_key_unavailable`), no JWT (`jwt_claims_unavailable`) or no client certificate
+  (`mtls_unavailable`), or a plain API Key's secret is gone (`secret_not_found`); and `503` when
+  the secrets store cannot be read.
+- Once the identity is derived, every identity the request body asserts is removed before the
+  request is forwarded: in an A2A message, the `agent-identity/v1`,
+  `agent-identity-credential/v1` and `agent-identity-binding/v1` entries of `extensions` and
+  `metadata`; in an MCP message, the same three in `_meta`, under either key spelling. The
+  destination receives only the gateway's own identity presentation, or none when no DID is
+  issued. An `http` Transit Point reads its requests in its surface's protocol, so the same
+  entries are removed there. A request read in a protocol with no identity carrier (DIDComm) is
+  refused with `500`, as identity injection refuses it.
+- Without a VC issuer (`vc_issuer_missing`), or when issuance fails (`vc_issuer_error`), an API
+  key or client certificate caller is not refused: it resolves no managed agent identity and
+  policy decides. A JWT caller is refused as on the Access Point's `from_jwt_claim`: `500`
+  `Identity resolution failed: from_jwt_claim requires a configured VC issuer` without a VC
+  issuer, and `502` `Identity resolution failed: VCIssuer failure during from_jwt_claim
+  resolution` when issuance fails. Each outcome counts in
+  `agent_gateway_managed_identity_resolve_total` with `mode="from_api_key"`,
+  `mode="from_jwt_claim"` or `mode="from_mtls"`.
+- A From Payload Transit Point still takes the DID from the body (`unverified`).
+- A stored `from_api_key` with `api_key_id`, or `from_mtls` with `certificate_id`, keeps the
+  stored credential's DID.
+- A `from_jwt_claim` the Transit Point inherits from the surface's protected slot, rather than
+  sets itself, reads the Access Point caller's token, which the Transit Point's request does not
+  carry, so it resolves no identity there.
+
+A save (`POST`, `PUT`, `PATCH`, and each enabled variant as resolved) refuses with `400` a
+Transit Point `from_api_key` without `api_key_id` whose `source_auth` is not API Key or API Key
+Provider: "Transit Point '<alias>': Identity 'From API Key' without an api_key_id needs the
+Transit Point's caller authentication (source_auth) to be API Key or API Key Provider". A
+Transit Point with no `source_auth`, such as one that relies on its transit token alone, is
+refused too. It likewise refuses a Transit Point `from_jwt_claim` whose `source_auth` is not
+JWT Bearer: "Transit Point '<alias>': Identity 'From JWT Claims' needs the Transit Point's caller
+authentication (source_auth) to be JWT Bearer", and a Transit Point `from_mtls` without
+`certificate_id` whose `source_auth` is not mTLS: "Transit Point '<alias>': Identity 'From mTLS
+certificate' without a certificate_id needs the Transit Point's caller authentication
+(source_auth) to be mTLS". A Transit Point's own `from_jwt_claim` is not held to the Access
+Point's methods. Every other slot (inbound, protected, external) still needs a stored
+certificate: a `from_mtls` there without a non-empty `certificate_id` is refused with
+"identity_slots.<slot>: Identity 'From mTLS certificate' needs a non-empty certificate_id", and
+one that reaches the request path anyway, such as one written to storage by hand, is refused with
+`500` and the body `Caller identity could not be resolved`, counted with `mode="from_mtls"` and
+`certificate_id_missing`. At startup the gateway logs "Channel '<name>': identity from_mtls
+without a certificate_id; requests other than discovery reads are refused until the surface is
+fixed" for such a surface.
+
+Upgrading: earlier releases skipped a Transit Point's own `from_jwt_claim` and forwarded the
+request with no managed agent identity. It now resolves one, so a stored Transit Point
+`from_jwt_claim` whose `source_auth` is not JWT Bearer refuses every request with `500` until it
+is given JWT Bearer caller authentication or another identity mode. At startup the gateway logs a
+warning naming the surface, the variant when it is an enabled variant's, and the Transit Point,
+for every such Transit Point and for any other whose own identity takes its DID from a caller
+credential its `source_auth` does not verify (`from_api_key` without `api_key_id`, `from_mtls`
+without `certificate_id`), for example "Channel '<name>': Transit Point '<alias>' takes its
+managed identity from_jwt_claim but its source_auth is not jwt_bearer; requests other than
+discovery reads are refused until the surface is fixed". Their requests other than discovery
+reads are refused with `500` until they are fixed.
+
+Rollback: a release without this setting refuses a Transit Point `from_api_key` without
+`api_key_id`, at save and on every request through that Transit Point (`500`
+`api_key_id_missing`). It cannot read a `from_mtls` without `certificate_id` at all, so it skips
+the whole surface at load: neither its Access Point nor its Transit Points are served. Name a
+stored key or certificate, or choose another mode, on every such Transit Point before rolling
+back.
 
 ### `from_jwt_claim`
 
@@ -1998,7 +2123,10 @@ Requires a `jwt_bearer` source auth method on the same surface, so the token is 
 verified before the DID is derived. On a direct or fabric-routed Access Point, a caller whose
 credential is missing or invalid, for any method, is refused with `401` before the target is
 called; a caller verified by another method, such as an API key, is served with no identity (see
-[Several methods on one Access Point](#several-methods-on-one-access-point)).
+[Several methods on one Access Point](#several-methods-on-one-access-point)). On a Transit
+Point's own identity it requires the Transit Point's `source_auth` to be `jwt_bearer` instead,
+and reads the token the Transit Point verified; see
+[Transit Point identity from its caller](#transit-point-identity-from-its-caller).
 
 | Field | Default | Effect |
 | --- | --- | --- |
@@ -2016,7 +2144,7 @@ The two derivation paths hash differently.
 | Mode | Hash |
 | --- | --- |
 | `payload_extraction` | Plain SHA-256 over the selected fields, sorted by path and joined as `field=value\|field=value` ([`identity_hash.rs`](../src/identity/identity_hash.rs)). No pepper. |
-| `from_mtls`, `from_api_key`, `from_jwt_claim` | `HMAC-SHA256(pepper, canonical(fields))` ([`credential_identity.rs`](../src/identity/credential_identity.rs)) |
+| `from_mtls`, `from_api_key`, `from_jwt_claim` | `HMAC-SHA256(pepper, canonical(fields))` ([`credential_identity.rs`](../src/identity/credential_identity.rs)). A stored certificate's fields are `credential_type` `mtls` and its `certificate_id`; a Transit Point caller's client certificate's are `credential_type` `mtls_caller`, the trusted CA's `trust_anchor_fingerprint`, the Transit Point's `identity_binding` type (with `identity_binding_oid` for `subject_rdn`) and the bound `principal` |
 | `static` | None. The configured DID is used as given. |
 
 ![Payload identity derivation: request payload, extract the x-identity fields, sort and canonicalise, SHA-256 hash, look up in the identity store, then return the existing DID or mint a new one](assets/diagrams/payload-identity-derivation.png)
@@ -2045,7 +2173,7 @@ Each managed identity record ([`filesystem.rs`](../src/identity/filesystem.rs)) 
 
 | Field | Holds |
 | --- | --- |
-| `slot` | The slot whose setting created it: `{"kind": "protected"}` (the protected slot, the surface `managed_identity`, an A2A proxy target, or a Transit Point that inherits the surface setting), or `{"kind": "transit_point", "alias": …}` for a Transit Point's own `managed_identity`. Set on creation, and on the first use of a record written before slot tracking. |
+| `slot` | The slot whose setting created it: `{"kind": "protected"}` (the protected slot, the surface `managed_identity`, an A2A proxy target, or a Transit Point that inherits the surface setting), or `{"kind": "transit_point", "alias": …}` for a Transit Point's own `managed_identity`, with `"caller_bound": true` (omitted otherwise) when it takes the DID from its caller's credential and the Transit Point issued that DID first. Set on creation, and on the first use of a record written before slot tracking. |
 | `credential_updated_at` | The `updated_at` of the stored certificate or secret the identity was last derived from. |
 | `rotation_count` | How many rotations of that credential its rotation history holds. Omitted while there are none. |
 
@@ -2121,7 +2249,11 @@ and managed records without a slot are grouped straight away (records without an
 still show one row per DID until their next use). Several DIDs in use at once share one
 entry, whose primary is the one used last. A DID's surface is the one it was last used on.
 External callers, including the external agent on a Transit Point response, keep one row per
-DID, and so do `from_jwt_claim` DIDs, one per claim value and all current at once. Without `AG_IDENTITY_HASH_PEPPER`, every
+DID, and so do `from_jwt_claim` DIDs, one per claim value and all current at once, and a
+Transit Point's DIDs taken from its callers' credentials (`slot` `caller_bound: true`, and
+every `credential_type` `mtls_caller`), one per credential and all current at once, each still
+shown as a managed agent of its surface. A Transit Point with a stored API key or certificate
+records no `caller_bound`, so its DIDs stay versions of the Managed Agent. Without `AG_IDENTITY_HASH_PEPPER`, every
 restart mints new credential-derived DIDs, which show as versions with no field changes.
 
 ## Trust Recorder

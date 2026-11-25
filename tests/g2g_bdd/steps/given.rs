@@ -483,6 +483,14 @@ pub async fn transit_point_authenticates_callers_with_api_key(
     });
 }
 
+#[given(expr = "Transit Point {string} takes the managed agent's identity from its caller's API key")]
+pub async fn transit_point_takes_identity_from_caller_api_key(
+    world: &mut G2gWorld,
+    transit_point: String,
+) {
+    transit_point_spec_mut(world, &transit_point).identity_from_caller_api_key = true;
+}
+
 /// `error_codes` is a comma-separated list.
 #[given(expr = "surface {string} denies a target Trust Check reporting any of error codes {string}")]
 pub async fn surface_denies_target_trust_check_errors(

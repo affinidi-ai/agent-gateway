@@ -947,7 +947,11 @@ class ElementRegistry {
           id: `identity-${tpId}-request`,
           type: 'identity' as SurfaceNodeType,
           label: '',
-          configured: this.isConfigured('identity', panelConfig),
+          configured: this.isConfigured('identity', panelConfig, {
+            id: `identity-${tpId}-request`,
+            parentId: tpId,
+            slotId: 'request:identity-managed_identity',
+          }),
           config: panelConfig,
           parentId: tpId,
           direction: 'request' as const,

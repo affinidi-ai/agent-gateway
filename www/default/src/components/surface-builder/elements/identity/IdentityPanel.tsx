@@ -10,7 +10,7 @@ import { deepLinks } from '../../../../utils/deepLinks';
 import { HEADER_METADATA_EXTENSION_URI } from '../_shared/headerMetadataMapping';
 import { transitPointProtocol } from '../transit-point/TransitPointPanel';
 import FieldHelp from '../../../shared/FieldHelp';
-import { isInboundIdentity } from './placement';
+import { isInboundIdentity, transitPointCallerAllows } from './placement';
 import {
   apiKeyReferenceWarningText,
   storedApiKeyProblem,
@@ -56,18 +56,40 @@ const TYPE_OPTIONS: ExtractionTypeOption[] = [
 
 const typeOptionsForPlacement = (
   isTransitPointIdentity: boolean,
-  isProtectedIdentity: boolean
+  isProtectedIdentity: boolean,
+  transitSourceAuth: unknown
 ): ExtractionTypeOption[] =>
   TYPE_OPTIONS.map(option => ({
     ...option,
     disabled:
-      option.disabled ||
-      (isTransitPointIdentity && option.value !== 'from_payload') ||
+      (option.disabled && !(isTransitPointIdentity && option.value === 'from_mtls')) ||
+      (isTransitPointIdentity &&
+        option.value !== 'from_payload' &&
+        !transitPointCallerAllows(option.value, transitSourceAuth)) ||
       // MA → AP response leg: the key picker lists API keys issued to callers, and none of
       // them identifies the Managed Agent.
       (isProtectedIdentity && option.value === 'from_api_key') ||
       undefined,
   }));
+
+const TRANSIT_POINT_UNAVAILABLE: { type: ExtractionType; testId: string; reason: string }[] = [
+  {
+    type: 'from_api_key',
+    testId: 'identity-panel-transit-api-key-unavailable',
+    reason: "From API Key needs this Transit Point's caller authentication to be an API key.",
+  },
+  {
+    type: 'from_jwt_claim',
+    testId: 'identity-panel-transit-jwt-claim-unavailable',
+    reason: "From JWT Claims needs this Transit Point's caller authentication to be JWT Bearer.",
+  },
+  {
+    type: 'from_mtls',
+    testId: 'identity-panel-transit-mtls-unavailable',
+    reason:
+      "From mTLS certificate needs this Transit Point's caller authentication to be mTLS, set through the API.",
+  },
+];
 
 const isSelectableExtractionType = (
   value: ExtractionType,
@@ -174,9 +196,21 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
   const [certificates, setCertificates] = useState<CertificateOption[]>([]);
   const [loadingKeys, setLoadingKeys] = useState(false);
   const [loadingCerts, setLoadingCerts] = useState(false);
+  const storedKeyId: string = config.api_key_id || '';
+  const parentNode = allNodes?.find(candidate => candidate.id === node.parentId);
+  const parentTransitProtocol = transitPointProtocol(parentNode?.type);
+  const isTransitPointIdentity = parentTransitProtocol !== null;
+  const transitSourceAuth = isTransitPointIdentity ? parentNode?.config?.source_auth : undefined;
+  const showsKeyPicker = !isInbound && !(isTransitPointIdentity && !storedKeyId);
+  const showsCertificatePicker = !(isTransitPointIdentity && !config.certificate_id);
 
   useEffect(() => {
-    if (extractionType !== 'from_api_key' || isInbound || !surfaceId || surfaceKeys.length > 0)
+    if (
+      extractionType !== 'from_api_key' ||
+      !showsKeyPicker ||
+      !surfaceId ||
+      surfaceKeys.length > 0
+    )
       return;
     setLoadingKeys(true);
     apiClient
@@ -185,10 +219,9 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
       .then((data: ApiKeyOption[]) => setSurfaceKeys(data))
       .catch(() => setSurfaceKeys([]))
       .finally(() => setLoadingKeys(false));
-  }, [extractionType, isInbound, surfaceId, surfaceKeys.length]);
+  }, [extractionType, showsKeyPicker, surfaceId, surfaceKeys.length]);
 
   const apiKeys = surfaceKeys.filter(k => k.status === 'active');
-  const storedKeyId: string = config.api_key_id || '';
   const storedKeyListed = !storedKeyId || apiKeys.some(k => k.key_id === storedKeyId);
   const storedKeyReference = storedApiKeyProblem(storedKeyId, meta?.apiKeyStatuses);
   const storedKeyProblem = storedKeyReference?.status ?? null;
@@ -198,7 +231,8 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
       : undefined;
 
   useEffect(() => {
-    if (extractionType !== 'from_mtls' || certificates.length > 0) return;
+    if (extractionType !== 'from_mtls' || !showsCertificatePicker || certificates.length > 0)
+      return;
     setLoadingCerts(true);
     apiClient
       .fetch('/api/v1/certificates/')
@@ -211,22 +245,24 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
       )
       .catch(() => setCertificates([]))
       .finally(() => setLoadingCerts(false));
-  }, [extractionType, certificates.length]);
+  }, [extractionType, showsCertificatePicker, certificates.length]);
 
   const fieldCount = Array.isArray(config.fields) ? config.fields.length : 0;
-  const parentTransitProtocol = transitPointProtocol(
-    allNodes?.find(candidate => candidate.id === node.parentId)?.type
-  );
   const identityProtocol = parentTransitProtocol ?? protocol;
   const isA2aLikeProtocol = identityProtocol === 'a2a' || identityProtocol === 'ap2';
-  const isTransitPointIdentity = parentTransitProtocol !== null;
   const isProtectedIdentity =
     node.slotId === 'response:identity-protected' ||
     (node.slotId === 'response:identity' && node.id === 'identity-protected');
   const extractionTypeOptions = typeOptionsForPlacement(
     isTransitPointIdentity,
-    isProtectedIdentity
+    isProtectedIdentity,
+    transitSourceAuth
   );
+  const transitUnavailable = isTransitPointIdentity
+    ? TRANSIT_POINT_UNAVAILABLE.filter(
+        ({ type }) => !transitPointCallerAllows(type, transitSourceAuth)
+      )
+    : [];
   const isInboundA2aIdentity =
     node.slotId === 'request:identity-inbound' && (protocol === 'a2a' || protocol === 'ap2');
   const isTransitPointA2aIdentity =
@@ -276,25 +312,56 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
         </Form.Select>
         <Form.Text className="text-muted d-block" style={{ fontSize: '10px' }}>
           <div>Choose how the gateway identifies the caller or agent on this leg.</div>
-          <ul className="mb-0 ps-3">
-            <li>
-              <strong>From Payload</strong>: identity details are already in the request or response
-              body (most common).
-            </li>
-            <li>
-              <strong>From API Key</strong>: the caller authenticates with an API key you&apos;ve
-              issued. Not offered on the Managed Agent&apos;s response identity.
-            </li>
-            <li>
-              <strong>From JWT Claims</strong>: the caller sends a signed token; read the identity
-              from one of its fields.
-            </li>
-            <li>
-              <strong>Static DID</strong> and <strong>From mTLS certificate</strong> can&apos;t be
-              selected here.
-            </li>
-          </ul>
+          {isTransitPointIdentity ? (
+            <ul className="mb-0 ps-3" data-testid="identity-panel-transit-type-help">
+              <li>
+                <strong>From Payload</strong>: identity details are already in the request body. Any
+                caller can copy that DID, so policy sees it as unverified; the options below bind it
+                to the caller&apos;s credential.
+              </li>
+              <li>
+                <strong>From API Key</strong>: each caller is identified by the API key it presents.
+                Needs API key or API Key Provider caller authentication on this Transit Point.
+              </li>
+              <li>
+                <strong>From JWT Claims</strong>: read the identity from a claim of the
+                caller&apos;s token. Needs JWT Bearer caller authentication on this Transit Point.
+              </li>
+              <li>
+                <strong>From mTLS certificate</strong>: each caller is identified by the client
+                certificate it presents. Needs mTLS caller authentication on this Transit Point, set
+                through the API.
+              </li>
+              <li>
+                <strong>Static DID</strong> can&apos;t be selected here.
+              </li>
+            </ul>
+          ) : (
+            <ul className="mb-0 ps-3">
+              <li>
+                <strong>From Payload</strong>: identity details are already in the request or
+                response body (most common).
+              </li>
+              <li>
+                <strong>From API Key</strong>: the caller authenticates with an API key you&apos;ve
+                issued. Not offered on the Managed Agent&apos;s response identity.
+              </li>
+              <li>
+                <strong>From JWT Claims</strong>: the caller sends a signed token; read the identity
+                from one of its fields.
+              </li>
+              <li>
+                <strong>Static DID</strong> and <strong>From mTLS certificate</strong> can&apos;t be
+                selected here.
+              </li>
+            </ul>
+          )}
         </Form.Text>
+        {transitUnavailable.map(({ type, testId, reason }) => (
+          <Form.Text key={type} className="text-muted d-block" data-testid={testId}>
+            {reason}
+          </Form.Text>
+        ))}
       </div>
 
       {extractionType === 'from_payload' && (
@@ -389,7 +456,18 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
         </div>
       )}
 
-      {extractionType === 'from_api_key' && !isInbound && (
+      {extractionType === 'from_api_key' && isTransitPointIdentity && !storedKeyId && (
+        <div className="config-section">
+          <Form.Text
+            className="text-muted d-block"
+            data-testid="identity-panel-transit-api-key-note"
+          >
+            Each caller is identified by the API key it presents to this Transit Point.
+          </Form.Text>
+        </div>
+      )}
+
+      {extractionType === 'from_api_key' && showsKeyPicker && (
         <div className="config-section">
           <label className="d-flex align-items-center gap-1">
             API Key
@@ -453,7 +531,15 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
         </div>
       )}
 
-      {extractionType === 'from_mtls' && (
+      {extractionType === 'from_mtls' && !showsCertificatePicker && (
+        <div className="config-section">
+          <Form.Text className="text-muted d-block" data-testid="identity-panel-transit-mtls-note">
+            Each caller is identified by the client certificate it presents to this Transit Point.
+          </Form.Text>
+        </div>
+      )}
+
+      {extractionType === 'from_mtls' && showsCertificatePicker && (
         <div className="config-section">
           <label>Client Certificate</label>
           <Form.Select
@@ -510,7 +596,9 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
             onChange={e => updateField('claim', e.target.value)}
           />
           <Form.Text className="d-block text-muted mb-2" style={{ fontSize: '11px' }}>
-            Requires JWT Bearer caller authentication on this surface.
+            {isTransitPointIdentity
+              ? 'Requires JWT Bearer caller authentication on this Transit Point.'
+              : 'Requires JWT Bearer caller authentication on this surface.'}
           </Form.Text>
           <label className="d-flex align-items-center gap-1">
             Namespace Claims

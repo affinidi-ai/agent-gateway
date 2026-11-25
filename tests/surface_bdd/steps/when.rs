@@ -982,7 +982,7 @@ fn build_a2a_message_send_body_with_parts(parts: Vec<serde_json::Value>) -> serd
 /// Send an A2A request to an A2A-proxy surface, negotiating A2A 1.0 unless the
 /// scenario sets `A2A-Version` itself, so it is served whichever versions the
 /// surface accepts.
-async fn send_a2a_proxy_request_and_record(
+pub(crate) async fn send_a2a_proxy_request_and_record(
     world: &mut SurfaceWorld,
     body: serde_json::Value,
     mut headers: Vec<(String, String)>,
@@ -3559,7 +3559,7 @@ async fn transit_point_url(
     format!("http://127.0.0.1:{outbound_port}{path}")
 }
 
-async fn record_transit_point_response(
+pub(crate) async fn record_transit_point_response(
     world: &mut SurfaceWorld,
     response: reqwest::Response,
 ) {

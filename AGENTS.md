@@ -172,8 +172,9 @@ _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-bui
 The Surface Builder's inbound Identity **From API Key** shows no key picker, since each caller is
 identified by the API key it presents, and blocks Save unless a Caller Context method is API Key
 or API Key Provider. An inbound **From JWT Claims** blocks Save unless a Caller Context method is
-JWT Bearer; on the protected or external Identity or a Transit Point it needs every method to be
-JWT Bearer. Callers of the other methods get no identity. The protected and external Identities'
+JWT Bearer; on the protected or external Identity it needs every method to be JWT Bearer, and on a
+Transit Point that Transit Point's own caller authentication to be JWT Bearer. Callers of the
+other methods get no identity. The protected and external Identities'
 key picker lists only the surface's own active keys. See _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
@@ -466,7 +467,12 @@ offers **Copy to variants**, which never saves by itself; see _Surface Builder_ 
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Agent Identity panel doesn't offer From API Key on the Managed Agent's response identity,
-and a stored one keeps working; see _Surface Builder_ in
+and a stored one keeps working. On a Transit Point's identity it offers From API Key, with no
+key picker, only while that Transit Point's caller authentication is API key or API Key
+Provider, From JWT Claims only while it is JWT Bearer, and From mTLS certificate, with no
+certificate picker, only while it is mTLS (set through the API); From mTLS certificate stays
+disabled in every other slot, and a stored setting it does not edit is kept; see
+_Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Caller Context element lists its caller authentication methods in order, in the sidebar and

@@ -324,6 +324,10 @@ fn build_surface_fixture(
                         "inject_vp": true,
                     });
                 }
+                if tp.identity_from_caller_api_key {
+                    point["managed_identity"] = serde_json::json!({ "type": "from_api_key" });
+                    point["identity_injection"] = serde_json::json!({ "inject_vp": true });
+                }
                 point
             })
             .collect::<Vec<_>>();

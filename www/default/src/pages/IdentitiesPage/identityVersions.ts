@@ -70,10 +70,21 @@ export const recordsRotations = (identity: Identity): boolean =>
 /**
  * A surface has one Managed Agent, so its managed identities, from its responses and from
  * its requests through any Transit Point, whatever their source, are versions of each other.
- * A `from_jwt_claim` DID is one parallel agent per claim value, so it is never grouped.
+ * A `from_jwt_claim` DID is one parallel agent per claim value, and a Transit Point DID taken
+ * from its caller's credential (`caller_bound`, and every `mtls_caller` one) is one per
+ * credential, all current at once, so neither is grouped.
  */
+const isCallerBound = (identity: Identity): boolean =>
+  (identity.slot?.kind === 'transit_point' && identity.slot.caller_bound === true) ||
+  sourceOf(identity) === 'mtls_caller';
+
 const groupKey = (identity: Identity): string => {
-  if (identity.origin !== 'managed' || !identity.surface_id || sourceOf(identity) === 'jwt_claim') {
+  if (
+    identity.origin !== 'managed' ||
+    !identity.surface_id ||
+    sourceOf(identity) === 'jwt_claim' ||
+    isCallerBound(identity)
+  ) {
     return `did|${identity.did}`;
   }
   return `surface|${identity.surface_id}`;

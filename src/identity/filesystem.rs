@@ -92,7 +92,13 @@ pub enum IdentityOrigin {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ManagedSlot {
     Protected,
-    TransitPoint { alias: String },
+    TransitPoint {
+        alias: String,
+        /// The DID was taken from the credential the Transit Point's caller presented, so
+        /// it is one of many current DIDs rather than a version of the Managed Agent.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        caller_bound: bool,
+    },
 }
 
 /// A change of the stored credential behind a credential-derived identity that kept its DID.
@@ -126,7 +132,20 @@ impl ManagedIdentitySource {
 
     pub fn transit_point(alias: impl Into<String>) -> Self {
         Self {
-            slot: ManagedSlot::TransitPoint { alias: alias.into() },
+            slot: ManagedSlot::TransitPoint {
+                alias: alias.into(),
+                caller_bound: false,
+            },
+            credential_updated_at: None,
+        }
+    }
+
+    pub fn caller_bound_transit_point(alias: impl Into<String>) -> Self {
+        Self {
+            slot: ManagedSlot::TransitPoint {
+                alias: alias.into(),
+                caller_bound: true,
+            },
             credential_updated_at: None,
         }
     }
@@ -1561,7 +1580,13 @@ mod tests {
         );
         assert!(!record.apply_managed_source(&ManagedIdentitySource::protected(), &record.identity_fields.clone()));
 
-        assert_eq!(record.slot, Some(ManagedSlot::TransitPoint { alias: "tp-1".into() }));
+        assert_eq!(
+            record.slot,
+            Some(ManagedSlot::TransitPoint {
+                alias: "tp-1".into(),
+                caller_bound: false
+            })
+        );
         assert_eq!(record.credential_updated_at, None);
         assert!(record.rotations.is_empty());
     }
@@ -1693,7 +1718,10 @@ mod tests {
             assert!(empty.get(absent).is_none(), "{absent} should be omitted");
         }
 
-        record.slot = Some(ManagedSlot::TransitPoint { alias: "tp-1".into() });
+        record.slot = Some(ManagedSlot::TransitPoint {
+            alias: "tp-1".into(),
+            caller_bound: false,
+        });
         record
             .rotations
             .push(CredentialRotation {
@@ -1703,6 +1731,24 @@ mod tests {
         let value = serde_json::to_value(&record).unwrap();
         assert_eq!(value["slot"], serde_json::json!({ "kind": "transit_point", "alias": "tp-1" }));
         assert_eq!(value["rotations"], serde_json::json!([{ "rotated_at": null }]));
+    }
+
+    #[test]
+    fn a_caller_bound_transit_point_slot_serializes_its_marker_and_reads_back() {
+        let slot = ManagedIdentitySource::caller_bound_transit_point("tp-1").slot;
+
+        let value = serde_json::to_value(&slot).unwrap();
+
+        assert_eq!(value, serde_json::json!({ "kind": "transit_point", "alias": "tp-1", "caller_bound": true }));
+        assert_eq!(serde_json::from_value::<ManagedSlot>(value).unwrap(), slot);
+    }
+
+    #[test]
+    fn a_transit_point_slot_stored_without_the_marker_reads_as_not_caller_bound() {
+        let slot: ManagedSlot =
+            serde_json::from_value(serde_json::json!({ "kind": "transit_point", "alias": "tp-1" })).unwrap();
+
+        assert_eq!(slot, ManagedIdentitySource::transit_point("tp-1").slot);
     }
 
     #[tokio::test]

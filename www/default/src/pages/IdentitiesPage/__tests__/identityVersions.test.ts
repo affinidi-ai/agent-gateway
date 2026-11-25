@@ -122,6 +122,60 @@ describe('groupIdentityVersions', () => {
     expect(entry.dids).toEqual([managed.did, 'did:mtls', 'did:tp']);
   });
 
+  it('lists each caller-bound Transit Point DID as its own row, still managed for the surface', () => {
+    const callerBound = (did: string) =>
+      version(managed, did, '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', {
+        agent_identity: { credential_type: 'api_key', api_key_id: `atgk_${did}` },
+        slot: { kind: 'transit_point', alias: 'tp-1', caller_bound: true },
+      });
+
+    const entries = groupIdentityVersions([callerBound('did:c1'), callerBound('did:c2'), managed]);
+
+    expect(entries.map(entry => entry.dids)).toEqual([['did:c1'], ['did:c2'], [managed.did]]);
+    expect(entries.slice(0, 2).every(entry => !entry.hasVersions)).toBe(true);
+    expect(
+      entries
+        .slice(0, 2)
+        .every(
+          entry =>
+            entry.primary.origin === 'managed' && entry.primary.surface_id === managed.surface_id
+        )
+    ).toBe(true);
+  });
+
+  it('still groups a stored-key Transit Point DID with the surface’s Managed Agent', () => {
+    const storedKey = version(
+      managed,
+      'did:stored',
+      '2026-01-02T00:00:00Z',
+      '2026-01-02T00:00:00Z',
+      {
+        agent_identity: { credential_type: 'api_key', api_key_id: 'atgk_stored' },
+        slot: { kind: 'transit_point', alias: 'tp-1' },
+      }
+    );
+
+    const entries = groupIdentityVersions([managed, storedKey]);
+
+    expect(entries.map(entry => entry.dids)).toEqual([[managed.did, 'did:stored']]);
+  });
+
+  it('lists an mtls_caller DID as its own row', () => {
+    const certificateCaller = version(
+      managed,
+      'did:cert',
+      '2026-01-02T00:00:00Z',
+      '2026-01-02T00:00:00Z',
+      {
+        agent_identity: { credential_type: 'mtls_caller', principal: 'agent-1' },
+      }
+    );
+
+    const entries = groupIdentityVersions([managed, certificateCaller]);
+
+    expect(entries.map(entry => entry.dids)).toEqual([[managed.did], ['did:cert']]);
+  });
+
   it('groups a record without a slot by its surface straight away', () => {
     const legacy = version(managed, 'did:legacy', '2025-12-01T00:00:00Z', '2025-12-02T00:00:00Z', {
       slot: undefined,

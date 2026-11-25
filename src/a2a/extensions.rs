@@ -357,6 +357,55 @@ pub async fn inject_identity_credential_extension(
     Ok((bytes::Bytes::from(modified_json), vp_jwt))
 }
 
+/// The extensions through which an A2A message asserts an agent identity: the
+/// raw identity, a signed credential and a caller binding.
+const ASSERTED_IDENTITY_EXTENSIONS: [&str; 3] = [
+    crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION,
+    crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION,
+    crate::config::AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION,
+];
+
+/// Removes every agent identity the request's message asserts, from its
+/// `extensions` and its `metadata`, so none is forwarded. A body that is not an
+/// A2A request with a message is returned unchanged.
+pub fn remove_asserted_identity(body_bytes: &bytes::Bytes) -> bytes::Bytes {
+    let Ok(mut body_json) = serde_json::from_slice::<JsonValue>(body_bytes) else {
+        return body_bytes.clone();
+    };
+    let path = if body_json
+        .pointer("/params/message")
+        .is_some()
+    {
+        "/params/message"
+    } else {
+        "/message"
+    };
+    let Some(message) = body_json
+        .pointer_mut(path)
+        .and_then(JsonValue::as_object_mut)
+    else {
+        return body_bytes.clone();
+    };
+    if let Some(extensions) = message
+        .get_mut("extensions")
+        .and_then(JsonValue::as_array_mut)
+    {
+        extensions.retain(|e| {
+            !e.as_str()
+                .is_some_and(|uri| ASSERTED_IDENTITY_EXTENSIONS.contains(&uri))
+        });
+    }
+    if let Some(metadata) = message
+        .get_mut("metadata")
+        .and_then(JsonValue::as_object_mut)
+    {
+        for uri in ASSERTED_IDENTITY_EXTENSIONS {
+            metadata.remove(uri);
+        }
+    }
+    serde_json::to_vec(&body_json).map_or_else(|_| body_bytes.clone(), bytes::Bytes::from)
+}
+
 /// A JSON-RPC `result` read as a Task or Message. A v1.0 `SendMessage` result
 /// wraps its payload (`SendMessageResponse`), so an object-valued `result.task`
 /// is read in its place; a `GetTask` or v0.3 result is returned unchanged.

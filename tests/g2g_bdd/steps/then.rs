@@ -543,6 +543,60 @@ pub async fn managed_agent_received_forwarded_request_with_identity_field(
     );
 }
 
+#[then(
+    expr = "managed agent {string} received the forwarded request with a VP proving only the API key Transit Point {string} verified"
+)]
+async fn managed_agent_received_only_the_verified_api_key_identity(
+    world: &mut G2gWorld,
+    target_name: String,
+    transit_point: String,
+) {
+    world
+        .topology
+        .actors
+        .expect_target_kind(&target_name, TargetActorKind::ManagedAgent);
+    let secret_id = world
+        .topology
+        .plans
+        .values()
+        .flat_map(|plan| &plan.surfaces)
+        .flat_map(|surface| &surface.transit_points)
+        .find(|point| point.alias == transit_point)
+        .and_then(|point| point.source_auth.as_ref())
+        .map(|crate::bdd_support::config::fabric_surface_fixture::SourceAuthSpec::ApiKey { secret_id, .. }| {
+            secret_id.clone()
+        })
+        .unwrap_or_else(|| panic!("Transit Point '{transit_point}' must authenticate its callers with an API key"));
+    let body = last_request_for(world, &target_name)
+        .await
+        .json_body();
+    let proof = body
+        .pointer(&format!("/params/message/metadata/{}", AGENT_IDENTITY_BINDING_URI.replace('/', "~1")))
+        .or_else(|| {
+            body.pointer(&format!("/params/message/metadata/{}", AGENT_IDENTITY_CREDENTIAL_URI.replace('/', "~1")))
+        })
+        .unwrap_or_else(|| panic!("managed agent '{target_name}' should receive an identity proof, got body: {body}"));
+    let subject = first_credential_subject_from_identity_proof(proof);
+    for (field, expected) in [("credential_type", "api_key"), ("api_key_id", secret_id.as_str())] {
+        assert_eq!(
+            identity_field_value_from_subject(&subject, field).and_then(Value::as_str),
+            Some(expected),
+            "managed agent '{target_name}' should receive the identity of the API key Transit Point '{transit_point}' verified, got credentialSubject: {subject}"
+        );
+    }
+    let text = body.to_string();
+    for copied in world
+        .obtained_identity_proofs
+        .values()
+    {
+        let presentation = copied.proof["verifiablePresentation"].to_string();
+        assert!(
+            !text.contains(presentation.trim_matches('"')),
+            "managed agent '{target_name}' should receive no identity presentation the caller copied, got body: {body}"
+        );
+    }
+}
+
 #[then(expr = "the VP Audit Log of gateway {int} records a verified identity binding issued by gateway {int}")]
 async fn vp_audit_log_of_gateway_records_verified_identity_binding(
     world: &mut G2gWorld,

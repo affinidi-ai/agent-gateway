@@ -2286,6 +2286,16 @@ impl TransitPoint {
                 .is_some_and(|binding| binding.enabled)
     }
 
+    /// The caller credential this Transit Point's own `managed_identity` takes
+    /// its DID from when its own `source_auth` does not verify that credential,
+    /// so every request through it is refused.
+    pub fn unverified_caller_credential(&self) -> Option<crate::source_auth::CallerCredential> {
+        self.managed_identity
+            .as_ref()?
+            .caller_credential()
+            .filter(|credential| !credential.verified_by(self.source_auth.as_ref()))
+    }
+
     /// Whether this Transit Point authenticates its callers: with a transit
     /// token, `mcp_http.authorization` or `source_auth`.
     pub fn authenticates_callers(&self) -> bool {

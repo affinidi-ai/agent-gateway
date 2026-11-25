@@ -342,8 +342,35 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   Managed Agent response identity (`response:identity-protected`), since the key picker lists
   API keys issued to callers, and none of them identifies the Managed Agent; the inbound and
   external slots still offer it. A protected
-  identity already set to From API Key keeps showing its key selector. Transit Point
-  identities offer only From Payload.
+  identity already set to From API Key keeps showing its key selector. A Transit Point
+  identity offers From Payload, and **From API Key** only while that Transit Point's caller
+  authentication (`source_auth`) is `api_key` or `api_key_provider`; otherwise the option is
+  disabled and one line says why (`identity-panel-transit-api-key-unavailable`). On a Transit
+  Point, From API Key shows no key picker, only the line "Each caller is identified by the API
+  key it presents to this Transit Point." (`identity-panel-transit-api-key-note`), and writes
+  `{type: "from_api_key"}` without `api_key_id`. A stored one with an `api_key_id` (set through
+  the API) keeps its key picker and its key. Save is blocked while a Transit Point From API
+  Key without `api_key_id` sits behind caller authentication that is not an API key
+  (`TRANSIT_POINT_API_KEY_NEEDS_API_KEY_CALLER` in `identity/definition.ts`). The caller
+  methods each identity type needs live in `TRANSIT_POINT_CALLER_METHODS`
+  (`identity/placement.ts`). A Transit Point identity offers **From JWT Claims**, with its JWT
+  Claim (written as `oid` when empty) and Namespace Claims, only while that Transit Point's
+  caller authentication is `jwt_bearer`, and **From mTLS certificate** only while it is `mtls`
+  (set through the API); each disabled option gets its own line saying why
+  (`identity-panel-transit-jwt-claim-unavailable`, `identity-panel-transit-mtls-unavailable`).
+  From mTLS certificate stays disabled in every other slot. On a Transit Point it shows no
+  certificate picker, only the line "Each caller is identified by the client certificate it
+  presents to this Transit Point." (`identity-panel-transit-mtls-note`), and writes
+  `{type: "from_mtls"}` without `certificate_id`; a stored one with a `certificate_id` keeps
+  its picker and its certificate. On a Transit Point the help under the type select
+  (`identity-panel-transit-type-help`) says what each option needs there, and that a From
+  Payload DID can be copied by any caller and is unverified to policy while the other options
+  bind it to the caller's credential. Save is blocked
+  while a Transit Point From JWT Claims sits behind caller authentication that is not JWT
+  Bearer (`TRANSIT_POINT_JWT_CLAIM_NEEDS_JWT_CALLER`), or a Transit Point From mTLS
+  certificate without `certificate_id` behind caller authentication that is not mTLS
+  (`TRANSIT_POINT_MTLS_NEEDS_MTLS_CALLER`); the rule that From JWT Claims needs an all-JWT
+  Bearer Caller Context applies to the other slots only.
 - **Listen Path** is the shared routing editor of Access Points and Transit Points
   (`_shared/RouteListenerSection.tsx`): a required **Surface Prefix** select and a required
   **Custom Path** input, which compose the node's route, helped by
@@ -574,8 +601,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   Save unless a Caller Context method is API Key or API Key Provider, with the gateway's own
   message (`INBOUND_API_KEY_NEEDS_API_KEY_CALLER`). An inbound From JWT Claims blocks Save unless
   a Caller Context method is JWT Bearer, with the dashboard's own message
-  (`INBOUND_JWT_CLAIM_NEEDS_JWT_CALLER`); on the protected or external Identity or a Transit
-  Point every method must be JWT Bearer. Callers of the other methods get no identity. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
+  (`INBOUND_JWT_CLAIM_NEEDS_JWT_CALLER`); on the protected or external Identity every method
+  must be JWT Bearer, and on a Transit Point that Transit Point's own caller authentication
+  (`TRANSIT_POINT_JWT_CLAIM_NEEDS_JWT_CALLER`). Callers of the other methods get no identity. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
   apart. Rules only the gateway enforces (an MCP `proxy://` target, `mcp_http.authorization`)
   and rules on inactive variants show as the save-error banner.
 - **Caller Context methods**: the caller-auth element's config holds `methods`, saved as
@@ -2623,8 +2651,10 @@ parts `IdentityNameCell`, `IdentitySurfaceCell`, `IdentityOriginBadge`,
   (`agent_identity.credential_type`) or `slot`, so the Managed Agent's response and Transit
   Point DIDs share it. The row shows the most recently used DID, a summed usage count, and the
   latest last use; its actions (Trust Score, Configure Policy, Copy link) belong to that DID.
-  `from_jwt_claim` DIDs (one per claim value), external callers and identities without a
-  surface keep one row per DID.
+  `from_jwt_claim` DIDs (one per claim value), caller-bound Transit Point DIDs (`slot`
+  `caller_bound: true`, and every `credential_type` `mtls_caller`; one per caller credential,
+  still managed for their surface), external callers and identities without a surface keep one
+  row per DID.
 - The expanded row's **Version History** section lists the entry's DIDs and the credential
   rotations inside them as one timeline, newest first, numbered from the oldest. Each version
   shows its time ("Time unknown" for a rotation found when tracking began), its DID, a

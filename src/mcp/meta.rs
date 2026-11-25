@@ -387,6 +387,23 @@ pub fn remove_metadata_key(
     removed
 }
 
+/// Removes every agent identity a message's `_meta` asserts (the raw identity,
+/// a signed credential and a caller binding, under either key spelling), so none
+/// is forwarded. A body that is not JSON is returned unchanged.
+pub fn remove_asserted_identity(body: &bytes::Bytes) -> bytes::Bytes {
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return body.clone();
+    };
+    for key in [
+        crate::config::MCP_AGENT_IDENTITY_KEY,
+        crate::config::MCP_AGENT_IDENTITY_CREDENTIAL_KEY,
+        crate::config::MCP_AGENT_IDENTITY_BINDING_KEY,
+    ] {
+        remove_metadata_key(&mut value, key);
+    }
+    serde_json::to_vec(&value).map_or_else(|_| body.clone(), bytes::Bytes::from)
+}
+
 pub fn validate_raw_identity_key(
     key: &str,
     context: McpMetadataContext,
