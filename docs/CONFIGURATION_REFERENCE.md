@@ -638,20 +638,20 @@ claim is shown as none) and raises a `user.login_failed` event with failure reas
 
 A `role_mapping` key must equal the identity provider's role value exactly, including its case.
 
-The configured user ID and username attributes must not carry more than one distinct value,
-including across repeated attributes or attribute statements; a value repeated unchanged is
-accepted. Such an assertion is refused before any user is created or updated: the browser gets
-the same generic `403` page, the log names the attribute (never its value) and a `user.login_failed`
-event is raised with failure reason `ambiguous_attribute`. The user ID attribute identifies the user
-only when the assertion's first attribute statement carries it, and the `NameID` otherwise, so an
-attribute that appears only in a later statement is ignored. Roles and the other attributes are read
-from every statement. Changing `attribute_mapping.user_id` to another attribute gives every user a
-new identifier, so each user who signs in afterwards is created as a new user.
+The user ID, username and profile attributes are read from the first attribute statement of the
+assertion only; role values are read from every statement. The user ID and username attributes must
+not carry more than one distinct value there, including across repeated attributes; a value repeated
+unchanged is accepted. Such an assertion is refused before any user is created or updated: the
+browser gets the same generic `403` page, the log names the attribute (never its value) and a
+`user.login_failed` event is raised with failure reason `ambiguous_attribute`. The user ID attribute
+identifies the user when it is present and the `NameID` otherwise. Changing `attribute_mapping.user_id`
+to another attribute gives every user a new identifier, so each user who signs in afterwards is
+created as a new user.
 
-The email, first name, last name, department and job title attributes may
-carry several values: the user keeps the stored value while the identity provider still sends it,
-and otherwise takes the first one sent, and the log warns naming the attribute. When no username
-attribute is sent, the username is the email the user keeps.
+The email, first name, last name, department and job title attributes may carry several values: the
+user keeps the stored value while the identity provider still sends it, and otherwise takes the first
+one sent, and the log warns naming the attribute. When no username attribute is sent, or the username
+is mapped to the email claim, the username is the email the user keeps.
 
 The first user to sign in to an appliance with no users is still the primary administrator, and
 the primary administrator signs in and is updated as usual, keeping that role, even when the role

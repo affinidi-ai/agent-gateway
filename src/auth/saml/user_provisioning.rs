@@ -87,7 +87,7 @@ fn ensure_single_valued_identity(
     if carries_several_values(all_attributes, &mapping.user_id) {
         return Err(AmbiguousAttribute { attribute: "user ID" });
     }
-    if carries_several_values(all_attributes, &mapping.username) {
+    if mapping.username != mapping.email && carries_several_values(all_attributes, &mapping.username) {
         return Err(AmbiguousAttribute { attribute: "username" });
     }
     Ok(())
@@ -166,9 +166,13 @@ pub async fn provision_user_from_saml(
             .as_ref()
             .and_then(|user| user.email.as_ref()),
     );
-    let username = attributes
-        .get(&mapping.username)
-        .cloned()
+    let username = (mapping.username != mapping.email)
+        .then(|| {
+            attributes
+                .get(&mapping.username)
+                .cloned()
+        })
+        .flatten()
         .or_else(|| email.clone())
         .context("Username not found in SAML attributes")?;
     let first_name = profile_value(
@@ -830,6 +834,37 @@ mod tests {
 
         assert_eq!(again.user.email.as_deref(), Some("old@example.test"));
         assert_eq!(again.user.username, "old@example.test");
+    }
+
+    #[tokio::test]
+    async fn a_username_mapped_to_the_email_claim_follows_the_kept_email_whatever_addresses_are_sent() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mut config = test_saml_config();
+        config
+            .attribute_mapping
+            .username = config
+            .attribute_mapping
+            .email
+            .clone();
+        let email = config
+            .attribute_mapping
+            .email
+            .clone();
+        let mut attributes = saml_attributes("saml-1", "jane");
+        attributes.insert(email.clone(), vec!["primary@example.test".to_string()]);
+        let first = provision_user_from_saml(&storage, &attributes, &config, &avatars)
+            .await
+            .unwrap();
+        assert_eq!(first.user.username, "primary@example.test");
+
+        attributes.insert(email, vec!["alias@example.test".to_string(), "primary@example.test".to_string()]);
+        let again = provision_user_from_saml(&storage, &attributes, &config, &avatars)
+            .await
+            .unwrap();
+
+        assert_eq!(again.user.username, "primary@example.test");
+        assert_eq!(again.user.email.as_deref(), Some("primary@example.test"));
     }
 
     #[tokio::test]

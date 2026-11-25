@@ -137,7 +137,8 @@ raises `user.login_failed` ([`user_integration_triggers.rs`](../src/integrations
 a passkey sign-in whose credential does not verify, and a SAML response the gateway rejects at the
 Assertion Consumer Service (bad or missing signature, untrusted certificate, wrong destination or
 audience, an unknown, used or expired AuthnRequest, expired conditions), and a verified SAML
-sign-in refused because its identity-provider role maps to no gateway role. A passkey sign-in whose
+sign-in refused because its identity-provider role maps to no gateway role or its user ID or username
+attribute carries conflicting values. A passkey sign-in whose
 challenge is unknown or expired has nothing to verify and raises nothing, and neither does any other
 failure after verification, such as reaching the user limit, a provisioning error or opening the
 session.

@@ -127,15 +127,14 @@ Feature: Sign-in integration events
     And the integration receives a "user.login_failed" event with login method "saml" and failure reason "ambiguous_attribute"
     And the integration receives no other sign-in event besides the first user's
 
-  Scenario: A SAML sign-in with two different user IDs in separate attribute statements is refused and creates no user
+  Scenario: A SAML sign-in reads the user ID from the first attribute statement only
     Given human users sign in with SAML
     And "alpha" has signed in with SAML as the first user and that event was received
+    And "mallory" has signed in with SAML carrying the identity provider roles "gw-all" and that event was received
     When "mallory" signs in with SAML carrying two different user IDs in separate attribute statements
-    Then the response status is 403
-    And the gateway issues no session cookie
-    And no human user "mallory" is stored
-    And the integration receives a "user.login_failed" event with login method "saml" and failure reason "ambiguous_attribute"
-    And the integration receives no other sign-in event besides the first user's
+    Then the response status is 200
+    And the integration receives a "user.login" event with login method "saml" for user "mallory"
+    And human user "mallory" is stored once
 
   Scenario: A SAML sign-in with two different usernames as repeated attributes is refused and creates no user
     Given human users sign in with SAML

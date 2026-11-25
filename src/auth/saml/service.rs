@@ -443,12 +443,12 @@ impl SamlService {
             .attribute_statements
             .as_deref()
             .map(|statements| {
-                collect_attributes_for_identity(
+                collect_attributes_with_roles_from_all_statements(
                     statements,
                     &self
                         .config
                         .attribute_mapping
-                        .user_id,
+                        .role,
                 )
             })
             .unwrap_or_default();
@@ -469,20 +469,21 @@ impl SamlService {
     }
 }
 
-/// [`collect_attributes`], except that the user ID attribute counts only when the first attribute
-/// statement carries it, as before roles were read from every statement; otherwise the account is
-/// found by the `NameID`, so an existing account is never matched to a different key.
-fn collect_attributes_for_identity(
+/// The attributes the gateway reads: those of the first attribute statement, except that the role
+/// attribute carries the values of every statement, so a role is never missed for the statement it
+/// sits in.
+fn collect_attributes_with_roles_from_all_statements(
     statements: &[AttributeStatement],
-    user_id_attribute: &str,
+    role_attribute: &str,
 ) -> SamlAttributes {
-    let mut attributes = collect_attributes(statements);
-    let in_first_statement = statements
+    let mut attributes = statements
         .first()
-        .is_some_and(|first| collect_attributes(std::slice::from_ref(first)).contains_key(user_id_attribute));
-    if !in_first_statement {
-        attributes.remove(user_id_attribute);
-    }
+        .map(|first| collect_attributes(std::slice::from_ref(first)))
+        .unwrap_or_default();
+    match collect_attributes(statements).remove(role_attribute) {
+        Some(roles) => attributes.insert(role_attribute.to_string(), roles),
+        None => attributes.remove(role_attribute),
+    };
     attributes
 }
 
@@ -802,25 +803,31 @@ mod tests {
     }
 
     #[test]
-    fn a_user_id_attribute_only_in_a_later_statement_is_not_collected() {
-        let collected = collect_attributes_for_identity(
+    fn only_the_first_statement_gives_the_attributes_but_the_role_comes_from_every_statement() {
+        let collected = collect_attributes_with_roles_from_all_statements(
             &[
-                statement(vec![attribute("email", &["a@example.test"])]),
-                statement(vec![attribute("uid", &["later"]), attribute("role", &["gw-admins"])]),
+                statement(vec![attribute("uid", &["first"]), attribute("role", &["gw-all"])]),
+                statement(vec![
+                    attribute("uid", &["later"]),
+                    attribute("name", &["later-name"]),
+                    attribute("role", &["gw-admins"]),
+                ]),
             ],
-            "uid",
+            "role",
         );
-        assert!(!collected.contains_key("uid"));
-        assert_eq!(collected["role"], vec!["gw-admins"]);
+        assert_eq!(collected["uid"], vec!["first"]);
+        assert!(!collected.contains_key("name"));
+        assert_eq!(collected["role"], vec!["gw-all", "gw-admins"]);
     }
 
     #[test]
-    fn a_user_id_attribute_in_the_first_statement_keeps_the_values_of_later_ones() {
-        let collected = collect_attributes_for_identity(
-            &[statement(vec![attribute("uid", &["one"])]), statement(vec![attribute("uid", &["two"])])],
-            "uid",
+    fn a_role_only_in_a_later_statement_is_collected() {
+        let collected = collect_attributes_with_roles_from_all_statements(
+            &[statement(vec![attribute("uid", &["first"])]), statement(vec![attribute("role", &["gw-admins"])])],
+            "role",
         );
-        assert_eq!(collected["uid"], vec!["one", "two"]);
+        assert_eq!(collected["role"], vec!["gw-admins"]);
+        assert_eq!(collected["uid"], vec!["first"]);
     }
 
     #[test]
