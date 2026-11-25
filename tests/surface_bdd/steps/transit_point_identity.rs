@@ -555,19 +555,24 @@ fn expect_caller(
 }
 
 #[when(
-    regex = r#"^(managed agent|agent) "([^"]+)" sends an A2A message/send request through Transit Point "([^"]+)" with key "([^"]+)"$"#
+    regex = r#"^(managed agent|agent) "([^"]+)" sends an A2A (message/send|tasks/get) request through Transit Point "([^"]+)" with key "([^"]+)"$"#
 )]
 async fn caller_sends_through_transit_point_with_key(
     world: &mut SurfaceWorld,
     kind: String,
     caller: String,
+    method: String,
     transit_point: String,
     key: String,
 ) {
     expect_caller(world, &kind, &caller);
     let provider = transit_point_provider(world, &transit_point);
     let header = provider_key(world, &provider, &key);
-    let body = transit_point_request_body(world);
+    let body = if method == "tasks/get" {
+        json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": { "id": "task-1" } })
+    } else {
+        transit_point_request_body(world)
+    };
     let agent = managed_agent(world);
     send_a2a_body_through_transit_point(world, &agent, &transit_point, vec![header], body).await;
 }

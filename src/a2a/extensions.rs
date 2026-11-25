@@ -235,6 +235,15 @@ pub async fn inject_custom_metadata_extension(
     Ok(bytes::Bytes::from(modified_json))
 }
 
+/// Whether an A2A request carries a message (`params.message` or `message`).
+/// Task operations such as `tasks/get` carry a task `id` instead.
+pub fn has_message(body: &JsonValue) -> bool {
+    body.get("params")
+        .and_then(|p| p.get("message"))
+        .or_else(|| body.get("message"))
+        .is_some()
+}
+
 /// Inject agent identity credential (VP) extension into the A2A request body
 /// This is called when GW1 has computed a DID for an agent and wants to forward it to GW2
 /// The VP contains a VC signed by the agent's DID, proving the identity

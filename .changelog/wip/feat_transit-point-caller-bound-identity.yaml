@@ -34,6 +34,14 @@ changes:
         resolution failed: Caller identity could not be resolved" (500, 502 when the DID cannot
         be issued, or 503 when a store is unavailable) instead of internal error text, which is
         logged.
+    - timestamp: '2026-11-25T18:00:00Z'
+      title: Forward A2A task requests through a Transit Point with a managed identity
+      description: >-
+        A2A task operations (tasks/get, tasks/cancel, tasks/resubscribe and their A2A 1.0 names)
+        through a Transit Point with a managed agent identity answered 500, because the gateway
+        tried to inject the identity presentation into a message these requests do not carry.
+        They are now forwarded unchanged, with no identity presentation, as the Access Point
+        already does.
   removed: []
   security:
     - timestamp: '2026-11-24T11:10:20Z'
@@ -49,7 +57,8 @@ changes:
         claim value, and a DID the Transit Point issues first is recorded as its managed agent
         (origin managed, slot transit_point with caller_bound true), with the managed agent's
         display name on its credential, and the Identities page lists each such DID as its own
-        row rather than as a version of the managed agent; a DID first issued to an Access Point caller stays an external caller
+        row rather than as a version of the managed agent, and the Agents page and
+        GET /v1/agents list every such DID among the agent's identities; a DID first issued to an Access Point caller stays an external caller
         record, a DID that is another surface's Managed Agent is recorded as a caller use so
         that agent keeps its name, and the Managed Agent's own stored key later replaces the
         caller_bound slot. The DID replaces any identity the request body asserts for policy, Trust Check,

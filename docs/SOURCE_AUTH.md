@@ -2082,10 +2082,14 @@ Every Transit Point policy reads the managed agent's DID and its **Counts as** v
   injection refuses it. An A2A body that is not exactly one JSON object, such as a JSON-RPC
   batch or a body that starts with a byte order mark, is refused with `400` and JSON-RPC error
   `-32600`, since its identities cannot all be removed; an object without a message, such as
-  `tasks/get`, is forwarded unchanged.
+  `tasks/get`, `tasks/cancel` or `tasks/resubscribe`, is forwarded unchanged, with no identity
+  presentation.
 - Without a VC issuer (`vc_issuer_missing`), or when issuance fails (`vc_issuer_error`), an API
   key or client certificate caller is not refused: it resolves no managed agent identity and
-  policy decides. A JWT caller is refused as on the Access Point's `from_jwt_claim`: `500`
+  policy decides. Without a VC issuer, an MCP request whose `_meta` carries an identity
+  presentation is still refused before policy, with `422` and the detail `Invalid MCP identity
+  presentation`, since the gateway cannot verify the presentation. A JWT caller is refused as
+  on the Access Point's `from_jwt_claim`: `500`
   `Identity resolution failed: from_jwt_claim requires a configured VC issuer` without a VC
   issuer, and `502` `Identity resolution failed: VCIssuer failure during from_jwt_claim
   resolution` when issuance fails. Each outcome counts in
@@ -2277,7 +2281,10 @@ DID, and so do `from_jwt_claim` DIDs, one per claim value and all current at onc
 Transit Point's DIDs taken from its callers' credentials (`slot` `caller_bound: true`, and
 every `credential_type` `mtls_caller`), one per credential and all current at once, each still
 shown as a managed agent of its surface. A Transit Point with a stored API key or certificate
-records no `caller_bound`, so its DIDs stay versions of the Managed Agent. Without `AG_IDENTITY_HASH_PEPPER`, every
+records no `caller_bound`, so its DIDs stay versions of the Managed Agent. An agent's
+`identities` on `GET /v1/agents` follow the same rule: each surface's most recently used
+managed DID, plus every `from_jwt_claim`, `mtls_caller` and caller-bound Transit Point DID.
+Without `AG_IDENTITY_HASH_PEPPER`, every
 restart mints new credential-derived DIDs, which show as versions with no field changes.
 
 ## Trust Recorder

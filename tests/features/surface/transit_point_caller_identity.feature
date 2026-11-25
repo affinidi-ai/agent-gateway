@@ -16,6 +16,14 @@ Feature: Transit Point identity from its caller's credential
     Then the response status is 200
     And external agent "delta" received the request with a VP proving the DID of key "bravo-key"
 
+  Scenario: A Transit Point that takes its identity from the caller's key forwards a task request
+    Given surface "alpha" has A2A Transit Point "tr1" to external agent "delta"
+    And Transit Point "tr1" authenticates its callers with an API key of API key provider "agents"
+    And Transit Point "tr1" takes the managed agent's identity from its caller's API key
+    When managed agent "bravo" sends an A2A tasks/get request through Transit Point "tr1" with key "bravo-key"
+    Then the response status is 200
+    And external agent "delta" received a forwarded request
+
   Scenario: A Transit Point policy admits a managed agent whose identity its key verified
     Given surface "alpha" has A2A Transit Point "tr1" to external agent "delta"
     And Transit Point "tr1" authenticates its callers with an API key of API key provider "agents"
