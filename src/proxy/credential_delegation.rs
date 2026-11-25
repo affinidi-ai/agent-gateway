@@ -2527,6 +2527,7 @@ mod tests {
         token.user_identity_hash = "__client_credentials__".to_string();
         token.access_token = "cached-service-token".to_string();
         token.created_at = now - Duration::seconds(3400);
+        token.consent_granted_at = token.created_at;
         token.expires_at = Some(now + Duration::seconds(200));
         let vault: Arc<dyn DelegationVaultStorage> = MockVaultStore::new(VaultLookupResult::Found(token));
         let directory = tempfile::tempdir().unwrap();

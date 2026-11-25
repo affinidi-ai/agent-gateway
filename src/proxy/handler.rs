@@ -17210,6 +17210,7 @@ pub(crate) mod target_auth_tests {
             .remove(0);
         let now = chrono::Utc::now();
         stored.created_at = now - chrono::Duration::seconds(3400);
+        stored.consent_granted_at = stored.created_at;
         stored.expires_at = Some(now + chrono::Duration::seconds(200));
         fixture
             .vault

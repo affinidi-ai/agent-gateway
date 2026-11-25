@@ -419,7 +419,9 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
   metadata).
 - An issued token is cached in the delegation vault and renewed half its lifetime before its
   `expires_at`, but at most 5 minutes and at least 60 seconds before (a one-hour token is
-  renewed 5 minutes early, a 100-second one 60 seconds early). One request renews it while the
+  renewed 5 minutes early, a 100-second one 60 seconds early). The lifetime is that token's own,
+  from when the provider issued it, so a renewed token, which keeps the vault row and its
+  `created_at`, is renewed on the same schedule as the first one. One request renews it while the
   others keep using the cached token. When the renewal fails at the token endpoint
   (`TokenRequestFailed`, `TokenRequestRejected`, `ScopeMismatch`) or is held back by the retry
   backoff, the cached token
