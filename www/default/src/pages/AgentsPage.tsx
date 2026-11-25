@@ -130,7 +130,7 @@ const AgentsPage: React.FC = () => {
                 icon="fa-robot"
                 title="Get started with Agents"
                 body="Agents show up here once they're connected through a surface. Create a surface to start routing, securing, and monitoring your agents."
-                docsHref={DOCS_URL.createFirstAgent}
+                docsHref={DOCS_URL.createFirstSurface}
                 docsLabel="View Docs"
               />
             )

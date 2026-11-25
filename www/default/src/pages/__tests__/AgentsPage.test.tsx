@@ -387,7 +387,7 @@ describe('AgentsPage', () => {
     renderPage();
 
     const docs = await screen.findByRole('link', { name: /View Docs/ });
-    expect(docs).toHaveAttribute('href', DOCS_URL.createFirstAgent);
+    expect(docs).toHaveAttribute('href', DOCS_URL.createFirstSurface);
     expect(docs).toHaveAttribute('target', '_blank');
   });
 
