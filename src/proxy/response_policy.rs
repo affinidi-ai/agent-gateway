@@ -278,30 +278,34 @@ where
     }
 }
 
-/// What a response policy sees of an MCP Proxy's answer.
-pub fn mcp_proxy_answer_context(answer: &Value) -> ResponseContext {
-    ResponseContext {
+/// The JSON-RPC error that replaces an MCP Proxy's `answer` to request `id` when
+/// `check` refuses it, or `None` when it may go back.
+pub async fn mcp_proxy_refusal<Check, Decided>(
+    answer: &Value,
+    id: Option<&Value>,
+    check: Check,
+) -> Option<Value>
+where
+    Check: FnOnce(ResponseContext) -> Decided,
+    Decided: std::future::Future<Output = ResponsePolicyDecision>,
+{
+    let decision = check(ResponseContext {
         status_code: 200,
         body: Some(answer.clone()),
         content_type: Some("application/json".to_string()),
         is_error: false,
         method: None,
-    }
-}
-
-/// The JSON-RPC error that replaces an MCP Proxy's answer to request `id` when a
-/// response policy refuses it.
-pub fn mcp_proxy_denied_answer(
-    id: Option<&Value>,
-    decision: ResponsePolicyDecision,
-) -> Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": -32000,
-            "message": decision.reason.unwrap_or_else(|| "Response blocked by policy".to_string())
-        }
+    })
+    .await;
+    (!decision.allow).then(|| {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32000,
+                "message": decision.reason.unwrap_or_else(|| "Response blocked by policy".to_string())
+            }
+        })
     })
 }
 
@@ -647,21 +651,33 @@ mod tests {
         assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), sent);
     }
 
-    #[test]
-    fn a_refused_mcp_proxy_answer_is_a_json_rpc_error_with_the_policy_reason() {
-        let denied = mcp_proxy_denied_answer(
-            Some(&serde_json::json!(7)),
+    #[tokio::test]
+    async fn a_refused_mcp_proxy_answer_is_a_json_rpc_error_with_the_policy_reason() {
+        let answer = serde_json::json!({"jsonrpc": "2.0", "id": 7, "result": {"secret": "s"}});
+
+        let denied = mcp_proxy_refusal(&answer, Some(&serde_json::json!(7)), |response| async move {
+            assert_eq!(response.body, Some(serde_json::json!({"jsonrpc": "2.0", "id": 7, "result": {"secret": "s"}})));
             ResponsePolicyDecision {
                 allow: false,
                 reason: Some("no secrets".to_string()),
                 error: None,
-            },
-        );
+            }
+        })
+        .await;
 
         assert_eq!(
             denied,
-            serde_json::json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32000, "message": "no secrets"}})
+            Some(serde_json::json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32000, "message": "no secrets"}}))
         );
+    }
+
+    #[tokio::test]
+    async fn an_allowed_mcp_proxy_answer_is_not_refused() {
+        let answer = serde_json::json!({"jsonrpc": "2.0", "id": 7, "result": {}});
+
+        let denied = mcp_proxy_refusal(&answer, Some(&serde_json::json!(7)), |_| async { decided(true) }).await;
+
+        assert_eq!(denied, None);
     }
 
     #[test]

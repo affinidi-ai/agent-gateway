@@ -176,7 +176,7 @@ logic.
 | Upstream response bounds | Buffering the upstream response within `[a2a] max_body_size`, the target's `networking.timeout.idle_secs` and its request timeout; `502` over the size or for a compressed body where none was accepted, `504` on a stall. An MCP event-stream passthrough is not buffered. | [`src/proxy/upstream_body.rs`](src/proxy/upstream_body.rs) |
 | A2A event streams | Forwarding a direct Target's `text/event-stream` one event at a time, each event given the response checks below; a refused event ends the stream with a JSON-RPC error event | [`src/a2a/streaming.rs`](src/a2a/streaming.rs), [`src/proxy/handler/a2a_stream.rs`](src/proxy/handler/a2a_stream.rs) |
 | Protected identity resolution | Deriving the managed agent's DID from its response | [`src/proxy/backend_identity.rs`](src/proxy/backend_identity.rs) |
-| Response processing | Rewrites, tool-list filtering, agent cards | [`src/proxy/response_policy.rs`](src/proxy/response_policy.rs) |
+| Response processing | Rewrites, tool-list filtering, agent cards; the surface response policy on direct answers and on answers sent back over Fabric | [`src/proxy/response_policy.rs`](src/proxy/response_policy.rs), [`src/proxy/handler/response_policy.rs`](src/proxy/handler/response_policy.rs), [`src/gateways/connection_points/message_processor/response_policy.rs`](src/gateways/connection_points/message_processor/response_policy.rs) |
 | Metrics | Recording the outcome | [`src/metrics/`](src/metrics/) |
 
 ## Outbound path
