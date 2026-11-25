@@ -6,7 +6,7 @@ use axum::{http::HeaderMap, response::Response};
 use crate::channel_info;
 use crate::proxy::response_policy::{
     CallerContext, ResponseContext, ResponsePolicyDecision, ResponsePolicyInput, SurfaceContext,
-    a2a_proxy_answer_under, check_response_policy, denied_response, response_context,
+    a2a_proxy_answer_under, answer_contexts, check_response_policy_on_each, denied_response,
 };
 use crate::state::ProxyState;
 
@@ -224,6 +224,7 @@ pub(super) struct DirectRequest<'a> {
     pub(super) trace_id: &'a str,
     pub(super) method: &'a str,
     pub(super) path: &'a str,
+    pub(super) caller_did: Option<&'a str>,
     pub(super) agent: Option<&'a crate::surface_context::AgentContext>,
     pub(super) extension_identity: Option<&'a crate::surface_context::ExtensionIdentityContext>,
     pub(super) identity: Option<&'a crate::source_auth::AuthenticatedIdentity>,
@@ -259,8 +260,8 @@ impl DirectResponsePolicy {
         let policy_manager = state.policy_manager.clone()?;
         let caller = CallerContext {
             did: request
-                .agent
-                .and_then(|ctx| ctx.did.clone()),
+                .caller_did
+                .map(str::to_string),
             identity_source: Some(
                 direct_caller_identity(request.agent, request.extension_identity)
                     .identity_source
@@ -292,11 +293,23 @@ impl DirectResponsePolicy {
         &self,
         response: ResponseContext,
     ) -> ResponsePolicyDecision {
-        let input = ResponsePolicyInput::new(response, self.caller.clone(), self.surface.clone());
-        check_response_policy(
+        self.check_each(vec![response])
+            .await
+    }
+
+    /// Evaluates the policy on each part of one Target answer and records one
+    /// decision for the answer.
+    async fn check_each(
+        &self,
+        responses: Vec<ResponseContext>,
+    ) -> ResponsePolicyDecision {
+        let inputs = responses
+            .into_iter()
+            .map(|response| ResponsePolicyInput::new(response, self.caller.clone(), self.surface.clone()));
+        check_response_policy_on_each(
             &self.policy_manager,
             &self.policy_id,
-            input,
+            inputs,
             crate::observability::PolicyDecisionEvent {
                 surface_id: Some(&self.config_id),
                 surface_name: Some(&self.surface.name),
@@ -313,6 +326,7 @@ impl DirectResponsePolicy {
 
     /// The `403` the caller gets when the policy refuses a whole Target answer
     /// with `status`, `body` and `content_type`, or `None` when it may go back.
+    /// An answer still framed as an event stream is checked event by event.
     pub(super) async fn refusal(
         &self,
         status: u16,
@@ -320,7 +334,7 @@ impl DirectResponsePolicy {
         content_type: Option<&str>,
     ) -> Option<Response> {
         let decision = self
-            .check(response_context(status, body, content_type))
+            .check_each(answer_contexts(status, body, content_type))
             .await;
         (!decision.allow).then(denied_response)
     }

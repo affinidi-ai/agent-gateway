@@ -27,6 +27,30 @@ Feature: Surface response policies over Fabric
     And the A2A response result matches managed agent "bravo" response result
     And the VP Audit Log of gateway 2 records a response policy "allow" on the Fabric request
 
+  Scenario: A response policy checks each event of a streamed A2A answer to a Fabric caller
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And managed agent "bravo" answers with an event stream whose last event names a secret
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And the VP Audit Log of gateway 2 keeps every audit event
+    And surface "alpha" has a response policy that denies an answer naming a secret
+    When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
+    Then the response status is 403
+    And the response says "response_policy_denied"
+    And the VP Audit Log of gateway 2 records a response policy "deny" on the Fabric request
+
+  Scenario: The response policy of a surface with a fabric:// Target refuses the answer it gets back
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And the VP Audit Log of gateway 1 keeps every audit event
+    And surface "charlie" has a response policy that denies every response
+    When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
+    Then the response status is 403
+    And the response says "response_policy_denied"
+    And managed agent "bravo" received one forwarded message
+    And the VP Audit Log of gateway 1 records a response policy "deny" on surface "charlie"
+
   Scenario: A response policy does not refuse an agent card fetched over Fabric
     Given a fabric with 2 gateways
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"

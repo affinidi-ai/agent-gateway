@@ -8879,6 +8879,12 @@ async fn handle_a2a_proxy_forward(
     };
 
     let request_body_bytes = body_bytes;
+    let (parts, body) = response.into_parts();
+    let dispatched_body = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .unwrap_or_default();
+    let connection_status = crate::proxy::handler::a2a_proxy_connection_status(parts.status, &dispatched_body);
+    let response = axum::response::Response::from_parts(parts, axum::body::Body::from(dispatched_body));
     let response = match response_policy {
         Some(policy) => {
             policy
@@ -8906,7 +8912,6 @@ async fn handle_a2a_proxy_forward(
                 .map(|v| (k.as_str().to_string(), v.to_string()))
         })
         .collect();
-    let connection_status = crate::proxy::handler::a2a_proxy_connection_status(status, &response_body_bytes);
 
     if let Some(metrics_store) = GLOBAL_METRICS_STORE.get() {
         let source = message

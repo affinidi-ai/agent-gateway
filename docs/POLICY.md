@@ -877,22 +877,28 @@ Transit Point traffic it used to allow. Scope such a rule to the inbound legs by
 
 The surface's response policy (`target.response_policy`, or the served variant's) runs on every
 answer from an HTTP, MCP Proxy or `a2a-proxy://` Target, including one an MCP Target gives
-through a Legacy SSE session, whether the request came in directly or over Fabric. On an
-`a2a-proxy://` Target it checks a successful answer only; the proxy's own JSON-RPC errors pass
-unchecked. On a modern MCP response it checks the complete result only; notifications sent
-before it are not checked. On a `tools/list` answer the policy sees the list after MCP tool
-gating has removed the tools the caller may not see, directly and over Fabric, on every Target
-kind. Responses the gateway makes itself are not checked, nor is an agent card, nor an empty
-answer from a Legacy SSE session (the answer to a notification). A denied answer is refused
-with `403 response_policy_denied`, or, on an MCP Proxy Target, with a JSON-RPC `-32000` error
-that carries the deny reason. A denied modern MCP result ends its stream when the Target
-answered with an event stream, and is refused with `502` when it answered with a single JSON
-response. A request received over Fabric is refused when the gateway has no policy
-manager to evaluate the policy with. On such a request `input.caller.did` is set only when a
-presentation from one of the peer's connection issuers carried it, and
-`input.caller.identity_source` is `fabric-presentation` or `fabric-asserted`. The decision is
-recorded with flow `fabric` and `via_fabric: true`, as every policy decision made on a request
-received over Fabric is.
+through a Legacy SSE session, whether the request came in directly or over Fabric. A surface
+whose Target is `fabric://` runs its own response policy on the answer the peer gateway sends
+back, so that answer meets the response policies of both surfaces: the receiving surface's on
+the peer and the sending surface's here. On an `a2a-proxy://` Target it checks a successful
+answer only; the proxy's own JSON-RPC errors pass unchecked. On a modern MCP response it checks
+the complete result only; notifications sent before it, JSON-RPC errors, `input_required` and
+other result types are not checked. An A2A answer framed as an event stream is checked event by
+event, each event's JSON as `input.response.body`, directly and over Fabric, and refused when
+any event is denied; one decision is recorded for the answer. On a `tools/list` answer the
+policy sees the list after MCP tool gating has removed the tools the caller may not see,
+directly and over Fabric, on every Target kind. Responses the gateway makes itself are not
+checked, nor is an agent card, nor an empty answer from a Legacy SSE session (the answer to a
+notification). A denied answer is refused with `403 response_policy_denied`, or, on an MCP
+Proxy Target, with a JSON-RPC `-32000` error that carries the deny reason. A denied modern MCP
+result ends its stream when the Target answered with an event stream, and is refused with
+`502` when it answered with a single JSON response. Without a policy manager to evaluate it
+with, the answer goes back unchecked. On a request received over Fabric `input.caller.did` is
+set only when a presentation from one of the peer's connection issuers carried it, and
+`input.caller.identity_source` is `fabric-presentation` or `fabric-asserted`, so a policy
+written for direct callers may refuse Fabric callers. The decision is recorded with flow
+`fabric` and `via_fabric: true`, as every policy decision made on a request received over
+Fabric is.
 
 A Transit Point's response policy gets `input.transit`, `input.extension_identity` while the
 managed agent has an identity, and `input.source_auth` when the Transit Point authenticated a

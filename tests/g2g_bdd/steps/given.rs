@@ -1175,6 +1175,26 @@ pub fn managed_agent_compresses_its_replies(
         .insert(surface_id, stream);
 }
 
+#[given(expr = "managed agent {string} answers with an event stream whose last event names a secret")]
+pub fn managed_agent_answers_with_an_event_stream_naming_a_secret(
+    world: &mut G2gWorld,
+    agent_name: String,
+) {
+    let (gw_index, surface_id) = world.target(&agent_name);
+    let plan = world
+        .topology
+        .plan_mut(gw_index);
+    plan.mock_responses.insert(
+        surface_id.clone(),
+        serde_json::json!([
+            {"jsonrpc": "2.0", "result": {"kind": "status-update", "status": {"state": "working"}}},
+            {"jsonrpc": "2.0", "result": {"kind": "message", "secret": "s3cr3t"}}
+        ]),
+    );
+    plan.mock_gzip
+        .insert(surface_id, crate::bdd_support::mock_server::MockStream::Events);
+}
+
 #[given(expr = "managed agent {string} serves an agent card")]
 pub fn managed_agent_serves_an_agent_card(
     world: &mut G2gWorld,
@@ -1323,6 +1343,15 @@ async fn surface_has_tool_list_response_policy(
         "default allow := true\n\nallow := false if {{\n    input.response.body.result.tools[_].name == {tool_literal}\n}}"
     );
     attach_surface_policy(world, &surface_name, "response_policy", "deny-tool-list", &rule).await;
+}
+
+#[given(expr = "surface {string} has a response policy that denies an answer naming a secret")]
+async fn surface_has_secret_response_policy(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    let rule = "default allow := true\n\nallow := false if {\n    input.response.body.result.secret\n}";
+    attach_surface_policy(world, &surface_name, "response_policy", "deny-secret", rule).await;
 }
 
 #[given(regex = r#"^surface "([^"]+)" lists only MCP tool "([^"]+)"$"#)]

@@ -844,6 +844,32 @@ async fn vp_audit_log_records_fabric_response_decision_under_request_trace(
     );
 }
 
+#[then(regex = r#"^the VP Audit Log of gateway (\d+) records a response policy "(allow|deny)" on surface "([^"]+)"$"#)]
+async fn vp_audit_log_records_response_decision_on_surface(
+    world: &mut G2gWorld,
+    gateway: usize,
+    decision: String,
+    surface_name: String,
+) {
+    let (_, surface_id) = world.surface(&surface_name);
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(|event| {
+            let recorded = &event["event"]["policy_decision"];
+            recorded["scope"] == "response"
+                && recorded["decision"] == decision.as_str()
+                && event["surface_id"] == surface_id.as_str()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
+    assert!(
+        found,
+        "expected gateway {gateway} to record a response policy {decision} on surface '{surface_id}', got {events:?}"
+    );
+}
+
 /// The audit outcome for a failed identity binding, as the step names it.
 fn audited_identity_binding_failure(reason: &str) -> &'static str {
     match reason {

@@ -1136,6 +1136,15 @@ async fn spawn_node(
                 .get(&surface.surface_id)
             {
                 response.stream = *stream;
+                if matches!(
+                    stream,
+                    crate::bdd_support::mock_server::MockStream::Sse
+                        | crate::bdd_support::mock_server::MockStream::Events
+                ) {
+                    response
+                        .headers
+                        .insert("content-type".to_string(), "text/event-stream".to_string());
+                }
             }
             if let Some(status) = plan
                 .mock_statuses

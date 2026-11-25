@@ -646,11 +646,15 @@ request received by the destination gateway:
    The sending gateway also sends `Accept-Encoding: identity` on every buffered forward and card
    read, from an Access Point's `fabric://` Target and from a Transit Point alike, so a receiving
    gateway without this check still gets an uncompressed answer.
-9. Apply response processing, including MCP tool-list filtering when configured, before packaging
-   the DIDComm response.
+9. Apply response processing, including MCP tool-list filtering when configured, then the response
+   policy of the surface variant serving the request, before packaging the DIDComm response (see
+   [`POLICY.md`](POLICY.md)). An answer the response policy refuses is not delivered, so the
+   payment agent-pay holds for it is voided rather than captured.
 
 The sending and receiving gateways enforce their own policies independently. For MCP surfaces, tool
-gating on each side composes: a tool hidden or denied by either surface remains unavailable.
+gating on each side composes: a tool hidden or denied by either surface remains unavailable. The
+same holds for response policies: the answer meets the receiving surface's, then the sending
+surface's.
 
 Fabric finds the destination surface by id, never by its Access Point route, but a surface reached
 only over Fabric, or used only for its Transit Points, still needs a route a surface prefix serves:

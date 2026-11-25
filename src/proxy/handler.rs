@@ -6503,6 +6503,9 @@ async fn proxy_charged_request(
             trace_id: &trace_id,
             method: method.as_ref(),
             path: uri.path(),
+            caller_did: agent_context
+                .as_ref()
+                .and_then(|ctx| ctx.did.as_deref()),
             agent: agent_context.as_ref(),
             extension_identity: extension_identity.as_ref(),
             identity: authenticated_identity.as_ref(),
@@ -6585,14 +6588,6 @@ async fn proxy_charged_request(
             )
             .await
         };
-        let dispatched = match response_policy.as_ref() {
-            Some(policy) => {
-                policy
-                    .a2a_proxy_answer(dispatched)
-                    .await
-            }
-            None => dispatched,
-        };
         let response = record_a2a_proxy_connection_metric(
             &state,
             proxy_id,
@@ -6603,6 +6598,14 @@ async fn proxy_charged_request(
             body_bytes.len() as u64,
         )
         .await;
+        let response = match response_policy.as_ref() {
+            Some(policy) => {
+                policy
+                    .a2a_proxy_answer(response)
+                    .await
+            }
+            None => response,
+        };
         connection_guard
             .decrement()
             .await;
@@ -13307,6 +13310,23 @@ async fn handle_fabric_request_inner(
         .cloned()
         .zip(injected_target_header);
     let refusal_trace_id = trace_id.clone();
+    let caller_did = extension_identity
+        .as_ref()
+        .and_then(|identity| identity.did.as_deref());
+    let response_policy = DirectResponsePolicy::for_request(
+        &state,
+        DirectRequest {
+            config_id,
+            trace_id: &trace_id,
+            method: method.as_ref(),
+            path: uri.path(),
+            caller_did,
+            agent: None,
+            extension_identity: extension_identity.as_ref(),
+            identity: authenticated_identity.as_ref(),
+            actor_did: caller_did,
+        },
+    );
     let mut process_response = async move |forward_result: Result<
         Option<crate::gateways::connection_points::messages::ReceivedMessage>,
         String,
@@ -14388,6 +14408,29 @@ async fn handle_fabric_request_inner(
                 }
                 .instrument(_inspect_span)
                 .await?;
+
+                let content_type = response_headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                    .and_then(|(_, value)| {
+                        value.as_str().or_else(|| {
+                            value
+                                .as_array()?
+                                .first()?
+                                .as_str()
+                        })
+                    });
+                if !is_agent_card_request
+                    && let Some(policy) = response_policy.as_ref()
+                    && let Some(refusal) = policy
+                        .refusal(status, response_body.as_bytes(), content_type)
+                        .await
+                {
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Err(refusal);
+                }
 
                 // Build response using Response::builder() like the test that worked
                 let _build_span = tracing::info_span!("fabric.build_response", otel.name = "Build HTTP Response");

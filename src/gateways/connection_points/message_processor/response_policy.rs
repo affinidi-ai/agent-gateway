@@ -8,8 +8,8 @@ use super::{
     filter_mcp_tools_list_for_fabric,
 };
 use crate::proxy::response_policy::{
-    CallerContext, ResponseContext, ResponsePolicyDecision, ResponsePolicyInput, SurfaceContext, check_response_policy,
-    denied_response, response_context,
+    CallerContext, ResponseContext, ResponsePolicyDecision, ResponsePolicyInput, SurfaceContext, answer_contexts,
+    check_response_policy_on_each, denied_response,
 };
 
 /// The response policy of the surface variant serving a Fabric request, with the
@@ -75,23 +75,40 @@ impl FabricResponsePolicy {
         &self,
         response: ResponseContext,
     ) -> ResponsePolicyDecision {
-        self.check_with(
+        self.check_each(vec![response])
+            .await
+    }
+
+    /// Evaluates the policy on each part of one Target answer with the gateway's
+    /// policy manager and records one decision for the answer.
+    async fn check_each(
+        &self,
+        responses: Vec<ResponseContext>,
+    ) -> ResponsePolicyDecision {
+        self.check_each_with(
             GLOBAL_POLICY_MANAGER
                 .get()
                 .map(std::sync::Arc::as_ref),
-            response,
+            responses,
         )
         .await
     }
 
-    /// Evaluates the policy on `response` with `policy_manager` and records the
-    /// decision. Without a policy manager the answer is refused and the decision
-    /// recorded as `no_policy_manager`, as the request plane does.
-    async fn check_with(
+    /// Evaluates the policy on each of `responses` with `policy_manager` and
+    /// records one decision. Without a policy manager the answer goes back
+    /// unchecked, as on the direct path.
+    async fn check_each_with(
         &self,
         policy_manager: Option<&crate::policies::SurfacePolicyManager>,
-        response: ResponseContext,
+        responses: Vec<ResponseContext>,
     ) -> ResponsePolicyDecision {
+        let Some(policy_manager) = policy_manager else {
+            return ResponsePolicyDecision {
+                allow: true,
+                reason: None,
+                error: None,
+            };
+        };
         let context = crate::observability::PolicyDecisionEvent {
             flow: crate::observability::PolicyFlow::Fabric,
             surface_id: Some(&self.surface_id),
@@ -103,28 +120,16 @@ impl FabricResponsePolicy {
             actor_did: self.actor_did.as_deref(),
             ..Default::default()
         };
-        let Some(policy_manager) = policy_manager else {
-            let error = crate::observability::PolicyEvaluationError::NoPolicyManager;
-            crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
-                scope: crate::observability::PolicyScope::Response,
-                allow: false,
-                error: Some(error),
-                policy_id: Some(&self.policy_id),
-                policy_definition_id: Some(&self.policy_id),
-                ..context
-            });
-            return ResponsePolicyDecision {
-                allow: false,
-                reason: None,
-                error: Some(error),
-            };
-        };
-        let input = ResponsePolicyInput::new(response, self.caller.clone(), self.surface.clone());
-        check_response_policy(policy_manager, &self.policy_id, input, context).await
+        let inputs = responses
+            .into_iter()
+            .map(|response| ResponsePolicyInput::new(response, self.caller.clone(), self.surface.clone()));
+        check_response_policy_on_each(policy_manager, &self.policy_id, inputs, context).await
     }
 
     /// The `403` the peer gets when the policy refuses a whole Target answer
     /// with `status`, `body` and `content_type`, or `None` when it may go back.
+    /// An answer still framed as an event stream (an A2A one) is checked event
+    /// by event, as a direct caller's is.
     pub(super) async fn refusal_of_buffered(
         &self,
         status: u16,
@@ -132,7 +137,7 @@ impl FabricResponsePolicy {
         content_type: Option<&str>,
     ) -> Option<ProcessingResult> {
         if self
-            .check(response_context(status, body.as_bytes(), content_type))
+            .check_each(answer_contexts(status, body.as_bytes(), content_type))
             .await
             .allow
         {
@@ -296,21 +301,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fabric_response_policy_without_a_policy_manager_refuses_and_records_why() {
+    async fn a_fabric_response_policy_without_a_policy_manager_lets_the_answer_through() {
         let policy = FabricResponsePolicy::for_request(&served(None), fabric_response_request()).unwrap();
 
         let (decision, decisions) = fabric_response_checked(&policy, None).await;
 
-        assert!(!decision.allow);
-        assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].scope, "response");
-        assert_eq!(decisions[0].decision, "error");
-        assert_eq!(
-            decisions[0]
-                .deny_reason
-                .as_deref(),
-            Some("no_policy_manager")
-        );
+        assert!(decision.allow);
+        assert!(decisions.is_empty());
     }
 
     async fn fabric_response_checked(
@@ -319,7 +316,11 @@ mod tests {
     ) -> (ResponsePolicyDecision, Vec<crate::observability::policy_audit::PolicyDecisionSummary>) {
         let collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let decision = crate::observability::policy_audit::POLICY_DECISION_COLLECTOR
-            .scope(collector.clone(), policy.check_with(manager, response_context(200, b"{}", None)))
+            .scope(
+                collector.clone(),
+                policy
+                    .check_each_with(manager, vec![crate::proxy::response_policy::response_context(200, b"{}", None)]),
+            )
             .await;
         let decisions = collector
             .lock()

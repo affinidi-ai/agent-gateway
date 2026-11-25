@@ -227,6 +227,64 @@ pub fn response_context(
     }
 }
 
+/// What a response policy sees of each event of a buffered `text/event-stream`
+/// answer with `status`: one context per event that carries data, with that
+/// event's JSON as the body, as a direct caller's event stream is checked. Empty
+/// when `body` holds no such event.
+pub fn event_stream_contexts(
+    status: u16,
+    body: &[u8],
+) -> Vec<ResponseContext> {
+    let text = String::from_utf8_lossy(body)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    text.split("\n\n")
+        .filter_map(|event| {
+            let data: Vec<&str> = event
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(|data| {
+                    data.strip_prefix(' ')
+                        .unwrap_or(data)
+                })
+                .collect();
+            (!data.is_empty()).then(|| serde_json::from_str::<Value>(&data.join("\n")).ok())
+        })
+        .map(|event| ResponseContext {
+            status_code: status,
+            is_error: status >= 400
+                || event
+                    .as_ref()
+                    .and_then(|event| event.get("error"))
+                    .is_some_and(|error| !error.is_null()),
+            body: event,
+            content_type: Some(mime::TEXT_EVENT_STREAM.to_string()),
+            method: None,
+        })
+        .collect()
+}
+
+/// What a response policy sees of a whole Target answer with `status`, `body`
+/// and `content_type`: one context per event when it is still framed as an
+/// event stream (see [`event_stream_contexts`]), otherwise one for the answer.
+pub fn answer_contexts(
+    status: u16,
+    body: &[u8],
+    content_type: Option<&str>,
+) -> Vec<ResponseContext> {
+    let events = match content_type {
+        Some(content_type) if crate::mcp::sse_transport::is_sse_content_type(content_type) => {
+            event_stream_contexts(status, body)
+        }
+        _ => Vec::new(),
+    };
+    if events.is_empty() {
+        vec![response_context(status, body, content_type)]
+    } else {
+        events
+    }
+}
+
 impl SurfaceContext {
     /// The response policy's view of `surface`.
     pub fn of(surface: &crate::config::agent_surface::AgentSurface) -> Self {
@@ -317,10 +375,33 @@ pub async fn check_response_policy(
     input: ResponsePolicyInput,
     context: crate::observability::PolicyDecisionEvent<'_>,
 ) -> ResponsePolicyDecision {
+    check_response_policy_on_each(policy_manager, policy_id, [input], context).await
+}
+
+/// Evaluates response policy `policy_id` on each of `inputs`, the parts of one
+/// answer, until one is refused, and records one response-scope decision for
+/// the answer: the refusal, or the allow when every part is allowed.
+pub async fn check_response_policy_on_each(
+    policy_manager: &crate::policies::surface_manager::SurfacePolicyManager,
+    policy_id: &str,
+    inputs: impl IntoIterator<Item = ResponsePolicyInput>,
+    context: crate::observability::PolicyDecisionEvent<'_>,
+) -> ResponsePolicyDecision {
     let attestation = policy_manager
         .resolve_policy_attestation(Some(policy_id))
         .await;
-    let decision = evaluate_response_policy(policy_manager, &response_policy_key(policy_id), input);
+    let key = response_policy_key(policy_id);
+    let mut decision = ResponsePolicyDecision {
+        allow: true,
+        reason: None,
+        error: None,
+    };
+    for input in inputs {
+        decision = evaluate_response_policy(policy_manager, &key, input);
+        if !decision.allow {
+            break;
+        }
+    }
     crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
         scope: crate::observability::PolicyScope::Response,
         allow: decision.allow,
@@ -678,6 +759,94 @@ mod tests {
         let denied = mcp_proxy_refusal(&answer, Some(&serde_json::json!(7)), |_| async { decided(true) }).await;
 
         assert_eq!(denied, None);
+    }
+
+    #[test]
+    fn each_data_event_of_an_event_stream_is_its_own_context() {
+        let body = b"event: message\r\ndata: {\"id\":1,\"result\":{\"kind\":\"task\"}}\r\n\r\n: keep-alive\n\ndata: {\"id\":1,\"error\":{\"code\":-1}}\n\n";
+
+        let contexts = event_stream_contexts(200, body);
+
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[0].body, Some(serde_json::json!({"id": 1, "result": {"kind": "task"}})));
+        assert!(!contexts[0].is_error);
+        assert!(contexts[1].is_error);
+        assert_eq!(
+            contexts[1]
+                .content_type
+                .as_deref(),
+            Some("text/event-stream")
+        );
+    }
+
+    #[test]
+    fn a_body_with_no_data_event_gives_no_contexts() {
+        assert!(event_stream_contexts(200, b"{\"result\":{}}").is_empty());
+    }
+
+    fn input_with_body(body: Value) -> ResponsePolicyInput {
+        let mut input = minimal_input();
+        input.response.body = Some(body);
+        input
+    }
+
+    #[tokio::test]
+    async fn one_refused_part_refuses_the_answer_with_one_record() {
+        use crate::observability::policy_audit::POLICY_DECISION_COLLECTOR;
+        let manager = manager_with(
+            "package surface.policy\n\ndefault allow := true\n\nallow := false if {\n    input.response.body.result.secret\n}\n",
+        );
+        let collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let decision = POLICY_DECISION_COLLECTOR
+            .scope(
+                collector.clone(),
+                check_response_policy_on_each(
+                    &manager,
+                    "pol-1",
+                    [
+                        input_with_body(serde_json::json!({"result": {"kind": "task"}})),
+                        input_with_body(serde_json::json!({"result": {"secret": "s"}})),
+                    ],
+                    crate::observability::PolicyDecisionEvent::default(),
+                ),
+            )
+            .await;
+
+        assert!(!decision.allow);
+        let recorded = collector
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].decision, "deny");
+    }
+
+    #[tokio::test]
+    async fn every_allowed_part_is_recorded_as_one_allow() {
+        use crate::observability::policy_audit::POLICY_DECISION_COLLECTOR;
+        let manager = manager_with(ALLOW_ALL);
+        let collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let decision = POLICY_DECISION_COLLECTOR
+            .scope(
+                collector.clone(),
+                check_response_policy_on_each(
+                    &manager,
+                    "pol-1",
+                    [minimal_input(), minimal_input(), minimal_input()],
+                    crate::observability::PolicyDecisionEvent::default(),
+                ),
+            )
+            .await;
+
+        assert!(decision.allow);
+        let recorded = collector
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].decision, "allow");
     }
 
     #[test]

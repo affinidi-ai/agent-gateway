@@ -11,15 +11,38 @@ changes:
         via_fabric false, so the Audit Log detail and audit integrations (AUDIT_VIA_FABRIC) showed
         these decisions as direct; the Fabric tools/list filter record also said flow access_point
         and now says fabric. Records written before the fix keep what they said.
+    - timestamp: '2026-11-25T18:00:00Z'
+      title: Keep a policy-refused a2a-proxy answer out of the proxy's failure count
+      description: >-
+        The a2a-proxy connection metric now records the proxy's own answer before the response
+        policy checks it, directly and over Fabric. Before, a healthy proxy whose answer the policy
+        refused was counted as a failed connection.
   removed: []
   security:
     - timestamp: '2026-11-25T18:00:00Z'
       title: ⭐ Apply a surface's response policy to answers sent back over Fabric
       description: >-
-        A surface's response policy now runs on every Target answer the gateway returns to a peer
-        gateway over Fabric (A2A, legacy and modern MCP, and MCP Proxy Targets) and records its
-        decision in the VP Audit Log, as it already did for direct callers. Before, a Fabric caller
-        received answers the policy was meant to block, and no response decision was recorded.
+        A surface's response policy now runs on the Target answers the gateway returns to a peer
+        gateway over Fabric (A2A, legacy MCP, the complete result of a modern MCP response, and MCP
+        Proxy Targets) and records its decision in the VP Audit Log, as it already did for direct
+        callers. Before, a Fabric caller received answers the policy was meant to block, and no
+        response decision was recorded. Review response policies for Fabric callers before
+        upgrading: their input.caller differs from a direct caller's (see docs/POLICY.md), so a
+        policy that allows by caller DID or identity source may start refusing peers. Those
+        refusals show in the Audit Log with via_fabric true.
+    - timestamp: '2026-11-25T18:00:00Z'
+      title: Apply the response policy of a surface with a fabric:// Target
+      description: >-
+        A surface whose Target is fabric:// now runs its own response policy on the answer the peer
+        gateway sends back, refusing it with 403 response_policy_denied when the policy denies it.
+        Before, only the receiving surface's response policy checked that answer.
+    - timestamp: '2026-11-25T18:00:00Z'
+      title: Check each event of a streamed A2A answer sent back over Fabric
+      description: >-
+        An A2A answer framed as an event stream that the gateway returns over Fabric now reaches the
+        response policy event by event, each event's JSON as input.response.body, as a direct
+        caller's stream does. Before, the policy saw a null body for the whole stream, so a rule on
+        the answer's content could not match it.
     - timestamp: '2026-11-25T18:00:00Z'
       title: Apply a surface's response policy to a2a-proxy Target answers
       description: >-
