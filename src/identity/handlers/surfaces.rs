@@ -1313,6 +1313,8 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResp
 async fn save_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
 ) -> axum::http::HeaderMap {
     let issuers = jwt_strategy_issuers(state, surface).await;
     let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
@@ -1324,7 +1326,7 @@ async fn save_warnings(
         surface,
     )
     .await;
-    let route_clashes = stored_listen_path_route_clash_warnings(state, surface).await;
+    let route_clashes = stored_listen_path_route_clash_warnings(state, surface, context, scope).await;
     let mut headers = axum::http::HeaderMap::new();
     for warning in surface
         .access_point_warnings()
@@ -2476,7 +2478,7 @@ fn check_listen_path_shadowing(
         }
     }
 
-    for clash in listen_path_route_clashes(surface, others, resolve_port) {
+    for clash in listen_path_route_clashes(surface, others, resolve_port, &|_| true) {
         let claim = (clash.key.clone(), clash.path.clone());
         // A path the same Transit Point already held is exempt, unless the route it now
         // clashes with is one of this surface's own that this save introduces:
@@ -2523,10 +2525,14 @@ struct ListenPathRouteClash {
 /// answers on, of this surface or of an active one in `others`, whatever the
 /// stored surface held: [`check_listen_path_shadowing`] refuses the ones a
 /// save introduces, and [`listen_path_route_clash_warnings`] tells the rest.
+///
+/// `names_owner` says whether a message may name another surface and its
+/// Transit Point; one it may not is called another surface's route alone.
 fn listen_path_route_clashes(
     surface: &AgentSurface,
     others: &[AgentSurface],
     resolve_port: &impl Fn(&str) -> Option<u16>,
+    names_owner: &impl Fn(&AgentSurface) -> bool,
 ) -> Vec<ListenPathRouteClash> {
     // Every derived route on every listener, with the point and surface it
     // belongs to. The surface being saved is held as `Mine`, never by name or
@@ -2540,8 +2546,7 @@ fn listen_path_route_clashes(
             derived.insert(
                 (key, route),
                 RouteOwner::Theirs {
-                    surface: owner.name.clone(),
-                    point,
+                    named: names_owner(owner).then(|| (owner.name.clone(), point)),
                 },
             );
         }
@@ -2592,13 +2597,17 @@ fn listen_path_route_clashes(
                     point.describe()
                 )
             }
-            Some(RouteOwner::Theirs { surface, point }) => {
+            Some(RouteOwner::Theirs { named: Some((surface, point)) }) => {
                 format!(
                     "the route {} of surface '{surface}' answers on, so the listener would register one of the \
                      two and skip the other",
                     point.describe()
                 )
             }
+            Some(RouteOwner::Theirs { named: None }) => "a route a Transit Point of another surface answers on, so \
+                                                         the listener would register one of the two and skip the \
+                                                         other"
+                .to_string(),
         };
         let message = format!(
             "listen_path '{}' on {} is {reason}; choose a different listener path",
@@ -2621,27 +2630,32 @@ fn listen_path_route_clashes(
 /// ([`listen_path_route_clashes`]). The save that introduces one is refused
 /// ([`check_listen_path_shadowing`]), so a warning is what a clash the surface
 /// is already stored with gets. A disabled surface registers no route, so it
-/// clashes with nothing.
+/// clashes with nothing. Another surface is named only where `visible` says
+/// the caller may read it, so the header discloses nothing a read would not.
 fn listen_path_route_clash_warnings(
     surface: &AgentSurface,
     others: &[AgentSurface],
     resolve_port: &impl Fn(&str) -> Option<u16>,
+    visible: &impl Fn(&AgentSurface) -> bool,
 ) -> Vec<String> {
     if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
         return Vec::new();
     }
-    listen_path_route_clashes(surface, others, resolve_port)
+    listen_path_route_clashes(surface, others, resolve_port, visible)
         .into_iter()
         .map(|clash| clash.message)
         .collect()
 }
 
 /// [`listen_path_route_clash_warnings`] for a surface just saved, against every
-/// surface the store holds. A store that cannot be listed costs the warning,
-/// never the save, which has already happened.
+/// surface the store holds, naming only those the caller may read
+/// ([`surface_visible`] for `context` and `scope`). A store that cannot be
+/// listed costs the warning, never the save, which has already happened.
 async fn stored_listen_path_route_clash_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
 ) -> Vec<String> {
     let Some(store) = state
         .agent_surface_store
@@ -2661,7 +2675,9 @@ async fn stored_listen_path_route_clash_warnings(
         return Vec::new();
     }
     match store.list_all().await {
-        Ok(others) => listen_path_route_clash_warnings(surface, &others, &resolve_port),
+        Ok(others) => listen_path_route_clash_warnings(surface, &others, &resolve_port, &|other: &AgentSurface| {
+            surface_visible(other.tenant_id.as_deref(), &other.surface_id, context, scope)
+        }),
         Err(error) => {
             tracing::warn!("Could not list surfaces for listen_path clash warnings: {error}");
             Vec::new()
@@ -2674,8 +2690,14 @@ async fn stored_listen_path_route_clash_warnings(
 /// route, so no two surfaces can be confused for sharing a name or an id.
 #[derive(Debug)]
 enum RouteOwner {
-    Mine { point: RoutePoint },
-    Theirs { surface: String, point: RoutePoint },
+    Mine {
+        point: RoutePoint,
+    },
+    /// Another surface's, with its name and point where the message may name
+    /// them, `None` where the caller may not read that surface.
+    Theirs {
+        named: Option<(String, RoutePoint)>,
+    },
 }
 
 /// The stored surface a save's exemptions may rest on: none while that surface
@@ -3891,7 +3913,7 @@ pub async fn create_surface(
 
     Ok((
         StatusCode::CREATED,
-        save_warnings(&state, &surface).await,
+        save_warnings(&state, &surface, tenant_context(&context), resource_scope(&scope)).await,
         SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, surface).await, warnings),
     ))
 }
@@ -3996,7 +4018,7 @@ pub async fn update_surface(
     )
     .await?;
     Ok((
-        save_warnings(&state, &saved).await,
+        save_warnings(&state, &saved, tenant_context(&context), resource_scope(&scope)).await,
         SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, saved).await, warnings),
     ))
 }
@@ -5037,7 +5059,7 @@ pub async fn patch_surface(
     )
     .await?;
     Ok((
-        save_warnings(&state, &saved).await,
+        save_warnings(&state, &saved, tenant_context(&context), resource_scope(&scope)).await,
         SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, saved).await, warnings),
     ))
 }
@@ -5157,7 +5179,7 @@ pub async fn patch_variant(
     )
     .await?;
     Ok((
-        save_warnings(&state, &saved).await,
+        save_warnings(&state, &saved, tenant_context(&context), resource_scope(&scope)).await,
         SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, saved).await, warnings),
     ))
 }
@@ -5915,7 +5937,7 @@ pub async fn create_variant(
 
     info!("Created variant '{}' (id={}) on surface '{}'", new_variant.alias, new_variant.id, surface_id);
 
-    let mut headers = save_warnings(&state, &saved).await;
+    let mut headers = save_warnings(&state, &saved, tenant_context(&context), resource_scope(&scope)).await;
     if left_out_target_binding && let Some(value) = warning_header(&copied_target_binding_warning(&new_variant.alias)) {
         headers.append(axum::http::header::WARNING, value);
     }
@@ -6091,7 +6113,7 @@ pub async fn update_variant(
     info!("Updated variant '{}' (id={}) on surface '{}'", updated.alias, updated.id, surface_id);
 
     Ok((
-        save_warnings(&state, &saved).await,
+        save_warnings(&state, &saved, tenant_context(&context), resource_scope(&scope)).await,
         SurfaceSaveResponse::new(SurfaceResponse::variant(updated, &saved), warnings),
     ))
 }
@@ -6229,7 +6251,7 @@ pub async fn promote_variant_to_default(
     info!("Promoted variant '{}' (id={}) to default on surface '{}'", variant_alias, variant_id, surface_id);
 
     Ok((
-        save_warnings(&state, &saved).await,
+        save_warnings(&state, &saved, tenant_context(&context), resource_scope(&scope)).await,
         SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, saved).await, warnings),
     ))
 }
@@ -10091,14 +10113,20 @@ mod validation_tests {
             .expect("a path the surface already held, saved unchanged, is exempt");
 
         // Exempt, and still told: the save answers it with a Warning.
-        let warnings = listen_path_route_clash_warnings(&stored, std::slice::from_ref(&other), &no_ports);
+        let warnings = listen_path_route_clash_warnings(&stored, std::slice::from_ref(&other), &no_ports, &|_| true);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("listen_path '/outbound/agents/a/alpha'"), "{warnings:?}");
         assert!(warnings[0].contains("Transit Point 'alpha' of surface 'other'"), "{warnings:?}");
+        // A caller that may not read the other surface is told of the clash
+        // without its name or its Transit Point's alias.
+        let hidden = listen_path_route_clash_warnings(&stored, std::slice::from_ref(&other), &no_ports, &|_| false);
+        assert_eq!(hidden.len(), 1, "{hidden:?}");
+        assert!(hidden[0].contains("a Transit Point of another surface"), "{hidden:?}");
+        assert!(!hidden[0].contains("'other'") && !hidden[0].contains("'alpha'"), "{hidden:?}");
         let mut disabled = stored.clone();
         disabled.status = SurfaceStatus::Disabled;
         assert!(
-            listen_path_route_clash_warnings(&disabled, std::slice::from_ref(&other), &no_ports).is_empty(),
+            listen_path_route_clash_warnings(&disabled, std::slice::from_ref(&other), &no_ports, &|_| true).is_empty(),
             "a disabled surface registers no route, so it clashes with nothing"
         );
 

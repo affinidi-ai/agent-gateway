@@ -120,6 +120,8 @@ describe('a Transit Point on an outbound address with a hostname of its own', ()
 
     expect(updateFields).toHaveBeenCalledWith(expect.objectContaining({ listen_path: '' }));
     expect(held.listen_path).toBe('');
+    // The prefix is cleared with it, so the empty pair is not marked invalid after Save.
+    expect(held.route_prefix).toBe('');
   });
 
   // A cleared path answers at the derived route: reopening the panel must not seed a

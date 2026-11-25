@@ -384,6 +384,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   path on an address with a hostname of its own. It runs only on a path the save introduces or
   changes, compared with `options.stored`, because that is what the admin API refuses: a surface
   already stored with such a path stays editable and its save is answered with a `Warning` header.
+  A variant view is also given `options.base`, the base surface as stored and as the save sends
+  it, so a variant repeating a path its base point keeps is exempt as the gateway exempts it,
+  even in a variant added in this session, which has no stored view.
   That comparison is why the rule cannot live in the node's `incompleteReason`, which sees no
   stored surface. Clearing the path saves, and `validateSurfacePayload` warns that the stored path
   stops answering. A base Transit Point's Listen Path edit is carried into every variant snapshot

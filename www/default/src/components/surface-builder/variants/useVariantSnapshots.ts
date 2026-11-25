@@ -205,26 +205,45 @@ export function syncAccessPointIdentifiers(
 
 const LISTEN_PATH_CANVAS_FIELDS = ['listen_path', 'route_prefix', 'route_suffix'] as const;
 
-function transitPointsOf(payload: any): any[] {
-  return Array.isArray(payload?.transit?.points) ? payload.transit.points : [];
+/** `value` as a plain object whose fields may be read, or `undefined`. */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+/** A snapshot payload's `transit.points`, each entry still to be narrowed, or none. */
+function transitPointsOf(payload: unknown): unknown[] {
+  const points = asRecord(asRecord(payload)?.transit)?.points;
+  return Array.isArray(points) ? points : [];
+}
+
+/** A snapshot payload's `canvas.nodes`, each entry still to be narrowed, or `undefined`. */
+function canvasNodesOf(payload: unknown): unknown[] | undefined {
+  const nodes = asRecord(asRecord(payload)?.canvas)?.nodes;
+  return Array.isArray(nodes) ? nodes : undefined;
 }
 
 /**
- * Whether canvas node `n` is the one for Transit Point `point`: by the point's
+ * Whether canvas node `node` is the one for Transit Point `point`: by the point's
  * id, which a node keeps while its alias may be derived, else by alias.
  */
-function isCanvasNodeOf(n: any, point: any): boolean {
+function isCanvasNodeOf(node: unknown, point: unknown): boolean {
+  const n = asRecord(node);
   if (typeof n?.type !== 'string' || !isTransitPointType(n.type)) return false;
-  const config = n.config;
-  if (!config || typeof config !== 'object') return false;
-  if (typeof point?.id === 'string' && point.id && config.id === point.id) return true;
-  return typeof config.alias === 'string' && config.alias === point?.alias;
+  const config = asRecord(n.config);
+  if (!config) return false;
+  const p = asRecord(point);
+  if (typeof p?.id === 'string' && p.id && config.id === p.id) return true;
+  return typeof config.alias === 'string' && config.alias === p?.alias;
 }
 
-function transitPointCanvasConfig(payload: any, point: any): Record<string, unknown> | undefined {
-  const nodes = payload?.canvas?.nodes;
-  if (!Array.isArray(nodes)) return undefined;
-  return nodes.find((n: any) => isCanvasNodeOf(n, point))?.config;
+function transitPointCanvasConfig(
+  payload: unknown,
+  point: unknown
+): Record<string, unknown> | undefined {
+  const node = canvasNodesOf(payload)?.find(n => isCanvasNodeOf(n, point));
+  return asRecord(asRecord(node)?.config);
 }
 
 function withFieldsFrom(
@@ -254,67 +273,76 @@ function withFieldsFrom(
  * `route_prefix` / `route_suffix` in the variant's canvas blob follow the
  * base's too, so the panel shows the path that is saved.
  */
-export function propagateBaseListenPaths(
-  snapshots: Record<string, any>,
-  previousBase: any,
-  nextBase: any
-): Record<string, any> {
-  const previous = transitPointsOf(previousBase);
-  const changes = transitPointsOf(nextBase).flatMap((point: any) => {
+export function propagateBaseListenPaths<S extends Record<string, unknown>>(
+  snapshots: S,
+  previousBase: unknown,
+  nextBase: unknown
+): S {
+  const previous = transitPointsOf(previousBase).map(asRecord);
+  const changes = transitPointsOf(nextBase).flatMap(entry => {
+    const point = asRecord(entry);
     const alias = point?.alias;
-    if (typeof alias !== 'string') return [];
-    const before = previous.find((p: any) => p?.alias === alias);
+    if (!point || typeof alias !== 'string') return [];
+    const before = previous.find(p => p?.alias === alias);
     if (!before || before.listen_path === point.listen_path) return [];
     return [
       {
         alias,
-        from: before.listen_path as unknown,
-        to: point.listen_path as unknown,
+        from: before.listen_path,
+        to: point.listen_path,
         canvas: transitPointCanvasConfig(nextBase, point),
       },
     ];
   });
   if (changes.length === 0) return snapshots;
-  const out: Record<string, any> = {};
+  const out: Record<string, unknown> = {};
   for (const [id, snap] of Object.entries(snapshots)) {
-    if (id === BASE_VARIANT_ID || !snap || typeof snap !== 'object') {
+    const record = asRecord(snap);
+    if (id === BASE_VARIANT_ID || !record) {
       out[id] = snap;
       continue;
     }
-    let next = snap;
+    let next: Record<string, unknown> = record;
     for (const change of changes) {
       const points = transitPointsOf(next);
-      const index = points.findIndex(
-        (p: any) => p?.alias === change.alias && p.listen_path === change.from
-      );
+      const index = points.findIndex(entry => {
+        const p = asRecord(entry);
+        return p?.alias === change.alias && p.listen_path === change.from;
+      });
       if (index < 0) continue;
+      const moved = asRecord(points[index]) ?? {};
       const nextPoints = [...points];
-      nextPoints[index] = withFieldsFrom(points[index], { listen_path: change.to }, [
-        'listen_path',
-      ]);
-      next = { ...next, transit: { ...next.transit, points: nextPoints } };
-      const nodes = next.canvas?.nodes;
-      if (Array.isArray(nodes)) {
+      nextPoints[index] = withFieldsFrom(moved, { listen_path: change.to }, ['listen_path']);
+      next = { ...next, transit: { ...asRecord(next.transit), points: nextPoints } };
+      const nodes = canvasNodesOf(next);
+      if (nodes) {
         const canvasSource = change.canvas ?? { listen_path: change.to };
         next = {
           ...next,
           canvas: {
-            ...next.canvas,
-            nodes: nodes.map((n: any) =>
-              isCanvasNodeOf(n, points[index])
+            ...asRecord(next.canvas),
+            nodes: nodes.map(n => {
+              const node = asRecord(n);
+              return node && isCanvasNodeOf(node, moved)
                 ? {
-                    ...n,
-                    config: withFieldsFrom(n.config, canvasSource, LISTEN_PATH_CANVAS_FIELDS),
+                    ...node,
+                    config: withFieldsFrom(
+                      asRecord(node.config) ?? {},
+                      canvasSource,
+                      LISTEN_PATH_CANVAS_FIELDS
+                    ),
                   }
-                : n
-            ),
+                : n;
+            }),
           },
         };
       }
     }
     out[id] = next;
   }
-  return out;
+  // Every entry is the caller's own snapshot, or that snapshot with its Listen Path fields
+  // rewritten, so the map keeps the caller's type.
+  return out as S;
 }
 
 /**

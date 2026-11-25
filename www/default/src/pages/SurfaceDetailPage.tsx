@@ -969,8 +969,16 @@ const SurfaceDetailPage: React.FC = () => {
       // Against the stored view the canvas is showing, which is a variant whenever one is
       // active, not the base surface underneath it.
       const activeId = variantSnapshots.activeVariantId ?? BASE_VARIANT_ID;
+      // A variant view may repeat a path its base point keeps, which the gateway exempts
+      // even in a variant added in this session, so each is also read against the base as
+      // stored and as this save sends it.
+      const baseDraft =
+        activeId === BASE_VARIANT_ID ? draftPayload : getVariantSnapshot(BASE_VARIANT_ID);
+      const baseFor = (vid: string) =>
+        vid === BASE_VARIANT_ID || !surface ? undefined : { stored: surface, draft: baseDraft };
       const issues = validateSurfacePayload(draftPayload, {
         stored: surface ? storedViewFor(activeId) : undefined,
+        base: baseFor(activeId),
       });
       const firstError = issues.find(i => i.severity === 'error');
       if (firstError) {
@@ -1051,7 +1059,10 @@ const SurfaceDetailPage: React.FC = () => {
         }
         // Each snapshot against its own stored view, so a legacy value this save never
         // touched stays exempt, as it is for the gateway.
-        const variantIssues = validateSurfacePayload(snap, { stored: storedViewFor(vid) });
+        const variantIssues = validateSurfacePayload(snap, {
+          stored: storedViewFor(vid),
+          base: baseFor(vid),
+        });
         const variantErr = variantIssues.find(i => i.severity === 'error');
         if (variantErr) {
           return {

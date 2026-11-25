@@ -141,6 +141,13 @@ export interface ValidateSurfaceOptions {
    * is judged, so a slow fetch never blocks a save.
    */
   routing?: RoutingConfig | null;
+  /**
+   * For a variant view: the base surface as stored and as this save sends it. A variant
+   * Listen Path equal to its base point's path in both repeats the base point's kept claim,
+   * which adds no route, so it is exempt as the gateway exempts it, even in a variant added
+   * in this session, which has no stored view of its own.
+   */
+  base?: { stored: unknown; draft: unknown };
 }
 
 /**
@@ -282,6 +289,17 @@ export function validateSurfacePayload(
   // What the stored surface's Transit Points already claim, so a save that keeps a
   // claim is told apart from one that introduces or changes it. Empty on a create.
   const storedPoints: StoredTransitPoint[] = storedTransitPoints(options.stored);
+  // The base point paths a variant view may repeat without introducing them: kept by the
+  // stored base and still held by the base this save sends. A disabled stored base claims
+  // nothing (`storedTransitPoints`).
+  const storedBasePoints = options.base ? storedTransitPoints(options.base.stored) : [];
+  const draftBase = (options.base?.draft as { transit?: { points?: unknown } } | null)?.transit
+    ?.points;
+  const draftBasePoints: StoredTransitPoint[] = Array.isArray(draftBase) ? draftBase : [];
+  const repeatsKeptBasePath = (alias: string, path: string) =>
+    !!alias &&
+    storedBasePoints.some(p => text(p?.alias) === alias && text(p?.listen_path) === path) &&
+    draftBasePoints.some(p => text(p?.alias) === alias && text(p?.listen_path) === path);
 
   // A Listen Path the gateway will not serve, refused here before the round trip, and
   // only when this save introduces or changes it. That is what the admin API refuses:
@@ -303,6 +321,7 @@ export function validateSurfacePayload(
       const before = storedPoints.find(stored => alias && text(stored?.alias) === alias);
       const kept = text(before?.listen_path);
       if (kept === path) return;
+      if (repeatsKeptBasePath(alias, path)) return;
       const problem = listenPathProblem(tp, routing);
       if (problem) {
         issues.push({

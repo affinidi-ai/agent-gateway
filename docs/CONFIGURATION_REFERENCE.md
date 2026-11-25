@@ -171,7 +171,9 @@ the `listen_path` registration wins over the variant one and the request is then
 custom route, so a caller that named the variant is served by the default variant's Target. As
 with the other refusals, only a path a save introduces or changes is refused, with the code
 `listen_path_route_clash`; a clash the surface is already stored with is answered with a
-`Warning` header of the same text on every save, until one of the two paths moves.
+`Warning` header of the same text on every save, until one of the two paths moves. The warning
+names another surface and its Transit Point only where the caller may read that surface; for a
+caller whose token cannot, it says the route is another surface's.
 
 `shared_hostname_outbound_addresses` of `GET /v1/config/surface-routing` names every outbound
 address whose listener the inbound `/outbound` proxy forwards to, which is where the

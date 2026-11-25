@@ -205,6 +205,28 @@ describe('validateSurfacePayload', () => {
         expect(issue?.message).toContain(reason);
       }
     });
+
+    // The gateway exempts a variant copy of a path the base point held before the save and
+    // still holds, even in a variant added in this save, which has no stored view.
+    it('exempts a new variant repeating a legacy path its base point keeps', () => {
+      const legacy = '/outbound/agents/{partner}';
+      const base = surface(legacy);
+      const listenPathIssue = (options: Parameters<typeof validateSurfacePayload>[1]) =>
+        validateSurfacePayload(surface(legacy), options).find(i => i.path?.endsWith('listen_path'));
+      expect(
+        listenPathIssue({ stored: null, routing, base: { stored: base, draft: base } })
+      ).toBeUndefined();
+      // A base that moves its path in this save, or never held it, leaves the copy introduced.
+      for (const moved of [
+        { stored: base, draft: surface('/outbound/agents/new') },
+        { stored: surface(), draft: base },
+        { stored: { ...base, status: 'disabled' }, draft: base },
+      ]) {
+        expect(listenPathIssue({ stored: null, routing, base: moved })).toMatchObject({
+          severity: 'error',
+        });
+      }
+    });
   });
 
   describe('a variant Listen Path its base Transit Point does not hold', () => {
