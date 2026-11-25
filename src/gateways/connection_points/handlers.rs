@@ -606,9 +606,9 @@ async fn load_accessible_connection_point<S: ConnectionPointStore>(
     Ok((connection_point, gateway))
 }
 
-/// Loads a User connection point for the by-id routes that return or change the record:
-/// get, use, update, exposed-surfaces, mediator-access and continue. They answer 404 for a
-/// System point, as the lists leave it out: a System point is the gateway's own, and a paused
+/// Loads a User connection point for the by-id routes that return or change the record: get,
+/// use, update, exposed-surfaces, reconnect, mediator-access and continue. They answer 404 for
+/// a System point, as the lists leave it out: a System point is the gateway's own, and a paused
 /// acceptance's temporary point holds the inviter's invitation URL and secret.
 async fn load_user_connection_point<S: ConnectionPointStore>(
     store: &S,
@@ -1972,8 +1972,7 @@ pub async fn reconnect_connection_point<P: ConnectionPointStore, M: MediatorStor
     info!("Manual reconnect requested for connection point: {}", id);
 
     let (mut connection_point, _) =
-        load_accessible_connection_point(cp_store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, true)
-            .await?;
+        load_user_connection_point(cp_store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, true).await?;
 
     // Resolve the mediator DID + URL (mediator_id may be a DID or a stored UUID).
     let (mediator_did, mediator_url) = if connection_point
@@ -2834,7 +2833,25 @@ mod tests {
         )
         .await
         .expect_err("exposed surfaces");
-        for err in [used, updated, exposed] {
+        let mediators = Arc::new(
+            crate::mediators::FileSystemMediatorStore::new(dir.path().join("mediators"))
+                .await
+                .unwrap(),
+        );
+        let (reconnect_listeners, _reconnect_dir) =
+            crate::gateways::test_helpers::test_listener_manager(dir.path()).await;
+        let reconnected = super::reconnect_connection_point(
+            Extension(points.clone()),
+            Extension(gateways.clone()),
+            Extension(mediators),
+            Extension(Arc::new(reconnect_listeners)),
+            Path(system.id.clone()),
+            None,
+            None,
+        )
+        .await
+        .expect_err("reconnect");
+        for err in [used, updated, exposed, reconnected] {
             assert_eq!(err.0, StatusCode::NOT_FOUND);
         }
         let stored = points
