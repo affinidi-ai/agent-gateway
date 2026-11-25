@@ -131,7 +131,7 @@ fn validate_identity_extraction(
 }
 
 pub(crate) const INBOUND_API_KEY_NEEDS_API_KEY_CALLER: &str =
-    "Identity 'From API Key' needs every Caller Context method to be API Key or API Key Provider";
+    "Identity 'From API Key' needs an API Key or API Key Provider Caller Context method";
 pub(crate) const INBOUND_API_KEY_WITH_RESOURCE_TOKENS: &str = "Identity 'From API Key' cannot be used with \
      mcp_http.authorization, which identifies callers by their resource token; remove one of them";
 pub(crate) const INBOUND_API_KEY_ON_MCP_PROXY: &str =
@@ -191,11 +191,10 @@ fn validate_api_key_identities(
     };
     let inbound_from_api_key = surface.inbound_identity_from_api_key();
     if inbound_from_api_key {
-        let methods = surface.source_auth_methods();
-        if methods.is_empty()
-            || !methods
-                .iter()
-                .all(|method| matches!(method, SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_)))
+        if !surface
+            .source_auth_methods()
+            .iter()
+            .any(|method| matches!(method, SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_)))
         {
             return Err(refuse(INBOUND_API_KEY_NEEDS_API_KEY_CALLER));
         }
@@ -9415,20 +9414,22 @@ mod validation_tests {
     fn inbound_from_api_key_refusal_matches_the_dashboard_text() {
         assert_eq!(
             INBOUND_API_KEY_NEEDS_API_KEY_CALLER,
-            "Identity 'From API Key' needs every Caller Context method to be API Key or API Key Provider"
+            "Identity 'From API Key' needs an API Key or API Key Provider Caller Context method"
         );
     }
 
     #[test]
-    fn inbound_from_api_key_is_refused_unless_every_caller_method_is_an_api_key() {
+    fn inbound_from_api_key_needs_an_api_key_method_to_read() {
+        for (case, caller) in [("no caller authentication", vec![]), ("jwt only", vec![jwt_caller()])] {
+            let s = inbound_api_key_surface(&caller);
+            assert!(refusal(validate_api_key_identities(&s, "")) == INBOUND_API_KEY_NEEDS_API_KEY_CALLER, "{case}");
+        }
         for (case, caller) in [
-            ("no caller authentication", vec![]),
-            ("jwt only", vec![jwt_caller()]),
             ("api key second", vec![jwt_caller(), provider_caller()]),
             ("jwt second", vec![api_key_caller("caller-keys"), jwt_caller()]),
         ] {
             let s = inbound_api_key_surface(&caller);
-            assert!(refusal(validate_api_key_identities(&s, "")) == INBOUND_API_KEY_NEEDS_API_KEY_CALLER, "{case}");
+            assert!(validate_api_key_identities(&s, "").is_ok(), "{case}");
         }
 
         let mut other_mode = inbound_api_key_surface(&[jwt_caller()]);

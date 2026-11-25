@@ -4221,8 +4221,8 @@ impl AgentSurface {
     /// Whether a caller whose credential is missing or invalid is refused
     /// before policy and the Target: on every Access Point that is not public
     /// (closed or legacy, whatever `on_failure` stores), and on a public one
-    /// whose inbound identity is `from_jwt_claim`, which derives no caller
-    /// identity without a valid JWT, or that is edited by hand to
+    /// whose inbound identity is `from_jwt_claim`, which refuses a failed
+    /// caller of every method there, or that is edited by hand to
     /// `on_failure: reject`.
     pub fn rejects_failed_caller_authentication(&self) -> bool {
         self.access_point.public != Some(true)

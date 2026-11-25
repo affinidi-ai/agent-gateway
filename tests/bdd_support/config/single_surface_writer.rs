@@ -518,6 +518,10 @@ fn write_single_surface_config_inner(
         );
     }
 
+    if surface_config.api_key_inbound_identity {
+        surface_fixture = surface_fixture.with_identity_slot("inbound", serde_json::json!({"type": "from_api_key"}));
+    }
+
     if surface_config.mcp_inbound_identity {
         let mut inbound_slot = serde_json::json!({
             "type": "payload_extraction",
