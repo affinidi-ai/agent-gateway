@@ -693,18 +693,14 @@ fn stored_users(world: &SurfaceWorld) -> Vec<Value> {
     stored
 }
 
-#[then(expr = "no human user {string} is stored")]
-fn no_console_user_is_stored(
-    world: &mut SurfaceWorld,
-    username: String,
-) {
+#[then("only the first human user is stored")]
+fn only_the_first_console_user_is_stored(world: &mut SurfaceWorld) {
     let stored = stored_users(world);
-    assert!(
-        stored
-            .iter()
-            .all(|user| user["username"] != username),
-        "the refused sign-in stored {username:?}: {stored:?}"
-    );
+    let names: Vec<&Value> = stored
+        .iter()
+        .map(|user| &user["username"])
+        .collect();
+    assert_eq!(stored.len(), 1, "the refused sign-in left another account: {names:?}");
 }
 
 #[then(expr = "human user {string} is stored once")]

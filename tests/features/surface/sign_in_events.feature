@@ -123,7 +123,7 @@ Feature: Sign-in integration events
     When "mallory" signs in with SAML carrying two different user IDs as repeated attributes
     Then the response status is 403
     And the gateway issues no session cookie
-    And no human user "mallory" is stored
+    And only the first human user is stored
     And the integration receives a "user.login_failed" event with login method "saml" and failure reason "ambiguous_attribute"
     And the integration receives no other sign-in event besides the first user's
 
@@ -142,7 +142,7 @@ Feature: Sign-in integration events
     When "mallory" signs in with SAML carrying two different usernames as repeated attributes
     Then the response status is 403
     And the gateway issues no session cookie
-    And no human user "mallory" is stored
+    And only the first human user is stored
     And the integration receives a "user.login_failed" event with login method "saml" and failure reason "ambiguous_attribute"
     And the integration receives no other sign-in event besides the first user's
 
