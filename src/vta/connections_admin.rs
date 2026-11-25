@@ -1421,10 +1421,13 @@ pub async fn verify_connection(
     // connector, which authenticates with this connection's control key.
     let previous = connection.pairing.clone();
     let previous_state = previous.state.as_str();
-    let outcome = match registry
+    let verified = registry
         .verify(&connection)
-        .await
-    {
+        .await;
+    // Verify signs in with a client of its own, which the agent may answer by superseding the
+    // cached client's session, so the cached client is dropped whatever the answer.
+    registry.invalidate(&id).await;
+    let outcome = match verified {
         Ok(outcome) => outcome,
         Err(e) => {
             warn!(
@@ -2082,6 +2085,11 @@ pub async fn rotate_connection_control_key(
         .start(&id, Some(&user_id))
         .await
     {
+        if matches!(e, crate::vta::connection_key_rotation::StartError::InProgress(_)) {
+            let driver = Arc::clone(&rotator);
+            let driven_id = id.clone();
+            tokio::spawn(async move { driver.drive(&driven_id).await });
+        }
         return rotation_start_refusal(e);
     }
     let driver = Arc::clone(&rotator);

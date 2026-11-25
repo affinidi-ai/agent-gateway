@@ -351,8 +351,12 @@ moved to a tenant that may not use it. `GET /v1/key-management/inventory` lists 
 and issuers the caller may see, and for a tenant PAT only its own orphaned contexts. A connection's
 `control_key_ref` must name a secret its tenant may reference. Gateway signing, the `[vta]` block
 and its control key are appliance-wide. A tenant's surface or issuer that signs through the
-appliance's own trust agent (no connection, `default` or `vta-bootstrap`) cannot name a context:
-the agent's grant covers every context, so the gateway creates the tenant's own. A tenant's surface
+appliance's own trust agent (no connection, `default` or `vta-bootstrap`), or through any other
+appliance-wide connection, cannot name a context: the agent's grant covers every context, so a named
+one could be the appliance's or another tenant's. Through the appliance's own trust agent the
+gateway creates the tenant's own context; through another appliance-wide connection a tenant's
+resource cannot sign unless the gateway creates contexts on it. A gateway whose connection store
+could not be opened lets a tenant's resource sign only through the appliance's own trust agent. A tenant's surface
 may still follow an appliance-wide issuer, or the Gateway signing default, that signs in an
 appliance context: choosing that issuer means signing as it, so the credential names that
 context's DID, as it named the issuer's before trust agents. The tenant only chooses the shared
@@ -409,7 +413,9 @@ control key** on the connection's row on Connections → Verifiable Trust Agent,
 `POST /v1/vta/connections/{id}/control-key/rotate` (`key_management.edit`).
 
 Three steps, each saved on the connection record before the action that follows it, so a restart
-resumes the rotation instead of repeating it:
+resumes the rotation instead of repeating it. A Standby node promoted to Active resumes the
+rotations it finds under way, and **Rotate control key** on a connection whose rotation is under way
+answers `409` and drives that rotation again:
 
 1. **Introduce**: a log entry, signed by the current key, adds the new key to the DID document
    beside the old one. A trust agent re-reads a cached document that does not define the key a
@@ -651,7 +657,10 @@ staying scoped to one context, which each such test names.
 - **The gateway's own key is published while it is in use.** Once Gateway signing is on a trust
   agent, `/oauth2/jwks.json` and token exchange self-trust include the gateway's own key and DID
   only while a token it signed may be outstanding: for 21 minutes after it last signed one (the
-  20-minute window plus the minute within which its last use is saved in the signer history).
+  20-minute window plus the minute between saves of its last use). Its last use is saved in the
+  signer history when the key set or self-trust is next read (serving the JWKS, verifying a token,
+  a token exchange), at most once a minute, so a restart right after a token was handed out, with
+  no such read in between, forgets that use.
   A surface or issuer that chooses **Gateway secret** keeps it in use by signing with it, and it
   is published again before its first new token. A gateway that signs with its own key keeps it
   published as its current signer, so nothing changes for it. Credentials, presentations and

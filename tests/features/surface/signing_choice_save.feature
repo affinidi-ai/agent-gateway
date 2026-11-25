@@ -136,6 +136,18 @@ Feature: A signing choice is checked the same way wherever it is saved
     Then the admin API response status is 400
     And the answer is the one for an issuer that does not exist
 
+  Scenario: A tenant's issuer cannot name a context of an appliance-wide connection
+    Given the appliance holds the trust agent connection "shared-agent"
+    And the operator has created the issuer "Orders" owned by tenant "tenant-a"
+    When the operator saves the issuer "Orders" signing through the trust agent connection "shared-agent"
+    Then the admin API response status is 400
+
+  Scenario: An appliance-wide issuer can name a context of an appliance-wide connection
+    Given the appliance holds the trust agent connection "shared-agent"
+    And the operator has created the issuer "Orders"
+    When the operator saves the issuer "Orders" signing through the trust agent connection "shared-agent"
+    Then the admin API response status is 200
+
   Scenario: A variant that sets its own signing is refused
     Given the appliance holds the trust agent connection "shared-agent"
     And the appliance holds the secret "orders-key"

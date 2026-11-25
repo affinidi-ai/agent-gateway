@@ -92,5 +92,7 @@ Feature: What the gateway signs through a trust agent verifies against the trust
     And Gateway signing moves to the gateway's own key
     And the operator revokes that trust agent's connection
     When agent "alpha" exchanges the issued token for a token scoped to audience "/reports"
-    Then no token is issued
+    Then the response status is 400
+    And the response is an "invalid_grant" error
+    And no token is issued
     And the gateway no longer publishes the trust agent's key

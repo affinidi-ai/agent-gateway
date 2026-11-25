@@ -771,7 +771,14 @@ impl ConnectionKeyRotator {
         Ok(view_of(&connection))
     }
 
-    /// Resume every rotation a restart interrupted.
+    /// Make this the rotator a node resumes rotations with when it becomes Active.
+    pub fn publish(self: &Arc<Self>) {
+        if let Ok(mut published) = PUBLISHED.write() {
+            *published = Arc::downgrade(self);
+        }
+    }
+
+    /// Resume every rotation a restart, a failover or a failed step interrupted.
     pub async fn resume_all(self: &Arc<Self>) {
         let Ok(connections) = self.store.list().await else {
             return;
@@ -791,6 +798,21 @@ impl ConnectionKeyRotator {
                 });
             }
         }
+    }
+}
+
+static PUBLISHED: std::sync::RwLock<std::sync::Weak<ConnectionKeyRotator>> =
+    std::sync::RwLock::new(std::sync::Weak::new());
+
+/// Resume the rotations the published rotator finds under way, on a node that has just become
+/// Active.
+pub async fn resume_published() {
+    let rotator = PUBLISHED
+        .read()
+        .ok()
+        .and_then(|published| published.upgrade());
+    if let Some(rotator) = rotator {
+        rotator.resume_all().await;
     }
 }
 
@@ -1585,6 +1607,45 @@ mod tests {
             assert_eq!(f.log().await.lines().count(), 3, "birth, one introduce, one retire, after {crash_after}");
             assert_eq!(f.secrets.ids(), vec!["vta-control-key-conn-r-key-2".to_string()], "after {crash_after}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_promoted_node_finishes_a_rotation_left_under_way() {
+        let f = fixture(&["key-1", "key-2"]).await;
+        f.rotator
+            .start(ID, None)
+            .await
+            .unwrap();
+        f.rotator.publish();
+
+        resume_published().await;
+        for _ in 0..100 {
+            if f.record()
+                .await
+                .control_key_state
+                .rotation
+                .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let record = f.record().await;
+        assert!(
+            record
+                .control_key_state
+                .rotation
+                .is_none(),
+            "the rotation was left under way"
+        );
+        assert!(
+            record
+                .control_key_state
+                .rotated_at
+                .is_some(),
+            "the rotation did not finish"
+        );
     }
 
     #[tokio::test]

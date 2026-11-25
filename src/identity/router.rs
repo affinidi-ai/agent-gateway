@@ -2684,6 +2684,7 @@ pub async fn create_identity_api_router(
                     std::sync::Arc::new(crate::vta::connection_key_rotation::SystemClock),
                     std::time::Duration::from_secs(sts_vta_config.connection_key_switch_timeout_secs),
                 ));
+                rotator.publish();
                 if !crate::server::mode::is_standby() {
                     rotator.resume_all().await;
                 }
@@ -3321,21 +3322,6 @@ async fn adopt_declared_contexts(
                 ContextId(context_id.to_string()),
             )
             .await;
-    }
-    for variant in &surface.variants {
-        if let Some(context_id) = variant
-            .overrides
-            .signing
-            .as_ref()
-            .and_then(|s| s.context_id.as_deref())
-        {
-            provisioner
-                .adopt(
-                    derived_context_name(surface.tenant_id.as_deref(), &surface.surface_id, Some(&variant.id)),
-                    ContextId(context_id.to_string()),
-                )
-                .await;
-        }
     }
 }
 

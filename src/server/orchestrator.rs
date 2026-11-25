@@ -5015,6 +5015,7 @@ async fn rederive_planes_on_activation(
     {
         warn!("Trust agent connection store refresh on activation failed: {e}");
     }
+    crate::vta::connection_key_rotation::resume_published().await;
     // Gateway signing is read from the dashboard settings on every signing
     // call, so the settings another node saved apply from the first request.
     if let Some(settings) = crate::storage::settings_store::global_settings_store()

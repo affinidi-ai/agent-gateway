@@ -80,6 +80,7 @@ impl HttpsTransport {
             Some(pin) => reqwest::Client::builder()
                 .timeout(timeout)
                 .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
                 .resolve_to_addrs(&pin.host, &pin.addrs)
                 .build()
                 .map_err(|e| e.to_string()),
@@ -115,15 +116,51 @@ impl TrustTaskTransport for HttpsTransport {
             .await
             .map_err(|e| VtaError::Transport(e.to_string()))?;
         let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| VtaError::Transport(e.to_string()))?;
+        let body = read_capped(resp).await?;
         if !status.is_success() {
-            return Err(VtaError::Http { status: status.as_u16(), body });
+            return Err(VtaError::Http {
+                status: status.as_u16(),
+                body: kept_error_body(body),
+            });
         }
         Ok(body)
     }
+}
+
+/// The largest answer read from a trust agent. A tenant chooses its own connection's endpoint,
+/// so an answer is never buffered whole before its size is known.
+const MAX_ANSWER_BYTES: usize = 512 * 1024;
+
+/// The most of a refusal's body kept in the error, and so in the logs.
+const MAX_KEPT_ERROR_BYTES: usize = 2 * 1024;
+
+async fn read_capped(mut resp: reqwest::Response) -> Result<String, VtaError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| VtaError::Transport(e.to_string()))?
+    {
+        if body.len() + chunk.len() > MAX_ANSWER_BYTES {
+            return Err(VtaError::Protocol(format!(
+                "the trust agent answered with more than {MAX_ANSWER_BYTES} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body)
+        .map_err(|_| VtaError::Protocol("the trust agent answered with text that is not UTF-8".to_string()))
+}
+
+fn kept_error_body(mut body: String) -> String {
+    if body.len() > MAX_KEPT_ERROR_BYTES {
+        let mut end = MAX_KEPT_ERROR_BYTES;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+    }
+    body
 }
 
 // ── DIDComm ──────────────────────────────────────────────────────────────────
@@ -366,6 +403,42 @@ mod tests {
                 .is_err(),
             "without the pin the host is resolved, and `.invalid` never resolves"
         );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_answer_is_refused_and_a_long_refusal_is_cut_short() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route(
+                super::super::client::TRUST_TASKS_PATH,
+                axum::routing::post(|| async { "x".repeat(MAX_ANSWER_BYTES + 1) }),
+            )
+            .route(
+                "/refuses/trust-tasks",
+                axum::routing::post(|| async {
+                    (axum::http::StatusCode::BAD_REQUEST, "y".repeat(MAX_KEPT_ERROR_BYTES * 4))
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let oversized = HttpsTransport::new(&format!("http://{addr}"), Duration::from_secs(5))
+            .unwrap()
+            .deliver(&json!({}), None)
+            .await;
+        assert!(matches!(oversized, Err(VtaError::Protocol(_))), "{oversized:?}");
+
+        let mut refusing = HttpsTransport::new(&format!("http://{addr}"), Duration::from_secs(5)).unwrap();
+        refusing.trust_tasks_url = format!("http://{addr}/refuses/trust-tasks");
+        match refusing
+            .deliver(&json!({}), None)
+            .await
+        {
+            Err(VtaError::Http { status: 400, body }) => assert_eq!(body.len(), MAX_KEPT_ERROR_BYTES),
+            other => panic!("expected a kept refusal, got {other:?}"),
+        }
     }
 
     struct RecordingChannel {

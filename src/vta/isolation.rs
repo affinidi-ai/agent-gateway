@@ -49,13 +49,39 @@ static CONNECTION_ORIGINS: RwLock<BTreeSet<String>> = RwLock::new(BTreeSet::new(
 /// back a listing older than one already applied.
 static SYNC: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// The host part of the key of every name this host answers to.
+const LOCAL_HOST: &str = "loopback";
+
 /// Canonical `(host, port)` key for an endpoint, or `None` when it names no
-/// host (a unix socket path, a relative URL).
+/// host (a unix socket path, a relative URL). Every name of this host itself
+/// (`localhost`, a loopback or unspecified address) is one host, so a trust
+/// agent reserved at one of them is reserved at all of them.
 pub fn origin_key(raw: &str) -> Option<String> {
     let url = Url::parse(raw.trim()).ok()?;
-    let host = url
-        .host_str()?
-        .to_ascii_lowercase();
+    let host = match url.host()? {
+        url::Host::Domain(domain) => {
+            let domain = domain
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            if domain == "localhost" || domain.ends_with(".localhost") {
+                LOCAL_HOST.to_string()
+            } else {
+                domain
+            }
+        }
+        url::Host::Ipv4(ip) if ip.is_loopback() || ip.is_unspecified() => LOCAL_HOST.to_string(),
+        url::Host::Ipv6(ip)
+            if ip.is_loopback()
+                || ip.is_unspecified()
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified()) =>
+        {
+            LOCAL_HOST.to_string()
+        }
+        url::Host::Ipv4(ip) => ip.to_string(),
+        url::Host::Ipv6(ip) => format!("[{ip}]"),
+    };
     // A missing port means the scheme default; normalising it here is what
     // makes `http://vta` and `http://vta:80` the same reservation.
     let port = url
@@ -266,10 +292,32 @@ mod tests {
 
         // Reserving a *range* would break every legitimate localhost upstream,
         // so only the configured VTA origin is refused.
-        for allowed in ["http://127.0.0.1:8080/mcp", "http://localhost:3000/mcp", "https://upstream.example/a2a"] {
+        for allowed in ["http://127.0.0.1:8080/mcp", "http://localhost:3001/mcp", "https://upstream.example/a2a"] {
             assert!(!is_reserved(allowed), "`{allowed}` was wrongly refused");
             assert_not_vta(allowed).expect("an unrelated upstream must still work");
         }
+
+        clear_reservations();
+    }
+
+    #[test]
+    fn another_name_of_this_host_cannot_reach_a_reserved_local_agent() {
+        let _guard = LOCK.lock().unwrap();
+        clear_reservations();
+        reserve("http://127.0.0.1:3000");
+
+        for attempt in [
+            "http://localhost:3000/mcp",
+            "http://LOCALHOST.:3000/mcp",
+            "http://agent.localhost:3000/mcp",
+            "http://127.0.0.2:3000/mcp",
+            "http://0.0.0.0:3000/mcp",
+            "http://[::1]:3000/mcp",
+            "http://[::ffff:127.0.0.1]:3000/mcp",
+        ] {
+            assert!(is_reserved(attempt), "`{attempt}` reached the local trust agent");
+        }
+        assert!(!is_reserved("http://10.0.0.1:3000/mcp"), "another host is another service");
 
         clear_reservations();
     }
@@ -311,7 +359,7 @@ mod tests {
         reserve("http://127.0.0.1:3000/trust-tasks");
         reserve("http://vta:3000");
 
-        assert_eq!(reserved_origins(), vec!["127.0.0.1:3000".to_string(), "vta:3000".to_string()]);
+        assert_eq!(reserved_origins(), vec!["loopback:3000".to_string(), "vta:3000".to_string()]);
         clear_reservations();
     }
 

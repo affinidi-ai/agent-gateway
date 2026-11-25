@@ -158,7 +158,7 @@ impl VtaError {
         if !secs.is_finite() || secs <= 0.0 {
             return None;
         }
-        Some(std::time::Duration::from_secs_f64(secs).min(Self::MAX_RETRY_AFTER))
+        Some(std::time::Duration::from_secs_f64(secs.min(Self::MAX_RETRY_AFTER.as_secs_f64())))
     }
 
     /// Upper bound on an agent-requested wait before the single retry.
@@ -213,11 +213,13 @@ mod tests {
     /// not be able to hold a caller's request open.
     #[test]
     fn an_agent_requested_wait_is_capped() {
-        let err = VtaError::Http {
-            status: 429,
-            body: r#"{"retryAfterSecs":3600}"#.to_string(),
-        };
-        assert_eq!(err.retry_after(), Some(VtaError::MAX_RETRY_AFTER));
+        for body in [r#"{"retryAfterSecs":3600}"#, r#"{"retryAfterSecs":1e300}"#] {
+            let err = VtaError::Http {
+                status: 429,
+                body: body.to_string(),
+            };
+            assert_eq!(err.retry_after(), Some(VtaError::MAX_RETRY_AFTER), "{body}");
+        }
     }
 
     /// A 429 without a usable hint still retries, just without waiting.

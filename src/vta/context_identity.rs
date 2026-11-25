@@ -147,8 +147,25 @@ fn identity_from_records(
         .strip_prefix("did:key:")
         .ok_or_else(|| anyhow!("context `{context_id}` has DID `{did}`; only a did:key context signs through here"))?;
 
-    let backing = keys
-        .get("keys")
+    let backing = held_key_id(keys, public_key).ok_or_else(|| {
+        anyhow!("context `{context_id}` holds no active Ed25519 key for its DID `{did}`, so it cannot sign as itself")
+    })?;
+
+    Ok(ContextIdentity {
+        did: did.to_string(),
+        key_id: backing,
+        public_key: public_key.to_string(),
+        verification_method: format!("{did}#{public_key}"),
+    })
+}
+
+/// The id of the active Ed25519 key with `public_key` in a listing of a context's keys: the only
+/// kind of key a context signs as.
+fn held_key_id(
+    keys: &Value,
+    public_key: &str,
+) -> Option<String> {
+    keys.get("keys")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -169,18 +186,7 @@ fn identity_from_records(
             key.get("keyId")
                 .and_then(Value::as_str)
         })
-        .ok_or_else(|| {
-            anyhow!(
-                "context `{context_id}` holds no active Ed25519 key for its DID `{did}`, so it cannot sign as itself"
-            )
-        })?;
-
-    Ok(ContextIdentity {
-        did: did.to_string(),
-        key_id: backing.to_string(),
-        public_key: public_key.to_string(),
-        verification_method: format!("{did}#{public_key}"),
-    })
+        .map(str::to_string)
 }
 
 /// Work out the identity of a context that signs as `did` (a `did:webvh`) from
@@ -204,30 +210,7 @@ fn webvh_identity_from_document(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let held = |public_key: &str| {
-        keys.get("keys")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .find(|key| {
-                key.get("publicKey")
-                    .and_then(Value::as_str)
-                    == Some(public_key)
-                    && key
-                        .get("keyType")
-                        .and_then(Value::as_str)
-                        == Some("ed25519")
-                    && key
-                        .get("status")
-                        .and_then(Value::as_str)
-                        == Some("active")
-            })
-            .and_then(|key| {
-                key.get("keyId")
-                    .and_then(Value::as_str)
-            })
-            .map(str::to_string)
-    };
+    let held = |public_key: &str| held_key_id(keys, public_key);
     for entry in document
         .get("assertionMethod")
         .and_then(Value::as_array)

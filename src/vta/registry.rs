@@ -268,11 +268,15 @@ impl VtaConnectionRegistry {
         let client = self
             .build_client(&connection)
             .await?;
-        self.client_cache
-            .write()
-            .await
-            .insert(connection_id.to_string(), Arc::clone(&client));
-        Ok(client)
+        // A client built meanwhile by a concurrent call is kept, so every caller shares one
+        // client and one session.
+        Ok(Arc::clone(
+            self.client_cache
+                .write()
+                .await
+                .entry(connection_id.to_string())
+                .or_insert(client),
+        ))
     }
 
     /// A tenant's connection is dialled only at public addresses: its
@@ -293,23 +297,28 @@ impl VtaConnectionRegistry {
             ))
         };
         let url = crate::url_validation::validate_webhook_url(connection.endpoint.trim()).map_err(refused)?;
-        let host = url
-            .host_str()
-            .ok_or_else(|| refused("the endpoint names no host".to_string()))?
-            .to_string();
         let port = url
             .port_or_known_default()
             .unwrap_or(443);
-        let lookup = host.clone();
-        let addrs: Vec<std::net::SocketAddr> = tokio::task::spawn_blocking(move || {
-            use std::net::ToSocketAddrs;
-            (lookup.as_str(), port)
-                .to_socket_addrs()
-                .map(Iterator::collect)
-        })
-        .await
-        .map_err(|e| VtaError::Transport(format!("the endpoint lookup did not finish: {e}")))?
-        .map_err(|e| VtaError::Transport(format!("resolving `{host}`: {e}")))?;
+        let (host, addrs) = match url.host() {
+            Some(url::Host::Ipv4(ip)) => (ip.to_string(), vec![std::net::SocketAddr::new(ip.into(), port)]),
+            Some(url::Host::Ipv6(ip)) => (ip.to_string(), vec![std::net::SocketAddr::new(ip.into(), port)]),
+            Some(url::Host::Domain(domain)) => {
+                let host = domain.to_string();
+                let lookup = host.clone();
+                let addrs: Vec<std::net::SocketAddr> = tokio::task::spawn_blocking(move || {
+                    use std::net::ToSocketAddrs;
+                    (lookup.as_str(), port)
+                        .to_socket_addrs()
+                        .map(Iterator::collect)
+                })
+                .await
+                .map_err(|e| VtaError::Transport(format!("the endpoint lookup did not finish: {e}")))?
+                .map_err(|e| VtaError::Transport(format!("resolving `{host}`: {e}")))?;
+                (host, addrs)
+            }
+            None => return Err(refused("the endpoint names no host".to_string())),
+        };
         if addrs.is_empty() {
             return Err(VtaError::Transport(format!("resolving `{host}` returned no addresses")));
         }
@@ -920,6 +929,18 @@ mod tests {
                     .unwrap()
             ]
         );
+        let pin = VtaConnectionRegistry::tenant_endpoint_pin(&tenant_connection("https://[2606:4700:4700::1111]:8443"))
+            .await
+            .expect("a public IPv6 address")
+            .expect("a tenant connection is pinned");
+        assert_eq!(
+            pin.addrs,
+            vec![
+                "[2606:4700:4700::1111]:8443"
+                    .parse()
+                    .unwrap()
+            ]
+        );
         assert_eq!(
             VtaConnectionRegistry::tenant_endpoint_pin(&connection("c1", true))
                 .await
@@ -931,7 +952,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_tenant_connection_at_a_private_address_is_refused() {
-        for endpoint in ["https://10.0.0.5", "https://127.0.0.1", "https://localhost"] {
+        for endpoint in ["https://10.0.0.5", "https://127.0.0.1", "https://localhost", "https://[::1]"] {
             let err = VtaConnectionRegistry::tenant_endpoint_pin(&tenant_connection(endpoint))
                 .await
                 .expect_err("a private address is never dialled for a tenant");

@@ -364,7 +364,8 @@ records: one a tenant PAT creates belongs to its tenant, and the `vta-bootstrap`
 mirrors the `[vta]` block is appliance-wide. A tenant PAT lists and reads its own tenant's
 connections and appliance-wide ones; another tenant's answers `404`, and so does a connection
 outside the PAT's resource pattern on the pairing and rotation routes. A tenant's connection
-may name only a public `https` endpoint, checked when saved and again before each dial (see
+may name only a public `https` endpoint, checked when saved and again each time a client is built
+for it, which then connects only to the addresses checked (see
 [`TRUST_AGENT_SIGNING.md`](TRUST_AGENT_SIGNING.md)). A connection's
 `control_key_ref` must name a secret its tenant may reference. A surface's or issuer's
 `signing.connection_id` (a variant sets none; it signs with its surface's) must name a connection of its own

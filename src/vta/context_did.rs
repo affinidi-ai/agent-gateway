@@ -281,7 +281,7 @@ pub async fn create_context_webvh(
         }
     }
     let created = client
-        .dispatch_signed::<Value>(TASK_WEBVH_DIDS_CREATE, request)
+        .dispatch_signed_at_most_once::<Value>(TASK_WEBVH_DIDS_CREATE, request)
         .await?;
     let created = payload_of(&created);
     let did = created

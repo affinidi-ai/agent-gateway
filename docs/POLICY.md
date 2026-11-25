@@ -1018,7 +1018,10 @@ and A2A proxy Target and Transit Point) and `pinned_strict_client`, refuse a res
 before resolving it, even where the forward-leg policy allows loopback and RFC 1918, so a caller
 cannot drive the trust agent through the proxy pipeline. Only addresses the gateway was
 configured with are reserved, never request input, so other local services stay reachable.
-`GET /v1/vta/status` lists the reserved origins under `reserved_origins`.
+Every name of the gateway's own host (`localhost`, a `.localhost` name, a loopback or unspecified
+address) counts as one host, listed as `loopback`, so a trust agent at `127.0.0.1:3000` is also
+refused as `localhost:3000` or `[::1]:3000`. Another host name that resolves to the same address
+is not compared. `GET /v1/vta/status` lists the reserved origins under `reserved_origins`.
 
 ### Other pinned egress sinks
 

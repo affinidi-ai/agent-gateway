@@ -55,6 +55,8 @@ pub struct VtaRestClient {
     /// rotates its control key; never held across an `.await`.
     control: std::sync::RwLock<(u64, Arc<dyn SignerKeyProvider>)>,
     session: RwLock<Option<Session>>,
+    /// Held while a session is opened, so concurrent calls sign in once.
+    signing_in: tokio::sync::Mutex<()>,
     /// Back-pressure + circuit breaker so a slow/hung VTA fails fast.
     resilience: Resilience,
     /// Customer-sovereign onboarding checks run after the first auth.
@@ -103,6 +105,7 @@ impl VtaRestClient {
             vta_did: vta_did.to_string(),
             control: std::sync::RwLock::new((0, control_key)),
             session: RwLock::new(None),
+            signing_in: tokio::sync::Mutex::new(()),
             resilience: Resilience::new(max_concurrent),
             onboarding,
             key_reloader: None,
@@ -344,24 +347,47 @@ impl VtaRestClient {
     /// A live session's token and the key it was opened with, authenticating
     /// when there is none, it has expired, or the control key was replaced.
     async fn session_token(&self) -> Result<(String, Arc<dyn SignerKeyProvider>), VtaError> {
+        if let Some(live) = self.live_session().await {
+            return Ok(live);
+        }
+        let _signing_in = self.signing_in.lock().await;
+        if let Some(live) = self.live_session().await {
+            return Ok(live);
+        }
+        self.establish().await
+    }
+
+    async fn live_session(&self) -> Option<(String, Arc<dyn SignerKeyProvider>)> {
         let generation = self.current_control().0;
-        if let Some(session) = self
-            .session
+        self.session
             .read()
             .await
             .as_ref()
-            && session.generation == generation
-            && Instant::now() < session.expires_at
+            .filter(|session| session.generation == generation && Instant::now() < session.expires_at)
+            .map(|session| {
+                (
+                    session
+                        .access_token
+                        .as_str()
+                        .to_owned(),
+                    Arc::clone(&session.key),
+                )
+            })
+    }
+
+    /// Drop the session `token` belongs to, after the trust agent superseded it, so the next call
+    /// signs in again. A session opened since is kept.
+    async fn forget_session(
+        &self,
+        token: &str,
+    ) {
+        let mut session = self.session.write().await;
+        if session
+            .as_ref()
+            .is_some_and(|session| session.access_token.as_str() == token)
         {
-            return Ok((
-                session
-                    .access_token
-                    .as_str()
-                    .to_owned(),
-                Arc::clone(&session.key),
-            ));
+            *session = None;
         }
-        self.establish().await
     }
 
     /// A valid access token, authenticating (or re-authenticating on expiry)
@@ -392,12 +418,11 @@ impl VtaRestClient {
         type_uri: &str,
         payload: Value,
     ) -> Result<T, VtaError> {
-        let generation = self.current_control().0;
         match self
             .dispatch_once(type_uri, payload.clone())
             .await
         {
-            Err(e) if e.is_superseded() && self.current_control().0 != generation => {
+            Err(e) if e.is_superseded() => {
                 self.dispatch_once(type_uri, payload)
                     .await
             }
@@ -419,8 +444,26 @@ impl VtaRestClient {
             .rsplit('/')
             .nth(1)
             .unwrap_or("dispatch");
-        self.post_trust_task(operation, &doc, Some(&token))
-            .await
+        let answer = self
+            .post_trust_task(operation, &doc, Some(&token))
+            .await;
+        self.forget_superseded(&answer, &token)
+            .await;
+        answer
+    }
+
+    async fn forget_superseded<T>(
+        &self,
+        answer: &Result<T, VtaError>,
+        token: &str,
+    ) {
+        if answer
+            .as_ref()
+            .is_err_and(VtaError::is_superseded)
+        {
+            self.forget_session(token)
+                .await;
+        }
     }
 
     /// Dispatch a Trust Task whose request document is **DI-signed** by the
@@ -441,12 +484,11 @@ impl VtaRestClient {
         type_uri: &str,
         payload: Value,
     ) -> Result<T, VtaError> {
-        let generation = self.current_control().0;
         match self
             .dispatch_signed_once(type_uri, payload.clone(), true)
             .await
         {
-            Err(e) if e.is_superseded() && self.current_control().0 != generation => {
+            Err(e) if e.is_superseded() => {
                 self.dispatch_signed_once(type_uri, payload, true)
                     .await
             }
@@ -505,14 +547,17 @@ impl VtaRestClient {
             .rsplit('/')
             .nth(1)
             .unwrap_or("dispatch");
-        if retry {
+        let answer = if retry {
             self.post_trust_task(operation, &doc, Some(&token))
                 .await
         } else {
             self.resilience
                 .run_once(operation, || self.post_trust_task_once(&doc, Some(&token)))
                 .await
-        }
+        };
+        self.forget_superseded(&answer, &token)
+            .await;
+        answer
     }
 }
 /// Parse a VTA response body: either the flat shape, or a Trust-Task
@@ -1069,16 +1114,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_superseded_call_without_a_key_change_is_not_retried() {
+    async fn a_session_another_sign_in_superseded_is_dropped_and_the_call_signs_in_once_more() {
+        let (client, calls) = supersede_client(401, SUPERSEDED, false).await;
+
+        let reply: Value = client
+            .dispatch("https://trusttasks.org/spec/test/echo/0.1", json!({}))
+            .await
+            .expect("signed in again and retried");
+
+        assert_eq!(reply["payload"]["ok"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one refused, one retried");
+    }
+
+    #[tokio::test]
+    async fn a_task_sent_at_most_once_drops_a_superseded_session_without_resending() {
         let (client, calls) = supersede_client(401, SUPERSEDED, false).await;
 
         let err = client
-            .dispatch::<Value>("https://trusttasks.org/spec/test/echo/0.1", json!({}))
+            .dispatch_signed_at_most_once::<Value>("https://trusttasks.org/spec/test/echo/0.1", json!({}))
             .await
             .expect_err("surfaced");
-
         assert!(err.is_superseded(), "{err:?}");
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "not resent");
+
+        let _: Value = client
+            .dispatch_signed_at_most_once("https://trusttasks.org/spec/test/echo/0.1", json!({}))
+            .await
+            .expect("the next call signs in again");
+    }
+
+    #[tokio::test]
+    async fn concurrent_calls_on_a_cold_client_sign_in_once() {
+        let (base, auth_count) = spawn_mock_vta(3600).await;
+        let client = Arc::new(test_client(&base, Arc::new(ControlKey::from_seed([4u8; 32]))));
+
+        let calls: Vec<_> = (0..8)
+            .map(|_| {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move { client.access_token().await })
+            })
+            .collect();
+        for call in calls {
+            call.await
+                .unwrap()
+                .expect("a session token");
+        }
+
+        assert_eq!(auth_count.load(Ordering::SeqCst), 1, "one sign-in for every concurrent call");
     }
 
     #[tokio::test]

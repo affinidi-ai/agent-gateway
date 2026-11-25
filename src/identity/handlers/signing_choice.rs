@@ -79,10 +79,7 @@ pub(crate) async fn validate_signing_choice(
     }
     match owner {
         SigningOwner::Resource(tenant_id) => {
-            let Some(store) = connections else {
-                return Ok(());
-            };
-            super::surface_tenancy::check_signing_connection(store, tenant_id, signing)
+            super::surface_tenancy::check_signing_connection(connections, tenant_id, signing)
                 .await
                 .map_err(|error| match error {
                     super::surface_tenancy::SigningConnectionError::NotAccessible
@@ -454,6 +451,56 @@ mod tests {
                 .await
                 .expect("the gateway creates the tenant's own context");
         }
+    }
+
+    #[tokio::test]
+    async fn a_tenant_resource_cannot_name_a_context_of_an_appliance_wide_connection() {
+        let (store, _tmp) = store_with(&[connection("shared", None), connection("own", Some("t"))]).await;
+        let message = invalid(
+            validate_signing_choice(
+                &through("shared"),
+                SigningOwner::Resource(Some("t")),
+                Some(&store),
+                &VtaConfig::default(),
+            )
+            .await,
+        );
+        assert!(message.contains("creates that tenant's contexts itself"), "{message}");
+        validate_signing_choice(&through("shared"), SigningOwner::Resource(None), Some(&store), &VtaConfig::default())
+            .await
+            .expect("an appliance-wide resource may name an appliance-wide connection's context");
+        validate_signing_choice(
+            &through("own"),
+            SigningOwner::Resource(Some("t")),
+            Some(&store),
+            &VtaConfig::default(),
+        )
+        .await
+        .expect("a tenant names a context of its own connection");
+    }
+
+    #[tokio::test]
+    async fn without_a_connection_store_a_tenant_resource_signs_only_through_the_appliances_own_agent() {
+        let provisioning = VtaConfig {
+            enabled: true,
+            auto_provision_contexts: true,
+            ..VtaConfig::default()
+        };
+        let message = invalid(
+            validate_signing_choice(&through("own"), SigningOwner::Resource(Some("t")), None, &VtaConfig::default())
+                .await,
+        );
+        assert!(message.contains("does not reference a trust agent connection"), "{message}");
+        let named = SurfaceSigningConfig {
+            connection_id: None,
+            ..through("unused")
+        };
+        let message =
+            invalid(validate_signing_choice(&named, SigningOwner::Resource(Some("t")), None, &provisioning).await);
+        assert!(message.contains("creates that tenant's contexts itself"), "{message}");
+        validate_signing_choice(&through("own"), SigningOwner::Resource(None), None, &VtaConfig::default())
+            .await
+            .expect("an appliance-wide resource keeps its rule without a store");
     }
 
     #[tokio::test]
