@@ -804,8 +804,18 @@ fn naming_trace(
     root: &std::path::Path,
     trace_id: Option<&str>,
 ) -> ReceivedMessage {
-    let mut message =
-        forward_request(root, json!({ "content-type": "application/json", "x-api-key": REFUSED_KEY }), a2a_body());
+    named_trace(
+        forward_request(root, json!({ "content-type": "application/json", "x-api-key": REFUSED_KEY }), a2a_body()),
+        trace_id,
+    )
+}
+
+/// `message` naming `trace_id` in place of the trace id it named, or no trace
+/// id at all.
+pub(super) fn named_trace(
+    mut message: ReceivedMessage,
+    trace_id: Option<&str>,
+) -> ReceivedMessage {
     match trace_id {
         Some(trace_id) => message.message_body["trace_id"] = json!(trace_id),
         None => {
@@ -819,41 +829,27 @@ fn naming_trace(
     message
 }
 
-/// The trace ids one receive carried: on each record it wrote, in the agent's
-/// transit token and in the agent's `X-Gateway-Trace-Id`, and the text of
-/// those records and of the request the agent received.
-struct ReceivedTrace {
-    records: Vec<Option<String>>,
-    token: Option<String>,
-    header: Vec<String>,
-    written: String,
+/// The trace ids on the records one receive wrote, and the text of those
+/// records.
+pub(super) struct RecordedTrace {
+    pub(super) records: Vec<Option<String>>,
+    pub(super) written: String,
 }
 
-impl ReceivedTrace {
-    fn of(
-        events: &[crate::delegation_vault::audit::DelegationAuditEvent],
-        received: &axum::http::HeaderMap,
-    ) -> Self {
-        let claims = test_issuer()
-            .validate(header_values(received, "x-transit-token")[0], 300)
-            .unwrap();
+impl RecordedTrace {
+    pub(super) fn of(events: &[crate::delegation_vault::audit::DelegationAuditEvent]) -> Self {
         Self {
             records: events
                 .iter()
                 .map(|event| event.trace_id.clone())
                 .collect(),
-            token: claims.trace_id,
-            header: header_values(received, "x-gateway-trace-id")
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            written: format!("{events:?}\n{received:?}"),
+            written: format!("{events:?}"),
         }
     }
 
-    /// Asserts that every record, the transit token and the header carry
+    /// Asserts that the receive wrote a record and that every record carries
     /// `expected`.
-    fn assert_carried(
+    pub(super) fn assert_carried(
         &self,
         expected: &str,
         case: &str,
@@ -862,18 +858,16 @@ impl ReceivedTrace {
         for record in &self.records {
             assert_eq!(record.as_deref(), Some(expected), "{case}: a record");
         }
-        assert_eq!(self.token.as_deref(), Some(expected), "{case}: the transit token");
-        assert_eq!(self.header, [expected], "{case}: X-Gateway-Trace-Id");
     }
 
     /// Asserts that the receive started its own trace: one new trace id in the
-    /// written form on every record, in the transit token and in the header,
-    /// and no text of `sent` anywhere.
-    fn assert_fresh(
+    /// written form on every record, and no text of `sent` in any. Returns
+    /// that trace id.
+    pub(super) fn assert_fresh(
         &self,
         sent: Option<&str>,
         case: &str,
-    ) {
+    ) -> String {
         let fresh = self
             .records
             .first()
@@ -887,6 +881,67 @@ impl ReceivedTrace {
         self.assert_carried(&fresh, case);
         if let Some(sent) = sent {
             assert!(!self.written.contains(sent), "{case}: {}", self.written);
+        }
+        fresh
+    }
+}
+
+/// The trace ids one receive carried: on each record it wrote, in the agent's
+/// transit token and in the agent's `X-Gateway-Trace-Id`, and the text of the
+/// request the agent received.
+struct ReceivedTrace {
+    recorded: RecordedTrace,
+    token: Option<String>,
+    header: Vec<String>,
+    received: String,
+}
+
+impl ReceivedTrace {
+    fn of(
+        events: &[crate::delegation_vault::audit::DelegationAuditEvent],
+        received: &axum::http::HeaderMap,
+    ) -> Self {
+        let claims = test_issuer()
+            .validate(header_values(received, "x-transit-token")[0], 300)
+            .unwrap();
+        Self {
+            recorded: RecordedTrace::of(events),
+            token: claims.trace_id,
+            header: header_values(received, "x-gateway-trace-id")
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            received: format!("{received:?}"),
+        }
+    }
+
+    /// Asserts that every record, the transit token and the header carry
+    /// `expected`.
+    fn assert_carried(
+        &self,
+        expected: &str,
+        case: &str,
+    ) {
+        self.recorded
+            .assert_carried(expected, case);
+        assert_eq!(self.token.as_deref(), Some(expected), "{case}: the transit token");
+        assert_eq!(self.header, [expected], "{case}: X-Gateway-Trace-Id");
+    }
+
+    /// Asserts that the receive started its own trace: one new trace id in the
+    /// written form on every record, in the transit token and in the header,
+    /// and no text of `sent` anywhere.
+    fn assert_fresh(
+        &self,
+        sent: Option<&str>,
+        case: &str,
+    ) {
+        let fresh = self
+            .recorded
+            .assert_fresh(sent, case);
+        self.assert_carried(&fresh, case);
+        if let Some(sent) = sent {
+            assert!(!self.received.contains(sent), "{case}: {}", self.received);
         }
     }
 }
@@ -1011,8 +1066,8 @@ async fn a_terminating_fabric_receive_sends_a_fresh_written_form_trace_onward() 
     let _receiver = receiver(root.path(), &terminating).await;
 
     let trace = buffered_trace(&target, &naming_trace(root.path(), Some(PEER_TRACE_ID))).await;
-    assert!(!trace.records.is_empty(), "the receive wrote no record");
-    for record in &trace.records {
+    assert!(!trace.recorded.records.is_empty(), "the receive wrote no record");
+    for record in &trace.recorded.records {
         assert_eq!(record.as_deref(), Some(PEER_TRACE_ID), "its own records keep the trace it continued");
     }
     let onward = trace
