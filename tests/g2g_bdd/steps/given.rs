@@ -1299,14 +1299,12 @@ async fn surface_has_allow_all_request_policy(
     attach_request_policy(world, &surface_name, "allow-all", "default allow := true").await;
 }
 
-#[given(regex = r#"^gateway (\d+) surface "([^"]+)" has a response policy that (allows|denies) every response$"#)]
+#[given(regex = r#"^surface "([^"]+)" has a response policy that (allows|denies) every response$"#)]
 async fn surface_has_every_response_policy(
     world: &mut G2gWorld,
-    gateway: usize,
     surface_name: String,
     decision: String,
 ) {
-    assert_eq!(world.surface(&surface_name).0, gateway, "surface '{surface_name}' must be on gateway {gateway}");
     let (label, rule) = match decision.as_str() {
         "allows" => ("allow-every-response", "default allow := true"),
         _ => ("deny-every-response", "default allow := false"),
@@ -1314,16 +1312,12 @@ async fn surface_has_every_response_policy(
     attach_surface_policy(world, &surface_name, "response_policy", label, rule).await;
 }
 
-#[given(
-    regex = r#"^gateway (\d+) surface "([^"]+)" has a response policy that denies a tool list naming tool "([^"]+)"$"#
-)]
+#[given(regex = r#"^surface "([^"]+)" has a response policy that denies a tool list naming tool "([^"]+)"$"#)]
 async fn surface_has_tool_list_response_policy(
     world: &mut G2gWorld,
-    gateway: usize,
     surface_name: String,
     tool: String,
 ) {
-    assert_eq!(world.surface(&surface_name).0, gateway, "surface '{surface_name}' must be on gateway {gateway}");
     let tool_literal = serde_json::to_string(&tool).expect("tool name should serialize");
     let rule = format!(
         "default allow := true\n\nallow := false if {{\n    input.response.body.result.tools[_].name == {tool_literal}\n}}"
@@ -1331,16 +1325,14 @@ async fn surface_has_tool_list_response_policy(
     attach_surface_policy(world, &surface_name, "response_policy", "deny-tool-list", &rule).await;
 }
 
-#[given(regex = r#"^gateway (\d+) surface "([^"]+)" lists only MCP tool "([^"]+)"$"#)]
+#[given(regex = r#"^surface "([^"]+)" lists only MCP tool "([^"]+)"$"#)]
 async fn surface_lists_only_mcp_tool(
     world: &mut G2gWorld,
-    gateway: usize,
     surface_name: String,
     tool: String,
 ) {
     world.start().await;
     let (gw_index, surface_id) = world.surface(&surface_name);
-    assert_eq!(gw_index, gateway, "surface '{surface_name}' must be on gateway {gateway}");
     world
         .harness()
         .gw(gw_index)

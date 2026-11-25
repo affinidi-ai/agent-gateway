@@ -4,6 +4,16 @@ changes:
   changed: []
   fixed:
     - timestamp: '2026-11-25T18:00:00Z'
+      title: Mark policy decisions on requests received over Fabric as via Fabric
+      description: >-
+        A policy decision the gateway makes on a request it received over Fabric is now recorded
+        with via_fabric true, matching its fabric flow. Before, every policy decision record said
+        via_fabric false, so the Audit Log detail and audit integrations (AUDIT_VIA_FABRIC) showed
+        these decisions as direct; the Fabric tools/list filter record also said flow access_point
+        and now says fabric. Records written before the fix keep what they said.
+  removed: []
+  security:
+    - timestamp: '2026-11-25T18:00:00Z'
       title: ⭐ Apply a surface's response policy to answers sent back over Fabric
       description: >-
         A surface's response policy now runs on every Target answer the gateway returns to a peer
@@ -24,13 +34,10 @@ changes:
         policy, directly and over Fabric, instead of being returned unchecked with no decision
         recorded.
     - timestamp: '2026-11-25T18:00:00Z'
-      title: Mark policy decisions on requests received over Fabric as via Fabric
+      title: Apply MCP tool gating to tools/list from MCP Proxy and Legacy SSE Targets
       description: >-
-        A policy decision the gateway makes on a request it received over Fabric is now recorded
-        with via_fabric true, matching its fabric flow. Before, every policy decision record said
-        via_fabric false, so the Audit Log detail and audit integrations (AUDIT_VIA_FABRIC) showed
-        these decisions as direct; the Fabric tools/list filter record also said flow access_point
-        and now says fabric. Records written before the fix keep what they said.
-  removed: []
-  security: []
+        A tools/list answer now has the tools MCP tool gating hides from the caller removed when it
+        comes from an MCP Proxy Target over Fabric, or from an MCP Target through a Legacy SSE
+        session, directly or over Fabric. Before, those answers listed every tool, including ones
+        the gating meant to hide.
   breaking: []

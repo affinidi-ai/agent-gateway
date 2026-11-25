@@ -194,10 +194,10 @@ pub fn evaluate_response_policy(
     }
 }
 
-/// Build the policy engine key for a response policy.
-/// Convention: "response:{surface_id}" or "response:{config_id}".
-pub fn response_policy_key(surface_or_channel_id: &str) -> String {
-    format!("response:{}", surface_or_channel_id)
+/// The policy engine key of the response policy with definition id
+/// `policy_definition_id`: "response:{policy_definition_id}".
+pub fn response_policy_key(policy_definition_id: &str) -> String {
+    format!("response:{}", policy_definition_id)
 }
 
 /// The body of the `403` a caller gets when a response policy refuses an answer.
@@ -239,12 +239,13 @@ impl SurfaceContext {
 }
 
 /// Whether the response policy checks an `a2a-proxy://` answer with `status` and
-/// `body`: only a successful one, so the proxy runtime's own JSON-RPC errors pass.
+/// `body`: only a successful one (2xx, and no JSON-RPC `error`), so the proxy
+/// runtime's own JSON-RPC errors pass.
 fn a2a_proxy_answer_is_checked(
     status: axum::http::StatusCode,
     body: &[u8],
 ) -> bool {
-    crate::proxy::handler::a2a_proxy_connection_status(status, body) == crate::metrics::ConnectionStatus::Success
+    status.is_success() && !serde_json::from_slice::<Value>(body).is_ok_and(|answer| answer.get("error").is_some())
 }
 
 /// An `a2a-proxy://` `answer`, or [`denied_response`] when `check` refuses it.

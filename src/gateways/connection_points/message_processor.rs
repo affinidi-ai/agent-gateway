@@ -5989,6 +5989,19 @@ async fn process_charged_forward_request(
             verification: caller_identity_verification,
         },
     );
+    let tools_list_gate = FabricToolsListGate {
+        surface: &surface,
+        config_id,
+        variant_alias,
+        request_body: body_bytes.clone(),
+        headers: headers.as_ref(),
+        method,
+        path,
+        from_did: message.from_did.as_deref(),
+        source_auth_context: source_auth_context.as_ref(),
+        modern_mcp_context: modern_mcp_context.as_ref(),
+        metadata: mcp_metadata_context,
+    };
     let deadline_ms: Option<u64> = message
         .message_body
         .get("deadline_ms")
@@ -6129,13 +6142,14 @@ async fn process_charged_forward_request(
             proxy_id,
             method,
             path,
-            headers,
-            body_bytes,
+            headers.clone(),
+            body_bytes.clone(),
             caller_identity,
             source_auth_failed,
             fabric_payment,
             gate_receipt,
             response_policy.as_ref(),
+            &tools_list_gate,
         )
         .await;
     }
@@ -6858,6 +6872,7 @@ async fn process_charged_forward_request(
             {
                 Ok(json_response) if !json_response.is_empty() => {
                     channel_info!(config_id, "GW2: Persistent SSE session succeeded (reuse)");
+                    let json_response = tools_list_gate.apply(json_response);
                     if let Some(policy) = response_policy.as_ref()
                         && let Some(refusal) =
                             policy.refusal_of_buffered(200, &json_response, Some("application/json")).await
@@ -7012,6 +7027,7 @@ async fn process_charged_forward_request(
                 {
                     Ok(json_response) if !json_response.is_empty() => {
                         channel_info!(config_id, "GW2: Persistent SSE session succeeded");
+                        let json_response = tools_list_gate.apply(json_response);
                         if let Some(policy) = response_policy.as_ref()
                             && let Some(refusal) =
                                 policy.refusal_of_buffered(200, &json_response, Some("application/json")).await
@@ -7128,7 +7144,6 @@ async fn process_charged_forward_request(
                 response_headers.insert("content-type".to_string(), vec!["application/json".to_string()]);
             }
 
-            let card_fetch_refused = card_fetch_refusal.is_some();
             let (modern_response, response_body) = if modern_request.is_some() {
                 (Some(response), String::new())
             } else {
@@ -7241,7 +7256,7 @@ async fn process_charged_forward_request(
                 .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
                 .and_then(|(_, values)| values.first())
                 .map(String::as_str);
-            if !card_fetch_refused
+            if !(is_agent_card_request || credentialed_card_fetch)
                 && let Some(policy) = response_policy.as_ref()
                 && let Some(refusal) = policy.refusal_of_buffered(status, &response_body, content_type).await
             {
@@ -8647,6 +8662,48 @@ async fn evaluate_mcp_tool_gating_call_for_fabric(
     Some(mcp_forward_error_response(Some(tool_request.id.clone()), -32001, "Tool is not available"))
 }
 
+/// What MCP tool gating filters a `tools/list` answer to a Fabric request with,
+/// for the answers that skip the shared response step (the MCP Proxy and Legacy
+/// SSE paths).
+struct FabricToolsListGate<'a> {
+    surface: &'a crate::config::agent_surface::AgentSurface,
+    config_id: &'a str,
+    variant_alias: Option<&'a str>,
+    request_body: bytes::Bytes,
+    headers: Option<&'a serde_json::Map<String, Value>>,
+    method: &'a str,
+    path: &'a str,
+    from_did: Option<&'a str>,
+    source_auth_context: Option<&'a crate::surface_context::SourceAuthContext>,
+    modern_mcp_context: Option<&'a crate::surface_context::McpContext>,
+    metadata: crate::mcp::meta::McpMetadataContext,
+}
+
+impl FabricToolsListGate<'_> {
+    /// `answer` without the tools MCP tool gating hides from this caller.
+    fn apply(
+        &self,
+        answer: String,
+    ) -> String {
+        filter_mcp_tools_list_for_fabric(
+            self.surface,
+            self.config_id,
+            self.variant_alias,
+            &self.request_body,
+            &answer,
+            self.headers,
+            self.method,
+            self.path,
+            self.from_did
+                .map(str::to_string),
+            self.source_auth_context,
+            self.modern_mcp_context,
+            self.metadata,
+        )
+        .unwrap_or(answer)
+    }
+}
+
 /// MCP Tool Gating — G2G (`fabric://`) `tools/list` response filter. Hides
 /// tools the firewall denies from the list GW1 receives, so a tool the managed
 /// agent can't call is also one it can't see. `request_body` is the original
@@ -9191,7 +9248,7 @@ async fn spawn_mcp_proxy_trust_recorder(
 }
 
 /// Handle MCP proxy forwarding for fabric gateway requests
-#[instrument(name = "fabric.mcp_proxy_forward", skip(message, surface, body_bytes, payment, gate_receipt, response_policy), fields(channel_id, proxy_id, msg.id = %message.didcomm_message_id))]
+#[instrument(name = "fabric.mcp_proxy_forward", skip(message, surface, body_bytes, payment, gate_receipt, response_policy, tools_list_gate), fields(channel_id, proxy_id, msg.id = %message.didcomm_message_id))]
 async fn handle_mcp_proxy_forward(
     message: &ReceivedMessage,
     surface: &crate::config::agent_surface::AgentSurface,
@@ -9206,6 +9263,7 @@ async fn handle_mcp_proxy_forward(
     payment: FabricPayment<'_>,
     gate_receipt: &mut Option<(crate::proxy::handler::agent_pay_gate::Receipt, crate::config::ChannelProtocol)>,
     response_policy: Option<&FabricResponsePolicy>,
+    tools_list_gate: &FabricToolsListGate<'_>,
 ) -> ProcessingResult {
     // Record fields in the span
     tracing::Span::current().record("channel_id", channel_id);
@@ -9481,6 +9539,11 @@ async fn handle_mcp_proxy_forward(
     };
     match executed {
         Ok(mcp_response) => {
+            let mcp_response = serde_json::to_string(&mcp_response)
+                .ok()
+                .map(|answer| tools_list_gate.apply(answer))
+                .and_then(|answer| serde_json::from_str(&answer).ok())
+                .unwrap_or(mcp_response);
             if let Some(policy) = response_policy {
                 let decision = policy
                     .check(
