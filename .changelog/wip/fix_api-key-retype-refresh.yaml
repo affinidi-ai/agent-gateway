@@ -1,0 +1,17 @@
+branch: fix/api-key-retype-refresh
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-25T00:11:10Z'
+      title: Refresh a legacy grant only through the provider the request checked
+      description: >-
+        A legacy binding read its credential provider a second time before refreshing an
+        expired grant and sent the client ID, client secret and the person's refresh token to
+        whatever that second read held, with no type check. A provider retyped to api_key
+        meanwhile, with an http token endpoint, received them in warn mode. The refresh now
+        uses the provider the request read and checked, as the 2026-07-28 and verified consent
+        refreshes already do.
+  breaking: []

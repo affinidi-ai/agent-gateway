@@ -2717,6 +2717,12 @@ A lookup has four outcomes.
 | Expired, no refresh token | Treats it as missing and applies the consent mode |
 | Not found | Applies the consent mode |
 
+A legacy binding refreshes with the provider it read before the lookup, the one whose type,
+tenant and issuer it checked; it does not read the provider again. When the provider is changed
+meanwhile, for example retyped to `api_key` with another token endpoint, that endpoint receives
+neither the client secret nor the refresh token, and the new settings apply from the next
+request.
+
 For a service token, one within 60 seconds of expiry counts as expired and is replaced by a
 fresh one, since no user is involved. It is renewed up to 5 minutes before that and, while the
 renewal fails, served stale until then (see [Service tokens](#service-tokens)).
