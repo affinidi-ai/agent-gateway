@@ -140,7 +140,7 @@ async fn caller_sends_presentation_expiring_in(
     let presentation = presentation_signer(world)
         .present_own_credential_with(ProofTimes::ExpiresIn(chrono::Duration::minutes(minutes)))
         .await;
-    send_presentation(world, presentation).await;
+    send_presentation(world, presentation, vec![]).await;
 }
 
 #[when(
@@ -153,5 +153,5 @@ async fn caller_sends_presentation_created_ahead(
     let presentation = presentation_signer(world)
         .present_own_credential_with(ProofTimes::CreatedInWithoutExpiry(chrono::Duration::minutes(minutes)))
         .await;
-    send_presentation(world, presentation).await;
+    send_presentation(world, presentation, vec![]).await;
 }
