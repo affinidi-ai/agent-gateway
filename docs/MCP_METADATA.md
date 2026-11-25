@@ -2210,8 +2210,9 @@ gaps and gates nothing. It runs every scenario the suite has: all server
 scenarios against each server target, the owned ones included, and all client
 scenarios, every `auth/*` one among them, through the gateway. A scenario that
 applies to `2026-07-28` or is an extension runs on that wire, and a scenario of
-older revisions only runs at its own. The `fabric` target is the exception: its
-BDD step runs the suite once, so it reports on the requirement set's scenarios.
+older revisions only runs at its own. On the `fabric` target the BDD step runs
+`report-cli.sh` in place of the suite's command, which runs every server
+scenario individually, without the requirement set or a baseline.
 The run ignores the suite's verdicts and the baselines, skips the checks
 the suite does not make and the legacy phase, and exits `0` unless the harness
 itself fails. `target/mcp-conformance/run/gaps.md` then lists, per target, each

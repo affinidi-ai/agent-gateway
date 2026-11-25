@@ -544,9 +544,9 @@ run_fabric_suite() {
         CARGO_TARGET_DIR="${REPO}/target" \
         cargo test --locked --test g2g_bdd) > "${bdd_log}" 2>&1 || ok=false
     if [[ "${REPORT}" == true ]]; then
-        if ! grep -qE '^=== [^ ]+ ===$' "${log}"; then
+        if [[ "${ok}" != true ]] || ! grep -qE '^=== [^ ]+ ===$' "${log}"; then
             tail -40 "${bdd_log}"
-            fail 1 "suite fabric: no scenario ran (logs: $(relative "${bdd_log}"), $(relative "${log}"))"
+            fail 1 "suite fabric: the report run did not complete (logs: $(relative "${bdd_log}"), $(relative "${log}"))"
         fi
         record INFO "suite fabric: $(grep -cE '^=== [^ ]+ ===$' "${log}") scenarios run, verdict ignored"
         REPORT_TARGETS+=(fabric)
