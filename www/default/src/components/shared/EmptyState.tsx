@@ -43,7 +43,7 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
     <i className={`fas ${ctaIcon} fa-sm me-1`} aria-hidden="true" />
   ) : null;
   const docsLink = docsHref ? (
-    <Link href={docsHref} external className="text-muted" data-testid={docsTestId}>
+    <Link href={docsHref} external className="text-muted" testId={docsTestId}>
       {docsLabel}
     </Link>
   ) : null;
