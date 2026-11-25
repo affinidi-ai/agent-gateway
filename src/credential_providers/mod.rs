@@ -93,9 +93,10 @@ impl CredentialProviderType {
     ) -> bool {
         match self {
             Self::OAuth2JwtBearer => matches!(algorithm, JwtSigningAlgorithm::RS256 | JwtSigningAlgorithm::ES256),
-            Self::OAuth2ClientCredentialsJwtAuth => {
-                matches!(algorithm, JwtSigningAlgorithm::PS256 | JwtSigningAlgorithm::RS256)
-            }
+            Self::OAuth2ClientCredentialsJwtAuth => matches!(
+                algorithm,
+                JwtSigningAlgorithm::PS256 | JwtSigningAlgorithm::RS256 | JwtSigningAlgorithm::ES256
+            ),
             Self::OAuth2AuthorizationCode | Self::OAuth2ClientCredentials | Self::ApiKey => false,
         }
     }
@@ -2431,7 +2432,7 @@ mod tests {
         assert!(!OAuth2JwtBearer.allows_jwt_algorithm(PS256));
         assert!(OAuth2ClientCredentialsJwtAuth.allows_jwt_algorithm(PS256));
         assert!(OAuth2ClientCredentialsJwtAuth.allows_jwt_algorithm(RS256));
-        assert!(!OAuth2ClientCredentialsJwtAuth.allows_jwt_algorithm(ES256));
+        assert!(OAuth2ClientCredentialsJwtAuth.allows_jwt_algorithm(ES256));
         assert!(!ApiKey.allows_jwt_algorithm(RS256));
     }
 

@@ -48,13 +48,13 @@ describe('JwtAssertionSection', () => {
     expect(screen.queryByTestId('credential-provider-jwt-subject-input')).not.toBeInTheDocument();
   });
 
-  it('asks a Client Credentials JWT provider for its certificate, offering PS256 first', () => {
+  it('asks a Client Credentials JWT provider for its certificate, offering PS256 first and ES256', () => {
     renderSection('oauth2_client_credentials_jwt_auth');
     expect(
       screen.getByTestId('credential-provider-jwt_certificate_secret_ref-select')
     ).toBeInTheDocument();
     expect(screen.queryByTestId('credential-provider-jwt-issuer-input')).not.toBeInTheDocument();
-    expect(algorithms()).toEqual(['PS256', 'RS256']);
+    expect(algorithms()).toEqual(['PS256', 'RS256', 'ES256']);
   });
 
   it('offers the certificate as optional with the key ID right under it', () => {

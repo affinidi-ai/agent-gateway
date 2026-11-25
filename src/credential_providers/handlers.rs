@@ -4231,13 +4231,9 @@ mod jwt_provider_tests {
         let state = with_key_material(&directory).await;
         let mut pss_bearer = jwt_bearer("a");
         pss_bearer["jwt_signing_algorithm"] = json!("PS256");
-        let mut ec_auth = jwt_auth("b");
-        ec_auth["jwt_signing_algorithm"] = json!("ES256");
-        for body in [pss_bearer, ec_auth] {
-            let (status, response) = create(&state, body).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(response["error"], "jwt_signing_algorithm is not supported for this provider type");
-        }
+        let (status, response) = create(&state, pss_bearer).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"], "jwt_signing_algorithm is not supported for this provider type");
         let mut internal = jwt_bearer("c");
         internal["jwt_audience"] = json!("http://169.254.169.254/token");
         let (status, response) = create(&state, internal).await;
@@ -4247,6 +4243,42 @@ mod jwt_provider_tests {
                 .as_str()
                 .unwrap()
                 .starts_with("jwt_audience: ")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_credentials_jwt_provider_signs_with_es256_only_with_an_ec_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let mut ec = jwt_auth("ec-auth");
+        ec["jwt_signing_algorithm"] = json!("ES256");
+        ec["jwt_signing_key_secret_ref"] = json!("EC_KEY");
+        let (status, body) = create(&state, ec).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["jwt_signing_algorithm"], "ES256");
+        let stored = state
+            .store
+            .find_by_provider_id(None, "ec-auth")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.jwt_signing_algorithm(), Some(crate::credential_providers::JwtSigningAlgorithm::ES256));
+
+        let mut rsa_key = jwt_auth("rsa-key-es256");
+        rsa_key["jwt_signing_algorithm"] = json!("ES256");
+        let (status, response) = create(&state, rsa_key).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response["error"],
+            "jwt_signing_key_secret_ref must reference a PEM private key or a Google service account JSON key matching jwt_signing_algorithm"
+        );
+        assert!(
+            state
+                .store
+                .find_by_provider_id(None, "rsa-key-es256")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

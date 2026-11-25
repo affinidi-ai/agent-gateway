@@ -3361,6 +3361,60 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_client_credentials_jwt_grant_signs_its_client_assertion_with_es256() {
+            let fixture = fixture().await;
+            let key = test_keys::ec_p256();
+            fixture
+                .secrets
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: "EC_SIGNING_KEY".into(),
+                    secret_id: "EC_SIGNING_KEY".into(),
+                    description: None,
+                    value: key.private_pem.clone(),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+            let mut endpoint = token_endpoint(200, issued()).await;
+            let provider = provider(
+                &endpoint.url,
+                json!({
+                    "provider_type": "oauth2_client_credentials_jwt_auth",
+                    "client_id_secret_ref": "CLIENT_ID",
+                    "jwt_signing_key_secret_ref": "EC_SIGNING_KEY",
+                    "jwt_signing_algorithm": "ES256"
+                }),
+            );
+            fetch_client_credentials_jwt_auth_token(&provider, &[], &fixture.secrets, &endpoint.egress)
+                .await
+                .unwrap();
+            let form = endpoint
+                .requests
+                .recv()
+                .await
+                .unwrap();
+            assert_eq!(
+                decode_header(&form["client_assertion"])
+                    .unwrap()
+                    .alg,
+                Algorithm::ES256
+            );
+            let mut validation = Validation::new(Algorithm::ES256);
+            validation.set_audience(&[&endpoint.url]);
+            let claims = decode::<Value>(
+                &form["client_assertion"],
+                &DecodingKey::from_ec_pem(key.public_pem.as_bytes()).unwrap(),
+                &validation,
+            )
+            .unwrap()
+            .claims;
+            assert_eq!(claims["iss"], "client-123");
+            assert_eq!(claims["sub"], "client-123");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_client_assertion_without_a_certificate_names_its_key_by_kid_only() {
             let fixture = fixture().await;
             let mut endpoint = token_endpoint(200, issued()).await;

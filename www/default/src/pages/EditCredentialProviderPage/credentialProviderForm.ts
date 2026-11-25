@@ -53,7 +53,7 @@ export const EMPTY_JWT_FIELDS: JwtFormFields = {
 /** Signing algorithms per type, the default first. */
 export const JWT_ALGORITHMS: Partial<Record<CredentialProviderType, JwtSigningAlgorithm[]>> = {
   oauth2_jwt_bearer: ['RS256', 'ES256'],
-  oauth2_client_credentials_jwt_auth: ['PS256', 'RS256'],
+  oauth2_client_credentials_jwt_auth: ['PS256', 'RS256', 'ES256'],
 };
 
 export interface ProviderTypeFields {

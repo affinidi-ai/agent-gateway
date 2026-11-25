@@ -1,0 +1,17 @@
+branch: feat/oauth-client-auth
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-25T00:16:00Z'
+      title: Accept ES256 for credential providers that sign a client assertion
+      description: >-
+        The admin API and the dashboard now accept ES256 as the signing algorithm of an
+        oauth2_client_credentials_jwt_auth provider and of an external consent provider whose client
+        authenticates with private_key_jwt, beside PS256 and RS256. The gateway already signed such
+        assertions correctly when a stored record named ES256, so the save rule now matches what
+        the gateway does. The key is still checked on save, and an ES256 provider whose key is not
+        an EC P-256 key is refused.
+  removed: []
+  security: []
+  breaking: []
