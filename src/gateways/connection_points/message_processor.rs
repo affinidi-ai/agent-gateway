@@ -5945,6 +5945,7 @@ async fn process_charged_forward_request(
             body_bytes,
             caller_identity,
             source_auth_failed,
+            audit_trace_id,
             fabric_payment,
             gate_receipt,
         )
@@ -8950,7 +8951,8 @@ async fn spawn_mcp_proxy_trust_recorder(
     }
 }
 
-/// Handle MCP proxy forwarding for fabric gateway requests
+/// Handle MCP proxy forwarding for fabric gateway requests. Its records carry
+/// `trace_id`, the receive's trace.
 #[instrument(name = "fabric.mcp_proxy_forward", skip(message, surface, body_bytes, payment, gate_receipt), fields(channel_id, proxy_id, msg.id = %message.didcomm_message_id))]
 async fn handle_mcp_proxy_forward(
     message: &ReceivedMessage,
@@ -8963,6 +8965,7 @@ async fn handle_mcp_proxy_forward(
     body_bytes: bytes::Bytes,
     caller_identity: Option<String>,
     source_auth_failed: bool,
+    trace_id: Option<&str>,
     payment: FabricPayment<'_>,
     gate_receipt: &mut Option<(crate::proxy::handler::agent_pay_gate::Receipt, crate::config::ChannelProtocol)>,
 ) -> ProcessingResult {
@@ -9115,11 +9118,7 @@ async fn handle_mcp_proxy_forward(
     let audit_facts = crate::audit::request_events::RequestFacts {
         surface_id: &surface.surface_id,
         channel_name: &surface.name,
-        trace_id: message
-            .message_body
-            .get("otel_context")
-            .and_then(|context| context.get("trace_id"))
-            .and_then(serde_json::Value::as_str),
+        trace_id,
         via_fabric: true,
     };
     // Resolve target auth header if configured on the channel
