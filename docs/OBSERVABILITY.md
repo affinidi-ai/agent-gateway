@@ -374,8 +374,7 @@ A Fabric receive continues the trace id the Fabric message names, read as `X-Gat
 trace, and its records, transit token and header carry that one id; no part of the invalid id is
 recorded or sent on. The records carry the message's trace id, never the trace of the span the
 sending gateway exports, which the message carries beside it. That holds for an MCP Proxy Target
-(`proxy://`) too: its audit records and its connection metrics carry the receive's trace id, the
-message's or the new one. A surface with `terminate_trace_id`
+(`proxy://`) too: its audit records carry the receive's trace id, the message's or the new one. A surface with `terminate_trace_id`
 sends its Managed Agent a fresh 32 hex trace id while its own records keep the one it continued.
 
 A Transit Point continues the trace of the transit token it verified, whether or not it requires

@@ -9121,7 +9121,6 @@ async fn handle_mcp_proxy_forward(
         trace_id,
         via_fabric: true,
     };
-    let metric_trace_id = trace_id.unwrap_or_default();
     // Resolve target auth header if configured on the channel
     let vault = get_delegation_vault_store();
     let target_credential = if let Some(target_auth) = surface.target_auth() {
@@ -9305,7 +9304,7 @@ async fn handle_mcp_proxy_forward(
                         Some(latency_ms),
                         caller_identity.clone(),
                         crate::metrics::ConnectionDirection::Request,
-                        metric_trace_id.to_string(),
+                        uuid::Uuid::new_v4().to_string(),
                         request_bytes,
                         0, // No bytes received in request direction
                         None,
@@ -9327,7 +9326,7 @@ async fn handle_mcp_proxy_forward(
                         Some(latency_ms),
                         None, // No agent identity for MCP responses
                         crate::metrics::ConnectionDirection::Response,
-                        metric_trace_id.to_string(),
+                        uuid::Uuid::new_v4().to_string(),
                         0, // No bytes sent in response direction
                         response_bytes,
                         None,
@@ -9425,7 +9424,7 @@ async fn handle_mcp_proxy_forward(
                         Some(latency_ms),
                         caller_identity.clone(),
                         crate::metrics::ConnectionDirection::Request,
-                        metric_trace_id.to_string(),
+                        uuid::Uuid::new_v4().to_string(),
                         request_bytes,
                         0, // No bytes received in request direction
                         None,
@@ -9447,7 +9446,7 @@ async fn handle_mcp_proxy_forward(
                         Some(latency_ms),
                         None, // No identity for failed requests
                         crate::metrics::ConnectionDirection::Response,
-                        metric_trace_id.to_string(),
+                        uuid::Uuid::new_v4().to_string(),
                         0, // No bytes sent in response direction
                         error_response_bytes,
                         None,

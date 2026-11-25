@@ -844,8 +844,8 @@ request back and forth without end. A hop count bounds them.
   `fabric_chain_too_long`).
 - The trace continues along the chain: a receiving gateway continues the trace id the sender
   named, on a buffered forward-request and a framed stream alike, in the 32 lowercase hex form,
-  so its audit records carry it, an MCP Proxy Target's (`proxy://`) and its connection metrics
-  included, and starts a new trace when the sender named none or one that
+  so its audit records carry it, an MCP Proxy Target's (`proxy://`) included, and starts a new
+  trace when the sender named none or one that
   is not valid (see [`OBSERVABILITY.md`](OBSERVABILITY.md));
   its onward trace id rides in the
   token, and the Transit Point sends it on the next hop, so caller to A to C to B is one trace

@@ -4556,11 +4556,10 @@ async fn unresolvable_mcp_proxy_credential_flow() {
     );
 }
 
-/// The trace one receive of an MCP `tools/call` at a `proxy://` surface carried on its
-/// records: its VP Audit Log records and its connection metrics. The peer's forward-request
-/// is `named` and then dispatched as the listener dispatches it. The surface's Target
-/// credential names a missing secret and falls back to passthrough, so the receive records
-/// that failure and still calls the MCP proxy.
+/// The trace one receive of an MCP `tools/call` at a `proxy://` surface carried on its VP
+/// Audit Log records. The peer's forward-request is `named` and then dispatched as the
+/// listener dispatches it. The surface's Target credential names a missing secret and falls
+/// back to passthrough, so the receive records that failure and still calls the MCP proxy.
 async fn mcp_proxy_receive_trace(named: impl FnOnce(ReceivedMessage) -> ReceivedMessage) -> RecordedTrace {
     use std::sync::Arc;
 
@@ -4589,28 +4588,13 @@ async fn mcp_proxy_receive_trace(named: impl FnOnce(ReceivedMessage) -> Received
         .await
         .unwrap();
     super::init_mcp_proxy_store(proxies).await;
-    let metrics = Arc::new(crate::metrics::MetricsStore::new(100));
-    super::init_metrics_store(metrics.clone()).await;
 
     let mut message =
         forward_request(root.path(), json!({"content-type": "application/json"}), echo_tool_call(false).1)
             .with_context("secrets_storage_path", json!(root.path().join("secrets")));
     message.message_body["path"] = json!("/mcp");
     let (_, events) = crate::audit::producer::capture(forward_response(&named(message))).await;
-    let connections = metrics
-        .get_recent_connections(100)
-        .await;
-    assert!(!connections.is_empty(), "the receive recorded no connection");
-    let mut trace = RecordedTrace::of(&events);
-    trace.records.extend(
-        connections
-            .iter()
-            .map(|connection| Some(connection.trace_id.clone())),
-    );
-    trace
-        .written
-        .push_str(&format!("\n{connections:?}"));
-    trace
+    RecordedTrace::of(&events)
 }
 
 /// The records of an MCP Proxy Target's Fabric receive carry the trace id the message names,
