@@ -2719,7 +2719,7 @@ name, description, id and DID.
   (`payment_gateways.delete`, the two-step `DeleteButton`). A refused delete (409 while surfaces
   take payments through it or it holds unsettled payments) shows the gateway's message.
 - **Connect Payment Gateway** (`payment_gateways.edit`) in the tab header opens the wizard. With no
-  payment gateway an `EmptyState` explains agent-pay with a **Connect Payment Gateway** action.
+  payment gateway an `EmptyState` explains agent-pay with a docs link; the header button is the only action.
 
 ### Connect Payment Gateway wizard
 
@@ -2989,7 +2989,7 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
 | List row, chevron               | `agents-row-<id>`, `agents-row-chevron`                                                         |
 | List filter, retry              | `agents-filter-input`, `agents-retry-button`                                                    |
 | List load error, no match       | `agents-load-error`, `agents-no-match`                                                          |
-| Header button, empty state docs | `agents-add-surface-button`, `agents-empty-docs-link`                                           |
+| Header button                   | `agents-add-surface-button`                                                                    |
 | Name, unnamed, endpoint host    | `agents-name`, `agents-unnamed`, `agents-endpoint-host`                                         |
 | Runtime, protocol, activity     | `agents-runtime`, `agents-protocol-badge`, `agents-last-activity`                               |
 | Surfaces, count, names          | `agents-surfaces`, `agents-surfaces-count`, `agents-surface-names`                              |
