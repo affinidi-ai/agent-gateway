@@ -518,6 +518,10 @@ fn write_single_surface_config_inner(
         );
     }
 
+    if surface_config.api_key_inbound_identity {
+        surface_fixture = surface_fixture.with_identity_slot("inbound", serde_json::json!({"type": "from_api_key"}));
+    }
+
     if surface_config.mcp_inbound_identity {
         let mut inbound_slot = serde_json::json!({
             "type": "payload_extraction",
@@ -705,6 +709,11 @@ fn write_single_surface_config_inner(
     }
     if let Some(max_secs) = surface_config.transit_token_max_lifetime_secs {
         set_transit_token_max_lifetime(base_dir, max_secs);
+    }
+    if let Some(max_secs) = surface_config.sts_id_jag_max_lifetime_secs {
+        edit_gateway_json(base_dir, |gateway| {
+            gateway["sts"]["id_jag_max_lifetime_secs"] = serde_json::json!(max_secs);
+        });
     }
     write_credential_policy(
         base_dir,

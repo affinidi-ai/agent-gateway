@@ -439,6 +439,17 @@ fn audience_includes(
 
 // ── Given bindings ────────────────────────────────────────────────────────────
 
+/// Sets `sts.id_jag_max_lifetime_secs` in `gateway.json` before the gateway starts.
+#[given(expr = "the gateway redeems only ID-JAGs that expire within {int} seconds")]
+fn gateway_redeems_id_jags_expiring_within(
+    world: &mut SurfaceWorld,
+    max_secs: u64,
+) {
+    world
+        .surface_config
+        .sts_id_jag_max_lifetime_secs = Some(max_secs);
+}
+
 #[given(expr = "the operator has a managed connection for agent {string} allowing audience {string}")]
 async fn managed_connection_allowing_audience(
     world: &mut SurfaceWorld,

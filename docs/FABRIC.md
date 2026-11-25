@@ -109,7 +109,9 @@ existed, until that peer is upgraded. Both messages are also refused, failing th
 reply, when their DIDComm `expires_time` has passed or their `(sender DID, message id)` pair was
 already processed: `connection-setup` after it proves control of its `channel_did` on a live
 invitation, `connection-accepted` once its sender and `channel_did` are present; both verify their
-issuer attestation afterwards. A pairing message without `expires_time` is remembered for one hour.
+issuer attestation afterwards. A pairing message without `expires_time` is remembered for one hour,
+in memory and in the [single-use store](CONFIGURATION_REFERENCE.md#single-use-store), so a restart
+does not make it acceptable again; one the store cannot record fails the handshake.
 
 An invitation pairs one gateway. The inviting gateway records the id of the invitation message
 its mediator serves, and accepts a `connection-setup` only when all of these hold:
@@ -143,18 +145,22 @@ recovery and its listener read that record by id, never a mediator found by DID.
 `pack_and_send_message` chooses each send's route from the recipient's DID: when its
 `DIDCommMessaging` service endpoint names a mediator other than the sender's own, the send is wrapped
 in a `routing/2.0/forward` addressed to the sender's mediator, which relays it. Otherwise it is sent
-directly. The route does not depend on the feature flag. Fabric stream frames and the x402
-settle messages for stored payments always send directly. Delegated `agent_pay` payment
-requests are ordinary fabric forwards and are routed like any other send.
+directly. The route does not depend on the feature flag. Fabric stream frames always send
+directly. Delegated `agent_pay` payment requests are ordinary fabric forwards and are routed like
+any other send.
 
 The gateway is not an x402 facilitator for its peers. An incoming `x402/verify-request` is
 answered `{"valid": false, "error": "facilitator_disabled"}` and an `x402/settle-request`
 `{"settled": false, "error": "facilitator_disabled"}`; a deferred-settlement record
 (`action: "record"`) is dropped without a reply. Nothing is verified, settled or recorded,
-whatever `facilitator_mode.facilitator_via_fabric` says. This gateway sends no verify request, so
-an `x402/verify-response` is dropped without touching the transaction store. Settle responses to
-its own requests are still handled, and the settlement worker still drains x402 payments already
-in its transaction store.
+whatever `facilitator_mode.facilitator_via_fabric` says. This gateway sends no verify or settle
+request, so an `x402/verify-response` or `x402/settle-response` is dropped without touching the
+transaction store. The x402 transactions already in that store are kept as they are: nothing
+writes a new one or settles, retries or recovers them. Only an `x402/settlement-complete`
+reporting `completed` from a transaction's own active facilitator gateway changes one, and only
+while its settlement is in progress: it marks the settlement completed and issues the receipt
+once, so a repeated message, or one for a settlement already completed, failed or refunded,
+changes nothing.
 
 ## Peer issuer DIDs
 
@@ -522,7 +528,14 @@ request received by the destination gateway:
    deleted after dispatch, and a reply threaded to the original id would displace the real response
    at the sender. The seen set holds a SHA-256 digest per pair in memory until the envelope's
    `expires_time`; expired entries are swept during admission, at most once a minute. It is exported
-   as the `agent_gateway_fabric_envelope_seen_entries` gauge, which counts entries not yet swept. On
+   as the `agent_gateway_fabric_envelope_seen_entries` gauge, which counts entries not yet swept.
+   An admitted envelope is also recorded, until the same instant, in the gateway's
+   [single-use store](CONFIGURATION_REFERENCE.md#single-use-store), so a replay is still refused
+   after a restart and, with the `dynamodb` backend, on another node. An envelope the store cannot
+   record is refused, never processed unguarded: a `forward-request` is answered `503`, and the
+   error is logged. A dispatch aborted before it answers, such as by a reconnect, forgets its
+   envelope in memory at once and in the store in the background, so the mediator's redelivery is
+   processed; the redelivery's admission waits for that forget. On
    the sending side the envelope lifetime is capped at 3480 s (`sent_envelope_lifetime_secs`)
    whatever the request timeout says (see [Fabric envelope
    lifetime](CONFIGURATION_RELOAD.md#fabric-envelope-lifetime)), leaving 120 s of clock skew below the

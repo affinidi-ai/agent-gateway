@@ -322,6 +322,7 @@ mod tests {
     fn test_didwebvh_fix_build_identity_uai_prefers_dna_and_metadata() {
         let metadata = HashMap::from([("deployment_env".to_string(), serde_json::json!("production"))]);
         let identity = DidWebVhIdentity {
+            pending_key_pair: None,
             id: Uuid::new_v4(),
             did: "did:webvh:example.com:agent".to_string(),
             key_pair: None,

@@ -2321,12 +2321,10 @@ pub fn create_identity_api_router(
                 .get_inbound_external_urls()
                 .into_iter()
                 .next(),
-            replay_backend: state
+            id_jag_max_lifetime_secs: state
                 .network_config
                 .sts
-                .replay_protection
-                .backend
-                .clone(),
+                .id_jag_max_lifetime_secs,
             throttle: state
                 .network_config
                 .sts

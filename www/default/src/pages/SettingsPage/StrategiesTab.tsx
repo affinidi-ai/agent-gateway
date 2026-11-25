@@ -2,7 +2,6 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiClient } from '../../api';
 import { usePermissions } from '../../context/PermissionsContext';
-import { Badge } from '../../components/shared/Badge';
 import { formatDateTime, topAndTail } from '../../utils/stringUtils';
 import { AppButton } from '../../components/shared/AppButton';
 import { EmptyState } from '../../components/shared/EmptyState';
@@ -149,12 +148,6 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
         <div className="card-header py-3 d-flex justify-content-between align-items-center">
           <h6 className="m-0 font-weight-bold text-primary">
             <i className="fas fa-id-badge"></i> JWT Verification Strategies
-            <Badge
-              value={filtered.length}
-              suffix={searchTerm ? ` of ${strategies.length}` : undefined}
-              className="ms-2"
-              ariaLabel={`${filtered.length}${searchTerm ? ` of ${strategies.length}` : ''} JWT verification strategies`}
-            />
           </h6>
           {canEdit && (
             <AppButton

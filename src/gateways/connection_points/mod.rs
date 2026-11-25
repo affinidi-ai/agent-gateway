@@ -25,4 +25,4 @@ pub use message_processor::{
 pub use messages::{MessageStore, ReceivedMessage};
 pub use store::ConnectionPointStore;
 pub use types::ConnectionPointType;
-pub use ws_listener::{ConnectionPointListenerManager, ConnectionStatus};
+pub use ws_listener::{ConnectionPointListenerManager, ConnectionStatus, ListenerStart};

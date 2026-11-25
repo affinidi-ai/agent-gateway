@@ -1351,6 +1351,25 @@ pub async fn managed_agent_served_its_agent_card_once(
     );
 }
 
+#[then(expr = "managed agent {string} received the forwarded message with no caller identity")]
+pub async fn actor_received_the_forwarded_message_with_no_caller_identity(
+    world: &mut G2gWorld,
+    target_name: String,
+) {
+    use crate::bdd_support::json_rpc::{AGENT_IDENTITY_BINDING_EXTENSION_URI, AGENT_IDENTITY_CREDENTIAL_EXTENSION_URI};
+    let messages = forwarded_messages_for(world, &target_name).await;
+    assert_eq!(messages.len(), 1, "managed agent '{target_name}' should receive one forwarded message: {messages:?}");
+    let body = messages[0].json_body();
+    for uri in [AGENT_IDENTITY_BINDING_EXTENSION_URI, AGENT_IDENTITY_CREDENTIAL_EXTENSION_URI] {
+        let pointer = format!("/params/message/metadata/{}", uri.replace('/', "~1"));
+        assert!(
+            body.pointer(&pointer)
+                .is_none(),
+            "managed agent '{target_name}' should receive no caller identity proof '{uri}', got body: {body}"
+        );
+    }
+}
+
 #[then(expr = "managed agent {string} received one forwarded message")]
 pub async fn actor_received_one_forwarded_message(
     world: &mut G2gWorld,

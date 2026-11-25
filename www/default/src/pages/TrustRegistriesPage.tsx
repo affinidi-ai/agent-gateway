@@ -225,7 +225,6 @@ const TrustRegistriesPage: React.FC<TrustRegistriesPageProps> = ({
             <div className="d-flex justify-content-between align-items-center">
               <h6 className="m-0 font-weight-bold text-primary">
                 <i className="fas fa-shield-alt"></i> All Trust Registries
-                <Badge value={0} tone="primary" className="ms-2" ariaLabel="0 trust registries" />
               </h6>
               {actionButtons}
             </div>
@@ -245,10 +244,6 @@ const TrustRegistriesPage: React.FC<TrustRegistriesPageProps> = ({
             <div className="d-flex justify-content-between align-items-center">
               <h6 className="m-0 font-weight-bold text-primary">
                 <i className="fas fa-shield-alt"></i> All Trust Registries
-                <span className="badge text-bg-primary ms-2" style={{ verticalAlign: 'middle' }}>
-                  {filteredTrustRegistries.length}
-                  {effectiveSearchTerm && ` of ${trustRegistries.length}`}
-                </span>
               </h6>
               {actionButtons}
             </div>

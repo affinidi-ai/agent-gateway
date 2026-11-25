@@ -259,6 +259,29 @@ pub async fn a2a_request_sent_to_surface(
     send_rpc(world, gw_index, &surface_name, build_a2a_request_body(), &[]).await;
 }
 
+/// An A2A message with an invalid API key, carrying an identity binding VP and
+/// an identity credential of the caller's own making.
+#[when(
+    expr = "the caller sends a Fabric A2A request with an invalid API key and an identity proof of its own through gateway {int} surface {string}"
+)]
+pub async fn a2a_request_with_invalid_api_key_and_own_identity_proof(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    surface_name: String,
+) {
+    use crate::bdd_support::json_rpc::{AGENT_IDENTITY_BINDING_EXTENSION_URI, AGENT_IDENTITY_CREDENTIAL_EXTENSION_URI};
+    world.start().await;
+    let mut body = build_a2a_request_body();
+    body["params"]["message"]["extensions"] =
+        serde_json::json!([AGENT_IDENTITY_BINDING_EXTENSION_URI, AGENT_IDENTITY_CREDENTIAL_EXTENSION_URI]);
+    body["params"]["message"]["metadata"] = serde_json::json!({
+        AGENT_IDENTITY_BINDING_EXTENSION_URI: {"verifiablePresentation": "caller-made-presentation"},
+        AGENT_IDENTITY_CREDENTIAL_EXTENSION_URI: {"did": "did:web:asserted.example", "verifiablePresentation": "caller-made-presentation"}
+    });
+    send_rpc(world, gw_index, &surface_name, body, &[("x-api-key".to_string(), "bdd-invalid-api-key".to_string())])
+        .await;
+}
+
 #[when(expr = "the caller fetches the agent card from gateway {int} surface {string}")]
 pub async fn agent_card_fetched_from_surface(
     world: &mut G2gWorld,

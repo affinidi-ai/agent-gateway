@@ -51,12 +51,6 @@ const CredentialsPage: React.FC = () => {
   const canViewSts = !permissionsLoading && hasPermission('sts_clients.view');
   const vault = useDelegationVault();
 
-  const [strategiesCount, setStrategiesCount] = useState(0);
-  const [providersCount, setProvidersCount] = useState(0);
-  const [tokensCount, setTokensCount] = useState(0);
-  const [delegationsCount, setDelegationsCount] = useState(0);
-  const [stsClientsCount, setStsClientsCount] = useState(0);
-
   useEffect(() => {
     if (permissionsLoading) return;
     const hidden =
@@ -82,16 +76,6 @@ const CredentialsPage: React.FC = () => {
   const viewHistory = () => navigate(auditLogPath(DELEGATION_ENDED_CATEGORIES));
   const viewActivity = (userHash: string) =>
     navigate(auditLogPath(DELEGATION_CATEGORIES, userHash));
-
-  const filterActive = searchTerm.trim().length > 0;
-  const tabBadge = (count: number) => {
-    if (!filterActive) return null;
-    return (
-      <span className="badge text-bg-primary ms-2" style={{ verticalAlign: 'middle' }}>
-        {count}
-      </span>
-    );
-  };
 
   return (
     <div className="container-fluid" data-testid="page-credentials">
@@ -122,14 +106,11 @@ const CredentialsPage: React.FC = () => {
             tabAttrs={{ 'data-testid': 'credentials-jwt-verification-tab-trigger' }}
             title={
               <>
-                <i className="fas fa-id-badge"></i> JWT Verification {tabBadge(strategiesCount)}
+                <i className="fas fa-id-badge"></i> JWT Verification
               </>
             }
           >
-            <StrategiesTab
-              externalSearchTerm={searchTerm}
-              onFilteredCountChange={setStrategiesCount}
-            />
+            <StrategiesTab externalSearchTerm={searchTerm} />
           </Tab>
         )}
 
@@ -139,13 +120,12 @@ const CredentialsPage: React.FC = () => {
             tabAttrs={{ 'data-testid': 'credentials-credential-providers-tab-trigger' }}
             title={
               <>
-                <i className="fas fa-id-card"></i> Credential Providers {tabBadge(providersCount)}
+                <i className="fas fa-id-card"></i> Credential Providers
               </>
             }
           >
             <CredentialProvidersTab
               externalSearchTerm={searchTerm}
-              onFilteredCountChange={setProvidersCount}
               onProvidersChange={vault.refresh}
             />
           </Tab>
@@ -157,14 +137,13 @@ const CredentialsPage: React.FC = () => {
             tabAttrs={{ 'data-testid': 'credentials-credential-tokens-tab-trigger' }}
             title={
               <>
-                <i className="fas fa-lock"></i> Credential Tokens {tabBadge(tokensCount)}
+                <i className="fas fa-lock"></i> Credential Tokens
               </>
             }
           >
             <CredentialTokensTab
               vault={vault}
               externalSearchTerm={searchTerm}
-              onFilteredCountChange={setTokensCount}
               onViewActivity={canViewAudit ? viewActivity : undefined}
             />
           </Tab>
@@ -176,14 +155,13 @@ const CredentialsPage: React.FC = () => {
             tabAttrs={{ 'data-testid': 'credentials-delegated-access-tab-trigger' }}
             title={
               <>
-                <i className="fas fa-user-check"></i> Delegated Access {tabBadge(delegationsCount)}
+                <i className="fas fa-user-check"></i> Delegated Access
               </>
             }
           >
             <DelegatedAccessTab
               vault={vault}
               externalSearchTerm={searchTerm}
-              onFilteredCountChange={setDelegationsCount}
               onViewHistory={canViewAudit ? viewHistory : undefined}
             />
           </Tab>
@@ -195,14 +173,11 @@ const CredentialsPage: React.FC = () => {
             tabAttrs={{ 'data-testid': 'credentials-sts-clients-tab-trigger' }}
             title={
               <>
-                <i className="fas fa-right-left"></i> STS Clients {tabBadge(stsClientsCount)}
+                <i className="fas fa-right-left"></i> STS Clients
               </>
             }
           >
-            <StsClientsTab
-              externalSearchTerm={searchTerm}
-              onFilteredCountChange={setStsClientsCount}
-            />
+            <StsClientsTab externalSearchTerm={searchTerm} />
           </Tab>
         )}
       </Tabs>

@@ -700,7 +700,9 @@ surface it creates unless it is public), a legacy one stored without `public`, a
 `caller_authentication.on_failure` is `reject`, see
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#closed-and-public-access-points). An Access Point whose
 inbound identity is `from_jwt_claim`, public or not, direct or over fabric, refuses one the
-same way, because no caller identity can be derived without a valid JWT. These refusals run
+same way, whatever method it failed; a caller verified by a method other than JWT Bearer is
+served there with no identity (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#several-methods-on-one-access-point)). These refusals run
 before gateway policy, so a gateway deny does not apply to them, and surface policy never sees
 the request. Their body is the generic `Caller credential missing or invalid`; the reason is
 logged. Only on any other public Access Point (`public: true`) does source auth hand a request
@@ -779,6 +781,14 @@ receive does not read this mode; the request body sets the caller there (see
 - A key that also identifies a Managed Agent gives its callers the Managed Agent's DID; see
   [One key in both roles](SOURCE_AUTH.md#one-key-in-both-roles) for the surface policy that
   refuses it.
+
+On a surface whose inbound identity is `from_api_key` or `from_jwt_claim`, a caller verified by
+a method that identity does not read (any method but an API key for `from_api_key`, any but
+JWT Bearer for `from_jwt_claim`), or whose credential failed on a public Access Point, gets no
+caller identity, on direct requests and Fabric send: `input.extension_identity` and
+`input.agent.did` are absent, and so are the trust-registry claims its body makes. Tell it apart
+by `input.source_auth.method`; see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#several-methods-on-one-access-point).
 
 A DID copied from the request body or an agent card into `input.agent.did` that
 differs from `extension_identity.did`, or when there is none, carries
@@ -1066,9 +1076,6 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   a private host answers. The fetch ignores any HTTP proxy. Under
   `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` admits listed loopback
   fixtures, never cloud metadata.
-- `egress::pinned_forward_client` (cloud-metadata-only) pins the **x402
-  remote-facilitator** client (`src/x402/remote_facilitator.rs`, re-pinned per
-  construction, resolve/pin on `spawn_blocking` off the async runtime).
 - `egress::pinned_forward_client` pins the **event hook** call (`src/event_hook/transport.rs`),
   the operator-configured `AG_EVENT_HOOK_URL` ([`INTEGRATIONS.md`](INTEGRATIONS.md#event-hook)):
   loopback and private receivers are allowed, cloud metadata is blocked, redirects are not followed.

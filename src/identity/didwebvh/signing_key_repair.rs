@@ -29,10 +29,7 @@ pub(crate) fn wait_before_next_version(
 ) -> Result<Option<std::time::Duration>> {
     let wait = (previous_time + chrono::Duration::seconds(1)).signed_duration_since(now);
     if wait > chrono::Duration::seconds(MAX_VERSION_TIME_WAIT_SECS) {
-        anyhow::bail!(
-            "the latest DID log version is dated {previous_time}, ahead of this node's clock; \
-             the repair runs again on the next start"
-        );
+        anyhow::bail!("the latest DID log version is dated {previous_time}, ahead of this node's clock");
     }
     Ok(wait.to_std().ok())
 }
@@ -290,7 +287,9 @@ pub(crate) async fn append_signing_key_version(
             .as_str()
             .context("DID log entry has no versionTime")?,
     )?;
-    if let Some(wait) = wait_before_next_version(previous_time.to_utc(), chrono::Utc::now())? {
+    if let Some(wait) = wait_before_next_version(previous_time.to_utc(), chrono::Utc::now())
+        .context("the repair runs again on the next start")?
+    {
         tokio::time::sleep(wait).await;
     }
 

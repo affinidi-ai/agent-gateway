@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
+use super::store::{Updated, undecided};
 use super::{DelegatedPaymentStore, LedgerOutcome, PaymentLedgerRow, SettleAction};
 use crate::gateways::payment_case::CaseStatusError;
 
@@ -373,6 +374,9 @@ async fn settle_with(
         let mut recorded = action;
         let written = store
             .update(&held.row_id, |row| {
+                if !undecided(row) {
+                    return false;
+                }
                 if row.settle_intent != Some(SettleAction::Capture) {
                     row.settle_intent = Some(action);
                 }
@@ -382,18 +386,33 @@ async fn settle_with(
                 row.settle_attempts = row
                     .settle_attempts
                     .saturating_add(1);
+                true
             })
             .await;
-        if let Err(e) = written {
-            warn!(
-                error = %e,
-                row_id = %held.row_id,
-                "[payments-ledger] Failed to record a settle intent; the reconciler sends it"
-            );
-            return Settled {
-                outcome: LedgerOutcome::Authorized,
-                receipt: None,
-            };
+        match written {
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    row_id = %held.row_id,
+                    "[payments-ledger] Failed to record a settle intent; the reconciler sends it"
+                );
+                return Settled {
+                    outcome: LedgerOutcome::Authorized,
+                    receipt: None,
+                };
+            }
+            Ok(Updated::Refused(row)) => {
+                info!(
+                    row_id = %held.row_id,
+                    outcome = row.outcome.as_str(),
+                    "[payments-ledger] Not settling a payment that is already closed"
+                );
+                return Settled {
+                    outcome: row.outcome,
+                    receipt: None,
+                };
+            }
+            Ok(Updated::Written(_)) => {}
         }
         if recorded != action {
             warn!(
@@ -474,6 +493,9 @@ async fn apply(
     let reference = receipt.and_then(|receipt| crate::proxy::handler::agent_pay_gate::receipt_facts(receipt).reference);
     let updated = store
         .update(row_id, |row| {
+            if !undecided(row) {
+                return false;
+            }
             row.outcome = outcome;
             if reference.is_some() {
                 row.receipt_reference = reference;
@@ -484,11 +506,21 @@ async fn apply(
             if reason.is_some() {
                 row.reason = reason;
             }
+            true
         })
         .await;
     match updated {
-        Ok(row) => {
+        Ok(Updated::Written(row)) => {
             report(&row, None);
+            Some(row)
+        }
+        Ok(Updated::Refused(row)) => {
+            info!(
+                row_id,
+                kept = row.outcome.as_str(),
+                refused = outcome.as_str(),
+                "[payments-ledger] Kept the outcome of a payment that is already closed"
+            );
             Some(row)
         }
         Err(e) => {
@@ -691,10 +723,18 @@ async fn reconcile_row(
             .filter(|later| **later != row.id)
         {
             let later = later.clone();
-            return store
-                .update(&row.id, |row| row.superseded_by = Some(later))
-                .await
-                .is_ok();
+            return matches!(
+                store
+                    .update(&row.id, |row| {
+                        if !undecided(row) {
+                            return false;
+                        }
+                        row.superseded_by = Some(later);
+                        true
+                    })
+                    .await,
+                Ok(Updated::Written(_))
+            );
         }
     }
     let deadline = row
@@ -766,7 +806,13 @@ async fn reconcile_row(
                     .unwrap_or(SettleAction::Void);
                 if row.authorization_id.is_none() {
                     let _ = store
-                        .update(&row.id, |row| row.authorization_id = Some(authorization_id.clone()))
+                        .update(&row.id, |row| {
+                            if !undecided(row) || row.authorization_id.is_some() {
+                                return false;
+                            }
+                            row.authorization_id = Some(authorization_id.clone());
+                            true
+                        })
                         .await;
                 }
                 let held = HeldPayment {
@@ -787,10 +833,14 @@ async fn reconcile_row(
         };
         crate::metrics::backends::prometheus::track_payment_settlement("reconcile", "failed");
         let kept = super::ledger_reason(&format!("reconcile_failed: {reason}"));
-        if let Ok(row) = store
+        if let Ok(Updated::Written(row)) = store
             .update(&row.id, |row| {
+                if !super::store::awaits_settlement(row) {
+                    return false;
+                }
                 row.reconcile_failed = true;
                 row.reason = Some(kept);
+                true
             })
             .await
         {
@@ -1456,6 +1506,120 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    async fn recorded(
+        store: &DelegatedPaymentStore,
+        row: &PaymentLedgerRow,
+    ) -> PaymentLedgerRow {
+        store
+            .get(&row.id)
+            .await
+            .unwrap()
+            .0
+    }
+
+    #[tokio::test]
+    async fn a_closed_payment_is_not_settled_again() {
+        let (store, dir) = store().await;
+        for closed in [LedgerOutcome::Paid, LedgerOutcome::Voided, LedgerOutcome::CaptureFailed] {
+            let gateway_id = gateway();
+            let client = Scripted::settling(vec![answer(SettlementStatus::Captured)]);
+            install_test_client(&gateway_id, client.clone());
+            let row = held_row(&gateway_id, closed, chrono::Duration::zero());
+            store
+                .record_durable(row.clone(), None)
+                .await
+                .unwrap();
+            let held = HeldPayment {
+                row_id: row.id.clone(),
+                payment_gateway_id: gateway_id,
+                authorization_id: "auth-1".to_string(),
+                wait: Duration::from_secs(1),
+            };
+
+            let settled = settle_with(Some(&store), &held, SettleAction::Capture, None).await;
+
+            assert_eq!(settled.outcome, closed, "{closed:?}");
+            assert!(
+                client
+                    .settled
+                    .lock()
+                    .unwrap()
+                    .is_empty(),
+                "{closed:?} is not sent to agent-pay"
+            );
+            let kept = recorded(&store, &row).await;
+            assert_eq!(kept.outcome, closed);
+            assert_eq!(kept.settle_attempts, 0);
+            assert_eq!(kept.settle_intent, None);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_late_answer_does_not_change_a_closed_payment() {
+        let (store, dir) = store().await;
+        for (closed, late) in [
+            (LedgerOutcome::Voided, LedgerOutcome::CaptureFailed),
+            (LedgerOutcome::Paid, LedgerOutcome::Unconfirmed),
+            (LedgerOutcome::Rejected, LedgerOutcome::Paid),
+        ] {
+            let row = held_row(&gateway(), closed, chrono::Duration::zero());
+            store
+                .record_durable(row.clone(), None)
+                .await
+                .unwrap();
+
+            let applied = apply(&store, &row.id, late, None, None, None).await;
+
+            assert_eq!(applied.map(|row| row.outcome), Some(closed), "{closed:?} then {late:?}");
+            assert_eq!(
+                recorded(&store, &row)
+                    .await
+                    .outcome,
+                closed
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn an_undecided_payment_takes_its_outcome_even_after_the_reconciler_gave_up() {
+        let (store, dir) = store().await;
+        let mut row = held_row(&gateway(), LedgerOutcome::Authorized, chrono::Duration::zero());
+        row.reconcile_failed = true;
+        store
+            .record_durable(row.clone(), None)
+            .await
+            .unwrap();
+
+        let applied = apply(&store, &row.id, LedgerOutcome::Paid, None, None, None).await;
+
+        assert_eq!(applied.map(|row| row.outcome), Some(LedgerOutcome::Paid));
+        assert_eq!(
+            recorded(&store, &row)
+                .await
+                .outcome,
+            LedgerOutcome::Paid
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_superseded_payment_is_closed() {
+        let (store, dir) = store().await;
+        let mut row = held_row(&gateway(), LedgerOutcome::Unconfirmed, chrono::Duration::zero());
+        row.superseded_by = Some("later-row".to_string());
+        store
+            .record_durable(row.clone(), None)
+            .await
+            .unwrap();
+
+        let applied = apply(&store, &row.id, LedgerOutcome::Paid, None, None, None).await;
+
+        assert_eq!(applied.map(|row| row.outcome), Some(LedgerOutcome::Unconfirmed));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -40,16 +40,6 @@ impl PaymentPayload {
         &self.accepted.amount
     }
 
-    /// Get the recipient address from the accepted field
-    pub fn pay_to(&self) -> &str {
-        &self.accepted.pay_to
-    }
-
-    /// Get the asset/token address from the accepted field
-    pub fn asset(&self) -> Option<&str> {
-        self.accepted.token_address()
-    }
-
     /// Extract transaction hash from payload (scheme-specific)
     pub fn tx_hash(&self) -> Option<String> {
         self.payload
@@ -84,32 +74,6 @@ impl PaymentPayload {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     }
-
-    /// Get the asset transfer method (eip3009, permit2, or default to transaction)
-    pub fn asset_transfer_method(&self) -> String {
-        self.accepted
-            .asset_transfer_method()
-    }
-
-    /// Extract EIP-3009 authorization data
-    pub fn eip3009_authorization(&self) -> Option<Eip3009Authorization> {
-        self.payload
-            .get("authorization")
-            .and_then(|auth| serde_json::from_value(auth.clone()).ok())
-    }
-}
-
-/// EIP-3009 transferWithAuthorization parameters
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Eip3009Authorization {
-    pub from: String,
-    pub to: String,
-    pub value: String,
-    #[serde(rename = "validAfter")]
-    pub valid_after: String,
-    #[serde(rename = "validBefore")]
-    pub valid_before: String,
-    pub nonce: String,
 }
 
 /// Resource information for v2 PaymentRequired response

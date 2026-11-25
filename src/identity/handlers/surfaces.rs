@@ -131,7 +131,7 @@ fn validate_identity_extraction(
 }
 
 pub(crate) const INBOUND_API_KEY_NEEDS_API_KEY_CALLER: &str =
-    "Identity 'From API Key' needs every Caller Context method to be API Key or API Key Provider";
+    "Identity 'From API Key' needs an API Key or API Key Provider Caller Context method";
 pub(crate) const INBOUND_API_KEY_WITH_RESOURCE_TOKENS: &str = "Identity 'From API Key' cannot be used with \
      mcp_http.authorization, which identifies callers by their resource token; remove one of them";
 pub(crate) const INBOUND_API_KEY_ON_MCP_PROXY: &str =
@@ -191,11 +191,10 @@ fn validate_api_key_identities(
     };
     let inbound_from_api_key = surface.inbound_identity_from_api_key();
     if inbound_from_api_key {
-        let methods = surface.source_auth_methods();
-        if methods.is_empty()
-            || !methods
-                .iter()
-                .all(|method| matches!(method, SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_)))
+        if !surface
+            .source_auth_methods()
+            .iter()
+            .any(|method| matches!(method, SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_)))
         {
             return Err(refuse(INBOUND_API_KEY_NEEDS_API_KEY_CALLER));
         }
@@ -273,14 +272,12 @@ fn refuse_unservable_route(
     existing: Option<&AgentSurface>,
     network_config: &crate::config::NetworkConfig,
 ) -> Result<(), SurfaceApiError> {
-    use crate::config::agent_surface::SurfaceStatus;
     let route = surface
         .access_point
         .route
         .as_str();
-    let kept_route =
-        existing.is_some_and(|existing| existing.status != SurfaceStatus::Disabled) && keeps_route(surface, existing);
-    if surface.status == SurfaceStatus::Disabled || kept_route {
+    let kept_route = existing.is_some_and(|existing| existing.status.is_live()) && keeps_route(surface, existing);
+    if !surface.status.is_live() || kept_route {
         return Ok(());
     }
     crate::config::route_claims::check_surface_route_syntax(route)
@@ -342,6 +339,12 @@ fn validate_required_fields(
     } else {
         format!("{}: ", label)
     };
+    if surface.status == crate::config::agent_surface::SurfaceStatus::Deleted {
+        return Err(SurfaceApiError::BadRequest(format!(
+            "{}status 'deleted' cannot be saved; delete the surface instead",
+            prefix
+        )));
+    }
     if surface.name.is_empty() {
         return Err(SurfaceApiError::BadRequest(format!("{}name is required", prefix)));
     }
@@ -2640,7 +2643,7 @@ fn check_listen_path_collisions(
     // A disabled surface reserves no routes (routing skips it), so saving
     // one can never introduce a collision. Skipping here keeps disabling a
     // conflicting surface possible — the natural way out of a duplicate.
-    if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+    if !surface.status.is_live() {
         return Ok(());
     }
 
@@ -2651,7 +2654,7 @@ fn check_listen_path_collisions(
         if other.surface_id == surface.surface_id {
             continue;
         }
-        if other.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+        if !other.status.is_live() {
             continue;
         }
         for key in outbound_listen_path_claims(other, &resolve_port) {
@@ -2739,7 +2742,7 @@ fn check_access_point_route_collisions(
 ) -> Result<(), SurfaceApiError> {
     // A disabled surface reserves no routes, so saving one can never
     // introduce a collision (mirrors check_listen_path_collisions).
-    if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+    if !surface.status.is_live() {
         return Ok(());
     }
 
@@ -2757,7 +2760,7 @@ fn check_access_point_route_collisions(
         if other.surface_id == surface.surface_id {
             continue;
         }
-        if other.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+        if !other.status.is_live() {
             continue;
         }
         let (other_listener, other_route) = access_point_route_claim(other, &resolve_port);
@@ -5299,7 +5302,7 @@ async fn apply_surface_change_while_locked(
     };
     provider_key_gate.owner_changed(changed_id);
     match change {
-        SurfaceChange::Upsert(surface) if surface.status == crate::config::agent_surface::SurfaceStatus::Active => {
+        SurfaceChange::Upsert(surface) if surface.status.is_live() => {
             provider_key_gate
                 .admit(surface)
                 .await
@@ -5316,7 +5319,7 @@ async fn apply_surface_change_while_locked(
     // deleted surface.
     match change {
         SurfaceChange::Upsert(surface) => {
-            if surface.status == crate::config::agent_surface::SurfaceStatus::Active {
+            if surface.status.is_live() {
                 if let Err(e) = state
                     .resolved_surface_cache
                     .upsert(surface)
@@ -5361,7 +5364,7 @@ async fn apply_surface_change_while_locked(
 
     let fast_result: anyhow::Result<bool> = match change {
         SurfaceChange::Upsert(surface) => {
-            if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
+            if !surface.status.is_live() {
                 // Inactive surfaces shouldn't be running — fall through
                 // to full reload, which filters them out via
                 // inject_surfaces_into_config.
@@ -5451,7 +5454,7 @@ async fn refresh_surface_policies(
     change: SurfaceChange<'_>,
 ) {
     match change {
-        SurfaceChange::Upsert(surface) if surface.status == crate::config::agent_surface::SurfaceStatus::Active => {
+        SurfaceChange::Upsert(surface) if surface.status.is_live() => {
             if let Err(e) = policy_manager
                 .update_channel_policy(surface)
                 .await
@@ -9088,6 +9091,19 @@ mod validation_tests {
     }
 
     #[test]
+    fn required_fields_rejects_a_deleted_status() {
+        let mut s = base_surface();
+        s.status = crate::config::agent_surface::SurfaceStatus::Deleted;
+        match validate_required_fields(&s, "") {
+            Err(SurfaceApiError::BadRequest(msg)) => assert!(msg.contains("status 'deleted'"), "{msg}"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        s.status = crate::config::agent_surface::SurfaceStatus::Disabled;
+        validate_required_fields(&s, "").expect("a disabled surface can be saved");
+    }
+
+    #[test]
     fn required_fields_rejects_missing_endpoint() {
         let mut s = base_surface();
         s.target.endpoint.clear();
@@ -9415,20 +9431,22 @@ mod validation_tests {
     fn inbound_from_api_key_refusal_matches_the_dashboard_text() {
         assert_eq!(
             INBOUND_API_KEY_NEEDS_API_KEY_CALLER,
-            "Identity 'From API Key' needs every Caller Context method to be API Key or API Key Provider"
+            "Identity 'From API Key' needs an API Key or API Key Provider Caller Context method"
         );
     }
 
     #[test]
-    fn inbound_from_api_key_is_refused_unless_every_caller_method_is_an_api_key() {
+    fn inbound_from_api_key_needs_an_api_key_method_to_read() {
+        for (case, caller) in [("no caller authentication", vec![]), ("jwt only", vec![jwt_caller()])] {
+            let s = inbound_api_key_surface(&caller);
+            assert!(refusal(validate_api_key_identities(&s, "")) == INBOUND_API_KEY_NEEDS_API_KEY_CALLER, "{case}");
+        }
         for (case, caller) in [
-            ("no caller authentication", vec![]),
-            ("jwt only", vec![jwt_caller()]),
             ("api key second", vec![jwt_caller(), provider_caller()]),
             ("jwt second", vec![api_key_caller("caller-keys"), jwt_caller()]),
         ] {
             let s = inbound_api_key_surface(&caller);
-            assert!(refusal(validate_api_key_identities(&s, "")) == INBOUND_API_KEY_NEEDS_API_KEY_CALLER, "{case}");
+            assert!(validate_api_key_identities(&s, "").is_ok(), "{case}");
         }
 
         let mut other_mode = inbound_api_key_surface(&[jwt_caller()]);

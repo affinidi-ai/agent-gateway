@@ -345,7 +345,6 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
             <div className="d-flex justify-content-between align-items-center">
               <h6 className="m-0 font-weight-bold text-primary">
                 <i className="fas fa-exchange-alt"></i> All Mediators
-                <Badge value={0} tone="primary" className="ms-2" ariaLabel="0 mediators" />
               </h6>
               {actionButtons}
             </div>
@@ -365,13 +364,6 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
             <div className="d-flex justify-content-between align-items-center">
               <h6 className="m-0 font-weight-bold text-primary">
                 <i className="fas fa-exchange-alt"></i> All Mediators
-                <Badge
-                  value={filteredMediators.length}
-                  tone="primary"
-                  className="ms-2"
-                  ariaLabel={`${filteredMediators.length} mediators`}
-                  suffix={effectiveSearchTerm ? ` of ${mediators.length}` : undefined}
-                />
               </h6>
               {actionButtons}
             </div>

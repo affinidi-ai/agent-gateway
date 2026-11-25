@@ -170,9 +170,11 @@ Access Point panel and on the canvas, and names a new surface `<protocol>_surfac
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Surface Builder's inbound Identity **From API Key** shows no key picker, since each caller is
-identified by the API key it presents, and blocks Save unless every Caller Context method is API
-Key or API Key Provider; the protected and external Identities' key picker lists only the
-surface's own active keys; see _Surface Builder_ in
+identified by the API key it presents, and blocks Save unless a Caller Context method is API Key
+or API Key Provider. An inbound **From JWT Claims** blocks Save unless a Caller Context method is
+JWT Bearer; on the protected or external Identity or a Transit Point it needs every method to be
+JWT Bearer. Callers of the other methods get no identity. The protected and external Identities'
+key picker lists only the surface's own active keys. See _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 A protected, external or Transit Point Identity whose API key reference is `blocking`
@@ -394,14 +396,15 @@ _Agent Cards tab_ in
 
 The read-only Agents page at `/agent-registry` needs `surfaces.view` and lists one row per managed
 agent, built by the gateway from the surfaces that target it; MCP surfaces are left out and no
-status is shown. Its empty state offers a **Create a surface** link, which opens `/surfaces/new`,
-to users with `surfaces.edit` only. Its Agent Card tab shows the card the gateway serves for
-Direct, Proxied and Fabric routes with a **Card source** row, and keeps the surface picker, with a
-Retry, when the card can't be read through the chosen surface. Its list shows the protocol with the
-shared `ProtocolBadge` (`components/shared/ProtocolBadge.tsx`) the Surfaces page and the template
-picker use, never restyled per page, the Identities and Used by surfaces counts as the Surfaces page's square count
-badge, and every row value at the table's body size. Its Connection tab lists each of the agent's
-DIDs with a copy button; see _Agents page_ in
+status is shown. Its header holds an **Add Surface** button (gated on `surfaces.edit` and the surface
+limit, using `useLimitGuard`) that opens `/surfaces/new`, and when no agents are shown, an `EmptyState`
+says "Get started with Agents" with a docs link to the first-surface creation guide. The Agent Card tab
+shows the card the gateway serves for Direct, Proxied and Fabric routes with a **Card source** row, and
+keeps the surface picker, with a Retry, when the card can't be read through the chosen surface. Its list
+shows the protocol with the shared `ProtocolBadge` (`components/shared/ProtocolBadge.tsx`) the Surfaces
+page and the template picker use, never restyled per page, the Identities and Used by surfaces counts as
+the Surfaces page's square count badge, and every row value at the table's body size. Its Connection tab
+lists each of the agent's DIDs with a copy button; see _Agents page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#agents-page).
 
 The Identities page shows one row per surface Managed Agent, with its earlier DIDs (from its
@@ -535,8 +538,8 @@ hands a failed caller to policy only on a public Access Point (`access_point.pub
 every other Access Point refuses it before policy with a `401`, direct or over Fabric: a closed
 one (`public: false`), a legacy one stored without `public`, and any whose
 `caller_authentication.on_failure` is `reject`. Two more refuse it, public or not: an Access
-Point whose inbound identity is `from_jwt_claim` (no caller identity can be derived without a
-valid JWT), and an MCP Access Point that publishes protected resource metadata (a missing or
+Point whose inbound identity is `from_jwt_claim` (a failed caller of any method; a verified
+caller of another method is served with no identity), and an MCP Access Point that publishes protected resource metadata (a missing or
 refused JWT Bearer credential gets the discovery challenge on direct requests, a failed
 credential of another method a plain `401`). Each such refusal's body says only `Caller
 credential missing or invalid`; the reason is logged, not sent. The admin API creates every

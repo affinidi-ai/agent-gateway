@@ -571,7 +571,11 @@ pub async fn process_message_internal(
         MessageType::ForwardResponse => process_forward_response(message).await,
         MessageType::ForwardStreamFrame | MessageType::ForwardStreamQuery | MessageType::ForwardStreamDisclose => {
             match crate::proxy::fabric_stream::global() {
-                Ok(runtime) => runtime.process(message, message_type),
+                Ok(runtime) => {
+                    runtime
+                        .process(message, message_type)
+                        .await
+                }
                 Err(reason) => ProcessingResult::Failed { reason },
             }
         }
@@ -580,7 +584,7 @@ pub async fn process_message_internal(
         MessageType::X402VerifyRequest => refuse_x402_verify_request(message),
         MessageType::X402VerifyResponse => ignore_x402_verify_response(message),
         MessageType::X402SettleRequest => refuse_x402_settle_request(message),
-        MessageType::X402SettleResponse => process_x402_settle_response(message).await,
+        MessageType::X402SettleResponse => ignore_x402_settle_response(message),
         MessageType::X402SettlementComplete => process_x402_settlement_complete(message).await,
 
         // Message pickup protocol
@@ -876,7 +880,7 @@ async fn process_connection_setup(message: &ReceivedMessage) -> ProcessingResult
 
     // Only a sender that proved control of its channel_did on a live
     // invitation may add to the seen set.
-    if let Err(rejection) = super::envelope_replay::admit_pairing_message(message) {
+    if let Err(rejection) = super::envelope_replay::admit_pairing_message(message).await {
         return pairing_envelope_refusal(message, rejection);
     }
 
@@ -1153,7 +1157,7 @@ async fn process_connection_accepted(message: &ReceivedMessage) -> ProcessingRes
         }
     };
 
-    if let Err(rejection) = super::envelope_replay::admit_pairing_message(message) {
+    if let Err(rejection) = super::envelope_replay::admit_pairing_message(message).await {
         return pairing_envelope_refusal(message, rejection);
     }
 
@@ -1681,6 +1685,7 @@ fn forward_request_envelope_refusal(
     let (status, error) = match rejection {
         EnvelopeRejection::Duplicate { .. } => return ProcessingResult::ProcessedNoResponse,
         EnvelopeRejection::Expired { .. } => (504, "Gateway Timeout"),
+        EnvelopeRejection::Unrecorded => (503, "Service Unavailable"),
         _ => (403, "Forbidden"),
     };
     ProcessingResult::RequiresResponse {
@@ -4755,7 +4760,7 @@ async fn process_charged_forward_request(
                 .await;
         }
     };
-    if let Err(rejection) = super::envelope_replay::admit_forward_request(message) {
+    if let Err(rejection) = super::envelope_replay::admit_forward_request(message).await {
         return forward_request_envelope_refusal(message, rejection);
     }
 
@@ -9550,78 +9555,10 @@ fn ignore_x402_verify_response(message: &ReceivedMessage) -> ProcessingResult {
     ProcessingResult::ProcessedNoResponse
 }
 
-#[instrument(skip(message), fields(message_id = %message.id))]
-async fn process_x402_settle_response(message: &ReceivedMessage) -> ProcessingResult {
-    info!("Processing settlement response");
-
-    let body = &message.message_body;
-    let settled = body
-        .get("settled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let transaction_id = body
-        .get("transaction_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let error_msg = body
-        .get("error")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Settlement failed");
-    let network = body
-        .get("network")
-        .and_then(|v| v.as_str());
-    let facilitator = body
-        .get("facilitator")
-        .and_then(|v| v.as_str());
-
-    // Get correlation_id from DIDComm thid field
-    // The response should have thid matching our original request message ID
-    let correlation_id = match &message.didcomm_thid {
-        Some(id) => id.clone(),
-        None => {
-            warn!("Settlement response missing thid - cannot match to request");
-            return ProcessingResult::Failed {
-                reason: "Missing thid (thread ID) in settlement response".to_string(),
-            };
-        }
-    };
-
-    if settled {
-        info!(
-            "✅ Settlement successful - txn: {} network: {} facilitator: {} correlation_id: {}",
-            transaction_id,
-            network.unwrap_or("unknown"),
-            facilitator.unwrap_or("unknown"),
-            correlation_id
-        );
-    } else {
-        warn!(
-            "❌ Settlement failed - error: {} network: {} facilitator: {} correlation_id: {}",
-            error_msg,
-            network.unwrap_or("unknown"),
-            facilitator.unwrap_or("unknown"),
-            correlation_id
-        );
-    }
-
-    // Create settlement response
-    let response = crate::x402::gateway_facilitator_service::SettlementResponse {
-        settled,
-        tx_hash: transaction_id.to_string(),
-        error: error_msg.to_string(),
-    };
-
-    // Try to signal any waiting immediate mode request (event-driven, NO POLLING!)
-    let signaled =
-        crate::x402::gateway_facilitator_service::signal_settlement_response(&correlation_id, response.clone()).await;
-
-    if signaled {
-        info!("✅ Signaled waiting immediate mode settlement request: {}", correlation_id);
-    } else {
-        // No immediate request waiting - this is deferred mode, update payment record
-        info!("No immediate request waiting, updating payment record for deferred settlement: {}", correlation_id);
-    }
-
+/// This gateway sends no x402 settle-request, so a settle-response answers
+/// nothing it asked and is dropped without touching the transaction store.
+fn ignore_x402_settle_response(message: &ReceivedMessage) -> ProcessingResult {
+    debug!(from = ?message.from_did, "Ignoring x402 settle-response: this gateway sends no settle-request");
     ProcessingResult::ProcessedNoResponse
 }
 
@@ -9631,61 +9568,75 @@ async fn process_x402_settle_response(message: &ReceivedMessage) -> ProcessingRe
 async fn process_x402_settlement_complete(message: &ReceivedMessage) -> ProcessingResult {
     info!("📥 Processing x402 settlement-complete");
 
-    let body = &message.message_body;
+    let Some(txn_store) = get_transaction_store() else {
+        warn!("Transaction store not available - cannot update settlement completion");
+        return ProcessingResult::ProcessedNoResponse;
+    };
+    let gateways = match message_gateway_store(message).await {
+        Ok(gateways) => gateways,
+        Err(e) => {
+            warn!("Ignoring settlement-complete: {}", e);
+            return ProcessingResult::ProcessedNoResponse;
+        }
+    };
+    if let Err(reason) = apply_settlement_complete(message, &txn_store, &gateways).await {
+        warn!("Ignoring settlement-complete from {:?}: {}", message.from_did, reason);
+    }
 
-    // Extract settlement completion details
+    ProcessingResult::ProcessedNoResponse
+}
+
+/// Complete the named transaction's settlement, but only when the message comes
+/// from the active peer gateway recorded as that transaction's facilitator,
+/// explicitly reports `completed`, and the settlement is still in progress.
+async fn apply_settlement_complete(
+    message: &ReceivedMessage,
+    txn_store: &crate::x402::TransactionStore,
+    gateways: &crate::gateways::FileSystemGatewayStore,
+) -> Result<(), String> {
+    let body = &message.message_body;
     let correlation_id = body
         .get("correlation_id")
         .and_then(|v| v.as_str())
-        .unwrap_or(&message.didcomm_message_id)
-        .to_string();
+        .unwrap_or(&message.didcomm_message_id);
+    if body
+        .get("status")
+        .and_then(|v| v.as_str())
+        != Some("completed")
+    {
+        return Err(format!("transaction {correlation_id:?} is not reported as completed"));
+    }
+    let from_did = message
+        .from_did
+        .as_deref()
+        .ok_or("the message has no sender DID")?;
+    let transaction = txn_store
+        .get(correlation_id)
+        .await
+        .ok_or_else(|| format!("no transaction {correlation_id:?}"))?;
+    let facilitator = transaction
+        .verification
+        .facilitator_gateway_id
+        .as_deref()
+        .ok_or_else(|| format!("transaction {correlation_id:?} has no facilitator gateway"))?;
+    let sender = gateways
+        .get_by_did(from_did)
+        .await
+        .map_err(|e| format!("gateway lookup failed: {e}"))?;
+    if !sender.is_some_and(|gateway| gateway.is_active() && gateway.id == facilitator) {
+        return Err(format!("the sender is not the active facilitator gateway of transaction {correlation_id:?}"));
+    }
 
     let tx_hash = body
         .get("tx_hash")
         .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-
-    let status = body
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("completed");
-
-    info!(
-        "✅ Settlement completion notification received: correlation_id={} tx_hash={} status={}",
-        correlation_id, tx_hash, status
-    );
-
-    // Update local transaction record with settlement completion from remote gateway
-    if let Some(txn_store) = get_transaction_store() {
-        // First set the transaction hash
-        if !tx_hash.is_empty() {
-            if let Err(e) = txn_store
-                .set_settlement_tx_hash(&correlation_id, tx_hash.clone())
-                .await
-            {
-                warn!("Failed to set settlement tx_hash for {}: {}", correlation_id, e);
-            } else {
-                info!("✅ Updated transaction {} with tx_hash: {}", correlation_id, tx_hash);
-            }
-        }
-
-        // Then mark settlement as complete
-        if status == "completed" {
-            if let Err(e) = txn_store
-                .complete_settlement(&correlation_id)
-                .await
-            {
-                warn!("Failed to complete settlement for {}: {}", correlation_id, e);
-            } else {
-                info!("✅ Marked settlement as complete for: {}", correlation_id);
-            }
-        }
-    } else {
-        warn!("Transaction store not available - cannot update settlement completion");
-    }
-
-    ProcessingResult::ProcessedNoResponse
+        .filter(|tx_hash| !tx_hash.is_empty())
+        .map(str::to_string);
+    txn_store
+        .complete_settlement(correlation_id, tx_hash)
+        .await?;
+    info!("✅ Marked settlement as complete for: {}", correlation_id);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -9711,6 +9662,9 @@ mod target_grant_tests;
 
 #[cfg(test)]
 mod fabric_partner_grant_tests;
+
+#[cfg(test)]
+mod settlement_complete_tests;
 
 #[cfg(test)]
 mod fabric_response_auth_tests;
@@ -11413,15 +11367,21 @@ mod tests {
         .with_context("agent_surface_storage_path", storage_context(storage_root))
     }
 
-    #[test]
-    fn redelivered_forward_request_is_dropped_without_a_response() {
+    #[tokio::test]
+    async fn redelivered_forward_request_is_dropped_without_a_response() {
         let temp = tempfile::tempdir().unwrap();
         let msg = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "surface-1");
 
         use crate::gateways::connection_points::envelope_replay::{EnvelopeRejection, admit_forward_request};
 
-        assert!(admit_forward_request(&msg).is_ok());
-        let duplicate = admit_forward_request(&msg).unwrap_err();
+        assert!(
+            admit_forward_request(&msg)
+                .await
+                .is_ok()
+        );
+        let duplicate = admit_forward_request(&msg)
+            .await
+            .unwrap_err();
         assert!(matches!(duplicate, EnvelopeRejection::Duplicate { .. }), "{duplicate}");
         assert!(
             matches!(forward_request_envelope_refusal(&msg, duplicate), ProcessingResult::ProcessedNoResponse),
@@ -11430,7 +11390,9 @@ mod tests {
 
         let mut expired = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "surface-1");
         expired.expires_time = Some(crate::gateways::connection_points::envelope_replay::now_secs() - 1);
-        let rejection = admit_forward_request(&expired).unwrap_err();
+        let rejection = admit_forward_request(&expired)
+            .await
+            .unwrap_err();
         assert!(matches!(rejection, EnvelopeRejection::Expired { .. }), "{rejection}");
         match forward_request_envelope_refusal(&expired, rejection) {
             ProcessingResult::RequiresResponse { response_body, .. } => {
@@ -11654,7 +11616,11 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert!(crate::gateways::connection_points::envelope_replay::admit_forward_request(&fresh).is_ok());
+        assert!(
+            crate::gateways::connection_points::envelope_replay::admit_forward_request(&fresh)
+                .await
+                .is_ok()
+        );
         // A redelivery of an admitted request gets no reply at all.
         assert!(matches!(refusal(fresh).await, Some(ProcessingResult::ProcessedNoResponse)));
 
@@ -13060,34 +13026,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_settle_response_completes_our_outstanding_settle_request() {
-        let correlation_id = format!("settle-{}", uuid::Uuid::new_v4());
-        let pending = crate::x402::gateway_facilitator_service::register_pending_settlement(&correlation_id).await;
+    async fn an_unsolicited_settle_response_is_dropped() {
         let message = make_handshake_msg(
             MessageType::X402SettleResponse.as_str(),
-            Some(&correlation_id),
+            Some("settle-unasked"),
             serde_json::json!({"settled": true, "transaction_id": "0xabc", "network": "eip155:1"}),
         );
 
         let result = process_message_internal(&message, &MessageType::X402SettleResponse).await;
-        let response = pending.await.unwrap();
 
         assert!(matches!(result, ProcessingResult::ProcessedNoResponse), "a settle response got a reply");
-        assert!(response.settled);
-        assert_eq!(response.tx_hash, "0xabc");
-    }
-
-    #[tokio::test]
-    async fn a_settle_response_without_a_thread_id_is_not_matched() {
-        let message = make_handshake_msg(
-            MessageType::X402SettleResponse.as_str(),
-            None,
-            serde_json::json!({"settled": true, "transaction_id": "0xabc"}),
-        );
-
-        let result = process_message_internal(&message, &MessageType::X402SettleResponse).await;
-
-        assert_eq!(failure_reason(&result), "Missing thid (thread ID) in settlement response");
     }
 
     #[test]

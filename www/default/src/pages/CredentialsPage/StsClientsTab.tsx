@@ -2,7 +2,6 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiClient } from '../../api';
 import { usePermissions } from '../../context/PermissionsContext';
-import { Badge } from '../../components/shared/Badge';
 import { formatDateTime } from '../../utils/stringUtils';
 import { AppButton } from '../../components/shared/AppButton';
 import { EmptyState } from '../../components/shared/EmptyState';
@@ -107,12 +106,6 @@ const StsClientsTab: React.FC<StsClientsTabProps> = ({
         <div className="card-header py-3 d-flex justify-content-between align-items-center">
           <h6 className="m-0 font-weight-bold text-primary">
             <i className="fas fa-right-left"></i> STS Clients
-            <Badge
-              value={filtered.length}
-              suffix={searchTerm ? ` of ${clients.length}` : undefined}
-              className="ms-2"
-              ariaLabel={`${filtered.length}${searchTerm ? ` of ${clients.length}` : ''} STS clients`}
-            />
           </h6>
           {canEdit && (
             <AppButton
@@ -170,9 +163,6 @@ const StsClientsTab: React.FC<StsClientsTabProps> = ({
               icon="fa-right-left"
               title="No STS clients configured yet"
               body="An STS client is an agent authorized to exchange tokens at /oauth2/token. Add one for each agent (or agent family) that needs to trade a token it already holds for a different token scoped to a downstream service."
-              ctaLabel={canEdit ? 'Add your first STS client' : undefined}
-              ctaIcon={canEdit ? 'fa-plus' : undefined}
-              onCtaClick={canEdit ? () => navigate('/sts-clients/new') : undefined}
             />
           )}
 

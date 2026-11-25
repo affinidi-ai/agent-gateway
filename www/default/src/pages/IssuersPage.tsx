@@ -153,12 +153,6 @@ const IssuersPage: React.FC<IssuersPageProps> = ({
           <div className="card-header py-3 d-flex justify-content-between align-items-center">
             <h6 className="m-0 font-weight-bold text-primary">
               <i className="fas fa-sitemap"></i> Issuers
-              <Badge
-                value={filteredIssuers.length}
-                suffix={(externalSearchTerm ?? '').trim() ? ` of ${issuers.length}` : undefined}
-                className="ms-2"
-                ariaLabel={`${filteredIssuers.length}${(externalSearchTerm ?? '').trim() ? ` of ${issuers.length}` : ''} issuers`}
-              />
             </h6>
             {!hideAddButton && (
               <AppButton
