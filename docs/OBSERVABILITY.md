@@ -888,9 +888,11 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     `unsupported_grant_type`, `invalid_scope`, `invalid_token`, `insufficient_scope`), otherwise
     `other`, so a token endpoint cannot write its own text into the record. A token, an
     assertion, a secret, the token endpoint's body and its `error_description` are never
-    recorded. A caller whose source authentication failed never gets the Target credential and
-    writes no `target_auth_failed` record; its `auth_failed` record (`blocking` false when the
-    request went on to policy) covers it.
+    recorded. A caller whose source authentication failed never gets the Target credential; its
+    `auth_failed` record (`blocking` false when the request went on to policy) covers it, and it
+    writes no `target_auth_failed` record for its credential. On a public Access Point it may
+    still write one if its path leaves the Target base path, since that check runs before the
+    credential is resolved (`target_path_refused` when the leg has only a delegated binding).
 
   Requests answered before any gateway handler runs (a path under no configured route) and
   gateway faults (a failed egress check task) are not recorded.
