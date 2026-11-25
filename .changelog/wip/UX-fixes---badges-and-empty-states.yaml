@@ -16,8 +16,8 @@ changes:
       description: Added a truncation notice on the Payments page when the ledger response contains more than 500 matching payments. The notice informs operators that only the newest 500 payments are shown and that older matching payments were not searched, preventing silent failures when searching for older payments.
   fixed:
     - timestamp: '2026-11-25T11:00:00Z'
-      title: Update Agents page browser tests for removed controls
-      description: Removed references to deleted count badge test IDs from the Agents browser tests and updated the empty-state test to use the new Add Surface button instead of the removed link, ensuring all tests now work with the redesigned UI.
+      title: Fix navigation from API key and certificate detail pages to Secrets tab
+      description: API key and certificate detail pages now return to their respective tabs (API Keys or Certificates) on the Secrets page instead of always returning to the generic Secrets tab, improving navigation flow for resource management.
   removed: []
   security: []
   breaking: []
