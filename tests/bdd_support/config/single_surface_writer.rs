@@ -1142,6 +1142,12 @@ fn credential_provider_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<Cr
         .map(target_auth_provider_fixture)
         .collect();
     providers.extend(delegation_provider_fixture(surface_config));
+    providers.extend(
+        surface_config
+            .stored_credential_providers
+            .iter()
+            .cloned(),
+    );
     providers
 }
 

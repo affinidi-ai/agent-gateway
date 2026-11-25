@@ -676,10 +676,15 @@ impl StorableEntity for CredentialProvider {
 
 impl CredentialProvider {
     /// The secret ids this provider reads: client, API key, signing key, certificate and
-    /// consent confirmation client ID and secret.
+    /// consent confirmation client ID and secret. An API key provider reads no client ID or
+    /// secret, so one an older record still holds is not among them.
     pub fn secret_refs(&self) -> Vec<&str> {
-        self.secret_ref_fields()
+        let [client_id, client_secret, others @ ..] = self.secret_ref_fields();
+        let reads_client = self.provider_type != CredentialProviderType::ApiKey;
+        [client_id, client_secret]
             .into_iter()
+            .filter(|_| reads_client)
+            .chain(others)
             .chain(self.consent_confirmation_secret_refs())
             .flatten()
             .collect()
@@ -1737,6 +1742,21 @@ mod tests {
     }
 
     #[test]
+    fn an_api_key_provider_names_no_client_reference_it_keeps_from_an_older_record() {
+        let provider = |provider_type: &str| -> CredentialProvider {
+            serde_json::from_value(serde_json::json!({
+                "id": "p", "name": "p", "provider_id": "p", "provider_type": provider_type,
+                "token_endpoint": "https://idp.example/token",
+                "client_id_secret_ref": "ID", "client_secret_secret_ref": "SECRET", "api_key_secret_ref": "KEY",
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        assert_eq!(provider("api_key").secret_refs(), ["KEY"]);
+        assert_eq!(provider("oauth2_client_credentials").secret_refs(), ["ID", "SECRET", "KEY"]);
+    }
+
+    #[test]
     fn a_service_token_reads_only_the_secrets_its_provider_type_uses() {
         let provider = |provider_type: &str, certificate: Option<&str>| -> CredentialProvider {
             serde_json::from_value(serde_json::json!({
@@ -1757,7 +1777,16 @@ mod tests {
         ] {
             let provider = provider(provider_type, certificate);
             assert_eq!(provider.service_token_secret_refs(), expected, "{provider_type}");
-            assert_eq!(provider.secret_refs().len(), 4 + usize::from(certificate.is_some()), "{provider_type}");
+            let client_refs = if provider_type == "api_key" {
+                0
+            } else {
+                2
+            };
+            assert_eq!(
+                provider.secret_refs().len(),
+                client_refs + 2 + usize::from(certificate.is_some()),
+                "{provider_type}"
+            );
         }
     }
 

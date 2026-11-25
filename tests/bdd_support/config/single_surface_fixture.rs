@@ -59,6 +59,8 @@ pub struct SurfaceConfigBuilder {
     pub oauth_max_consent_age_secs: Option<u64>,
     /// OAuth providers the gateway has besides the surface's own, by provider id.
     pub additional_oauth_providers: Vec<String>,
+    /// Credential providers stored exactly as given, as a record an older gateway wrote.
+    pub stored_credential_providers: Vec<crate::bdd_support::config::config_tree::CredentialProviderFixture>,
     /// The surface's OAuth provider is stored as the admin API now creates one: with a
     /// record id of its own, which its callback path ends in, instead of its provider id.
     pub oauth_callback_path_ends_in_record_id: bool,
@@ -291,6 +293,7 @@ impl Default for SurfaceConfigBuilder {
             oauth_authorization_response_issuer: None,
             oauth_max_consent_age_secs: None,
             additional_oauth_providers: Vec::new(),
+            stored_credential_providers: Vec::new(),
             oauth_callback_path_ends_in_record_id: false,
             identity_provider: false,
             identity_provider_endpoints: None,
