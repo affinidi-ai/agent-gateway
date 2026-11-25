@@ -1112,9 +1112,13 @@ held row shows its case id. The Surface cell says `via <payment surface> on <pay
 gateway>` (`payments-gateway-<id>`, the id as its tooltip) and the details show the
 **Payment gateway** by name (`payments-detail-gateway`). `usePaymentGatewayNames` reads
 `GET /payment-gateways` once per page and falls back to the id for an unlisted gateway or a
-failed read; the ledger is never filtered by it. `usePaymentLedger` only lets the latest request write rows,
-the error and the Refresh state, so a slow answer to an earlier filter never overwrites a
-later one. When a refresh fails, the rows of the same filter stay under
+failed read; the ledger is never filtered by it. The page requests at most 500 newest payments, so
+when more than 500 match the filters, an alert notice says "Showing only the newest 500 matching
+payments. Older payments were not searched." (`payments-capped-list-note`). Its text filter runs
+only on those 500 rows, so if the user searches and finds no match, another notice appears saying
+the same, with a different test id (`payments-capped-search-note`). `usePaymentLedger` only lets
+the latest request write rows, the error and the Refresh state, so a slow answer to an earlier
+filter never overwrites a later one. When a refresh fails, the rows of the same filter stay under
 `payments-stale-note` ("may be out of date"), and the rows of an earlier filter are dropped.
 An outcome or surface filter with no rows shows "No payments match this filter" rather than
 "No payments yet". The outcomes are `paid`, `challenge`, `held`, `rejected`, `unavailable`, `unconfirmed` (the
@@ -1155,6 +1159,7 @@ by the token's decimals and shown in dollars. `/payments` is left free for gatew
 `payments-detail-caller-principal`, `payments-reason-<id>`,
 `payments-legacy-panel`, `payments-legacy-row-<key>`,
 `payments-error-alert`, `payments-error-dismiss-button`, `payments-stale-note`,
+`payments-capped-list-note`, `payments-capped-search-note`,
 `payments-surface-filter`, `payments-gateway-<id>`, `payments-detail-gateway`.
 
 ## Agent Cards tab
@@ -2713,8 +2718,8 @@ name, description, id and DID.
   (`payment_gateways.edit`, `POST /payment-gateways/{id}/ping`, not for a pending row); Delete
   (`payment_gateways.delete`, the two-step `DeleteButton`). A refused delete (409 while surfaces
   take payments through it or it holds unsettled payments) shows the gateway's message.
-- **Connect Payment Gateway** (`payment_gateways.edit`) opens the wizard. With no payment
-  gateway an `EmptyState` explains agent-pay and has the same action.
+- **Connect Payment Gateway** (`payment_gateways.edit`) in the tab header opens the wizard. With no
+  payment gateway an `EmptyState` explains agent-pay with a **Connect Payment Gateway** action.
 
 ### Connect Payment Gateway wizard
 
@@ -2772,7 +2777,7 @@ to it over `fabric://`) shows the gateway's message.
 | Tab, list, rows                          | `connections-tab-payment-gateways`, `page-payment-gateways`, `payment-gateways-table`, `payment-gateways-row-<id>`, `gateway-status-<id>`                       |
 | List actions                             | `payment-gateways-connect-button`, `-open-button-<id>`, `-verify-button-<id>`, `-ping-button-<id>`, `-delete-button-<id>` (all `payment-gateways-`)              |
 | List offer                               | `payment-gateways-offer-<id>` (and `-payable-count`), `-offer-loading-<id>`, `-offer-error-<id>`, `-offer-empty-<id>`                                           |
-| List states                              | `payment-gateways-empty-state`, `payment-gateways-empty-connect-button`, `payment-gateways-no-match`, `payment-gateways-error-alert`, `payment-gateways-success-alert`, each alert with `-dismiss-button` |
+| List states                              | `payment-gateways-empty-state`, `payment-gateways-no-match`, `payment-gateways-error-alert`, `payment-gateways-success-alert`, each alert with `-dismiss-button` |
 | Wizard steps                             | `wizard-progress`, `wizard-progress-step-<key>`, `wizard-step-details`, `wizard-step-link`, `wizard-step-connect`, `wizard-step-approval`, `wizard-step-verify`, `wizard-step-complete` |
 | Wizard navigation (both OOB wizards)     | `wizard-next`, `wizard-back`, `wizard-cancel`, `wizard-submit`, `wizard-oob-view-button`, `wizard-oob-connect-retry-button`                                     |
 | Wizard fields (both OOB wizards)         | `wizard-oob-name-input`, `wizard-oob-description-input`, `wizard-oob-did-method-select`, `wizard-oob-link-input`, `wizard-oob-secret-input`, `wizard-oob-details-error`, `wizard-oob-link-error`, `wizard-oob-connect-error` |
@@ -2817,12 +2822,13 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
 - With no agents and no load error, the list shows an `EmptyState` with title **Get started with
   Agents**, body "Agents show up here once they're connected through a surface. Create a surface
   to start routing, securing, and monitoring your agents.", and a docs link
-  (`DOCS_URL.createFirstAgent`). The header holds an **Add Surface** button (`agents-add-surface-button`)
-  for users with `surfaces.edit`; without `surfaces.edit` only the docs link in the empty state
-  shows, since the page needs only `surfaces.view` and `/surfaces/new` needs `surfaces.edit`.
-  The button uses the same `useLimitGuard` as the Surfaces page to show a balloon when at capacity
-  before opening the builder, preventing operators from spending time configuring a surface the
-  server will refuse to create.
+  (`DOCS_URL.createFirstSurface`) pointing to the first-surface creation guide. The header holds an
+  **Add Surface** button (`agents-add-surface-button`) for users with `surfaces.edit` and the
+  surface limit not reached. Without `surfaces.edit` only the docs link in the empty state shows,
+  since the page needs only `surfaces.view` and `/surfaces/new` needs `surfaces.edit`. The button
+  uses the same `useLimitGuard` as the Surfaces page to show a balloon when at capacity before
+  opening the builder, preventing operators from spending time configuring a surface the server
+  will refuse to create.
 - Columns: Agent, Route, Protocol, Identities, Used by surfaces, Trust registry, Last activity.
   The protocol badge (`agents-protocol-badge`) is the shared `ProtocolBadge`
   (`components/shared/ProtocolBadge.tsx`), the one the Surfaces page uses: A2A
@@ -2981,9 +2987,9 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
 | ------------------------------- | ----------------------------------------------------------------------------------------------- |
 | Pages                           | `page-agents`, `page-agent-details`                                                             |
 | List row, chevron               | `agents-row-<id>`, `agents-row-chevron`                                                         |
-| List filter, count, retry       | `agents-filter-input`, `agents-count`, `agents-retry-button`                                    |
+| List filter, retry              | `agents-filter-input`, `agents-retry-button`                                                    |
 | List load error, no match       | `agents-load-error`, `agents-no-match`                                                          |
-| Empty state add surface         | `agents-add-surface-link`                                                                       |
+| Header button, empty state docs | `agents-add-surface-button`, `agents-empty-docs-link`                                           |
 | Name, unnamed, endpoint host    | `agents-name`, `agents-unnamed`, `agents-endpoint-host`                                         |
 | Runtime, protocol, activity     | `agents-runtime`, `agents-protocol-badge`, `agents-last-activity`                               |
 | Surfaces, count, names          | `agents-surfaces`, `agents-surfaces-count`, `agents-surface-names`                              |

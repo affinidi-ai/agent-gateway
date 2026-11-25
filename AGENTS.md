@@ -382,14 +382,15 @@ _Agent Cards tab_ in
 
 The read-only Agents page at `/agent-registry` needs `surfaces.view` and lists one row per managed
 agent, built by the gateway from the surfaces that target it; MCP surfaces are left out and no
-status is shown. Its empty state offers a **Create a surface** link, which opens `/surfaces/new`,
-to users with `surfaces.edit` only. Its Agent Card tab shows the card the gateway serves for
-Direct, Proxied and Fabric routes with a **Card source** row, and keeps the surface picker, with a
-Retry, when the card can't be read through the chosen surface. Its list shows the protocol with the
-shared `ProtocolBadge` (`components/shared/ProtocolBadge.tsx`) the Surfaces page and the template
-picker use, never restyled per page, the Identities and Used by surfaces counts as the Surfaces page's square count
-badge, and every row value at the table's body size. Its Connection tab lists each of the agent's
-DIDs with a copy button; see _Agents page_ in
+status is shown. Its header holds an **Add Surface** button (gated on `surfaces.edit` and the surface
+limit, using `useLimitGuard`) that opens `/surfaces/new`, and when no agents are shown, an `EmptyState`
+says "Get started with Agents" with a docs link to the first-surface creation guide. The Agent Card tab
+shows the card the gateway serves for Direct, Proxied and Fabric routes with a **Card source** row, and
+keeps the surface picker, with a Retry, when the card can't be read through the chosen surface. Its list
+shows the protocol with the shared `ProtocolBadge` (`components/shared/ProtocolBadge.tsx`) the Surfaces
+page and the template picker use, never restyled per page, the Identities and Used by surfaces counts as
+the Surfaces page's square count badge, and every row value at the table's body size. Its Connection tab
+lists each of the agent's DIDs with a copy button; see _Agents page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#agents-page).
 
 The Identities page shows one row per surface Managed Agent, with its earlier DIDs (from its

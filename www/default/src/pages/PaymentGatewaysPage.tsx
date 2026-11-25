@@ -3,7 +3,6 @@ import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import { usePermissions } from '../context/PermissionsContext';
 import { AppButton } from '../components/shared/AppButton';
-import { Badge } from '../components/shared/Badge';
 import { EmptyState } from '../components/shared/EmptyState';
 import SearchInput from '../components/shared/SearchInput';
 import { pingPaymentGateway } from '../components/payment-gateways/pingPaymentGateway';
@@ -161,12 +160,6 @@ const PaymentGatewaysPage: React.FC<PaymentGatewaysPageProps> = ({
             <div className="d-flex justify-content-between align-items-center">
               <h6 className="m-0 font-weight-bold text-primary">
                 <i className="fas fa-credit-card"></i> Payment Gateways
-                <Badge
-                  value={filtered.length}
-                  suffix={effectiveSearchTerm ? ` of ${gateways.length}` : undefined}
-                  className="ms-2"
-                  ariaLabel={`${filtered.length}${effectiveSearchTerm ? ` of ${gateways.length}` : ''} payment gateways`}
-                />
               </h6>
               {!actionsContainer && connectButton}
             </div>
