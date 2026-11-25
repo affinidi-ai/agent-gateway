@@ -2513,8 +2513,9 @@ in components. It fills `surface_variant` from `variant` on records written befo
   changes are red, deletions and detachments amber, the rest neutral.
 - The footnote shows the actor instead of the caller. Records hold ids only; `useUserNames`
   resolves user ids to usernames from `/users` and keeps the id when the list is not readable.
-  It is called once, in `AuditPage`, and asks for the list only when the page shows a policy
-  change and the viewer has `users.view`; the resolver is passed down as the `userName` prop.
+  It is called once, in `AuditPage`, and asks for the list only when the page shows a record
+  `changeActor` names an actor for (a policy change, a Target authentication change or a forced
+  secret delete) and the viewer has `users.view`; the resolver is passed down as the `userName` prop.
   Don't call it per row. The names are cached per session token, so signing out and in (as
   anyone) loads them again and never shows the previous session's. Within a session a 403 is
   kept until the page reloads; any other failure is retried on the next visit. The status comes
@@ -2543,8 +2544,8 @@ both are offered as filters in the Category menu (low frequency).
   the secret id and how many records still used it; Details shows Change (with Secret) and a
   **Records still using it** group, one row per referrer by kind and id. A record with no
   referrers has no such rows.
-- Both show the actor (`actorLabel`, resolved through `userName`) in the footnote and the detail
-  line, and the evidence pane shows only **Details**, as for a policy change.
+- Both show the actor (`actorLabel`, resolved through `userName`, which loads the users list for
+  them as for a policy change) in the footnote and the detail line, and the evidence pane shows only **Details**, as for a policy change.
 - Every value is rendered as React text; record fields come from the gateway and are untrusted.
 
 ## Audit page: surface variants and refusals

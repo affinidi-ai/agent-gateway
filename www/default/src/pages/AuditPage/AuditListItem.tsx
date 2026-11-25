@@ -1,13 +1,6 @@
 import React from 'react';
 import { formatDateTime, timeAgo } from '../../utils/stringUtils';
-import {
-  callerDidOf,
-  policyChange,
-  policyDecision,
-  secretForceDelete,
-  targetAuthChange,
-  trustCheck,
-} from './auditHelpers';
+import { callerDidOf, changeActor, policyDecision, trustCheck } from './auditHelpers';
 import { actorLabel, describeEntry, type UserNameResolver } from './eventNarrative';
 import type { AuditEntry } from './types';
 
@@ -16,19 +9,17 @@ interface AuditListItemProps {
   idx: number;
   isSelected: boolean;
   onSelect: () => void;
-  /** Names the users policy changes were made by. */
+  /** Names the users changes were made by. */
   userName?: UserNameResolver;
 }
 
 /**
- * Short "actor" label for the footnote: who made a policy change, else caller
+ * Short "actor" label for the footnote: who made a change, else caller
  * name → caller DID → auth method.
  */
 function actorOf(entry: AuditEntry, userName?: UserNameResolver): string {
-  const change = policyChange(entry);
-  if (change) return actorLabel(change.change.actor, userName);
-  const managed = targetAuthChange(entry) ?? secretForceDelete(entry);
-  if (managed) return actorLabel(managed.actor, userName);
+  const actor = changeActor(entry);
+  if (actor) return actorLabel(actor, userName);
   return (
     entry.caller?.name ||
     entry.caller?.name_redacted ||

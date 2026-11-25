@@ -3,6 +3,7 @@ import {
   POLICY_CHANGE_EVENTS,
   type AuditEntry,
   type EmbeddedDecision,
+  type PolicyChangeActor,
   type PolicyChangeData,
   type PolicyChangeEvent,
   type PolicyDecisionData,
@@ -372,6 +373,16 @@ export function policyChange(
     }
   }
   return null;
+}
+
+/** Who made the change an entry records: a policy change, a Target authentication change or a forced secret delete. */
+export function changeActor(entry: AuditEntry): PolicyChangeActor | null {
+  return (
+    policyChange(entry)?.change.actor ??
+    targetAuthChange(entry)?.actor ??
+    secretForceDelete(entry)?.actor ??
+    null
+  );
 }
 
 /** Sentence-case name of a policy change, e.g. "Policy attached". */
