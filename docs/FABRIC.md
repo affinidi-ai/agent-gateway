@@ -278,8 +278,10 @@ metadata output moves a top-level `_meta` when the answer has `params`)
 (`io.affinidi.fabric/agent-identity-credential`, or its historical extension URI key); a `did`
 beside that presentation must name its verified holder, or the answer is refused as `invalid`. An answer to
 a modern MCP request, which travels on a framed Fabric stream, is checked the same way, message by
-message. Answers to a Transit Point over Fabric and agent cards fetched over Fabric are not
-checked.
+message, for each `complete` result; an interim result (`input_required` or `task`) is passed on
+unchecked and supplies no identity, since the paired gateway adds a presentation only to a
+`complete` one. Answers to a Transit Point over Fabric and agent cards fetched over Fabric are
+not checked.
 
 Accepted risk: an answer that carries no presentation is not checked. A paired gateway signs one
 only when its surface has a managed identity and it has a VC issuer, so an answer from any other
