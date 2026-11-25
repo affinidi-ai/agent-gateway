@@ -71,6 +71,8 @@ export const SurfaceSigningSection: React.FC<Props> = ({
   // What the gateway-wide default signs with: `null` while it is read, `unreadable` when it could
   // not be (the status needs `vta_connections.view`).
   const [defaultBackend, setDefaultBackend] = useState<string | null>(null);
+  /** Whether the `[vta]` configuration block is enabled, so Gateway signing can follow it. */
+  const [configBlock, setConfigBlock] = useState(false);
   /** Remote was picked and no agent has been chosen yet, so nothing is stored for it. */
   const [remotePending, setRemotePending] = useState(false);
 
@@ -95,7 +97,9 @@ export const SurfaceSigningSection: React.FC<Props> = ({
       .fetch('/api/v1/vta/status')
       .then(response => (response.ok ? response.json() : null))
       .then(status => {
-        if (alive) setDefaultBackend(status?.default_resolution?.backend ?? 'unreadable');
+        if (!alive) return;
+        setDefaultBackend(status?.default_resolution?.backend ?? 'unreadable');
+        setConfigBlock(status?.enabled === true);
       })
       .catch(() => {
         if (alive) setDefaultBackend('unreadable');
@@ -137,8 +141,13 @@ export const SurfaceSigningSection: React.FC<Props> = ({
     ready(connection) ||
     signing?.connection_id === connection.id;
 
+  // A read-only editor whose list could not be read still names the agent it signs through.
+  const storedOnly =
+    disabled && selectedAgent && !connections.some(c => c.id === selectedAgent)
+      ? selectedAgent
+      : null;
   const listedConnections = connections.filter(listed);
-  const noAgents = connectionsLoaded && !loadError && listedConnections.length === 0;
+  const noAgents = connectionsLoaded && !loadError && !storedOnly && listedConnections.length === 0;
 
   useEffect(() => {
     onTypeChange?.(type);
@@ -181,7 +190,11 @@ export const SurfaceSigningSection: React.FC<Props> = ({
     setSigning(undefined);
   };
 
-  const inheritable = subject !== 'gateway';
+  // Gateway signing that sets nothing follows the `[vta]` block, whose own record is listed only
+  // once it is connected, so it says so and offers the block back rather than an empty picker.
+  const followsBlock = subject === 'gateway' && configBlock;
+  const inheritable = subject !== 'gateway' || followsBlock;
+  const showsAgents = !(followsBlock && inherited && !remotePending);
   const followed = ownerSigning
     ? SIGNING_TYPE_LABELS[ownerSigning.backend === 'local' ? 'local' : 'remote']
     : null;
@@ -221,10 +234,19 @@ export const SurfaceSigningSection: React.FC<Props> = ({
 
       {inheritable && inherited && !remotePending && (
         <Form.Text className="d-block text-muted" data-testid="surface-signing-inherited">
-          {followed
-            ? `Following its issuer, ${owner?.name} (${followed}).`
-            : followingDefault(defaultBackend)}{' '}
-          Choose a source to set {subject === 'issuer' ? "this issuer's" : "this surface's"} own.
+          {followsBlock ? (
+            <>
+              Following the <code>[vta]</code> configuration block. Choose a source to replace it.
+            </>
+          ) : (
+            <>
+              {followed
+                ? `Following its issuer, ${owner?.name} (${followed}).`
+                : followingDefault(defaultBackend)}{' '}
+              Choose a source to set {subject === 'issuer' ? "this issuer's" : "this surface's"}{' '}
+              own.
+            </>
+          )}
         </Form.Text>
       )}
       {inheritable && !inherited && (
@@ -235,11 +257,17 @@ export const SurfaceSigningSection: React.FC<Props> = ({
           disabled={disabled}
           onClick={useDefault}
         >
-          Use the gateway-wide default
+          {followsBlock ? (
+            <>
+              Use the <code>[vta]</code> configuration block
+            </>
+          ) : (
+            'Use the gateway-wide default'
+          )}
         </button>
       )}
 
-      {type === 'remote' && (
+      {type === 'remote' && showsAgents && (
         <div className="mt-2">
           {noAgents ? (
             <Form.Text className="d-block text-muted" data-testid="surface-signing-no-agents">
@@ -260,6 +288,7 @@ export const SurfaceSigningSection: React.FC<Props> = ({
                 onChange={event => chooseAgent(event.target.value)}
               >
                 <option value="">Select a Verifiable Trust Agent…</option>
+                {storedOnly && <option value={storedOnly}>{storedOnly}</option>}
                 {listedConnections.map(connection => (
                   <option key={connection.id} value={connection.id} disabled={!ready(connection)}>
                     {connection.name}
@@ -302,8 +331,8 @@ export const SurfaceSigningSection: React.FC<Props> = ({
         </div>
       )}
 
-      {loadError && (
-        <Form.Text className="text-muted">
+      {loadError && !disabled && (
+        <Form.Text className="text-muted" data-testid="surface-signing-load-error">
           Verifiable Trust Agents could not be listed, so only the gateway secret can be chosen
           here.
         </Form.Text>

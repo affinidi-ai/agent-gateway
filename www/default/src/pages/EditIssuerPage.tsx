@@ -9,6 +9,7 @@ import { useSafeNavigate } from '../hooks/useSafeNavigate';
 import FieldHelp from '../components/shared/FieldHelp';
 import { SurfaceSigningSection } from '../components/surface-builder/elements/surface/SurfaceSigningSection';
 import { isSigningEmpty, type SurfaceSigning } from '../components/surface-builder/elements/types';
+import { useOptionalPermissions } from '../context/PermissionsContext';
 
 interface Issuer {
   id: string;
@@ -40,6 +41,8 @@ const EditIssuerPage: React.FC<EditIssuerPageProps> = ({ embeddedId, onDone }) =
   const [trustRegistryDid, setTrustRegistryDid] = useState('');
   const [authorityDid, setAuthorityDid] = useState('');
   const [signing, setSigning] = useState<SurfaceSigning | undefined>(undefined);
+  // The gateway refuses a changed signing choice without `key_management.edit`.
+  const canChooseSigning = useOptionalPermissions()?.hasPermission('key_management.edit') ?? false;
   const [trustRegistries, setTrustRegistries] = useState<TrustRegistry[]>([]);
   const [loading, setLoading] = useState(isEditMode);
   const [saving, setSaving] = useState(false);
@@ -289,7 +292,12 @@ const EditIssuerPage: React.FC<EditIssuerPageProps> = ({ embeddedId, onDone }) =
             </small>
           </div>
           <div data-testid="issuer-signing">
-            <SurfaceSigningSection signing={signing} setSigning={setSigning} subject="issuer" />
+            <SurfaceSigningSection
+              signing={signing}
+              setSigning={setSigning}
+              subject="issuer"
+              disabled={!canChooseSigning}
+            />
           </div>
           {isEditMode && did && (
             <div className="mb-3">

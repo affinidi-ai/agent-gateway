@@ -13,6 +13,8 @@ interface Props {
   onSettled: (connection: VtaConnection) => void;
   /** Reports whether the appliance default should be applied on finish. */
   onDefaultChoice: (makeDefault: boolean) => void;
+  /** Reports whether the signing key is still being created, so the wizard can hold Done. */
+  onMintingChange?: (minting: boolean) => void;
 }
 
 /**
@@ -31,6 +33,7 @@ export const WizardFinishStep: React.FC<Props> = ({
   onProvisionKey,
   onSettled,
   onDefaultChoice,
+  onMintingChange,
 }) => {
   const { hasPermission } = usePermissions();
   const canProvision = hasPermission('key_management.edit');
@@ -65,6 +68,10 @@ export const WizardFinishStep: React.FC<Props> = ({
       }
     })();
   }, [activeKeyId, canProvision, current, onProvisionKey, onSettled]);
+
+  useEffect(() => {
+    onMintingChange?.(minting);
+  }, [minting, onMintingChange]);
 
   // Pre-check only when the settings were read and hold no default at all.
   // Connecting a second agent must never silently repoint signing for

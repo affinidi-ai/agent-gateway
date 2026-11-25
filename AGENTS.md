@@ -198,16 +198,22 @@ no signing tier banner. The tab's Control key card, shown while `GET /v1/vta/sta
 reports a `control_key`, shows the key the gateway signs in to its trust agent with, when it was
 last rotated and when it is next due, and a Rotate control key button for key management editors.
 A connection added by hand with a `did:webvh` identity has a Rotate control key action on its
-row, with a rotation-under-way state and Cancel. The gateway-wide default is **Settings →
-Security → Gateway signing**, editable only with both `settings.edit` and `key_management.edit`,
-and saved only after a confirmation dialog that lists what changing the gateway signer does. See
+row, with a rotation-under-way state and Cancel. **Revoke** needs `vta_connections.delete`: the
+first click arms it with a toast, the next sends it, and a `409` naming what stops signing needs
+one more click to acknowledge. The connect wizard's grant step names the four capabilities the
+grant gives, never "sign-only", and its **Done** waits for the signing key to be minted. The
+gateway-wide default is **Settings → Security → Gateway signing**, editable only with both
+`settings.edit` and `key_management.edit`, follows the `[vta]` configuration block while that is
+enabled and nothing is chosen, and is saved only after a confirmation dialog that lists what
+changing the gateway signer does. See
 _Verifiable Trust Agent tab and Gateway signing_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#verifiable-trust-agent-tab-and-gateway-signing).
 
 Wherever a signing key is chosen (a surface, an issuer, Gateway signing) the field is **Signing key
 source**, with **Gateway secret** and **Verifiable Trust Agent**, which picks a connected agent.
 An Issuer's choice applies to every surface it owns that sets none of its own, before the
-gateway-wide default. See _Signing key source_ in
+gateway-wide default. On a surface or issuer the field is read-only without
+`key_management.edit`. See _Signing key source_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#signing-key-source).
 
 The Secrets page's Key Management tab says the signing keys are held by a separately operated

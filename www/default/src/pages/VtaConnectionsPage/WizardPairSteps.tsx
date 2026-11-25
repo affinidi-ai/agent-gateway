@@ -33,8 +33,9 @@ export const PairStep: React.FC<PairStepProps> = ({ payload, error, onReissue })
       <p>
         Run this once on your own VTA. It grants this gateway the{' '}
         <strong>{payload.requested_role}</strong> role in{' '}
-        <strong>{payload.context_id ?? 'one context'}</strong> — enough to sign, and nothing else.
-        It does <strong>not</strong> grant administration.
+        <strong>{payload.context_id ?? 'one context'}</strong> with four capabilities:{' '}
+        <code>context-create</code>, <code>key-mint</code>, <code>sign-jws</code> and{' '}
+        <code>sign-document</code>. It does <strong>not</strong> grant administration.
       </p>
       <div className="d-flex align-items-start gap-2 mb-3">
         <pre className="flex-grow-1 mb-0 p-3 bg-light rounded small">
@@ -82,7 +83,8 @@ export const VerifyStep: React.FC<VerifyStepProps> = ({ checking, error, connect
       <div className="text-center py-4">
         <div className="spinner-border text-primary mb-3" role="status" />
         <p className="text-muted mb-0">
-          Authenticating, checking the grant is sign-only, and pinning the agent&apos;s identity…
+          Authenticating, checking the grant covers one context without administration, and pinning
+          the agent&apos;s identity…
         </p>
       </div>
     );
@@ -101,7 +103,7 @@ export const VerifyStep: React.FC<VerifyStepProps> = ({ checking, error, connect
             {(connection.pairing.granted_contexts ?? []).length !== 1 && (
               <> across {(connection.pairing.granted_contexts ?? []).length} contexts</>
             )}
-            . Re-grant with a sign-only role in exactly one context, then verify again.
+            . Re-grant the <code>initiator</code> role in exactly one context, then verify again.
           </div>
         )}
         <AppButton variant="primary" onClick={onRetry}>

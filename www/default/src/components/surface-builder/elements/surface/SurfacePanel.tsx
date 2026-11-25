@@ -9,6 +9,7 @@ import { getIssuers } from '../../../../utils/issuersCache';
 import type { Issuer } from '../../../../types';
 import FieldHelp from '../../../shared/FieldHelp';
 import { SurfaceSigningSection } from './SurfaceSigningSection';
+import { useOptionalPermissions } from '../../../../context/PermissionsContext';
 
 /**
  * Right-panel editor for the Surface element. Pulls its values from
@@ -17,6 +18,8 @@ import { SurfaceSigningSection } from './SurfaceSigningSection';
  */
 const SurfacePanel: React.FC<ConfigPanelProps> = ({ hasAttemptedSave }) => {
   const meta = useOptionalSurfaceMeta();
+  // The gateway refuses a changed signing choice without `key_management.edit`.
+  const canChooseSigning = useOptionalPermissions()?.hasPermission('key_management.edit') ?? false;
 
   const [issuers, setIssuers] = useState<Issuer[]>([]);
   useEffect(() => {
@@ -152,7 +155,7 @@ const SurfacePanel: React.FC<ConfigPanelProps> = ({ hasAttemptedSave }) => {
         <SurfaceSigningSection
           signing={signing}
           setSigning={setSigning}
-          disabled={disabled}
+          disabled={disabled || !canChooseSigning}
           owner={issuers.find(d => d.id === issuerId)}
         />
       </div>

@@ -50,6 +50,7 @@ const ConnectTrustAgentWizardPage: React.FC = () => {
   const [verified, setVerified] = useState<VtaConnection | null>(null);
   const [makeDefault, setMakeDefault] = useState(false);
   const [finishing, setFinishing] = useState(false);
+  const [minting, setMinting] = useState(false);
   // A revoked or degraded connection opened from its row: shown as it is until the operator
   // asks to pair it again, because pairing replaces its state and the agent DID it pinned.
   const [outOfUse, setOutOfUse] = useState<VtaConnection | null>(null);
@@ -317,13 +318,14 @@ const ConnectTrustAgentWizardPage: React.FC = () => {
                   onProvisionKey={provisionKey}
                   onSettled={setVerified}
                   onDefaultChoice={setMakeDefault}
+                  onMintingChange={setMinting}
                 />
               )}
             </div>
             <div className="card-footer d-flex justify-content-end">
               <AppButton
                 variant="primary"
-                disabled={finishing}
+                disabled={finishing || minting}
                 onClick={() => void finish()}
                 data-testid="wizard-submit"
               >

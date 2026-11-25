@@ -230,6 +230,23 @@ describe('SurfaceSigningSection', () => {
     expect(await screen.findByText(/could not be listed/)).toBeInTheDocument();
   });
 
+  it('shows a read-only choice with its agent and no listing error when the agents cannot be listed', async () => {
+    mockFetch.mockResolvedValue({ ok: false, json: () => Promise.resolve([]) });
+    render(
+      <SurfaceSigningSection
+        disabled
+        signing={{ backend: 'vta', connection_id: 'vta-custom' } as never}
+        setSigning={jest.fn()}
+      />
+    );
+
+    await waitFor(() => expect(agentSelect()).toHaveValue('vta-custom'));
+    expect(typeSelect()).toBeDisabled();
+    expect(agentSelect()).toBeDisabled();
+    expect(screen.queryByTestId('surface-signing-load-error')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('surface-signing-no-agents')).not.toBeInTheDocument();
+  });
+
   it('follows the issuer that owns the surface, and says so', async () => {
     respond([connection()]);
     render(
@@ -296,6 +313,49 @@ describe('SurfaceSigningSection', () => {
   });
 
   describe('as the gateway-wide default', () => {
+    const respondWithBlock = (backend: string) =>
+      mockFetch.mockImplementation((url: string) =>
+        Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve(
+              url.includes('/vta/status')
+                ? { enabled: true, default_resolution: { backend } }
+                : [configNotReady]
+            ),
+        })
+      );
+
+    it('says it follows the [vta] block rather than that no agent is connected', async () => {
+      respondWithBlock('vta');
+      render(<SurfaceSigningSection subject="gateway" setSigning={jest.fn()} />);
+
+      await waitFor(() => expect(typeSelect()).toHaveValue('remote'));
+      expect(screen.getByTestId('surface-signing-inherited')).toHaveTextContent(
+        'Following the [vta] configuration block.'
+      );
+      expect(screen.queryByTestId('surface-signing-no-agents')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('surface-signing-pick-agent')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('surface-signing-reset')).not.toBeInTheDocument();
+    });
+
+    it('offers the [vta] block back once another source is chosen', async () => {
+      respondWithBlock('local');
+      const setSigning = jest.fn();
+      render(
+        <SurfaceSigningSection
+          subject="gateway"
+          signing={{ backend: 'local' } as never}
+          setSigning={setSigning}
+        />
+      );
+
+      const reset = await screen.findByTestId('surface-signing-reset');
+      expect(reset).toHaveTextContent('Use the [vta] configuration block');
+      await userEvent.click(reset);
+      expect(setSigning).toHaveBeenLastCalledWith(undefined);
+    });
+
     it('shows no inherited note and no way back to one, and reports the source shown', async () => {
       respond([connection()]);
       const onTypeChange = jest.fn();

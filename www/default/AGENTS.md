@@ -2803,6 +2803,15 @@ The table reads `GET /v1/vta/connections`:
   the server refuses both. It has no row rotate button either: its control key is rotated from
   the Control key card.
 - A row opens the connect wizard at its grant step, or at the last step when it is connected.
+- **Revoke** (outline danger, shown only with `vta_connections.delete` and `canRevoke`) takes
+  three clicks at most. The first only arms that row, with the error toast "Click Revoke again to
+  stop <name> signing."; the button itself does not change, and the armed row stays armed until
+  another row is armed or the revoke is sent. The second posts
+  `POST /v1/vta/connections/{id}/revoke`. When the gateway answers `409` (agents or signing
+  choices that would stop signing), the toast shows its message with "Click Revoke again to
+  proceed.", and only the next click sends the revoke again with
+  `acknowledge_stranded_agents=true&acknowledge_signing_users=true`. Arming any row drops that
+  acknowledgement. A success toasts that the connection is revoked and can no longer sign.
 
 ### Add a Verifiable Trust Agent wizard
 
@@ -2819,7 +2828,10 @@ with the shared navigation test ids (`wizard-next`, `wizard-back`, `wizard-cance
    HTTPS) and puts no key material in the form; a refusal shows in `wizard-trust-agent-error`.
 2. **Grant Access** (`wizard-step-grant`) shows the `vta acl create` command to run on your own
    agent. It grants the `initiator` role in that one context with four capabilities, never
-   administration, and the copy says so. An expired command offers a new one; **Finish later**
+   administration, and the copy names them: `context-create`, `key-mint`, `sign-jws` and
+   `sign-document`. No copy calls the grant "sign-only": Verify says it checks the grant covers
+   one context without administration, and an over-privileged grant is told to re-grant the
+   `initiator` role in exactly one context. An expired command offers a new one; **Finish later**
    leaves with the connection saved.
 3. **Verify** (`wizard-step-verify`) checks the grant; a refusal shows its reason and a retry. A
    `409` or `502` whose body is the connection records it and shows its `pairing.last_error`,
@@ -2831,7 +2843,8 @@ with the shared navigation test ids (`wizard-next`, `wizard-back`, `wizard-cance
    repoint signing away from one, a stored choice of the gateway's own key counts as a default,
    and a failed read leaves it unchecked. Its hint says it can be changed later in
    **Settings → Security → Gateway signing**, or per surface in the surface editor. **Done**
-   returns to the tab.
+   returns to the tab; it is disabled while the signing key is still being minted
+   (`onMintingChange`), so the default is never applied to a connection without a key.
 
 `?id=` resumes a created connection at the grant step, or at the last step when it is connected.
 A revoked or degraded one opens at the grant step showing its state and reason
@@ -2858,7 +2871,13 @@ tokens and credentials already issued keep the key that signed them and verify o
 still published. **Change gateway signing** (`gateway-signing-confirm-dialog-confirm`) posts
 `default_signing` to `POST /v1/settings`: `{ "backend": "local" }` for Gateway secret, or the
 chosen agent with its context and key. **Cancel** and the close button save nothing. No text sits
-above the choice, and there is no inherited note: the gateway default inherits from nothing.
+above the choice. While the `[vta]` configuration block is enabled (`enabled` in
+`GET /v1/vta/status`) and Gateway signing sets nothing, it follows that block: the note
+(`surface-signing-inherited`) says "Following the `[vta]` configuration block.", no agent list or
+"No Verifiable Trust Agent is connected yet." is shown, and once another source is chosen
+**Use the `[vta]` configuration block** (`surface-signing-reset`) takes it back (Save then sends
+`default_signing: {}`). Without the block there is no inherited note and no way back: the
+gateway default then inherits from nothing.
 
 ### Signing key source
 
@@ -2874,6 +2893,12 @@ a paired one without a key is listed disabled with the reason. The `[vta]` block
 (`vta-bootstrap`) is offered once it is connected; while it is not, it is left out unless the
 surface already saved it, so the select is never blank. Verifiable Trust Agent with no agent yet
 stores nothing and says what applies meanwhile (`surface-signing-pick-agent`).
+
+On a surface or an issuer the field is read-only without `key_management.edit` (the gateway
+refuses a changed choice without it), as Gateway signing is without both `settings.edit` and
+`key_management.edit`. A read-only field shows the stored choice, names a stored agent by its id
+when the connections cannot be listed, and does not show the "could not be listed" note
+(`surface-signing-load-error`), which an editor sees.
 
 - **Surface Builder → Surface**: a surface that sets nothing follows its issuer's source, then
   the gateway-wide default; the source shown is the one it follows, with a note

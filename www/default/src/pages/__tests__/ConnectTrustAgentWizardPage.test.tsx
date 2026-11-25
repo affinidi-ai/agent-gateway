@@ -150,6 +150,12 @@ describe('ConnectTrustAgentWizardPage', () => {
     });
     expect(await screen.findByTestId('wizard-step-grant')).toBeInTheDocument();
     expect(await screen.findByText(grantCommand)).toBeInTheDocument();
+    const grantStep = screen.getByTestId('wizard-step-grant');
+    for (const capability of ['context-create', 'key-mint', 'sign-jws', 'sign-document']) {
+      expect(grantStep).toHaveTextContent(capability);
+    }
+    expect(grantStep).toHaveTextContent('It does not grant administration.');
+    expect(grantStep).not.toHaveTextContent(/enough to sign|sign-only/);
     expect(screen.getByTestId('wizard-progress-step-grant')).toHaveAttribute(
       'aria-current',
       'step'
@@ -247,6 +253,27 @@ describe('ConnectTrustAgentWizardPage', () => {
     mountWizard('/connections/trust-agents/connect?id=agent-1');
 
     expect(await screen.findByTestId('wizard-step-complete')).toBeInTheDocument();
+  });
+
+  it('holds Done while the signing key is still being created', async () => {
+    const keyless = { ...connected, keys: {} };
+    let mintKey: (value: unknown) => void = () => {};
+    handlers['GET /api/v1/vta/connections'] = () => json([keyless]);
+    handlers['POST /api/v1/vta/connections/agent-1/keys'] = () =>
+      new Promise(resolve => {
+        mintKey = resolve;
+      });
+    mountWizard('/connections/trust-agents/connect?id=agent-1');
+
+    expect(await screen.findByTestId('wizard-step-complete')).toBeInTheDocument();
+    await waitFor(() =>
+      expect(calls.some(c => c.url === '/api/v1/vta/connections/agent-1/keys')).toBe(true)
+    );
+    expect(screen.getByTestId('wizard-submit')).toBeDisabled();
+
+    mintKey(json(connected));
+
+    await waitFor(() => expect(screen.getByTestId('wizard-submit')).toBeEnabled());
   });
 
   it('goes back to the Trust Agents tab when cancelled', async () => {

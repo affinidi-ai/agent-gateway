@@ -21,6 +21,15 @@ jest.mock('../../hooks/useSafeNavigate', () => ({
   useSafeNavigate: () => ({ navigate: jest.fn() }),
 }));
 jest.mock('../../utils/toaster', () => ({ showToast: jest.fn() }));
+let mockCanManageKeys = true;
+jest.mock('../../context/PermissionsContext', () => ({
+  useOptionalPermissions: () => ({
+    hasPermission: (p: string) => p !== 'key_management.edit' || mockCanManageKeys,
+  }),
+}));
+beforeEach(() => {
+  mockCanManageKeys = true;
+});
 
 const api = apiClient as unknown as Record<string, jest.Mock>;
 
@@ -122,6 +131,27 @@ describe('EditIssuerPage signing', () => {
       context_id: 'gateway',
       key_id: 'key-1',
     });
+  });
+
+  it('shows the signing source read-only to a user without key_management.edit', async () => {
+    mockCanManageKeys = false;
+    await open('issuer-1', {
+      backend: 'vta',
+      connection_id: 'agent-1',
+      context_id: 'gateway',
+      key_id: 'key-1',
+    });
+
+    await waitFor(() => expect(typeSelect()).toHaveValue('remote'));
+    expect(typeSelect()).toBeDisabled();
+    expect(screen.getByTestId('surface-signing-agent-select')).toBeDisabled();
+    expect(screen.getByTestId('surface-signing-reset')).toBeDisabled();
+  });
+
+  it('lets a user with key_management.edit change the signing source', async () => {
+    await open('issuer-1');
+
+    expect(typeSelect()).toBeEnabled();
   });
 
   it('sends an empty block to hand the issuer back to the appliance default', async () => {
