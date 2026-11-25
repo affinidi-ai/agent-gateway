@@ -636,10 +636,19 @@ is not mapped. A refusal is logged with the SAML subject and the role values rec
 claim is shown as none) and raises a `user.login_failed` event with failure reason
 `role_not_mapped` ([`docs/INTEGRATIONS.md`](INTEGRATIONS.md#sign-in-events)).
 
-The configured user ID, username, email, first name, last name, department and job title attributes
-must not carry more than one distinct value, including across repeated attributes or attribute
-statements; a value repeated unchanged is accepted. Such an assertion is refused before any user is
-created or updated.
+A `role_mapping` key must equal the identity provider's role value exactly, including its case.
+
+The configured user ID and username attributes must not carry more than one distinct value,
+including across repeated attributes or attribute statements; a value repeated unchanged is
+accepted. Such an assertion is refused before any user is created or updated: the browser gets
+the same generic `403` page, the log names the attribute (never its value) and a `user.login_failed`
+event is raised with failure reason `ambiguous_attribute`. The user ID attribute is read from every
+attribute statement. An account saved under the assertion's `NameID` is found by it when no account
+has the attribute's value, and is re-keyed to the attribute. Changing `attribute_mapping.user_id`
+to another attribute gives every user a new identifier, so each user who signs in afterwards is
+created as a new user. The email, first name, last name, department and job title attributes may
+carry several values: the user keeps the stored value while the identity provider still sends it,
+and otherwise takes the first one sent, and the log warns naming the attribute.
 
 The first user to sign in to an appliance with no users is still the primary administrator, and
 the primary administrator signs in and is updated as usual, keeping that role, even when the role
@@ -647,9 +656,10 @@ is unmapped. A `role_mapping` value or `default_role` that is not `administrator
 `user` (spelled exactly so, in lower case) stops the gateway at startup, naming the entry. `saml.json` is read only at startup, so a change to `role_mapping` or `default_role` takes effect after a restart. At
 startup the gateway warns when `default_role` is `administrator`, since every unmapped sign-in
 then becomes an administrator, and when `role_mapping` is empty and `default_role` is unset, since
-every sign-in but the first user's is then refused.
+every sign-in but the first user's is then refused, or when every `role_mapping` key is an unedited
+`<...>` placeholder from the example file, since no identity-provider role is then mapped.
 
-Each SAML sign-in sets the user's role from the identity provider, with one exception: the
+Each SAML sign-in sets the user's role from `role_mapping` or `default_role`, with one exception: the
 first user to sign in becomes the primary administrator and keeps that role whatever the
 identity provider sends later, so a missing or changed role claim cannot remove the only
 guaranteed administrator. A sign-in that would have changed it logs a warning instead

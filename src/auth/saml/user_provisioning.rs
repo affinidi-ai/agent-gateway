@@ -78,34 +78,48 @@ fn carries_several_values(
         > 1
 }
 
-/// Refuse an assertion whose user-id, username or profile attribute carries more than one
-/// distinct value, since which one is used would depend on the identity provider's ordering.
-fn ensure_single_valued_attributes(
+/// An assertion whose user-id or username attribute carries more than one distinct value, so
+/// which one names the user would depend on the identity provider's ordering.
+#[derive(Debug, thiserror::Error)]
+#[error("The SAML {attribute} attribute carries more than one value")]
+pub struct AmbiguousAttribute {
+    pub attribute: &'static str,
+}
+
+fn ensure_single_valued_identity(
     all_attributes: &SamlAttributes,
     config: &SamlConfig,
-) -> Result<()> {
+) -> Result<(), AmbiguousAttribute> {
     let mapping = &config.attribute_mapping;
-    anyhow::ensure!(
-        !carries_several_values(all_attributes, &mapping.user_id, "NameID"),
-        "The SAML user ID attribute carries more than one value"
-    );
-    anyhow::ensure!(
-        !carries_several_values(all_attributes, &mapping.username, &mapping.email),
-        "The SAML username attribute carries more than one value"
-    );
-    for (label, attribute) in [
-        ("email", &mapping.email),
-        ("first name", &mapping.first_name),
-        ("last name", &mapping.last_name),
-        ("department", &mapping.department),
-        ("job title", &mapping.job_title),
-    ] {
-        anyhow::ensure!(
-            !carries_several_values(all_attributes, attribute, attribute),
-            "The SAML {label} attribute carries more than one value"
-        );
+    if carries_several_values(all_attributes, &mapping.user_id, "NameID") {
+        return Err(AmbiguousAttribute { attribute: "user ID" });
+    }
+    if carries_several_values(all_attributes, &mapping.username, &mapping.email) {
+        return Err(AmbiguousAttribute { attribute: "username" });
     }
     Ok(())
+}
+
+/// The value a profile attribute gives the user: the stored one when the identity provider still
+/// sends it, else the first sent. Several distinct values are logged by attribute name only.
+fn profile_value(
+    all_attributes: &SamlAttributes,
+    attribute: &str,
+    stored: Option<&String>,
+) -> Option<String> {
+    let values = all_attributes.get(attribute)?;
+    if values
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        > 1
+    {
+        warn!(%attribute, "The SAML attribute carries several values; keeping the stored one if sent, else the first");
+    }
+    stored
+        .filter(|stored| values.contains(stored))
+        .or_else(|| values.first())
+        .cloned()
 }
 
 /// Provision or update a user from SAML attributes
@@ -132,7 +146,7 @@ pub async fn provision_user_from_saml(
         )
         .or_else(|| attributes.get("NameID"))
         .context("User ID not found in SAML attributes")?;
-    ensure_single_valued_attributes(all_attributes, config)?;
+    ensure_single_valued_identity(all_attributes, config)?;
 
     let username = attributes
         .get(
@@ -142,42 +156,6 @@ pub async fn provision_user_from_saml(
         )
         .or_else(|| attributes.get(&config.attribute_mapping.email))
         .context("Username not found in SAML attributes")?;
-
-    let email = attributes
-        .get(&config.attribute_mapping.email)
-        .map(|s| s.to_string());
-
-    let first_name = attributes
-        .get(
-            &config
-                .attribute_mapping
-                .first_name,
-        )
-        .map(|s| s.to_string());
-
-    let last_name = attributes
-        .get(
-            &config
-                .attribute_mapping
-                .last_name,
-        )
-        .map(|s| s.to_string());
-
-    let department = attributes
-        .get(
-            &config
-                .attribute_mapping
-                .department,
-        )
-        .map(|s| s.to_string());
-
-    let job_title = attributes
-        .get(
-            &config
-                .attribute_mapping
-                .job_title,
-        )
-        .map(|s| s.to_string());
 
     // Determine role from SAML attributes
     let role = determine_role(all_attributes, config).map_err(|refused| {
@@ -193,9 +171,56 @@ pub async fn provision_user_from_saml(
         .await;
 
     // Check if user already exists
-    let existing_user = storage
+    let mut existing_user = storage
         .load_user_by_saml_id(user_id_attr)
         .await?;
+    // An account saved under the assertion's NameID before the user ID attribute was read from
+    // every statement is found by it once, and re-keyed to the attribute below.
+    if existing_user.is_none()
+        && let Some(name_id) = attributes
+            .get("NameID")
+            .filter(|name_id| *name_id != user_id_attr)
+    {
+        existing_user = storage
+            .load_user_by_saml_id(name_id)
+            .await?;
+    }
+    let mapping = &config.attribute_mapping;
+    let email = profile_value(
+        all_attributes,
+        &mapping.email,
+        existing_user
+            .as_ref()
+            .and_then(|user| user.email.as_ref()),
+    );
+    let first_name = profile_value(
+        all_attributes,
+        &mapping.first_name,
+        existing_user
+            .as_ref()
+            .and_then(|user| user.first_name.as_ref()),
+    );
+    let last_name = profile_value(
+        all_attributes,
+        &mapping.last_name,
+        existing_user
+            .as_ref()
+            .and_then(|user| user.last_name.as_ref()),
+    );
+    let department = profile_value(
+        all_attributes,
+        &mapping.department,
+        existing_user
+            .as_ref()
+            .and_then(|user| user.department.as_ref()),
+    );
+    let job_title = profile_value(
+        all_attributes,
+        &mapping.job_title,
+        existing_user
+            .as_ref()
+            .and_then(|user| user.job_title.as_ref()),
+    );
 
     let (user, change) = if let Some(mut user) = existing_user {
         let previous = user.clone();
@@ -205,6 +230,7 @@ pub async fn provision_user_from_saml(
         user.last_name = last_name;
         user.department = department;
         user.job_title = job_title;
+        user.saml_id = Some(user_id_attr.clone());
         if !user.is_primary {
             user.role = role?;
         } else {
@@ -696,38 +722,146 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_assertion_whose_profile_attribute_has_two_distinct_values_is_refused() {
+    async fn a_profile_attribute_with_two_values_takes_the_first_for_a_new_user() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
         let mapping = SamlAttributeMapping::default();
-        for (attribute, label) in [
-            (mapping.email.clone(), "email"),
-            (mapping.first_name.clone(), "first name"),
-            (mapping.last_name.clone(), "last name"),
-            (mapping.department.clone(), "department"),
-            (mapping.job_title.clone(), "job title"),
-        ] {
-            let dir = tempdir().unwrap();
-            let (storage, avatars) = user_storage(&dir).await;
-            let mut attributes = saml_attributes("saml-1", "jane");
-            attributes.insert(attribute, vec!["one".to_string(), "two".to_string()]);
+        let mut attributes = saml_attributes("saml-1", "jane");
+        attributes.insert(mapping.email, vec!["first@example.test".to_string(), "second@example.test".to_string()]);
+        attributes.insert(mapping.department, vec!["Platform".to_string(), "Sales".to_string()]);
+        attributes.insert(mapping.job_title, vec!["Engineer".to_string(), "Manager".to_string()]);
 
-            let err = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+        let user = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap()
+            .user;
+
+        assert_eq!(user.email.as_deref(), Some("first@example.test"));
+        assert_eq!(user.department.as_deref(), Some("Platform"));
+        assert_eq!(user.job_title.as_deref(), Some("Engineer"));
+    }
+
+    #[tokio::test]
+    async fn a_profile_attribute_keeps_the_stored_value_while_the_idp_still_sends_it() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mapping = SamlAttributeMapping::default();
+        let mut attributes = saml_attributes("saml-1", "jane");
+        attributes.insert(mapping.department.clone(), vec!["Sales".to_string()]);
+        let first = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap();
+        assert!(first.user.is_primary);
+
+        attributes.insert(mapping.department.clone(), vec!["Platform".to_string(), "Sales".to_string()]);
+        let kept = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap();
+        assert_eq!(
+            kept.user
+                .department
+                .as_deref(),
+            Some("Sales")
+        );
+        assert_eq!(kept.user.user_id, first.user.user_id);
+
+        attributes.insert(mapping.department, vec!["Platform".to_string(), "Legal".to_string()]);
+        let replaced = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap();
+        assert_eq!(
+            replaced
+                .user
+                .department
+                .as_deref(),
+            Some("Platform")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_primary_administrator_signs_in_whatever_profile_values_are_sent() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mapping = SamlAttributeMapping::default();
+        let mut attributes = saml_attributes("saml-admin", "admin");
+        attributes.insert(mapping.email, vec!["a@example.test".to_string(), "b@example.test".to_string()]);
+
+        let provisioned = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap();
+
+        assert!(provisioned.user.is_primary);
+        assert_eq!(
+            provisioned
+                .user
+                .email
+                .as_deref(),
+            Some("a@example.test")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_user_saved_under_the_name_id_is_found_and_rekeyed_to_the_user_id_attribute() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let config = test_saml_config();
+        let mut before = saml_attributes("name-id-1", "jane");
+        before.remove(&SamlAttributeMapping::default().user_id);
+        before.insert("NameID".to_string(), vec!["name-id-1".to_string()]);
+        let original = provision_user_from_saml(&storage, &before, &config, &avatars)
+            .await
+            .unwrap();
+        assert_eq!(
+            original
+                .user
+                .saml_id
+                .as_deref(),
+            Some("name-id-1")
+        );
+
+        let mut after = saml_attributes("attribute-id-1", "jane");
+        after.insert("NameID".to_string(), vec!["name-id-1".to_string()]);
+        let again = provision_user_from_saml(&storage, &after, &config, &avatars)
+            .await
+            .unwrap();
+
+        assert_eq!(again.user.user_id, original.user.user_id);
+        assert_eq!(again.user.saml_id.as_deref(), Some("attribute-id-1"));
+        assert!(matches!(again.change, SignInChange::Updated { .. }));
+        assert_eq!(
+            storage
+                .list_users()
                 .await
-                .unwrap_err();
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 
-            assert!(
-                err.to_string()
-                    .contains(&format!("The SAML {label} attribute carries more than one value")),
-                "{label}: {err}"
-            );
-            assert!(
-                storage
-                    .list_users()
-                    .await
-                    .unwrap()
-                    .is_empty(),
-                "{label}: no user is stored"
-            );
-        }
+    #[tokio::test]
+    async fn a_sign_in_whose_name_id_matches_nobody_creates_a_new_user() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let config = mapped_config();
+        provision_user_from_saml(&storage, &saml_attributes("saml-first", "first"), &config, &avatars)
+            .await
+            .unwrap();
+        let mut attributes = with_role(saml_attributes("attribute-id-2", "second"), "gw-admins");
+        attributes.insert("NameID".to_string(), vec!["unknown-name-id".to_string()]);
+
+        let provisioned = provision_user_from_saml(&storage, &attributes, &config, &avatars)
+            .await
+            .unwrap();
+
+        assert!(matches!(provisioned.change, SignInChange::Created));
+        assert_eq!(
+            storage
+                .list_users()
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -800,9 +934,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            err.to_string()
-                .contains("username attribute")
+        assert_eq!(
+            err.downcast_ref::<AmbiguousAttribute>()
+                .map(|ambiguous| ambiguous.attribute),
+            Some("username")
         );
         assert!(
             storage

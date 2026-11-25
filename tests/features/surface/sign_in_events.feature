@@ -115,42 +115,54 @@ Feature: Sign-in integration events
     When "mallory" signs in with SAML carrying the identity provider roles "contractors"
     Then the response status is 403
     And the integration receives a "user.login_failed" event with login method "saml" and failure reason "role_not_mapped"
+    And human user "mallory" keeps the stored role "administrator"
 
   Scenario: A SAML sign-in with two different user IDs as repeated attributes is refused and creates no user
     Given human users sign in with SAML
     And "alpha" has signed in with SAML as the first user and that event was received
     When "mallory" signs in with SAML carrying two different user IDs as repeated attributes
-    Then the response status is 500
+    Then the response status is 403
     And the gateway issues no session cookie
     And no human user "mallory" is stored
-    And the integration receives no other sign-in event
+    And the integration receives a "user.login_failed" event with login method "saml" and failure reason "ambiguous_attribute"
+    And the integration receives no other sign-in event besides the first user's
 
   Scenario: A SAML sign-in with two different user IDs in separate attribute statements is refused and creates no user
     Given human users sign in with SAML
     And "alpha" has signed in with SAML as the first user and that event was received
     When "mallory" signs in with SAML carrying two different user IDs in separate attribute statements
-    Then the response status is 500
+    Then the response status is 403
     And the gateway issues no session cookie
     And no human user "mallory" is stored
-    And the integration receives no other sign-in event
+    And the integration receives a "user.login_failed" event with login method "saml" and failure reason "ambiguous_attribute"
+    And the integration receives no other sign-in event besides the first user's
 
   Scenario: A SAML sign-in with two different usernames as repeated attributes is refused and creates no user
     Given human users sign in with SAML
     And "alpha" has signed in with SAML as the first user and that event was received
     When "mallory" signs in with SAML carrying two different usernames as repeated attributes
-    Then the response status is 500
+    Then the response status is 403
     And the gateway issues no session cookie
     And no human user "mallory" is stored
-    And the integration receives no other sign-in event
+    And the integration receives a "user.login_failed" event with login method "saml" and failure reason "ambiguous_attribute"
+    And the integration receives no other sign-in event besides the first user's
 
-  Scenario: A SAML sign-in with two different email addresses as repeated attributes is refused and creates no user
+  Scenario: A SAML sign-in with two different email addresses signs in and keeps one account
     Given human users sign in with SAML
     And "alpha" has signed in with SAML as the first user and that event was received
     When "mallory" signs in with SAML carrying two different email addresses as repeated attributes
-    Then the response status is 500
-    And the gateway issues no session cookie
-    And no human user "mallory" is stored
-    And the integration receives no other sign-in event
+    Then the response status is 200
+    And the integration receives a "user.login" event with login method "saml" for user "mallory"
+    And human user "mallory" is stored once
+
+  Scenario: A SAML sign-in whose user ID attribute is only in a second statement finds the account saved under the NameID
+    Given human users sign in with SAML
+    And "alpha" has signed in with SAML as the first user and that event was received
+    And "mallory" has signed in with SAML carrying the identity provider roles "gw-all" and that event was received
+    When "mallory" signs in with SAML carrying the user ID only in a second attribute statement
+    Then the response status is 200
+    And the integration receives a "user.login" event with login method "saml" for user "mallory"
+    And human user "mallory" is stored once
 
   Scenario: A SAML sign-in whose role is named like a gateway role but not mapped is refused
     Given human users sign in with SAML

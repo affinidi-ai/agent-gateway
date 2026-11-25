@@ -142,6 +142,21 @@ fn saml_json_sets(
         .keeps_gateway_log = true;
 }
 
+#[given(expr = "saml.json maps the identity provider role {string} to {string}")]
+fn saml_json_maps_role(
+    world: &mut SurfaceWorld,
+    idp_role: String,
+    gateway_role: String,
+) {
+    world
+        .surface_config
+        .saml_settings
+        .insert("role_mapping".to_string(), json!({ idp_role: gateway_role }));
+    world
+        .surface_config
+        .keeps_gateway_log = true;
+}
+
 #[when("the gateway tries to start")]
 async fn gateway_tries_to_start(world: &mut SurfaceWorld) {
     world
@@ -425,6 +440,14 @@ async fn sign_in_with_saml_repeated_emails(
     sign_in_with_saml_layout(world, subject, "gw-all".to_string(), AssertionLayout::RepeatedEmail).await;
 }
 
+#[when(expr = "{string} signs in with SAML carrying the user ID only in a second attribute statement")]
+async fn sign_in_with_saml_user_id_only_in_a_second_statement(
+    world: &mut SurfaceWorld,
+    subject: String,
+) {
+    sign_in_with_saml_layout(world, subject, "gw-all".to_string(), AssertionLayout::UserIdOnlyInSecondStatement).await;
+}
+
 async fn sign_in_with_saml_layout(
     world: &mut SurfaceWorld,
     subject: String,
@@ -647,11 +670,7 @@ fn the_gateway_issues_no_session_cookie(world: &mut SurfaceWorld) {
     );
 }
 
-#[then(expr = "no human user {string} is stored")]
-fn no_console_user_is_stored(
-    world: &mut SurfaceWorld,
-    username: String,
-) {
+fn stored_users(world: &SurfaceWorld) -> Vec<Value> {
     let base = world
         .infra
         .as_ref()
@@ -671,12 +690,48 @@ fn no_console_user_is_stored(
         .filter_map(|text| serde_json::from_str(&text).ok())
         .collect();
     assert!(!stored.is_empty(), "the first user's account is stored in {users_dir:?}");
+    stored
+}
+
+#[then(expr = "no human user {string} is stored")]
+fn no_console_user_is_stored(
+    world: &mut SurfaceWorld,
+    username: String,
+) {
+    let stored = stored_users(world);
     assert!(
         stored
             .iter()
             .all(|user| user["username"] != username),
         "the refused sign-in stored {username:?}: {stored:?}"
     );
+}
+
+#[then(expr = "human user {string} is stored once")]
+fn console_user_is_stored_once(
+    world: &mut SurfaceWorld,
+    username: String,
+) {
+    let stored = stored_users(world);
+    let matching = stored
+        .iter()
+        .filter(|user| user["username"] == username)
+        .count();
+    assert_eq!(matching, 1, "{username:?} is stored {matching} times: {stored:?}");
+}
+
+#[then(expr = "human user {string} keeps the stored role {string}")]
+fn console_user_keeps_the_stored_role(
+    world: &mut SurfaceWorld,
+    username: String,
+    role: String,
+) {
+    let stored = stored_users(world);
+    let user = stored
+        .iter()
+        .find(|user| user["username"] == username)
+        .unwrap_or_else(|| panic!("no stored user {username:?}: {stored:?}"));
+    assert_eq!(user["role"], role.as_str(), "{username:?}'s stored role: {user}");
 }
 
 #[then(expr = "that event names human user {string}")]

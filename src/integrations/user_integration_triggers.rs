@@ -33,6 +33,7 @@ pub enum LoginFailure<'a> {
     UnknownUser,
     SamlRejected,
     RoleNotMapped,
+    AmbiguousAttribute,
 }
 
 impl<'a> LoginFailure<'a> {
@@ -53,13 +54,14 @@ impl<'a> LoginFailure<'a> {
             Self::UnknownUser => "unknown_user",
             Self::SamlRejected => "saml_rejected",
             Self::RoleNotMapped => "role_not_mapped",
+            Self::AmbiguousAttribute => "ambiguous_attribute",
         }
     }
 
     fn account(&self) -> Option<&'a UserData> {
         match self {
             Self::InvalidCredential(user) | Self::NotApproved(user) => Some(user),
-            Self::UnknownUser | Self::SamlRejected | Self::RoleNotMapped => None,
+            Self::UnknownUser | Self::SamlRejected | Self::RoleNotMapped | Self::AmbiguousAttribute => None,
         }
     }
 }

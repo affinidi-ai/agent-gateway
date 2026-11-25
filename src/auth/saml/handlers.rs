@@ -349,6 +349,18 @@ pub async fn saml_acs(
                     "Your account has no role in this application. Please contact your administrator.",
                 ));
             }
+            if let Some(ambiguous) = e.downcast_ref::<super::user_provisioning::AmbiguousAttribute>() {
+                warn!(attribute = ambiguous.attribute, "SAML sign-in refused: {}", e);
+                crate::integrations::trigger_user_login_failed(
+                    crate::integrations::LoginMethod::Saml,
+                    crate::integrations::LoginFailure::AmbiguousAttribute,
+                );
+                return Ok(saml_error_page(
+                    StatusCode::FORBIDDEN,
+                    "Sign-in unavailable",
+                    "Your identity provider sent conflicting account details. Please contact your administrator.",
+                ));
+            }
             error!("Failed to provision user from SAML: {}", e);
             return Ok(saml_error_page(
                 StatusCode::INTERNAL_SERVER_ERROR,

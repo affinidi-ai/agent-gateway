@@ -152,9 +152,10 @@ session.
 | `unknown_user` | No account has the username the sign-in named, or the account was deleted before the sign-in finished |
 | `saml_rejected` | The SAML response was rejected |
 | `role_not_mapped` | The SAML response was valid, but none of the identity-provider role values has a `role_mapping` entry and `saml.json` sets no `default_role` |
+| `ambiguous_attribute` | The SAML response was valid, but its user ID or username attribute carried more than one distinct value, so it named no single user |
 
 `USER_ID`, `USERNAME`, `USER_EMAIL`, `USER_ROLE`, `USER_STATUS` and `NEW_STATE` are set only when the
-account exists, from the account as stored. For `unknown_user`, `saml_rejected` and `role_not_mapped` they are absent:
+account exists, from the account as stored. For `unknown_user`, `saml_rejected`, `role_not_mapped` and `ambiguous_attribute` they are absent:
 a template placeholder for them is empty and `EVENT_DATA` leaves them out, so neither the username a
 caller typed nor anything in a rejected SAML response leaves the appliance. With the default
 `webhook` or `stream` template, `data` holds `login_method`, `failure_reason` and, for an existing
