@@ -10,7 +10,7 @@ changes:
         several common chunks of at most 500 KB each, so the budget keeps flagging real growth and
         the browser can cache and load the parts separately.
     - timestamp: '2026-11-25T10:20:00Z'
-      title: Warn on every save about a stored listen_path that is another Transit Point's route
+      title: Warn on save about a stored listen_path on another Transit Point's route
       description: >-
         A save that introduces a listen_path equal to a route another Transit Point answers on is
         refused with listen_path_route_clash, while a surface already stored with such a clash
@@ -45,7 +45,7 @@ changes:
         the save of a Transit Point routed to a URL but not of one routed through another gateway,
         which saved as if the edit had applied. Both are now blocked until a prefix is picked.
     - timestamp: '2026-11-25T11:00:00Z'
-      title: Check malformed and unserved variant Listen Paths in the Surface Builder before saving
+      title: Check malformed and unserved variant Listen Paths before a dashboard save
       description: >-
         The Surface Builder blocked a Listen Path outside the configured surface prefixes before
         sending the save, but left two other gateway refusals to the round trip. It now also blocks
@@ -57,7 +57,7 @@ changes:
   security: []
   breaking:
     - timestamp: '2026-11-25T10:00:00Z'
-      title: Refuse every variant listen_path no route serves, as listen_path_variant_unserved
+      title: Refuse a variant listen_path no route serves as listen_path_variant_unserved
       description: >-
         The outbound listener registers routes from the base surface's Transit Points alone and
         builds each variant's from the base point's alias and path, so a variant's own listen_path

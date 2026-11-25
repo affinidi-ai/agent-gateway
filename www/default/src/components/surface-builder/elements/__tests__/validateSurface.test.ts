@@ -216,7 +216,9 @@ describe('validateSurfacePayload', () => {
     const wire = (base?: string, variant?: string) => ({
       ...ok(),
       transit: { points: [point(base)] },
-      variants: [{ id: 'v-beta', alias: 'beta', overrides: { transit: { points: [point(variant)] } } }],
+      variants: [
+        { id: 'v-beta', alias: 'beta', overrides: { transit: { points: [point(variant)] } } },
+      ],
     });
 
     it('blocks a variant path the base point does not hold, which no route serves', () => {
@@ -247,7 +249,10 @@ describe('validateSurfacePayload', () => {
         })
       ).not.toBeNull();
       expect(
-        variantListenPathProblem({ ...wire(undefined, '/outbound/agents/x'), status: 'disabled' }, null)
+        variantListenPathProblem(
+          { ...wire(undefined, '/outbound/agents/x'), status: 'disabled' },
+          null
+        )
       ).toBeNull();
     });
 

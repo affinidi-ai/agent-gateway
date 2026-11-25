@@ -2643,7 +2643,10 @@ async fn stored_listen_path_route_clash_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
 ) -> Vec<String> {
-    let Some(store) = state.agent_surface_store.as_ref() else {
+    let Some(store) = state
+        .agent_surface_store
+        .as_ref()
+    else {
         return Vec::new();
     };
     let resolve_port = |addr: &str| {
