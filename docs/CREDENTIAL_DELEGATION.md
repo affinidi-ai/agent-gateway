@@ -1642,7 +1642,10 @@ request is a `tools/call` of one of them. On a Transit Point it happens after th
 resolved and before anything is sent, and only when a credential was attached, in a header or
 `_meta`. A request that carries no delegated credential, such as a `2026-07-28` `tools/list`
 against a binding scoped to tools, is not refused for its path. It is recorded as a `request_rejected` record at `forward` with reason
-`target_path_refused`, or as `target_auth_failed` when the leg also has a Target credential. A
+`target_path_refused`, or as `target_auth_failed` when the leg also has a Target credential. On
+Fabric receive a discovery read (the agent card) is not counted as carrying a delegated
+credential, since that leg injects none into it; the direct path counts every request a binding
+applies to. A
 `2026-07-28` MCP proxy call is held by its REST client's own base-path check (400). A Target
 bound by external consent keeps its stricter admission check (400).
 
