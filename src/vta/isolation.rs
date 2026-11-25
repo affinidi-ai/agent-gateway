@@ -68,6 +68,9 @@ pub fn origin_key(raw: &str) -> Option<String> {
 /// endpoint (unix socket) is ignored, because there is nothing a proxy target
 /// could name it by.
 pub fn reserve(endpoint: &str) {
+    if !recording() {
+        return;
+    }
     let Some(key) = origin_key(endpoint) else {
         return;
     };
@@ -80,6 +83,9 @@ pub fn reserve(endpoint: &str) {
 /// Held until a [`sync_connection_reservations`] finds no verified record
 /// using it.
 pub fn reserve_connection(endpoint: &str) {
+    if !recording() {
+        return;
+    }
     let Some(key) = origin_key(endpoint) else {
         return;
     };
@@ -112,6 +118,9 @@ pub async fn sync_connection_reservations(store: &dyn crate::vta::connections::V
         .filter(|connection| reserves_endpoint(connection))
         .filter_map(|connection| origin_key(&connection.endpoint))
         .collect();
+    if !recording() {
+        return;
+    }
     if let Ok(mut current) = CONNECTION_ORIGINS.write() {
         *current = origins;
     }
@@ -165,10 +174,59 @@ pub(crate) fn clear_reservations() {
     }
 }
 
+/// Whether reservations are recorded. Always, except in unit tests: there the
+/// reservations are process-wide while each test's mock trust agent listens on
+/// a loopback port another test may be given next, so only a test that holds
+/// [`TEST_LOCK`] records them, on its own thread, and they are cleared when it
+/// lets go.
+#[cfg(not(test))]
+fn recording() -> bool {
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECORDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn recording() -> bool {
+    RECORDING.with(std::cell::Cell::get)
+}
+
+/// The lock a test that checks reservations holds: it records them on the
+/// holding thread only, and clears them before and after.
+#[cfg(test)]
+pub(crate) struct ReservationTestLock(std::sync::Mutex<()>);
+
+#[cfg(test)]
+pub(crate) struct RecordingReservations<'a>(#[allow(dead_code)] std::sync::MutexGuard<'a, ()>);
+
+#[cfg(test)]
+impl ReservationTestLock {
+    pub(crate) fn lock(&self) -> Result<RecordingReservations<'_>, std::convert::Infallible> {
+        let guard = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_reservations();
+        RECORDING.with(|recording| recording.set(true));
+        Ok(RecordingReservations(guard))
+    }
+}
+
+#[cfg(test)]
+impl Drop for RecordingReservations<'_> {
+    fn drop(&mut self) {
+        RECORDING.with(|recording| recording.set(false));
+        clear_reservations();
+    }
+}
+
 /// `RESERVED` is process-wide, so every test that writes it — here and in
 /// `egress` — must hold this.
 #[cfg(test)]
-pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static TEST_LOCK: ReservationTestLock = ReservationTestLock(std::sync::Mutex::new(()));
 
 #[cfg(test)]
 mod tests {
