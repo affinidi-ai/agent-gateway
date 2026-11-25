@@ -12148,6 +12148,37 @@ async fn handle_fabric_request_inner(
         }
     }
 
+    let fabric_send_facts = crate::audit::request_events::RequestFacts {
+        surface_id: config_id,
+        channel_name,
+        trace_id: Some(&trace_id),
+        via_fabric: false,
+    };
+    if (state
+        .surface
+        .target_auth()
+        .is_some()
+        || (delegates_credentials_over_fabric(&state.surface)
+            && modern_request
+                .as_ref()
+                .is_some_and(|request| {
+                    state
+                        .surface
+                        .agent_keyed_binding_applies(request.called_tool_name())
+                })))
+        && !crate::proxy::paths::appended_path_stays_below_base(uri.path())
+    {
+        warn!(
+            channel = channel_name,
+            "Refusing a Fabric request that climbs out of its path: it would carry a Target or delegated credential"
+        );
+        record_credential_destination_refusal(&fabric_send_facts, None, state.surface.target_auth());
+        connection_guard
+            .decrement()
+            .await;
+        return Err(TargetAuthFailure::PathRefused.response());
+    }
+
     let inbound_payment = InboundPayment {
         intake: payment,
         identity: authenticated_identity.as_ref(),
@@ -12753,31 +12784,6 @@ async fn handle_fabric_request_inner(
         &target_credential_header_names(&state.surface),
     );
 
-    let fabric_send_facts = crate::audit::request_events::RequestFacts {
-        surface_id: config_id,
-        channel_name,
-        trace_id: Some(&trace_id),
-        via_fabric: false,
-    };
-    if (state
-        .surface
-        .target_auth()
-        .is_some()
-        || modern_delegation
-            .as_ref()
-            .is_some_and(|prepared| prepared.attaches_credentials()))
-        && !crate::proxy::paths::appended_path_stays_below_base(uri.path())
-    {
-        warn!(
-            channel = channel_name,
-            "Refusing a Fabric request that climbs out of its path: it would carry a Target or delegated credential"
-        );
-        record_credential_destination_refusal(&fabric_send_facts, None, state.surface.target_auth());
-        connection_guard
-            .decrement()
-            .await;
-        return Err(TargetAuthFailure::PathRefused.response());
-    }
     // Inject target authentication credentials into the forwarded headers so
     // GW2 delivers them to the upstream service.
     let mut injected_target_header: Option<String> = None;
@@ -21468,6 +21474,16 @@ allow if {
             .register_test_listener(listener)
             .await;
         let listener_manager = Arc::new(tokio::sync::RwLock::new(Some(Arc::new(manager))));
+        {
+            let mut fabric = state.clone();
+            fabric.listener_manager = listener_manager.clone();
+            let surface = Arc::make_mut(&mut fabric.surface);
+            surface.target.endpoint = format!("fabric://{}/opted-in", peer.id);
+            surface
+                .target
+                .fabric_delegated_credentials = true;
+            modern_requests_outside_the_target_base_path(&fabric, &runtime, &build_request, &message).await;
+        }
         for (surface_id, opted_in, with_runtime) in
             [("opted-out", false, false), ("opted-in", true, false), ("opted-out", false, true)]
         {
