@@ -636,8 +636,9 @@ is not mapped. A refusal is logged with the SAML subject and the role values rec
 claim is shown as none) and raises a `user.login_failed` event with failure reason
 `role_not_mapped` ([`docs/INTEGRATIONS.md`](INTEGRATIONS.md#sign-in-events)).
 
-The configured user ID and username attributes must not carry more than one distinct value, including
-across repeated attributes or attribute statements. Such an assertion is refused before any user is
+The configured user ID, username, email, first name, last name, department and job title attributes
+must not carry more than one distinct value, including across repeated attributes or attribute
+statements; a value repeated unchanged is accepted. Such an assertion is refused before any user is
 created or updated.
 
 The first user to sign in to an appliance with no users is still the primary administrator, and

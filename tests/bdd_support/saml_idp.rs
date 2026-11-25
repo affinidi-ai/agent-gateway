@@ -86,6 +86,7 @@ pub enum AssertionLayout {
     RepeatedUserId,
     UserIdInSecondStatement,
     RepeatedUsername,
+    RepeatedEmail,
 }
 
 fn template(
@@ -113,6 +114,7 @@ fn template(
                 format!("<saml:AttributeStatement>{}</saml:AttributeStatement>", attribute(NAME_ID_CLAIM, &other));
         }
         AssertionLayout::RepeatedUsername => attributes.push(attribute(NAME_CLAIM, &other)),
+        AssertionLayout::RepeatedEmail => attributes.push(attribute(EMAIL_CLAIM, &other)),
         _ => {}
     }
     if !roles.is_empty() {
@@ -124,7 +126,8 @@ fn template(
             }
             AssertionLayout::RepeatedUserId
             | AssertionLayout::UserIdInSecondStatement
-            | AssertionLayout::RepeatedUsername => attributes.push(attribute(ROLE_CLAIM, roles)),
+            | AssertionLayout::RepeatedUsername
+            | AssertionLayout::RepeatedEmail => attributes.push(attribute(ROLE_CLAIM, roles)),
             AssertionLayout::RepeatedAttribute => {
                 attributes.extend(
                     roles

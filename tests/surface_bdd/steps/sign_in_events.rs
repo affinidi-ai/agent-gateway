@@ -417,6 +417,14 @@ async fn sign_in_with_saml_repeated_usernames(
     sign_in_with_saml_layout(world, subject, "gw-all".to_string(), AssertionLayout::RepeatedUsername).await;
 }
 
+#[when(expr = "{string} signs in with SAML carrying two different email addresses as repeated attributes")]
+async fn sign_in_with_saml_repeated_emails(
+    world: &mut SurfaceWorld,
+    subject: String,
+) {
+    sign_in_with_saml_layout(world, subject, "gw-all".to_string(), AssertionLayout::RepeatedEmail).await;
+}
+
 async fn sign_in_with_saml_layout(
     world: &mut SurfaceWorld,
     subject: String,

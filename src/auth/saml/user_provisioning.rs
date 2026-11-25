@@ -78,9 +78,9 @@ fn carries_several_values(
         > 1
 }
 
-/// Refuse an assertion whose user-id or username attribute carries more than one distinct value,
-/// since which one names the user would depend on the identity provider's ordering.
-fn ensure_single_valued_identity(
+/// Refuse an assertion whose user-id, username or profile attribute carries more than one
+/// distinct value, since which one is used would depend on the identity provider's ordering.
+fn ensure_single_valued_attributes(
     all_attributes: &SamlAttributes,
     config: &SamlConfig,
 ) -> Result<()> {
@@ -93,6 +93,18 @@ fn ensure_single_valued_identity(
         !carries_several_values(all_attributes, &mapping.username, &mapping.email),
         "The SAML username attribute carries more than one value"
     );
+    for (label, attribute) in [
+        ("email", &mapping.email),
+        ("first name", &mapping.first_name),
+        ("last name", &mapping.last_name),
+        ("department", &mapping.department),
+        ("job title", &mapping.job_title),
+    ] {
+        anyhow::ensure!(
+            !carries_several_values(all_attributes, attribute, attribute),
+            "The SAML {label} attribute carries more than one value"
+        );
+    }
     Ok(())
 }
 
@@ -120,7 +132,7 @@ pub async fn provision_user_from_saml(
         )
         .or_else(|| attributes.get("NameID"))
         .context("User ID not found in SAML attributes")?;
-    ensure_single_valued_identity(all_attributes, config)?;
+    ensure_single_valued_attributes(all_attributes, config)?;
 
     let username = attributes
         .get(
@@ -684,15 +696,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_email_takes_the_first_value_of_its_attribute_beside_a_single_user_id_and_username() {
+    async fn an_assertion_whose_profile_attribute_has_two_distinct_values_is_refused() {
+        let mapping = SamlAttributeMapping::default();
+        for (attribute, label) in [
+            (mapping.email.clone(), "email"),
+            (mapping.first_name.clone(), "first name"),
+            (mapping.last_name.clone(), "last name"),
+            (mapping.department.clone(), "department"),
+            (mapping.job_title.clone(), "job title"),
+        ] {
+            let dir = tempdir().unwrap();
+            let (storage, avatars) = user_storage(&dir).await;
+            let mut attributes = saml_attributes("saml-1", "jane");
+            attributes.insert(attribute, vec!["one".to_string(), "two".to_string()]);
+
+            let err = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+                .await
+                .unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains(&format!("The SAML {label} attribute carries more than one value")),
+                "{label}: {err}"
+            );
+            assert!(
+                storage
+                    .list_users()
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{label}: no user is stored"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_profile_attribute_repeating_one_value_is_accepted() {
         let dir = tempdir().unwrap();
         let (storage, avatars) = user_storage(&dir).await;
         let mapping = SamlAttributeMapping::default();
-        let attributes: SamlAttributes = HashMap::from([
-            (mapping.user_id, vec!["saml-1".to_string()]),
-            (mapping.username, vec!["first-name".to_string()]),
-            (mapping.email, vec!["first@example.test".to_string(), "second@example.test".to_string()]),
-        ]);
+        let mut attributes = saml_attributes("saml-1", "jane");
+        attributes.insert(mapping.email, vec!["jane@example.test".to_string(); 2]);
+        attributes.insert(mapping.department, vec!["Platform".to_string(); 2]);
 
         let provisioned = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
             .await
@@ -701,17 +746,16 @@ mod tests {
         assert_eq!(
             provisioned
                 .user
-                .saml_id
+                .email
                 .as_deref(),
-            Some("saml-1")
+            Some("jane@example.test")
         );
-        assert_eq!(provisioned.user.username, "first-name");
         assert_eq!(
             provisioned
                 .user
-                .email
+                .department
                 .as_deref(),
-            Some("first@example.test")
+            Some("Platform")
         );
     }
 

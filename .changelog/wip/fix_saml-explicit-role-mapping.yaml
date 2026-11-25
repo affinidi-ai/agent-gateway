@@ -26,7 +26,7 @@ changes:
         role values maps to, whether they come in one attribute, in repeated attributes or in several attribute
         statements. A value that merely looks like a gateway role, such as admin, is not mapped. A sign-in whose
         values have no entry, or with no role value, gets default_role or is refused with a 403 page and no user
-        created or updated. An assertion whose user ID or username attribute carries more than one distinct value is refused.
+        created or updated. An assertion whose user ID, username, email, first name, last name, department or job title attribute carries more than one distinct value is refused.
         Before upgrading, add a role_mapping entry for every identity-provider role that should sign in, or set
         default_role to user to keep admitting the rest, and check that an saml.json copied from an earlier
         example maps only roles you intend to grant. A role_mapping value or default_role that is not exactly
