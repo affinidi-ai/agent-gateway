@@ -12755,7 +12755,7 @@ async fn handle_fabric_request_inner(
             connection_guard
                 .decrement()
                 .await;
-            return Err(refusal.response());
+            return Err(refusal.response_for(&state.surface, &body_bytes));
         }
         match inject_target_auth_header(
             target_auth,
@@ -12788,7 +12788,9 @@ async fn handle_fabric_request_inner(
                         connection_guard
                             .decrement()
                             .await;
-                        return Err(e.failure().response());
+                        return Err(e
+                            .failure()
+                            .response_for(&state.surface, &body_bytes));
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -13373,7 +13375,7 @@ async fn handle_fabric_request_inner(
                     connection_guard
                         .decrement()
                         .await;
-                    return Err(TargetAuthFailure::Rejected.response());
+                    return Err(TargetAuthFailure::Rejected.response_for(&state.surface, &original_body_bytes));
                 }
 
                 let response_headers = response_msg
@@ -13433,7 +13435,12 @@ async fn handle_fabric_request_inner(
                     }
 
                     channel_error!(config_id, "❌ Gateway forwarding error: {}", error);
-                    let relayed_failure = TargetAuthFailure::relayed(status, &response_body);
+                    if let Some(failure) = TargetAuthFailure::relayed(status, &response_body) {
+                        connection_guard
+                            .decrement()
+                            .await;
+                        return Err(failure.response_for(&state.surface, &original_body_bytes));
+                    }
 
                     // For MCP requests, return the error as a properly formatted JSON-RPC error response
                     // instead of converting it to an HTTP error (which causes a 500)
@@ -13451,15 +13458,12 @@ async fn handle_fabric_request_inner(
                             -32603
                         };
                         let jsonrpc_error = || {
-                            let mut jsonrpc_error = serde_json::json!({
+                            let jsonrpc_error = serde_json::json!({
                                 "code": jsonrpc_error_code,
                                 "message": error
                                     .as_str()
                                     .unwrap_or("Gateway forwarding failed")
                             });
-                            if let Some(failure) = relayed_failure {
-                                jsonrpc_error["data"] = serde_json::json!({ "reason": failure.reason() });
-                            }
                             serde_json::json!({ "jsonrpc": "2.0", "id": null, "error": jsonrpc_error }).to_string()
                         };
 
@@ -13518,9 +13522,6 @@ async fn handle_fabric_request_inner(
                     connection_guard
                         .decrement()
                         .await;
-                    if let Some(failure) = relayed_failure {
-                        return Err(failure.response());
-                    }
                     return Err(create_error_response(
                         error_status,
                         error
@@ -15859,7 +15860,9 @@ async fn handle_mcp_proxy_request_inner(
                 record_target_auth_failure(&audit_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return Err(e.failure().response());
+                        return Err(e
+                            .failure()
+                            .response_for(&state.surface, body_bytes));
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -16202,7 +16205,7 @@ async fn handle_mcp_proxy_request_inner(
             if let Some(target_auth) = state.surface.target_auth() {
                 record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
             }
-            Err(refusal.response())
+            Err(refusal.response_for(&state.surface, body_bytes))
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::Failed(e)) => {
             error!(

@@ -1111,7 +1111,8 @@ the token.
 With `fallback: reject`, a request whose Target credential cannot be obtained is refused with a
 status that says what kind of failure it is, the generic detail "Target authentication failed"
 and a fixed `reason`: a top-level field of the problem JSON, or `error.data.reason` in the
-JSON-RPC error of an MCP Transit Point. The cause itself reaches only the VP Audit Log.
+JSON-RPC `-32603` error, echoing the request `id`, of an MCP surface or MCP Transit Point. The
+cause itself reaches only the VP Audit Log.
 
 | Status | `reason` | When |
 | --- | --- | --- |
@@ -1124,7 +1125,7 @@ error.
 
 This holds on the direct path, a `proxy://` MCP Target, the Fabric send leg, Fabric receive
 (whose ForwardResponse carries the status and reason, which the sending gateway passes on; an
-MCP surface puts the reason in `error.data.reason`), a Transit Point
+MCP surface answers it as a JSON-RPC error with the reason in `error.data.reason`), a Transit Point
 and the agent card fetch. A Transit Point credential that cannot be sent as a header is refused
 with `500 target_auth_misconfigured` whatever the `fallback`. A request that would carry the
 credential outside the Target's base path is refused whatever the `fallback`, with `400

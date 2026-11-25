@@ -52,8 +52,10 @@ changes:
         When the Target behind an MCP Access Point is unreachable or its Target authentication
         fails, the gateway now replies with a JSON-RPC -32603 error that echoes the request id and
         names the cause in error.data.reason, under the same HTTP status as before, instead of an
-        A2A problem document an MCP client could not parse. The message names no Target URL or
-        secret, and a notification gets the status and no body. A2A surfaces are unchanged.
+        A2A problem document an MCP client could not parse. A Target authentication failure is
+        answered this way on the direct path, through an MCP Proxy Target and over Fabric,
+        including a refusal the peer gateway relays. The message names no Target URL or secret,
+        and a notification gets the status and no body. A2A surfaces are unchanged.
     - timestamp: '2026-11-25T00:05:03Z'
       title: Show a saved Transit Point's stored Target authentication when it is opened
       description: >-

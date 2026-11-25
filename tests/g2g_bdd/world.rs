@@ -221,13 +221,9 @@ fn expected_probe_status(
     }
 }
 
-fn fabric_route_probe_stage(
-    topology: &TopologyBuilder,
-    link: &FabricLink,
-) -> Option<FabricRouteProbeStage> {
-    let target = surface_spec(topology, link.to_gw, &link.to_surface);
-
-    let target_credential_unavailable = target
+/// Whether `surface` refuses every request because its Target credential cannot be obtained.
+fn target_credential_unavailable(surface: &SurfaceSpec) -> bool {
+    surface
         .target_auth
         .as_ref()
         .is_some_and(|target_auth| {
@@ -236,11 +232,20 @@ fn fabric_route_probe_stage(
                 .is_none()
                 && target_auth.fallback == "reject"
         })
-        || target
+        || surface
             .target_auth_provider
             .as_ref()
-            .is_some_and(|provider| provider.token_status != 200 && provider.fallback == "reject");
-    if target_credential_unavailable {
+            .is_some_and(|provider| provider.token_status != 200 && provider.fallback == "reject")
+}
+
+fn fabric_route_probe_stage(
+    topology: &TopologyBuilder,
+    link: &FabricLink,
+) -> Option<FabricRouteProbeStage> {
+    let target = surface_spec(topology, link.to_gw, &link.to_surface);
+    let sender = surface_spec(topology, link.from_gw, &link.from_surface);
+
+    if target_credential_unavailable(target) || target_credential_unavailable(sender) {
         return None;
     }
 
