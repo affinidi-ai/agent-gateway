@@ -2083,7 +2083,9 @@ scored scenario list comes from
 
 **Binary.** Both phases run the ordinary gateway binary, each on its own
 generated env. The modern phase first probes that the Access Point admits
-`2026-07-28`; every gateway endpoint admits it. Fabric is
+`2026-07-28`, unless only the `direct` and `fabric` targets are selected, which
+do not use it; every gateway endpoint admits it. A failed probe stops a normal
+run, while a report-only run records it as a note in `gaps.md` and goes on. Fabric is
 measured through a two-gateway topology (the `fabric` target below).
 
 | Target | Endpoint | Scenarios | Baseline |

@@ -144,6 +144,7 @@ absolute_path() {
 
 SUMMARY=()
 REPORT_TARGETS=()
+REPORT_NOTES=()
 FAILED=false
 STARTED_PIDS=()
 OWN_LOCK=false
@@ -634,10 +635,48 @@ report_authorization() {
         "${CONFORMANCE}" authorization --url "http://127.0.0.1:${MODERN_INBOUND_PORT}" -o "${RESULTS}/authorization"
 }
 
+# The probe sends one modern request to the Access Point. The direct and fabric
+# targets use neither that Access Point nor this gateway's modern admission, so
+# a run that selects only those does not depend on it. A normal run stops when
+# the probe fails; a report-only run records the failure and goes on, so the
+# gaps still get listed.
+probe_needed() {
+    local name
+    for name in "${MODERN_TARGETS[@]}"; do
+        [[ "${name}" == direct || "${name}" == fabric ]] || return 0
+    done
+    return 1
+}
+
+probe_modern() {
+    local log="${LOGS}/compat-probe.log" status message
+    if ! probe_needed; then
+        record INFO "modern: probe skipped; the selected targets do not use the Access Point"
+        return
+    fi
+    set +e
+    node "${HERE}/compat.mjs" probe --targets "${TARGETS_FILE}" > "${log}" 2>&1
+    status=$?
+    set -e
+    cat "${log}"
+    case "${status}" in
+        0) record PASS "modern: probe admits ${SPEC_VERSION}"; return ;;
+        2) message="modern: the binary does not admit ${SPEC_VERSION} (probe got -32022)" ;;
+        *) message="modern: probe failed (log: $(relative "${log}"))" ;;
+    esac
+    if [[ "${REPORT}" == true ]]; then
+        record INFO "${message}; the report goes on"
+        REPORT_NOTES+=("${message}")
+        return
+    fi
+    fail "$([[ "${status}" == 2 ]] && echo 2 || echo 1)" "${message}"
+}
+
 write_gaps() {
-    local log="${LOGS}/gaps.log" line
+    local log="${LOGS}/gaps.log" line note notes=()
+    for note in "${REPORT_NOTES[@]+"${REPORT_NOTES[@]}"}"; do notes+=(--note "${note}"); done
     if ! node "${HERE}/suite-report.mjs" gaps --results "${RESULTS}" --targets "$(IFS=,; echo "${REPORT_TARGETS[*]}")" \
-        --failed-dir "${REPORT_DIR}" --out "${GAPS_FILE}" > "${log}" 2>&1; then
+        --failed-dir "${REPORT_DIR}" --out "${GAPS_FILE}" "${notes[@]+"${notes[@]}"}" > "${log}" 2>&1; then
         tail -5 "${log}"
         record FAIL "report: a target has no results (log: $(relative "${log}"))"
         FAILED=true
@@ -744,17 +783,7 @@ if [[ "${RUN_MODERN}" == true ]]; then
     fi
 
     start_gateway modern "${BINARY}" "${MODERN_INBOUND_PORT}" "${MODERN_OUTBOUND_PORT}"
-    probe_log="${LOGS}/compat-probe.log"
-    set +e
-    node "${HERE}/compat.mjs" probe --targets "${TARGETS_FILE}" > "${probe_log}" 2>&1
-    probe_status=$?
-    set -e
-    cat "${probe_log}"
-    case "${probe_status}" in
-        0) record PASS "modern: probe admits ${SPEC_VERSION}" ;;
-        2) fail 2 "modern: the binary does not admit ${SPEC_VERSION} (probe got -32022)" ;;
-        *) fail 1 "modern: probe failed (log: $(relative "${probe_log}"))" ;;
-    esac
+    probe_modern
 
     for name in "${MODERN_TARGETS[@]}"; do
         url="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))[process.argv[2]])' "${TARGETS_FILE}" "${name}")"

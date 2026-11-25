@@ -83,7 +83,9 @@ not be fetched, `130` interrupted (SIGINT), `143` terminated (SIGTERM).
    `direct` target still talks to the reference server itself.
 4. **Modern phase.** Builds the gateway (`cargo build`, target dir `target/`),
    writes a fresh env with `env.mjs`, starts the gateway and probes it: a
-   `-32022` answer means the binary does not admit `2026-07-28`. Then runs the
+   `-32022` answer means the binary does not admit `2026-07-28`. The probe
+   runs unless every selected modern target is `direct` or `fabric`, which use
+   neither that Access Point nor this gateway's modern admission. Then runs the
    suite per target, `check-results.mjs`, `compat.mjs admitted` and
    `compat.mjs legacy`. The `fabric` target runs `fabric.feature` through the
    g2g BDD runner (`cargo test --test g2g_bdd`): two gateways
@@ -207,8 +209,10 @@ A scenario that applies to `2026-07-28`, or that is an extension, runs on the
 as `server-initialize`, runs at its own revision.
 
 The run ignores the suite's exit status and the baselines, and does not run
-`check-results.mjs`, `client-parity.mjs` or `compat.mjs`. It exits `0` however
-many gaps it finds. It still exits non-zero when the harness itself fails: a
+`check-results.mjs`, `client-parity.mjs` or `compat.mjs` (apart from the modern probe). It exits `0` however
+many gaps it finds. A failed probe does not stop it: the summary shows an
+`INFO` line and `run/gaps.md` a `Harness notes` section, and the scenarios
+still run. It still exits non-zero when the harness itself fails: a
 build error, a gateway or fixture that does not start, a port in use, a gateway
 still listening after its client scenario ended, or a target for which the
 suite ran no scenario or saved no result.

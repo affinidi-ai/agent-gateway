@@ -126,8 +126,11 @@ export function gapsLine({ passed, rows }) {
   return `${passed} passed; ${rows.length} open gap(s)`;
 }
 
-export function renderGaps(targets) {
+export function renderGaps(targets, notes = []) {
   const lines = ['# MCP conformance: open gaps', '', 'Every failed or warned check of a report-only run, per target.'];
+  if (notes.length > 0) {
+    lines.push('', '## Harness notes', '', ...notes.map((note) => `- ${cell(redact(note))}`));
+  }
   for (const target of targets) {
     lines.push('', `## ${target.name}`, '', gapsLine(target));
     if (target.rows.length === 0) continue;
@@ -195,7 +198,7 @@ function gaps(values) {
     if (results.size === 0) empty.push(name);
     return { name, passed: passedCount(results), rows: gapRows(results, failedScenarios(values['failed-dir'], name)) };
   });
-  fs.writeFileSync(values.out, renderGaps(targets));
+  fs.writeFileSync(values.out, renderGaps(targets, values.note ?? []));
   for (const target of targets) console.log(`${target.name}: ${gapsLine(target)}`);
   if (empty.length > 0) {
     console.error(`suite-report.mjs gaps: no results for ${empty.join(', ')}`);
@@ -216,6 +219,7 @@ if (import.meta.filename === process.argv[1]) {
       targets: { type: 'string' },
       out: { type: 'string' },
       'failed-dir': { type: 'string' },
+      note: { type: 'string', multiple: true },
     },
   });
   if (positionals[0] === 'counts') counts(values);

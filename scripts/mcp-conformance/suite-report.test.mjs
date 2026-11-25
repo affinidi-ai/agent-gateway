@@ -223,6 +223,13 @@ test('the gaps file has one section per target and keeps a table row on one line
   assert.equal(text.split('\n').filter((line) => line.startsWith('| Scenario |')).length, 1);
 });
 
+test('harness notes come before the targets and carry no credential', () => {
+  const text = renderGaps([{ name: 't', passed: 1, rows: [] }], ['modern: probe failed', 'sent Bearer abc']);
+  assert.ok(text.indexOf('## Harness notes') < text.indexOf('## t'));
+  assert.ok(text.includes('- modern: probe failed\n- sent Bearer [redacted]\n'));
+  assert.ok(!renderGaps([{ name: 't', passed: 1, rows: [] }]).includes('Harness notes'));
+});
+
 test('a long message is cut', () => {
   const text = renderGaps([{ name: 't', passed: 0, rows: [{ scenario: 's', check: 'c', status: 'FAILURE', message: 'x'.repeat(900) }] }]);
   const row = text.split('\n').find((line) => line.startsWith('| s |'));
