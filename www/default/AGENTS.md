@@ -1640,6 +1640,8 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   `credential-provider-jwt-section`): Key ID sits under Certificate, a warning
   (`credential-provider-jwt-key-unidentified-warning`, from `jwtKeyUnidentified`) shows when
   neither names the key, and the algorithm select lists the type's algorithms, default first.
+  The Audience `FieldHelp` (`field-help-jwt-audience`) says an empty Audience means the token
+  endpoint, and that a server following RFC 7523bis wants its issuer identifier there instead.
 - **Client Credentials** and **Authorization Code** (without an `issuer`) show the same
   **Client authentication** select (`ClientAuthenticationSelect.tsx`, its own `FieldHelp` text)
   with two options: "Form body (default)", which sends an empty `client_authentication`, and

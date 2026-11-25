@@ -314,7 +314,7 @@ record that misses a required one.
 | `client_authentication` | Optional: how the grant's client identifies itself. `none` is a public client: `client_id` in the form body. `client_secret_basic` is HTTP Basic with the client ID and secret, each form-urlencoded (RFC 6749 section 2.3.1). `client_secret_post` puts `client_id` and `client_secret` in the form body. Unset sends no client identity and leaves the client references unread. An update that omits it keeps the stored value, and an empty string clears it. An update that changes `provider_type` and omits it drops the stored value | Refused with 400 `client_authentication is only for oauth2_jwt_bearer providers and for oauth2_client_credentials and oauth2_authorization_code providers without an issuer`; see [Client secret authentication](#client-secret-authentication) for those types |
 | `client_id_secret_ref` | Required with a `client_authentication` (400 `client_id_secret_ref is required for this client_authentication`), and sent as `client_id` or inside the Basic credentials; not used without one. An empty string clears it, which the dashboard sends while Not sent is chosen, so a cleared provider holds no reference that would block deleting the secret | Required, sent as `client_id` |
 | `client_secret_secret_ref` | Required with `client_secret_basic` and `client_secret_post` (400 `client_secret_secret_ref is required for this client_authentication`), refused with `none` (400 `client_secret_secret_ref is not allowed with client_authentication none`); not used without a `client_authentication`. An update that omits it keeps the stored reference, so an update that switches a stored provider from a secret method to `none` must also send an empty string to clear it, as the dashboard does | Refused, so a misconfiguration cannot fall back to a client secret |
-| `jwt_audience` | Optional `aud`; the token endpoint when unset | The same |
+| `jwt_audience` | Optional `aud`; the token endpoint when unset. See [Assertion audience](#assertion-audience) | The same |
 | `jwt_key_id` | Optional `kid` header. It overrides the `private_key_id` of a JSON key file, which is the default `kid` | Optional `kid` header, such as the `kid` of the key in an Ory client's JWKS. The dashboard warns when neither it nor a certificate is set, since the server may then not find the key |
 
 Create and update resolve the referenced key and certificate after checking the caller may
@@ -346,6 +346,19 @@ also names its scopes in the `scope` form field, which servers such as Hydra gra
 without it Hydra issues an empty scope, and the gateway refuses a token whose scopes differ
 from those requested. A provider that sets no client authentication sends its scopes only in the assertion's
 `scope` claim, as before.
+
+#### Assertion audience
+
+A provider without `jwt_audience` addresses its assertion to its token endpoint. Google, Entra
+and Ory Hydra accept that. An authorization server that follows RFC 7523bis
+(`draft-ietf-oauth-rfc7523bis`) wants its issuer identifier as the only audience and refuses the
+token endpoint, usually with 400 `invalid_grant` or 401 `invalid_client`: set `jwt_audience` to
+the `issuer` of its RFC 8414 metadata (`/.well-known/oauth-authorization-server`). The
+dashboard's Audience help says the same. The default stays the token endpoint, so a provider that
+works today keeps its audience; the gateway does not know the issuer of a provider without an
+`issuer`, which only an external consent provider has. An external consent provider whose client
+uses `private_key_jwt` always addresses its assertion to its issuer and refuses `jwt_audience`
+(see [External consent providers](#external-consent-providers)).
 
 #### Ory Hydra
 
