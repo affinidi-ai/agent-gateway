@@ -1488,6 +1488,48 @@ async fn fabric_consent_flow() {
     assert_eq!(pending.1["result"]["resultType"], "input_required");
     assert!(calls.lock().await.is_empty());
     {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        use crate::delegation_vault::audit::DelegationAuditAction;
+        let (mut message, stream) = make_request(&body, &surface, &sender_did, &bearer);
+        message.message_body["path"] = json!("/%2e%2e/admin");
+        let (result, events) = crate::audit::producer::capture(Box::pin(
+            super::process_forward_request_with_mcp_runtime(&message, Some(stream), versions, Some(runtime.clone())),
+        ))
+        .await;
+        let refused = decode(result).await;
+        assert_eq!(refused.0, 400, "{:?}", refused.1);
+        assert_ne!(refused.1["result"]["resultType"], "input_required", "{:?}", refused.1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.event,
+                    DelegationAuditAction::RequestRejected {
+                        stage: RejectionStage::Forward,
+                        reason: RejectionReason::TargetPathRefused,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(
+                    event.event,
+                    DelegationAuditAction::ConsentRequired
+                        | DelegationAuditAction::ElicitationSent
+                        | DelegationAuditAction::TokenInjected
+                        | DelegationAuditAction::TokenNotFound
+                        | DelegationAuditAction::TokenRefreshed
+                )),
+            "{events:?}"
+        );
+        assert!(calls.lock().await.is_empty(), "the Target is not called");
+    }
+    {
         let send = |body: Value, token: Option<String>, runtime: Arc<ContinuationRuntime>| {
             let token = token.unwrap_or_else(|| bearer.clone());
             let (message, stream) = make_request(&body, &surface, &sender_did, &token);

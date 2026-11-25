@@ -397,19 +397,9 @@ impl ModernDelegationContext<'_> {
         {
             // Tool-scoped bindings never apply on a Transit Point: a partner
             // upstream names its own tools, and bindings carry no destination.
-            if let CredentialRequirement::Tools(tools) = &config.required_for
+            if matches!(config.required_for, CredentialRequirement::Tools(_))
                 && (matches!(self.route, ContinuationRoute::TransitPoint { .. })
-                    || request.method != "tools/call"
-                    || !request
-                        .params
-                        .as_ref()
-                        .and_then(|params| params.get("name"))
-                        .and_then(Value::as_str)
-                        .is_some_and(|name| {
-                            tools
-                                .iter()
-                                .any(|tool| tool == name)
-                        }))
+                    || !config.applies_to_tool(request.called_tool_name()))
             {
                 continue;
             }
@@ -1074,6 +1064,11 @@ impl PreparedDelegation {
         self.injections
             .extend(injections);
         Ok(())
+    }
+
+    /// Whether the request carries a delegated credential, in a header or `_meta`.
+    pub fn attaches_credentials(&self) -> bool {
+        !self.injections.is_empty()
     }
 
     /// Whether this call opens a stream and carries a consent that ends.

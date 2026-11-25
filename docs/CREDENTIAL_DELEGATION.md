@@ -1634,8 +1634,13 @@ rule on every leg that attaches one: the direct path, Fabric send (`2026-07-28` 
 receive (including a grant released to a partner's request), and Transit Points over HTTP and
 Fabric. A request that would carry one outside the Target base path gets the same
 `400 target_path_refused` as for the Target credential. On the direct path and Fabric receive that happens before any grant is
-read or token requested; on a Transit Point, after the credential is resolved and before
-anything is sent. It is recorded as a `request_rejected` record at `forward` with reason
+read, token requested or consent started, for legacy and `2026-07-28` requests alike: the
+request would carry one when a binding applies to it, that is a binding for every request, or a
+binding scoped to tools when the request is a `tools/call` of one of them. On Fabric send and a
+Transit Point it happens after the credential is resolved and before anything is sent, and
+only when a credential was attached, in a header or `_meta`. A request that carries no
+delegated credential, such as a `2026-07-28` `tools/list` against a binding scoped to tools, is
+not refused for its path. It is recorded as a `request_rejected` record at `forward` with reason
 `target_path_refused`, or as `target_auth_failed` when the leg also has a Target credential. A
 `2026-07-28` MCP proxy call is held by its REST client's own base-path check (400). A Target
 bound by external consent keeps its stricter admission check (400).

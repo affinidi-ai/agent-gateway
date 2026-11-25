@@ -592,6 +592,16 @@ impl AgentSurface {
             .is_some()
     }
 
+    /// Whether a binding an agent-keyed path serves applies to a request calling `tool`, so
+    /// the request would carry a delegated credential.
+    pub fn agent_keyed_binding_applies(
+        &self,
+        tool: Option<&str>,
+    ) -> bool {
+        self.agent_keyed_outbound_credentials()
+            .any(|binding| binding.applies_to_tool(tool))
+    }
+
     /// The Access Point Target's `consent_mode = external` binding, whose
     /// grant is kept by binding under the hop `target`.
     pub fn target_external_credentials(&self) -> Option<&crate::config::types::OutboundCredentialBinding> {
@@ -1491,6 +1501,26 @@ mod tests {
         assert_eq!(surface.source_credential_headers(), ["Authorization", "X-API-Key"]);
         assert!(!surface_with_methods(serde_json::json!([])).has_source_auth());
         assert!(surface.has_source_auth());
+    }
+
+    #[test]
+    fn only_an_agent_keyed_binding_that_applies_to_the_called_tool_carries_a_delegated_credential() {
+        let with_bindings = |bindings: serde_json::Value| {
+            let mut surface = surface(SurfaceProtocol::Mcp);
+            surface.outbound_credentials = serde_json::from_value(bindings).expect("bindings");
+            surface
+        };
+        let scoped = with_bindings(serde_json::json!([
+            {"credential_provider_id": "maps", "required_for": {"tools": ["read"]}}
+        ]));
+        assert!(scoped.agent_keyed_binding_applies(Some("read")));
+        assert!(!scoped.agent_keyed_binding_applies(Some("write")));
+        assert!(!scoped.agent_keyed_binding_applies(None));
+        let external = with_bindings(serde_json::json!([
+            {"credential_provider_id": "vendor", "consent_mode": "external"}
+        ]));
+        assert!(!external.agent_keyed_binding_applies(None));
+        assert!(!with_bindings(serde_json::json!([])).agent_keyed_binding_applies(Some("read")));
     }
 
     fn surface(protocol: SurfaceProtocol) -> AgentSurface {

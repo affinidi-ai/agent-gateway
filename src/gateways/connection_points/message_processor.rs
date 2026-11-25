@@ -3945,6 +3945,28 @@ pub(super) fn fabric_caller_did_and_source(
     }
 }
 
+/// The URL a Fabric request for `path` is forwarded to: `path` under the Target endpoint, or,
+/// for an agent card request on a surface with an agent card location, that location on the
+/// Target's origin.
+fn fabric_target_url(
+    surface: &crate::config::agent_surface::AgentSurface,
+    config_id: &str,
+    path: &str,
+    card_request: bool,
+) -> String {
+    if card_request
+        && surface
+            .agent_card_location_path()
+            .is_some()
+    {
+        let url = crate::proxy::handler::agent_card::card_target_url(surface);
+        channel_info!(config_id, "Agent card location override applied: {}", loggable::url(&url));
+        url
+    } else {
+        join_endpoint_path(surface.target_endpoint(), path)
+    }
+}
+
 /// Whether a delegated credential binding of the receiving surface's Target
 /// applies to a Fabric request calling `tool`, so the request needs a caller
 /// the surface verified to key it.
@@ -5695,6 +5717,29 @@ async fn process_charged_forward_request(
         evidence: None,
         received_at,
     };
+    let credentialed_card_fetch =
+        surface.target_auth().is_some() && crate::proxy::handler::is_fabric_card_fetch(&surface, method, path);
+    let target_url = fabric_target_url(&surface, config_id, path, is_agent_card_request || credentialed_card_fetch);
+    let forwards_to_target_url = !surface.dispatches_to_a2a_proxy()
+        && (!surface.target_endpoint().starts_with("proxy://") || modern_request.is_some());
+    let carries_delegated_credential = !is_agent_card_request
+        && surface.agent_keyed_binding_applies(crate::mcp::tool_analyzer::called_tool_name(&body_bytes).as_deref());
+    if forwards_to_target_url
+        && (surface.target_auth().is_some() || carries_delegated_credential)
+        && !crate::proxy::paths::is_target_credential_destination(
+            surface.target_endpoint(),
+            method,
+            &target_url,
+            surface.agent_card_location_path(),
+        )
+    {
+        channel_warn!(
+            config_id,
+            "Refusing a request outside the Target base path: it would carry a Target or delegated credential"
+        );
+        crate::proxy::handler::record_credential_destination_refusal(&audit_facts, None, surface.target_auth());
+        return target_auth_failure_result(crate::proxy::handler::TargetAuthFailure::PathRefused);
+    }
     let mut modern_delegation = None;
     if let Some(request) = modern_request.as_ref()
         && surface.has_agent_keyed_outbound_credentials()
@@ -5931,24 +5976,11 @@ async fn process_charged_forward_request(
     // request, as on the direct path: a bodiless GET of the card path that keeps
     // only content-negotiation headers from the peer, and carries no caller's
     // delegated credential, caller key or transit token.
-    let credentialed_card_fetch =
-        surface.target_auth().is_some() && crate::proxy::handler::is_fabric_card_fetch(&surface, method, path);
     if credentialed_card_fetch {
         body_bytes = Default::default();
         outbound_creds.clear();
         modern_delegation = None;
     }
-
-    // An agent card request at a configured card location goes to that path on the
-    // Target's origin, dropping any sub-path of the Target endpoint.
-    let target_url = if (is_agent_card_request || credentialed_card_fetch) && surface.agent_card_location_path().is_some() {
-        let url = crate::proxy::handler::agent_card::card_target_url(&surface);
-        channel_info!(config_id, "Agent card location override applied: {}", loggable::url(&url));
-        url
-    } else {
-        join_endpoint_path(surface.target_endpoint(), path)
-    };
-
     channel_info!(
         config_id,
         "🌐 Making HTTP request: {} {}{}",
@@ -6090,29 +6122,6 @@ async fn process_charged_forward_request(
         channel_info!(config_id, "  ↳ No headers to add");
     }
     req = req.header(reqwest::header::ACCEPT_ENCODING, "identity");
-
-    let carries_delegated_credential = modern_delegation.is_some()
-        || (!is_agent_card_request && {
-            let called_tool = crate::mcp::tool_analyzer::called_tool_name(&body_bytes);
-            outbound_creds
-                .iter()
-                .any(|binding| binding.applies_to_tool(called_tool.as_deref()))
-        });
-    if (surface.target_auth().is_some() || carries_delegated_credential)
-        && !crate::proxy::paths::is_target_credential_destination(
-            surface.target_endpoint(),
-            method,
-            &target_url,
-            surface.agent_card_location_path(),
-        )
-    {
-        channel_warn!(
-            config_id,
-            "Refusing a request outside the Target base path: it would carry a Target or delegated credential"
-        );
-        crate::proxy::handler::record_credential_destination_refusal(&audit_facts, None, surface.target_auth());
-        return target_auth_failure_result(crate::proxy::handler::TargetAuthFailure::PathRefused);
-    }
 
     // Inject target authentication credentials (if configured on the channel)
     let mut target_token = None;

@@ -623,6 +623,8 @@ pub struct OutboundPipelineContext {
     /// managed agent's headers and sent after the agent's headers are filtered, in
     /// place of any agent header of the same name.
     pub delegated_credential_headers: HeaderMap,
+    /// Whether a delegated credential was put into the request, as a header or in `_meta`.
+    pub carries_delegated_credential: bool,
     /// The only origin a request carrying a grant by binding may be sent to: its
     /// provider's `resource`. Set when such a grant is injected; the forward then
     /// goes through Strict pinned egress to that origin only, never over Fabric.
@@ -924,6 +926,7 @@ impl OutboundPipelineContext {
             original_method,
             original_headers,
             delegated_credential_headers: HeaderMap::new(),
+            carries_delegated_credential: false,
             grant_destination: None,
             released_grant: None,
             proxy_backend_status: None,
@@ -5485,12 +5488,11 @@ fn carries_transit_credential(ctx: &OutboundPipelineContext) -> bool {
     ctx.virtual_channel
         .target_auth
         .is_some()
-        || !ctx
-            .delegated_credential_headers
-            .is_empty()
+        || ctx.carries_delegated_credential
         || ctx
             .modern_delegation
-            .is_some()
+            .as_ref()
+            .is_some_and(|prepared| prepared.attaches_credentials())
 }
 
 /// Records and refuses with `400 target_path_refused` a Transit Point request whose path
@@ -5977,6 +5979,7 @@ fn apply_credential_injections(
                     .insert(header_name, header_value);
             }
         }
+        ctx.carries_delegated_credential = true;
     }
     Ok(())
 }
@@ -8580,6 +8583,7 @@ mod tests {
             original_method: Method::POST,
             original_headers: HeaderMap::new(),
             delegated_credential_headers: HeaderMap::new(),
+            carries_delegated_credential: false,
             grant_destination: None,
             released_grant: None,
             proxy_backend_status: None,
@@ -24236,10 +24240,14 @@ mod tests {
                 "secret_id": "target-key", "header_name": header, "header_format": "Key {value}"}}}))
             .unwrap()
         });
-        for (name, value) in delegated {
-            ctx.delegated_credential_headers
-                .insert(*name, HeaderValue::from_static(value));
-        }
+        let injections: Vec<_> = delegated
+            .iter()
+            .map(|(name, value)| crate::proxy::credential_delegation::ResolvedCredentialInjection::Header {
+                name: (*name).into(),
+                value: (*value).into(),
+            })
+            .collect();
+        apply_credential_injections(&mut ctx, &injections).unwrap();
         ctx
     }
 
@@ -24448,18 +24456,30 @@ mod tests {
         use crate::audit::request_events::{RejectionReason, RejectionStage};
         let directory = tempfile::tempdir().unwrap();
         let state = delegation_state(directory.path(), &[]).await;
+        let header = crate::proxy::credential_delegation::ResolvedCredentialInjection::Header {
+            name: "authorization".into(),
+            value: "Bearer person-token".into(),
+        };
+        let meta = crate::proxy::credential_delegation::ResolvedCredentialInjection::McpMeta {
+            field: "calendar".into(),
+            value: "person-token".into(),
+        };
         for endpoint in ["http://127.0.0.1:9/base", "fabric://peer-gateway/partner"] {
-            for (delegated, refused_for_the_path) in
-                [(&[("authorization", "Bearer person-token")][..], true), (&[][..], false)]
+            for (injections, refused_for_the_path) in
+                [(std::slice::from_ref(&header), true), (std::slice::from_ref(&meta), true), (&[][..], false)]
             {
                 let mut ctx = credential_header_case(
                     &state,
                     None,
-                    delegated,
+                    &[],
                     Method::POST,
                     "/outbound/surfaces/order/partner-a/%2e%2e/admin",
                 )
                 .await;
+                ctx.body_bytes = Some(Bytes::from_static(
+                    br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read"}}"#,
+                ));
+                apply_credential_injections(&mut ctx, injections).unwrap();
                 ctx.virtual_channel
                     .target_endpoint = endpoint.to_string();
                 let (result, events) = crate::audit::producer::capture(async {
@@ -24495,9 +24515,9 @@ mod tests {
                                 ..
                             })
                         ),
-                        "{endpoint}: {result:?}"
+                        "{endpoint} {injections:?}: {result:?}"
                     );
-                    assert_eq!(records, vec![(&RejectionStage::Forward, &Some(400))], "{endpoint}");
+                    assert_eq!(records, vec![(&RejectionStage::Forward, &Some(400))], "{endpoint} {injections:?}");
                 } else {
                     assert!(
                         !matches!(

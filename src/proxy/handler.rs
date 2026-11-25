@@ -6503,6 +6503,43 @@ async fn proxy_charged_request(
         return Ok(response);
     }
 
+    let called_tool = modern_request
+        .as_ref()
+        .map_or_else(
+            || {
+                mcp_context
+                    .as_ref()
+                    .and_then(crate::surface_context::McpContext::called_tool_name)
+            },
+            |request| request.called_tool_name(),
+        );
+    if (state
+        .surface
+        .target_auth()
+        .is_some()
+        || state
+            .surface
+            .agent_keyed_binding_applies(called_tool))
+        && !crate::proxy::paths::is_target_credential_destination(
+            &state.surface.target.endpoint,
+            method.as_str(),
+            &target_url,
+            state
+                .surface
+                .agent_card_location_path(),
+        )
+    {
+        warn!(
+            channel = channel_name,
+            "Refusing a request outside the Target base path: it would carry a Target or delegated credential"
+        );
+        record_credential_destination_refusal(&audit_facts, None, state.surface.target_auth());
+        connection_guard
+            .decrement()
+            .await;
+        return Ok(TargetAuthFailure::PathRefused.response());
+    }
+
     let mut modern_delegation = None;
     if let Some(request) = modern_request.as_ref()
         && state
@@ -6882,31 +6919,6 @@ async fn proxy_charged_request(
     let mcp_tool = mcp_context
         .as_ref()
         .and_then(crate::surface_context::McpContext::called_tool_name);
-    let carries_delegated_credential = modern_delegation.is_some()
-        || outbound_credentials
-            .iter()
-            .any(|binding| binding.applies_to_tool(mcp_tool));
-    if (state
-        .surface
-        .target_auth()
-        .is_some()
-        || carries_delegated_credential)
-        && !crate::proxy::paths::is_target_credential_destination(
-            &state.surface.target.endpoint,
-            method.as_str(),
-            &target_url,
-            state
-                .surface
-                .agent_card_location_path(),
-        )
-    {
-        warn!(
-            channel = channel_name,
-            "Refusing a request outside the Target base path: it would carry a Target or delegated credential"
-        );
-        record_credential_destination_refusal(&audit_facts, None, state.surface.target_auth());
-        return Ok(TargetAuthFailure::PathRefused.response());
-    }
 
     // Inject target authentication credentials (if configured)
     let mut target_token = None;
@@ -12735,7 +12747,9 @@ async fn handle_fabric_request_inner(
         .surface
         .target_auth()
         .is_some()
-        || modern_delegation.is_some())
+        || modern_delegation
+            .as_ref()
+            .is_some_and(|prepared| prepared.attaches_credentials()))
         && !crate::proxy::paths::appended_path_stays_below_base(uri.path())
     {
         warn!(
@@ -21111,6 +21125,100 @@ allow if {
             .unwrap();
     }
 
+    /// A `2026-07-28` request whose path climbs out of the Target base path is refused with
+    /// `400` before any grant is read or consent is started when a binding applies to it; a
+    /// request no binding applies to is not refused for its path.
+    async fn modern_requests_outside_the_target_base_path(
+        state: &crate::state::ProxyState,
+        runtime: &std::sync::Arc<crate::mcp::continuations::config::ContinuationRuntime>,
+        build_request: &impl Fn(&serde_json::Value) -> axum::http::Request<axum::body::Body>,
+        message: &serde_json::Value,
+    ) {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        use crate::delegation_vault::audit::DelegationAuditAction;
+        let send = |state: crate::state::ProxyState, mut request: axum::http::Request<axum::body::Body>| {
+            *request.uri_mut() = "https://gateway.example/mcp/%2e%2e/%2e%2e/admin"
+                .parse()
+                .unwrap();
+            let runtime = runtime.clone();
+            async move {
+                let (response, events) =
+                    crate::audit::producer::capture(Box::pin(super::proxy_handler_with_mcp_runtime(
+                        "127.0.0.1:12345"
+                            .parse()
+                            .unwrap(),
+                        state,
+                        request,
+                        crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                        Some(runtime),
+                    )))
+                    .await;
+                let response = response.unwrap_or_else(|response| response);
+                let status = response.status();
+                let body = String::from_utf8_lossy(
+                    &axum::body::to_bytes(response.into_body(), 16384)
+                        .await
+                        .unwrap(),
+                )
+                .into_owned();
+                let path_refusals = events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event.event,
+                            DelegationAuditAction::RequestRejected {
+                                stage: RejectionStage::Forward,
+                                reason: RejectionReason::TargetPathRefused,
+                                ..
+                            }
+                        )
+                    })
+                    .count();
+                let grant_work = events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event.event,
+                            DelegationAuditAction::ConsentRequired
+                                | DelegationAuditAction::ElicitationSent
+                                | DelegationAuditAction::TokenInjected
+                                | DelegationAuditAction::TokenNotFound
+                                | DelegationAuditAction::TokenRefreshed
+                        )
+                    })
+                    .count();
+                (status, body, path_refusals, grant_work)
+            }
+        };
+
+        let (status, body, path_refusals, grant_work) = send(state.clone(), build_request(message)).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains(super::TARGET_AUTH_FAILED), "{body}");
+        assert!(body.contains("target_path_refused"), "{body}");
+        assert!(!body.contains("input_required"), "{body}");
+        assert_eq!(path_refusals, 1, "{body}");
+        assert_eq!(grant_work, 0, "{body}");
+
+        let mut scoped = state.clone();
+        let surface = std::sync::Arc::make_mut(&mut scoped.surface);
+        surface.outbound_credentials[0].required_for =
+            crate::config::types::CredentialRequirement::Tools(vec!["read".into()]);
+        surface.target.payment_policy = None;
+        let listing = serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {
+            "_meta": message["params"]["_meta"].clone()
+        }});
+        let mut request = build_request(&listing);
+        request
+            .headers_mut()
+            .insert("mcp-method", axum::http::HeaderValue::from_static("tools/list"));
+        request
+            .headers_mut()
+            .remove("mcp-name");
+        let (status, body, path_refusals, _) = send(scoped, request).await;
+        assert_eq!(path_refusals, 0, "{status} {body}");
+        assert!(!body.contains(super::TARGET_AUTH_FAILED), "{status} {body}");
+    }
+
     async fn direct_modern_consent_flow() {
         use std::sync::Arc;
 
@@ -21312,6 +21420,7 @@ allow if {
         .unwrap();
         assert_eq!(status, axum::http::StatusCode::OK, "{response}");
         assert_eq!(response["result"]["resultType"], "input_required");
+        modern_requests_outside_the_target_base_path(&state, &runtime, &build_request, &message).await;
         // Two surfaces route to the same peer gateway. Only the opted-in one reaches the delegation
         // gate, which stops it without a runtime; the other skips consent, even with a runtime, and
         // goes on to Fabric dispatch (its free tool makes no payment call).
