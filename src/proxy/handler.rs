@@ -7841,7 +7841,14 @@ async fn proxy_charged_request(
             );
             tokio::time::timeout(deadline, execute)
                 .await
-                .map_err(|_| create_error_response(StatusCode::GATEWAY_TIMEOUT, "MCP proxy execution timed out"))?
+                .map_err(|_| {
+                    target_unreachable_response(
+                        &state.surface,
+                        StatusCode::GATEWAY_TIMEOUT,
+                        &body_bytes,
+                        "MCP proxy execution timed out",
+                    )
+                })?
                 .map_err(|error| (*error).into_response())
         };
         let response = if let Some(breaker) = circuit_breaker.clone() {
@@ -8083,7 +8090,12 @@ async fn proxy_charged_request(
         tokio::time::timeout(header_timeout, send_response)
             .await
             .map_err(|_| {
-                create_error_response(StatusCode::GATEWAY_TIMEOUT, "Modern MCP upstream response headers timed out")
+                target_unreachable_response(
+                    &state.surface,
+                    StatusCode::GATEWAY_TIMEOUT,
+                    &body_bytes,
+                    "Modern MCP upstream response headers timed out",
+                )
             })??
     } else if let Some(header_timeout) = a2a_stream_header_timeout {
         tokio::time::timeout(header_timeout, send_response)
@@ -10568,20 +10580,27 @@ fn handle_upstream_error(
     } else {
         StatusCode::BAD_GATEWAY
     };
-    if state
-        .surface
-        .access_point
-        .protocol
-        == crate::config::agent_surface::SurfaceProtocol::Mcp
-    {
-        return crate::mcp::errors::target_failure_response(
-            status_code,
-            request_body,
-            "target_unreachable",
-            "Target unavailable",
-        );
+    target_unreachable_response(&state.surface, status_code, request_body, error_message)
+}
+
+const TARGET_UNREACHABLE: &str = "target_unreachable";
+const TARGET_UNAVAILABLE: &str = "Target unavailable";
+
+/// The answer to a request whose Target, or the peer gateway of a `fabric://` route, could
+/// not be reached or gave no answer in time: on an MCP surface the JSON-RPC
+/// `target_unreachable` error that echoes the id of `request_body`, otherwise the problem
+/// JSON with `detail`.
+pub(crate) fn target_unreachable_response(
+    surface: &crate::config::agent_surface::AgentSurface,
+    status: StatusCode,
+    request_body: &[u8],
+    detail: &str,
+) -> Response {
+    if surface.access_point.protocol == crate::config::agent_surface::SurfaceProtocol::Mcp {
+        crate::mcp::errors::target_failure_response(status, request_body, TARGET_UNREACHABLE, TARGET_UNAVAILABLE)
+    } else {
+        create_error_response(status, detail)
     }
-    create_error_response(status_code, error_message)
 }
 
 /// Message returned to the caller when forwarding to the target fails. It names the
@@ -11009,7 +11028,7 @@ fn modern_fabric_failure_response(
         | crate::proxy::fabric_forward::FabricForwardError::ReplyNotReceived(_) => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::BAD_GATEWAY,
     };
-    create_error_response(status, "Modern Fabric transport is unavailable")
+    crate::mcp::errors::target_failure_response_with_id(status, id, TARGET_UNREACHABLE, TARGET_UNAVAILABLE)
 }
 
 /// Policy input for MCP tool gating on the fabric leg. The `tools/list`
@@ -11239,7 +11258,12 @@ async fn handle_fabric_request_inner(
         .await
         .ok_or_else(|| {
             channel_warn!(config_id, "No active listener found for gateway {}", gateway_id);
-            create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Gateway not connected")
+            target_unreachable_response(
+                &state.surface,
+                StatusCode::SERVICE_UNAVAILABLE,
+                &body_bytes,
+                "Gateway not connected",
+            )
         })?;
 
     // Get the remote gateway's DID
@@ -13129,8 +13153,10 @@ async fn handle_fabric_request_inner(
         channel_warn!(config_id, "Consider checking if a cached DID document exists but is expired");
         // The underlying pack/send error stays in the channel log above; the
         // client only gets a generic message so mediator/SDK internals don't leak.
-        create_error_response(
+        target_unreachable_response(
+            &state.surface,
             StatusCode::BAD_GATEWAY,
+            &body_bytes,
             &format!("Failed to send message to remote gateway '{}'. Gateway may be offline if DID resolution failed.", gateway_id)
         )
     })?;
@@ -14612,7 +14638,12 @@ async fn handle_fabric_request_inner(
                 connection_guard
                     .decrement()
                     .await;
-                Err(create_error_response(StatusCode::GATEWAY_TIMEOUT, "Gateway did not respond in time"))
+                Err(target_unreachable_response(
+                    &state.surface,
+                    StatusCode::GATEWAY_TIMEOUT,
+                    &body_bytes,
+                    "Gateway did not respond in time",
+                ))
             }
             Err(e) => {
                 channel_error!(config_id, "❌ Fabric forward failed: {}", e);
@@ -14672,7 +14703,12 @@ async fn handle_fabric_request_inner(
                 connection_guard
                     .decrement()
                     .await;
-                Err(create_error_response(StatusCode::BAD_GATEWAY, &format!("Fabric forwarding failed: {}", e)))
+                Err(target_unreachable_response(
+                    &state.surface,
+                    StatusCode::BAD_GATEWAY,
+                    &body_bytes,
+                    &format!("Fabric forwarding failed: {}", e),
+                ))
             }
         }
     };
@@ -21360,7 +21396,7 @@ allow if {
                 "{surface_id} runtime={with_runtime}: {status} {body}"
             );
             assert_eq!(
-                body.contains("Modern Fabric transport is unavailable"),
+                body.contains("target_unreachable"),
                 !opted_in,
                 "{surface_id} runtime={with_runtime}: {status} {body}"
             );
@@ -23017,7 +23053,32 @@ allow if {
                     .get(axum::http::header::RETRY_AFTER)
                     .is_none()
             );
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "call-1",
+                    "error": {"code": -32603, "message": "Target unavailable", "data": {"reason": "target_unreachable"}},
+                }),
+                "{status}"
+            );
         }
+
+        let notification = modern_fabric_failure_response(FabricForwardError::NoResponse("gw".into()), None, &facts);
+        assert_eq!(notification.status(), axum::http::StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            axum::body::to_bytes(notification.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a notification gets the status and no body"
+        );
     }
 
     // ── Log and span redaction ─────────────────────────────────────────────────

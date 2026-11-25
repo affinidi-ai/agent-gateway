@@ -75,19 +75,30 @@ pub fn target_failure_response(
     message: &str,
 ) -> Response {
     let id = match serde_json::from_slice::<JsonValue>(request_body) {
-        Ok(JsonValue::Object(message)) => match message.get("id") {
-            Some(id) => id.clone(),
-            None => return status.into_response(),
-        },
-        _ => JsonValue::Null,
+        Ok(JsonValue::Object(message)) => message.get("id").cloned(),
+        _ => Some(JsonValue::Null),
     };
-    create_mcp_error_response_with_status(
-        status,
-        Some(id),
-        error_codes::INTERNAL_ERROR,
-        message,
-        Some(json!({"reason": reason})),
-    )
+    target_failure_response_with_id(status, id, reason, message)
+}
+
+/// [`target_failure_response`] for a request whose `id` was already read: `None` for a
+/// notification, which gets `status` and no body.
+pub fn target_failure_response_with_id(
+    status: StatusCode,
+    id: Option<JsonValue>,
+    reason: &str,
+    message: &str,
+) -> Response {
+    match id {
+        Some(id) => create_mcp_error_response_with_status(
+            status,
+            Some(id),
+            error_codes::INTERNAL_ERROR,
+            message,
+            Some(json!({"reason": reason})),
+        ),
+        None => status.into_response(),
+    }
 }
 
 /// Standard JSON-RPC error codes

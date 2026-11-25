@@ -3769,6 +3769,18 @@ async fn caller_asks_mcp_surface_at_path_for_available_tools(
     send_json_request_to_path_and_record(world, &path, body, vec![]).await;
 }
 
+#[when(expr = "the caller asks the MCP surface at path {string} for available tools using protocol version {string}")]
+async fn caller_asks_mcp_surface_at_path_using_protocol_version(
+    world: &mut SurfaceWorld,
+    path: String,
+    protocol_version: String,
+) {
+    let protocol_version = McpVersion::from(protocol_version.as_str());
+    let body = build_modern_mcp_list_tools_body(serde_json::json!("modern-mcp-tools-list"), &protocol_version, true);
+    let headers = modern_mcp_request_headers(&protocol_version, "tools/list");
+    send_json_request_to_path_and_record(world, &path, body, headers).await;
+}
+
 #[when(
     expr = "the caller asks the MCP surface at path {string} for available tools with a valid alternate variant API key"
 )]
