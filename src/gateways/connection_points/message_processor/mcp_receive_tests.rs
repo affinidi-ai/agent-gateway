@@ -3,6 +3,9 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use super::fabric_transit_tests::{
+    PEER_TRACE_ID, RecordedTrace, SURFACE_ID, forward_request, forward_response, named_trace, receiver,
+};
 use super::{ProcessingResult, build_fabric_gating_input, process_forward_request};
 use crate::component_tests::helpers::MockServer;
 use crate::config::agent_surface::AgentSurface;
@@ -4551,6 +4554,124 @@ async fn unresolvable_mcp_proxy_credential_flow() {
             "detail": "Target authentication failed", "reason": "target_auth_misconfigured"}),
         "{response_body}"
     );
+}
+
+/// The trace one receive of an MCP `tools/call` at a `proxy://` surface carried on its
+/// records: its VP Audit Log records and its connection metrics. The peer's forward-request
+/// is `named` and then dispatched as the listener dispatches it. The surface's Target
+/// credential names a missing secret and falls back to passthrough, so the receive records
+/// that failure and still calls the MCP proxy.
+async fn mcp_proxy_receive_trace(named: impl FnOnce(ReceivedMessage) -> ReceivedMessage) -> RecordedTrace {
+    use std::sync::Arc;
+
+    use crate::mcp_proxies::filesystem::McpProxyStore;
+    use crate::proxy::handler::target_auth_tests::{BackendAnswer, echo_tool_call, mcp_proxy_answering};
+
+    let root = tempfile::tempdir().unwrap();
+    let (proxy, mut surface, _backend) =
+        mcp_proxy_answering(BackendAnswer::new(std::sync::Mutex::new((200, None)))).await;
+    surface.surface_id = SURFACE_ID.to_string();
+    surface.target.auth = Some(
+        serde_json::from_value(json!({
+            "method": {"static_secret": {"secret_id": "missing", "header_name": "x-target-key"}},
+            "fallback": "passthrough"
+        }))
+        .unwrap(),
+    );
+    let _receiver = receiver(root.path(), &surface).await;
+    let proxies = Arc::new(
+        crate::mcp_proxies::FileSystemMcpProxyStore::new(
+            root.path()
+                .join("proxies"),
+        )
+        .await
+        .unwrap(),
+    );
+    proxies
+        .create(&proxy)
+        .await
+        .unwrap();
+    super::init_mcp_proxy_store(proxies).await;
+    let metrics = Arc::new(crate::metrics::MetricsStore::new(100));
+    super::init_metrics_store(metrics.clone()).await;
+
+    let mut message = forward_request(root.path(), json!({"content-type": "application/json"}), echo_tool_call(false).1)
+        .with_context(
+            "secrets_storage_path",
+            json!(
+                root.path()
+                    .join("secrets")
+            ),
+        );
+    message.message_body["path"] = json!("/mcp");
+    let (_, events) = crate::audit::producer::capture(forward_response(&named(message))).await;
+    let connections = metrics
+        .get_recent_connections(100)
+        .await;
+    assert!(!connections.is_empty(), "the receive recorded no connection");
+    let mut trace = RecordedTrace::of(&events);
+    trace
+        .records
+        .extend(
+            connections
+                .iter()
+                .map(|connection| Some(connection.trace_id.clone())),
+        );
+    trace
+        .written
+        .push_str(&format!("\n{connections:?}"));
+    trace
+}
+
+/// The records of an MCP Proxy Target's Fabric receive carry the trace id the message names,
+/// never the trace of the span the sending gateway exports, which the message carries beside it.
+#[test]
+fn an_mcp_proxy_receive_records_the_trace_the_message_names_not_the_senders_exported_span() {
+    run_in_own_process(|| async {
+        mcp_proxy_receive_trace(|mut message| {
+            message.message_body["otel_context"] =
+                json!({"trace_id": "0af7651916cd43dd8448eb211c80319c", "span_id": "b7ad6b7169203331", "trace_flags": 1});
+            message
+        })
+        .await
+        .assert_carried(PEER_TRACE_ID, "an exported span named beside the trace id");
+    });
+}
+
+/// The records of an MCP Proxy Target's Fabric receive carry a trace id the message names in
+/// the hyphenated form in its written form.
+#[test]
+fn an_mcp_proxy_receive_records_a_hyphenated_trace_id_in_its_written_form() {
+    run_in_own_process(|| async {
+        let sent = "4bf92f35-77b3-4da6-a3ce-929d0e0e4736";
+        mcp_proxy_receive_trace(|message| named_trace(message, Some(sent)))
+            .await
+            .assert_carried(PEER_TRACE_ID, sent);
+    });
+}
+
+/// An MCP Proxy Target's Fabric receive of a message whose trace id is not valid starts its
+/// own trace: one new trace id in the written form on every record, and the text the peer
+/// sent on none.
+#[test]
+fn an_mcp_proxy_receive_starts_its_own_trace_for_a_trace_id_that_is_not_valid() {
+    run_in_own_process(|| async {
+        let sent = "trace-from-the-peer";
+        mcp_proxy_receive_trace(|message| named_trace(message, Some(sent)))
+            .await
+            .assert_fresh(Some(sent), sent);
+    });
+}
+
+/// An MCP Proxy Target's Fabric receive of a message that names no trace id starts its own
+/// trace, on every record.
+#[test]
+fn an_mcp_proxy_receive_starts_its_own_trace_when_the_peer_names_none() {
+    run_in_own_process(|| async {
+        mcp_proxy_receive_trace(|message| named_trace(message, None))
+            .await
+            .assert_fresh(None, "no trace id named");
+    });
 }
 
 /// Saves `surfaces` to a surface store under `root` and returns its storage path.
