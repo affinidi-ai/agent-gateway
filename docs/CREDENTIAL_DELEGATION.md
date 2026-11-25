@@ -48,6 +48,12 @@ already lacks one is refused every update until the update names it. On a token 
 is still http and not listed in `insecure_token_endpoints`, naming a missing client secret
 reference is refused as well (see [https token endpoints](#https-token-endpoints)).
 
+An `api_key` provider stores no `token_endpoint`, `client_id_secret_ref` or
+`client_secret_secret_ref`, since it reads only its API key and sends nothing to a token
+endpoint. A create or update of one drops any it is sent, after the endpoint's URL checks, and
+a retype to `api_key` drops the stored ones, so a retype back to an OAuth type must send them
+again.
+
 An update is refused with `400` when the provider's service token would read a secret (its API
 key, client ID and secret, signing key or certificate) that is the Response authentication
 `api_key.secret_id` of a surface, or of a variant as it resolves, that sends the provider to its
@@ -201,7 +207,10 @@ turning on a `client_authentication` that sends one or, on an `oauth2_client_cre
 hold, and cannot change its type to an OAuth type: a retype must meet the rule like a new
 provider. Setting `client_authentication` to `none`, clearing it, or switching between
 `client_secret_basic` and `client_secret_post` is still saved. Listing the endpoint in
-`insecure_token_endpoints` allows the change on purpose.
+`insecure_token_endpoints` allows the change on purpose. A retype to `api_key` keeps no token
+endpoint or client ([Credential providers](#credential-providers)), and a legacy binding's
+request that read the provider before the retype still refreshes through the provider it
+checked ([Delegation vault](#delegation-vault)).
 
 A provider sends a client secret when it holds a `client_secret_secret_ref` and its type sends
 it: an `oauth2_client_credentials` or `oauth2_authorization_code` provider always does, an

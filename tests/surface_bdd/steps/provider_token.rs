@@ -358,6 +358,27 @@ async fn operator_changes_provider_type(
     change_stored_provider(world, json!({ "provider_type": provider_type }), None).await;
 }
 
+#[when(expr = "the operator changes the credential provider to an API key provider using the secret {string}")]
+async fn operator_changes_provider_to_api_key(
+    world: &mut SurfaceWorld,
+    secret_id: String,
+) {
+    change_stored_provider(world, json!({ "provider_type": "api_key", "api_key_secret_ref": secret_id }), None).await;
+}
+
+#[then("the stored credential provider has no token endpoint and no client references")]
+async fn stored_provider_has_no_token_endpoint_or_client(world: &mut SurfaceWorld) {
+    let stored = stored_target_auth_provider(world).await;
+    for field in ["token_endpoint", "client_id_secret_ref", "client_secret_secret_ref"] {
+        assert!(
+            stored
+                .get(field)
+                .is_none_or(Value::is_null),
+            "{field} of the stored provider: {stored}"
+        );
+    }
+}
+
 #[then("the stored credential provider is still a JWT Bearer provider")]
 async fn stored_provider_is_still_a_jwt_bearer_provider(world: &mut SurfaceWorld) {
     let stored = stored_target_auth_provider(world).await;

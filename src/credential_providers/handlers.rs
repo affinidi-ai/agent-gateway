@@ -682,6 +682,17 @@ fn client_id_reference(
     }
 }
 
+/// An `api_key` provider reads only its API key and sends nothing to a token endpoint, so it
+/// stores no token endpoint and no client ID or secret reference: a create or update drops
+/// them, the stored ones of a provider retyped to `api_key` included.
+fn clear_unused_token_client(provider: &mut CredentialProvider) {
+    if provider.provider_type == CredentialProviderType::ApiKey {
+        provider.token_endpoint = None;
+        provider.client_id_secret_ref = None;
+        provider.client_secret_secret_ref = None;
+    }
+}
+
 /// Validate a set of named URL fields against the SSRF blocklist.
 /// Returns an error response on the first invalid URL, or `None` if all pass.
 fn validate_url_fields(fields: &[(&str, Option<&str>)]) -> Option<Response> {
@@ -980,6 +991,7 @@ pub async fn create_provider(
     ]) {
         return resp;
     }
+    clear_unused_token_client(&mut provider);
 
     if let Err(error) =
         validate_provider_settings(&state, &provider, None, &TokenEgress::from_environment(), &context, &scope).await
@@ -1241,7 +1253,7 @@ pub async fn update_provider(
     let provider_type = req
         .provider_type
         .unwrap_or_else(|| existing.provider_type.clone());
-    let updated = CredentialProvider {
+    let mut updated = CredentialProvider {
         id: existing.id,
         tenant_id: existing.tenant_id,
         name: req
@@ -1317,6 +1329,7 @@ pub async fn update_provider(
         created_at: existing.created_at,
         updated_at: Utc::now(),
     };
+    clear_unused_token_client(&mut updated);
 
     if let Some(response) = missing_type_fields(&updated) {
         return response;
@@ -2692,6 +2705,121 @@ mod jwt_provider_tests {
             .unwrap()
             .unwrap();
         assert!(!stored.is_deactivated());
+    }
+
+    fn assert_no_token_client(
+        stored: &CredentialProvider,
+        body: &Value,
+    ) {
+        assert_eq!(stored.provider_type, CredentialProviderType::ApiKey);
+        assert_eq!(
+            stored
+                .api_key_secret_ref
+                .as_deref(),
+            Some("API_KEY")
+        );
+        assert_eq!(
+            (&stored.token_endpoint, &stored.client_id_secret_ref, &stored.client_secret_secret_ref),
+            (&None, &None, &None),
+            "an api_key provider stores no token endpoint and no client"
+        );
+        for field in ["token_endpoint", "client_id_secret_ref", "client_secret_secret_ref"] {
+            assert!(
+                body.get(field)
+                    .is_none_or(Value::is_null),
+                "{field}: {body}"
+            );
+        }
+    }
+
+    /// A provider retyped to `api_key` keeps no token endpoint and no client ID or secret
+    /// reference, the stored ones or an http endpoint the update sends, so no later read of
+    /// it finds a client to send to a token endpoint. A retype to a type that sends them
+    /// keeps them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_retyped_to_api_key_keeps_no_token_endpoint_or_client_references() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        add_secret(&state, "API_KEY", "key-value").await;
+        let (status, body) = create(&state, authorization_code("to-api-key")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (status, retyped) = update(
+            &state,
+            &id,
+            json!({"provider_type": "api_key", "api_key_secret_ref": "API_KEY", "token_endpoint": "http://192.0.2.1/token"}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{retyped}");
+        let stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_no_token_client(&stored, &retyped);
+
+        let (status, body) = create(&state, authorization_code("to-client-credentials")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, retyped) = update(&state, &id, json!({"provider_type": "oauth2_client_credentials"})).await;
+        assert_eq!(status, StatusCode::OK, "{retyped}");
+        let stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                stored
+                    .token_endpoint
+                    .as_deref(),
+                stored
+                    .client_id_secret_ref
+                    .as_deref(),
+                stored
+                    .client_secret_secret_ref
+                    .as_deref()
+            ),
+            (Some("https://github.com/login/oauth/access_token"), Some("CLIENT_ID"), Some("CLIENT_SECRET")),
+            "a client credentials provider sends its client to its token endpoint"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_api_key_provider_is_created_without_a_token_endpoint_or_client_references() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        add_secret(&state, "API_KEY", "key-value").await;
+        let requested = with(
+            api_key_provider("key-with-client", "API_KEY"),
+            json!({"token_endpoint": "http://192.0.2.1/token",
+                   "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"}),
+        );
+
+        let (status, created) = create(&state, requested).await;
+
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let stored = state
+            .store
+            .get(
+                created["id"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_no_token_client(&stored, &created);
     }
 
     /// A provider store whose provider someone deactivates right after it is
