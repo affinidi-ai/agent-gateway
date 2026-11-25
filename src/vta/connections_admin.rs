@@ -1830,7 +1830,12 @@ pub async fn vta_status(
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    let custody_claim = crate::vta::inventory::custody_claim(through_trust_agent, &surface_list, &issuer_list);
+    let custody_claim = crate::vta::inventory::custody_claim(
+        through_trust_agent,
+        &surface_list,
+        &issuer_list,
+        crate::vta::key_directory::local_key_in_use(),
+    );
     let default_resolution =
         crate::vta::onboarding_default::effective(&state.default_resolution, dashboard_default.as_ref());
     (
@@ -2317,6 +2322,7 @@ fn inventory_for_caller(
         crate::vta::inventory::signs_through_trust_agent(config, default_signing),
         surfaces,
         &issuers,
+        crate::vta::key_directory::local_key_in_use(),
     );
     issuers.retain(|issuer| {
         can_access(issuer.tenant_id.as_deref(), context)

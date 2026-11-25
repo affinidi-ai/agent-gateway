@@ -231,16 +231,20 @@ pub fn chooses_gateway_key(
 
 /// Whether the gateway may claim that a separately operated trust agent holds
 /// its signing keys: it signs through one, no surface chooses the gateway's
-/// own key, and no token that key signed may still be outstanding.
+/// own key, and no token that key signed may still be outstanding
+/// (`local_key_in_use`, see [`crate::vta::key_directory::local_key_in_use`]).
 pub fn custody_claim(
     through_trust_agent: bool,
     surfaces: &[AgentSurface],
     issuers: &[crate::issuers::types::Issuer],
+    local_key_in_use: bool,
 ) -> bool {
-    through_trust_agent && !chooses_gateway_key(surfaces, issuers) && !crate::vta::key_directory::local_key_in_use()
+    through_trust_agent && !chooses_gateway_key(surfaces, issuers) && !local_key_in_use
 }
 
-/// Build the inventory from the live records.
+/// Build the inventory from the live records. Its `custody_claim` reads the
+/// signing choices only; a caller that knows the gateway's own key is in use
+/// sets it from [`custody_claim`].
 ///
 /// `default_signing` is the gateway-wide default from Settings. `known_contexts`
 /// are the context names the provisioner has created or adopted; anything in
@@ -307,7 +311,7 @@ pub fn build(
     let through_trust_agent = signs_through_trust_agent(config, default_signing);
     KeyInventory {
         tier: tier(through_trust_agent).to_string(),
-        custody_claim: custody_claim(through_trust_agent, surfaces, issuers),
+        custody_claim: custody_claim(through_trust_agent, surfaces, issuers, false),
         context_did_method: config
             .context_did_method
             .as_str()
@@ -644,6 +648,10 @@ mod tests {
         assert!(!own.custody_claim);
         assert!(!via_issuer.custody_claim);
         assert!(through_the_agent.custody_claim);
+        assert!(
+            !custody_claim(true, &[], &[], true),
+            "nor while a token the gateway's own key signed may be outstanding"
+        );
     }
 
     /// A variant signs with its surface's choice, so when the surface follows
