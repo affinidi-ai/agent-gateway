@@ -1,0 +1,23 @@
+# Failures of the suite's own test agent with no gateway in front of it
+# (target "direct"). They are the agent's, not the gateway's: a gateway target
+# that fails the same test is not scored for it. The run fails on a failure
+# not listed here and on a listed test that no longer fails.
+#
+# minimum_passed is how many tests pass today. Fewer means tests stopped running
+# or started being skipped, which a list of failures alone would not show.
+minimum_passed = 87
+
+[[expected]]
+test = "agent_card.test_agent_card_caching.TestAgentCardCacheControl::test_cache_control_present"
+outcome = "fail"
+reason = "CARD-CACHE-001: the test agent (a2a-sdk 1.3.1) sends no Cache-Control header with its agent card."
+
+[[expected]]
+test = "agent_card.test_agent_card_caching.TestAgentCardCacheControl::test_cache_control_has_max_age"
+outcome = "fail"
+reason = "CARD-CACHE-001: the test agent (a2a-sdk 1.3.1) sends no Cache-Control header with its agent card, so there is no max-age."
+
+[[expected]]
+test = "core_operations.test_requirements::test_must_requirement[CORE-SEND-003-jsonrpc]"
+outcome = "fail"
+reason = "CORE-SEND-003: the test agent accepts a part with an unsupported media type instead of answering ContentTypeNotSupportedError."

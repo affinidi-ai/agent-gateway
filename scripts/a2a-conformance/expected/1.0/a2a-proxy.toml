@@ -1,0 +1,75 @@
+# Failures of the gateway-owned A2A proxy when the suite treats it as an agent
+# (target "a2a-proxy"). The A2A proxy is an agent in its own right, so it is
+# scored on its own failures, not against the direct run. The run fails on a
+# failure not listed here and on a listed test that no longer fails.
+#
+# Its backend is the Direct Line stand-in (directline.py), which only echoes
+# text. The suite steers its own test agent through messageId prefixes the
+# stand-in never sees, so the checks that need a task, an artifact or a stream
+# are skipped or fail for that reason alone; the entries say which.
+#
+# minimum_passed is how many tests pass today. Fewer means tests stopped running
+# or started being skipped, which a list of failures alone would not show.
+minimum_passed = 38
+
+[[expected]]
+tests = [
+    "agent_card.test_agent_card_caching.TestAgentCardCacheControl::test_cache_control_has_max_age",
+    "agent_card.test_agent_card_caching.TestAgentCardCacheControl::test_cache_control_present",
+    "agent_card.test_agent_card_caching.TestAgentCardETag::test_etag_present",
+]
+outcome = "fail"
+reason = "The Access Point sends neither Cache-Control nor ETag with any agent card it serves, generated or rewritten (CARD-CACHE-001, CARD-CACHE-002)."
+
+[[expected]]
+tests = [
+    "core_operations.test_artifacts.TestDataArtifact::test_task_has_data_artifact[jsonrpc]",
+    "core_operations.test_artifacts.TestFileArtifact::test_task_has_file_artifact[jsonrpc]",
+    "core_operations.test_artifacts.TestFileUrlArtifact::test_task_has_file_url_artifact[jsonrpc]",
+    "core_operations.test_artifacts.TestMessageResponse::test_returns_message_with_text_part[jsonrpc]",
+    "core_operations.test_artifacts.TestTextArtifact::test_task_has_text_artifact[jsonrpc]",
+]
+outcome = "fail"
+reason = "Not a finding: the Direct Line stand-in answers every text with one text reply, so the A2A proxy returns a message and never a task with artifacts or the fixed text these checks read."
+
+[[expected]]
+tests = [
+    "core_operations.test_requirements::test_must_requirement[CORE-SEND-003-jsonrpc]",
+]
+outcome = "fail"
+reason = "The A2A proxy answers a non-text part with InvalidParams (-32602); A2A 1.0 names ContentTypeNotSupportedError (-32005) for it (CORE-SEND-003)."
+
+[[expected]]
+tests = [
+    "core_operations.test_requirements::test_must_requirement[CORE-MULTI-001a-jsonrpc]",
+]
+outcome = "fail"
+reason = "The A2A proxy reply carries no contextId when the caller sent none; A2A 1.0 has the agent generate one and return it (CORE-MULTI-001a)."
+
+[[expected]]
+tests = [
+    "core_operations.test_requirements::test_must_requirement[CORE-MULTI-004-jsonrpc]",
+]
+outcome = "fail"
+reason = "The A2A proxy ignores taskId, so a message naming a task that does not exist is answered instead of refused with TaskNotFoundError (CORE-MULTI-004)."
+
+[[expected]]
+tests = [
+    "core_operations.test_error_handling.TestCapabilityExtendedCard::test_extended_card_not_supported_jsonrpc",
+    "core_operations.test_error_handling.TestCapabilityPushNotifications::test_push_not_supported_jsonrpc",
+    "core_operations.test_error_handling.TestCapabilityStreaming::test_streaming_not_supported_jsonrpc",
+    "core_operations.test_error_handling.TestJsonRpcErrorStructure::test_a2a_error_type_mappings",
+    "core_operations.test_requirements::test_must_requirement[CORE-CANCEL-003-jsonrpc]",
+    "core_operations.test_requirements::test_must_requirement[CORE-GET-002-jsonrpc]",
+    "core_operations.test_requirements::test_must_requirement[CORE-LIST-001-jsonrpc]",
+    "core_operations.test_requirements::test_must_requirement[CORE-LIST-002-jsonrpc]",
+    "core_operations.test_requirements::test_must_requirement[CORE-LIST-003-jsonrpc]",
+    "core_operations.test_requirements::test_must_requirement[CORE-LIST-004-jsonrpc]",
+    "core_operations.test_requirements::test_must_requirement[CORE-LIST-005-jsonrpc]",
+    "jsonrpc.test_error_codes.TestJsonRpcErrorCodeMappings::test_push_notification_not_supported_error",
+    "jsonrpc.test_error_codes.TestJsonRpcErrorCodeMappings::test_task_not_cancelable_error",
+    "jsonrpc.test_error_codes.TestJsonRpcErrorCodeMappings::test_task_not_found_error",
+    "jsonrpc.test_error_codes.TestJsonRpcErrorCodeMappings::test_unsupported_operation_error",
+]
+outcome = "fail"
+reason = "The A2A proxy serves SendMessage only and answers every other A2A method with MethodNotFound (-32601). A2A 1.0 expects the error of the operation: TaskNotFoundError (-32001) for an unknown task, PushNotificationNotSupportedError (-32003) for push configuration, UnsupportedOperationError (-32004) for streaming and the extended card; ListTasks has no error to fall back on."

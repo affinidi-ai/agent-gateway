@@ -28,6 +28,7 @@ SHELL := /bin/bash
         ui-test ui-test-headed ui-test-report \
 		itest-a2a itest-a2a-setup itest-a2a-run itest-a2a-teardown itest-a2a-clean itest-a2a-shopping \
 		gw-e2e mcp-conformance mcp-conformance-legacy mcp-discovery \
+		a2a-conformance a2a-conformance-legacy \
 		mediator mediator-start mediator-up mediator-stop mediator-down
 
 # Default target
@@ -922,6 +923,16 @@ mcp-conformance: ## Run the MCP 2026-07-28 conformance harness (ARGS="--unit-tes
 
 mcp-conformance-legacy: ## Run only the MCP legacy (2024-11-05) compatibility checks
 	@./scripts/mcp-conformance/run.sh --only legacy $(ARGS)
+
+# Needs Python >= 3.15 (3.13 or 3.14 for the legacy run), git and openssl; the
+# first run fetches the pinned suite and its packages. ARGS passes options
+# through, e.g. ARGS="--only transit" or ARGS="--report". See
+# scripts/a2a-conformance/README.md.
+a2a-conformance: ## Run the A2A 1.0 conformance harness (ARGS="--report" etc.)
+	@./scripts/a2a-conformance/run.sh $(ARGS)
+
+a2a-conformance-legacy: ## Run the A2A 0.3 conformance harness
+	@./scripts/a2a-conformance/run.sh --a2a-version 0.3 $(ARGS)
 
 # Needs Docker, Node >= 22 and mkcert with its CA installed (mkcert -install).
 # ARGS="--keep" leaves it running for MCP Inspector. See scripts/mcp-discovery/README.md.

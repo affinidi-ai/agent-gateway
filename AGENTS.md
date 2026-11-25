@@ -71,6 +71,7 @@ changes:
   - Fixtures store an Access Point as the admin API creates it: closed when it authenticates callers, public when it does not. Test a caller whose credential fails on that protected flow (refused with `401`, the Target never called). Only a scenario about what a public Access Point still guarantees (the failed caller reaches policy, gets no Target credential and no caller identity, and a policy can deny it) says `the surface is stored with a public Access Point`, and only one about a legacy surface says `the surface is stored as a legacy surface`.
 - **Legacy component**: `src/component_tests/` is frozen. No new files, test functions or helpers; existing tests may be fixed or deleted. The `freeze` tests in `src/component_tests/mod.rs` pin each file's test count in `FROZEN_FILES` and fail on a new file or a count that moves without its pin. Pins only go down; a raise needs a reason stated in the pull request, usually matching main's count after a `FROZEN_FILES` merge conflict or when main itself fails the guard (see [`docs/development/TESTING.md`](docs/development/TESTING.md#legacy-component-tests)). New helpers are a review rule; the tests do not catch them.
 - **MCP conformance**: `make mcp-conformance` (`scripts/mcp-conformance/`) runs the published MCP suite and the legacy compatibility checks against the ordinary gateway binary; `ARGS=--unit-tests` adds the full binary test suite.
+- **A2A conformance**: `make a2a-conformance` (`scripts/a2a-conformance/`) runs the A2A TCK against its own test agent directly and through an Access Point, a Transit Point and an A2A proxy, and fails on a difference its baselines do not list; `make a2a-conformance-legacy` runs the A2A `0.3` suite.
 
 ## Frontend conventions
 
@@ -647,7 +648,7 @@ Do not summarise these here. Update the owning document in the same change as th
 | ------------------------------------------------------------------------------ | -------------------------------------------------------------------- |
 | Request path, module map, invariants                                           | [`ARCHITECTURE.md`](ARCHITECTURE.md)                                 |
 | Policy planes, egress and SSRF, policy audit logging                           | [`docs/POLICY.md`](docs/POLICY.md)                                   |
-| Protocol revisions, A2A version negotiation, validation boundaries, AP2 gating | [`docs/PROTOCOLS.md`](docs/PROTOCOLS.md)                             |
+| Protocol revisions, A2A version negotiation, validation boundaries, AP2 gating, A2A conformance | [`docs/PROTOCOLS.md`](docs/PROTOCOLS.md)            |
 | MCP metadata contract and the tool-gating firewall                             | [`docs/MCP_TOOL_GATING.md`](docs/MCP_TOOL_GATING.md)                 |
 | MCP 2026-07-28, modern admission, `mcp_http`, Resource Server, conformance     | [`docs/MCP_METADATA.md`](docs/MCP_METADATA.md)                       |
 | Fabric, peer issuer DIDs, envelope replay                                      | [`docs/FABRIC.md`](docs/FABRIC.md)                                   |
@@ -700,6 +701,7 @@ directly.
 | Format Rust and frontend                                | `make fmt`                                         |
 | Local CI preflight                                      | `make ci`                                          |
 | MCP conformance                                         | `make mcp-conformance`                             |
+| A2A conformance                                         | `make a2a-conformance`                             |
 
 ## Before ready for review
 
@@ -708,4 +710,5 @@ directly.
 3. `cargo test --no-fail-fast --all-targets --all-features`
 4. If `www/default/` files changed: `cd www/default && npx prettier --write src && npm run lint`
 5. If MCP admission, forwarding or owned dispatch changed: `make mcp-conformance`
-6. If `tests/features/` or a step binding changed: `python3 scripts/bdd-gherkin.py --lint`
+6. If A2A forwarding, validation, agent cards or the A2A proxy changed: `make a2a-conformance` and `make a2a-conformance-legacy`
+7. If `tests/features/` or a step binding changed: `python3 scripts/bdd-gherkin.py --lint`

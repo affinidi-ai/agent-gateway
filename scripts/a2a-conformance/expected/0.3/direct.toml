@@ -1,0 +1,24 @@
+# Failures of the suite's bundled test agent with no gateway in front of it
+# (target "direct", A2A 0.3 suite). The run fails on an entry that is missing here, on a
+# listed test with another outcome, and on a listed test that no longer applies.
+#
+# minimum_passed is how many tests pass today. Fewer means tests stopped running
+# or started being skipped, which a list of failures alone would not show.
+minimum_passed = 52
+
+[[expected]]
+tests = [
+    "tests.mandatory.protocol.test_message_send_method::test_message_send_continue_task",
+    "tests.mandatory.protocol.test_state_transitions::test_task_history_length",
+    "tests.mandatory.protocol.test_tasks_cancel_method::test_tasks_cancel_valid",
+    "tests.optional.capabilities.test_message_send_capabilities::test_message_send_continue_with_contextid",
+]
+outcome = "fail"
+reason = "The bundled agent finishes every task at once, and the a2a-sdk refuses a further message or a cancel for a finished task; the test needs a task that is still running."
+
+[[expected]]
+tests = [
+    "tests.mandatory.protocol.test_a2a_v030_new_methods.TestMethodMappingCompliance::test_core_method_mapping_compliance",
+]
+outcome = "fail"
+reason = "The suite's method-mapping check fails on the bundled agent's replies with a KeyError for 'id'."

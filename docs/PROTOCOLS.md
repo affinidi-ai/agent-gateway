@@ -841,6 +841,51 @@ Relevant implementation:
   `result`, `kind: "message"`, `role: "agent"`, `kind: "text"` parts), whatever `A2A-Version` the
   caller sent.
 
+### A2A conformance harness
+
+A2A behaviour is measured with the A2A project's own conformance suite, the
+[A2A TCK](https://github.com/a2aproject/a2a-tck), rather than a hand-written checklist.
+`scripts/a2a-conformance/` runs it end to end: `make a2a-conformance` runs the A2A `1.0` suite
+and `make a2a-conformance-legacy` the `0.3` suite, both on the JSON-RPC binding.
+[Its README](../scripts/a2a-conformance/README.md) covers options, pins, outputs and baseline
+maintenance.
+
+The suite's own test agent is measured twice with the same suite: directly, and through the
+gateway. A forwarding target is scored on the tests whose outcome differs from the direct run, so
+a failure of the test agent itself never counts against the gateway. The A2A proxy is an agent in
+its own right and is scored on its own failures.
+
+| Target | Endpoint | Scored |
+| --- | --- | --- |
+| `direct` | The suite's test agent, without the gateway | On its own failures |
+| `access-point` | A2A Access Point forwarding to the test agent, `validation: envelope` | Against `direct` |
+| `access-point-full` | The same with `validation: full` | Against `direct` |
+| `transit` | A2A Transit Point on the outbound listener, same agent | Against `direct` |
+| `a2a-proxy` | A2A Access Point whose Target is an A2A proxy over a Direct Line stand-in | On its own failures |
+
+Each entry in `scripts/a2a-conformance/expected/<version>/` names a test, its outcome and the
+cause. A run fails on a difference that is not listed and on a listed entry that no longer
+applies, and an agent's baseline also sets how many tests must pass. The baselines record these
+differences:
+
+| Target | Suite | Difference | Cause |
+| --- | --- | --- | --- |
+| `access-point`, `access-point-full` | `1.0` | The agent card has no `ETag` | The Access Point builds the card response itself from the rewritten JSON and copies no header of the agent's response; it sets `Content-Type` and `Vary` only |
+| `access-point`, `access-point-full`, `transit` | `1.0` | The card lists `HTTP+JSON` and `GRPC` interfaces that do not answer | The rewrite keeps each entry's `protocolBinding` and points it at the JSON-RPC endpoint (see [Current limitations](#current-limitations)) |
+| `access-point`, `access-point-full`, `a2a-proxy` | `0.3` | A JSON-RPC request the gateway refuses itself is answered with HTTP `400` | See [Error mapping](#error-mapping); the `0.3` suite requires HTTP `200` for a JSON-RPC error, and the agent answers the same request with `200`. The envelope and request-shape checks run on the Access Point only, so the `transit` target forwards such a request and shows no difference |
+| `transit` | both | A URL ending in `/` is answered `404` | A Transit Point serves its path and any path below it, but a bare trailing slash matches neither route. The Access Point matches on the channel prefix and picks the surface afterwards, so it accepts both spellings |
+| `transit` | both | Subscribing to a running task delivers nothing in time | A Transit Point buffers an event stream until the agent closes it (see [Current limitations](#current-limitations)) |
+| `a2a-proxy` | both | Methods other than the send method answer `-32601` | The A2A proxy serves the send method only; the suites expect the error of the operation, such as `TaskNotFoundError` (`-32001`) |
+| `a2a-proxy` | `1.0` | The reply has no `contextId` when the caller sent none; a `taskId` that does not exist is ignored; a non-text part answers `-32602` | The A2A proxy echoes the `contextId` of the caller's message, keeps no tasks, and supports text parts only |
+| `a2a-proxy` | `1.0` | The generated agent card has no `Cache-Control` and no `ETag` | The Access Point sends neither with any card it serves, generated or rewritten |
+
+The A2A proxy's backend in the harness only echoes text, so the checks that need a task, an
+artifact or a stream cannot pass there; its baseline marks those entries as not being findings.
+
+Not covered: the gRPC and HTTP+JSON bindings, which the gateway does not serve; a `fabric://`
+Target; push notification delivery, which the test agents do not declare; and callers the
+gateway authenticates, since the suite sends no credentials.
+
 ## Target Credential Scope
 
 A Target credential (`target.auth`, or a Transit Point's `target_auth`) is sent only to URLs

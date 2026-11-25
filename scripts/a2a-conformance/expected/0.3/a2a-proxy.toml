@@ -1,0 +1,63 @@
+# Failures of the gateway-owned A2A proxy when the suite treats it as an agent. It is scored on
+# its own failures, not against the direct run. Its backend is the Direct Line stand-in
+# (directline.py), which only echoes text
+# (target "a2a-proxy", A2A 0.3 suite). The run fails on an entry that is missing here, on a
+# listed test with another outcome, and on a listed test that no longer applies.
+#
+# minimum_passed is how many tests pass today. Fewer means tests stopped running
+# or started being skipped, which a list of failures alone would not show.
+minimum_passed = 36
+
+[[expected]]
+tests = [
+    "tests.mandatory.jsonrpc.test_json_rpc_compliance::test_rejects_invalid_json_rpc_requests[invalid_request0--32600]",
+    "tests.mandatory.jsonrpc.test_json_rpc_compliance::test_rejects_invalid_json_rpc_requests[invalid_request1--32600]",
+    "tests.mandatory.jsonrpc.test_protocol_violations::test_invalid_jsonrpc_version",
+    "tests.mandatory.jsonrpc.test_protocol_violations::test_missing_method_field",
+]
+outcome = "fail"
+reason = "The gateway answers a JSON-RPC request it refuses itself with HTTP 400 and the JSON-RPC error in the body (docs/PROTOCOLS.md, Error mapping); this suite requires HTTP 200 for a JSON-RPC error. The suite fails on the HTTP 400: an assertion on the status, a raised HTTPError, or a -32603 from its transport client."
+
+[[expected]]
+tests = [
+    "tests.mandatory.protocol.test_tasks_cancel_method::test_tasks_cancel_nonexistent",
+    "tests.mandatory.protocol.test_tasks_get_method::test_tasks_get_nonexistent",
+    "tests.optional.capabilities.test_a2a_v030_method_enhancements.TestA2AV030MethodEnhancements::test_error_response_enhancements",
+]
+outcome = "fail"
+reason = "The A2A proxy serves message/send only and answers every other A2A method with MethodNotFound (-32601); the suite expects TaskNotFoundError (-32001) for a task that does not exist."
+
+[[expected]]
+tests = [
+    "tests.optional.capabilities.test_a2a_v030_method_enhancements.TestA2AV030MethodEnhancements::test_message_send_enhanced_parts_support",
+]
+outcome = "fail"
+reason = "The A2A proxy refuses a non-text part with InvalidParams (-32602): it supports text parts only."
+
+[[expected]]
+tests = [
+    "tests.mandatory.jsonrpc.test_json_rpc_compliance::test_rejects_invalid_json_rpc_requests[invalid_request3--32600]",
+]
+outcome = "fail"
+reason = "The A2A proxy does not check the type of the JSON-RPC id, so a request with an object as id fails on its params with -32602 where the suite expects InvalidRequest (-32600)."
+
+[[expected]]
+tests = [
+    "tests.mandatory.protocol.test_a2a_v030_new_methods.TestMethodMappingCompliance::test_core_method_mapping_compliance",
+    "tests.mandatory.protocol.test_message_send_method::test_message_send_continue_task",
+    "tests.mandatory.protocol.test_state_transitions::test_task_history_length",
+    "tests.mandatory.protocol.test_tasks_cancel_method::test_tasks_cancel_valid",
+    "tests.mandatory.protocol.test_tasks_get_method::test_tasks_get_valid",
+    "tests.mandatory.protocol.test_tasks_get_method::test_tasks_get_with_history_length",
+    "tests.optional.capabilities.test_a2a_v030_method_enhancements.TestA2AV030MethodEnhancements::test_tasks_get_enhanced_parameters",
+    "tests.optional.capabilities.test_a2a_v030_method_enhancements.TestMethodPerformanceAndScaling::test_concurrent_method_calls",
+    "tests.optional.capabilities.test_a2a_v030_method_enhancements.TestMethodPerformanceAndScaling::test_method_response_times",
+    "tests.optional.capabilities.test_message_send_capabilities::test_message_send_continue_with_contextid",
+    "tests.optional.capabilities.test_push_notification_config_methods::test_delete_push_notification_config",
+    "tests.optional.capabilities.test_push_notification_config_methods::test_delete_push_notification_config_nonexistent",
+    "tests.optional.capabilities.test_push_notification_config_methods::test_get_push_notification_config",
+    "tests.optional.capabilities.test_push_notification_config_methods::test_list_push_notification_config",
+    "tests.optional.capabilities.test_push_notification_config_methods::test_set_push_notification_config",
+]
+outcome = "fail"
+reason = "Not a finding: the A2A proxy answers message/send with a message and never creates a task, so a check that needs a task id has nothing to work with."
