@@ -34,6 +34,11 @@ pub struct SurfaceConfigBuilder {
     pub mcp_inbound_identity_strip_raw: bool,
     /// The inbound identity is the `sub` claim of the caller's JWT (`from_jwt_claim`).
     pub jwt_claim_inbound_identity: bool,
+    /// The inbound identity is the API key the caller presents (`from_api_key`).
+    pub api_key_inbound_identity: bool,
+    /// The Access Point maps this caller header into the identity binding
+    /// extension's `verifiablePresentation`.
+    pub identity_binding_header: Option<String>,
     pub target_auth: Option<SurfaceTargetAuthConfig>,
     pub target_auth_provider: Option<SurfaceTargetAuthProviderConfig>,
     pub mcp_tool_policy: Option<McpToolPolicyFixture>,
@@ -84,6 +89,9 @@ pub struct SurfaceConfigBuilder {
     pub transit_token_lifetime_secs: Option<u64>,
     /// The appliance's `transit_token_max_lifetime_secs` in `gateway.json`.
     pub transit_token_max_lifetime_secs: Option<u64>,
+    /// `sts.id_jag_max_lifetime_secs` in `gateway.json`: the longest remaining lifetime an
+    /// ID-JAG presented for redemption may have.
+    pub sts_id_jag_max_lifetime_secs: Option<u64>,
     pub didwebvh_identity: Option<DidWebVhIdentityFixture>,
     pub caller_trust_check_list: Vec<serde_json::Value>,
     pub trust_recorder_entries: Vec<serde_json::Value>,
@@ -285,6 +293,8 @@ impl Default for SurfaceConfigBuilder {
             mcp_inbound_identity: false,
             mcp_inbound_identity_strip_raw: false,
             jwt_claim_inbound_identity: false,
+            api_key_inbound_identity: false,
+            identity_binding_header: None,
             target_auth: None,
             target_auth_provider: None,
             mcp_tool_policy: None,
@@ -325,6 +335,7 @@ impl Default for SurfaceConfigBuilder {
             transit_source_auth: false,
             transit_token_lifetime_secs: None,
             transit_token_max_lifetime_secs: None,
+            sts_id_jag_max_lifetime_secs: None,
             didwebvh_identity: None,
             caller_trust_check_list: Vec::new(),
             trust_recorder_entries: Vec::new(),

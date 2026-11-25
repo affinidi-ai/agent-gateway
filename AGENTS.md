@@ -170,9 +170,11 @@ Access Point panel and on the canvas, and names a new surface `<protocol>_surfac
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Surface Builder's inbound Identity **From API Key** shows no key picker, since each caller is
-identified by the API key it presents, and blocks Save unless every Caller Context method is API
-Key or API Key Provider; the protected and external Identities' key picker lists only the
-surface's own active keys; see _Surface Builder_ in
+identified by the API key it presents, and blocks Save unless a Caller Context method is API Key
+or API Key Provider. An inbound **From JWT Claims** blocks Save unless a Caller Context method is
+JWT Bearer; on the protected or external Identity or a Transit Point it needs every method to be
+JWT Bearer. Callers of the other methods get no identity. The protected and external Identities'
+key picker lists only the surface's own active keys. See _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 A protected, external or Transit Point Identity whose API key reference is `blocking`
@@ -563,8 +565,8 @@ hands a failed caller to policy only on a public Access Point (`access_point.pub
 every other Access Point refuses it before policy with a `401`, direct or over Fabric: a closed
 one (`public: false`), a legacy one stored without `public`, and any whose
 `caller_authentication.on_failure` is `reject`. Two more refuse it, public or not: an Access
-Point whose inbound identity is `from_jwt_claim` (no caller identity can be derived without a
-valid JWT), and an MCP Access Point that publishes protected resource metadata (a missing or
+Point whose inbound identity is `from_jwt_claim` (a failed caller of any method; a verified
+caller of another method is served with no identity), and an MCP Access Point that publishes protected resource metadata (a missing or
 refused JWT Bearer credential gets the discovery challenge on direct requests, a failed
 credential of another method a plain `401`). Each such refusal's body says only `Caller
 credential missing or invalid`; the reason is logged, not sent. The admin API creates every

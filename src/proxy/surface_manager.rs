@@ -594,7 +594,7 @@ impl SurfaceTaskManager {
         let active_surfaces: Vec<crate::config::agent_surface::AgentSurface> = new_config
             .surfaces
             .iter()
-            .filter(|surface| surface.status == crate::config::agent_surface::SurfaceStatus::Active)
+            .filter(|surface| surface.status.is_live())
             .cloned()
             .collect();
         let channels_count = active_surfaces.len();
@@ -993,7 +993,10 @@ impl SurfaceTaskManager {
         Ok((channels_count, false, Some(warnings.join(". "))))
     }
 
-    /// Reload channels with fallback to cached configuration on failure
+    /// Reload channels from `new_config_result`. When the new configuration
+    /// could not be loaded, nothing is rebuilt: every surface keeps serving
+    /// from the configuration already running, and the result says so with
+    /// `is_fallback` and a warning.
     pub async fn reload_channels_with_fallback(
         &self,
         new_config_result: anyhow::Result<Arc<GatewayConfig>>,
@@ -1004,60 +1007,28 @@ impl SurfaceTaskManager {
     ) -> anyhow::Result<(usize, bool, Option<String>)> {
         match new_config_result {
             Ok(new_config) => {
-                // Try to reload with new configuration
                 self.reload_channels(new_config, tls_acceptor, client, metrics_store, task_monitor)
                     .await
             }
             Err(load_error) => {
-                // Failed to load new config, try to use cached config
-                warn!("Failed to load new configuration: {}. Attempting to use cached configuration.", load_error);
-
-                match self.config_cache.load().await {
-                    Ok(cached) => {
-                        info!(
-                            cached_at = %cached.cached_at,
-                            channels = cached.config.surfaces.len(),
-                            "Using cached configuration as fallback"
-                        );
-
-                        let warning = format!(
-                            "Failed to load new configuration from DynamoDB. Using cached configuration from {}. Error: {}",
-                            cached.cached_at, load_error
-                        );
-
-                        // Reload with cached config
-                        let new_config = Arc::new(cached.config);
-                        match self
-                            .reload_channels(new_config, tls_acceptor, client, metrics_store, task_monitor)
-                            .await
-                        {
-                            Ok((channels_count, _, port_warning)) => Ok((
-                                channels_count,
-                                true,
-                                Some(match port_warning {
-                                    Some(port_warning) => format!("{warning}. {port_warning}"),
-                                    None => warning,
-                                }),
-                            )),
-                            Err(e) => {
-                                error!("Failed to reload even with cached configuration: {}", e);
-                                Err(e)
-                            }
-                        }
-                    }
-                    Err(cache_error) => {
-                        error!(
-                            load_error = %load_error,
-                            cache_error = %cache_error,
-                            "Failed to load new configuration and no cached configuration available"
-                        );
-                        anyhow::bail!(
-                            "Failed to load new configuration: {}. Also failed to load cached configuration: {}",
-                            load_error,
-                            cache_error
-                        )
-                    }
-                }
+                let running = self
+                    .config
+                    .read()
+                    .await
+                    .surfaces
+                    .len();
+                warn!(
+                    error = %load_error,
+                    surfaces = running,
+                    "Failed to load new configuration; keeping the configuration already running"
+                );
+                Ok((
+                    running,
+                    true,
+                    Some(format!(
+                        "Failed to load new configuration: {load_error}. The configuration already running was kept."
+                    )),
+                ))
             }
         }
     }
@@ -1096,88 +1067,8 @@ impl SurfaceTaskManager {
             .transit_points()
             .is_empty();
 
-        // Step 1: Update the channel in the configuration first
-        let port: u16;
-        let previous_surface: Option<crate::config::agent_surface::AgentSurface>;
-        {
-            let mut config_lock = self.config.write().await;
-            let mut new_config = (**config_lock).clone();
-
-            // Find and replace the channel by config_id, or add it if it doesn't exist
-            if let Some(config_id) = new_surface.config_id() {
-                if let Some(idx) = new_config
-                    .surfaces
-                    .iter()
-                    .position(|r| r.config_id() == Some(config_id))
-                {
-                    previous_surface = Some(new_config.surfaces[idx].clone());
-                    new_config.surfaces[idx] = new_surface.clone();
-                    info!("Updated existing channel with config_id '{}': {}", config_id, surface_name);
-                    crate::channel_info!(config_id, "Updated existing channel: {}", surface_name);
-                } else {
-                    previous_surface = None;
-                    new_config
-                        .surfaces
-                        .push(new_surface.clone());
-                    info!("Added new channel with config_id '{}': {}", config_id, surface_name);
-                    crate::channel_info!(config_id, "Added new channel: {}", surface_name);
-                }
-            } else {
-                // All channels MUST have config_id - this should never happen
-                error!("Channel '{}' has no config_id - this should never happen!", surface_name);
-                return Err(anyhow::anyhow!("Channel '{}' has no config_id", surface_name));
-            }
-
-            // Load network configuration to map addresses to ports
-            let network_config = self
-                .bootstrap_config
-                .load_network_config()
-                .map_err(|e| anyhow::anyhow!("Failed to load network configuration: {}", e))?;
-            if let Some(adjustment) =
-                new_surface.transit_token_lifetime_adjustment(network_config.transit_token_max_lifetime_secs)
-            {
-                warn!("{adjustment}");
-            }
-
-            // Get the port for this channel
-            port = network_config
-                .map_url_to_port(&surface_listen_address)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Could not map channel listen_address to internal port: {}", surface_listen_address)
-                })?;
-
-            *config_lock = Arc::new(new_config.clone());
-
-            // Save updated configuration to cache
-            if let Err(e) = self
-                .config_cache
-                .save(&new_config, "single_channel_reload")
-                .await
-            {
-                warn!("Failed to save configuration to cache: {}", e);
-            }
-        }
-
-        info!("Channel '{}' uses port {} - updating state dynamically (no restart)", channel_name, port);
-        if let Some(config_id) = new_surface.config_id() {
-            crate::channel_info!(config_id, "Channel uses port {} - updating state dynamically (no restart)", port);
-        }
-
-        // Step 2: Get the port listener state for this port
-        let port_states = self
-            .port_listener_states
-            .read()
-            .await;
-        let state = port_states
-            .get(&port)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No port listener found for port {}. This should not happen - port listeners should be permanent.",
-                    port
-                )
-            })?;
-
-        // Step 3: Build the new SurfaceInfo for this channel
+        // Compile identity engines before anything changes, so a surface that
+        // fails to compile leaves the running configuration as it was.
         let vc_issuer = self.vc_issuer.clone();
 
         // Compile identity engines for this channel
@@ -1206,110 +1097,6 @@ impl SurfaceTaskManager {
             info!(channel = %surface_name, "Compiled identity selector from managed_identity JSON Schema");
             if let Some(config_id) = new_surface.config_id() {
                 crate::channel_info!(config_id, "Compiled identity selector from managed_identity JSON Schema");
-            }
-        }
-
-        // Use config_id for task ID to ensure stability across name changes
-        let channel_task_id = if let Some(config_id) = new_surface.config_id() {
-            format!("task-{}-{}", config_id, uuid::Uuid::new_v4())
-        } else {
-            // Fallback to name if no config_id (should never happen)
-            format!("task-{}-{}", surface_name, uuid::Uuid::new_v4())
-        };
-
-        // Step 3a: Drop every stale TaskInfo for this config_id (AP + every
-        // TP) before we register the new ones. The previous implementation
-        // only unregistered the AP task and left old TP tasks behind, so a
-        // surface that lost or renamed a transit point would accumulate
-        // ghost rows in the dashboard on every reload.
-        if let Some(ref monitor) = task_monitor
-            && let Some(config_id) = new_surface.config_id()
-        {
-            let removed = monitor
-                .unregister_all_tasks_for_config_id(config_id)
-                .await;
-            if removed > 0 {
-                info!("Unregistered {} old task(s) for channel with config_id '{}' before reload", removed, config_id);
-            }
-        }
-
-        // Register task for monitoring if enabled
-        if let Some(ref monitor) = task_monitor {
-            let now = chrono::Utc::now();
-            let task_info = crate::observability::TaskInfo {
-                task_id: channel_task_id.clone(),
-                config_id: new_surface
-                    .config_id()
-                    .map(str::to_string), // Use config_id for tracking
-                channel_name: surface_name.clone(),
-                transit_point: None,
-                listen_address: surface_listen_address.clone(),
-                target_endpoint: surface_target_endpoint.clone(),
-                started_at: now,
-                status: crate::observability::TaskStatus::Running,
-                total_connections: 0,
-                active_connections: 0,
-                bytes_sent: 0,
-                bytes_received: 0,
-                last_activity: None,
-                error_count: 0,
-                recent_bytes_sent: 0,
-                recent_bytes_received: 0,
-                recent_window_start: now,
-            };
-            monitor
-                .register_task(task_info)
-                .await;
-
-            // Also register one task per outbound virtual channel (transit
-            // point) so per-TP throughput, latency, and errors are visible
-            // alongside the inbound access-point task. They share `config_id`
-            // so `unregister_all_tasks_for_config_id` cleans them up together
-            // when the channel is removed.
-            if surface_has_outbound {
-                for tp in channel_surface.transit_points() {
-                    // `alias` is guaranteed non-empty after compat
-                    // back-fill (legacy surfaces) and the surface API's
-                    // alias-pattern validation (new surfaces).
-                    let tp_task_id = if let Some(cid) = new_surface.config_id() {
-                        format!("task-{}-tp-{}", cid, tp.alias)
-                    } else {
-                        format!("task-{}-tp-{}-{}", surface_name, tp.alias, uuid::Uuid::new_v4())
-                    };
-                    // Effective outbound listener: per-VC override →
-                    // channel-wide outbound → inbound fallback. Mirrors
-                    // the same precedence used by `group_outbound_vcs_by_port`
-                    // so the dashboard reflects where traffic actually binds.
-                    let tp_listen = tp
-                        .listen_address
-                        .clone()
-                        .or_else(|| surface_outbound_listen_address.clone())
-                        .unwrap_or_else(|| surface_listen_address.clone());
-                    let tp_task = crate::observability::TaskInfo {
-                        task_id: tp_task_id,
-                        config_id: new_surface
-                            .config_id()
-                            .map(str::to_string),
-                        channel_name: surface_name.clone(),
-                        transit_point: Some(tp.alias.clone()),
-                        listen_address: tp_listen,
-                        target_endpoint: tp.target_endpoint.clone(),
-                        started_at: now,
-                        status: crate::observability::TaskStatus::Running,
-                        total_connections: 0,
-                        active_connections: 0,
-                        bytes_sent: 0,
-                        bytes_received: 0,
-                        last_activity: None,
-                        error_count: 0,
-                        recent_bytes_sent: 0,
-                        recent_bytes_received: 0,
-                        recent_window_start: now,
-                    };
-                    monitor
-                        .register_task(tp_task)
-                        .await;
-                }
             }
         }
 
@@ -1437,6 +1224,201 @@ impl SurfaceTaskManager {
                     external_selector: variant_engines_compiled.external_selector,
                 },
             );
+        }
+
+        // Resolve the port and its listener before anything is published, so a
+        // surface that cannot be served leaves the running configuration as it was.
+        let network_config = self
+            .bootstrap_config
+            .load_network_config()
+            .map_err(|e| anyhow::anyhow!("Failed to load network configuration: {}", e))?;
+        if let Some(adjustment) =
+            new_surface.transit_token_lifetime_adjustment(network_config.transit_token_max_lifetime_secs)
+        {
+            warn!("{adjustment}");
+        }
+        let port = network_config
+            .map_url_to_port(&surface_listen_address)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Could not map channel listen_address to internal port: {}", surface_listen_address)
+            })?;
+        if !self
+            .port_listener_states
+            .read()
+            .await
+            .contains_key(&port)
+        {
+            anyhow::bail!(
+                "No port listener found for port {}. This should not happen - port listeners should be permanent.",
+                port
+            );
+        }
+
+        // Step 1: Update the channel in the configuration
+        let previous_surface: Option<crate::config::agent_surface::AgentSurface>;
+        {
+            let mut config_lock = self.config.write().await;
+            let mut new_config = (**config_lock).clone();
+
+            // Find and replace the channel by config_id, or add it if it doesn't exist
+            if let Some(config_id) = new_surface.config_id() {
+                if let Some(idx) = new_config
+                    .surfaces
+                    .iter()
+                    .position(|r| r.config_id() == Some(config_id))
+                {
+                    previous_surface = Some(new_config.surfaces[idx].clone());
+                    new_config.surfaces[idx] = new_surface.clone();
+                    info!("Updated existing channel with config_id '{}': {}", config_id, surface_name);
+                    crate::channel_info!(config_id, "Updated existing channel: {}", surface_name);
+                } else {
+                    previous_surface = None;
+                    new_config
+                        .surfaces
+                        .push(new_surface.clone());
+                    info!("Added new channel with config_id '{}': {}", config_id, surface_name);
+                    crate::channel_info!(config_id, "Added new channel: {}", surface_name);
+                }
+            } else {
+                // All channels MUST have config_id - this should never happen
+                error!("Channel '{}' has no config_id - this should never happen!", surface_name);
+                return Err(anyhow::anyhow!("Channel '{}' has no config_id", surface_name));
+            }
+
+            *config_lock = Arc::new(new_config.clone());
+
+            // Save updated configuration to cache
+            if let Err(e) = self
+                .config_cache
+                .save(&new_config, "single_channel_reload")
+                .await
+            {
+                warn!("Failed to save configuration to cache: {}", e);
+            }
+        }
+
+        info!("Channel '{}' uses port {} - updating state dynamically (no restart)", channel_name, port);
+        if let Some(config_id) = new_surface.config_id() {
+            crate::channel_info!(config_id, "Channel uses port {} - updating state dynamically (no restart)", port);
+        }
+
+        // Step 2: Get the port listener state for this port
+        let port_states = self
+            .port_listener_states
+            .read()
+            .await;
+        let state = port_states
+            .get(&port)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No port listener found for port {}. This should not happen - port listeners should be permanent.",
+                    port
+                )
+            })?;
+
+        // Step 3: Build the new SurfaceInfo for this channel
+        // Use config_id for task ID to ensure stability across name changes
+        let channel_task_id = if let Some(config_id) = new_surface.config_id() {
+            format!("task-{}-{}", config_id, uuid::Uuid::new_v4())
+        } else {
+            // Fallback to name if no config_id (should never happen)
+            format!("task-{}-{}", surface_name, uuid::Uuid::new_v4())
+        };
+
+        // Step 3a: Drop every stale TaskInfo for this config_id (AP + every
+        // TP) before we register the new ones. The previous implementation
+        // only unregistered the AP task and left old TP tasks behind, so a
+        // surface that lost or renamed a transit point would accumulate
+        // ghost rows in the dashboard on every reload.
+        if let Some(ref monitor) = task_monitor
+            && let Some(config_id) = new_surface.config_id()
+        {
+            let removed = monitor
+                .unregister_all_tasks_for_config_id(config_id)
+                .await;
+            if removed > 0 {
+                info!("Unregistered {} old task(s) for channel with config_id '{}' before reload", removed, config_id);
+            }
+        }
+
+        // Register task for monitoring if enabled
+        if let Some(ref monitor) = task_monitor {
+            let now = chrono::Utc::now();
+            let task_info = crate::observability::TaskInfo {
+                task_id: channel_task_id.clone(),
+                config_id: new_surface
+                    .config_id()
+                    .map(str::to_string), // Use config_id for tracking
+                channel_name: surface_name.clone(),
+                transit_point: None,
+                listen_address: surface_listen_address.clone(),
+                target_endpoint: surface_target_endpoint.clone(),
+                started_at: now,
+                status: crate::observability::TaskStatus::Running,
+                total_connections: 0,
+                active_connections: 0,
+                bytes_sent: 0,
+                bytes_received: 0,
+                last_activity: None,
+                error_count: 0,
+                recent_bytes_sent: 0,
+                recent_bytes_received: 0,
+                recent_window_start: now,
+            };
+            monitor
+                .register_task(task_info)
+                .await;
+
+            // Also register one task per outbound virtual channel (transit
+            // point) so per-TP throughput, latency, and errors are visible
+            // alongside the inbound access-point task. They share `config_id`
+            // so `unregister_all_tasks_for_config_id` cleans them up together
+            // when the channel is removed.
+            if surface_has_outbound {
+                for tp in channel_surface.transit_points() {
+                    // `alias` is guaranteed non-empty after compat
+                    // back-fill (legacy surfaces) and the surface API's
+                    // alias-pattern validation (new surfaces).
+                    let tp_task_id = if let Some(cid) = new_surface.config_id() {
+                        format!("task-{}-tp-{}", cid, tp.alias)
+                    } else {
+                        format!("task-{}-tp-{}-{}", surface_name, tp.alias, uuid::Uuid::new_v4())
+                    };
+                    // Effective outbound listener: per-VC override →
+                    // channel-wide outbound → inbound fallback. Mirrors
+                    // the same precedence used by `group_outbound_vcs_by_port`
+                    // so the dashboard reflects where traffic actually binds.
+                    let tp_listen = tp
+                        .listen_address
+                        .clone()
+                        .or_else(|| surface_outbound_listen_address.clone())
+                        .unwrap_or_else(|| surface_listen_address.clone());
+                    let tp_task = crate::observability::TaskInfo {
+                        task_id: tp_task_id,
+                        config_id: new_surface
+                            .config_id()
+                            .map(str::to_string),
+                        channel_name: surface_name.clone(),
+                        transit_point: Some(tp.alias.clone()),
+                        listen_address: tp_listen,
+                        target_endpoint: tp.target_endpoint.clone(),
+                        started_at: now,
+                        status: crate::observability::TaskStatus::Running,
+                        total_connections: 0,
+                        active_connections: 0,
+                        bytes_sent: 0,
+                        bytes_received: 0,
+                        last_activity: None,
+                        error_count: 0,
+                        recent_bytes_sent: 0,
+                        recent_bytes_received: 0,
+                        recent_window_start: now,
+                    };
+                    monitor
+                        .register_task(tp_task)
+                        .await;
+                }
+            }
         }
 
         let new_channel_info = crate::state::SurfaceInfo {
@@ -1910,7 +1892,8 @@ impl SurfaceTaskManager {
             .map(|r| r.name.clone())
     }
 
-    /// Reload a single channel with fallback to cached configuration
+    /// Reload a single channel. A surface that could not be loaded is an
+    /// error and leaves the channel serving as it was.
     pub async fn reload_single_channel_with_fallback(
         &self,
         channel_name: &str,
@@ -1928,37 +1911,12 @@ impl SurfaceTaskManager {
                     .await
             }
             Err(load_error) => {
-                // Failed to load new channel, try to use cached config
-                warn!(
-                    "Failed to load channel '{}': {}. Attempting to use cached configuration.",
-                    channel_name, load_error
+                error!(
+                    error = %load_error,
+                    channel = channel_name,
+                    "Failed to load channel; it keeps serving as it was"
                 );
-
-                match self.config_cache.load().await {
-                    Ok(_cached) => {
-                        // This function should not be called without a config_id in the error case
-                        // Log error and return the load_error
-                        error!(
-                            "Cannot use fallback for channel '{}' - original error did not provide config_id",
-                            channel_name
-                        );
-                        Err(load_error)
-                    }
-                    Err(cache_error) => {
-                        error!(
-                            load_error = %load_error,
-                            cache_error = %cache_error,
-                            channel = channel_name,
-                            "Failed to load channel and no cached configuration available"
-                        );
-                        anyhow::bail!(
-                            "Failed to load channel '{}': {}. Also failed to load cached configuration: {}",
-                            channel_name,
-                            load_error,
-                            cache_error
-                        )
-                    }
-                }
+                Err(load_error)
             }
         }
     }
@@ -2057,6 +2015,19 @@ mod tests {
     }
 
     fn manager(directory: &std::path::Path) -> super::SurfaceTaskManager {
+        manager_with_bootstrap(
+            directory,
+            serde_json::json!({
+                "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
+                "backup_encryption_key": "env://UNUSED_BACKUP_KEY"
+            }),
+        )
+    }
+
+    fn manager_with_bootstrap(
+        directory: &std::path::Path,
+        bootstrap: serde_json::Value,
+    ) -> super::SurfaceTaskManager {
         let config: crate::config::GatewayConfig = serde_json::from_value(serde_json::json!({
             "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
             "integration": {"variable_pattern": "\\$\\{([^}]+)\\}", "custom_variable_prefix": "_", "types": [],
@@ -2064,11 +2035,7 @@ mod tests {
             "extension_inspection": {"enabled": false}
         }))
         .unwrap();
-        let bootstrap: crate::config::BootstrapConfig = serde_json::from_value(serde_json::json!({
-            "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
-            "backup_encryption_key": "env://UNUSED_BACKUP_KEY"
-        }))
-        .unwrap();
+        let bootstrap: crate::config::BootstrapConfig = serde_json::from_value(bootstrap).unwrap();
         super::SurfaceTaskManager::new(
             std::sync::Arc::new(config),
             std::sync::Arc::new(bootstrap),
@@ -2079,6 +2046,139 @@ mod tests {
             std::sync::Arc::new(crate::storage::SettingsStore::new(directory)),
             std::sync::Arc::new(crate::didauth::DidAuthSessionStore::new()),
         )
+    }
+
+    fn test_tls_acceptor(directory: &std::path::Path) -> tokio_rustls::TlsAcceptor {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_path = directory.join("cert.pem");
+        let key_path = directory.join("key.pem");
+        std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+        std::fs::write(
+            &key_path,
+            certified
+                .signing_key
+                .serialize_pem(),
+        )
+        .unwrap();
+        tokio_rustls::TlsAcceptor::from(crate::server::load_tls_config(&cert_path, &key_path).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_failed_configuration_load_keeps_the_surfaces_already_running() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = manager(directory.path());
+        {
+            let mut running = manager.config.write().await;
+            let mut config = (**running).clone();
+            config.surfaces = vec![surface_with_variant()];
+            *running = std::sync::Arc::new(config);
+        }
+
+        let (count, kept_running, warning) = manager
+            .reload_channels_with_fallback(
+                Err(anyhow::anyhow!("DynamoDB read throttled")),
+                test_tls_acceptor(directory.path()),
+                reqwest::Client::new(),
+                None,
+                None,
+            )
+            .await
+            .expect("a failed load is reported, not an error");
+
+        assert_eq!(count, 1);
+        assert!(kept_running);
+        let warning = warning.expect("the failed load is reported");
+        assert!(warning.contains("DynamoDB read throttled"), "{warning}");
+        assert!(warning.contains("already running was kept"), "{warning}");
+        let running = manager.config.read().await;
+        assert_eq!(running.surfaces.len(), 1);
+        assert_eq!(running.surfaces[0].surface_id, "s1");
+    }
+
+    #[tokio::test]
+    async fn a_surface_reload_that_fails_to_build_leaves_the_running_configuration_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = manager(directory.path());
+        let running_surface = surface_with_variant();
+        {
+            let mut running = manager.config.write().await;
+            let mut config = (**running).clone();
+            config.surfaces = vec![running_surface.clone()];
+            *running = std::sync::Arc::new(config);
+        }
+        let mut broken = running_surface.clone();
+        broken.target.endpoint = "https://changed.example.com/mcp".to_string();
+        broken.default_variant_id = Some("missing".to_string());
+
+        let result = manager
+            .reload_single_channel(&broken.name.clone(), broken, test_tls_acceptor(directory.path()), None, None)
+            .await;
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("default_variant_id='missing'")
+        );
+        let running = manager.config.read().await;
+        assert_eq!(running.surfaces.len(), 1);
+        assert_eq!(
+            running.surfaces[0]
+                .target
+                .endpoint,
+            running_surface
+                .target
+                .endpoint
+        );
+    }
+
+    #[tokio::test]
+    async fn a_surface_reload_with_no_listener_for_its_port_leaves_the_running_configuration_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = manager_with_bootstrap(
+            directory.path(),
+            serde_json::json!({
+                "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
+                "backup_encryption_key": "env://UNUSED_BACKUP_KEY",
+                "config_files": {
+                    "gateway": concat!(env!("CARGO_MANIFEST_DIR"), "/config/examples/gateway.example.json")
+                }
+            }),
+        );
+        let mut running_surface = surface_with_variant();
+        running_surface
+            .access_point
+            .listen_address = "https://localhost:8443".to_string();
+        {
+            let mut running = manager.config.write().await;
+            let mut config = (**running).clone();
+            config.surfaces = vec![running_surface.clone()];
+            *running = std::sync::Arc::new(config);
+        }
+        let mut changed = running_surface.clone();
+        changed.target.endpoint = "https://changed.example.com/mcp".to_string();
+
+        let result = manager
+            .reload_single_channel(&changed.name.clone(), changed, test_tls_acceptor(directory.path()), None, None)
+            .await;
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No port listener found for port 8443"),
+        );
+        let running = manager.config.read().await;
+        assert_eq!(running.surfaces.len(), 1);
+        assert_eq!(
+            running.surfaces[0]
+                .target
+                .endpoint,
+            running_surface
+                .target
+                .endpoint
+        );
     }
 
     fn answering(path: &'static str) -> axum::Router {

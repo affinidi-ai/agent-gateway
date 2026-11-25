@@ -1,0 +1,17 @@
+branch: fix/saml-handoff-token-escaping
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-24T09:00:00Z'
+      title: Encode the SAML sign-in session token safely and add a script CSP
+      description: >-
+        The page served after a SAML sign-in wrote the session token into an inline script
+        without escaping it, which was safe only while tokens were UUIDs. The token and the
+        return target are now written as JSON string literals with the characters that can
+        break out of a script (<, >, &, U+2028, U+2029) escaped, and the page is served with a
+        nonce-based Content-Security-Policy that allows only its own script (default-src 'none',
+        no inline script without the nonce, no framing). The sign-in flow itself is unchanged.
+  breaking: []

@@ -296,12 +296,12 @@
     {
       "id": "fabric_gateway",
       "name": "Level 3 - Facilitator via Fabric Gateway",
-      "description": "Delegates payment verification to another connected gateway via DIDComm messages"
+      "description": "Kept so stored configurations still load. The gateway no longer verifies x402 payments through a facilitator."
     },
     {
       "id": "external_facilitator",
       "name": "Level 4 - Facilitator via external provider",
-      "description": "Uses external HTTP payment verification service (x402 v2 spec)"
+      "description": "Kept so stored configurations still load. The gateway no longer verifies x402 payments through a facilitator."
     }
   ],
   "settlement_modes": [
@@ -318,7 +318,7 @@
     {
       "id": "immediate",
       "name": "Immediate",
-      "description": "Executes settlement immediately after verification. Settlement method depends on verification mode: Local (embedded facilitator executes on-chain), Fabric Gateway (delegates to other gateway), or External Facilitator (delegates to external service)"
+      "description": "Kept so stored configurations still load. The gateway no longer settles x402 payments; recorded transactions are kept as they are."
     }
   ],
   "recipient_addresses": [
@@ -352,10 +352,7 @@
     "verification_async": "sync",
     "settlement_mode": "none",
     "min_confirmations": 0,
-    "accept_mempool_tx": true,
-    "facilitator_timeout_secs": 10,
-    "enable_facilitator_server": true,
-    "settlement_timeout_ms": 60000
+    "accept_mempool_tx": true
   },
   "rpc_endpoints": {
     "eip155:84532": "https://sepolia.base.org",
@@ -369,62 +366,5 @@
     "eip155:137": "https://polygon-rpc.com",
     "eip155:80002": "https://rpc-amoy.polygon.technology",
     "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1": "https://api.devnet.solana.com"
-  },
-  "facilitator_private_keys": {
-    "eip155:84532": {
-      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
-      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
-    },
-    "eip155:8453": {
-      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
-      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
-    },
-    "eip155:1": {
-      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
-      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
-    },
-    "eip155:11155111": {
-      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
-      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
-    },
-    "eip155:10": {
-      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
-      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
-    },
-    "eip155:11155420": {
-      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
-      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
-    },
-    "eip155:42161": {
-      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
-      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
-    },
-    "eip155:421614": {
-      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
-      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
-    },
-    "eip155:137": {
-      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
-      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
-    },
-    "eip155:80002": {
-      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
-      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
-    },
-    "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1": {
-      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
-      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
-    }
-  },
-  "settlement_storage": {
-    "batch_size": 100,
-    "settlement_interval_seconds": 60,
-    "max_retries": 3
-  },
-  "facilitator": {
-    "url": "https://x402.example.com",
-    "timeout_seconds": 30,
-    "max_retries": 3,
-    "retry_backoff_ms": 1000
   }
 }

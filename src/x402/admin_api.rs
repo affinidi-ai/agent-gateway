@@ -1131,8 +1131,9 @@ async fn list_all_payments(
     list_all_payments_from_transaction_store(state, query, transaction_store).await
 }
 
-/// Delete a transaction (payment record)
-/// Only allows deletion if transaction is finalized (not in pending/processing state)
+/// Delete a recorded x402 transaction, whatever its stage: nothing verifies,
+/// settles or advances these records any more, so one left pending is removed
+/// only this way.
 async fn delete_transaction(
     State(state): State<AdminApiState>,
     Path(transaction_id): Path<String>,
@@ -1142,42 +1143,13 @@ async fn delete_transaction(
         .ok_or_else(|| ErrorResponse {
             error: "Transaction store not configured".to_string(),
         })?;
-
-    // Get the transaction to check if it's finalized
-    let transaction = transaction_store
+    transaction_store
         .get(&transaction_id)
         .await
         .ok_or_else(|| ErrorResponse {
             error: "Transaction not found".to_string(),
         })?;
 
-    // Check if verification stage is pending
-    if transaction
-        .verification
-        .status
-        == crate::x402::transaction_store::VerificationStatus::Pending
-    {
-        return Err(ErrorResponse {
-            error: "Cannot delete transaction with pending verification".to_string(),
-        });
-    }
-
-    // Check if settlement stage exists and is pending/processing
-    if let Some(ref settlement) = transaction.settlement {
-        match settlement.status {
-            crate::x402::transaction_store::SettlementStatus::Pending
-            | crate::x402::transaction_store::SettlementStatus::Processing
-            | crate::x402::transaction_store::SettlementStatus::AwaitingRemote
-            | crate::x402::transaction_store::SettlementStatus::AwaitingExternal => {
-                return Err(ErrorResponse {
-                    error: "Cannot delete transaction with pending/processing settlement".to_string(),
-                });
-            }
-            _ => {} // Completed, Failed, Refunded - OK to delete
-        }
-    }
-
-    // Transaction is finalized - safe to delete
     transaction_store
         .delete(&transaction_id)
         .await
@@ -1325,5 +1297,52 @@ mod tests {
         for uri in DELETE_ROUTES {
             assert_eq!(status_of(app.clone(), "DELETE", uri).await, StatusCode::FORBIDDEN, "DELETE {uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_transaction_left_pending_or_in_settlement_can_be_deleted() {
+        use crate::x402::transaction_store::{SettlementStatus, X402Transaction};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::x402::TransactionStore::new(dir.path().join("x402"))
+                .await
+                .unwrap(),
+        );
+        let payload: crate::x402::PaymentPayload = serde_json::from_value(serde_json::json!({
+            "x402Version": 2,
+            "accepted": {"scheme": "exact", "network": "eip155:1", "amount": "1000", "asset": "0x123",
+                "payTo": "0x456", "maxTimeoutSeconds": 300},
+            "payload": {"signature": "0xsig"}
+        }))
+        .unwrap();
+        let record = |id: &str| {
+            X402Transaction::new(
+                id.to_string(),
+                "surface-1".to_string(),
+                "Surface".to_string(),
+                "/".to_string(),
+                payload.clone(),
+                "FabricGateway".to_string(),
+                None,
+            )
+        };
+        store
+            .insert(record("pending-verification"))
+            .await;
+        store
+            .insert(record("in-settlement").with_settlement(SettlementStatus::AwaitingRemote, "fabric_gateway"))
+            .await;
+        let state = || AdminApiState {
+            transaction_store: Some(Arc::clone(&store)),
+        };
+
+        for id in ["pending-verification", "in-settlement"] {
+            let deleted = delete_transaction(State(state()), Path(id.to_string())).await;
+            assert_eq!(deleted.map_err(|e| e.error), Ok(StatusCode::NO_CONTENT), "{id}");
+            assert!(store.get(id).await.is_none(), "{id}");
+        }
+        let missing = delete_transaction(State(state()), Path("missing".to_string())).await;
+        assert_eq!(missing.map_err(|e| e.error), Err("Transaction not found".to_string()));
     }
 }

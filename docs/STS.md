@@ -183,19 +183,26 @@ use, the `[vta]` key, or the gateway's own key while a token it signed may be ou
 see [`TRUST_AGENT_SIGNING.md`](TRUST_AGENT_SIGNING.md#publication). Genuinely external issuers still resolve a configured strategy by `iss`
 — then required to be an actual ID-JAG — explicit `typ: oauth-id-jag+jwt`
 (`parse_jose_typ`), `aud` = this gateway, present `jti`, unexpired `exp`
-(`validate_id_jag`, which **requires `jti`**).
+(`validate_id_jag`, which **requires `jti`**). The grant's remaining lifetime
+(`exp` minus now) may not exceed `sts.id_jag_max_lifetime_secs` in
+`gateway.json` (1 to 3600, default 900); a longer-lived grant is refused with
+`invalid_grant`. A value outside that range stops the gateway at startup.
 
 - It is **bound to its `client_id`**: a different authenticated client cannot
   redeem it.
-- It is **single-use**: the replay-protection backend (`src/sts/replay.rs`,
-  behind the `ReplayProtection` trait) consumes the `jti` and rejects any replay
-  within the validity window; the backend is selected by `gateway.json`
-  (`sts.replay_protection.backend`, default `in_process`) and resolved through a
-  runtime registry (`build_replay_backend` / `register_replay_backend`), so an
-  alternative provider can be registered at startup without touching the handler
-  — an unknown/unregistered name falls back to the built-in in-process guard (an
-  in-process `ReplayGuard`: DashMap keyed by `jti`, atomic per-jti via the entry
-  API, opportunistically pruned).
+- It is **single-use**: redemption records the SHA-256 digest of the
+  canonical (`iss`, `jti`) pair until the grant's `exp` in the gateway's
+  single-use store (`src/storage/single_use.rs`, namespace `id-jag`), so the
+  same `jti` from two issuers is two grants and a replay is refused within the
+  validity window, after a restart too. The store is chosen by `gateway.json`
+  `single_use_store`: this node's disk by default, or a DynamoDB table shared
+  by every node (see
+  [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#single-use-store)).
+  The record is atomic per grant, so concurrent redemptions of one ID-JAG
+  cannot both succeed. A store that cannot record the redemption fails closed:
+  `server_error`, and no token is issued.
+  `sts.replay_protection.backend` is still accepted but no longer used; any
+  value other than `in_process` logs a startup warning.
 - The grant is consumed only after every other check passes, so a benign failure
   (e.g. wrong audience) never burns a valid ID-JAG.
 - The issued access token's scope is **ceilinged to the grant**: `ceiling_scopes`

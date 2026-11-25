@@ -953,7 +953,7 @@ pub fn group_outbound_vcs_by_port(
         std::collections::HashMap::new();
 
     for surface in surfaces {
-        if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
+        if !surface.status.is_live() {
             continue;
         }
         let Some(ref transit) = surface.transit else {
@@ -1053,7 +1053,7 @@ pub fn find_unresolved_outbound_transit_points(
     let mut problems = Vec::new();
 
     for surface in surfaces {
-        if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
+        if !surface.status.is_live() {
             continue;
         }
         let Some(ref transit) = surface.transit else {
@@ -1412,11 +1412,16 @@ pub struct RateLimitConfig {
 /// STS (`/oauth2/token`) runtime controls. All fields have safe defaults, so a
 /// gateway configuration without an `sts` block behaves as if these defaults
 /// were set.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StsRuntimeConfig {
-    /// Replay-protection backend selection for single-use ID-JAG redemption.
+    /// Accepted for compatibility and not used: redeemed ID-JAGs are recorded
+    /// in the single-use store (`single_use_store`).
     #[serde(default)]
     pub replay_protection: ReplayProtectionConfig,
+    /// The longest remaining lifetime, in seconds, an ID-JAG presented for
+    /// redemption may have; from 1 to 3600, 900 when unset.
+    #[serde(default = "default_id_jag_max_lifetime_secs")]
+    pub id_jag_max_lifetime_secs: u64,
     /// Brute-force throttle for the token endpoint.
     #[serde(default)]
     pub token_endpoint_throttle: TokenEndpointThrottleConfig,
@@ -1426,6 +1431,42 @@ pub struct StsRuntimeConfig {
 
     #[serde(default, skip_serializing_if = "crate::sts::replay::McpReplayConfig::is_default")]
     pub mcp_replay: crate::sts::replay::McpReplayConfig,
+}
+
+impl Default for StsRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            replay_protection: ReplayProtectionConfig::default(),
+            id_jag_max_lifetime_secs: default_id_jag_max_lifetime_secs(),
+            token_endpoint_throttle: TokenEndpointThrottleConfig::default(),
+            mcp_issuer: None,
+            mcp_replay: crate::sts::replay::McpReplayConfig::default(),
+        }
+    }
+}
+
+impl StsRuntimeConfig {
+    /// Refuses an `id_jag_max_lifetime_secs` outside 1 to 3600 and warns when
+    /// the unused `replay_protection.backend` is set to anything but its default.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=3600).contains(&self.id_jag_max_lifetime_secs) {
+            return Err(format!(
+                "sts.id_jag_max_lifetime_secs must be from 1 to 3600, not {}",
+                self.id_jag_max_lifetime_secs
+            ));
+        }
+        if self.replay_protection.backend != default_replay_backend() {
+            tracing::warn!(
+                backend = %self.replay_protection.backend,
+                "sts.replay_protection.backend is no longer used: redeemed ID-JAGs are recorded in single_use_store"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn default_id_jag_max_lifetime_secs() -> u64 {
+    900
 }
 
 /// Per-client-IP throttle for a sign-in endpoint (SAML login, CLI login, passkey sign-in and
@@ -1558,8 +1599,7 @@ fn default_login_throttle_per_ip() -> RateLimitConfig {
     }
 }
 
-/// Selects the replay-protection backend by name. The built-in backend is
-/// `in_process`; additional backends may be registered at startup.
+/// `sts.replay_protection`, accepted for compatibility and not used.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayProtectionConfig {
     #[serde(default = "default_replay_backend")]
@@ -1904,32 +1944,6 @@ pub struct X402PaymentRequirement {
     pub extra: Option<serde_json::Value>,
 }
 
-impl X402PaymentRequirement {
-    /// Token contract address, or `None` when the requirement is for the network's native currency
-    pub fn token_address(&self) -> Option<&str> {
-        if self.asset.is_empty() || self.asset == "native" {
-            None
-        } else {
-            Some(&self.asset)
-        }
-    }
-
-    /// Asset transfer method from `extra` (`assetTransferMethod`, or legacy `asset_transfer_method`),
-    /// defaulting to `transaction`
-    pub fn asset_transfer_method(&self) -> String {
-        self.extra
-            .as_ref()
-            .and_then(|extra| {
-                extra
-                    .get("assetTransferMethod")
-                    .or_else(|| extra.get("asset_transfer_method"))
-            })
-            .and_then(|v| v.as_str())
-            .unwrap_or("transaction")
-            .to_string()
-    }
-}
-
 /// x402 payment provider of a stored `x402` policy. An enabled `AgentPay`
 /// policy loads as [`crate::config::agent_surface::PaymentPolicy::AgentPay`];
 /// `Local` is the unsupported local paywall.
@@ -2261,6 +2275,36 @@ fn any_pattern_matches(
         }
     };
     compiled.is_match(s)
+}
+
+#[cfg(test)]
+mod sts_runtime_config_tests {
+    use super::StsRuntimeConfig;
+
+    fn with_lifetime(secs: u64) -> StsRuntimeConfig {
+        StsRuntimeConfig {
+            id_jag_max_lifetime_secs: secs,
+            ..StsRuntimeConfig::default()
+        }
+    }
+
+    #[test]
+    fn an_id_jag_lifetime_cap_from_1_to_3600_is_accepted() {
+        for secs in [1, 900, 3600] {
+            assert_eq!(with_lifetime(secs).validate(), Ok(()), "{secs}");
+        }
+        assert_eq!(StsRuntimeConfig::default().id_jag_max_lifetime_secs, 900);
+    }
+
+    #[test]
+    fn an_id_jag_lifetime_cap_outside_1_to_3600_is_refused() {
+        for secs in [0, 3601] {
+            assert_eq!(
+                with_lifetime(secs).validate(),
+                Err(format!("sts.id_jag_max_lifetime_secs must be from 1 to 3600, not {secs}"))
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4668,12 +4712,22 @@ mod x402_storage_config_tests {
     }
 
     #[test]
-    fn example_x402_config_parses_settlement_worker_settings() {
+    fn example_x402_config_parses_without_the_facilitator_blocks() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/examples/x402.example.json");
         let contents = std::fs::read_to_string(path).expect("read x402 example");
         let config: X402Config = serde_json::from_str(&contents).expect("parse x402 example");
 
-        assert_eq!(settlement_worker_settings(&config), (100, 60, 3));
+        assert!(
+            config
+                .settlement_storage
+                .is_none()
+        );
+        assert!(
+            config
+                .facilitator_private_keys
+                .is_none()
+        );
+        assert!(config.facilitator.is_none());
         assert!(
             config
                 .transaction_storage

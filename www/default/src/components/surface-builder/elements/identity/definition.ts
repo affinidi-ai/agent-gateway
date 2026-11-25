@@ -1,5 +1,5 @@
 import * as Cap from '../capabilities';
-import type { DependencyNode, NodeDefinition, PayloadSlice } from '../types';
+import type { CanvasNode, DependencyNode, NodeDefinition, PayloadSlice } from '../types';
 import { findSlotById } from '../edges/archetypes';
 import { registry } from '../registry';
 import IdentityPanel from './IdentityPanel';
@@ -9,7 +9,15 @@ import { DOCS_URL } from '../../../../config/docs';
 import { readMethods } from '../caller-auth/methods';
 
 export const INBOUND_API_KEY_NEEDS_API_KEY_CALLER =
-  "Identity 'From API Key' needs every Caller Context method to be API Key or API Key Provider";
+  "Identity 'From API Key' needs an API Key or API Key Provider Caller Context method";
+
+export const INBOUND_JWT_CLAIM_NEEDS_JWT_CALLER =
+  'From JWT Claims needs a JWT Bearer Caller Context method. Add one, or change this extraction type.';
+
+const callerMethods = (allNodes: CanvasNode[]) => {
+  const callerAuth = allNodes.find(n => n.type === 'caller-auth');
+  return callerAuth ? readMethods(callerAuth.config) : [];
+};
 
 const INBOUND_API_KEY_CALLER_METHODS = new Set<unknown>(['api_key', 'api_key_provider']);
 
@@ -65,7 +73,7 @@ export const identityDefinition: NodeDefinition = {
         and an optional JSON schema to validate the extracted block.</li>
         <li><strong>From API key</strong>: on the Access Point → Managed
         Agent request edge, each caller is identified by the API key it
-        presents (the Caller Context must use API Key or API Key Provider);
+        presents (the Caller Context needs an API Key or API Key Provider method);
         elsewhere, derive identity from the configured API key id.</li>
         <li><strong>From mTLS</strong>: take the identity from the other
         side's TLS client certificate (the caller's certificate on an
@@ -111,9 +119,16 @@ export const identityDefinition: NodeDefinition = {
       message: 'Extension rules with default_action=reject need an identity extraction type',
     },
     {
+      description: 'Inbound from_jwt_claim needs a JWT Bearer method',
+      condition: (c, _ctx, node) => c.type === 'from_jwt_claim' && isInboundIdentity(node),
+      check: (_c, ctx) => callerMethods(ctx.allNodes).some(m => m.method_type === 'jwt_bearer'),
+      severity: 'error',
+      message: INBOUND_JWT_CLAIM_NEEDS_JWT_CALLER,
+    },
+    {
       description:
-        'from_jwt_claim derives the DID from a validated JWT, so the surface must authenticate every caller with JWT Bearer',
-      condition: c => c.type === 'from_jwt_claim',
+        'from_jwt_claim outside the inbound slot needs every caller method to be JWT Bearer',
+      condition: (c, _ctx, node) => c.type === 'from_jwt_claim' && !isInboundIdentity(node),
       check: (_c, ctx) =>
         ctx.allNodes.some(n => {
           const methods = n.type === 'caller-auth' ? readMethods(n.config) : [];
@@ -124,17 +139,12 @@ export const identityDefinition: NodeDefinition = {
         'From JWT Claims requires a Caller Context whose methods are all JWT Bearer. Remove the other methods, or change this extraction type.',
     },
     {
-      description:
-        'Inbound from_api_key identifies each caller by the key it presents, so every Caller Context method must be API Key or API Key Provider',
+      description: 'Inbound from_api_key needs an API Key or API Key Provider method',
       condition: (c, _ctx, node) => c.type === 'from_api_key' && isInboundIdentity(node),
-      check: (_c, ctx) => {
-        const callerAuth = ctx.allNodes.find(n => n.type === 'caller-auth');
-        const methods = callerAuth ? readMethods(callerAuth.config) : [];
-        return (
-          methods.length > 0 &&
-          methods.every(method => INBOUND_API_KEY_CALLER_METHODS.has(method.method_type))
-        );
-      },
+      check: (_c, ctx) =>
+        callerMethods(ctx.allNodes).some(method =>
+          INBOUND_API_KEY_CALLER_METHODS.has(method.method_type)
+        ),
       severity: 'error',
       message: INBOUND_API_KEY_NEEDS_API_KEY_CALLER,
     },

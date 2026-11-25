@@ -1,7 +1,7 @@
 //! The paths `gateway.json` claims on an inbound listener, and whether one of
 //! them serves a surface route.
 
-use super::agent_surface::{AgentSurface, SurfaceStatus};
+use super::agent_surface::AgentSurface;
 use super::network::{NetworkConfig, RouteType};
 
 /// The paths an entry's router registrations match.
@@ -247,7 +247,7 @@ impl NetworkConfig {
         let claims = self.route_claims();
         surfaces
             .iter()
-            .filter(|surface| surface.status != SurfaceStatus::Disabled)
+            .filter(|surface| surface.status.is_live())
             .filter_map(|surface| {
                 let route = &surface.access_point.route;
                 check_surface_route_syntax(&normalize_route(route))
