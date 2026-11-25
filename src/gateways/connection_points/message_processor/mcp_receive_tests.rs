@@ -4580,12 +4580,9 @@ async fn mcp_proxy_receive_trace(named: impl FnOnce(ReceivedMessage) -> Received
     );
     let _receiver = receiver(root.path(), &surface).await;
     let proxies = Arc::new(
-        crate::mcp_proxies::FileSystemMcpProxyStore::new(
-            root.path()
-                .join("proxies"),
-        )
-        .await
-        .unwrap(),
+        crate::mcp_proxies::FileSystemMcpProxyStore::new(root.path().join("proxies"))
+            .await
+            .unwrap(),
     );
     proxies
         .create(&proxy)
@@ -4595,14 +4592,9 @@ async fn mcp_proxy_receive_trace(named: impl FnOnce(ReceivedMessage) -> Received
     let metrics = Arc::new(crate::metrics::MetricsStore::new(100));
     super::init_metrics_store(metrics.clone()).await;
 
-    let mut message = forward_request(root.path(), json!({"content-type": "application/json"}), echo_tool_call(false).1)
-        .with_context(
-            "secrets_storage_path",
-            json!(
-                root.path()
-                    .join("secrets")
-            ),
-        );
+    let mut message =
+        forward_request(root.path(), json!({"content-type": "application/json"}), echo_tool_call(false).1)
+            .with_context("secrets_storage_path", json!(root.path().join("secrets")));
     message.message_body["path"] = json!("/mcp");
     let (_, events) = crate::audit::producer::capture(forward_response(&named(message))).await;
     let connections = metrics
@@ -4610,13 +4602,11 @@ async fn mcp_proxy_receive_trace(named: impl FnOnce(ReceivedMessage) -> Received
         .await;
     assert!(!connections.is_empty(), "the receive recorded no connection");
     let mut trace = RecordedTrace::of(&events);
-    trace
-        .records
-        .extend(
-            connections
-                .iter()
-                .map(|connection| Some(connection.trace_id.clone())),
-        );
+    trace.records.extend(
+        connections
+            .iter()
+            .map(|connection| Some(connection.trace_id.clone())),
+    );
     trace
         .written
         .push_str(&format!("\n{connections:?}"));

@@ -1066,7 +1066,13 @@ async fn a_terminating_fabric_receive_sends_a_fresh_written_form_trace_onward() 
     let _receiver = receiver(root.path(), &terminating).await;
 
     let trace = buffered_trace(&target, &naming_trace(root.path(), Some(PEER_TRACE_ID))).await;
-    assert!(!trace.recorded.records.is_empty(), "the receive wrote no record");
+    assert!(
+        !trace
+            .recorded
+            .records
+            .is_empty(),
+        "the receive wrote no record"
+    );
     for record in &trace.recorded.records {
         assert_eq!(record.as_deref(), Some(PEER_TRACE_ID), "its own records keep the trace it continued");
     }
