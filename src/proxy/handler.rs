@@ -21239,6 +21239,7 @@ allow if {
         let (status, body, path_refusals, _) = send(scoped, request).await;
         assert_eq!(path_refusals, 0, "{status} {body}");
         assert!(!body.contains(super::TARGET_AUTH_FAILED), "{status} {body}");
+        assert!(!status.is_client_error(), "{status} {body}");
     }
 
     async fn direct_modern_consent_flow() {

@@ -24536,6 +24536,97 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_modern_delegation_counts_as_a_transit_credential_only_when_it_attaches_one() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        let header = crate::proxy::credential_delegation::ResolvedCredentialInjection::Header {
+            name: "authorization".into(),
+            value: "Bearer person-token".into(),
+        };
+        for endpoint in ["http://127.0.0.1:9/base", "fabric://peer-gateway/partner"] {
+            for attaches in [true, false] {
+                let mut ctx = credential_header_case(
+                    &state,
+                    None,
+                    &[],
+                    Method::POST,
+                    "/outbound/surfaces/order/partner-a/%2e%2e/admin",
+                )
+                .await;
+                ctx.body_bytes = Some(Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#));
+                let mut prepared = crate::proxy::credential_delegation::modern::PreparedDelegation::handling(
+                    crate::mcp::request_validation::ValidatedModernMessage {
+                        protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+                        client_capabilities: None,
+                        client_info: None,
+                        method: "tools/list".into(),
+                        id: Some(json!(1)),
+                        kind: crate::mcp::request_validation::McpMessageKind::Request,
+                        params: None,
+                    },
+                    vec!["provider".to_string()],
+                );
+                if attaches {
+                    prepared.injections = vec![header.clone()];
+                }
+                ctx.modern_delegation = Some(Box::new(prepared));
+                ctx.virtual_channel
+                    .target_endpoint = endpoint.to_string();
+                let (result, events) = crate::audit::producer::capture(async {
+                    if endpoint.starts_with("fabric://") {
+                        step_forward_request_fabric(&state, &mut ctx)
+                            .await
+                            .map(drop)
+                    } else {
+                        step_forward_request_http(&state, &mut ctx)
+                            .await
+                            .map(drop)
+                    }
+                })
+                .await;
+                let records: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match &event.event {
+                        crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                            stage,
+                            reason: RejectionReason::TargetPathRefused,
+                            http_status,
+                            ..
+                        } => Some((stage, http_status)),
+                        _ => None,
+                    })
+                    .collect();
+                if attaches {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(OutboundPipelineError::TargetAuthFailed {
+                                failure: crate::proxy::handler::TargetAuthFailure::PathRefused,
+                                ..
+                            })
+                        ),
+                        "{endpoint}: {result:?}"
+                    );
+                    assert_eq!(records, vec![(&RejectionStage::Forward, &Some(400))], "{endpoint}");
+                } else {
+                    assert!(
+                        !matches!(
+                            result,
+                            Err(OutboundPipelineError::TargetAuthFailed {
+                                failure: crate::proxy::handler::TargetAuthFailure::PathRefused,
+                                ..
+                            })
+                        ),
+                        "{endpoint}: {result:?}"
+                    );
+                    assert_eq!(records, Vec::new(), "{endpoint}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fabric_transit_point_refuses_only_a_peer_401_naming_the_header_it_sent_its_target_credential_in() {
         use crate::audit::request_events::{RejectionReason, TargetAuthOutcome};
         let directory = tempfile::tempdir().unwrap();
