@@ -1,7 +1,9 @@
 Feature: A surface signs only through a trust agent connection its tenant may use
   A trust agent connection holds the authority to sign as its owner. A surface may name
   a connection in its signing settings only if its own tenant owns that connection or the
-  connection belongs to the whole appliance; any other save is refused with 400. A
+  connection belongs to the whole appliance; any other save is refused with 400. A tenant's
+  surface cannot name a context of an appliance-wide connection, since that context could be
+  the appliance's or another tenant's. A
   connection that does not exist is refused the same way, so the answer never reveals
   which connection ids another tenant has. A surface's tokens sign with the connection's key
   and are refused when it cannot, so a choice that names no key is refused on save.
@@ -24,12 +26,13 @@ Feature: A surface signs only through a trust agent connection its tenant may us
     When the operator saves the surface signing through the trust agent connection "agent-b"
     Then the admin API response status is 200
 
-  Scenario: A tenant's surface can sign through an appliance-wide connection
+  Scenario: A tenant's surface cannot name a context of an appliance-wide connection
     Given the appliance holds the trust agent connection "shared-agent"
     And tenant "tenant-b" holds the secret "orders-key"
     And the operator has created the surface for route "/orders" owned by tenant "tenant-b" authenticating its target with secret "orders-key"
     When the operator saves the surface signing through the trust agent connection "shared-agent"
-    Then the admin API response status is 200
+    Then the admin API response status is 400
+    And the admin API error response mentions "the gateway creates that tenant's contexts itself"
 
   Scenario: A tenant's surface is refused a connection that does not exist, the same way
     Given tenant "tenant-b" holds the secret "orders-key"

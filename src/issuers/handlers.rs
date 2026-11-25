@@ -1897,11 +1897,19 @@ mod tests {
             "a connection that does not exist reads the same as another tenant's"
         );
         assert!(try_with("ours").await.is_ok());
+        let shared = try_with("shared").await.err();
+        assert_eq!(
+            shared
+                .as_ref()
+                .map(|(status, _)| *status),
+            Some(StatusCode::BAD_REQUEST),
+            "a tenant cannot name a context of an appliance-wide connection"
+        );
         assert!(
-            try_with("shared")
-                .await
-                .is_ok(),
-            "an appliance-wide connection is usable by a tenant"
+            shared
+                .unwrap()
+                .1
+                .contains("creates that tenant's contexts itself")
         );
     }
 }
