@@ -180,6 +180,11 @@ presentation another gateway issued. A sender with neither an established nor a 
 rejected with 403; a sender with trusted issuers but a failed attestation exchange is admitted for
 those issuers only.
 
+The attestation names only the sender's gateway-wide issuer. A sender surface or issuer that signs
+through its own trust agent issues credentials under that trust agent context's DID, which the
+receiver accepts only once its operator adds that DID to the connection's `trusted_issuer_dids`
+(see [`TRUST_AGENT_SIGNING.md`](TRUST_AGENT_SIGNING.md#issuer-dids)).
+
 Earlier builds had a per-surface allowlist, `AgentSurface.trusted_binding_issuers`, which accepted
 a presentation from any peer that forwarded it. The field no longer exists. A stored surface that
 still carries it has the field removed at load, with a WARN naming the surface

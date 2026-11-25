@@ -91,6 +91,9 @@ pub trait VtaClients: Send + Sync {
     ) -> Result<Arc<VtaRestClient>>;
 }
 
+/// A context's resolver and the client it was built on.
+type CachedResolver = (Arc<VtaRestClient>, Arc<ContextIdentityResolver>);
+
 /// Signs agent presentations through the agent's own VTA context.
 pub struct VtaVpIssuer {
     clients: Arc<dyn VtaClients>,
@@ -104,8 +107,11 @@ pub struct VtaVpIssuer {
     /// a quiet downgrade to the key we are trying to stop using.
     local: Arc<dyn VpIssuer>,
     /// One resolver per (trust agent, context), so an agent's identity is read
-    /// from the trust agent once rather than on every presentation.
-    resolvers: RwLock<HashMap<String, Arc<ContextIdentityResolver>>>,
+    /// from the trust agent once rather than on every presentation. Each is kept
+    /// with the client it was built on and reused only while the connection
+    /// still hands out that client, so a revoked or disabled connection stops
+    /// signing on its next use.
+    resolvers: RwLock<HashMap<String, CachedResolver>>,
 }
 
 impl VtaVpIssuer {
@@ -134,14 +140,6 @@ impl VtaVpIssuer {
                 .unwrap_or(""),
             binding.context_id
         );
-        if let Some(resolver) = self
-            .resolvers
-            .read()
-            .await
-            .get(&key)
-        {
-            return Ok(Arc::clone(resolver));
-        }
         // Resolve the agent's own trust agent — what lets two agents hold their
         // keys in different ones.
         let client = self
@@ -152,11 +150,20 @@ impl VtaVpIssuer {
                     .as_deref(),
             )
             .await?;
-        let resolver = Arc::new(ContextIdentityResolver::new(client, binding.context_id.clone()));
+        if let Some((cached_client, resolver)) = self
+            .resolvers
+            .read()
+            .await
+            .get(&key)
+            && Arc::ptr_eq(cached_client, &client)
+        {
+            return Ok(Arc::clone(resolver));
+        }
+        let resolver = Arc::new(ContextIdentityResolver::new(Arc::clone(&client), binding.context_id.clone()));
         self.resolvers
             .write()
             .await
-            .insert(key, Arc::clone(&resolver));
+            .insert(key, (client, Arc::clone(&resolver)));
         Ok(resolver)
     }
 
@@ -468,6 +475,71 @@ mod tests {
 
         assert!(err.contains("different identity"), "{err}");
         assert_eq!(vta.sign_calls(), 0, "nothing may be signed for a holder the context is not");
+    }
+
+    /// Revoking or disabling the connection an agent's key lives in stops that
+    /// agent signing on its next use, even after it has signed through it.
+    #[tokio::test]
+    async fn an_agent_stops_signing_once_its_connection_is_withdrawn() {
+        struct Withdrawable {
+            client: Arc<VtaRestClient>,
+            withdrawn: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait]
+        impl VtaClients for Withdrawable {
+            async fn client_for(
+                &self,
+                _connection_id: Option<&str>,
+            ) -> Result<Arc<VtaRestClient>> {
+                if self
+                    .withdrawn
+                    .load(Ordering::SeqCst)
+                {
+                    bail!("VTA connection `c1` is revoked");
+                }
+                Ok(Arc::clone(&self.client))
+            }
+        }
+
+        let vta = MockContextVta::new("gw/agent-1", "agent-1-issuer");
+        let url = vta.spawn().await;
+        let local = Arc::new(CountingLocal::default());
+        let clients = Arc::new(Withdrawable {
+            client: vta.client(&url),
+            withdrawn: std::sync::atomic::AtomicBool::new(false),
+        });
+        let issuer = VtaVpIssuer::new(
+            Arc::clone(&clients) as Arc<dyn VtaClients>,
+            Arc::new(FixedContext("gw/agent-1")),
+            Arc::clone(&local) as Arc<dyn VpIssuer>,
+        );
+        let agent_did: &'static str = Box::leak(vta.did().into_boxed_str());
+
+        issuer
+            .issue(credentials(agent_did, None, None))
+            .await
+            .expect("signs while the connection is usable");
+        let signed_before = vta.sign_calls();
+        clients
+            .withdrawn
+            .store(true, Ordering::SeqCst);
+
+        let presentation = issuer
+            .issue(credentials(agent_did, None, None))
+            .await
+            .expect_err("a withdrawn connection must not sign a presentation")
+            .to_string();
+        let jwt = issuer
+            .sign_agent_jwt(agent_did, &json!({ "iss": agent_did }))
+            .await
+            .expect_err("a withdrawn connection must not sign a JWT")
+            .to_string();
+
+        assert!(presentation.contains("revoked"), "{presentation}");
+        assert!(jwt.contains("revoked"), "{jwt}");
+        assert_eq!(vta.sign_calls(), signed_before, "nothing is signed after the withdrawal");
+        assert_eq!(local.0.load(Ordering::SeqCst), 0, "and nothing falls back to a gateway-held key");
     }
 
     /// The agent that *has* a context never falls back to a local key when the

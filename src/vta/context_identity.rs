@@ -124,12 +124,13 @@ pub(crate) async fn list_context_keys(
     bail!("the key listing of context `{context_id}` did not end within {KEY_LISTING_MAX_PAGES} pages")
 }
 
-/// The DID a context signs as, the key that DID is, and the verification
-/// method a verifier resolves for it.
+/// The DID a context signs as, the key that DID is, its Ed25519 multibase
+/// public key, and the verification method a verifier resolves for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextIdentity {
     pub did: String,
     pub key_id: String,
+    pub public_key: String,
     pub verification_method: String,
 }
 
@@ -182,6 +183,7 @@ fn identity_from_records(
     Ok(ContextIdentity {
         did: did.to_string(),
         key_id: backing.to_string(),
+        public_key: public_key.to_string(),
         verification_method: format!("{did}#{public_key}"),
     })
 }
@@ -272,6 +274,7 @@ fn webvh_identity_from_document(
             return Ok(ContextIdentity {
                 did: did.to_string(),
                 key_id,
+                public_key: public_key.to_string(),
                 verification_method: id,
             });
         }
@@ -641,6 +644,11 @@ impl ContextIdentityResolver {
                 response.alg
             );
         }
+        // The echoed fields say nothing about the token itself, so the token
+        // must be the one asked for and verify under the context's own key.
+        crate::vta::authority::check_returned_jws(&response.jws, &identity.verification_method, typ, claims)
+            .and_then(|()| crate::vta::authority::verify_jws_signature(&response.jws, &identity.public_key))
+            .map_err(|e| anyhow!("signing as context `{}`: {}", self.context_id, e.log_detail()))?;
         Ok(response.jws)
     }
 }
@@ -663,6 +671,13 @@ pub(crate) mod mock {
 
     use super::*;
 
+    #[derive(Clone, Copy)]
+    pub(crate) enum JwsTamper {
+        Claims,
+        Header,
+        Key,
+    }
+
     #[derive(Clone)]
     pub(crate) struct MockContextVta {
         pub context_id: String,
@@ -676,6 +691,9 @@ pub(crate) mod mock {
         pub last_context_read: Arc<Mutex<Option<String>>>,
         pub echo_key_id: Arc<Mutex<Option<String>>>,
         pub tamper_document: Arc<Mutex<bool>>,
+        /// Return a JWS that is not the one asked for, while the echoed key id
+        /// and algorithm stay right.
+        pub tamper_jws: Arc<Mutex<Option<JwsTamper>>>,
         pub refuse_signing: Arc<Mutex<bool>>,
         /// Serve the listing in two pages, the real key on the second, so a
         /// caller that stops at the first `nextCursor` would miss it.
@@ -711,6 +729,7 @@ pub(crate) mod mock {
                 last_context_read: Arc::new(Mutex::new(None)),
                 echo_key_id: Arc::new(Mutex::new(None)),
                 tamper_document: Arc::new(Mutex::new(false)),
+                tamper_jws: Arc::new(Mutex::new(None)),
                 refuse_signing: Arc::new(Mutex::new(false)),
                 paged_listing: Arc::new(Mutex::new(false)),
                 list_requests: Arc::new(Mutex::new(Vec::new())),
@@ -910,13 +929,24 @@ pub(crate) mod mock {
                 .cloned()
                 .unwrap_or_default();
             header.insert("alg".to_string(), json!("EdDSA"));
+            let tamper = *vta.tamper_jws.lock().unwrap();
+            let mut claims = payload["payload"].clone();
+            let mut signing = (*vta.signing).clone();
+            match tamper {
+                Some(JwsTamper::Claims) => claims["injected"] = json!(true),
+                Some(JwsTamper::Header) => {
+                    header.insert("kid".to_string(), json!("did:key:zOther#zOther"));
+                }
+                Some(JwsTamper::Key) => signing = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]),
+                None => {}
+            }
             let b64 = |bytes: &[u8]| base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes);
             let signing_input = format!(
                 "{}.{}",
                 b64(&serde_json::to_vec(&Value::Object(header)).unwrap()),
-                b64(&serde_json::to_vec(&payload["payload"]).unwrap()),
+                b64(&serde_json::to_vec(&claims).unwrap()),
             );
-            let signature = ed25519_dalek::Signer::sign(&*vta.signing, signing_input.as_bytes());
+            let signature = ed25519_dalek::Signer::sign(&signing, signing_input.as_bytes());
             return Json(json!({
                 "id": "urn:uuid:envelope",
                 "payload": {
@@ -1152,6 +1182,48 @@ mod tests {
             .expect_err("an attribution mismatch must not yield a document")
             .to_string();
         assert!(err.contains("some-other-key"), "{err}");
+    }
+
+    /// The echoed key id and algorithm are right, but the token is not the one
+    /// asked for: other claims, another key named in its header, or a signature
+    /// the context's key does not verify. Each is refused, never passed on.
+    #[tokio::test]
+    async fn a_returned_jws_that_is_not_the_token_asked_for_is_refused() {
+        use super::mock::JwsTamper;
+        for (tamper, expected) in [
+            (JwsTamper::Claims, "payload is not the claims sent"),
+            (JwsTamper::Header, "`kid`"),
+            (JwsTamper::Key, "does not verify"),
+        ] {
+            let vta = MockContextVta::new("gw/ctx", "ctx-issuer");
+            *vta.tamper_jws.lock().unwrap() = Some(tamper);
+            let url = vta.spawn().await;
+            let resolver = ContextIdentityResolver::new(vta.client(&url), "gw/ctx".to_string());
+
+            let err = resolver
+                .sign_jws(&json!({ "iss": vta.did(), "sub": "task" }), "JWT")
+                .await
+                .expect_err("a token that is not the one asked for must not be published")
+                .to_string();
+            assert!(err.contains(expected), "{expected}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_returned_jws_is_the_token_asked_for_and_verifies() {
+        let vta = MockContextVta::new("gw/ctx", "ctx-issuer");
+        let url = vta.spawn().await;
+        let resolver = ContextIdentityResolver::new(vta.client(&url), "gw/ctx".to_string());
+        let claims = json!({ "iss": vta.did(), "sub": "task" });
+
+        let jws = resolver
+            .sign_jws(&claims, "JWT")
+            .await
+            .expect("a token the context's key signed");
+
+        crate::vta::authority::check_returned_jws(&jws, &vta.verification_method(), "JWT", &claims)
+            .expect("the token asked for");
+        crate::vta::authority::verify_jws_signature(&jws, &vta.public_key).expect("signed by the context's key");
     }
 
     #[tokio::test]

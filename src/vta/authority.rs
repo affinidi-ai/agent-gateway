@@ -302,7 +302,7 @@ impl VtaCredentialAuthority {
 /// Checks that the compact `jws` an agent returned is the token asked for: its
 /// protected header names `key_id`, the gateway's algorithm and `typ`, and its
 /// payload is `claims`. Other header fields the agent adds are allowed.
-fn check_returned_jws(
+pub(crate) fn check_returned_jws(
     jws: &str,
     key_id: &str,
     typ: &str,
@@ -341,7 +341,7 @@ fn check_returned_jws(
 
 /// Checks that the compact `jws` carries a signature the Ed25519 multibase
 /// public key `public_key_mb` verifies.
-fn verify_jws_signature(
+pub(crate) fn verify_jws_signature(
     jws: &str,
     public_key_mb: &str,
 ) -> Result<(), VtaError> {

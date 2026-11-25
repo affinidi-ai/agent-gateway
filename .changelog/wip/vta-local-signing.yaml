@@ -20,7 +20,9 @@ changes:
         keys/sign-document, every request carries a proof from the gateway's
         control key, and the gateway checks each answer against what it asked
         for (key, algorithm, signer, purpose, challenge, domain and document)
-        before using it. A credential or presentation proof the trust agent made
+        before using it; a returned token, an agent JWT included, must carry the
+        requested header and claims and verify under the signing key. Revoking or
+        disabling a connection stops its agents signing on their next use. A credential or presentation proof the trust agent made
         is held to the same proof purpose rules as any other. The signer is
         resolved on every call, the published key
         set and the gateway's own token checks follow it, and a choice that
@@ -73,7 +75,10 @@ changes:
         then on changes, that peers and verifiers must trust it, and that tokens
         already issued keep the key that signed them. With Verifiable Trust Agent
         chosen, Gateway signing offers a Connect VTA button in its header, and
-        the agent list appears only once an agent is connected.
+        the agent list appears only once an agent is connected. A surface or
+        issuer with its own trust agent issues credentials under that context's
+        DID, which a Fabric peer accepts once its operator adds it to the
+        connection's trusted issuers.
     - timestamp: '2026-11-17T16:00:00Z'
       title: ⭐ Let trust agent contexts sign as a did:webvh that survives key rotation
       description: >-

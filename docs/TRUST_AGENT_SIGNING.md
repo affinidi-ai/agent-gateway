@@ -153,6 +153,13 @@ attested, so after the gateway-wide signer changes each peer pairing must be re-
 `POST /v1/gateways/{id}/trusted-issuers`. Until then presentations from those peers fail
 attribution, and the error names the fix.
 
+A peer is attested only the gateway-wide issuer. A surface or issuer that signs through its own
+trust agent issues its identity credentials under that context's DID, which a Fabric peer does not
+know, so a presentation it sends or returns over Fabric fails attribution at that peer. On each
+peer that should accept it, add the context's DID to that connection with
+`POST /v1/gateways/{id}/trusted-issuers` (see
+[Peer issuer DIDs](FABRIC.md#peer-issuer-dids)).
+
 ## How the gateway signs through a trust agent
 
 Every Trust Task the gateway sends on the signing path is DI-signed by its control key, because
@@ -308,7 +315,9 @@ Revoking, deleting, disabling or repointing a connection is refused with `409` w
 surface or an issuer signs through it (`signing_users`, and `hidden_signing_users` for those the
 caller may not see), while agents onboarded through it keep their key there
 (`stranded_agents`; revoking strands them, and the only recovery is re-onboarding with a new DID),
-or when either cannot be checked. Repeating the request with `?acknowledge_signing_users=true`
+or when either cannot be checked. Once a connection is revoked or disabled, its agents stop
+signing presentations and agent JWTs on their next use, even agents that have already signed
+through it. Repeating the request with `?acknowledge_signing_users=true`
 and/or `?acknowledge_stranded_agents=true` proceeds; the dashboard asks for a second click on
 Revoke, naming what stops signing, and sends both.
 
@@ -321,7 +330,8 @@ revoke that lands while Verify is talking to the agent is kept. The `[vta]` bloc
 A surface's `signing.connection_id` (with its `context_id` and `key_id`) has its identity
 credential issued and signed by that trust agent, under the DID of the context it names; every
 other surface keeps the default. An issuer's `signing` block applies the same to every surface
-it owns that sets none of its own.
+it owns that sets none of its own. A Fabric peer accepts that context's DID only once it is added to
+the peer's connection; see [Issuer DIDs](#issuer-dids).
 
 ### Tenancy
 
@@ -463,7 +473,8 @@ connection's active key from then on, so a rotation or a newly provisioned key m
 that signed with the old one. Every token the trust agent returns is checked before it is
 published: its header must name the requested key, algorithm and type, its payload must be the
 claims sent, and the key's public key (recorded with the key id, or else read from the trust agent
-once) must verify its signature; anything else is refused. Name an owner
+once; for a context, the key its DID names) must verify its signature; anything else is refused.
+This covers tokens a context signs, such as agent JWTs, as well as the gateway's own. Name an owner
 for the trust agent's encrypted backup (`pnm backup export`) and its restore test. A trust agent
 operator with host access can still use the key, though not extract it.
 
