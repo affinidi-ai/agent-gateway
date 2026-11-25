@@ -13,7 +13,9 @@ changes:
         Before, the gateway accepted any `expires` the
         holder signed, so a presentation minted with a far-future expiry could be replayed for
         as long as its credential lasted. Agents and STS clients that sign their own
-        presentations with an `expires` more than 7 minutes ahead are now refused.
+        presentations with an `expires` more than 7 minutes ahead are now refused. A proof
+        with `expires` but no `created` is bounded only by its `expires`, so it is accepted in
+        the last 7 minutes before it expires; the gateway's own proofs always carry `created`.
     - timestamp: '2026-11-24T00:00:00Z'
       title: Bind identity presentations to their recipient to limit replay
       description: >-
@@ -45,7 +47,9 @@ changes:
         from an issuer the connection does not trust is refused with `502`. So is an MCP answer
         whose credential carries a `did` other than the presentation's holder. This includes a Managed Agent's own credential
         passed through when the paired gateway adds none (its surface has no managed identity,
-        or the result is not complete).
+        or the result is not complete). A refused answer to a modern MCP request sent as
+        `text/event-stream` has already sent its `200`, so its stream ends early instead and
+        only the VP Audit Log records the refusal.
     - timestamp: '2026-11-24T00:00:00Z'
       title: Take an MCP surface's payload identity from a verified Fabric answer
       description: >-
@@ -59,7 +63,9 @@ changes:
         `PUT /v1/gateways/{id}`. Off by default, so a peer may keep relaying presentations from
         an issuer the operator trusts for the connection; on, such a presentation must be
         addressed to this gateway, and one with no `domain` is refused. A connection without an
-        attested peer issuer admits no relayed presentation.
+        attested peer issuer admits no relayed presentation. Turn it on only after the gateways
+        of every `trusted_issuer_dids` issuer run this release, since older gateways mint
+        presentations with no `domain`.
   breaking:
     - timestamp: '2026-11-25T00:00:00Z'
       title: Refuse presentations whose proof lives longer than 7 minutes
@@ -71,3 +77,13 @@ changes:
         clients presenting one at the token endpoint. Migration: sign each presentation just
         before sending it with a proof `expires` of 5 minutes or less after `created`, and keep
         the signer's clock in sync; presentations the gateway signs already meet this.
+    - timestamp: '2026-11-25T00:00:00Z'
+      title: Refuse relayed presentations addressed elsewhere on unattested connections
+      description: >-
+        On a Remote gateway connection whose record holds hand-trusted `trusted_issuer_dids`
+        but no attested `issuer_did`, a relayed presentation that names a recipient other than
+        this gateway was accepted and is now refused: `403` under an identity policy on a
+        request, `502` with an `invalid` identity binding on an answer. Migration: let the
+        connection establish the peer's `issuer_did`. The issuer exchange runs at listener
+        start and on a request over the connection, but not on the answer path, so restart the
+        listener or send a request over a connection that carries only answers.

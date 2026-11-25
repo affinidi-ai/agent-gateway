@@ -185,8 +185,14 @@ gateway refuses one that names another (see
 anyway while the record's `require_addressed_presentations` is `false` (the default). Set it to
 `true` with `PUT /v1/gateways/{id}` (`gateways.edit`, Remote gateways only; the self gateway
 answers `400`) to refuse such relays on this connection, including relayed presentations that
-name no recipient. Without an attested peer issuer, no issuer counts as relayed, so every
-presentation must be addressed to this gateway when it names a recipient. The setting is API-only: the Edit Gateway page does not show it, and a
+name no recipient. Turn it on only after the gateways of every `trusted_issuer_dids` issuer run a
+release that addresses its presentations, since older gateways mint them with no `domain`.
+Without an attested peer issuer, no issuer counts as relayed, so every presentation must be
+addressed to this gateway when it names a recipient: on a connection whose record holds
+hand-trusted issuers but no `issuer_did`, a relayed presentation addressed elsewhere is refused.
+The answer path does not run the issuer exchange for a hand-trusted issuer, so a connection that
+carries only answers stays unattested until the exchange runs at listener start or on a request
+over the connection. The setting is API-only: the Edit Gateway page does not show it, and a
 dashboard save keeps the stored value.
 
 Accepted risk: a presentation with no `domain` is still accepted, and the gateway mints such
@@ -280,8 +286,10 @@ beside that presentation must name its verified holder, or the answer is refused
 a modern MCP request, which travels on a framed Fabric stream, is checked the same way, message by
 message, for each `complete` result; an interim result (`input_required` or `task`) is passed on
 unchecked and supplies no identity, since the paired gateway adds a presentation only to a
-`complete` one. Answers to a Transit Point over Fabric and agent cards fetched over Fabric are
-not checked.
+`complete` one. A modern answer sent as `text/event-stream` has its `200` and headers on the
+wire before the check runs, so a refused one is not answered with `502`: its stream ends early,
+and only the VP Audit Log record shows the refusal. Answers to a Transit Point over Fabric and
+agent cards fetched over Fabric are not checked.
 
 Accepted risk: an answer that carries no presentation is not checked. A paired gateway signs one
 only when its surface has a managed identity and it has a VC issuer, so an answer from any other
