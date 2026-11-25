@@ -6,6 +6,11 @@
 // does the discovery, writes a credential provider with the token endpoint it
 // found and binds it to the surface's Target. The gateway then fetches the
 // token and attaches it; what the suite judges is the gateway's token request.
+//
+// The provider sends the scenario's client secret or signed assertion to the
+// token endpoint, so discovery trusts nothing the tested server names: every
+// URL it follows or stores must be on the origin of the server under test or on
+// loopback, where the suite's servers run.
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -52,8 +57,24 @@ export function authorizationServerMetadataUrl(issuer) {
   return `${url.origin}/.well-known/oauth-authorization-server${issuerPath}`;
 }
 
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+export function trustedUrl(value, suiteUrl, what) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${what} is not a URL`);
+  }
+  const trusted =
+    (url.protocol === 'http:' || url.protocol === 'https:') &&
+    (url.origin === new URL(suiteUrl).origin || LOOPBACK_HOSTS.has(url.hostname));
+  if (!trusted) throw new Error(`${what} ${url.origin} is neither the origin of the server under test nor loopback`);
+  return url.href;
+}
+
 async function json(url) {
-  const response = await fetch(url, { headers: { accept: 'application/json' } });
+  const response = await fetch(url, { headers: { accept: 'application/json' }, redirect: 'error' });
   if (!response.ok) throw new Error(`${url} answered ${response.status}`);
   return response.json();
 }
@@ -63,14 +84,18 @@ export async function discoverTokenEndpoint(suiteUrl) {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
     body: JSON.stringify({ jsonrpc: '2.0', id: 'discover', method: 'ping' }),
+    redirect: 'error',
   });
   if (challenged.status !== 401) throw new Error(`expected a 401 challenge from ${suiteUrl}, got ${challenged.status}`);
-  const resource = await json(resourceMetadataUrl(challenged.headers.get('www-authenticate')));
+  const trust = (value, what) => trustedUrl(value, suiteUrl, what);
+  const metadataUrl = trust(resourceMetadataUrl(challenged.headers.get('www-authenticate')), 'the resource_metadata URL');
+  const resource = await json(metadataUrl);
   const issuer = resource.authorization_servers?.[0];
   if (!issuer) throw new Error('the protected resource metadata names no authorization server');
+  trust(issuer, 'the authorization server');
   const server = await json(authorizationServerMetadataUrl(issuer));
   if (!server.token_endpoint) throw new Error('the authorization server metadata names no token endpoint');
-  return { tokenEndpoint: server.token_endpoint, issuer };
+  return { tokenEndpoint: trust(server.token_endpoint, 'the token endpoint'), issuer };
 }
 
 export function providerFiles(scenario, context, { tokenEndpoint, issuer }, now = new Date().toISOString()) {
@@ -86,9 +111,15 @@ export function providerFiles(scenario, context, { tokenEndpoint, issuer }, now 
   };
 }
 
-function writeJson(dir, id, value) {
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, `${id}.json`), `${JSON.stringify(value, null, 2)}\n`);
+// Secrets are readable by this user only; the gateway runs as the same user.
+function writeJson(dir, id, value, { secret = false } = {}) {
+  fs.mkdirSync(dir, { recursive: true, ...(secret ? { mode: 0o700 } : {}) });
+  const file = path.join(dir, `${id}.json`);
+  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, secret ? { mode: 0o600 } : undefined);
+  if (secret) {
+    fs.chmodSync(dir, 0o700);
+    fs.chmodSync(file, 0o600);
+  }
 }
 
 // Adds the provider, its secrets and the Target binding to an env that env.mjs
@@ -98,7 +129,7 @@ export function seedTargetAuth(envDir, scenario, context, discovered) {
   const storage = path.join(envDir, 'config', '_storage');
   const files = providerFiles(scenario, context, discovered);
   writeJson(path.join(storage, 'credential_providers'), files.provider.id, files.provider);
-  for (const secret of files.secrets) writeJson(path.join(storage, 'secrets'), secret.id, secret);
+  for (const secret of files.secrets) writeJson(path.join(storage, 'secrets'), secret.id, secret, { secret: true });
   const surfaceFile = path.join(storage, 'agent_surfaces', `${SURFACE_ID}.json`);
   const surface = JSON.parse(fs.readFileSync(surfaceFile, 'utf8'));
   surface.target.auth = files.targetAuth;

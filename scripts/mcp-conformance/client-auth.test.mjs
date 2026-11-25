@@ -12,6 +12,7 @@ import {
   providerFiles,
   resourceMetadataUrl,
   seedTargetAuth,
+  trustedUrl,
 } from './client-auth.mjs';
 
 const DISCOVERED = { tokenEndpoint: 'http://localhost:9/token', issuer: 'http://localhost:9' };
@@ -87,6 +88,12 @@ test('seeding writes the provider and secrets and binds the Target', () => {
   const surfaceFile = path.join(storage, 'agent_surfaces', `${SURFACE_ID}.json`);
   fs.writeFileSync(surfaceFile, JSON.stringify({ surface_id: SURFACE_ID, target: { endpoint: 'http://localhost:9/mcp' } }));
   seedTargetAuth(envDir, 'auth/client-credentials-basic', { client_id: 'cid', client_secret: 's' }, DISCOVERED);
+  if (process.platform !== 'win32') {
+    const mode = (...parts) => fs.statSync(path.join(storage, ...parts)).mode & 0o777;
+    assert.equal(mode('secrets'), 0o700);
+    assert.equal(mode('secrets', 'conformance-client-secret.json'), 0o600);
+    assert.equal(mode('secrets', 'conformance-client-id.json'), 0o600);
+  }
   const read = (...parts) => JSON.parse(fs.readFileSync(path.join(storage, ...parts), 'utf8'));
   assert.equal(read('credential_providers', 'conformance-target-auth.json').token_endpoint, 'http://localhost:9/token');
   assert.equal(read('secrets', 'conformance-client-secret.json').value, 's');
@@ -117,5 +124,87 @@ test('discovery follows the challenge to the token endpoint and fails without on
     await assert.rejects(discoverTokenEndpoint(`${origin}/mcp`), /expected a 401 challenge/);
   } finally {
     await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('a URL is trusted on the origin of the server under test or on loopback only', () => {
+  const suite = 'https://suite.example:8443/mcp';
+  assert.equal(trustedUrl('https://suite.example:8443/token', suite, 'x'), 'https://suite.example:8443/token');
+  for (const url of ['http://localhost:1/t', 'http://127.0.0.1:2/t', 'http://[::1]:3/t']) {
+    assert.equal(trustedUrl(url, suite, 'x'), url);
+  }
+  for (const url of [
+    'https://other.example/token',
+    'https://suite.example/token',
+    'http://suite.example:8443/token',
+    'https://suite.example.evil.example:8443/token',
+    'https://suite.example@evil.example/token',
+    'ftp://localhost/token',
+    'file:///etc/passwd',
+  ]) {
+    assert.throws(() => trustedUrl(url, suite, 'the token endpoint'), /the token endpoint .* neither the origin/, url);
+  }
+  assert.throws(() => trustedUrl('not a url', suite, 'the token endpoint'), /the token endpoint is not a URL/);
+});
+
+async function discoveryServer(metadata) {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    requests.push(`${req.method} ${req.url}`);
+    const origin = `http://localhost:${server.address().port}`;
+    const { challenge = `${origin}/.well-known/oauth-protected-resource/mcp`, resource, authorizationServer } = metadata(origin);
+    if (req.method === 'POST') {
+      res.writeHead(401, { 'www-authenticate': `Bearer resource_metadata="${challenge}"` });
+      return res.end();
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (req.url === '/.well-known/oauth-protected-resource/mcp') return res.end(JSON.stringify(resource));
+    if (req.url.startsWith('/.well-known/oauth-authorization-server')) return res.end(JSON.stringify(authorizationServer));
+    res.end('{}');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return { server, requests, origin: `http://localhost:${server.address().port}` };
+}
+
+test('discovery refuses a challenge, issuer or token endpoint that points off the server under test', async () => {
+  const cases = [
+    ['resource_metadata', () => ({ challenge: 'https://attacker.example/metadata', resource: {}, authorizationServer: {} }), /resource_metadata URL/],
+    [
+      'issuer',
+      () => ({ resource: { authorization_servers: ['https://attacker.example'] }, authorizationServer: { token_endpoint: 'https://attacker.example/token' } }),
+      /the authorization server https:\/\/attacker\.example/,
+    ],
+    [
+      'token endpoint',
+      (origin) => ({ resource: { authorization_servers: [`${origin}/as`] }, authorizationServer: { token_endpoint: 'https://attacker.example/token' } }),
+      /the token endpoint https:\/\/attacker\.example/,
+    ],
+  ];
+  for (const [name, metadata, message] of cases) {
+    const { server, requests, origin } = await discoveryServer(metadata);
+    try {
+      await assert.rejects(discoverTokenEndpoint(`${origin}/mcp`), message, name);
+      assert.ok(requests.every((request) => !request.includes('attacker')), name);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  }
+});
+
+test('discovery does not follow a redirect', async () => {
+  const target = http.createServer((req, res) => res.writeHead(200).end('{}'));
+  await new Promise((resolve) => target.listen(0, '127.0.0.1', resolve));
+  const server = http.createServer((req, res) => {
+    if (req.method === 'POST') {
+      res.writeHead(401, { 'www-authenticate': `Bearer resource_metadata="http://localhost:${server.address().port}/meta"` });
+      return res.end();
+    }
+    res.writeHead(302, { location: `http://localhost:${target.address().port}/elsewhere` }).end();
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    await assert.rejects(discoverTokenEndpoint(`http://localhost:${server.address().port}/mcp`), /fetch failed/);
+  } finally {
+    await Promise.all([server, target].map((s) => new Promise((resolve) => s.close(resolve))));
   }
 });
