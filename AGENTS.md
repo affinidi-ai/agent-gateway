@@ -320,6 +320,10 @@ A Transit Point's static-secret target authentication picks its secret from a te
 with a refresh button beside it, and Save is blocked while no secret is picked; see _Surface
 Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+The Managed Agent and Transit Point editors open a stored Target header as the same type, read
+by one rule (`storedHeaderKind`) as the gateway reads it; see _One reading of a stored header_
+under _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
 A Trust Check on a Managed Agent → Transit Point arrow belongs to that Transit Point and saves
 to `transit.points[i].trust_check_list`, and each query's **Checks** select picks the destination
 agent or this surface's managed agent (on MCP Transit Points only the managed agent); the

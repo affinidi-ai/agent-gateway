@@ -1,0 +1,19 @@
+branch: fix/stored-header-kind
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-25T00:02:02Z'
+      title: Show a stored Target header as one type on Managed Agents and Transit Points
+      description: >-
+        The Managed Agent and Transit Point editors read a stored Target authentication header by
+        different rules, so the same header could open as Bearer Token in one and Custom in the
+        other (for example `authorization: Bearer {value}`, `X-Partner: Bearer {value}` or
+        `x-api-key: {value}`). Both now use one rule that reads a header as the gateway does:
+        Bearer or Basic for an Authorization header whose format starts with that scheme in any
+        letter case, API Key for an X-API-Key header, Custom for any other, with names compared in
+        any letter case and with `_` read as `-`. A Transit Point opened as Bearer Token keeps a
+        stored `authorization` spelling on save, so opening and saving changes no header.
+  removed: []
+  security: []
+  breaking: []

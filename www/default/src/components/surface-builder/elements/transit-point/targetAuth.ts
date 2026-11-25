@@ -13,6 +13,8 @@ import {
   providerTargetAuthFromApi,
   providerTargetAuthToApi,
   record,
+  sameHeaderName,
+  storedHeaderKind,
   storedHeaderValue,
   trimSpaces,
 } from '../_shared/providerTargetAuth';
@@ -84,7 +86,9 @@ function editedTargetAuth(c: TransitPointTargetAuthForm): Record<string, unknown
   let headerFormat: string;
   switch (type) {
     case 'bearer':
-      headerName = 'Authorization';
+      headerName = sameHeaderName(header(c.auth_header_name), 'Authorization')
+        ? header(c.auth_header_name)
+        : 'Authorization';
       headerFormat = format('Bearer {value}');
       break;
     case 'api_key':
@@ -106,18 +110,16 @@ function editedTargetAuth(c: TransitPointTargetAuthForm): Record<string, unknown
   };
 }
 
-/** The panel's auth type for a stored static secret, so opening the panel keeps its header. */
+/**
+ * The panel's auth type for a stored static secret: its `storedHeaderKind`, shown as Custom
+ * Header for Basic, which the panel has no type for.
+ */
 export function staticSecretAuthType(
   headerName: string,
   headerFormat: string
 ): 'bearer' | 'api_key' | 'custom_header' {
-  if (headerFormat.startsWith('Bearer ') && headerName === 'Authorization') {
-    return 'bearer';
-  }
-  if (headerName === 'X-API-Key' || headerName.toLowerCase().includes('api-key')) {
-    return 'api_key';
-  }
-  return 'custom_header';
+  const kind = storedHeaderKind(headerName, headerFormat);
+  return kind === 'bearer' || kind === 'api_key' ? kind : 'custom_header';
 }
 
 /**

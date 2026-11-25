@@ -679,6 +679,16 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   - **Scopes.** The credential provider method has an optional space-separated **Scopes** input
     (`managed-agent-target-auth-scopes`, `transit-point-target-auth-provider-scopes`) wired to the
     wire `scopes`; empty uses the provider's default scopes.
+  - **One reading of a stored header.** Both editors pick the type a stored header opens as with
+    `storedHeaderKind` (`_shared/providerTargetAuth.ts`), which reads it as the gateway does:
+    **Bearer Token** or **Basic Auth** for an `Authorization` header whose format starts with
+    `Bearer ` or `Basic ` in any letter case, **API Key** for an `X-API-Key` header, **Custom** for
+    any other. Names are compared with `sameHeaderName` and the stored values are not trimmed. The
+    Managed Agent uses it for a static secret or a provider with no stored `auth_type` hint (a
+    stored hint is shown as it is); the Transit Point uses it for a static secret
+    (`staticSecretAuthType`) and, having no Basic Auth type, shows Basic as **Custom Header**. The
+    Transit Point's Bearer Token type saves a stored spelling of `Authorization`, such as
+    `authorization`, unchanged, so opening and saving a Transit Point changes no header.
   - **Rules that block Save**, which the gateway refuses in every mode: a header name that is not
     an HTTP token or is reserved (Host, Content-Length, Transfer-Encoding, Connection, Keep-Alive,
     Proxy-Connection, TE, Upgrade, Trailer, and the gateway's own transit, caller, identity, trace and
