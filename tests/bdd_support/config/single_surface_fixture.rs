@@ -164,6 +164,13 @@ pub struct SurfaceConfigBuilder {
     pub stored_surfaces_on_routes: Vec<StoredSurfaceFixture>,
     /// The key id the seeded surface's protected Identity takes its DID from.
     pub protected_identity_api_key_id: Option<String>,
+    /// The seeded surface's inbound Identity is `from_mtls` naming no stored certificate.
+    pub inbound_identity_from_unnamed_certificate: bool,
+    /// The seeded surface's inbound Identity gives every caller this static DID.
+    pub inbound_static_did: Option<String>,
+    /// An enabled variant, by alias, whose Transit Points are the surface's but with the one
+    /// named taking the managed agent's identity from its caller's API key.
+    pub variant_caller_key_transit_point: Option<(String, String)>,
     /// When the API Key Provider's key was created; when the gateway starts if absent.
     pub api_key_provider_key_created_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The gateway starts in Standby mode.
@@ -370,6 +377,9 @@ impl Default for SurfaceConfigBuilder {
             other_stored_surfaces: Vec::new(),
             stored_surfaces_on_routes: Vec::new(),
             protected_identity_api_key_id: None,
+            inbound_identity_from_unnamed_certificate: false,
+            inbound_static_did: None,
+            variant_caller_key_transit_point: None,
             api_key_provider_key_created_at: None,
             starts_standby: false,
             sign_in_event_stream: None,

@@ -148,3 +148,40 @@ Feature: Transit Point identity from its caller's credential
     When the operator creates the surface from the draft
     Then the admin API response status is 400
     And the admin API error response names Transit Point "tr1" and its caller authentication
+
+  Scenario: A save warns of a Transit Point JWT claim identity the issuer does not namespace
+    Given a surface draft whose Transit Point "tr1" authenticates its callers with JWT Bearer
+    And Transit Point "tr1" in the draft takes the managed agent's identity from the JWT claim "oid"
+    When the operator creates the surface from the draft
+    Then the admin API response status is 201
+    And the admin API response carries a Warning header containing "add 'iss' to namespace_claims"
+
+  Scenario: A save does not warn of a Transit Point JWT claim identity namespaced by the issuer
+    Given a surface draft whose Transit Point "tr1" authenticates its callers with JWT Bearer
+    And Transit Point "tr1" in the draft takes the managed agent's identity from the JWT claim "oid" namespaced by claim "iss"
+    When the operator creates the surface from the draft
+    Then the admin API response status is 201
+    And the admin API response carries no Warning header containing "namespace_claims"
+
+  Scenario: A stored Access Point identity from a client certificate it does not name refuses its callers
+    Given surface "alpha" authenticates its callers with an API key of API key provider "agents"
+    And surface "alpha" was stored with its inbound Identity taking its DID from a client certificate it does not name
+    When a caller sends a request to the Access Point with key "bravo-key"
+    Then the response status is 500
+    And the response mentions "Caller identity could not be resolved"
+    And managed agent "bravo" was not called
+
+  Scenario: A surface policy reads no identity hash for a static DID
+    Given surface "alpha" gives its callers the static DID "did:web:caller.example"
+    And surface "alpha" has a policy that admits only caller DID "did:web:caller.example" without an identity hash
+    When the caller sends an A2A message/send request to surface "alpha" with header "X-Example" set to "alpha"
+    Then the response status is 200
+    And managed agent "bravo" received the forwarded request
+
+  Scenario: A variant's Transit Point gives the managed agent the DID of the key it presented
+    Given surface "alpha" has A2A Transit Point "tr1" to external agent "delta"
+    And Transit Point "tr1" authenticates its callers with an API key of API key provider "agents"
+    And surface "alpha" has variant "beta" whose Transit Point "tr1" takes the managed agent's identity from its caller's API key
+    When managed agent "bravo" sends an A2A message/send request through Transit Point "tr1" of variant "beta" with key "bravo-key"
+    Then the response status is 200
+    And external agent "delta" received the request with a VP proving the DID of key "bravo-key"

@@ -1610,7 +1610,9 @@ impl VCIssuer {
 
     /// [`Self::issue_or_get_credential`] for the managed agent of `channel_config_id`:
     /// records the identity as managed unless the record already has an origin, and a managed
-    /// record takes the slot and credential state in `source`. The VC follows the record's
+    /// record takes the slot and credential state in `source`. A caller-bound Transit Point
+    /// using a record that is another surface's Managed Agent is recorded as a caller of
+    /// this surface instead, so that agent keeps its name. The VC follows the record's
     /// origin: a managed one is named with its managed display name.
     pub async fn issue_or_get_managed_credential(
         &self,
@@ -1826,6 +1828,14 @@ impl VCIssuer {
                 }
             },
             (existing, _) => existing,
+        };
+        let (origin, managed_source) = if managed_source.is_some_and(|source| source.slot.is_caller_bound())
+            && effective_origin == Some(IdentityOrigin::Managed)
+            && record.managed_on_another_surface(channel_config_id.as_deref())
+        {
+            (Some(IdentityOrigin::ExternalCaller), None)
+        } else {
+            (origin, managed_source)
         };
         if let Some(source) = managed_source
             && effective_origin == Some(IdentityOrigin::Managed)
@@ -5664,6 +5674,89 @@ mod tests {
             assert_eq!(caller.did, managed.did);
             assert_eq!(reissued.did, managed.did);
             assert_eq!(jwt_subject(&reissued.credential)["name"], json!("OXYGEN"));
+        }
+
+        async fn usage_role(
+            issuer: &VCIssuer,
+            did: &str,
+            surface_id: &str,
+        ) -> Option<IdentityOrigin> {
+            issuer
+                .get_identity_store()
+                .find_by_did(did)
+                .await
+                .unwrap()
+                .unwrap()
+                .channel_usage
+                .iter()
+                .find(|usage| usage.channel_config_id == surface_id)
+                .and_then(|usage| usage.role)
+        }
+
+        #[tokio::test]
+        async fn another_surfaces_managed_agent_key_at_a_caller_bound_transit_point_is_a_caller_use() {
+            let f = fixture().await;
+            f.save_surface("vc-cb-owner", "OXYGEN")
+                .await;
+            f.save_surface("vc-cb-transit", "HELIUM")
+                .await;
+            let issuer = &f.issuer;
+            let caller_bound = || ManagedIdentitySource::caller_bound_transit_point("tp");
+            let managed = issuer
+                .issue_or_get_managed_credential(fields("key"), None, Some("vc-cb-owner".into()), None, protected())
+                .await
+                .unwrap();
+
+            let at_transit_point = issuer
+                .issue_or_get_managed_credential(
+                    fields("key"),
+                    None,
+                    Some("vc-cb-transit".into()),
+                    None,
+                    caller_bound(),
+                )
+                .await
+                .unwrap();
+            let reissued = issuer
+                .issue_or_get_managed_credential(fields("key"), None, Some("vc-cb-owner".into()), None, protected())
+                .await
+                .unwrap();
+
+            assert_eq!(at_transit_point.did, managed.did);
+            assert_eq!(usage_role(issuer, &managed.did, "vc-cb-owner").await, Some(IdentityOrigin::Managed));
+            assert_eq!(usage_role(issuer, &managed.did, "vc-cb-transit").await, Some(IdentityOrigin::ExternalCaller));
+            let record = issuer
+                .get_identity_store()
+                .find_by_did(&managed.did)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.slot, Some(crate::identity::filesystem::ManagedSlot::Protected));
+            assert_eq!(jwt_subject(&reissued.credential)["name"], json!("OXYGEN"));
+        }
+
+        #[tokio::test]
+        async fn a_caller_bound_transit_point_keeps_its_own_and_new_dids_managed() {
+            let f = fixture().await;
+            f.save_surface("vc-cb-own", "HELIUM")
+                .await;
+            let issuer = &f.issuer;
+            let caller_bound = || ManagedIdentitySource::caller_bound_transit_point("tp");
+
+            let first = issuer
+                .issue_or_get_managed_credential(fields("fresh"), None, Some("vc-cb-own".into()), None, caller_bound())
+                .await
+                .unwrap();
+            let again = issuer
+                .issue_or_get_managed_credential(fields("fresh"), None, Some("vc-cb-own".into()), None, caller_bound())
+                .await
+                .unwrap();
+
+            assert!(first.is_new);
+            assert_eq!(again.did, first.did);
+            assert_eq!(origin_of(issuer, &first.did).await, Some(IdentityOrigin::Managed));
+            assert_eq!(usage_role(issuer, &first.did, "vc-cb-own").await, Some(IdentityOrigin::Managed));
+            assert_eq!(jwt_subject(&again.credential)["name"], json!("HELIUM"));
         }
 
         #[tokio::test]

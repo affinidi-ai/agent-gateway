@@ -10854,10 +10854,13 @@ async fn resolve_configured_caller_identity(
             | crate::identity::credential_identity::CredentialIdentityError::CertificateIdMissing),
         ) => {
             warn!(channel = channel_name, leg, error = %e, "Failed to derive inbound credential-based identity");
-            let mode = match mi {
-                ManagedIdentityConfig::FromMtls { .. } => "from_mtls",
-                _ => "from_api_key",
-            };
+            let mode = match e {
+                crate::identity::credential_identity::CredentialIdentityError::CertificateIdMissing => {
+                    crate::source_auth::CallerCredential::Mtls
+                }
+                _ => crate::source_auth::CallerCredential::ApiKey,
+            }
+            .identity_mode();
             crate::metrics::backends::prometheus::track_managed_identity_resolve(
                 channel_name,
                 mode,

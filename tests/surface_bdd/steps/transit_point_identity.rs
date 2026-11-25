@@ -22,7 +22,7 @@ use crate::steps::then::{
 };
 use crate::steps::when::{
     build_primary_target_surface_payload, ensure_admin_session, ensure_gateway_running, record_transit_point_response,
-    send_a2a_body_through_transit_point, send_a2a_proxy_request_and_record,
+    send_a2a_body_through_transit_point, send_a2a_body_through_transit_point_path, send_a2a_proxy_request_and_record,
     send_mcp_request_through_transit_point_path_with_headers, transit_point_path,
 };
 use crate::world::SurfaceWorld;
@@ -257,6 +257,101 @@ fn surface_inbound_identity_from_caller_api_key(
         .api_key_inbound_identity = true;
 }
 
+#[given(
+    expr = "surface {string} was stored with its inbound Identity taking its DID from a client certificate it does not name"
+)]
+fn surface_stored_with_inbound_identity_from_unnamed_certificate(
+    world: &mut SurfaceWorld,
+    surface: String,
+) {
+    assert!(
+        world
+            .actors
+            .surface(&surface)
+            .is_some(),
+        "unknown surface '{surface}'"
+    );
+    before_the_gateway_starts(world, "the stored surface's inbound Identity");
+    world
+        .surface_config
+        .inbound_identity_from_unnamed_certificate = true;
+}
+
+#[given(expr = "surface {string} gives its callers the static DID {string}")]
+fn surface_gives_callers_static_did(
+    world: &mut SurfaceWorld,
+    surface: String,
+    did: String,
+) {
+    assert!(
+        world
+            .actors
+            .surface(&surface)
+            .is_some(),
+        "unknown surface '{surface}'"
+    );
+    world
+        .surface_config
+        .inbound_static_did = Some(did);
+}
+
+#[given(expr = "surface {string} has a policy that admits only caller DID {string} without an identity hash")]
+fn surface_admits_only_did_without_identity_hash(
+    world: &mut SurfaceWorld,
+    surface: String,
+    did: String,
+) {
+    assert!(
+        world
+            .actors
+            .surface(&surface)
+            .is_some(),
+        "unknown surface '{surface}'"
+    );
+    let did_literal = serde_json::to_string(&did).expect("the DID should serialize");
+    let rego = format!(
+        r#"package surface.policy
+
+default allow := false
+
+allow if {{
+    input.extension_identity.did == {did_literal}
+    not input.extension_identity.identity_hash
+}}
+"#
+    );
+    world
+        .surface_config
+        .request_policy = Some(PolicyDefinitionFixture::new(
+        "bdd-static-did-without-identity-hash",
+        "BDD surface policy: admit only a static DID without an identity hash",
+        &rego,
+    ));
+}
+
+#[given(
+    expr = "surface {string} has variant {string} whose Transit Point {string} takes the managed agent's identity from its caller's API key"
+)]
+fn variant_transit_point_takes_identity_from_caller_api_key(
+    world: &mut SurfaceWorld,
+    surface: String,
+    variant: String,
+    transit_point: String,
+) {
+    assert!(
+        world
+            .actors
+            .surface(&surface)
+            .is_some(),
+        "unknown surface '{surface}'"
+    );
+    transit_point_config_mut(world, &transit_point);
+    before_the_gateway_starts(world, "the surface variant");
+    world
+        .surface_config
+        .variant_caller_key_transit_point = Some((variant, transit_point));
+}
+
 #[given(expr = "API key provider {string} has issued key {string}")]
 fn api_key_provider_has_issued_key(
     world: &mut SurfaceWorld,
@@ -478,6 +573,39 @@ async fn caller_sends_through_transit_point_with_key(
 }
 
 #[when(
+    expr = "managed agent {string} sends an A2A message\\/send request through Transit Point {string} of variant {string} with key {string}"
+)]
+async fn managed_agent_sends_through_variant_transit_point_with_key(
+    world: &mut SurfaceWorld,
+    agent: String,
+    transit_point: String,
+    variant: String,
+    key: String,
+) {
+    expect_caller(world, "managed agent", &agent);
+    let provider = transit_point_provider(world, &transit_point);
+    let header = provider_key(world, &provider, &key);
+    let route = world
+        .surface_config
+        .route
+        .trim_end_matches('/')
+        .to_string();
+    let path = format!("/outbound{route}${variant}/{transit_point}");
+    send_a2a_body_through_transit_point_path(world, &agent, &path, vec![header], build_a2a_message_send_body("hello"))
+        .await;
+}
+
+#[when(expr = "a caller sends a request to the Access Point with key {string}")]
+async fn caller_sends_request_to_access_point_with_key(
+    world: &mut SurfaceWorld,
+    key: String,
+) {
+    let provider = access_point_provider(world);
+    let header = provider_key(world, &provider, &key);
+    send_a2a_proxy_request_and_record(world, build_a2a_message_send_body("hello"), vec![header]).await;
+}
+
+#[when(
     regex = r#"^(managed agent|agent) "([^"]+)" invokes MCP tool "([^"]+)" through Transit Point "([^"]+)" with key "([^"]+)"$"#
 )]
 async fn caller_invokes_mcp_tool_through_transit_point_with_key(
@@ -512,19 +640,24 @@ async fn caller_sends_through_transit_point_without_key(
     send_a2a_body_through_transit_point(world, &agent, &transit_point, Vec::new(), body).await;
 }
 
-#[given(expr = "a caller has sent a request to the Access Point with key {string}")]
-async fn caller_has_sent_request_to_access_point_with_key(
-    world: &mut SurfaceWorld,
-    key: String,
-) {
-    let provider = match world
+/// The API Key Provider agent the surface's Access Point checks its callers' keys with.
+fn access_point_provider(world: &SurfaceWorld) -> String {
+    match world
         .surface_config
         .source_auth
         .as_ref()
     {
         Some(SurfaceSourceAuthConfig::ApiKeyProvider(config)) => config.agent_id.clone(),
         _ => panic!("the surface must authenticate its callers with an API key provider"),
-    };
+    }
+}
+
+#[given(expr = "a caller has sent a request to the Access Point with key {string}")]
+async fn caller_has_sent_request_to_access_point_with_key(
+    world: &mut SurfaceWorld,
+    key: String,
+) {
+    let provider = access_point_provider(world);
     let header = provider_key(world, &provider, &key);
     send_a2a_proxy_request_and_record(world, build_a2a_message_send_body("hello"), vec![header]).await;
     let status = world
@@ -849,6 +982,20 @@ fn draft_transit_point_takes_identity_from_jwt_claim(
 ) {
     let point = draft_transit_point(world, &alias);
     point["managed_identity"] = json!({ "type": "from_jwt_claim", "claim": claim, "namespace_claims": [] });
+    point["identity_injection"] = json!({ "inject_vp": true });
+}
+
+#[given(
+    expr = "Transit Point {string} in the draft takes the managed agent's identity from the JWT claim {string} namespaced by claim {string}"
+)]
+fn draft_transit_point_takes_identity_from_namespaced_jwt_claim(
+    world: &mut SurfaceWorld,
+    alias: String,
+    claim: String,
+    namespace: String,
+) {
+    let point = draft_transit_point(world, &alias);
+    point["managed_identity"] = json!({ "type": "from_jwt_claim", "claim": claim, "namespace_claims": [namespace] });
     point["identity_injection"] = json!({ "inject_vp": true });
 }
 

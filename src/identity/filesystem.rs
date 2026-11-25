@@ -101,6 +101,12 @@ pub enum ManagedSlot {
     },
 }
 
+impl ManagedSlot {
+    pub fn is_caller_bound(&self) -> bool {
+        matches!(self, Self::TransitPoint { caller_bound: true, .. })
+    }
+}
+
 /// A change of the stored credential behind a credential-derived identity that kept its DID.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CredentialRotation {
@@ -329,6 +335,31 @@ impl AgentIdentityRecord {
         }
     }
 
+    /// Whether this record is another surface's Managed Agent, from a slot that is not
+    /// caller-bound: it has a managed use on another surface and none on `channel_id`.
+    pub fn managed_on_another_surface(
+        &self,
+        channel_id: Option<&str>,
+    ) -> bool {
+        let managed_uses = || {
+            self.channel_usage
+                .iter()
+                .filter(|usage| usage.role != Some(IdentityOrigin::ExternalCaller))
+                .map(|usage| {
+                    usage
+                        .channel_config_id
+                        .as_str()
+                })
+                .filter(|id| !id.is_empty())
+        };
+        !self
+            .slot
+            .as_ref()
+            .is_some_and(ManagedSlot::is_caller_bound)
+            && managed_uses().any(|id| Some(id) != channel_id)
+            && !managed_uses().any(|id| Some(id) == channel_id)
+    }
+
     /// Number of rotations of this identity's credential, in its history and on the record.
     pub fn total_rotations(&self) -> usize {
         self.rotation_count + self.rotations.len()
@@ -339,16 +370,29 @@ impl AgentIdentityRecord {
         &self,
         source: &ManagedIdentitySource,
     ) -> bool {
-        self.slot.is_none()
+        self.replaces_slot(source)
             || source
                 .credential_updated_at
                 .is_some_and(|updated_at| self.credential_updated_at != Some(updated_at))
     }
 
+    /// Whether `source` sets the slot: one is not known yet, or a slot that is not
+    /// caller-bound replaces a caller-bound one.
+    fn replaces_slot(
+        &self,
+        source: &ManagedIdentitySource,
+    ) -> bool {
+        match &self.slot {
+            None => true,
+            Some(slot) => slot.is_caller_bound() && !source.slot.is_caller_bound(),
+        }
+    }
+
     /// Records `source` on this managed identity, now derived with `identity_fields`, and
     /// returns whether anything changed.
     ///
-    /// The slot is kept once known. A credential's first `updated_at` is stored as the
+    /// The slot is kept once known, except that a slot which is not caller-bound replaces a
+    /// caller-bound one, never the reverse. A credential's first `updated_at` is stored as the
     /// baseline. After that, an mTLS certificate rotates when its identity fields change, and
     /// any other credential, whose fields don't describe its value, whenever its `updated_at`
     /// changes. A field change seen when the baseline is stored is a rotation of unknown time.
@@ -361,7 +405,7 @@ impl AgentIdentityRecord {
         if !self.would_change(source) {
             return false;
         }
-        if self.slot.is_none() {
+        if self.replaces_slot(source) {
             self.slot = Some(source.slot.clone());
         }
         let Some(updated_at) = source
@@ -1589,6 +1633,38 @@ mod tests {
         );
         assert_eq!(record.credential_updated_at, None);
         assert!(record.rotations.is_empty());
+    }
+
+    #[test]
+    fn a_slot_that_is_not_caller_bound_replaces_a_caller_bound_one() {
+        let mut record = local_record("h");
+        let fields = record.identity_fields.clone();
+        let caller_bound = ManagedIdentitySource::caller_bound_transit_point("tp-1");
+
+        assert!(record.apply_managed_source(&caller_bound, &fields));
+        assert!(record.would_change(&ManagedIdentitySource::protected()));
+        assert!(record.apply_managed_source(&ManagedIdentitySource::protected(), &fields));
+
+        assert_eq!(record.slot, Some(ManagedSlot::Protected));
+    }
+
+    #[test]
+    fn a_caller_bound_slot_never_replaces_one_that_is_not() {
+        let mut record = local_record("h");
+        let fields = record.identity_fields.clone();
+        let caller_bound = ManagedIdentitySource::caller_bound_transit_point("tp-1");
+
+        assert!(record.apply_managed_source(&ManagedIdentitySource::transit_point("tp-2"), &fields));
+        assert!(!record.would_change(&caller_bound));
+        assert!(!record.apply_managed_source(&caller_bound, &fields));
+
+        assert_eq!(
+            record.slot,
+            Some(ManagedSlot::TransitPoint {
+                alias: "tp-2".into(),
+                caller_bound: false
+            })
+        );
     }
 
     #[test]

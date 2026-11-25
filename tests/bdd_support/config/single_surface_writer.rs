@@ -463,6 +463,21 @@ fn write_single_surface_config_inner(
         if let Some(secs) = surface_config.transit_token_lifetime_secs {
             transit_json["transit_token_lifetime_secs"] = serde_json::json!(secs);
         }
+        if let Some((variant, alias)) = &surface_config.variant_caller_key_transit_point {
+            let mut variant_points = points.clone();
+            let point = variant_points
+                .iter_mut()
+                .find(|point| point["alias"] == alias.as_str())
+                .unwrap_or_else(|| panic!("variant '{variant}' overrides unknown Transit Point '{alias}'"));
+            point["managed_identity"] = serde_json::json!({ "type": "from_api_key" });
+            point["identity_injection"] = serde_json::json!({ "inject_vp": true });
+            surface_fixture
+                .variants
+                .push(serde_json::json!({
+                    "id": format!("{variant}-id"), "alias": variant, "name": variant, "description": "",
+                    "enabled": true, "overrides": { "transit": { "points": variant_points } }
+                }));
+        }
         surface_fixture = surface_fixture.with_transit(transit_json);
     }
     for element in &surface_config.caller_trust_check_list {
@@ -556,6 +571,14 @@ fn write_single_surface_config_inner(
             inbound_slot["strip_raw_meta"] = serde_json::json!(true);
         }
         surface_fixture = surface_fixture.with_identity_slot("inbound", inbound_slot);
+    }
+
+    if surface_config.inbound_identity_from_unnamed_certificate {
+        surface_fixture = surface_fixture.with_identity_slot("inbound", serde_json::json!({ "type": "from_mtls" }));
+    }
+    if let Some(did) = &surface_config.inbound_static_did {
+        surface_fixture =
+            surface_fixture.with_identity_slot("inbound", serde_json::json!({ "type": "static", "did": did }));
     }
 
     if let Some(key_id) = &surface_config.protected_identity_api_key_id {

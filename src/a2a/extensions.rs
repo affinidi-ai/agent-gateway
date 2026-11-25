@@ -366,12 +366,17 @@ const ASSERTED_IDENTITY_EXTENSIONS: [&str; 3] = [
 ];
 
 /// Removes every agent identity the request's message asserts, from its
-/// `extensions` and its `metadata`, so none is forwarded. A body that is not an
-/// A2A request with a message is returned unchanged.
-pub fn remove_asserted_identity(body_bytes: &bytes::Bytes) -> bytes::Bytes {
-    let Ok(mut body_json) = serde_json::from_slice::<JsonValue>(body_bytes) else {
-        return body_bytes.clone();
-    };
+/// `extensions` and its `metadata`, so none is forwarded. An empty body, and a
+/// JSON object without a message, are returned unchanged; `None` for any other
+/// body that is not exactly one JSON object, such as a batch, whose identities
+/// could not all be removed.
+pub fn remove_asserted_identity(body_bytes: &bytes::Bytes) -> Option<bytes::Bytes> {
+    if body_bytes.is_empty() {
+        return Some(body_bytes.clone());
+    }
+    let mut body_json = serde_json::from_slice::<JsonValue>(body_bytes)
+        .ok()
+        .filter(JsonValue::is_object)?;
     let path = if body_json
         .pointer("/params/message")
         .is_some()
@@ -384,7 +389,7 @@ pub fn remove_asserted_identity(body_bytes: &bytes::Bytes) -> bytes::Bytes {
         .pointer_mut(path)
         .and_then(JsonValue::as_object_mut)
     else {
-        return body_bytes.clone();
+        return Some(body_bytes.clone());
     };
     if let Some(extensions) = message
         .get_mut("extensions")
@@ -403,7 +408,9 @@ pub fn remove_asserted_identity(body_bytes: &bytes::Bytes) -> bytes::Bytes {
             metadata.remove(uri);
         }
     }
-    serde_json::to_vec(&body_json).map_or_else(|_| body_bytes.clone(), bytes::Bytes::from)
+    serde_json::to_vec(&body_json)
+        .ok()
+        .map(bytes::Bytes::from)
 }
 
 /// A JSON-RPC `result` read as a Task or Message. A v1.0 `SendMessage` result
@@ -1776,5 +1783,50 @@ mod tests {
         let (injected, _did) = inject_backend_vp(&body).await;
 
         assert!(injected.is_none());
+    }
+
+    #[test]
+    fn asserted_identity_is_removed_from_a_message() {
+        let body = bytes::Bytes::from(
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "message/send", "params": { "message": {
+                "messageId": "m", "role": "user", "parts": [],
+                "extensions": [IDENTITY_URI, CREDENTIAL_URI, "https://example.com/other"],
+                "metadata": { IDENTITY_URI: { "name": "copied" }, CREDENTIAL_URI: "vp", "kept": true }
+            } } })
+            .to_string(),
+        );
+
+        let removed: serde_json::Value =
+            serde_json::from_slice(&remove_asserted_identity(&body).expect("one JSON object")).unwrap();
+
+        assert_eq!(removed["params"]["message"]["extensions"], json!(["https://example.com/other"]));
+        assert_eq!(removed["params"]["message"]["metadata"], json!({ "kept": true }));
+    }
+
+    #[test]
+    fn a_body_without_a_message_is_kept_unchanged() {
+        let body = bytes::Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"t"}}"#);
+
+        assert_eq!(remove_asserted_identity(&body), Some(body.clone()));
+        assert_eq!(remove_asserted_identity(&bytes::Bytes::new()), Some(bytes::Bytes::new()));
+    }
+
+    #[test]
+    fn a_body_that_is_not_one_json_object_has_no_identity_removed() {
+        let message = json!({ "jsonrpc": "2.0", "id": 1, "method": "message/send", "params": { "message": {
+            "messageId": "m", "role": "user", "parts": [], "extensions": [IDENTITY_URI] } } });
+        for (case, body) in [
+            (
+                "batch",
+                json!([message])
+                    .to_string()
+                    .into_bytes(),
+            ),
+            ("byte order mark", [b"\xEF\xBB\xBF".as_slice(), message.to_string().as_bytes()].concat()),
+            ("string", br#""text""#.to_vec()),
+            ("not JSON", b"not json".to_vec()),
+        ] {
+            assert_eq!(remove_asserted_identity(&bytes::Bytes::from(body)), None, "{case}");
+        }
     }
 }

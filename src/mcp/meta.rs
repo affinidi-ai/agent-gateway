@@ -365,8 +365,16 @@ pub fn remove_metadata_key(
     body: &mut Value,
     key: &str,
 ) -> bool {
+    remove_metadata_key_at(body, key, &["/_meta", "/params/_meta", "/result/_meta"])
+}
+
+fn remove_metadata_key_at(
+    body: &mut Value,
+    key: &str,
+    paths: &[&str],
+) -> bool {
     let mut removed = false;
-    for path in ["/_meta", "/params/_meta", "/result/_meta"] {
+    for path in paths {
         if let Some(metadata) = body
             .pointer_mut(path)
             .and_then(Value::as_object_mut)
@@ -387,21 +395,37 @@ pub fn remove_metadata_key(
     removed
 }
 
-/// Removes every agent identity a message's `_meta` asserts (the raw identity,
-/// a signed credential and a caller binding, under either key spelling), so none
-/// is forwarded. A body that is not JSON is returned unchanged.
+/// The `_meta` keys through which an MCP message asserts an agent identity: the
+/// raw identity, a signed credential and a caller binding (each under either
+/// key spelling), and the gateway-reserved `agentIdentity` and
+/// `didwebvhIdentity`.
+const ASSERTED_IDENTITY_KEYS: [&str; 5] = [
+    crate::config::MCP_AGENT_IDENTITY_KEY,
+    crate::config::MCP_AGENT_IDENTITY_CREDENTIAL_KEY,
+    crate::config::MCP_AGENT_IDENTITY_BINDING_KEY,
+    "agentIdentity",
+    "didwebvhIdentity",
+];
+
+/// Removes every agent identity a message's `_meta` asserts (see
+/// [`ASSERTED_IDENTITY_KEYS`]), so none is forwarded. A body that is not JSON
+/// is returned unchanged.
 pub fn remove_asserted_identity(body: &bytes::Bytes) -> bytes::Bytes {
     let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
         return body.clone();
     };
-    for key in [
-        crate::config::MCP_AGENT_IDENTITY_KEY,
-        crate::config::MCP_AGENT_IDENTITY_CREDENTIAL_KEY,
-        crate::config::MCP_AGENT_IDENTITY_BINDING_KEY,
-    ] {
+    for key in ASSERTED_IDENTITY_KEYS {
         remove_metadata_key(&mut value, key);
     }
     serde_json::to_vec(&value).map_or_else(|_| body.clone(), bytes::Bytes::from)
+}
+
+/// [`remove_asserted_identity`] on a request's `params`, as captured when the
+/// request was admitted.
+pub fn remove_asserted_identity_from_params(params: &mut Value) {
+    for key in ASSERTED_IDENTITY_KEYS {
+        remove_metadata_key_at(params, key, &["/_meta"]);
+    }
 }
 
 pub fn validate_raw_identity_key(
@@ -509,6 +533,32 @@ mod tests {
         assert!(remove_metadata_key(&mut body, "gone"));
         assert!(!remove_metadata_key(&mut body, "gone"));
         assert_eq!(body, serde_json::json!({"params": {"_meta": {"kept": 1}}}));
+    }
+
+    #[test]
+    fn every_asserted_identity_is_removed_including_the_gateway_reserved_keys() {
+        let copied = serde_json::json!({"did": "did:example:copied"});
+        let meta = serde_json::json!({
+            crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION: copied,
+            crate::config::MCP_AGENT_IDENTITY_CREDENTIAL_KEY: copied,
+            crate::config::MCP_AGENT_IDENTITY_BINDING_KEY: copied,
+            "agentIdentity": copied,
+            "didwebvhIdentity": copied,
+            "progressToken": 7
+        });
+        let body = bytes::Bytes::from(
+            serde_json::json!({"method": "tools/call", "_meta": meta, "params": {"name": "echo", "_meta": meta}})
+                .to_string(),
+        );
+
+        let removed: serde_json::Value = serde_json::from_slice(&remove_asserted_identity(&body)).unwrap();
+
+        assert_eq!(removed["_meta"], serde_json::json!({"progressToken": 7}));
+        assert_eq!(removed["params"]["_meta"], serde_json::json!({"progressToken": 7}));
+
+        let mut params = serde_json::json!({"name": "echo", "_meta": meta});
+        remove_asserted_identity_from_params(&mut params);
+        assert_eq!(params, serde_json::json!({"name": "echo", "_meta": {"progressToken": 7}}));
     }
 
     #[test]

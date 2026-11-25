@@ -1979,7 +1979,12 @@ give it a Managed Agent record.
 
 A caller using a Managed Agent's key on another surface that accepts it is recorded as a caller
 use of that surface. It does not make that surface one of the Managed Agent's managed surfaces,
-so the Managed Agent keeps its name (see [Managed agents](#managed-agents)).
+so the Managed Agent keeps its name (see [Managed agents](#managed-agents)). The same holds for
+a Transit Point that takes its managed agent's DID from its caller's key (see
+[Transit Point identity from its caller](#transit-point-identity-from-its-caller)): presented
+the key of another surface's Managed Agent, it uses that agent's DID and is recorded as a
+caller use of its own surface. A DID that is new, or already that Transit Point's own, is
+recorded as its managed agent.
 
 Request-time refusals return a fixed body and log the cause server-side. Each counts in
 `agent_gateway_managed_identity_resolve_total` with `mode="from_api_key"`, whose `channel_id`
@@ -2009,7 +2014,7 @@ the request body or a stored credential:
 | `from_api_key` without `api_key_id` | API Key Provider | One DID per key, derived from its key id | `source_auth` |
 | | API Key | One DID per secret, shared by every caller holding a value of that secret | `unverified` |
 | `from_jwt_claim` (`claim`, `namespace_claims`) | JWT Bearer | One DID per value of `claim`, namespaced by the values of `namespace_claims`, in the token the Transit Point verified | `source_auth` |
-| `from_mtls` without `certificate_id` | mTLS | One DID per trusted CA, identity binding and principal: the hash of the subject and public key of the CA (or the pinned certificate) the client certificate was verified against, the Transit Point's `identity_binding` (its `type`, and its `oid` for `subject_rdn`), and the principal that binding derives. A renewed certificate with the same principal under the same CA and binding keeps the DID; the same principal under another CA, or one value read through another binding (a CN equal to a DNS SAN or to a leaf fingerprint), gets another. Under pinned trust the anchor is the pinned certificate, which is the presented one, so a renewed certificate that is pinned again gets a new DID | `source_auth` |
+| `from_mtls` without `certificate_id` | mTLS | One DID per trusted CA, identity binding and principal: the hash of the subject and public key of the CA the client certificate was verified against, or under pinned trust the SHA-256 fingerprint of the pinned certificate, the Transit Point's `identity_binding` (its `type`, and its `oid` for `subject_rdn`), and the principal that binding derives. A renewed certificate with the same principal under the same CA and binding keeps the DID; the same principal under another CA, or one value read through another binding (a CN equal to a DNS SAN or to a leaf fingerprint), gets another. Under pinned trust the anchor is the pinned certificate, which is the presented one, so a renewed certificate that is pinned again gets a new DID | `source_auth` |
 
 The identity fields and hash are the ones the inbound slot derives from a presented key, or
 the Access Point's `from_jwt_claim` from a verified token, and the DID is looked up by that hash,
@@ -2020,22 +2025,31 @@ managed agent (`origin` `managed`, `slot`
 managed agent's display name. The Identities page lists each such DID as its own row, not as a
 version of the Managed Agent (see [Identity versions](#identity-versions)). A record's origin is set once, by its first
 use: a DID first issued to an Access Point caller stays an external caller record, and the
-Transit Point still uses that DID. A client certificate's identity fields are
+Transit Point still uses that DID. A DID that is another surface's Managed Agent, from a stored
+key or certificate, is recorded as a caller use of this surface, so that agent keeps its name
+(see [One key in both roles](#one-key-in-both-roles)). A slot that is not caller-bound, such as
+the Managed Agent's own stored key, later replaces `caller_bound`; a caller-bound use never
+replaces another slot. A client certificate's identity fields are
 `credential_type` `mtls_caller`, `trust_anchor_fingerprint`, `identity_binding` (the binding's
 `type`), `identity_binding_oid` (for `subject_rdn` only) and `principal`; its hash never equals
 that of a stored certificate (`credential_type` `mtls`). Changing the Transit Point's
 `identity_binding` gives its callers new DIDs.
 
 A JWT claim's DID is hashed from the values of `claim` and `namespace_claims` only, not from
-the token's issuer. A Transit Point that verifies tokens from another identity provider than
-the Access Point, or two identity providers that issue the same claim value, give both callers
-one DID. List `iss` in `namespace_claims` to keep them apart; this applies on the Access Point
-too. A save (and each enabled variant as resolved) answers with a `Warning` header for each
-Transit Point whose own `from_jwt_claim` leaves `iss` out of `namespace_claims` while its
-`source_auth` verifies tokens through a JWT verification strategy the Access Point does not
+the token's issuer, and is shared across the gateway: every Access Point and Transit Point, on
+any surface, that reads the same claim values gives them the same DID, including two surfaces
+that trust different identity providers. A Transit Point that verifies tokens from another
+identity provider than the Access Point, or two identity providers that issue the same claim
+value, give both callers one DID. List `iss` in `namespace_claims` whenever more than one
+identity provider issues tokens the gateway reads a claim identity from; this applies on the
+Access Point too. A save (and each enabled variant as resolved) answers with a `Warning` header
+for each Transit Point whose own `from_jwt_claim` leaves `iss` out of `namespace_claims` while
+its `source_auth` verifies tokens through a JWT verification strategy the Access Point does not
 accept: "Transit Point '<alias>' takes its managed agent's DID from a JWT claim verified through
 strategy '<strategy>', which the Access Point does not use: a token from another identity
-provider with the same claim value gets the same DID; add 'iss' to namespace_claims".
+provider with the same claim value gets the same DID; add 'iss' to namespace_claims". For a
+variant that sets its own Access Point caller authentication, the warning names "the Access
+Point of variant '<variant>'" instead.
 
 Every Transit Point policy reads the managed agent's DID and its **Counts as** value in
 `input.extension_identity`, as the Access Point reports its caller; see
@@ -2058,11 +2072,17 @@ Every Transit Point policy reads the managed agent's DID and its **Counts as** v
 - Once the identity is derived, every identity the request body asserts is removed before the
   request is forwarded: in an A2A message, the `agent-identity/v1`,
   `agent-identity-credential/v1` and `agent-identity-binding/v1` entries of `extensions` and
-  `metadata`; in an MCP message, the same three in `_meta`, under either key spelling. The
-  destination receives only the gateway's own identity presentation, or none when no DID is
-  issued. An `http` Transit Point reads its requests in its surface's protocol, so the same
-  entries are removed there. A request read in a protocol with no identity carrier (DIDComm) is
-  refused with `500`, as identity injection refuses it.
+  `metadata`; in an MCP message, the same three in `_meta`, under either key spelling, and the
+  gateway-reserved `agentIdentity` and `didwebvhIdentity`. On a `2026-07-28` MCP request they
+  are removed from the request policy reads too (`input.mcp.params._meta`), so policy, MCP tool
+  gating and Trust Check never see the asserted identity. The destination receives only the
+  gateway's own identity presentation, or none when no DID is issued. An `http` Transit Point
+  reads its requests in its surface's protocol, so the same entries are removed there. A request
+  read in a protocol with no identity carrier (DIDComm) is refused with `500`, as identity
+  injection refuses it. An A2A body that is not exactly one JSON object, such as a JSON-RPC
+  batch or a body that starts with a byte order mark, is refused with `400` and JSON-RPC error
+  `-32600`, since its identities cannot all be removed; an object without a message, such as
+  `tasks/get`, is forwarded unchanged.
 - Without a VC issuer (`vc_issuer_missing`), or when issuance fails (`vc_issuer_error`), an API
   key or client certificate caller is not refused: it resolves no managed agent identity and
   policy decides. A JWT caller is refused as on the Access Point's `from_jwt_claim`: `500`
@@ -2094,7 +2114,11 @@ certificate: a `from_mtls` there without a non-empty `certificate_id` is refused
 "identity_slots.<slot>: Identity 'From mTLS certificate' needs a non-empty certificate_id", and
 one that reaches the request path anyway, such as one written to storage by hand, is refused with
 `500` and the body `Caller identity could not be resolved`, counted with `mode="from_mtls"` and
-`certificate_id_missing`. At startup the gateway logs "Channel '<name>': identity from_mtls
+`certificate_id_missing`. A Transit Point that inherits such a stored identity (with
+`identity_injection.inject_vp`) refuses with the body `Identity resolution failed: Caller
+identity could not be resolved`, as it does for any stored key or certificate it cannot derive
+the DID from: `500` when misconfigured, `502` when the VC issuer cannot issue the DID, and `503`
+when a store is unavailable. At startup the gateway logs "Channel '<name>': identity from_mtls
 without a certificate_id; requests other than discovery reads are refused until the surface is
 fixed" for such a surface.
 
@@ -2173,7 +2197,7 @@ Each managed identity record ([`filesystem.rs`](../src/identity/filesystem.rs)) 
 
 | Field | Holds |
 | --- | --- |
-| `slot` | The slot whose setting created it: `{"kind": "protected"}` (the protected slot, the surface `managed_identity`, an A2A proxy target, or a Transit Point that inherits the surface setting), or `{"kind": "transit_point", "alias": …}` for a Transit Point's own `managed_identity`, with `"caller_bound": true` (omitted otherwise) when it takes the DID from its caller's credential and the Transit Point issued that DID first. Set on creation, and on the first use of a record written before slot tracking. |
+| `slot` | The slot whose setting created it: `{"kind": "protected"}` (the protected slot, the surface `managed_identity`, an A2A proxy target, or a Transit Point that inherits the surface setting), or `{"kind": "transit_point", "alias": …}` for a Transit Point's own `managed_identity`, with `"caller_bound": true` (omitted otherwise) when it takes the DID from its caller's credential and the Transit Point issued that DID first. Set on creation, and on the first use of a record written before slot tracking; a slot that is not caller-bound replaces a `caller_bound` one, never the reverse. |
 | `credential_updated_at` | The `updated_at` of the stored certificate or secret the identity was last derived from. |
 | `rotation_count` | How many rotations of that credential its rotation history holds. Omitted while there are none. |
 
