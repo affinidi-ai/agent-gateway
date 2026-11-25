@@ -190,9 +190,11 @@ release that addresses its presentations, since older gateways mint them with no
 Without an attested peer issuer, no issuer counts as relayed, so every presentation must be
 addressed to this gateway when it names a recipient: on a connection whose record holds
 hand-trusted issuers but no `issuer_did`, a relayed presentation addressed elsewhere is refused.
-The answer path does not run the issuer exchange for a hand-trusted issuer, so a connection that
-carries only answers stays unattested until the exchange runs at listener start or on a request
-over the connection. The setting is API-only: the Edit Gateway page does not show it, and a
+The answer path does not run the issuer exchange for a hand-trusted issuer, so attest the peer
+with `POST /v1/gateways/{id}/issuer`, or restart the listener, which runs the exchange at start; a
+request this gateway receives from the peer also runs it. A peer too old to answer the exchange
+needs an upgrade first; until then, relayed presentations addressed elsewhere stay refused on
+that connection. The setting is API-only: the Edit Gateway page does not show it, and a
 dashboard save keeps the stored value.
 
 Accepted risk: a presentation with no `domain` is still accepted, and the gateway mints such

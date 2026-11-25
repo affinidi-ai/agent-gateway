@@ -287,35 +287,69 @@ fn mcp_answer_credential(response_json: &JsonValue) -> Result<Option<&JsonValue>
 }
 
 /// Find the credential extension on the agent's message, where GW2 places it
-/// (see `backend_identity::extract_a2a_identity_from_response_message_with_uri`),
-/// and verify its presentation. Artifacts are not read: GW2 never puts a
-/// credential there.
+/// (see `crate::a2a::extensions::inject_vp_into_a2a_response`), and verify its
+/// presentation. Every message location is read whatever else the body holds
+/// (see [`a2a_answer_credential`]), so a request-shaped `params.message` cannot
+/// hide the credential; copies that differ are refused. Artifacts are not
+/// read: GW2 never puts a credential there.
 async fn extract_a2a_fabric_identity(
     response_json: &JsonValue,
     vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
     channel_name: &str,
 ) -> Result<Option<ResponsePresentation>, String> {
-    use crate::proxy::backend_identity::{
-        IdentityExtractionError, extract_a2a_identity_from_response_message_with_uri,
-    };
-
-    match extract_a2a_identity_from_response_message_with_uri(
-        response_json,
-        crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION,
-    ) {
-        Ok(credential_ext) => {
+    match a2a_answer_credential(response_json) {
+        Ok(Some(credential_ext)) => {
             info!(channel = channel_name, "Fabric: Found VP credential extension from GW2");
-            verify_fabric_credential(&credential_ext, vc_issuer, channel_name).await
+            verify_fabric_credential(credential_ext, vc_issuer, channel_name).await
         }
-        Err(IdentityExtractionError::DeclaredButMissing) => {
-            warn!(channel = channel_name, "Fabric: VP credential extension declared but not found in metadata");
+        Ok(None) => {
+            debug!(channel = channel_name, "Fabric: No VP credential extension in response");
             Ok(None)
         }
         Err(e) => {
-            debug!(channel = channel_name, reason = %e, "Fabric: No VP credential extension in response");
-            Ok(None)
+            warn!(channel = channel_name, error = e, "✗ Fabric: A2A answer credential cannot be read");
+            Err(format!("VP verification failed for server agent identity: {e}"))
         }
     }
+}
+
+/// The identity credential an A2A answer carries in the metadata of any message
+/// location: a request-shaped `params.message` or top-level `message`, and in
+/// the `result` (and the Task a v1.0 `result.task` wraps) its `message`,
+/// `status.message`, or the result itself when it is a bare Message. A
+/// location that declares the extension without a payload carries none. Copies
+/// that differ are refused.
+fn a2a_answer_credential(response_json: &JsonValue) -> Result<Option<&JsonValue>, &'static str> {
+    let ext_uri = crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION;
+    let outer = response_json.get("result");
+    let task = outer
+        .map(crate::a2a::extensions::unwrap_task_result)
+        .filter(|task| !outer.is_some_and(|outer| std::ptr::eq(*task, outer)));
+    let mut locations = vec![response_json.pointer("/params/message"), response_json.get("message")];
+    for result in [outer, task]
+        .into_iter()
+        .flatten()
+    {
+        locations.extend([result.get("message"), result.pointer("/status/message"), Some(result)]);
+    }
+    let mut found: Option<&JsonValue> = None;
+    for credential in locations
+        .into_iter()
+        .flatten()
+        .filter_map(|message| {
+            message
+                .get("metadata")?
+                .get(ext_uri)
+        })
+    {
+        match found {
+            Some(existing) if existing != credential => {
+                return Err("A2A answer carries conflicting identity credentials");
+            }
+            _ => found = Some(credential),
+        }
+    }
+    Ok(found)
 }
 
 /// Verify the VP carried by GW2's credential extension. Rejects a credential
@@ -1520,5 +1554,82 @@ mod tests {
 
         // Had the artifact been read, the bad presentation would fail verification.
         assert_eq!(extract(&response, Some(&issuer)).await, Ok(None));
+    }
+
+    /// Check an A2A answer from the peer whose issuer signed `signed`, sent
+    /// from the Connection Point `did:example:local-cp`.
+    async fn checked_a2a_answer(
+        signed: &crate::identity::test_helpers::SignedAgentPresentation,
+        response: &JsonValue,
+    ) -> (
+        Result<Option<ResponsePresentation>, AnswerIdentityRefusal>,
+        Vec<crate::delegation_vault::audit::DelegationAuditEvent>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let (manager, gateway_id, _issuer_dir) = manager_with_peer(root.path(), &signed.issuer_did).await;
+        let body = response.to_string();
+        let surface = surface();
+        let facts = facts();
+        crate::audit::producer::capture(check_answer_identity(AnswerIdentityCheck {
+            response_body: &body,
+            surface: &surface,
+            vc_issuer: Some(&signed.issuer),
+            listener_manager: Some(manager),
+            gateway_id: &gateway_id,
+            recipient_did: Some("did:example:local-cp"),
+            facts: &facts,
+            caller: None,
+        }))
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_a2a_answer_addressed_to_the_calling_connection_point_is_attributed() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation_bound_to("did:example:local-cp").await;
+
+        let (result, events) = checked_a2a_answer(&signed, &credential_response(&signed.presentation)).await;
+
+        match result {
+            Ok(Some(presentation)) => assert_eq!(presentation.agent_did, signed.holder_did),
+            other => panic!("expected an attributed presentation, got {other:?}"),
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(
+                    event.event,
+                    crate::delegation_vault::audit::DelegationAuditAction::IdentityBindingVerified { .. }
+                )),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_params_message_does_not_hide_a_wrong_recipient_presentation_in_an_a2a_answer() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation_bound_to("did:example:other-cp").await;
+        let mut response = credential_response(&signed.presentation);
+        response["params"] = json!({ "message": {} });
+
+        let (result, events) = checked_a2a_answer(&signed, &response).await;
+
+        assert!(matches!(result, Err(AnswerIdentityRefusal::Invalid(_))), "{result:?}");
+        assert_eq!(failed_outcome(&events), Some(crate::audit::events::IdentityBindingFailure::Invalid));
+    }
+
+    #[test]
+    fn a2a_answer_credential_refuses_differing_copies_in_params_message_and_the_result() {
+        let mut answer = v1_task(agent_message(CREDENTIAL_URI, json!({ "did": "did:example:a" })));
+        answer["params"] = json!({ "message": agent_message(CREDENTIAL_URI, json!({ "did": "did:example:b" })) });
+
+        assert_eq!(a2a_answer_credential(&answer), Err("A2A answer carries conflicting identity credentials"));
+    }
+
+    #[test]
+    fn a2a_answer_credential_accepts_identical_copies() {
+        let credential = json!({ "did": "did:example:a" });
+        let mut answer = v1_task(agent_message(CREDENTIAL_URI, credential.clone()));
+        answer["params"] = json!({ "message": agent_message(CREDENTIAL_URI, credential.clone()) });
+
+        assert_eq!(a2a_answer_credential(&answer), Ok(Some(&credential)));
     }
 }

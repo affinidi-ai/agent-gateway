@@ -1571,12 +1571,16 @@ client that sets none, is still accepted. A refused presentation is refused with
 each) and the recipient DID; the request is then treated as one whose presentation failed, and
 an answer to an Access Point with a managed identity whose Target is `fabric://` is refused with
 `502` and recorded as an `invalid` identity binding (answers to a Transit Point over Fabric, and
-to an Access Point without a managed identity, are not checked).
+to an Access Point without a managed identity, are not checked). A refused answer to a modern MCP
+request sent as `text/event-stream` has already sent its `200`, so its stream ends early instead
+and only the VP Audit Log records the refusal.
 
 A presentation's proof may expire at most 5 minutes after it is verified, plus 2 minutes of
 clock skew. A proof with both `created` and `expires` may span at most 5 minutes plus 2 minutes
 of clock skew between them. No proof may be created more than 2 minutes ahead of the gateway's
-clock. The gateway mints its own presentations with a 5 minute lifetime.
+clock. A proof with `expires` but no `created` is bounded only by its `expires`, so it is accepted
+in the last 7 minutes before it expires. The gateway mints its own presentations with `created`
+and a 5 minute lifetime.
 
 A paired gateway may relay a presentation another gateway issued, which names that other
 gateway's recipient. Over Fabric such a presentation is accepted when its issuer is one the

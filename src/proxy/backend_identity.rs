@@ -1008,20 +1008,6 @@ pub fn extract_a2a_identity_from_message_with_uri(
     extract_a2a_identity_from_locations(json, ext_uri, response_identity_candidates)
 }
 
-/// Like [`extract_a2a_identity_from_message_with_uri`], but on a response reads
-/// only the agent's message (see [`response_message_candidates`]), never
-/// `artifacts[]`.
-///
-/// Used on the calling side of Fabric, where the peer gateway places the
-/// credential only on that message, so an identity found in an artifact was not
-/// put there by the peer gateway.
-pub fn extract_a2a_identity_from_response_message_with_uri(
-    json: &JsonValue,
-    ext_uri: &str,
-) -> Result<JsonValue, IdentityExtractionError> {
-    extract_a2a_identity_from_locations(json, ext_uri, response_message_candidates)
-}
-
 fn extract_a2a_identity_from_locations(
     json: &JsonValue,
     ext_uri: &str,
@@ -1128,14 +1114,6 @@ fn response_identity_candidates(result: &JsonValue) -> Vec<&JsonValue> {
     }
 
     candidates
-}
-
-/// Location 1 of [`response_identity_candidates`] only: the agent's status
-/// message, without `artifacts[]`.
-fn response_message_candidates(result: &JsonValue) -> Vec<&JsonValue> {
-    response_message(crate::a2a::extensions::unwrap_task_result(result))
-        .into_iter()
-        .collect()
 }
 
 /// The agent's message in an unwrapped response `result`: `result.message`,
