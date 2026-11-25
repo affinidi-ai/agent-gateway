@@ -442,7 +442,15 @@ impl SamlService {
         let mut attributes = assertion
             .attribute_statements
             .as_deref()
-            .map(collect_attributes)
+            .map(|statements| {
+                collect_attributes_for_identity(
+                    statements,
+                    &self
+                        .config
+                        .attribute_mapping
+                        .user_id,
+                )
+            })
             .unwrap_or_default();
 
         // Also extract NameID if present
@@ -459,6 +467,23 @@ impl SamlService {
     pub fn config(&self) -> &SamlConfig {
         &self.config
     }
+}
+
+/// [`collect_attributes`], except that the user ID attribute counts only when the first attribute
+/// statement carries it, as before roles were read from every statement; otherwise the account is
+/// found by the `NameID`, so an existing account is never matched to a different key.
+fn collect_attributes_for_identity(
+    statements: &[AttributeStatement],
+    user_id_attribute: &str,
+) -> SamlAttributes {
+    let mut attributes = collect_attributes(statements);
+    let in_first_statement = statements
+        .first()
+        .is_some_and(|first| collect_attributes(std::slice::from_ref(first)).contains_key(user_id_attribute));
+    if !in_first_statement {
+        attributes.remove(user_id_attribute);
+    }
+    attributes
 }
 
 /// Gather every value of every attribute across all attribute statements, appending the values of
@@ -774,6 +799,28 @@ mod tests {
         let reversed = collect_attributes(&[second, first]);
         assert_eq!(forward["role"], vec!["gw-admins", "contractors"]);
         assert_eq!(reversed["role"], vec!["contractors", "gw-admins"]);
+    }
+
+    #[test]
+    fn a_user_id_attribute_only_in_a_later_statement_is_not_collected() {
+        let collected = collect_attributes_for_identity(
+            &[
+                statement(vec![attribute("email", &["a@example.test"])]),
+                statement(vec![attribute("uid", &["later"]), attribute("role", &["gw-admins"])]),
+            ],
+            "uid",
+        );
+        assert!(!collected.contains_key("uid"));
+        assert_eq!(collected["role"], vec!["gw-admins"]);
+    }
+
+    #[test]
+    fn a_user_id_attribute_in_the_first_statement_keeps_the_values_of_later_ones() {
+        let collected = collect_attributes_for_identity(
+            &[statement(vec![attribute("uid", &["one"])]), statement(vec![attribute("uid", &["two"])])],
+            "uid",
+        );
+        assert_eq!(collected["uid"], vec!["one", "two"]);
     }
 
     #[test]

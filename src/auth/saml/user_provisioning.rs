@@ -57,20 +57,13 @@ fn changes_reported_state(
     old.role != new.role || old.status != new.status || old.is_primary != new.is_primary
 }
 
-/// The first value of `attribute` when present, else of `fallback`, and whether the one used carries
-/// more than one distinct value.
+/// Whether `attribute` carries more than one distinct value.
 fn carries_several_values(
     all_attributes: &SamlAttributes,
     attribute: &str,
-    fallback: &str,
 ) -> bool {
-    let used = if all_attributes.contains_key(attribute) {
-        attribute
-    } else {
-        fallback
-    };
     all_attributes
-        .get(used)
+        .get(attribute)
         .into_iter()
         .flatten()
         .collect::<std::collections::HashSet<_>>()
@@ -91,10 +84,10 @@ fn ensure_single_valued_identity(
     config: &SamlConfig,
 ) -> Result<(), AmbiguousAttribute> {
     let mapping = &config.attribute_mapping;
-    if carries_several_values(all_attributes, &mapping.user_id, "NameID") {
+    if carries_several_values(all_attributes, &mapping.user_id) {
         return Err(AmbiguousAttribute { attribute: "user ID" });
     }
-    if carries_several_values(all_attributes, &mapping.username, &mapping.email) {
+    if carries_several_values(all_attributes, &mapping.username) {
         return Err(AmbiguousAttribute { attribute: "username" });
     }
     Ok(())
@@ -148,15 +141,6 @@ pub async fn provision_user_from_saml(
         .context("User ID not found in SAML attributes")?;
     ensure_single_valued_identity(all_attributes, config)?;
 
-    let username = attributes
-        .get(
-            &config
-                .attribute_mapping
-                .username,
-        )
-        .or_else(|| attributes.get(&config.attribute_mapping.email))
-        .context("Username not found in SAML attributes")?;
-
     // Determine role from SAML attributes
     let role = determine_role(all_attributes, config).map_err(|refused| {
         refused.for_subject(
@@ -171,20 +155,9 @@ pub async fn provision_user_from_saml(
         .await;
 
     // Check if user already exists
-    let mut existing_user = storage
+    let existing_user = storage
         .load_user_by_saml_id(user_id_attr)
         .await?;
-    // An account saved under the assertion's NameID before the user ID attribute was read from
-    // every statement is found by it once, and re-keyed to the attribute below.
-    if existing_user.is_none()
-        && let Some(name_id) = attributes
-            .get("NameID")
-            .filter(|name_id| *name_id != user_id_attr)
-    {
-        existing_user = storage
-            .load_user_by_saml_id(name_id)
-            .await?;
-    }
     let mapping = &config.attribute_mapping;
     let email = profile_value(
         all_attributes,
@@ -193,6 +166,11 @@ pub async fn provision_user_from_saml(
             .as_ref()
             .and_then(|user| user.email.as_ref()),
     );
+    let username = attributes
+        .get(&mapping.username)
+        .cloned()
+        .or_else(|| email.clone())
+        .context("Username not found in SAML attributes")?;
     let first_name = profile_value(
         all_attributes,
         &mapping.first_name,
@@ -230,7 +208,6 @@ pub async fn provision_user_from_saml(
         user.last_name = last_name;
         user.department = department;
         user.job_title = job_title;
-        user.saml_id = Some(user_id_attr.clone());
         if !user.is_primary {
             user.role = role?;
         } else {
@@ -801,40 +778,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_user_saved_under_the_name_id_is_found_and_rekeyed_to_the_user_id_attribute() {
+    async fn a_name_id_equal_to_another_users_stored_key_does_not_land_on_that_account() {
         let dir = tempdir().unwrap();
         let (storage, avatars) = user_storage(&dir).await;
-        let config = test_saml_config();
-        let mut before = saml_attributes("name-id-1", "jane");
-        before.remove(&SamlAttributeMapping::default().user_id);
-        before.insert("NameID".to_string(), vec!["name-id-1".to_string()]);
-        let original = provision_user_from_saml(&storage, &before, &config, &avatars)
+        let config = mapped_config();
+        let owner = provision_user_from_saml(&storage, &saml_attributes("shared-key", "owner"), &config, &avatars)
             .await
             .unwrap();
+        let mut attributes = with_role(saml_attributes("newcomer-id", "newcomer"), "gw-admins");
+        attributes.insert("NameID".to_string(), vec!["shared-key".to_string()]);
+
+        let newcomer = provision_user_from_saml(&storage, &attributes, &config, &avatars)
+            .await
+            .unwrap();
+
+        assert!(matches!(newcomer.change, SignInChange::Created));
+        assert_ne!(newcomer.user.user_id, owner.user.user_id);
         assert_eq!(
-            original
+            newcomer
                 .user
                 .saml_id
                 .as_deref(),
-            Some("name-id-1")
+            Some("newcomer-id")
         );
+        let owner_now = storage
+            .load_user_by_saml_id("shared-key")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner_now.user_id, owner.user.user_id);
+        assert_eq!(owner_now.username, "owner");
+    }
 
-        let mut after = saml_attributes("attribute-id-1", "jane");
-        after.insert("NameID".to_string(), vec!["name-id-1".to_string()]);
-        let again = provision_user_from_saml(&storage, &after, &config, &avatars)
+    #[tokio::test]
+    async fn two_emails_with_no_username_attribute_sign_in_and_the_username_follows_the_stored_email() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mapping = SamlAttributeMapping::default();
+        let mut attributes = saml_attributes("saml-1", "jane");
+        attributes.remove(&mapping.username);
+        attributes.insert(mapping.email.clone(), vec!["old@example.test".to_string()]);
+        let first = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap();
+        assert_eq!(first.user.username, "old@example.test");
+
+        attributes.insert(mapping.email, vec!["new@example.test".to_string(), "old@example.test".to_string()]);
+        let again = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
             .await
             .unwrap();
 
-        assert_eq!(again.user.user_id, original.user.user_id);
-        assert_eq!(again.user.saml_id.as_deref(), Some("attribute-id-1"));
-        assert!(matches!(again.change, SignInChange::Updated { .. }));
-        assert_eq!(
-            storage
-                .list_users()
-                .await
-                .unwrap()
-                .len(),
-            1
+        assert_eq!(again.user.email.as_deref(), Some("old@example.test"));
+        assert_eq!(again.user.username, "old@example.test");
+    }
+
+    #[tokio::test]
+    async fn an_assertion_with_neither_a_username_nor_an_email_is_refused() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mapping = SamlAttributeMapping::default();
+        let mut attributes = saml_attributes("saml-1", "jane");
+        attributes.remove(&mapping.username);
+        attributes.remove(&mapping.email);
+
+        let err = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Username not found")
         );
     }
 

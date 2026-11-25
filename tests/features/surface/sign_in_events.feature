@@ -155,7 +155,7 @@ Feature: Sign-in integration events
     And the integration receives a "user.login" event with login method "saml" for user "mallory"
     And human user "mallory" is stored once
 
-  Scenario: A SAML sign-in whose user ID attribute is only in a second statement finds the account saved under the NameID
+  Scenario: A SAML sign-in whose user ID attribute is only in a second statement is found by its NameID
     Given human users sign in with SAML
     And "alpha" has signed in with SAML as the first user and that event was received
     And "mallory" has signed in with SAML carrying the identity provider roles "gw-all" and that event was received
