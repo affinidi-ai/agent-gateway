@@ -2989,7 +2989,7 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
 | List row, chevron               | `agents-row-<id>`, `agents-row-chevron`                                                         |
 | List filter, retry              | `agents-filter-input`, `agents-retry-button`                                                    |
 | List load error, no match       | `agents-load-error`, `agents-no-match`                                                          |
-| Header button                   | `agents-add-surface-button`                                                                    |
+| Header button, empty state docs | `agents-add-surface-button`, `agents-empty-docs-link`                                           |
 | Name, unnamed, endpoint host    | `agents-name`, `agents-unnamed`, `agents-endpoint-host`                                         |
 | Runtime, protocol, activity     | `agents-runtime`, `agents-protocol-badge`, `agents-last-activity`                               |
 | Surfaces, count, names          | `agents-surfaces`, `agents-surfaces-count`, `agents-surface-names`                              |

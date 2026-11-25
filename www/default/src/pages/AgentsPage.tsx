@@ -132,6 +132,7 @@ const AgentsPage: React.FC = () => {
                 body="Agents show up here once they're connected through a surface. Create a surface to start routing, securing, and monitoring your agents."
                 docsHref={DOCS_URL.createFirstSurface}
                 docsLabel="View Docs"
+                docsTestId="agents-empty-docs-link"
               />
             )
           ) : visible.length === 0 ? (
