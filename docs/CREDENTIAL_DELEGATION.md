@@ -54,6 +54,34 @@ endpoint. A create or update of one drops any it is sent, after the endpoint's U
 a retype to `api_key` drops the stored ones, so a retype back to an OAuth type must send them
 again.
 
+### Client secret authentication
+
+`client_authentication` says how an `oauth2_client_credentials` provider, or an
+`oauth2_authorization_code` provider without an `issuer`, sends its client ID and secret with
+each token request: the Client Credentials grant, the code exchange (legacy and `2026-07-28`
+consent) and every refresh.
+
+| `client_authentication` | The gateway sends |
+| --- | --- |
+| unset (default) | `client_id` and `client_secret` in the form body, as before the setting existed |
+| `client_secret_post` | The same: `client_id` and `client_secret` in the form body |
+| `client_secret_basic` | HTTP Basic: the client ID and secret, each form-urlencoded, joined by `:` and base64-encoded (RFC 6749 section 2.3.1), and no client field in the form body |
+
+RFC 6749 section 2.3.1 requires servers to support HTTP Basic, and some accept nothing else: a
+token endpoint that answers 401 `invalid_client` to a provider that works elsewhere usually wants
+`client_secret_basic`. `none` is refused on these types with 400 `client_authentication none is
+only for oauth2_jwt_bearer providers`, since they always send a client secret. An update that
+omits `client_authentication` keeps the stored value, an empty string clears it, and an update
+that changes `provider_type` and omits it drops the stored value. A provider with an `issuer`
+names its method in `token_endpoint_auth_method` instead (see
+[External consent providers](#external-consent-providers)), and the other types refuse the field
+with 400 `client_authentication is only for oauth2_jwt_bearer providers and for
+oauth2_client_credentials and oauth2_authorization_code providers without an issuer`. A stored
+provider without the field keeps sending its client ID and secret in the form body; a gateway
+without the setting ignores it, and its next save of that provider drops it. The consent
+confirmation login client (see [Consent confirmation](#consent-confirmation)) always sends its
+client ID and secret in the form body.
+
 An update is refused with `400` when the provider's service token would read a secret (its API
 key, client ID and secret, signing key or certificate) that is the Response authentication
 `api_key.secret_id` of a surface, or of a variant as it resolves, that sends the provider to its
@@ -283,7 +311,7 @@ record that misses a required one.
 | `jwt_issuer` | Required: the `iss` claim, a service account's `client_email` | Not used: `iss` and `sub` are the client ID |
 | `jwt_subject` | Required: the `sub` claim, the account the token is issued for (with domain-wide delegation, the user to act as; without it, a Google service account's own `client_email`, the same value as `jwt_issuer`). Create, update and `validate` refuse a blank one with 400 `jwt_subject is required for this provider type`. A provider stored without it still signs its grant without `sub`, but every update of it through the provider update endpoint, a signing key rotation included, must name one | Not used |
 | `jwt_certificate_secret_ref` | Not used | Optional: the PEM certificate, whose SHA-256 thumbprint goes in the `x5t#S256` header. Entra needs it; issuers that find the key by `kid`, such as Ory, do not |
-| `client_authentication` | Optional: how the grant's client identifies itself. `none` is a public client: `client_id` in the form body. `client_secret_basic` is HTTP Basic with the client ID and secret, each form-urlencoded (RFC 6749 section 2.3.1). `client_secret_post` puts `client_id` and `client_secret` in the form body. Unset sends no client identity and leaves the client references unread. An update that omits it keeps the stored value, and an empty string clears it. An update that changes `provider_type` away from `oauth2_jwt_bearer` and omits it drops the stored value | Refused with 400 `client_authentication is only for oauth2_jwt_bearer providers`, as on every type but this one |
+| `client_authentication` | Optional: how the grant's client identifies itself. `none` is a public client: `client_id` in the form body. `client_secret_basic` is HTTP Basic with the client ID and secret, each form-urlencoded (RFC 6749 section 2.3.1). `client_secret_post` puts `client_id` and `client_secret` in the form body. Unset sends no client identity and leaves the client references unread. An update that omits it keeps the stored value, and an empty string clears it. An update that changes `provider_type` and omits it drops the stored value | Refused with 400 `client_authentication is only for oauth2_jwt_bearer providers and for oauth2_client_credentials and oauth2_authorization_code providers without an issuer`; see [Client secret authentication](#client-secret-authentication) for those types |
 | `client_id_secret_ref` | Required with a `client_authentication` (400 `client_id_secret_ref is required for this client_authentication`), and sent as `client_id` or inside the Basic credentials; not used without one. An empty string clears it, which the dashboard sends while Not sent is chosen, so a cleared provider holds no reference that would block deleting the secret | Required, sent as `client_id` |
 | `client_secret_secret_ref` | Required with `client_secret_basic` and `client_secret_post` (400 `client_secret_secret_ref is required for this client_authentication`), refused with `none` (400 `client_secret_secret_ref is not allowed with client_authentication none`); not used without a `client_authentication`. An update that omits it keeps the stored reference, so an update that switches a stored provider from a secret method to `none` must also send an empty string to clear it, as the dashboard does | Refused, so a misconfiguration cannot fall back to a client secret |
 | `jwt_audience` | Optional `aud`; the token endpoint when unset | The same |
@@ -303,7 +331,7 @@ and an unreachable one answers `"reachable": false` with the fixed error `token_
 not be reached`; the detail is only logged. It takes no client references, so it does not check
 a `client_authentication`; create and update do. JWK keys are not
 accepted. The provider API never returns the key or certificate; the list leaves out
-their references and the client references too, and shows a JWT Bearer provider's
+their references and the client references too, and shows a provider's
 `client_authentication`.
 
 RFC 7523 makes client authentication optional in a JWT Bearer grant, and servers differ. A Google

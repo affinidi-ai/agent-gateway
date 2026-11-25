@@ -138,6 +138,23 @@ describe('CredentialProvidersTab', () => {
       ).not.toBeInTheDocument();
     });
 
+    it.each([
+      ['oauth2_client_credentials', 'client_secret_basic', 'HTTP Basic'],
+      ['oauth2_authorization_code', 'client_secret_post', 'Form body'],
+    ])('badges a %s provider whose client authentication is %s', async (type, method, label) => {
+      await renderList([
+        {
+          ...item('m2m', 'https://idp.example/token', null),
+          provider_type: type,
+          client_authentication: method,
+        },
+      ]);
+      const row = screen.getByRole('row', { name: /^m2m/ });
+      expect(
+        within(row).getByTestId('credential-provider-client-authentication-badge')
+      ).toHaveTextContent(label);
+    });
+
     it('shows no badge without a client authentication or on another type', async () => {
       await renderList([
         jwt('google', {}),

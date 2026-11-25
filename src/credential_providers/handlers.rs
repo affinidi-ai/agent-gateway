@@ -120,8 +120,12 @@ enum ProviderValidationError {
     MissingForClientAuthentication(&'static str),
     #[error("client_secret_secret_ref is not allowed: this provider authenticates with a signed JWT")]
     ClientSecretNotAllowed,
-    #[error("client_authentication is only for oauth2_jwt_bearer providers")]
+    #[error(
+        "client_authentication is only for oauth2_jwt_bearer providers and for oauth2_client_credentials and oauth2_authorization_code providers without an issuer"
+    )]
     ClientAuthenticationNotAllowed,
+    #[error("client_authentication none is only for oauth2_jwt_bearer providers")]
+    PublicClientNotAllowed,
     #[error("client_secret_secret_ref is not allowed with client_authentication none")]
     PublicClientTakesNoSecret,
     #[error("jwt_signing_algorithm is not supported for this provider type")]
@@ -157,6 +161,7 @@ impl IntoResponse for ProviderValidationError {
             | Self::MissingForClientAuthentication(_)
             | Self::ClientSecretNotAllowed
             | Self::ClientAuthenticationNotAllowed
+            | Self::PublicClientNotAllowed
             | Self::PublicClientTakesNoSecret
             | Self::UnsupportedAlgorithm
             | Self::InvalidAudience(_)
@@ -405,16 +410,9 @@ async fn validate_secret_references(
 
 /// The required fields (`jwt_subject` included for a JWT Bearer grant), client authentication,
 /// algorithm and audience of an `oauth2_jwt_bearer` or `oauth2_client_credentials_jwt_auth`
-/// provider; other types pass unchecked, except that none may set a client authentication.
+/// provider; other types pass unchecked, except for the client authentication they may set.
 fn validate_jwt_provider(provider: &CredentialProvider) -> Result<(), ProviderValidationError> {
-    if provider.provider_type != CredentialProviderType::OAuth2JwtBearer
-        && provider
-            .jwt
-            .client_authentication_method()
-            .is_some()
-    {
-        return Err(ProviderValidationError::ClientAuthenticationNotAllowed);
-    }
+    validate_client_authentication_type(provider)?;
     let required = match provider.provider_type {
         CredentialProviderType::OAuth2JwtBearer => vec![
             (
@@ -498,6 +496,32 @@ fn validate_jwt_provider(provider: &CredentialProvider) -> Result<(), ProviderVa
             .map_err(|error| ProviderValidationError::InvalidAudience(error.to_string()))?;
     }
     Ok(())
+}
+
+/// The types a client authentication fits: any method on a JWT Bearer provider, and only a method
+/// that sends the client secret on an `oauth2_client_credentials` provider or an
+/// `oauth2_authorization_code` provider without an `issuer`, which always send one. A provider
+/// with an `issuer` names its method in `token_endpoint_auth_method` instead.
+fn validate_client_authentication_type(provider: &CredentialProvider) -> Result<(), ProviderValidationError> {
+    let Some(method) = provider
+        .jwt
+        .client_authentication_method()
+    else {
+        return Ok(());
+    };
+    match provider.provider_type {
+        CredentialProviderType::OAuth2JwtBearer => Ok(()),
+        CredentialProviderType::OAuth2ClientCredentials | CredentialProviderType::OAuth2AuthorizationCode
+            if provider.issuer.is_none() =>
+        {
+            if method.uses_secret() {
+                Ok(())
+            } else {
+                Err(ProviderValidationError::PublicClientNotAllowed)
+            }
+        }
+        _ => Err(ProviderValidationError::ClientAuthenticationNotAllowed),
+    }
 }
 
 /// A JWT Bearer provider's client authentication needs the client references it sends: the
@@ -613,14 +637,15 @@ fn validate_token_endpoint_scheme(
 }
 
 /// The JWT settings an update stores: the requested ones over the stored ones, without a
-/// stored client authentication when the update retypes the provider away from
-/// `oauth2_jwt_bearer` and does not send one.
+/// stored client authentication when the update changes the provider's type and does not send
+/// one, since a method means something else, or nothing, on another type.
 fn updated_jwt_settings(
     requested: JwtAssertionSettings,
     stored: JwtAssertionSettings,
+    stored_type: &CredentialProviderType,
     provider_type: &CredentialProviderType,
 ) -> JwtAssertionSettings {
-    let keeps_stored_method = *provider_type == CredentialProviderType::OAuth2JwtBearer
+    let keeps_stored_method = stored_type == provider_type
         || requested
             .client_authentication
             .is_some();
@@ -1299,7 +1324,7 @@ pub async fn update_provider(
         api_key_secret_ref: req
             .api_key_secret_ref
             .or(existing.api_key_secret_ref),
-        jwt: updated_jwt_settings(req.jwt, existing.jwt, &provider_type),
+        jwt: updated_jwt_settings(req.jwt, existing.jwt, &existing.provider_type, &provider_type),
         description: req
             .description
             .or(existing.description),
@@ -3814,14 +3839,11 @@ mod jwt_provider_tests {
             .unwrap()
             .to_string();
 
-        let (status, response) = update(
-            &state,
-            &id,
-            json!({"provider_type": "oauth2_client_credentials", "client_authentication": "client_secret_basic"}),
-        )
-        .await;
+        let (status, response) =
+            update(&state, &id, json!({"provider_type": "oauth2_client_credentials", "client_authentication": "none"}))
+                .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
-        assert_eq!(response["error"], "client_authentication is only for oauth2_jwt_bearer providers");
+        assert_eq!(response["error"], "client_authentication none is only for oauth2_jwt_bearer providers");
 
         let (status, response) = update(&state, &id, json!({"provider_type": "oauth2_client_credentials"})).await;
         assert_eq!(status, StatusCode::OK, "{response}");
@@ -3859,11 +3881,33 @@ mod jwt_provider_tests {
             })
         };
         let mut client_assertion = jwt_auth("foundry");
-        client_assertion["client_authentication"] = json!("none");
-        for body in [client_credentials("m2m", "client_secret_basic"), client_assertion] {
+        client_assertion["client_authentication"] = json!("client_secret_basic");
+        let api_key = json!({
+            "name": "Key", "provider_id": "key", "provider_type": "api_key", "api_key_secret_ref": "CLIENT_SECRET",
+            "client_authentication": "client_secret_basic"
+        });
+        for body in [client_assertion, api_key] {
             let (status, response) = create(&state, body).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
-            assert_eq!(response["error"], "client_authentication is only for oauth2_jwt_bearer providers");
+            assert_eq!(
+                response["error"],
+                "client_authentication is only for oauth2_jwt_bearer providers and for oauth2_client_credentials and \
+                 oauth2_authorization_code providers without an issuer"
+            );
+        }
+        let (status, response) = create(&state, client_credentials("m2m-public", "none")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], "client_authentication none is only for oauth2_jwt_bearer providers");
+        for provider_id in ["foundry", "key", "m2m-public"] {
+            assert!(
+                state
+                    .store
+                    .find_by_provider_id(None, provider_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{provider_id}"
+            );
         }
         let (status, response) = create(&state, client_credentials("m2m-empty", "")).await;
         assert_eq!(status, StatusCode::CREATED, "{response}");
@@ -3872,6 +3916,130 @@ mod jwt_provider_tests {
                 .get("client_authentication")
                 .is_none()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_secret_provider_stores_keeps_changes_and_clears_its_client_authentication() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let method = |body: &Value| {
+            body.get("client_authentication")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        let stored_method = |id: String| {
+            let store = state.store.clone();
+            async move {
+                store
+                    .get(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .jwt
+                    .client_authentication
+            }
+        };
+        let client_credentials = json!({
+            "name": "M2M", "provider_id": "m2m", "provider_type": "oauth2_client_credentials",
+            "token_endpoint": "https://oauth2.googleapis.com/token",
+            "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+            "client_authentication": "client_secret_basic"
+        });
+        let consent = with(authorization_code("github"), json!({"client_authentication": "client_secret_basic"}));
+        for body in [client_credentials, consent] {
+            let (status, created) = create(&state, body).await;
+            assert_eq!(status, StatusCode::CREATED, "{created}");
+            assert_eq!(method(&created).as_deref(), Some("client_secret_basic"));
+            let id = created["id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(
+                stored_method(id.clone()).await,
+                Some(crate::credential_providers::GrantClientAuthentication::ClientSecretBasic)
+            );
+
+            let (status, body) = update(&state, &id, json!({"description": "renamed"})).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(method(&body).as_deref(), Some("client_secret_basic"));
+
+            let (status, body) = update(&state, &id, json!({"client_authentication": "client_secret_post"})).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(method(&body).as_deref(), Some("client_secret_post"));
+
+            let (status, body) = update(&state, &id, json!({"client_authentication": "none"})).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"], "client_authentication none is only for oauth2_jwt_bearer providers");
+
+            let (status, body) = update(&state, &id, json!({"client_authentication": ""})).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(method(&body), None);
+            assert_eq!(stored_method(id).await, None);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retyping_a_client_secret_provider_drops_a_client_authentication_the_update_does_not_send() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, created) = create(
+            &state,
+            with(authorization_code("retyped"), json!({"client_authentication": "client_secret_basic"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, body) = update(&state, &id, json!({"provider_type": "oauth2_client_credentials"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.get("client_authentication")
+                .is_none(),
+            "{body}"
+        );
+
+        let (status, body) = update(
+            &state,
+            &id,
+            json!({"provider_type": "oauth2_authorization_code", "client_authentication": "client_secret_basic"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["client_authentication"], "client_secret_basic");
+
+        let (status, body) = update(
+            &state,
+            &id,
+            json!({"provider_type": "oauth2_jwt_bearer", "jwt_issuer": "agent@project.iam.gserviceaccount.com",
+                   "jwt_subject": "admin@example.com", "jwt_signing_key_secret_ref": "SA_KEY"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.get("client_authentication")
+                .is_none(),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn a_provider_with_an_issuer_takes_no_client_authentication() {
+        let mut external: CredentialProvider = serde_json::from_value(json!({
+            "id": "external", "name": "External", "provider_id": "external",
+            "provider_type": "oauth2_authorization_code", "issuer": "https://idp.example",
+            "token_endpoint": "https://idp.example/token", "client_id_secret_ref": "CLIENT_ID",
+            "client_secret_secret_ref": "CLIENT_SECRET", "client_authentication": "client_secret_basic",
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(matches!(
+            validate_jwt_provider(&external),
+            Err(ProviderValidationError::ClientAuthenticationNotAllowed)
+        ));
+        external.issuer = None;
+        assert!(validate_jwt_provider(&external).is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

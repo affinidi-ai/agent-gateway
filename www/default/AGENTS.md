@@ -1640,6 +1640,14 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   `credential-provider-jwt-section`): Key ID sits under Certificate, a warning
   (`credential-provider-jwt-key-unidentified-warning`, from `jwtKeyUnidentified`) shows when
   neither names the key, and the algorithm select lists the type's algorithms, default first.
+- **Client Credentials** and **Authorization Code** (without an `issuer`) show the same
+  **Client authentication** select (`ClientAuthenticationSelect.tsx`, its own `FieldHelp` text)
+  with two options: "Form body (default)", which sends an empty `client_authentication`, and
+  "HTTP Basic" (`client_secret_basic`). A stored `client_secret_post` shows as the default and is
+  sent unchanged unless the operator picks another option; a `none` left from JWT Bearer is
+  sent empty. `clientAuthenticationsOf` in `credentialProviderForm.ts` lists the methods each
+  type takes, and decides what Save sends and whether the list shows a badge. A provider with an
+  `issuer` shows no select.
 - Key material is never typed into this form. Signing key and certificate are secret pickers
   (`SecretSelect.tsx`, `credential-provider-<field>-select`); the operator creates the secret on
   the Secrets page and pastes the PEM, or a whole Google service account JSON key file (16 KiB
@@ -1649,7 +1657,9 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   switching a provider to Client Credentials JWT drops its client secret. The exceptions are the
   client ID reference, which is omitted for every type but JWT Bearer while its picker is hidden
   (JWT Bearer sends it empty then, so a stored one is cleared and no longer blocks deleting its
-  secret), and `client_authentication`, which is always sent, empty for every type but JWT Bearer.
+  secret), and `client_authentication`, which is always sent: the chosen method on JWT Bearer, HTTP
+  Basic or the form body on Client Credentials and Authorization Code, and empty on the other
+  types.
 - `resource` has no input (it is set through the API or YAML) and is never sent on save. When
   `entraRejectsResource` finds the provider's token requests send it to a Microsoft identity
   platform v2.0 token endpoint, which rejects it (AADSTS901002), the form warns
@@ -1798,9 +1808,9 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   (`delegated-access-provider-deactivated-<id>`), also right after a Deactivate on the same
   page, since the tab tells the page (`onProvidersChange`). Success and failure are toasts.
 - The Credential Providers tab labels the types from `PROVIDER_TYPE_LABELS` in the same module, and
-  shows a secondary badge after the type of a JWT Bearer provider that has a
-  `client_authentication` (`credential-provider-client-authentication-badge`: Client ID only,
-  HTTP Basic or Form body, from `CLIENT_AUTHENTICATION_LABELS`); no badge without one. A
+  shows a secondary badge after the type of a provider whose `client_authentication` its type
+  takes (`credential-provider-client-authentication-badge`: Client ID only, HTTP Basic or Form
+  body, from `CLIENT_AUTHENTICATION_LABELS`; `clientAuthenticationsOf`); no badge without one. A
   refused delete shows the API's reason and, for a `409`, the surface that binds the provider
   (`providerDeleteError`).
 - Credential provider pages follow their own permissions, not `settings.*`.

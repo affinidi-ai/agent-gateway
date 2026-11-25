@@ -1,6 +1,17 @@
 branch: feat/oauth-client-auth
 changes:
-  added: []
+  added:
+    - timestamp: '2026-11-25T00:34:00Z'
+      title: Let client secret credential providers authenticate with HTTP Basic
+      description: >-
+        An oauth2_client_credentials provider, or an oauth2_authorization_code provider without an
+        issuer, can now set client_authentication to client_secret_basic, and then sends its client
+        ID and secret by HTTP Basic, each form-urlencoded as RFC 6749 section 2.3.1 requires, on
+        the client credentials grant, the code exchange and every refresh. RFC 6749 requires
+        token endpoints to accept HTTP Basic and some accept nothing else, so such a provider got
+        401 invalid_client before. Unset, or client_secret_post, keeps sending them in the form
+        body, so stored providers work as before. The dashboard offers Form body (default) and
+        HTTP Basic for these types, and the provider list badges the choice.
   changed: []
   fixed:
     - timestamp: '2026-11-25T00:16:00Z'

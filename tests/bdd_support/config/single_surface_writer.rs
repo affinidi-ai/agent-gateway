@@ -1205,8 +1205,8 @@ pub fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) 
         api_key_secret_ref: None,
         authorization_response_issuer: None,
         max_consent_age_secs: None,
-        jwt_settings: (provider.grant == TargetAuthProviderGrant::JwtBearer).then(|| {
-            serde_json::json!({
+        jwt_settings: match provider.grant {
+            TargetAuthProviderGrant::JwtBearer => Some(serde_json::json!({
                 "jwt_issuer": TARGET_AUTH_JWT_ISSUER,
                 "jwt_signing_key_secret_ref": TARGET_AUTH_SIGNING_KEY_SECRET,
                 "jwt_key_id": (!provider.signing_key_is_service_account_file).then_some("bdd-target-key-id"),
@@ -1214,8 +1214,11 @@ pub fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) 
                 "client_authentication": provider
                     .client_authentication
                     .map(|method| method.api_value()),
-            })
-        }),
+            })),
+            TargetAuthProviderGrant::ClientCredentials | TargetAuthProviderGrant::AuthorizationCode => provider
+                .client_authentication
+                .map(|method| serde_json::json!({ "client_authentication": method.api_value() })),
+        },
         consent_confirmation: None,
         created_at: now,
         updated_at: now,

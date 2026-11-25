@@ -3270,8 +3270,13 @@ fn target_credential_provider_authenticates_its_client(
     world: &mut SurfaceWorld,
     wording: String,
 ) {
-    jwt_bearer_target_auth_provider(world).client_authentication =
-        Some(TargetAuthClientAuthentication::from_wording(&wording));
+    let provider = target_auth_provider(world);
+    assert_ne!(
+        provider.grant,
+        TargetAuthProviderGrant::AuthorizationCode,
+        "a JWT Bearer or client credentials provider sets the client authentication of its token requests"
+    );
+    provider.client_authentication = Some(TargetAuthClientAuthentication::from_wording(&wording));
 }
 
 #[given("the credential provider is refusing token requests")]

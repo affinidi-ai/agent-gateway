@@ -110,10 +110,13 @@ pub enum JwtSigningAlgorithm {
     ES256,
 }
 
-/// How the client of an `oauth2_jwt_bearer` grant identifies itself to the token endpoint
-/// (RFC 6749 section 2.3). A provider that sets no client authentication sends no client
-/// identity with its grant, as a Google service account does. `Unset` is what an empty string
-/// in a request means: it clears the stored setting and is never stored. It is separate from
+/// How a provider's client identifies itself to the token endpoint (RFC 6749 section 2.3). A JWT
+/// Bearer provider that sets none sends no client identity with its grant, as a Google service
+/// account does. An `oauth2_client_credentials` provider, or an `oauth2_authorization_code`
+/// provider without an `issuer`, takes only the two methods that send its client secret, and one
+/// that sets none sends the client ID and secret in the form body, as `ClientSecretPost` does.
+/// `Unset` is what an empty string in a request means: it clears the stored setting and is never
+/// stored. It is separate from
 /// [`TokenEndpointAuthMethod`], which an external consent provider's metadata names and which
 /// includes `private_key_jwt`: a JWT Bearer grant's client never signs a second JWT, and this
 /// setting needs the empty string that clears it.
@@ -176,9 +179,10 @@ pub struct JwtAssertionSettings {
     /// `sub` claim of a JWT Bearer grant: required for a JWT Bearer provider (domain-wide delegation)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_subject: Option<String>,
-    /// How the client of a JWT Bearer grant identifies itself; unset sends no client identity
-    /// and leaves the client references unread. `oauth2_jwt_bearer` only, cleared by an empty
-    /// string in an update.
+    /// How the provider's client identifies itself at the token endpoint. On a JWT Bearer grant,
+    /// unset sends no client identity and leaves the client references unread; on a client
+    /// credentials or authorization code provider without an `issuer`, unset sends the client ID
+    /// and secret in the form body. Cleared by an empty string in an update.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_authentication: Option<GrantClientAuthentication>,
 }

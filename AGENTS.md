@@ -197,8 +197,10 @@ The Target authentication fallback select on the Managed Agent and on a Transit 
 its reject option **Reject request**, with no status; see _Target authentication fallback_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#target-authentication-fallback).
 
-The credential provider editor's **Client authentication** select (JWT Bearer) keeps its
-explanation behind `FieldHelp`; see _Credential provider editor_ in
+The credential provider editor's **Client authentication** select keeps its explanation behind
+`FieldHelp`. JWT Bearer offers Not sent, Client ID only, HTTP Basic and Form body; Client
+Credentials and Authorization Code (without an `issuer`) offer Form body (default) and HTTP Basic;
+see _Credential provider editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 
 The credential provider editor and list warn when a provider's token requests send `resource`

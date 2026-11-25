@@ -530,6 +530,7 @@ async fn exchange_code_for_tokens_with(
     )
     .await
     .context("Failed to resolve client_secret")?;
+    let client = GrantClient::with_secret(provider, client_id, zeroize::Zeroizing::new(client_secret));
 
     let callback_url = provider
         .consent_redirect_uri(gateway_base_url)
@@ -541,16 +542,12 @@ async fn exchange_code_for_tokens_with(
         .pinned_client(token_endpoint)
         .await?;
 
-    let mut params = vec![
-        ("grant_type", "authorization_code".to_string()),
-        ("code", code.to_string()),
-        ("redirect_uri", callback_url.clone()),
-        ("client_id", client_id),
-        ("client_secret", client_secret),
-    ];
+    let mut params =
+        vec![("grant_type", "authorization_code"), ("code", code), ("redirect_uri", callback_url.as_str())];
+    let authorization = client.apply(&mut params);
 
     if let Some(verifier) = code_verifier {
-        params.push(("code_verifier", verifier.to_string()));
+        params.push(("code_verifier", verifier));
     }
 
     info!(
@@ -561,10 +558,14 @@ async fn exchange_code_for_tokens_with(
         "Exchanging authorization code for tokens"
     );
 
-    let response = http_client
+    let mut request = http_client
         .post(token_url)
         .header("Accept", "application/json")
-        .form(&params)
+        .form(&params);
+    if let Some(authorization) = authorization {
+        request = with_sensitive_authorization(request, authorization);
+    }
+    let response = request
         .send()
         .await
         .context("Failed to send token exchange request")?;
@@ -720,13 +721,10 @@ async fn refresh_access_token_with(
     )
     .await
     .context("Failed to resolve client_secret for refresh")?;
+    let client = GrantClient::with_secret(provider, client_id, zeroize::Zeroizing::new(client_secret));
 
-    let params = [
-        ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token),
-        ("client_id", &client_id),
-        ("client_secret", &client_secret),
-    ];
+    let mut params = vec![("grant_type", "refresh_token"), ("refresh_token", refresh_token)];
+    let authorization = client.apply(&mut params);
 
     info!(
         target: "credential_delegation",
@@ -739,10 +737,14 @@ async fn refresh_access_token_with(
         .pinned_client(token_endpoint)
         .await?;
 
-    let response = http_client
+    let mut request = http_client
         .post(token_url)
         .header("Accept", "application/json")
-        .form(&params)
+        .form(&params);
+    if let Some(authorization) = authorization {
+        request = with_sensitive_authorization(request, authorization);
+    }
+    let response = request
         .send()
         .await
         .context("Failed to send token refresh request")?;
@@ -839,21 +841,21 @@ async fn scoped_token_grant(
     let mode = egress
         .policy
         .tenant_credential_isolation;
-    let client_id = provider_client_id(provider, secrets, mode).await?;
-    let client_secret = provider_client_secret(provider, secrets, mode).await?;
+    let client = GrantClient::with_secret(
+        provider,
+        provider_client_id(provider, secrets, mode).await?,
+        provider_client_secret(provider, secrets, mode).await?,
+    );
     let scope = scopes.join(" ");
-    let mut params = vec![
-        (
-            "grant_type",
-            if refresh_token.is_some() {
-                "refresh_token"
-            } else {
-                "client_credentials"
-            },
-        ),
-        ("client_id", client_id.as_str()),
-        ("client_secret", client_secret.as_str()),
-    ];
+    let mut params = vec![(
+        "grant_type",
+        if refresh_token.is_some() {
+            "refresh_token"
+        } else {
+            "client_credentials"
+        },
+    )];
+    let authorization = client.apply(&mut params);
     if let Some(resource) = resource {
         params.push(("resource", resource));
     }
@@ -863,21 +865,63 @@ async fn scoped_token_grant(
     if let Some(refresh_token) = refresh_token {
         params.push(("refresh_token", refresh_token));
     }
-    request_token(provider, endpoint, &params, None, refresh_token.is_some(), egress).await
+    request_token(provider, endpoint, &params, authorization, refresh_token.is_some(), egress).await
 }
 
 const JWT_BEARER_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
 const JWT_CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 
-/// The client identity a JWT Bearer grant carries, resolved from the provider's secret
-/// references and held in zeroizing buffers until the request is sent.
-enum GrantClient {
+/// The client identity a token request carries, resolved from the provider's secret references
+/// and held in zeroizing buffers until the request is sent.
+pub(super) enum GrantClient {
     /// A public client: `client_id` in the form body.
     Public { id: String },
     /// `client_id` and `client_secret` in the form body.
     Post { id: String, secret: zeroize::Zeroizing<String> },
     /// The `Authorization` header value of HTTP Basic client authentication.
     Basic { authorization: zeroize::Zeroizing<String> },
+}
+
+impl GrantClient {
+    /// The client ID and secret as the provider's client authentication sends them: by HTTP
+    /// Basic for `client_secret_basic`, otherwise in the form body.
+    pub(super) fn with_secret(
+        provider: &CredentialProvider,
+        id: String,
+        secret: zeroize::Zeroizing<String>,
+    ) -> Self {
+        if provider
+            .jwt
+            .client_authentication_method()
+            == Some(GrantClientAuthentication::ClientSecretBasic)
+        {
+            Self::Basic {
+                authorization: super::revocation::basic_authorization(&id, &secret),
+            }
+        } else {
+            Self::Post { id, secret }
+        }
+    }
+
+    /// Add this client's form fields to `params`, and return the `Authorization` header value
+    /// that HTTP Basic sends instead.
+    pub(super) fn apply<'a>(
+        &'a self,
+        params: &mut Vec<(&'a str, &'a str)>,
+    ) -> Option<&'a str> {
+        match self {
+            Self::Public { id } => {
+                params.push(("client_id", id));
+                None
+            }
+            Self::Post { id, secret } => {
+                params.push(("client_id", id));
+                params.push(("client_secret", secret));
+                None
+            }
+            Self::Basic { authorization } => Some(authorization),
+        }
+    }
 }
 
 /// The client ID the provider's `client_id_secret_ref` names.
@@ -934,13 +978,7 @@ async fn grant_client(
         return Ok(Some(GrantClient::Public { id }));
     }
     let secret = provider_client_secret(provider, secrets, mode).await?;
-    Ok(Some(if method == GrantClientAuthentication::ClientSecretBasic {
-        GrantClient::Basic {
-            authorization: super::revocation::basic_authorization(&id, &secret),
-        }
-    } else {
-        GrantClient::Post { id, secret }
-    }))
+    Ok(Some(GrantClient::with_secret(provider, id, secret)))
 }
 
 /// Fetch a token with a JWT Bearer grant (RFC 7523 section 2.1): the signed JWT is the
@@ -979,19 +1017,9 @@ pub async fn fetch_jwt_bearer_token(
     if let Some(resource) = provider.resource.as_deref() {
         params.push(("resource", resource));
     }
-    let authorization = match &client {
-        None => None,
-        Some(GrantClient::Public { id }) => {
-            params.push(("client_id", id.as_str()));
-            None
-        }
-        Some(GrantClient::Post { id, secret }) => {
-            params.push(("client_id", id.as_str()));
-            params.push(("client_secret", secret.as_str()));
-            None
-        }
-        Some(GrantClient::Basic { authorization }) => Some(authorization.as_str()),
-    };
+    let authorization = client
+        .as_ref()
+        .and_then(|client| client.apply(&mut params));
     if client.is_some() && !scope.is_empty() {
         params.push(("scope", scope.as_str()));
     }
@@ -2760,21 +2788,63 @@ mod tests {
             status: u16,
             body: Value,
         ) -> TokenEndpoint {
+            token_endpoint_answering(move |_, _| (status, body.clone())).await
+        }
+
+        /// How a client authenticates to a [`token_endpoint_accepting_only`].
+        #[derive(Debug, Clone, Copy)]
+        enum ClientAuthAccepted {
+            Basic,
+            FormBody,
+        }
+
+        /// A token endpoint that issues a token only to the fixture's client authenticating
+        /// the `accepted` way, and answers 401 `invalid_client` to any other request.
+        async fn token_endpoint_accepting_only(accepted: ClientAuthAccepted) -> TokenEndpoint {
+            token_endpoint_answering(move |authorization, form| {
+                let field = |name: &str| {
+                    form.get(name)
+                        .map(String::as_str)
+                };
+                let authenticated = match accepted {
+                    ClientAuthAccepted::Basic => {
+                        authorization == Some(basic("client-123", "client-secret").as_str())
+                            && field("client_id").is_none()
+                            && field("client_secret").is_none()
+                    }
+                    ClientAuthAccepted::FormBody => {
+                        authorization.is_none()
+                            && field("client_id") == Some("client-123")
+                            && field("client_secret") == Some("client-secret")
+                    }
+                };
+                if authenticated {
+                    (200, issued())
+                } else {
+                    (401, json!({"error": "invalid_client"}))
+                }
+            })
+            .await
+        }
+
+        async fn token_endpoint_answering(
+            answer: impl Fn(Option<&str>, &HashMap<String, String>) -> (u16, Value) + Clone + Send + Sync + 'static
+        ) -> TokenEndpoint {
             let (sender, requests) = tokio::sync::mpsc::channel(4);
             let (authorization_sender, authorizations) = tokio::sync::mpsc::unbounded_channel();
             let app = axum::Router::new().fallback(axum::routing::post(
                 move |headers: axum::http::HeaderMap, axum::Form(form): axum::Form<HashMap<String, String>>| {
                     let sender = sender.clone();
                     let authorization_sender = authorization_sender.clone();
-                    let body = body.clone();
+                    let answer = answer.clone();
                     async move {
+                        let authorization = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        let (status, body) = answer(authorization.as_deref(), &form);
                         authorization_sender
-                            .send(
-                                headers
-                                    .get(axum::http::header::AUTHORIZATION)
-                                    .and_then(|value| value.to_str().ok())
-                                    .map(str::to_string),
-                            )
+                            .send(authorization)
                             .ok();
                         sender
                             .send(form)
@@ -3309,6 +3379,192 @@ mod tests {
                     resource
                 );
             }
+        }
+
+        fn client_credentials(client_authentication: Option<&str>) -> Value {
+            let mut settings = json!({
+                "provider_type": "oauth2_client_credentials",
+                "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"
+            });
+            if let Some(method) = client_authentication {
+                settings["client_authentication"] = json!(method);
+            }
+            settings
+        }
+
+        fn rejected_code(error: &anyhow::Error) -> Option<&str> {
+            error
+                .downcast_ref::<TokenRequestRejected>()
+                .map(|rejected| rejected.code.as_str())
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn client_secret_basic_gets_a_client_credentials_token_where_only_http_basic_is_accepted() {
+            let fixture = fixture().await;
+            let mut endpoint = token_endpoint_accepting_only(ClientAuthAccepted::Basic).await;
+            let provider = provider(&endpoint.url, client_credentials(Some("client_secret_basic")));
+            let token = fetch_scoped_client_credentials_token(
+                &provider,
+                &["read".to_string()],
+                &fixture.secrets,
+                &endpoint.egress,
+            )
+            .await
+            .unwrap();
+            assert_eq!(token.access_token, "issued-access");
+            let form = endpoint
+                .requests
+                .recv()
+                .await
+                .unwrap();
+            assert_eq!(form_keys(&form), ["grant_type", "scope"]);
+            assert_eq!(
+                endpoint
+                    .authorizations
+                    .recv()
+                    .await
+                    .unwrap(),
+                Some(basic("client-123", "client-secret"))
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_client_credentials_provider_stored_without_a_client_authentication_keeps_the_form_body() {
+            let fixture = fixture().await;
+            let form_only = token_endpoint_accepting_only(ClientAuthAccepted::FormBody).await;
+            let basic_only = token_endpoint_accepting_only(ClientAuthAccepted::Basic).await;
+            for method in [None, Some("client_secret_post")] {
+                let stored = provider(&form_only.url, client_credentials(method));
+                let token = fetch_scoped_client_credentials_token(&stored, &[], &fixture.secrets, &form_only.egress)
+                    .await
+                    .unwrap();
+                assert_eq!(token.access_token, "issued-access", "{method:?}");
+
+                let refused = provider(&basic_only.url, client_credentials(method));
+                let error = fetch_scoped_client_credentials_token(&refused, &[], &fixture.secrets, &basic_only.egress)
+                    .await
+                    .unwrap_err();
+                assert_eq!(rejected_code(&error), Some("invalid_client"), "{method:?}");
+            }
+            let basic = provider(&form_only.url, client_credentials(Some("client_secret_basic")));
+            let error = fetch_scoped_client_credentials_token(&basic, &[], &fixture.secrets, &form_only.egress)
+                .await
+                .unwrap_err();
+            assert_eq!(rejected_code(&error), Some("invalid_client"));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn client_secret_basic_carries_the_code_exchange_and_every_refresh() {
+            let fixture = fixture().await;
+            let mut endpoint = token_endpoint_accepting_only(ClientAuthAccepted::Basic).await;
+            let provider = provider(
+                &endpoint.url,
+                json!({"provider_type": "oauth2_authorization_code",
+                       "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+                       "client_authentication": "client_secret_basic", "resource": "https://api.example/"}),
+            );
+            exchange_code_for_tokens_with(
+                &provider,
+                "code",
+                "https://203.0.113.10",
+                &fixture.secrets,
+                Some("verifier"),
+                &endpoint.egress,
+            )
+            .await
+            .unwrap();
+            refresh_access_token_with(&provider, "refresh", &fixture.secrets, &endpoint.egress)
+                .await
+                .unwrap();
+            refresh_scoped_access_token(&provider, "refresh", &[], &fixture.secrets, &endpoint.egress)
+                .await
+                .unwrap()
+                .unwrap();
+            for grant in ["authorization_code", "refresh_token", "refresh_token"] {
+                let form = endpoint
+                    .requests
+                    .recv()
+                    .await
+                    .unwrap();
+                assert_eq!(form["grant_type"], grant);
+                assert!(!form.contains_key("client_id") && !form.contains_key("client_secret"), "{grant}: {form:?}");
+                assert_eq!(
+                    endpoint
+                        .authorizations
+                        .recv()
+                        .await
+                        .unwrap(),
+                    Some(basic("client-123", "client-secret")),
+                    "{grant}"
+                );
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_authorization_code_provider_without_a_client_authentication_exchanges_and_refreshes_in_the_form_body()
+         {
+            let fixture = fixture().await;
+            let basic_only = token_endpoint_accepting_only(ClientAuthAccepted::Basic).await;
+            let provider = provider(
+                &basic_only.url,
+                json!({"provider_type": "oauth2_authorization_code",
+                       "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"}),
+            );
+            let exchange = exchange_code_for_tokens_with(
+                &provider,
+                "code",
+                "https://203.0.113.10",
+                &fixture.secrets,
+                None,
+                &basic_only.egress,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(format!("{exchange:#}"), "Token exchange failed (HTTP 401 Unauthorized): invalid_client");
+            let refresh = refresh_access_token_with(&provider, "refresh", &fixture.secrets, &basic_only.egress)
+                .await
+                .unwrap_err();
+            assert_eq!(format!("{refresh:#}"), "Token refresh failed (HTTP 401 Unauthorized): invalid_client");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_client_credentials_basic_credential_form_urlencodes_the_client_id_and_secret() {
+            let fixture = fixture().await;
+            for (secret_id, value) in [("ODD_ID", "client id"), ("ODD_SECRET", "p@ss:w+rd/%")] {
+                fixture
+                    .secrets
+                    .create(crate::secrets::CreateSecretRequest {
+                        tenant_id: None,
+                        name: secret_id.into(),
+                        secret_id: secret_id.into(),
+                        description: None,
+                        value: value.into(),
+                        secret_type: "General".into(),
+                        tags: vec![],
+                    })
+                    .await
+                    .unwrap();
+            }
+            let mut endpoint = token_endpoint(200, issued()).await;
+            let mut settings = client_credentials(Some("client_secret_basic"));
+            settings["client_id_secret_ref"] = json!("ODD_ID");
+            settings["client_secret_secret_ref"] = json!("ODD_SECRET");
+            fetch_scoped_client_credentials_token(
+                &provider(&endpoint.url, settings),
+                &[],
+                &fixture.secrets,
+                &endpoint.egress,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                endpoint
+                    .authorizations
+                    .recv()
+                    .await
+                    .unwrap(),
+                Some(basic("client+id", "p%40ss%3Aw%2Brd%2F%25"))
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

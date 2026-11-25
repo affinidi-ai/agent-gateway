@@ -18,6 +18,7 @@ import {
   ClientAuthentication,
   CredentialProviderType,
   PROVIDER_TYPE_LABELS,
+  clientAuthenticationsOf,
   entraRejectsResource,
   entraResourceMessage,
 } from '../EditCredentialProviderPage/credentialProviderForm';
@@ -324,9 +325,10 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                       >
                         {PROVIDER_TYPE_LABELS[provider.provider_type] ?? provider.provider_type}
                       </span>
-                      {provider.provider_type === 'oauth2_jwt_bearer' &&
-                        provider.client_authentication &&
-                        CLIENT_AUTHENTICATION_LABELS[provider.client_authentication] && (
+                      {provider.client_authentication &&
+                        clientAuthenticationsOf(provider.provider_type).includes(
+                          provider.client_authentication
+                        ) && (
                           <span
                             className="badge text-bg-secondary ms-1"
                             data-testid="credential-provider-client-authentication-badge"

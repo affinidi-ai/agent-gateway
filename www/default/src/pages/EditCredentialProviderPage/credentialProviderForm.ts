@@ -28,6 +28,22 @@ const CLIENT_AUTHENTICATIONS: ClientAuthentication[] = [
   'client_secret_post',
 ];
 
+/**
+ * The client authentications a provider type takes: every method on JWT Bearer, HTTP Basic and
+ * the form body on the types that always send a client secret, and none on the others.
+ */
+export function clientAuthenticationsOf(type: CredentialProviderType): ClientAuthentication[] {
+  switch (type) {
+    case 'oauth2_jwt_bearer':
+      return CLIENT_AUTHENTICATIONS;
+    case 'oauth2_client_credentials':
+    case 'oauth2_authorization_code':
+      return ['client_secret_basic', 'client_secret_post'];
+    default:
+      return [];
+  }
+}
+
 export type JwtSigningAlgorithm = 'RS256' | 'PS256' | 'ES256';
 
 export interface JwtFormFields {
@@ -245,8 +261,11 @@ export function providerCredentialFields(
   const value = (enabled: boolean, raw: string) => (enabled ? raw.trim() : '');
   const body: Record<string, string | undefined> = {};
   if (fields.tokenEndpoint) body.token_endpoint = form.token_endpoint.trim();
-  body.client_authentication =
-    form.provider_type === 'oauth2_jwt_bearer' ? form.client_authentication : '';
+  body.client_authentication = clientAuthenticationsOf(form.provider_type).includes(
+    form.client_authentication
+  )
+    ? form.client_authentication
+    : '';
   if (fields.clientId || form.provider_type === 'oauth2_jwt_bearer') {
     body.client_id_secret_ref = value(fields.clientId, form.client_id_secret_ref);
   }
