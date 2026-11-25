@@ -2,11 +2,15 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { after } from 'node:test';
 import { countsLine, gapRows, listSection, loadResults, only, redact, renderGaps, tally, targetSource } from './suite-report.mjs';
+
+const roots = [];
+after(() => roots.forEach((root) => fs.rmSync(root, { recursive: true, force: true })));
 
 function resultsDir(entries) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'suite-report-'));
+  roots.push(root);
   for (const [name, checks] of Object.entries(entries)) {
     const dir = path.join(root, name);
     fs.mkdirSync(dir, { recursive: true });

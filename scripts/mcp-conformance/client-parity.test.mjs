@@ -2,11 +2,15 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { after } from 'node:test';
 import { compare, difference, parseVerdicts, resultDir } from './client-parity.mjs';
+
+const roots = [];
+after(() => roots.forEach((root) => fs.rmSync(root, { recursive: true, force: true })));
 
 function results(checksByScenario) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'client-parity-'));
+  roots.push(root);
   for (const [scenario, runs] of Object.entries(checksByScenario)) {
     runs.forEach((checks, index) => {
       const dir = path.join(root, `${scenario}-2026-01-0${index + 1}T00-00-00-000Z`);

@@ -81,8 +81,9 @@ test('a context without the value a secret needs is refused', () => {
   assert.throws(() => providerFiles('auth/client-credentials-basic', { client_id: 'cid' }, DISCOVERED, NOW), /conformance-client-secret/);
 });
 
-test('seeding writes the provider and secrets and binds the Target', () => {
+test('seeding writes the provider and secrets and binds the Target', (t) => {
   const envDir = fs.mkdtempSync(path.join(os.tmpdir(), 'client-auth-'));
+  t.after(() => fs.rmSync(envDir, { recursive: true, force: true }));
   const storage = path.join(envDir, 'config', '_storage');
   fs.mkdirSync(path.join(storage, 'agent_surfaces'), { recursive: true });
   const surfaceFile = path.join(storage, 'agent_surfaces', `${SURFACE_ID}.json`);
