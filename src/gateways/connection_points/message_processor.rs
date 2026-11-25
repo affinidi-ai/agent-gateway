@@ -3945,22 +3945,6 @@ pub(super) fn fabric_caller_did_and_source(
     }
 }
 
-/// Whether `binding`, of the receiving surface's Target, applies to a Fabric
-/// request calling `tool`.
-fn fabric_binding_applies(
-    binding: &crate::config::types::OutboundCredentialBinding,
-    tool: Option<&str>,
-) -> bool {
-    match &binding.required_for {
-        crate::config::types::CredentialRequirement::All => true,
-        crate::config::types::CredentialRequirement::Tools(tools) => tool.is_some_and(|tool| {
-            tools
-                .iter()
-                .any(|named| named == tool)
-        }),
-    }
-}
-
 /// Whether a delegated credential binding of the receiving surface's Target
 /// applies to a Fabric request calling `tool`, so the request needs a caller
 /// the surface verified to key it.
@@ -3970,7 +3954,7 @@ fn fabric_delegation_applies(
 ) -> bool {
     bindings
         .iter()
-        .any(|binding| fabric_binding_applies(binding, tool))
+        .any(|binding| binding.applies_to_tool(tool))
 }
 
 /// Whether a binding that applies to a Fabric request calling `tool` releases
@@ -3985,7 +3969,7 @@ async fn fabric_per_user_binding_applies(
 ) -> bool {
     for binding in bindings
         .iter()
-        .filter(|binding| fabric_binding_applies(binding, tool))
+        .filter(|binding| binding.applies_to_tool(tool))
     {
         let Some(providers) = providers else {
             return true;
@@ -6107,20 +6091,32 @@ async fn process_charged_forward_request(
     }
     req = req.header(reqwest::header::ACCEPT_ENCODING, "identity");
 
-    // Inject target authentication credentials (if configured on the channel)
-    let mut target_token = None;
-    if let Some(target_auth) = surface.target_auth() {
-        if !crate::proxy::paths::is_target_credential_destination(
+    let carries_delegated_credential = modern_delegation.is_some()
+        || (!is_agent_card_request && {
+            let called_tool = crate::mcp::tool_analyzer::called_tool_name(&body_bytes);
+            outbound_creds
+                .iter()
+                .any(|binding| binding.applies_to_tool(called_tool.as_deref()))
+        });
+    if (surface.target_auth().is_some() || carries_delegated_credential)
+        && !crate::proxy::paths::is_target_credential_destination(
             surface.target_endpoint(),
             method,
             &target_url,
             surface.agent_card_location_path(),
-        ) {
-            channel_warn!(config_id, "Refusing a request outside the Target base path: it would carry the Target credential");
-            let refusal = crate::proxy::handler::TargetAuthFailure::PathRefused;
-            crate::proxy::handler::record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
-            return target_auth_failure_result(refusal);
-        }
+        )
+    {
+        channel_warn!(
+            config_id,
+            "Refusing a request outside the Target base path: it would carry a Target or delegated credential"
+        );
+        crate::proxy::handler::record_credential_destination_refusal(&audit_facts, None, surface.target_auth());
+        return target_auth_failure_result(crate::proxy::handler::TargetAuthFailure::PathRefused);
+    }
+
+    // Inject target authentication credentials (if configured on the channel)
+    let mut target_token = None;
+    if let Some(target_auth) = surface.target_auth() {
         // Build a secrets store from the storage path passed via message context
         let secrets_store: Option<Arc<dyn crate::secrets::SecretsStore>> = match message
             .context

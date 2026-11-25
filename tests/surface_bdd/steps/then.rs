@@ -965,6 +965,7 @@ fn audited_refusal_reason(refusal: &str) -> &'static str {
         "a request that fails MCP admission" => "mcp_admission",
         "a malformed request" => "invalid_envelope",
         "a rejected request extension" => "extension_rejected",
+        "a path outside the Target base path" => "target_path_refused",
         "a Target response that is not authenticated" => "target_response_auth_failed",
         other => panic!("no audited reason for the request refusal '{other}'"),
     }

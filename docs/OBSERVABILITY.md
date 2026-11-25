@@ -842,6 +842,11 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     pass 8 Fabric crossings, recorded against its surface with the call's trace id, and on Fabric
     receive `transit_token_unavailable` (the peer is answered `503`): the managed agent should
     get a transit token for the request and it could not be issued.
+    `target_path_refused` (`400` on HTTP, no status over Fabric): a request that would carry a
+    delegated credential, and no Target credential, outside the Target base path, on the direct
+    path, Fabric send, Fabric receive or a Transit Point (see
+    [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#target-base-path)); the record carries
+    no `transit_point` alias, so the trace id ties a Transit Point refusal to its call.
     `target_response_auth_failed` (`502`, with `rpc_error_code` `-32603` for a JSON-RPC
     request): the Target's response failed the surface's Response authentication
     (`target.response_auth`), or the request could not be checked and was not sent, so it was
@@ -859,7 +864,9 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     `outcome` follows the `fallback`), the request would have carried it outside the Target
     base path, or a Transit
     Point's resolved credential cannot be sent as a header (the last two always `rejected`,
-    whatever the `fallback`). One record per request, on the direct path, a `proxy://` MCP Target, the
+    whatever the `fallback`). A request that leaves the Target base path while the leg has a
+    Target credential is recorded once as `target_auth_failed`, whatever delegated credential it
+    would also have carried. One record per request, on the direct path, a `proxy://` MCP Target, the
     Fabric send leg, Fabric receive (forward and MCP Proxy), a Transit Point, and the agent card
     fetch and its preview. The record carries the request's trace id, except on the gateway's
     own card fetch with no triggering request (the preview), where `trace_id` is absent; a card

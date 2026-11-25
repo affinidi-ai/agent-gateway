@@ -5480,6 +5480,33 @@ pub(crate) fn delegation_agent_did(ctx: &OutboundPipelineContext) -> Option<&str
     })
 }
 
+/// Whether a Transit Point request carries a Target credential or a delegated credential.
+fn carries_transit_credential(ctx: &OutboundPipelineContext) -> bool {
+    ctx.virtual_channel
+        .target_auth
+        .is_some()
+        || !ctx
+            .delegated_credential_headers
+            .is_empty()
+        || ctx
+            .modern_delegation
+            .is_some()
+}
+
+/// Records and refuses with `400 target_path_refused` a Transit Point request whose path
+/// leaves the target endpoint's base path while it carries a Target or delegated credential,
+/// whatever the `fallback`: the caller's error.
+fn refuse_path_outside_target_base(ctx: &OutboundPipelineContext) -> OutboundPipelineError {
+    crate::proxy::handler::record_credential_destination_refusal(
+        &transit_audit_facts(ctx),
+        Some(&ctx.virtual_channel.alias),
+        ctx.virtual_channel
+            .target_auth
+            .as_ref(),
+    );
+    target_auth_failed(ctx, crate::proxy::handler::TargetAuthFailure::PathRefused)
+}
+
 /// Refuse with `502` a request the Transit Point does not forward for a reason other than
 /// its Target credential: the egress policy blocks the target endpoint, or a credential
 /// header it carries cannot be sent.
@@ -5508,15 +5535,6 @@ fn refuse_unsendable_target_credential(
     target_auth: &crate::config::TargetAuthConfig,
 ) -> OutboundPipelineError {
     record_and_refuse(ctx, target_auth, crate::proxy::handler::TargetAuthFailure::Misconfigured)
-}
-
-/// Records and refuses a Transit Point request whose path leaves the target endpoint's base
-/// path, whatever its `fallback`: the caller's error.
-fn refuse_path_outside_target_base(
-    ctx: &OutboundPipelineContext,
-    target_auth: &crate::config::TargetAuthConfig,
-) -> OutboundPipelineError {
-    record_and_refuse(ctx, target_auth, crate::proxy::handler::TargetAuthFailure::PathRefused)
 }
 
 fn record_and_refuse(
@@ -6984,14 +7002,9 @@ async fn step_forward_request_fabric(
     } else {
         format!("/{}", remainder)
     };
-    if let Some(target_auth) = ctx
-        .virtual_channel
-        .target_auth
-        .as_ref()
-        && !crate::proxy::paths::appended_path_stays_below_base(&path)
-    {
-        warn!(request_id = %ctx.request_id, "Refusing a Transit Point request that climbs out of its path: it would carry the Target credential");
-        return Err(refuse_path_outside_target_base(ctx, target_auth));
+    if carries_transit_credential(ctx) && !crate::proxy::paths::appended_path_stays_below_base(&path) {
+        warn!(request_id = %ctx.request_id, "Refusing a Transit Point request that climbs out of its path: it would carry a Target or delegated credential");
+        return Err(refuse_path_outside_target_base(ctx));
     }
 
     let is_modern = matches!(
@@ -7156,10 +7169,7 @@ async fn step_forward_request_http(
             .as_deref(),
     );
 
-    if let Some(target_auth) = ctx
-        .virtual_channel
-        .target_auth
-        .as_ref()
+    if carries_transit_credential(ctx)
         && !crate::proxy::paths::is_target_credential_destination(
             &ctx.virtual_channel
                 .target_endpoint,
@@ -7170,8 +7180,8 @@ async fn step_forward_request_http(
                 .as_deref(),
         )
     {
-        warn!(request_id = %ctx.request_id, "Refusing a Transit Point request outside its base path: it would carry the Target credential");
-        return Err(refuse_path_outside_target_base(ctx, target_auth));
+        warn!(request_id = %ctx.request_id, "Refusing a Transit Point request outside its base path: it would carry a Target or delegated credential");
+        return Err(refuse_path_outside_target_base(ctx));
     }
 
     // Defense-in-depth SSRF guard at the forwarding layer. `pinned_forward_client`
@@ -24429,6 +24439,79 @@ mod tests {
                 })
                 .collect();
             assert_eq!(records, vec![(Some(400), TargetAuthOutcome::Rejected, Some(alias))], "{fallback} {endpoint}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_request_outside_its_base_path_is_refused_when_it_carries_a_delegated_credential_on_either_leg()
+     {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        for endpoint in ["http://127.0.0.1:9/base", "fabric://peer-gateway/partner"] {
+            for (delegated, refused_for_the_path) in
+                [(&[("authorization", "Bearer person-token")][..], true), (&[][..], false)]
+            {
+                let mut ctx = credential_header_case(
+                    &state,
+                    None,
+                    delegated,
+                    Method::POST,
+                    "/outbound/surfaces/order/partner-a/%2e%2e/admin",
+                )
+                .await;
+                ctx.virtual_channel
+                    .target_endpoint = endpoint.to_string();
+                let (result, events) = crate::audit::producer::capture(async {
+                    if endpoint.starts_with("fabric://") {
+                        step_forward_request_fabric(&state, &mut ctx)
+                            .await
+                            .map(drop)
+                    } else {
+                        step_forward_request_http(&state, &mut ctx)
+                            .await
+                            .map(drop)
+                    }
+                })
+                .await;
+                let records: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match &event.event {
+                        crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                            stage,
+                            reason: RejectionReason::TargetPathRefused,
+                            http_status,
+                            ..
+                        } => Some((stage, http_status)),
+                        _ => None,
+                    })
+                    .collect();
+                if refused_for_the_path {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(OutboundPipelineError::TargetAuthFailed {
+                                failure: crate::proxy::handler::TargetAuthFailure::PathRefused,
+                                ..
+                            })
+                        ),
+                        "{endpoint}: {result:?}"
+                    );
+                    assert_eq!(records, vec![(&RejectionStage::Forward, &Some(400))], "{endpoint}");
+                } else {
+                    assert!(
+                        !matches!(
+                            result,
+                            Err(OutboundPipelineError::TargetAuthFailed {
+                                failure: crate::proxy::handler::TargetAuthFailure::PathRefused,
+                                ..
+                            })
+                        ),
+                        "{endpoint}: {result:?}"
+                    );
+                    assert_eq!(records, Vec::new(), "{endpoint}");
+                }
+            }
         }
     }
 

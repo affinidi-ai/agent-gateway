@@ -1076,6 +1076,25 @@ pub(crate) fn record_target_auth_refusal(
     );
 }
 
+/// Records in the VP Audit Log that a request was refused because it would have carried a
+/// credential outside the Target's base path: as a refusal over the Target credential of
+/// `target_auth` when the leg has one, otherwise as a `forward` refusal with reason
+/// `target_path_refused`, which only a delegated credential would have carried.
+pub(crate) fn record_credential_destination_refusal(
+    facts: &crate::audit::request_events::RequestFacts<'_>,
+    transit_point: Option<&str>,
+    target_auth: Option<&crate::config::TargetAuthConfig>,
+) {
+    use crate::audit::request_events::{RejectionReason, RejectionStage, request_rejected};
+    let status = TargetAuthFailure::PathRefused.status();
+    match target_auth {
+        Some(target_auth) => record_target_auth_refusal(facts, transit_point, target_auth, status),
+        None => {
+            request_rejected(facts, RejectionStage::Forward, RejectionReason::TargetPathRefused, status.as_u16(), None)
+        }
+    }
+}
+
 /// Records in the VP Audit Log that the peer gateway refused the Target credential of
 /// `target_auth` with `401`, so the request was answered with `500 target_auth_rejected`.
 pub(crate) fn record_target_credential_refused_by_target(
@@ -6850,25 +6869,48 @@ async fn proxy_charged_request(
         }
     }
 
-    // Inject target authentication credentials (if configured)
-    let mut target_token = None;
-    if let Some(target_auth) = state.surface.target_auth() {
-        if !crate::proxy::paths::is_target_credential_destination(
+    let mut outbound_credentials = state
+        .surface
+        .target_outbound_credentials();
+    if let Some(prepared) = modern_delegation.as_ref() {
+        outbound_credentials.retain(|binding| {
+            !prepared
+                .handled_provider_ids
+                .contains(&binding.credential_provider_id)
+        });
+    }
+    let mcp_tool = mcp_context
+        .as_ref()
+        .and_then(crate::surface_context::McpContext::called_tool_name);
+    let carries_delegated_credential = modern_delegation.is_some()
+        || outbound_credentials
+            .iter()
+            .any(|binding| binding.applies_to_tool(mcp_tool));
+    if (state
+        .surface
+        .target_auth()
+        .is_some()
+        || carries_delegated_credential)
+        && !crate::proxy::paths::is_target_credential_destination(
             &state.surface.target.endpoint,
             method.as_str(),
             &target_url,
             state
                 .surface
                 .agent_card_location_path(),
-        ) {
-            warn!(
-                channel = channel_name,
-                "Refusing a request outside the Target base path: it would carry the Target credential"
-            );
-            let refusal = TargetAuthFailure::PathRefused;
-            record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
-            return Ok(refusal.response());
-        }
+        )
+    {
+        warn!(
+            channel = channel_name,
+            "Refusing a request outside the Target base path: it would carry a Target or delegated credential"
+        );
+        record_credential_destination_refusal(&audit_facts, None, state.surface.target_auth());
+        return Ok(TargetAuthFailure::PathRefused.response());
+    }
+
+    // Inject target authentication credentials (if configured)
+    let mut target_token = None;
+    if let Some(target_auth) = state.surface.target_auth() {
         let caller_assertion = CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed);
         let mcp_proxy_base_url = match state.mcp_proxy_store.as_ref() {
             Some(store) => {
@@ -6958,16 +7000,6 @@ async fn proxy_charged_request(
 
     // ── Credential delegation: inject delegated OAuth tokens or signal consent ──
     let mut delegation_actions_for_vp: Option<serde_json::Value> = None;
-    let mut outbound_credentials = state
-        .surface
-        .target_outbound_credentials();
-    if let Some(prepared) = modern_delegation.as_ref() {
-        outbound_credentials.retain(|binding| {
-            !prepared
-                .handled_provider_ids
-                .contains(&binding.credential_provider_id)
-        });
-    }
     if !outbound_credentials.is_empty() {
         let surface_variant = crate::observability::policy_audit::current_request_variant();
         // Credential delegation requires a verified identity — both source_auth
@@ -7017,10 +7049,6 @@ async fn proxy_charged_request(
             &state.secrets_store,
             &state.gateway_base_url,
         ) {
-            let mcp_tool = mcp_context
-                .as_ref()
-                .and_then(crate::surface_context::McpContext::called_tool_name);
-
             let agent_did_for_vault = state
                 .surface
                 .target_grant_agent_did(request_agent_did.as_deref());
@@ -12703,22 +12731,27 @@ async fn handle_fabric_request_inner(
         trace_id: Some(&trace_id),
         via_fabric: false,
     };
+    if (state
+        .surface
+        .target_auth()
+        .is_some()
+        || modern_delegation.is_some())
+        && !crate::proxy::paths::appended_path_stays_below_base(uri.path())
+    {
+        warn!(
+            channel = channel_name,
+            "Refusing a Fabric request that climbs out of its path: it would carry a Target or delegated credential"
+        );
+        record_credential_destination_refusal(&fabric_send_facts, None, state.surface.target_auth());
+        connection_guard
+            .decrement()
+            .await;
+        return Err(TargetAuthFailure::PathRefused.response());
+    }
     // Inject target authentication credentials into the forwarded headers so
     // GW2 delivers them to the upstream service.
     let mut injected_target_header: Option<String> = None;
     if let Some(target_auth) = state.surface.target_auth() {
-        if !crate::proxy::paths::appended_path_stays_below_base(uri.path()) {
-            warn!(
-                channel = channel_name,
-                "Refusing a Fabric request that climbs out of its path: it would carry the Target credential"
-            );
-            let refusal = TargetAuthFailure::PathRefused;
-            record_target_auth_refusal(&fabric_send_facts, None, target_auth, refusal.status());
-            connection_guard
-                .decrement()
-                .await;
-            return Err(refusal.response());
-        }
         match inject_target_auth_header(
             target_auth,
             &TargetAuthContext::of_proxy(&state),
@@ -21590,6 +21623,63 @@ allow if {
             assert_eq!(
                 observed[before + 1].1["params"]["inputResponses"],
                 json!({"upstream-input": {"action": "accept"}})
+            );
+        }
+        {
+            let mut fabric = state.clone();
+            fabric.listener_manager = listener_manager.clone();
+            let surface = Arc::make_mut(&mut fabric.surface);
+            surface.target.endpoint = format!("fabric://{}/opted-in", peer.id);
+            surface
+                .target
+                .fabric_delegated_credentials = true;
+            message["id"] = json!(20);
+            let params = message["params"]
+                .as_object_mut()
+                .unwrap();
+            params.remove("requestState");
+            params.remove("inputResponses");
+            let mut request = build_request(&message);
+            *request.uri_mut() = "https://gateway.example/mcp/%2e%2e/%2e%2e/admin"
+                .parse()
+                .unwrap();
+            let (response, events) = crate::audit::producer::capture(tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                Box::pin(super::proxy_handler_with_mcp_runtime(
+                    address,
+                    fabric,
+                    request,
+                    versions,
+                    Some(runtime.clone()),
+                )),
+            ))
+            .await;
+            let response = response
+                .expect("the Fabric send leg answers")
+                .unwrap_or_else(|response| response);
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 16384)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&bytes);
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains(super::TARGET_AUTH_FAILED), "{body}");
+            assert!(body.contains("target_path_refused"), "{body}");
+            let refusals: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        stage, reason, ..
+                    } => Some((*stage, *reason)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                refusals,
+                [(
+                    crate::audit::request_events::RejectionStage::Forward,
+                    crate::audit::request_events::RejectionReason::TargetPathRefused
+                )]
             );
         }
         // Gateway consent end to end over HTTP: the gateway's own

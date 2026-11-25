@@ -1311,6 +1311,22 @@ impl OutboundCredentialBinding {
     pub fn is_external(&self) -> bool {
         self.consent_mode == ConsentMode::External
     }
+
+    /// Whether the binding applies to a request calling `tool`: every request, or only a
+    /// call of one of its tools.
+    pub fn applies_to_tool(
+        &self,
+        tool: Option<&str>,
+    ) -> bool {
+        match &self.required_for {
+            CredentialRequirement::All => true,
+            CredentialRequirement::Tools(tools) => tool.is_some_and(|tool| {
+                tools
+                    .iter()
+                    .any(|named| named == tool)
+            }),
+        }
+    }
 }
 
 fn default_elicit_timeout_secs() -> u64 {
@@ -5021,6 +5037,27 @@ mod target_auth_method_tests {
         let secret: TargetAuthMethod =
             serde_json::from_value(json!({"static_secret": {"secret_id": "s", "header_name": "x-key"}})).unwrap();
         assert_eq!(secret.header_name(), Some("x-key"));
+    }
+}
+
+#[cfg(test)]
+mod outbound_credential_binding_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn binding(required_for: serde_json::Value) -> OutboundCredentialBinding {
+        serde_json::from_value(json!({"credential_provider_id": "maps", "required_for": required_for})).unwrap()
+    }
+
+    #[test]
+    fn a_binding_applies_to_every_request_or_only_to_its_tools() {
+        let all = binding(json!("all"));
+        assert!(all.applies_to_tool(None));
+        assert!(all.applies_to_tool(Some("x")));
+        let tools = binding(json!({"tools": ["a"]}));
+        assert!(tools.applies_to_tool(Some("a")));
+        assert!(!tools.applies_to_tool(Some("b")));
+        assert!(!tools.applies_to_tool(None));
     }
 }
 

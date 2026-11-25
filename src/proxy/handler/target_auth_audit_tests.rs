@@ -273,3 +273,94 @@ async fn a_refused_token_request_is_recorded_with_its_oauth_error_code_and_no_se
         assert!(!stored.contains(secret), "the audit records carry secret text");
     }
 }
+
+fn delegated_surface(
+    endpoint: &str,
+    target_auth: Option<Value>,
+    required_for: Value,
+) -> AgentSurface {
+    let mut target = json!({"endpoint": endpoint});
+    if let Some(auth) = target_auth {
+        target["auth"] = auth;
+    }
+    serde_json::from_value(json!({
+        "surface_id": "orders", "name": "Orders",
+        "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+        "target": target,
+        "outbound_credentials": [{"credential_provider_id": "maps", "required_for": required_for}]
+    }))
+    .unwrap()
+}
+
+/// Each `target_path_refused` record: its stage and HTTP status.
+fn path_records(events: &[DelegationAuditEvent]) -> Vec<(RejectionStage, Option<u16>)> {
+    events
+        .iter()
+        .filter_map(|event| match &event.event {
+            DelegationAuditAction::RequestRejected {
+                stage,
+                reason: RejectionReason::TargetPathRefused,
+                http_status,
+                ..
+            } => Some((*stage, *http_status)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_request_outside_the_target_base_path_is_refused_when_a_delegated_credential_applies() {
+    let target = agent().await;
+    let surface = delegated_surface(&format!("{}/base", target.url()), None, json!("all"));
+    let (answered, events) = send(router(surface), "/a2a/%2e%2e/admin").await;
+    assert_eq!(answered.as_u16(), 400);
+    assert_eq!(path_records(&events), vec![(RejectionStage::Forward, Some(400))]);
+    assert_eq!(target_auth_records(&events), Vec::new());
+    assert_eq!(
+        target
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_tool_scoped_binding_that_does_not_apply_leaves_the_path_unchecked() {
+    let target = agent().await;
+    let surface = delegated_surface(&format!("{}/base", target.url()), None, json!({"tools": ["other"]}));
+    let (_, events) = send(router(surface), "/a2a/%2e%2e/admin").await;
+    assert_eq!(path_records(&events), Vec::new());
+}
+
+#[tokio::test]
+async fn a_request_inside_the_target_base_path_with_a_delegated_binding_records_no_path_refusal() {
+    let target = agent().await;
+    let surface = delegated_surface(&format!("{}/base", target.url()), None, json!("all"));
+    let (answered, events) = send(router(surface), "/a2a/inside").await;
+    assert_ne!(answered.as_u16(), 400);
+    assert_eq!(path_records(&events), Vec::new());
+}
+
+#[tokio::test]
+async fn a_request_with_a_target_credential_and_a_binding_outside_the_base_path_is_recorded_once_as_target_auth_failed()
+{
+    let target = agent().await;
+    let surface = delegated_surface(
+        &format!("{}/base", target.url()),
+        Some(json!({"method": "credential_lookup", "fallback": "reject"})),
+        json!("all"),
+    );
+    let (answered, events) = send(router(surface), "/a2a/%2e%2e/admin").await;
+    assert_eq!(answered.as_u16(), 400);
+    assert_eq!(
+        target_auth_records(&events),
+        vec![(
+            RejectionStage::Forward,
+            Some(400),
+            None,
+            Some("trace".to_string()),
+            detail(TargetAuthOutcome::Rejected, None)
+        )]
+    );
+    assert_eq!(path_records(&events), Vec::new());
+}

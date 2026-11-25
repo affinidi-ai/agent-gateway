@@ -843,8 +843,10 @@ Relevant implementation:
 
 ## Target Credential Scope
 
-A Target credential (`target.auth`, or a Transit Point's `target_auth`) is sent only to URLs
-under its Target or Transit Point destination. Before the credential
+A Target credential (`target.auth`, or a Transit Point's `target_auth`), and any delegated
+credential the gateway attaches (see
+[Target base path](CREDENTIAL_DELEGATION.md#target-base-path)), is sent only to URLs under its
+Target or Transit Point destination. Before the credential
 is attached to a forwarded request, the gateway checks the outbound URL against the Target
 endpoint: the scheme, host and port must match (a default port matches an explicit one), and the
 path must equal the Target's path or continue below it after a `/`. Both paths are compared after
@@ -877,6 +879,13 @@ so it is refused the same way. Every refusal carries the detail "Target authenti
 | Transit Point to an `http(s)` destination | The destination endpoint joined with the path after the Transit Point's listen prefix | `400 target_path_refused` |
 | Transit Point to a `fabric://` destination | The path after the listen prefix, which must not climb above the peer gateway's base | `400 target_path_refused` |
 
+Each row applies when the leg attaches either a Target credential or a delegated credential.
+Fabric send checks a delegated credential only on a `2026-07-28` MCP request, the only one that
+carries it to the peer. A delegated credential on a `2026-07-28` MCP proxy call is held by the
+REST client's own base-path check (`400`, JSON-RPC error `-32602`) described below. A request
+refused for a delegated credential alone is recorded as a `target_path_refused` refusal at
+`forward`.
+
 On the MCP proxy, a path parameter value containing another path parameter's `{name}`
 placeholder is also refused while the credential is attached, because the OpenAPI client
 substitutes parameters one at a time and the value would be rewritten into another parameter's
@@ -885,8 +894,8 @@ place. It is refused as leaving the base: a `400 target_path_refused` and a
 Any other value containing `{` or `}` is refused as invalid arguments by the gateway's REST client,
 which sends the tool call, encodes each path parameter as one segment, refuses a braced or `.`
 segment, and checks the base path after substitution. A refused request reaches neither the Target
-nor any other host. A surface without `target.auth`, or a
-Transit Point without `target_auth`, forwards as before. The 2026-07-28 MCP proxy path encodes
+nor any other host. A leg that attaches neither a Target credential nor a delegated credential
+forwards as before. The 2026-07-28 MCP proxy path encodes
 each path parameter as one segment and refuses a parameter that makes a segment `.` or `..`, and,
 below a non-root `base_url` path, one that makes an ambiguous segment above (for example
 `../admin`, sent as `..%2Fadmin`), with or without the credential. The refusal is an HTTP `400` with JSON-RPC error `-32602` and the message "Invalid tool arguments", answered before any request is sent; it writes no VP Audit Log record.

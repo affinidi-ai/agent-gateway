@@ -64,9 +64,11 @@ pub enum RejectionReason {
     /// A closed Access Point without source authentication refused the
     /// request with `503`.
     AccessPointNotReady,
-    /// A request to a Target bound by external consent whose path the vendor
-    /// might read otherwise than the gateway, or that is not one the grant is
-    /// sent to.
+    /// A request whose path is not one a Target's grant or delegated
+    /// credential is sent to: at admission, for a Target bound by external
+    /// consent whose path the vendor might read otherwise than the gateway; at
+    /// forward, when a delegated credential, and no Target credential, would
+    /// leave the Target base path.
     TargetPathRefused,
     /// A request to a Target bound by external consent with a method the
     /// grant is not sent with.
