@@ -1,0 +1,36 @@
+branch: fix/fabric-receive-response-policy
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-25T18:00:00Z'
+      title: ⭐ Apply a surface's response policy to answers sent back over Fabric
+      description: >-
+        A surface's response policy now runs on every Target answer the gateway returns to a peer
+        gateway over Fabric (A2A, legacy and modern MCP, and MCP Proxy Targets) and records its
+        decision in the VP Audit Log, as it already did for direct callers. Before, a Fabric caller
+        received answers the policy was meant to block, and no response decision was recorded.
+    - timestamp: '2026-11-25T18:00:00Z'
+      title: Apply a surface's response policy to a2a-proxy Target answers
+      description: >-
+        A surface whose Target is an a2a-proxy:// endpoint now runs its response policy on each
+        successful answer, directly and over Fabric, refusing it with 403 response_policy_denied
+        when the policy denies it. The proxy's own JSON-RPC error answers pass unchecked.
+    - timestamp: '2026-11-25T18:00:00Z'
+      title: Apply a surface's response policy to answers from Legacy SSE MCP Targets
+      description: >-
+        When an MCP Target only speaks Legacy SSE, the gateway answers through a persistent SSE
+        session instead of the plain POST. That answer now goes through the surface's response
+        policy, directly and over Fabric, instead of being returned unchecked with no decision
+        recorded.
+    - timestamp: '2026-11-25T18:00:00Z'
+      title: Mark policy decisions on requests received over Fabric as via Fabric
+      description: >-
+        A policy decision the gateway makes on a request it received over Fabric is now recorded
+        with via_fabric true, matching its fabric flow. Before, every policy decision record said
+        via_fabric false, so the Audit Log detail and audit integrations (AUDIT_VIA_FABRIC) showed
+        these decisions as direct; the Fabric tools/list filter record also said flow access_point
+        and now says fabric. Records written before the fix keep what they said.
+  removed: []
+  security: []
+  breaking: []

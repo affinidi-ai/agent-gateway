@@ -2697,7 +2697,7 @@ pub fn audit_policy_decision(
         scopes: None,
         token_id: None,
         inject_as: None,
-        via_fabric: false,
+        via_fabric: flow == crate::observability::PolicyFlow::Fabric.as_str(),
         caller,
         mcp_tool_name: None,
         vp_jwt: None,
@@ -4458,6 +4458,40 @@ mod tests {
         assert_eq!(row["event"]["policy_decision"]["policy_name"], "Deny unknown callers");
         assert_eq!(row["event"]["policy_decision"]["policy_version"], 3);
         assert_eq!(row["event"]["policy_decision"]["policy_content_hash"], "sha256:abc");
+    }
+
+    #[tokio::test]
+    async fn a_policy_decision_on_a_fabric_request_is_marked_via_fabric() {
+        let ((), events) = crate::audit::producer::capture(async {
+            for flow in ["fabric", "access_point", "transit_point"] {
+                audit_policy_decision(
+                    "response",
+                    "deny",
+                    "pol-1",
+                    None,
+                    Some("pol-1"),
+                    None,
+                    Some("surface-1"),
+                    None,
+                    None,
+                    Some("POST"),
+                    Some("/"),
+                    Some("trace-1"),
+                    flow,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            }
+        })
+        .await;
+
+        let marked: Vec<bool> = events
+            .iter()
+            .map(|event| event.via_fabric)
+            .collect();
+        assert_eq!(marked, [true, false, false]);
     }
 
     fn transit_claims(

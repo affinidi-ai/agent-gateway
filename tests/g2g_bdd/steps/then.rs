@@ -775,6 +775,75 @@ async fn vp_audit_log_records_fabric_policy_decision_under_request_trace_id(
     );
 }
 
+fn is_fabric_response_decision(
+    event: &Value,
+    decision: &str,
+) -> bool {
+    let recorded = &event["event"]["policy_decision"];
+    recorded["scope"] == "response"
+        && recorded["flow"] == "fabric"
+        && recorded["decision"] == decision
+        && event["via_fabric"] == true
+}
+
+/// The VP Audit Log of `gateway` once it holds its response policy `decision`
+/// on a Fabric request.
+async fn audit_with_fabric_response_decision(
+    world: &mut G2gWorld,
+    gateway: usize,
+    decision: &str,
+) -> Vec<Value> {
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(|event| is_fabric_response_decision(event, decision))
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
+    assert!(
+        found,
+        "expected gateway {gateway} to record a response policy {decision} on the Fabric request, got {events:?}"
+    );
+    events
+}
+
+#[then(regex = r#"^the VP Audit Log of gateway (\d+) records a response policy "(allow|deny)" on the Fabric request$"#)]
+async fn vp_audit_log_records_fabric_response_decision(
+    world: &mut G2gWorld,
+    gateway: usize,
+    decision: String,
+) {
+    audit_with_fabric_response_decision(world, gateway, &decision).await;
+}
+
+#[then(
+    regex = r#"^the VP Audit Log of gateway (\d+) records a response policy "(allow|deny)" on the Fabric request under the trace id of its request policy decision$"#
+)]
+async fn vp_audit_log_records_fabric_response_decision_under_request_trace(
+    world: &mut G2gWorld,
+    gateway: usize,
+    decision: String,
+) {
+    let events = audit_with_fabric_response_decision(world, gateway, &decision).await;
+    let request_trace = events
+        .iter()
+        .find(|event| {
+            let recorded = &event["event"]["policy_decision"];
+            recorded["scope"] == "surface" && recorded["flow"] == "fabric"
+        })
+        .and_then(|event| event["trace_id"].as_str())
+        .unwrap_or_else(|| panic!("gateway {gateway} should record its request policy decision: {events:?}"));
+    let response = events
+        .iter()
+        .find(|event| is_fabric_response_decision(event, &decision))
+        .unwrap();
+    assert_eq!(
+        response["trace_id"].as_str(),
+        Some(request_trace),
+        "the response policy decision should carry the trace id of the request policy decision, got {response}"
+    );
+}
+
 /// The audit outcome for a failed identity binding, as the step names it.
 fn audited_identity_binding_failure(reason: &str) -> &'static str {
     match reason {
@@ -1674,6 +1743,25 @@ pub async fn response_does_not_say(
         other => other.to_string(),
     };
     assert!(!text.contains(&unexpected), "response body {text:?} contains {unexpected:?}");
+}
+
+#[then(expr = "the caller receives no result from MCP server {string}")]
+pub async fn caller_receives_no_mcp_result(
+    world: &mut G2gWorld,
+    server: String,
+) {
+    let body = world
+        .response_body
+        .as_ref()
+        .expect("a When must record the response body before this Then");
+    let text = match body {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    assert!(
+        !text.contains("\"result\""),
+        "the caller should receive no result from MCP server {server:?}, got {text:?}"
+    );
 }
 
 /// The `detail` of the problem the caller was answered with, compared whole, so a

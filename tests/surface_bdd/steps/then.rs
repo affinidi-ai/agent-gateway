@@ -907,6 +907,55 @@ pub(crate) async fn expect_vp_audit_record(
     assert!(found, "expected {what}, got {events:?}");
 }
 
+/// The VP Audit Log once it holds the record of a marker request: a body that is no
+/// JSON-RPC envelope, refused before the Target with `invalid_envelope`. Records reach
+/// the log in the order they are made, so every record of an earlier request is in it.
+pub(crate) async fn vp_audit_events_up_to_a_marker(world: &mut SurfaceWorld) -> Vec<serde_json::Value> {
+    let port = world
+        .infra
+        .as_ref()
+        .expect("the gateway is running")
+        .gateway_port;
+    let route = world
+        .surface_config
+        .route
+        .clone();
+    let marker = crate::bdd_support::caller::post_raw_path(port, &route, "{}", &[])
+        .await
+        .unwrap_or_else(|error| panic!("POST a body that is no JSON-RPC envelope: {error:#}"));
+    assert_eq!(marker.status, 400, "the marker request must be refused before the Target");
+    let (marked, events) =
+        vp_audit_events_matching(world, |event| event["event"]["request_rejected"]["reason"] == "invalid_envelope")
+            .await;
+    assert!(marked, "expected the marker's invalid_envelope record, got {events:?}");
+    events
+}
+
+fn is_response_decision(event: &serde_json::Value) -> bool {
+    event["event"]["policy_decision"]["scope"] == "response"
+}
+
+#[then(regex = r#"^the VP Audit Log records a response policy "(allow|deny)"$"#)]
+async fn vp_audit_log_records_response_decision(
+    world: &mut SurfaceWorld,
+    decision: String,
+) {
+    expect_vp_audit_record(world, &format!("a response policy {decision}"), |event| {
+        is_response_decision(event) && event["event"]["policy_decision"]["decision"] == decision.as_str()
+    })
+    .await;
+}
+
+#[then("the VP Audit Log records no response policy decision")]
+async fn vp_audit_log_records_no_response_decision(world: &mut SurfaceWorld) {
+    let events = vp_audit_events_up_to_a_marker(world).await;
+    let decisions: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| is_response_decision(event))
+        .collect();
+    assert!(decisions.is_empty(), "expected no response policy decision, got {decisions:?}");
+}
+
 /// The audit scheme of a source authentication method, as the step names it.
 fn audited_auth_scheme(auth_type: &str) -> &'static str {
     match auth_type {

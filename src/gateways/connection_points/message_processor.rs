@@ -4003,6 +4003,131 @@ pub(super) fn fabric_caller_did_and_source(
     }
 }
 
+/// The response policy of the surface variant serving a Fabric request, with the
+/// request fields its decisions are recorded with.
+struct FabricResponsePolicy {
+    policy_id: String,
+    surface: crate::proxy::response_policy::SurfaceContext,
+    caller: crate::proxy::response_policy::CallerContext,
+    surface_id: String,
+    trace_id: Option<String>,
+    method: String,
+    path: String,
+    identity: Option<crate::source_auth::AuthenticatedIdentity>,
+    actor_did: Option<String>,
+}
+
+/// The Fabric request a [`FabricResponsePolicy`] decides for.
+struct FabricResponseRequest<'a> {
+    config_id: &'a str,
+    trace_id: Option<&'a str>,
+    method: &'a str,
+    path: &'a str,
+    identity: Option<&'a crate::source_auth::AuthenticatedIdentity>,
+    caller_identity: Option<&'a str>,
+    verification: crate::surface_context::IdentityVerification,
+}
+
+impl FabricResponsePolicy {
+    /// The response policy `request` meets on `served`, the surface variant
+    /// serving it, or `None` when that variant has none.
+    fn for_request(
+        served: &crate::config::agent_surface::AgentSurface,
+        request: FabricResponseRequest<'_>,
+    ) -> Option<Self> {
+        let policy_id = served
+            .response_policy_definition_id()?
+            .to_string();
+        let (did, identity_source) = fabric_caller_did_and_source(request.caller_identity, request.verification);
+        Some(Self {
+            policy_id,
+            surface: crate::proxy::response_policy::SurfaceContext::of(served),
+            caller: crate::proxy::response_policy::CallerContext {
+                did: did.map(str::to_string),
+                identity_source: Some(identity_source.to_string()),
+                dna_uai: None,
+            },
+            surface_id: request.config_id.to_string(),
+            trace_id: request
+                .trace_id
+                .map(str::to_string),
+            method: request.method.to_string(),
+            path: request.path.to_string(),
+            identity: request.identity.cloned(),
+            actor_did: request
+                .caller_identity
+                .map(str::to_string),
+        })
+    }
+
+    /// Evaluates the policy on a Target answer `response` and records the
+    /// decision. Without a policy manager the answer is refused and the
+    /// decision recorded as `no_policy_manager`, as the request plane does.
+    async fn check(
+        &self,
+        policy_manager: Option<&crate::policies::SurfacePolicyManager>,
+        response: crate::proxy::response_policy::ResponseContext,
+    ) -> crate::proxy::response_policy::ResponsePolicyDecision {
+        let context = crate::observability::PolicyDecisionEvent {
+            flow: crate::observability::PolicyFlow::Fabric,
+            surface_id: Some(&self.surface_id),
+            surface_name: Some(&self.surface.name),
+            trace_id: self.trace_id.as_deref(),
+            http_method: Some(&self.method),
+            path: Some(&self.path),
+            identity: self.identity.as_ref(),
+            actor_did: self.actor_did.as_deref(),
+            ..Default::default()
+        };
+        let Some(policy_manager) = policy_manager else {
+            let error = crate::observability::PolicyEvaluationError::NoPolicyManager;
+            crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                scope: crate::observability::PolicyScope::Response,
+                allow: false,
+                error: Some(error),
+                policy_id: Some(&self.policy_id),
+                policy_definition_id: Some(&self.policy_id),
+                ..context
+            });
+            return crate::proxy::response_policy::ResponsePolicyDecision {
+                allow: false,
+                reason: None,
+                error: Some(error),
+            };
+        };
+        let input = crate::proxy::response_policy::ResponsePolicyInput::new(
+            response,
+            self.caller.clone(),
+            self.surface.clone(),
+        );
+        crate::proxy::response_policy::check_response_policy(policy_manager, &self.policy_id, input, context).await
+    }
+
+    /// The `403` the peer gets when the policy refuses a whole Target answer
+    /// with `status`, `body` and `content_type`, or `None` when it may go back.
+    async fn refusal_of_buffered(
+        &self,
+        status: u16,
+        body: &str,
+        content_type: Option<&str>,
+    ) -> Option<ProcessingResult> {
+        let response = crate::proxy::response_policy::response_context(status, body.as_bytes(), content_type);
+        if self
+            .check(
+                GLOBAL_POLICY_MANAGER
+                    .get()
+                    .map(Arc::as_ref),
+                response,
+            )
+            .await
+            .allow
+        {
+            return None;
+        }
+        Some(axum_response_to_forward_result(crate::proxy::response_policy::denied_response()).await)
+    }
+}
+
 /// Whether `binding`, of the receiving surface's Target, applies to a Fabric
 /// request calling `tool`.
 fn fabric_binding_applies(
@@ -5852,6 +5977,18 @@ async fn process_charged_forward_request(
     }
     let active_variant_alias = variant_alias.map(|s| s.to_string());
     let resolved_surface = surface.clone();
+    let response_policy = FabricResponsePolicy::for_request(
+        &surface,
+        FabricResponseRequest {
+            config_id,
+            trace_id: (!trace_id_field.is_empty()).then_some(trace_id_field),
+            method,
+            path,
+            identity: authenticated_identity.as_ref(),
+            caller_identity: caller_identity.as_deref(),
+            verification: caller_identity_verification,
+        },
+    );
     let deadline_ms: Option<u64> = message
         .message_body
         .get("deadline_ms")
@@ -5974,6 +6111,7 @@ async fn process_charged_forward_request(
             a2a_proxy_receive_caller(&surface, method, path, source_auth_failed),
             fabric_payment,
             gate_receipt,
+            response_policy.as_ref(),
         )
         .await;
     }
@@ -5997,6 +6135,7 @@ async fn process_charged_forward_request(
             source_auth_failed,
             fabric_payment,
             gate_receipt,
+            response_policy.as_ref(),
         )
         .await;
     }
@@ -6719,6 +6858,12 @@ async fn process_charged_forward_request(
             {
                 Ok(json_response) if !json_response.is_empty() => {
                     channel_info!(config_id, "GW2: Persistent SSE session succeeded (reuse)");
+                    if let Some(policy) = response_policy.as_ref()
+                        && let Some(refusal) =
+                            policy.refusal_of_buffered(200, &json_response, Some("application/json")).await
+                    {
+                        return refusal;
+                    }
                     let response_time_ms = response_start.elapsed().as_millis() as u64;
                     let response_bytes = json_response.len() as u64;
 
@@ -6867,6 +7012,12 @@ async fn process_charged_forward_request(
                 {
                     Ok(json_response) if !json_response.is_empty() => {
                         channel_info!(config_id, "GW2: Persistent SSE session succeeded");
+                        if let Some(policy) = response_policy.as_ref()
+                            && let Some(refusal) =
+                                policy.refusal_of_buffered(200, &json_response, Some("application/json")).await
+                        {
+                            return refusal;
+                        }
                         let response_time_ms = response_start.elapsed().as_millis() as u64;
                         let response_bytes = json_response.len() as u64;
 
@@ -6977,6 +7128,7 @@ async fn process_charged_forward_request(
                 response_headers.insert("content-type".to_string(), vec!["application/json".to_string()]);
             }
 
+            let card_fetch_refused = card_fetch_refusal.is_some();
             let (modern_response, response_body) = if modern_request.is_some() {
                 (Some(response), String::new())
             } else {
@@ -7062,6 +7214,38 @@ async fn process_charged_forward_request(
                     Ok(body) => body,
                     Err(error) => return axum_response_to_forward_result(error.into_response(response_body.as_bytes(), axum::http::StatusCode::BAD_GATEWAY)).await,
                 };
+            }
+            // MCP Tool Gating — G2G `tools/list` filter. Hides denied tools
+            // from the list GW1 receives (parity with the direct-path filter),
+            // before the response policy sees the list, as on the direct path.
+            // `response_body` is already de-SSE'd above, so this covers MCP
+            // targets that answer over SSE too.
+            if let Some(filtered) = filter_mcp_tools_list_for_fabric(
+                &resolved_surface,
+                config_id,
+                active_variant_alias.as_deref(),
+                &body_bytes,
+                &response_body,
+                headers.as_ref(),
+                method,
+                path,
+                message.from_did.clone(),
+                source_auth_context.as_ref(),
+                modern_mcp_context.as_ref(),
+                mcp_metadata_context,
+            ) {
+                response_body = filtered;
+            }
+            let content_type = response_headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                .and_then(|(_, values)| values.first())
+                .map(String::as_str);
+            if !card_fetch_refused
+                && let Some(policy) = response_policy.as_ref()
+                && let Some(refusal) = policy.refusal_of_buffered(status, &response_body, content_type).await
+            {
+                return refusal;
             }
             if let Some((receipt, protocol)) = stream_receipt.as_ref()
                 && let Some(injected) = receipt
@@ -7960,27 +8144,6 @@ async fn process_charged_forward_request(
                 );
             }
 
-            // MCP Tool Gating — G2G `tools/list` filter. Hides denied tools
-            // from the list GW1 receives (parity with the direct-path filter).
-            // `response_body` is already de-SSE'd above, so this covers MCP
-            // targets that answer over SSE too.
-            if let Some(filtered) = filter_mcp_tools_list_for_fabric(
-                &resolved_surface,
-                config_id,
-                active_variant_alias.as_deref(),
-                &body_bytes,
-                &response_body,
-                headers.as_ref(),
-                method,
-                path,
-                message.from_did.clone(),
-                source_auth_context.as_ref(),
-                modern_mcp_context.as_ref(),
-                mcp_metadata_context,
-            ) {
-                response_body = filtered;
-            }
-
             if surface_protocol == crate::config::ChannelProtocol::Mcp {
                 response_body = match crate::mcp::meta::normalize_text(&response_body, mcp_metadata_context) {
                     Ok(body) => body,
@@ -8571,6 +8734,7 @@ fn filter_mcp_tools_list_for_fabric(
             &filtered.listed,
             &filtered.kept,
             crate::observability::PolicyDecisionEvent {
+                flow: crate::observability::PolicyFlow::Fabric,
                 surface_id: Some(config_id),
                 surface_name: Some(surface.name.as_str()),
                 http_method: Some(method),
@@ -8716,6 +8880,22 @@ fn gateway_owned_receive_header(
     }
 }
 
+/// The A2A proxy's `answer` to a Fabric request, or the `403` the surface's
+/// response policy gives when it refuses a successful one.
+async fn a2a_proxy_answer_under_fabric_response_policy(
+    answer: axum::response::Response,
+    response_policy: Option<&FabricResponsePolicy>,
+) -> axum::response::Response {
+    let Some(policy) = response_policy else {
+        return answer;
+    };
+    let policy_manager = GLOBAL_POLICY_MANAGER
+        .get()
+        .map(Arc::as_ref);
+    crate::proxy::response_policy::a2a_proxy_answer_under(answer, |response| policy.check(policy_manager, response))
+        .await
+}
+
 async fn handle_a2a_proxy_forward(
     message: &ReceivedMessage,
     surface: &crate::config::agent_surface::AgentSurface,
@@ -8726,6 +8906,7 @@ async fn handle_a2a_proxy_forward(
     caller: crate::proxy::handler::CallerAssertion,
     payment: FabricPayment<'_>,
     gate_receipt: &mut Option<(crate::proxy::handler::agent_pay_gate::Receipt, crate::config::ChannelProtocol)>,
+    response_policy: Option<&FabricResponsePolicy>,
 ) -> ProcessingResult {
     let config_id = surface
         .config_id()
@@ -8822,6 +9003,7 @@ async fn handle_a2a_proxy_forward(
     };
 
     let request_body_bytes = body_bytes;
+    let response = a2a_proxy_answer_under_fabric_response_policy(response, response_policy).await;
     let (parts, body) = response.into_parts();
     let response_body_bytes = axum::body::to_bytes(body, usize::MAX)
         .await
@@ -9009,7 +9191,7 @@ async fn spawn_mcp_proxy_trust_recorder(
 }
 
 /// Handle MCP proxy forwarding for fabric gateway requests
-#[instrument(name = "fabric.mcp_proxy_forward", skip(message, surface, body_bytes, payment, gate_receipt), fields(channel_id, proxy_id, msg.id = %message.didcomm_message_id))]
+#[instrument(name = "fabric.mcp_proxy_forward", skip(message, surface, body_bytes, payment, gate_receipt, response_policy), fields(channel_id, proxy_id, msg.id = %message.didcomm_message_id))]
 async fn handle_mcp_proxy_forward(
     message: &ReceivedMessage,
     surface: &crate::config::agent_surface::AgentSurface,
@@ -9023,6 +9205,7 @@ async fn handle_mcp_proxy_forward(
     source_auth_failed: bool,
     payment: FabricPayment<'_>,
     gate_receipt: &mut Option<(crate::proxy::handler::agent_pay_gate::Receipt, crate::config::ChannelProtocol)>,
+    response_policy: Option<&FabricResponsePolicy>,
 ) -> ProcessingResult {
     // Record fields in the span
     tracing::Span::current().record("channel_id", channel_id);
@@ -9298,6 +9481,29 @@ async fn handle_mcp_proxy_forward(
     };
     match executed {
         Ok(mcp_response) => {
+            if let Some(policy) = response_policy {
+                let decision = policy
+                    .check(
+                        GLOBAL_POLICY_MANAGER
+                            .get()
+                            .map(Arc::as_ref),
+                        crate::proxy::response_policy::mcp_proxy_answer_context(&mcp_response),
+                    )
+                    .await;
+                if !decision.allow {
+                    let denied =
+                        crate::proxy::response_policy::mcp_proxy_denied_answer(mcp_request.get("id"), decision);
+                    return ProcessingResult::RequiresResponse {
+                        response_type: MessageType::ForwardResponse.to_string(),
+                        response_body: serde_json::json!({
+                            "status": 200,
+                            "headers": {"Content-Type": "application/json"},
+                            "body": denied.to_string(),
+                        }),
+                    };
+                }
+            }
+
             // Broadcast payload capture for successful MCP proxy request
             if let (Some(ws_state), Some(metrics_store)) = (GLOBAL_WS_STATE.get(), GLOBAL_METRICS_STORE.get()) {
                 let config_id = surface
@@ -9864,6 +10070,145 @@ mod tests {
             .unwrap()
             .clone();
         (out, decisions)
+    }
+
+    fn surface_with_response_policies() -> crate::config::agent_surface::AgentSurface {
+        let mut surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "surface-1", "name": "surface-1",
+            "access_point": {"listen_address": "0.0.0.0:9000", "route": "/agent", "protocol": "a2a"},
+            "target": {
+                "endpoint": "https://agent.example",
+                "response_policy": {"policy_definition_id": "base-response"}
+            }
+        }))
+        .unwrap();
+        surface.variants.push(
+            serde_json::from_value(serde_json::json!({
+                "id": "v-1", "alias": "beta", "name": "Beta",
+                "overrides": {"target": {"response_policy": {"policy_definition_id": "beta-response"}}}
+            }))
+            .unwrap(),
+        );
+        surface
+    }
+
+    fn fabric_response_request() -> FabricResponseRequest<'static> {
+        FabricResponseRequest {
+            config_id: "surface-1",
+            trace_id: Some("peer-trace"),
+            method: "POST",
+            path: "/agent",
+            identity: None,
+            caller_identity: Some("did:example:caller"),
+            verification: crate::surface_context::IdentityVerification::Vp,
+        }
+    }
+
+    fn served(alias: Option<&str>) -> crate::config::agent_surface::AgentSurface {
+        surface_with_response_policies()
+            .serve_variant(alias)
+            .map(crate::config::agent_surface_variants::ServedVariant::into_parts)
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn a_fabric_request_meets_the_response_policy_of_the_variant_serving_it() {
+        let beta = FabricResponsePolicy::for_request(&served(Some("beta")), fabric_response_request()).unwrap();
+        let base = FabricResponsePolicy::for_request(&served(None), fabric_response_request()).unwrap();
+
+        assert_eq!(beta.policy_id, "beta-response");
+        assert_eq!(base.policy_id, "base-response");
+    }
+
+    #[test]
+    fn a_fabric_request_to_a_surface_without_a_response_policy_meets_none() {
+        let mut surface = served(None);
+        surface.target.response_policy = None;
+
+        assert!(FabricResponsePolicy::for_request(&surface, fabric_response_request()).is_none());
+    }
+
+    #[test]
+    fn a_fabric_response_policy_sees_the_caller_the_peer_vouched_for() {
+        let policy = FabricResponsePolicy::for_request(&served(None), fabric_response_request()).unwrap();
+
+        assert_eq!(policy.caller.did.as_deref(), Some("did:example:caller"));
+        assert_eq!(
+            policy
+                .caller
+                .identity_source
+                .as_deref(),
+            Some("fabric-presentation")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fabric_response_decision_carries_the_peer_trace_and_the_fabric_flow() {
+        let manager = crate::policies::SurfacePolicyManager::new();
+        manager
+            .load_policy_text("response:base-response", "package surface.policy\n\ndefault allow := false\n")
+            .unwrap();
+        let policy = FabricResponsePolicy::for_request(&served(None), fabric_response_request()).unwrap();
+
+        let (decision, decisions) = fabric_response_checked(&policy, Some(&manager)).await;
+
+        assert!(!decision.allow);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].scope, "response");
+        assert_eq!(decisions[0].flow, "fabric");
+        assert_eq!(decisions[0].decision, "deny");
+        assert_eq!(
+            decisions[0]
+                .surface_id
+                .as_deref(),
+            Some("surface-1")
+        );
+        assert_eq!(
+            decisions[0]
+                .caller_did
+                .as_deref(),
+            Some("did:example:caller")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fabric_response_policy_without_a_policy_manager_refuses_and_records_why() {
+        let policy = FabricResponsePolicy::for_request(&served(None), fabric_response_request()).unwrap();
+
+        let (decision, decisions) = fabric_response_checked(&policy, None).await;
+
+        assert!(!decision.allow);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].scope, "response");
+        assert_eq!(decisions[0].decision, "error");
+        assert_eq!(
+            decisions[0]
+                .deny_reason
+                .as_deref(),
+            Some("no_policy_manager")
+        );
+    }
+
+    async fn fabric_response_checked(
+        policy: &FabricResponsePolicy,
+        manager: Option<&crate::policies::SurfacePolicyManager>,
+    ) -> (
+        crate::proxy::response_policy::ResponsePolicyDecision,
+        Vec<crate::observability::policy_audit::PolicyDecisionSummary>,
+    ) {
+        let collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let decision = crate::observability::policy_audit::POLICY_DECISION_COLLECTOR
+            .scope(
+                collector.clone(),
+                policy.check(manager, crate::proxy::response_policy::response_context(200, b"{}", None)),
+            )
+            .await;
+        let decisions = collector
+            .lock()
+            .unwrap()
+            .clone();
+        (decision, decisions)
     }
 
     fn forward_response_body(result: &ProcessingResult) -> String {

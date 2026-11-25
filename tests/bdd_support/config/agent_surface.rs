@@ -320,6 +320,14 @@ impl AgentSurfaceFixture {
         self
     }
 
+    pub fn with_target_response_policy_definition_id(
+        mut self,
+        policy_definition_id: impl Into<String>,
+    ) -> Self {
+        self.target.response_policy = Some(policy_definition_id.into());
+        self
+    }
+
     pub fn with_mcp_tool_policy(
         mut self,
         tool_name: impl Into<String>,

@@ -6567,6 +6567,20 @@ async fn proxy_charged_request(
             )
             .await
         };
+        let dispatched = a2a_proxy_answer_under_response_policy(
+            &state,
+            dispatched,
+            response_policy_caller(agent_context.as_ref(), None),
+            direct_response_decision(
+                &state,
+                config_id,
+                &trace_id,
+                (method.as_ref(), uri.path()),
+                authenticated_identity.as_ref(),
+                request_agent_did.as_deref(),
+            ),
+        )
+        .await;
         let response = record_a2a_proxy_connection_metric(
             &state,
             proxy_id,
@@ -8356,6 +8370,28 @@ async fn proxy_charged_request(
                 connection_guard
                     .decrement()
                     .await;
+                if !json_response.is_empty()
+                    && let Some(refusal) = direct_response_policy_refusal(
+                        &state,
+                        DirectTargetAnswer {
+                            status: StatusCode::OK.as_u16(),
+                            body: json_response.as_bytes(),
+                            content_type: Some("application/json"),
+                        },
+                        response_policy_caller(agent_context.as_ref(), caller_identity_source.clone()),
+                        direct_response_decision(
+                            &state,
+                            config_id,
+                            &trace_id,
+                            (method.as_ref(), uri.path()),
+                            authenticated_identity.as_ref(),
+                            request_agent_did.as_deref(),
+                        ),
+                    )
+                    .await
+                {
+                    return Err(refusal);
+                }
                 return Ok(axum::response::Response::builder()
                     .status(StatusCode::OK)
                     .header("Content-Type", "application/json")
@@ -9411,116 +9447,32 @@ async fn proxy_charged_request(
         // ── Step 23: Response policy evaluation (§4.11 / §6.1) ─────────────────
         // If a response_policy_definition_id is configured, evaluate the OPA policy
         // on the upstream response before returning it to the caller.
-        if let Some(response_policy_id) = state
-            .surface
-            .response_policy_definition_id()
-            && let Some(ref pm) = state.policy_manager
+        let content_type_str = response_headers
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok());
+        if let Some(refusal) = direct_response_policy_refusal(
+            &state,
+            DirectTargetAnswer {
+                status: status.as_u16(),
+                body: &response_body,
+                content_type: content_type_str,
+            },
+            response_policy_caller(agent_context.as_ref(), caller_identity_source.clone()),
+            direct_response_decision(
+                &state,
+                config_id,
+                &trace_id,
+                (method.as_ref(), uri.path()),
+                authenticated_identity.as_ref(),
+                request_agent_did.as_deref(),
+            ),
+        )
+        .await
         {
-            use crate::proxy::response_policy::{
-                CallerContext as RpCallerContext, ResponseContext, ResponsePolicyInput, SurfaceContext,
-                evaluate_response_policy,
-            };
-
-            let response_json: Option<serde_json::Value> = serde_json::from_slice(&response_body).ok();
-
-            let content_type_str = response_headers
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-
-            let policy_key = format!("response:{}", response_policy_id);
-            let input = ResponsePolicyInput::new(
-                ResponseContext {
-                    status_code: status.as_u16(),
-                    body: response_json,
-                    content_type: content_type_str,
-                    is_error: status.is_server_error() || status.is_client_error(),
-                    method: None,
-                },
-                RpCallerContext {
-                    did: agent_context
-                        .as_ref()
-                        .and_then(|ctx| ctx.did.clone()),
-                    identity_source: caller_identity_source.clone(),
-                    dna_uai: agent_context
-                        .as_ref()
-                        .and_then(|ctx| ctx.agent_dna.as_ref())
-                        .map(|dna| dna.uai.clone()),
-                },
-                SurfaceContext {
-                    id: state
-                        .surface
-                        .surface_id
-                        .clone(),
-                    name: channel_name.clone(),
-                    protocol: format!(
-                        "{:?}",
-                        state
-                            .surface
-                            .channel_protocol()
-                    )
-                    .to_lowercase(),
-                },
-            );
-
-            let response_policy = pm
-                .resolve_policy_attestation(Some(response_policy_id))
+            connection_guard
+                .decrement()
                 .await;
-            let decision = evaluate_response_policy(pm.as_ref(), &policy_key, input);
-            if !decision.allow {
-                crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
-                    scope: crate::observability::PolicyScope::Response,
-                    allow: false,
-                    reason: decision.reason.as_deref(),
-                    error: decision.error,
-                    policy_id: Some(response_policy_id),
-                    policy_definition_id: Some(response_policy_id),
-                    policy_name: response_policy
-                        .name
-                        .as_deref(),
-                    policy_version: response_policy.version,
-                    policy_content_hash: response_policy
-                        .content_hash
-                        .as_deref(),
-                    surface_id: Some(config_id),
-                    surface_name: Some(state.surface.name.as_str()),
-                    trace_id: Some(&trace_id),
-                    http_method: Some(method.as_ref()),
-                    path: Some(uri.path()),
-                    identity: authenticated_identity.as_ref(),
-                    actor_did: request_agent_did.as_deref(),
-                    ..Default::default()
-                });
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(axum::response::Response::builder()
-                    .status(axum::http::StatusCode::FORBIDDEN)
-                    .header("Content-Type", "application/json")
-                    .body(axum::body::Body::from(r#"{"error":"Response blocked","code":"response_policy_denied"}"#))
-                    .unwrap());
-            }
-            crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
-                scope: crate::observability::PolicyScope::Response,
-                allow: true,
-                policy_id: Some(response_policy_id),
-                policy_definition_id: Some(response_policy_id),
-                policy_name: response_policy
-                    .name
-                    .as_deref(),
-                policy_version: response_policy.version,
-                policy_content_hash: response_policy
-                    .content_hash
-                    .as_deref(),
-                surface_id: Some(config_id),
-                surface_name: Some(state.surface.name.as_str()),
-                trace_id: Some(&trace_id),
-                http_method: Some(method.as_ref()),
-                path: Some(uri.path()),
-                identity: authenticated_identity.as_ref(),
-                actor_did: request_agent_did.as_deref(),
-                ..Default::default()
-            });
+            return Err(refusal);
         }
 
         // Inject VP into response if client supports credential extension and backend agent has DID
@@ -15374,6 +15326,104 @@ async fn prepare_a2a_proxy_agent_card_for_target_context(
     .map(|prepared| prepared.card)
 }
 
+/// A whole Target answer a direct caller is about to get.
+struct DirectTargetAnswer<'a> {
+    status: u16,
+    body: &'a [u8],
+    content_type: Option<&'a str>,
+}
+
+/// The request fields a direct response policy decision is recorded with.
+fn direct_response_decision<'a>(
+    state: &'a ProxyState,
+    config_id: &'a str,
+    trace_id: &'a str,
+    request: (&'a str, &'a str),
+    identity: Option<&'a crate::source_auth::AuthenticatedIdentity>,
+    actor_did: Option<&'a str>,
+) -> crate::observability::PolicyDecisionEvent<'a> {
+    let (http_method, path) = request;
+    crate::observability::PolicyDecisionEvent {
+        surface_id: Some(config_id),
+        surface_name: Some(state.surface.name.as_str()),
+        trace_id: Some(trace_id),
+        http_method: Some(http_method),
+        path: Some(path),
+        identity,
+        actor_did,
+        ..Default::default()
+    }
+}
+
+/// The direct caller as a response policy sees it.
+fn response_policy_caller(
+    agent_context: Option<&crate::surface_context::AgentContext>,
+    identity_source: Option<String>,
+) -> crate::proxy::response_policy::CallerContext {
+    crate::proxy::response_policy::CallerContext {
+        did: agent_context.and_then(|ctx| ctx.did.clone()),
+        identity_source,
+        dna_uai: agent_context
+            .and_then(|ctx| ctx.agent_dna.as_ref())
+            .map(|dna| dna.uai.clone()),
+    }
+}
+
+/// The `403` a direct caller gets when the surface's response policy refuses
+/// `answer`, or `None` when the surface has no response policy or it allows the
+/// answer. The decision is recorded with `context`.
+async fn direct_response_policy_refusal(
+    state: &ProxyState,
+    answer: DirectTargetAnswer<'_>,
+    caller: crate::proxy::response_policy::CallerContext,
+    context: crate::observability::PolicyDecisionEvent<'_>,
+) -> Option<Response> {
+    use crate::proxy::response_policy::{
+        ResponsePolicyInput, SurfaceContext, check_response_policy, denied_response, response_context,
+    };
+    let (Some(policy_id), Some(policy_manager)) = (
+        state
+            .surface
+            .response_policy_definition_id(),
+        state.policy_manager.as_ref(),
+    ) else {
+        return None;
+    };
+    let input = ResponsePolicyInput::new(
+        response_context(answer.status, answer.body, answer.content_type),
+        caller,
+        SurfaceContext::of(&state.surface),
+    );
+    let decision = check_response_policy(policy_manager, policy_id, input, context).await;
+    (!decision.allow).then(denied_response)
+}
+
+/// The A2A proxy's `answer`, or the `403` its surface's response policy gives
+/// when it refuses a successful one. The decision is recorded with `context`.
+async fn a2a_proxy_answer_under_response_policy(
+    state: &ProxyState,
+    answer: Response,
+    caller: crate::proxy::response_policy::CallerContext,
+    context: crate::observability::PolicyDecisionEvent<'_>,
+) -> Response {
+    use crate::proxy::response_policy::{
+        ResponsePolicyInput, SurfaceContext, a2a_proxy_answer_under, check_response_policy,
+    };
+    let (Some(policy_id), Some(policy_manager)) = (
+        state
+            .surface
+            .response_policy_definition_id(),
+        state.policy_manager.as_ref(),
+    ) else {
+        return answer;
+    };
+    a2a_proxy_answer_under(answer, |response| {
+        let input = ResponsePolicyInput::new(response, caller, SurfaceContext::of(&state.surface));
+        check_response_policy(policy_manager, policy_id, input, context)
+    })
+    .await
+}
+
 async fn record_a2a_proxy_connection_metric(
     state: &ProxyState,
     proxy_id: &str,
@@ -16202,59 +16252,25 @@ async fn handle_mcp_proxy_request_inner(
                 && let Some(ref pm) = state.policy_manager
             {
                 use crate::proxy::response_policy::{
-                    CallerContext as RpCallerContext, ResponseContext, ResponsePolicyInput, SurfaceContext,
-                    evaluate_response_policy,
+                    CallerContext as RpCallerContext, ResponsePolicyInput, SurfaceContext, check_response_policy,
+                    mcp_proxy_answer_context, mcp_proxy_denied_answer,
                 };
 
-                let policy_key = format!("response:{}", response_policy_id);
                 let input = ResponsePolicyInput::new(
-                    ResponseContext {
-                        status_code: 200,
-                        body: Some(response_json.clone()),
-                        content_type: Some("application/json".to_string()),
-                        is_error: false,
-                        method: None,
-                    },
+                    mcp_proxy_answer_context(&response_json),
                     RpCallerContext {
                         did: None,
                         identity_source: authenticated_identity.map(|id| format!("{:?}", id)),
                         dna_uai: None,
                     },
-                    SurfaceContext {
-                        id: state
-                            .surface
-                            .surface_id
-                            .clone(),
-                        name: channel_name.to_string(),
-                        protocol: format!(
-                            "{:?}",
-                            state
-                                .surface
-                                .channel_protocol()
-                        )
-                        .to_lowercase(),
-                    },
+                    SurfaceContext::of(&state.surface),
                 );
 
-                let response_policy = pm
-                    .resolve_policy_attestation(Some(response_policy_id))
-                    .await;
-                let decision = evaluate_response_policy(pm.as_ref(), &policy_key, input);
-                if !decision.allow {
-                    crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
-                        scope: crate::observability::PolicyScope::Response,
-                        allow: false,
-                        reason: decision.reason.as_deref(),
-                        error: decision.error,
-                        policy_id: Some(response_policy_id),
-                        policy_definition_id: Some(response_policy_id),
-                        policy_name: response_policy
-                            .name
-                            .as_deref(),
-                        policy_version: response_policy.version,
-                        policy_content_hash: response_policy
-                            .content_hash
-                            .as_deref(),
+                let decision = check_response_policy(
+                    pm.as_ref(),
+                    response_policy_id,
+                    input,
+                    crate::observability::PolicyDecisionEvent {
                         surface_id: Some(config_id),
                         surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
@@ -16262,37 +16278,13 @@ async fn handle_mcp_proxy_request_inner(
                         path: Some(uri.path()),
                         identity: authenticated_identity,
                         ..Default::default()
-                    });
-                    let error_response = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": json_request.get("id"),
-                        "error": {
-                            "code": -32000,
-                            "message": decision.reason.unwrap_or_else(|| "Response blocked by policy".to_string())
-                        }
-                    });
-                    return Err(axum::response::Json(error_response).into_response());
+                    },
+                )
+                .await;
+                if !decision.allow {
+                    let denied = mcp_proxy_denied_answer(json_request.get("id"), decision);
+                    return Err(axum::response::Json(denied).into_response());
                 }
-                crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
-                    scope: crate::observability::PolicyScope::Response,
-                    allow: true,
-                    policy_id: Some(response_policy_id),
-                    policy_definition_id: Some(response_policy_id),
-                    policy_name: response_policy
-                        .name
-                        .as_deref(),
-                    policy_version: response_policy.version,
-                    policy_content_hash: response_policy
-                        .content_hash
-                        .as_deref(),
-                    surface_id: Some(config_id),
-                    surface_name: Some(state.surface.name.as_str()),
-                    trace_id: Some(&trace_id),
-                    http_method: Some("POST"),
-                    path: Some(uri.path()),
-                    identity: authenticated_identity,
-                    ..Default::default()
-                });
             }
 
             // Trust Recorder — writes TrAdmin records to configured TRs on the

@@ -875,6 +875,22 @@ the payload, a static DID or a stored key or certificate (all `unverified`), and
 Transit Point traffic it used to allow. Scope such a rule to the inbound legs by testing that
 `input.transit` is absent.
 
+The surface's response policy (`target.response_policy`, or the served variant's) runs on every
+answer from an HTTP, MCP Proxy or `a2a-proxy://` Target, whether the request came in directly
+or over Fabric. On an `a2a-proxy://` Target it checks a successful answer only; the proxy's own
+JSON-RPC errors pass unchecked. On a `tools/list` answer the policy sees the list after MCP tool
+gating has removed the tools the caller may not see, directly and over Fabric. Responses the
+gateway makes itself are not checked, nor is an empty answer from a Legacy SSE session (the
+answer to a notification). A denied
+answer is refused with `403 response_policy_denied`, or, on an MCP Proxy Target, with a
+JSON-RPC `-32000` error that carries the deny reason; a denied message of a modern MCP response
+ends its stream. A request received over Fabric is refused when the gateway has no policy
+manager to evaluate the policy with. On such a request `input.caller.did` is set only when a
+presentation from one of the peer's connection issuers carried it, and
+`input.caller.identity_source` is `fabric-presentation` or `fabric-asserted`. The decision is
+recorded with flow `fabric` and `via_fabric: true`, as every policy decision made on a request
+received over Fabric is.
+
 A Transit Point's response policy gets `input.transit`, `input.extension_identity` while the
 managed agent has an identity, and `input.source_auth` when the Transit Point authenticated a
 client, beside its `input.response`, `input.caller` and

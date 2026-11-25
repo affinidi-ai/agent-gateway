@@ -2470,6 +2470,33 @@ fn a2a_proxy_is_disabled(
         .a2a_proxy_target = Some(proxy.with_disabled());
 }
 
+#[given(regex = r#"^surface "([^"]+)" has a response policy that (allows|denies) every response$"#)]
+fn surface_has_every_response_policy(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+    decision: String,
+) {
+    assert_eq!(
+        world
+            .surface_config
+            .surface_name
+            .as_deref(),
+        Some(surface_name.as_str()),
+        "the response policy must be set on the configured surface"
+    );
+    let rego = match decision.as_str() {
+        "allows" => "package surface.policy\n\ndefault allow := true\n",
+        _ => "package surface.policy\n\ndefault allow := false\n",
+    };
+    world
+        .surface_config
+        .response_policy = Some(RequestPolicyFixture::new(
+        format!("bdd-{decision}-every-response"),
+        "BDD response policy",
+        rego.to_string(),
+    ));
+}
+
 #[given(expr = "non-A2A managed agent {string} does not answer before the proxy timeout")]
 fn non_a2a_managed_agent_does_not_answer_before_proxy_timeout(
     world: &mut SurfaceWorld,

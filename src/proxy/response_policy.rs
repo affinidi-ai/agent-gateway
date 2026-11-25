@@ -196,9 +196,141 @@ pub fn evaluate_response_policy(
 
 /// Build the policy engine key for a response policy.
 /// Convention: "response:{surface_id}" or "response:{config_id}".
-#[allow(dead_code)]
 pub fn response_policy_key(surface_or_channel_id: &str) -> String {
     format!("response:{}", surface_or_channel_id)
+}
+
+/// The body of the `403` a caller gets when a response policy refuses an answer.
+pub const DENIED_BODY: &str = r#"{"error":"Response blocked","code":"response_policy_denied"}"#;
+
+/// The `403` a caller gets when a response policy refuses an answer.
+pub fn denied_response() -> axum::response::Response {
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::FORBIDDEN)
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(DENIED_BODY))
+        .expect("a static response builds")
+}
+
+/// What a response policy sees of a Target answer with `status`, `body` and `content_type`.
+pub fn response_context(
+    status: u16,
+    body: &[u8],
+    content_type: Option<&str>,
+) -> ResponseContext {
+    ResponseContext {
+        status_code: status,
+        body: serde_json::from_slice(body).ok(),
+        content_type: content_type.map(str::to_string),
+        is_error: status >= 400,
+        method: None,
+    }
+}
+
+impl SurfaceContext {
+    /// The response policy's view of `surface`.
+    pub fn of(surface: &crate::config::agent_surface::AgentSurface) -> Self {
+        Self {
+            id: surface.surface_id.clone(),
+            name: surface.name.clone(),
+            protocol: format!("{:?}", surface.channel_protocol()).to_lowercase(),
+        }
+    }
+}
+
+/// Whether the response policy checks an `a2a-proxy://` answer with `status` and
+/// `body`: only a successful one, so the proxy runtime's own JSON-RPC errors pass.
+fn a2a_proxy_answer_is_checked(
+    status: axum::http::StatusCode,
+    body: &[u8],
+) -> bool {
+    crate::proxy::handler::a2a_proxy_connection_status(status, body) == crate::metrics::ConnectionStatus::Success
+}
+
+/// An `a2a-proxy://` `answer`, or [`denied_response`] when `check` refuses it.
+/// Only an answer [`a2a_proxy_answer_is_checked`] accepts is given to `check`.
+pub async fn a2a_proxy_answer_under<Check, Decided>(
+    answer: axum::response::Response,
+    check: Check,
+) -> axum::response::Response
+where
+    Check: FnOnce(ResponseContext) -> Decided,
+    Decided: std::future::Future<Output = ResponsePolicyDecision>,
+{
+    let (parts, body) = answer.into_parts();
+    let Ok(body) = axum::body::to_bytes(body, usize::MAX).await else {
+        warn!("Failed to read an A2A proxy answer for its response policy; refusing it");
+        return denied_response();
+    };
+    if !a2a_proxy_answer_is_checked(parts.status, &body) {
+        return axum::response::Response::from_parts(parts, axum::body::Body::from(body));
+    }
+    let content_type = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let response = response_context(parts.status.as_u16(), &body, content_type);
+    if check(response).await.allow {
+        axum::response::Response::from_parts(parts, axum::body::Body::from(body))
+    } else {
+        denied_response()
+    }
+}
+
+/// What a response policy sees of an MCP Proxy's answer.
+pub fn mcp_proxy_answer_context(answer: &Value) -> ResponseContext {
+    ResponseContext {
+        status_code: 200,
+        body: Some(answer.clone()),
+        content_type: Some("application/json".to_string()),
+        is_error: false,
+        method: None,
+    }
+}
+
+/// The JSON-RPC error that replaces an MCP Proxy's answer to request `id` when a
+/// response policy refuses it.
+pub fn mcp_proxy_denied_answer(
+    id: Option<&Value>,
+    decision: ResponsePolicyDecision,
+) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32000,
+            "message": decision.reason.unwrap_or_else(|| "Response blocked by policy".to_string())
+        }
+    })
+}
+
+/// Evaluates response policy `policy_id` on `input` and records the response-scope
+/// decision with the request fields `context` carries.
+pub async fn check_response_policy(
+    policy_manager: &crate::policies::surface_manager::SurfacePolicyManager,
+    policy_id: &str,
+    input: ResponsePolicyInput,
+    context: crate::observability::PolicyDecisionEvent<'_>,
+) -> ResponsePolicyDecision {
+    let attestation = policy_manager
+        .resolve_policy_attestation(Some(policy_id))
+        .await;
+    let decision = evaluate_response_policy(policy_manager, &response_policy_key(policy_id), input);
+    crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+        scope: crate::observability::PolicyScope::Response,
+        allow: decision.allow,
+        reason: decision.reason.as_deref(),
+        error: decision.error,
+        policy_id: Some(policy_id),
+        policy_definition_id: Some(policy_id),
+        policy_name: attestation.name.as_deref(),
+        policy_version: attestation.version,
+        policy_content_hash: attestation
+            .content_hash
+            .as_deref(),
+        ..context
+    });
+    decision
 }
 
 #[cfg(test)]
@@ -342,6 +474,199 @@ mod tests {
 
         assert!(!decision.allow);
         assert_eq!(decision.error, None);
+    }
+
+    fn manager_with(rego: &str) -> crate::policies::SurfacePolicyManager {
+        let manager = crate::policies::SurfacePolicyManager::new();
+        manager
+            .load_policy_text("response:pol-1", rego)
+            .unwrap();
+        manager
+    }
+
+    const DENY_ALL: &str = "package surface.policy\n\ndefault allow := false\n\ndeny_reason := \"no secrets\"\n";
+    const ALLOW_ALL: &str = "package surface.policy\n\ndefault allow := true\n";
+
+    async fn checked(
+        manager: &crate::policies::SurfacePolicyManager
+    ) -> (ResponsePolicyDecision, Vec<crate::observability::policy_audit::PolicyDecisionSummary>) {
+        use crate::observability::policy_audit::POLICY_DECISION_COLLECTOR;
+        let collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let decision = POLICY_DECISION_COLLECTOR
+            .scope(collector.clone(), async {
+                check_response_policy(
+                    manager,
+                    "pol-1",
+                    minimal_input(),
+                    crate::observability::PolicyDecisionEvent {
+                        surface_id: Some("surf-001"),
+                        trace_id: Some("trace-1"),
+                        ..Default::default()
+                    },
+                )
+                .await
+            })
+            .await;
+        let recorded = collector
+            .lock()
+            .unwrap()
+            .clone();
+        (decision, recorded)
+    }
+
+    #[tokio::test]
+    async fn a_checked_allow_is_recorded_as_a_response_allow() {
+        let (decision, recorded) = checked(&manager_with(ALLOW_ALL)).await;
+
+        assert!(decision.allow);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].scope, "response");
+        assert_eq!(recorded[0].decision, "allow");
+        assert_eq!(
+            recorded[0]
+                .policy_definition_id
+                .as_deref(),
+            Some("pol-1")
+        );
+        assert_eq!(
+            recorded[0]
+                .surface_id
+                .as_deref(),
+            Some("surf-001")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_checked_deny_is_recorded_with_its_reason() {
+        let (decision, recorded) = checked(&manager_with(DENY_ALL)).await;
+
+        assert!(!decision.allow);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].decision, "deny");
+        assert_eq!(
+            recorded[0]
+                .deny_reason
+                .as_deref(),
+            Some("no secrets")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_check_that_cannot_decide_is_recorded_as_an_error_and_refuses() {
+        let manager = manager_with(
+            "package surface.policy\n\nallow := true if {\n    true\n}\n\nallow := false if {\n    true\n}\n",
+        );
+
+        let (decision, recorded) = checked(&manager).await;
+
+        assert!(!decision.allow);
+        assert_eq!(recorded[0].decision, "error");
+        assert_eq!(
+            recorded[0]
+                .deny_reason
+                .as_deref(),
+            Some("evaluation_error")
+        );
+    }
+
+    fn a2a_answer(body: Value) -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn answered(response: axum::response::Response) -> (u16, String) {
+        let status = response.status().as_u16();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    fn decided(allow: bool) -> ResponsePolicyDecision {
+        ResponsePolicyDecision {
+            allow,
+            reason: None,
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_a2a_proxy_answer_becomes_a_403() {
+        let answer = a2a_answer(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"secret": "s"}}));
+
+        let (status, body) = answered(a2a_proxy_answer_under(answer, |_| async { decided(false) }).await).await;
+
+        assert_eq!(status, 403);
+        assert_eq!(body, DENIED_BODY);
+    }
+
+    #[tokio::test]
+    async fn an_allowed_a2a_proxy_answer_is_given_unchanged() {
+        let sent = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}});
+
+        let (status, body) = answered(
+            a2a_proxy_answer_under(a2a_answer(sent.clone()), |response| async move {
+                assert_eq!(
+                    response.body,
+                    Some(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}))
+                );
+                assert_eq!(
+                    response
+                        .content_type
+                        .as_deref(),
+                    Some("application/json")
+                );
+                decided(true)
+            })
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), sent);
+    }
+
+    #[tokio::test]
+    async fn an_a2a_proxy_error_answer_is_not_checked() {
+        let sent =
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32603, "message": "backend failed"}});
+
+        let (status, body) = answered(
+            a2a_proxy_answer_under(a2a_answer(sent.clone()), |_| async {
+                panic!("an A2A proxy error answer must not reach the response policy")
+            })
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), sent);
+    }
+
+    #[test]
+    fn a_refused_mcp_proxy_answer_is_a_json_rpc_error_with_the_policy_reason() {
+        let denied = mcp_proxy_denied_answer(
+            Some(&serde_json::json!(7)),
+            ResponsePolicyDecision {
+                allow: false,
+                reason: Some("no secrets".to_string()),
+                error: None,
+            },
+        );
+
+        assert_eq!(
+            denied,
+            serde_json::json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32000, "message": "no secrets"}})
+        );
+    }
+
+    #[test]
+    fn a_target_error_status_is_an_error_response() {
+        assert!(response_context(502, b"{}", None).is_error);
+        assert!(!response_context(200, b"{}", None).is_error);
     }
 
     #[test]
