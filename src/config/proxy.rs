@@ -4,7 +4,7 @@ mod identity_warnings;
 
 use super::network::NetworkConfig;
 use super::types::*;
-use identity_warnings::{transit_caller_identity_warnings, unnamed_mtls_identity_warning};
+use identity_warnings::{transit_caller_identity_warnings, unnamed_mtls_identity_warnings};
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 
@@ -439,7 +439,7 @@ fn validate_source_auth_surface(surface: &crate::config::agent_surface::AgentSur
     for warning in transit_caller_identity_warnings(surface) {
         warn!("{warning}");
     }
-    if let Some(warning) = unnamed_mtls_identity_warning(surface) {
+    for warning in unnamed_mtls_identity_warnings(surface) {
         warn!("{warning}");
     }
     Ok(())

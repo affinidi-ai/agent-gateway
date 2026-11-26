@@ -5202,10 +5202,22 @@ async fn step_inject_trusted_identity(
         ctx.active_variant_id
             .as_deref(),
     );
+    let parsed_a2a = matches!(protocol, ChannelProtocol::A2a | ChannelProtocol::Ap2)
+        .then(|| serde_json::from_slice::<serde_json::Value>(body).ok())
+        .flatten();
     let injected_vp_jwt: Option<String> = match protocol {
         ChannelProtocol::A2a | ChannelProtocol::Ap2
-            if serde_json::from_slice::<serde_json::Value>(body)
-                .is_ok_and(|json| !crate::a2a::extensions::has_message(&json)) =>
+            if parsed_a2a
+                .as_ref()
+                .is_some_and(|json| !json.is_object()) =>
+        {
+            warn!(request_id = %ctx.request_id, "A2A request body is not one JSON object; refused");
+            return Err(OutboundPipelineError::AssertedIdentityUnremovable);
+        }
+        ChannelProtocol::A2a | ChannelProtocol::Ap2
+            if parsed_a2a
+                .as_ref()
+                .is_some_and(|json| !crate::a2a::extensions::has_message(json)) =>
         {
             debug!(request_id = %ctx.request_id, "A2A request carries no message; no identity credential injected");
             None

@@ -164,8 +164,9 @@ pub struct SurfaceConfigBuilder {
     pub stored_surfaces_on_routes: Vec<StoredSurfaceFixture>,
     /// The key id the seeded surface's protected Identity takes its DID from.
     pub protected_identity_api_key_id: Option<String>,
-    /// The seeded surface's inbound Identity is `from_mtls` naming no stored certificate.
-    pub inbound_identity_from_unnamed_certificate: bool,
+    /// The seeded surface's identity slot (`inbound` or `protected`) that is `from_mtls`
+    /// naming no stored certificate.
+    pub unnamed_certificate_identity_slot: Option<String>,
     /// The seeded surface's inbound Identity gives every caller this static DID.
     pub inbound_static_did: Option<String>,
     /// An enabled variant, by alias, whose Transit Points are the surface's but with the one
@@ -377,7 +378,7 @@ impl Default for SurfaceConfigBuilder {
             other_stored_surfaces: Vec::new(),
             stored_surfaces_on_routes: Vec::new(),
             protected_identity_api_key_id: None,
-            inbound_identity_from_unnamed_certificate: false,
+            unnamed_certificate_identity_slot: None,
             inbound_static_did: None,
             variant_caller_key_transit_point: None,
             api_key_provider_key_created_at: None,

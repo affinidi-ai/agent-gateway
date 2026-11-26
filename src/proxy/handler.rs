@@ -16751,8 +16751,8 @@ const CALLER_IDENTITY_PROOFS: [&str; 2] = [
 
 /// `body_bytes` without the identity proofs its caller put in it, for a caller
 /// that gets no inbound identity, so none of its own reaches the Target: the
-/// MCP `_meta` entries, and the A2A and AP2 message `metadata` entries (in
-/// `params.message`, `message` or a bare message), of a request or of each
+/// MCP `_meta` entries, and the A2A and AP2 message `metadata` entries (at each
+/// of [`crate::a2a::extensions::MESSAGE_POINTERS`]), of a request or of each
 /// request of a JSON-RPC batch. The extension URIs in `extensions` stay: they
 /// also ask for the responding agent's credential. A body with no proof, an
 /// empty one, or one of another protocol is returned byte for byte. A body the
@@ -16793,11 +16793,13 @@ fn remove_mcp_identity_proofs(request: &mut serde_json::Value) -> bool {
         .fold(false, |removed, key| crate::mcp::meta::remove_metadata_key(request, key) | removed)
 }
 
-/// Remove the caller identity proofs from an A2A or AP2 message's `metadata`;
-/// whether any was there.
+/// Remove the caller identity proofs from the `metadata` at every A2A or AP2
+/// message location; whether any was there. Unlike a Transit Point's removal of
+/// asserted identity, this removes only the two proofs and keeps the extension
+/// URIs, by design.
 fn remove_a2a_identity_proofs(request: &mut serde_json::Value) -> bool {
     let mut removed = false;
-    for pointer in ["/params/message", "/message", ""] {
+    for pointer in crate::a2a::extensions::MESSAGE_POINTERS {
         if let Some(metadata) = request
             .pointer_mut(pointer)
             .and_then(|message| message.get_mut("metadata"))

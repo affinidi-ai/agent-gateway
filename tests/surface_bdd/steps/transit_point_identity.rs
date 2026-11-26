@@ -258,11 +258,12 @@ fn surface_inbound_identity_from_caller_api_key(
 }
 
 #[given(
-    expr = "surface {string} was stored with its inbound Identity taking its DID from a client certificate it does not name"
+    regex = r#"^surface "([^"]+)" was stored with its (inbound|protected) Identity taking its DID from a client certificate it does not name$"#
 )]
-fn surface_stored_with_inbound_identity_from_unnamed_certificate(
+fn surface_stored_with_identity_from_unnamed_certificate(
     world: &mut SurfaceWorld,
     surface: String,
+    slot: String,
 ) {
     assert!(
         world
@@ -271,10 +272,10 @@ fn surface_stored_with_inbound_identity_from_unnamed_certificate(
             .is_some(),
         "unknown surface '{surface}'"
     );
-    before_the_gateway_starts(world, "the stored surface's inbound Identity");
+    before_the_gateway_starts(world, "the stored surface's Identity");
     world
         .surface_config
-        .inbound_identity_from_unnamed_certificate = true;
+        .unnamed_certificate_identity_slot = Some(slot);
 }
 
 #[given(expr = "surface {string} gives its callers the static DID {string}")]
@@ -539,6 +540,48 @@ fn destination_received_no_identity_binding(
     );
 }
 
+#[then(expr = "external agent {string} received no identity presentation")]
+fn external_agent_received_no_identity_presentation(
+    world: &mut SurfaceWorld,
+    agent: String,
+) {
+    let body = get_observed_request_for_actor(world, &agent, TargetActorKind::ExternalAgent).json_body();
+    let text = body.to_string();
+    for presentation in [IDENTITY_CREDENTIAL_URI, IDENTITY_BINDING_URI, "verifiablePresentation"] {
+        assert!(
+            !text.contains(presentation),
+            "external agent '{agent}' should receive no identity presentation ({presentation}), got body: {body}"
+        );
+    }
+}
+
+#[then(expr = "the agents list gives one agent the DIDs of keys {string} and {string}")]
+async fn agents_list_gives_one_agent_the_dids_of_keys(
+    world: &mut SurfaceWorld,
+    first: String,
+    second: String,
+) {
+    let expected = [issued_did_of_key(world, &first).await, issued_did_of_key(world, &second).await];
+    assert_ne!(expected[0], expected[1], "keys '{first}' and '{second}' should have different DIDs");
+    let body = &get_admin_response(world).body;
+    let listed = body["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|agent| {
+            let dids: Vec<&str> = agent["identities"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|identity| identity["did"].as_str())
+                .collect();
+            expected
+                .iter()
+                .all(|did| dids.contains(&did.as_str()))
+        });
+    assert!(listed, "one agent should list the DIDs of keys '{first}' and '{second}' {expected:?}, got: {body}");
+}
+
 /// Checks the caller a step names: the surface's managed agent, or another agent the
 /// scenario does not declare.
 fn expect_caller(
@@ -555,23 +598,25 @@ fn expect_caller(
 }
 
 #[when(
-    regex = r#"^(managed agent|agent) "([^"]+)" sends an A2A (message/send|tasks/get) request through Transit Point "([^"]+)" with key "([^"]+)"$"#
+    regex = r#"^(managed agent|agent) "([^"]+)" sends an A2A (message/send request|tasks/get request|JSON-RPC batch) through Transit Point "([^"]+)" with key "([^"]+)"$"#
 )]
 async fn caller_sends_through_transit_point_with_key(
     world: &mut SurfaceWorld,
     kind: String,
     caller: String,
-    method: String,
+    request: String,
     transit_point: String,
     key: String,
 ) {
     expect_caller(world, &kind, &caller);
     let provider = transit_point_provider(world, &transit_point);
     let header = provider_key(world, &provider, &key);
-    let body = if method == "tasks/get" {
-        json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": { "id": "task-1" } })
-    } else {
-        transit_point_request_body(world)
+    let body = match request.as_str() {
+        "tasks/get request" => {
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": { "id": "task-1" } })
+        }
+        "JSON-RPC batch" => json!([transit_point_request_body(world)]),
+        _ => transit_point_request_body(world),
     };
     let agent = managed_agent(world);
     send_a2a_body_through_transit_point(world, &agent, &transit_point, vec![header], body).await;

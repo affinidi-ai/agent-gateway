@@ -424,6 +424,35 @@ describe('identity From mTLS certificate — Transit Point', () => {
     ).toEqual([TRANSIT_POINT_MTLS_NEEDS_MTLS_CALLER]);
   });
 
+  it('treats a whitespace-only id as absent', () => {
+    const blankCert = tpIdentity({ type: 'from_mtls', certificate_id: '  ' });
+    const blankKey = tpIdentity({ type: 'from_api_key', api_key_id: ' ' });
+    const payload = registry.buildPayload(
+      makeCtx([accessPoint, transitPoint(jwtCaller), blankCert])
+    );
+    expect(payload.transit.points[0].managed_identity).toEqual({ type: 'from_mtls' });
+    expect(fromApiKeyErrors([accessPoint, transitPoint(jwtCaller), blankCert], blankCert)).toEqual([
+      TRANSIT_POINT_MTLS_NEEDS_MTLS_CALLER,
+    ]);
+    expect(fromApiKeyErrors([accessPoint, transitPoint(jwtCaller), blankKey], blankKey)).toEqual([
+      TRANSIT_POINT_API_KEY_NEEDS_API_KEY_CALLER,
+    ]);
+    expect(
+      registry.getIncompleteReason(
+        'identity',
+        { type: 'from_mtls', certificate_id: ' ' },
+        protectedNode
+      )
+    ).toBe('Select a certificate');
+    expect(
+      registry.getIncompleteReason(
+        'identity',
+        { type: 'from_api_key', api_key_id: ' ' },
+        protectedNode
+      )
+    ).toBe(SELECT_OWN_API_KEY);
+  });
+
   it('hydrates a stored setting without certificate_id as configured', () => {
     const node = hydrateTransitPointIdentity(mtlsCaller, { type: 'from_mtls' });
     expect(node?.config).toEqual({ type: 'from_mtls' });

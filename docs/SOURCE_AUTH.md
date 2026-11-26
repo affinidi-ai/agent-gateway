@@ -210,8 +210,9 @@ or whose credential failed on a public Access Point, is served with no inbound i
 requests and Fabric send: none is derived from its credential or taken from its request body,
 `input.agent.did` and the trust-registry claims its body makes are absent from policy input, and
 the identity binding VP and identity credential it puts in its request, or that Header Metadata
-Mapping copies from its headers, are removed before the Target, in a single request, each request
-of a batch, or a bare message. A body the gateway cannot read to remove them (not JSON, or nested
+Mapping copies from its headers, are removed before the Target, in a single request or each
+request of a batch, from every A2A message location (`params.message`, `message`, the bare body,
+`result.status.message`, `result.message` and `result`). A body the gateway cannot read to remove them (not JSON, or nested
 deeper than it parses) is refused with `400` and a JSON-RPC parse error (`-32700`), even with A2A
 validation `off`. The extension URIs that name them stay, since they also ask for the responding
 agent's credential, and other metadata the caller sends, such as a trust-registry `agent_did`, is
@@ -1948,6 +1949,12 @@ trust tied to that DID: policy rules, Trust Check entries, Transit Point grants,
 token `sub` and the Workload Binding `userIdentity.id`. A plain API Key secret that is also the
 Managed Agent's key gives every caller the Managed Agent's DID.
 
+When one key serves surface A's Managed Agent and surface B's caller-bound Transit Point (its own
+`from_api_key` without `api_key_id`), the order of first use decides. If A's Managed Agent uses
+the key first, B's Transit Point records a caller use and the DID keeps A's agent's name. If B's
+Transit Point uses it first, the DID is recorded as B's caller-bound managed agent: it is managed
+on both surfaces and is not named after A's agent.
+
 To refuse such callers, deny the key in the surface policy and keep the condition in every
 `allow` rule:
 
@@ -2070,9 +2077,11 @@ Every Transit Point policy reads the managed agent's DID and its **Counts as** v
   (`mtls_unavailable`), or a plain API Key's secret is gone (`secret_not_found`); and `503` when
   the secrets store cannot be read.
 - Once the identity is derived, every identity the request body asserts is removed before the
-  request is forwarded: in an A2A message, the `agent-identity/v1`,
+  request is forwarded: in an A2A body, the `agent-identity/v1`,
   `agent-identity-credential/v1` and `agent-identity-binding/v1` entries of `extensions` and
-  `metadata`; in an MCP message, the same three in `_meta`, under either key spelling, and the
+  `metadata` at every message location (`params.message`, `message`, the bare body,
+  `result.status.message`, `result.message` and `result`), and the body is forwarded as the
+  gateway re-serialized it, so a duplicate key it read once is not forwarded; in an MCP message, the same three in `_meta`, under either key spelling, and the
   gateway-reserved `agentIdentity` and `didwebvhIdentity`. On a `2026-07-28` MCP request they
   are removed from the request policy reads too (`input.mcp.params._meta`), so policy, MCP tool
   gating and Trust Check never see the asserted identity. The destination receives only the
@@ -2081,9 +2090,14 @@ Every Transit Point policy reads the managed agent's DID and its **Counts as** v
   read in a protocol with no identity carrier (DIDComm) is refused with `500`, as identity
   injection refuses it. An A2A body that is not exactly one JSON object, such as a JSON-RPC
   batch or a body that starts with a byte order mark, is refused with `400` and JSON-RPC error
-  `-32600`, since its identities cannot all be removed; an object without a message, such as
+  `-32600`, since its identities cannot all be removed.
+- On any Transit Point that injects an identity, an A2A body that is JSON but not one object,
+  such as a JSON-RPC batch, is refused with `400` and JSON-RPC error `-32600`, so it is never
+  forwarded without the gateway's presentation. An object without a message, such as
   `tasks/get`, `tasks/cancel` or `tasks/resubscribe`, is forwarded unchanged, with no identity
-  presentation.
+  presentation, through a Transit Point whose identity is taken from its caller's credential,
+  stored (a key or certificate it names) or static. A From Payload Transit Point still answers
+  `422` for it, since such a request carries no message to read the identity from.
 - Without a VC issuer (`vc_issuer_missing`), or when issuance fails (`vc_issuer_error`), an API
   key or client certificate caller is not refused: it resolves no managed agent identity and
   policy decides. Without a VC issuer, an MCP request whose `_meta` carries an identity
@@ -2124,7 +2138,8 @@ identity could not be resolved`, as it does for any stored key or certificate it
 the DID from: `500` when misconfigured, `502` when the VC issuer cannot issue the DID, and `503`
 when a store is unavailable. At startup the gateway logs "Channel '<name>': identity from_mtls
 without a certificate_id; requests other than discovery reads are refused until the surface is
-fixed" for such a surface.
+fixed" for such a surface, and the same warning beginning "Channel '<name>' variant '<variant>'"
+for an enabled variant whose own inbound, protected or external slot is such a `from_mtls`.
 
 Upgrading: earlier releases skipped a Transit Point's own `from_jwt_claim` and forwarded the
 request with no managed agent identity. It now resolves one, so a stored Transit Point
@@ -2143,7 +2158,12 @@ Rollback: a release without this setting refuses a Transit Point `from_api_key` 
 `api_key_id_missing`). It cannot read a `from_mtls` without `certificate_id` at all, so it skips
 the whole surface at load: neither its Access Point nor its Transit Points are served. Name a
 stored key or certificate, or choose another mode, on every such Transit Point before rolling
-back.
+back. An earlier release also skips a Transit Point's own `from_jwt_claim` and does not remove
+the identity the request body asserts, so after a rollback such a Transit Point forwards the
+identity the body asserts. It ignores `caller_bound` too, so the DIDs a Transit Point took from
+its callers' credentials read back as versions of the Managed Agent. Before rolling back, switch
+every Transit Point with its own `from_jwt_claim` to another identity mode, or turn its identity
+injection off.
 
 ### `from_jwt_claim`
 

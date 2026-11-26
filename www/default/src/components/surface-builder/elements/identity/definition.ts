@@ -33,6 +33,8 @@ const INBOUND_API_KEY_CALLER_METHODS = new Set<unknown>(['api_key', 'api_key_pro
 const transitPointAllows = (type: string, allNodes: DependencyNode[], node?: DependencyNode) =>
   transitPointCallerAllows(type, allNodes.find(n => n.id === node?.parentId)?.config?.source_auth);
 
+const isNamed = (id: unknown) => typeof id === 'string' && id.trim() !== '';
+
 export const identityDefinition: NodeDefinition = {
   type: 'identity',
   label: 'Identity',
@@ -174,7 +176,7 @@ export const identityDefinition: NodeDefinition = {
       description:
         "A Transit Point from_api_key without api_key_id identifies each caller by the key it presents, so the Transit Point's caller authentication must be API Key or API Key Provider",
       condition: (c, _ctx, node) =>
-        c.type === 'from_api_key' && !c.api_key_id && isTransitPointIdentity(node),
+        c.type === 'from_api_key' && !isNamed(c.api_key_id) && isTransitPointIdentity(node),
       check: (_c, ctx, node) => transitPointAllows('from_api_key', ctx.allNodes, node),
       severity: 'error',
       message: TRANSIT_POINT_API_KEY_NEEDS_API_KEY_CALLER,
@@ -191,7 +193,7 @@ export const identityDefinition: NodeDefinition = {
       description:
         "A Transit Point from_mtls without certificate_id identifies each caller by its client certificate, so the Transit Point's caller authentication must be mTLS",
       condition: (c, _ctx, node) =>
-        c.type === 'from_mtls' && !c.certificate_id && isTransitPointIdentity(node),
+        c.type === 'from_mtls' && !isNamed(c.certificate_id) && isTransitPointIdentity(node),
       check: (_c, ctx, node) => transitPointAllows('from_mtls', ctx.allNodes, node),
       severity: 'error',
       message: TRANSIT_POINT_MTLS_NEEDS_MTLS_CALLER,
@@ -282,8 +284,9 @@ export function identityConfigToWire(ic: Record<string, any> | undefined): any |
   if (!ic || typeof ic !== 'object') return undefined;
   const value: Record<string, any> = {};
   if (ic.type) value.type = ic.type;
-  if (ic.type === 'from_api_key' && ic.api_key_id) value.api_key_id = ic.api_key_id;
-  if (ic.type === 'from_mtls' && ic.certificate_id) value.certificate_id = ic.certificate_id;
+  if (ic.type === 'from_api_key' && isNamed(ic.api_key_id)) value.api_key_id = ic.api_key_id;
+  if (ic.type === 'from_mtls' && isNamed(ic.certificate_id))
+    value.certificate_id = ic.certificate_id;
   // Backend `ManagedIdentityConfig::Static` expects the DID under `did`
   // (the panel edits it as `static_did`).
   if (ic.type === 'static' && ic.static_did) value.did = ic.static_did;
@@ -316,12 +319,16 @@ function identityIncompleteReason(
   if (!config.type) return 'Select an identity extraction type';
   if (
     config.type === 'from_api_key' &&
-    !config.api_key_id &&
+    !isNamed(config.api_key_id) &&
     !isInboundIdentity(node) &&
     !isTransitPointIdentity(node)
   )
     return SELECT_OWN_API_KEY;
-  if (config.type === 'from_mtls' && !config.certificate_id && !isTransitPointIdentity(node))
+  if (
+    config.type === 'from_mtls' &&
+    !isNamed(config.certificate_id) &&
+    !isTransitPointIdentity(node)
+  )
     return 'Select a certificate';
   if (config.type === 'static' && !config.static_did) return 'Enter a static DID';
   return null;

@@ -1,29 +1,65 @@
 //! Boot warnings for stored identities that take a DID from a caller
 //! credential nothing verifies.
 
-/// The warning for a surface whose inbound, protected or external identity is
+/// The warnings for a surface whose inbound, protected or external identity is
 /// `from_mtls` without a non-empty `certificate_id`, which only a Transit
-/// Point's own identity may take from its caller.
-pub(super) fn unnamed_mtls_identity_warning(surface: &crate::config::agent_surface::AgentSurface) -> Option<String> {
-    [
-        surface
-            .inbound_identity()
-            .cloned(),
-        surface.managed_identity(),
-        surface
-            .external_identity()
-            .cloned(),
-    ]
-    .iter()
-    .flatten()
-    .any(|identity| identity.caller_credential() == Some(crate::source_auth::CallerCredential::Mtls))
-    .then(|| {
-        format!(
-            "Channel '{}': identity from_mtls without a certificate_id; requests other than discovery reads are \
-             refused until the surface is fixed",
-            surface.name
-        )
-    })
+/// Point's own identity may take from its caller: one for the base surface,
+/// and one for each enabled variant as resolved with such a slot the base does
+/// not already warn about.
+pub(super) fn unnamed_mtls_identity_warnings(surface: &crate::config::agent_surface::AgentSurface) -> Vec<String> {
+    let unnamed = |surface: &crate::config::agent_surface::AgentSurface| {
+        [
+            (
+                "inbound",
+                surface
+                    .inbound_identity()
+                    .cloned(),
+            ),
+            ("protected", surface.managed_identity()),
+            (
+                "external",
+                surface
+                    .external_identity()
+                    .cloned(),
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, identity)| {
+            identity
+                .as_ref()
+                .is_some_and(|identity| {
+                    identity.caller_credential() == Some(crate::source_auth::CallerCredential::Mtls)
+                })
+        })
+        .map(|(slot, _)| slot)
+        .collect::<Vec<_>>()
+    };
+    let base = unnamed(surface);
+    let variants = surface
+        .variants
+        .iter()
+        .filter_map(|variant| {
+            surface
+                .resolve_variant(Some(&variant.alias))
+                .ok()
+                .filter(|resolved| {
+                    unnamed(resolved)
+                        .iter()
+                        .any(|slot| !base.contains(slot))
+                })
+                .map(|_| format!("Channel '{}' variant '{}'", surface.name, variant.alias))
+        });
+    (!base.is_empty())
+        .then(|| format!("Channel '{}'", surface.name))
+        .into_iter()
+        .chain(variants)
+        .map(|scope| {
+            format!(
+                "{scope}: identity from_mtls without a certificate_id; requests other than discovery reads are \
+                 refused until the surface is fixed"
+            )
+        })
+        .collect()
 }
 
 /// One warning per Transit Point whose own identity takes its DID from a
@@ -167,14 +203,33 @@ mod tests {
                     serde_json::json!([api_key_method("X-API-Key")]),
                     serde_json::json!({"identity_slots": {slot: identity.clone()}}),
                 );
-                assert_eq!(unnamed_mtls_identity_warning(&surface).as_deref(), Some(warning), "{case} on {slot}");
+                assert_eq!(unnamed_mtls_identity_warnings(&surface), [warning], "{case} on {slot}");
             }
         }
         let stored = surface_with_caller_auth(
             serde_json::json!([api_key_method("X-API-Key")]),
             serde_json::json!({"identity_slots": {"protected": {"type": "from_mtls", "certificate_id": "cert-1"}}}),
         );
-        assert_eq!(unnamed_mtls_identity_warning(&stored), None);
+        assert!(unnamed_mtls_identity_warnings(&stored).is_empty());
+
+        let slot_variant = |alias: &str, enabled: bool| {
+            serde_json::json!({
+                "id": format!("v-{alias}"), "alias": alias, "name": alias, "description": "", "enabled": enabled,
+                "overrides": { "identity_slots": { "external": {"type": "from_mtls"} } }
+            })
+        };
+        let with_variants = surface_with_caller_auth(
+            serde_json::json!([api_key_method("X-API-Key")]),
+            serde_json::json!({
+                "identity_slots": {"protected": {"type": "from_mtls", "certificate_id": "cert-1"}},
+                "variants": [slot_variant("candidate", true), slot_variant("parked", false)],
+            }),
+        );
+        assert_eq!(
+            unnamed_mtls_identity_warnings(&with_variants),
+            ["Channel 'multi' variant 'candidate': identity from_mtls without a certificate_id; requests other than \
+              discovery reads are refused until the surface is fixed"]
+        );
     }
 
     #[test]

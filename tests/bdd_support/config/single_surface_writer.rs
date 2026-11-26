@@ -573,8 +573,8 @@ fn write_single_surface_config_inner(
         surface_fixture = surface_fixture.with_identity_slot("inbound", inbound_slot);
     }
 
-    if surface_config.inbound_identity_from_unnamed_certificate {
-        surface_fixture = surface_fixture.with_identity_slot("inbound", serde_json::json!({ "type": "from_mtls" }));
+    if let Some(slot) = &surface_config.unnamed_certificate_identity_slot {
+        surface_fixture = surface_fixture.with_identity_slot(slot.as_str(), serde_json::json!({ "type": "from_mtls" }));
     }
     if let Some(did) = &surface_config.inbound_static_did {
         surface_fixture =

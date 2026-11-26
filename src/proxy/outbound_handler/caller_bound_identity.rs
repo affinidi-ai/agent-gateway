@@ -1255,6 +1255,79 @@ mod tests {
         }
     }
 
+    async fn stored_key_context_resolved(
+        state: &OutboundProxyState,
+        body: &serde_json::Value,
+    ) -> OutboundPipelineContext {
+        let mut ctx = presented_key_context(Some(presented_provider_key("atgk_tp_caller_key")));
+        ctx.virtual_channel
+            .managed_identity = Some(crate::source_auth::ManagedIdentityConfig::FromApiKey {
+            api_key_id: Some("atgk_tp_stored_key".to_string()),
+        });
+        ctx.protocol = Some(ChannelProtocol::A2a);
+        ctx.body_bytes = Some(Bytes::from(body.to_string()));
+        step_resolve_agent_identity(state, &mut ctx)
+            .await
+            .expect("the stored key resolves the managed agent identity");
+        assert!(matches!(ctx.resolved_identity, ProtectedAgentIdentity::Managed { .. }));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn a_stored_identity_a2a_transit_point_refuses_a_batch() {
+        let (vc_issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let mut state = test_outbound_state();
+        state.vc_issuer = Some(Arc::new(vc_issuer));
+        let batch = json!([{ "jsonrpc": "2.0", "id": 1, "method": "message/send", "params": { "message": {
+            "role": "user", "parts": [{ "kind": "text", "text": "hello" }],
+            "metadata": { crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION: { "did": "did:example:copied" } }
+        } } }]);
+        let mut ctx = stored_key_context_resolved(&state, &batch).await;
+        let body = ctx.body_bytes.clone();
+
+        let err = step_inject_trusted_identity(&state, &mut ctx)
+            .await
+            .expect_err("a batch is refused");
+
+        assert!(matches!(err, OutboundPipelineError::AssertedIdentityUnremovable), "{err:?}");
+        assert_eq!(ctx.body_bytes, body, "nothing is forwarded");
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let answer: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(answer["error"]["code"], json!(-32600), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn a_stored_identity_a2a_transit_point_forwards_a_task_request_without_a_presentation() {
+        let (vc_issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let mut state = test_outbound_state();
+        state.vc_issuer = Some(Arc::new(vc_issuer));
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": { "id": "task-1" } });
+        let mut ctx = stored_key_context_resolved(&state, &body).await;
+
+        step_inject_trusted_identity(&state, &mut ctx)
+            .await
+            .expect("a task request is forwarded");
+
+        let forwarded: serde_json::Value = serde_json::from_slice(
+            ctx.body_bytes
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(forwarded, body);
+        assert!(
+            !forwarded
+                .to_string()
+                .contains(crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION)
+        );
+    }
+
     #[tokio::test]
     async fn a_managed_agent_element_asks_about_the_did_of_the_key_a_caller_bound_transit_point_verified() {
         let (vc_issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer().await;

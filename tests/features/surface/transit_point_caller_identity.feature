@@ -23,6 +23,27 @@ Feature: Transit Point identity from its caller's credential
     When managed agent "bravo" sends an A2A tasks/get request through Transit Point "tr1" with key "bravo-key"
     Then the response status is 200
     And external agent "delta" received a forwarded request
+    And external agent "delta" received no identity presentation
+
+  Scenario: A Transit Point that takes its identity from the caller's key refuses a JSON-RPC batch
+    Given surface "alpha" has A2A Transit Point "tr1" to external agent "delta"
+    And Transit Point "tr1" authenticates its callers with an API key of API key provider "agents"
+    And Transit Point "tr1" takes the managed agent's identity from its caller's API key
+    When managed agent "bravo" sends an A2A JSON-RPC batch through Transit Point "tr1" with key "bravo-key"
+    Then the response status is 400
+    And the response is a JSON-RPC error with code -32600
+    And external agent "delta" was not called
+
+  Scenario: The Agents API lists each DID a Transit Point took from its callers' keys
+    Given surface "alpha" has A2A Transit Point "tr1" to external agent "delta"
+    And Transit Point "tr1" authenticates its callers with an API key of API key provider "agents"
+    And Transit Point "tr1" takes the managed agent's identity from its caller's API key
+    And API key provider "agents" has issued key "bravo-second-key"
+    And managed agent "bravo" has sent a request through Transit Point "tr1" with key "bravo-key"
+    And managed agent "bravo" has sent a request through Transit Point "tr1" with key "bravo-second-key"
+    When the operator lists the agents
+    Then the admin API response status is 200
+    And the agents list gives one agent the DIDs of keys "bravo-key" and "bravo-second-key"
 
   Scenario: A Transit Point policy admits a managed agent whose identity its key verified
     Given surface "alpha" has A2A Transit Point "tr1" to external agent "delta"
@@ -178,6 +199,15 @@ Feature: Transit Point identity from its caller's credential
     Then the response status is 500
     And the response mentions "Caller identity could not be resolved"
     And managed agent "bravo" was not called
+
+  Scenario: A Transit Point that inherits a client certificate identity it does not name refuses its callers
+    Given surface "alpha" has A2A Transit Point "tr1" to external agent "delta"
+    And surface "alpha" was stored with its protected Identity taking its DID from a client certificate it does not name
+    And transit point "tr1" presents the surface's managed agent identity on its outbound calls
+    When managed agent "bravo" sends an A2A message/send request through Transit Point "tr1"
+    Then the response status is 500
+    And the response mentions "Caller identity could not be resolved"
+    And external agent "delta" was not called
 
   Scenario: A surface policy reads no identity hash for a static DID
     Given surface "alpha" gives its callers the static DID "did:web:caller.example"
