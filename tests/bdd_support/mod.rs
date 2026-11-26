@@ -23,6 +23,7 @@ pub mod passkey;
 pub mod policies;
 pub mod presentation_signer;
 pub mod redis_stream;
+pub mod saml_idp;
 pub mod sign_in_events;
 pub mod signing_trust_agent;
 pub mod sse_client;
