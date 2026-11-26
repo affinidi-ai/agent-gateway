@@ -88,10 +88,6 @@ pub struct VtaCredentialAuthority {
     /// the only way to publish an **internal** key, whose record the VTA
     /// refuses to return to any caller at any role.
     signing_key_public: Option<String>,
-    /// Public JWKs carried over from another authority — in practice the local
-    /// issuer key, kept in the JWKS while a deployment migrates surface by
-    /// surface so previously locally-signed tokens do not stop verifying.
-    carried_over_jwks: Vec<Value>,
     /// The pinned key's public JWKS, resolved once from the VTA and cached so
     /// publishing it (`/oauth2/jwks.json`) is not a per-call VTA hop — and so
     /// **verification stays a local public-key operation**.
@@ -117,7 +113,6 @@ impl VtaCredentialAuthority {
             signing_key_id,
             retiring_keys: Vec::new(),
             signing_key_public: None,
-            carried_over_jwks: Vec::new(),
             jwks_cache: RwLock::new(None),
             public_key_cache: RwLock::new(None),
             audit,
@@ -147,18 +142,6 @@ impl VtaCredentialAuthority {
         public_key: Option<String>,
     ) -> Self {
         self.signing_key_public = public_key;
-        self
-    }
-
-    /// Keep `jwks` (another authority's **public** keys, typically the local
-    /// issuer's) in the published key set. This is what makes a surface-by-surface
-    /// migration safe: the old key still verifies while the new one signs.
-    #[must_use]
-    pub fn with_carried_over_jwks(
-        mut self,
-        jwks: Vec<Value>,
-    ) -> Self {
-        self.carried_over_jwks = jwks;
         self
     }
 
@@ -492,10 +475,11 @@ impl CredentialAuthority for VtaCredentialAuthority {
         // operation with no per-verify VTA hop.
         //
         // The set is deliberately **multi-key**: the active signing
-        // key, every retiring VTA key, and any carried-over local key. A
-        // per-surface migration or a rotation means two keys are live at once,
-        // and a verifier selects between them by `kid`; publishing only the
-        // active key would silently break every token signed by the other.
+        // key and every retiring VTA key. A rotation means two keys are live
+        // at once, and a verifier selects between them by `kid`; publishing
+        // only the active key would silently break every token signed by the
+        // other. The gateway's own key is published beside it by the appliance
+        // authority, only while a token it signed may be outstanding.
         if let Some(jwks) = self
             .jwks_cache
             .read()
@@ -505,7 +489,7 @@ impl CredentialAuthority for VtaCredentialAuthority {
             return Ok(jwks);
         }
 
-        let mut keys: Vec<Value> = Vec::with_capacity(1 + self.retiring_keys.len() + self.carried_over_jwks.len());
+        let mut keys: Vec<Value> = Vec::with_capacity(1 + self.retiring_keys.len());
         keys.push(
             self.resolve_jwk(
                 &self.signing_key_id,
@@ -531,12 +515,6 @@ impl CredentialAuthority for VtaCredentialAuthority {
                 ),
             }
         }
-        keys.extend(
-            self.carried_over_jwks
-                .iter()
-                .cloned(),
-        );
-
         let jwks = json!({ "keys": keys });
         *self.jwks_cache.write().await = Some(jwks.clone());
         Ok(jwks)
@@ -1128,20 +1106,15 @@ mod live_tests {
     // ── multi-key JWKS + signing quota ───────────────────────────────────────
 
     #[tokio::test]
-    async fn the_jwks_publishes_retiring_and_carried_over_keys_by_kid() {
+    async fn the_jwks_publishes_the_active_and_retiring_keys_by_kid() {
         let signing = Arc::new(SigningKey::from_bytes(&[21u8; 32]));
         let (base, _vta) = spawn(Arc::clone(&signing)).await;
         let control = Arc::new(ControlKey::from_seed([7u8; 32]));
         let client = Arc::new(
             VtaRestClient::new(&base, "did:webvh:vta.example", control, Duration::from_secs(5), 8, None).unwrap(),
         );
-        // A carried-over local key — what a mid-migration deployment looks like:
-        // the local key still verifies in-flight tokens while the VTA key signs.
-        let local_jwk =
-            json!({ "kty": "OKP", "crv": "Ed25519", "x": "bG9jYWw", "use": "sig", "alg": "EdDSA", "kid": "key-1" });
         let auth = VtaCredentialAuthority::new(client, "active-key".to_string(), None)
-            .with_retiring_keys(vec![("retiring-key".to_string(), None)])
-            .with_carried_over_jwks(vec![local_jwk]);
+            .with_retiring_keys(vec![("retiring-key".to_string(), None)]);
 
         let jwks = auth
             .issuer_jwks()
@@ -1155,8 +1128,7 @@ mod live_tests {
             .collect();
         assert!(kids.contains(&"active-key"), "the active key is published: {kids:?}");
         assert!(kids.contains(&"retiring-key"), "a retiring key keeps verifying: {kids:?}");
-        assert!(kids.contains(&"key-1"), "the carried-over local key keeps verifying: {kids:?}");
-        assert_eq!(kids.len(), 3, "exactly the three live keys: {kids:?}");
+        assert_eq!(kids.len(), 2, "exactly the two live keys, never the gateway's own: {kids:?}");
     }
 
     #[tokio::test]
@@ -1208,9 +1180,8 @@ mod live_tests {
         let client = Arc::new(
             VtaRestClient::new(&base, "did:webvh:vta.example", control, Duration::from_secs(5), 8, None).unwrap(),
         );
-        // The mock answers `keys/show` for any id, so simulate an unresolvable
-        // key by pointing the carried-over path at nothing and relying on the
-        // active key alone being required.
+        // The mock answers `keys/show` for any id, so rely on the active key
+        // alone being required.
         let auth = VtaCredentialAuthority::new(client, "active-key".to_string(), None);
         let jwks = auth
             .issuer_jwks()

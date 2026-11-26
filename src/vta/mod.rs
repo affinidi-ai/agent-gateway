@@ -61,8 +61,6 @@ pub use error::VtaError;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::Value;
-
 use crate::config::vta::VtaConfig;
 use crate::identity::authority::CredentialAuthority;
 use authority::VtaCredentialAuthority;
@@ -206,26 +204,6 @@ pub async fn select_signing_backends(
         .audit_enabled
         .then(|| audit::VtaAuditSink::spawn(config.audit_queue_capacity, Arc::new(audit::LogAuditEmitter)));
 
-    // Keep the local issuer's **public** key in the published JWKS.
-    // Migrating surface by surface means tokens signed by the local key are
-    // still in flight; dropping it from the JWKS would break them. A failure
-    // here must not block startup — it only costs the carried-over key.
-    let carried_over_jwks = match local.issuer_jwks().await {
-        Ok(jwks) => jwks
-            .get("keys")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default(),
-        Err(e) => {
-            tracing::warn!(
-                target: "vta_audit",
-                error = %e,
-                "local issuer JWKS unavailable; VTA-signed tokens will publish without it",
-            );
-            Vec::new()
-        }
-    };
-
     let di_vc_issuer: Arc<dyn crate::identity::ssi::vc_issuer::VcIssuer> =
         Arc::new(vc_issuer::VtaVcIssuer::new(Arc::clone(&client), context_id.to_string()));
 
@@ -269,7 +247,6 @@ pub async fn select_signing_backends(
                         .map(|k| (k.key_id.clone(), k.public_key.clone()))
                         .collect(),
                 )
-                .with_carried_over_jwks(carried_over_jwks)
                 .with_quota(quota::SignQuota::new(config.sign_quota_max, config.sign_quota_window_secs)),
         ),
         di_vc_issuer: Some(di_vc_issuer),
@@ -574,6 +551,39 @@ mod tests {
             .expect("select");
         // Enabled → a different (VTA) connector, not the local one.
         assert!(!Arc::ptr_eq(&local, &selected.authority));
+    }
+
+    /// The `[vta]` connector publishes only the trust agent's keys. The
+    /// gateway's own key is the appliance authority's to publish, and only
+    /// while a token it signed may be outstanding.
+    #[tokio::test]
+    async fn the_vta_connector_does_not_publish_the_gateways_own_key() {
+        let (local, _tmp) = local_authority().await;
+        let config = VtaConfig {
+            enabled: true,
+            base_url: Some("http://localhost:3000".to_string()),
+            vta_did: Some("did:webvh:vta.example".to_string()),
+            context_id: Some("ctx".to_string()),
+            signing_key_id: Some("key-gateway-jwt".to_string()),
+            signing_key_public: Some(crate::vta::control_key::ControlKey::from_seed([9u8; 32]).public_key_multibase()),
+            ..VtaConfig::default()
+        };
+        let selected = select_signing_backends(&config, Arc::clone(&local))
+            .await
+            .expect("select");
+
+        let jwks = selected
+            .authority
+            .issuer_jwks()
+            .await
+            .expect("the key set needs no trust agent call");
+        let kids: Vec<&str> = jwks["keys"]
+            .as_array()
+            .expect("keys")
+            .iter()
+            .filter_map(|key| key["kid"].as_str())
+            .collect();
+        assert_eq!(kids, vec!["key-gateway-jwt"]);
     }
 
     #[tokio::test]
