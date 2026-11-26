@@ -1,8 +1,9 @@
 // The command `conformance client` spawns for each scenario. The suite starts its
 // own server and appends that server's URL as the last argument. This driver
-// runs the suite's reference client either straight at that URL (`direct`) or at
-// an Access Point of a gateway whose Target is that URL (`gateway`), so a
-// difference between the two results is the gateway's.
+// runs the suite's reference client at that URL (`direct`) or at an Access Point
+// of a gateway whose Target is that URL (`gateway`), both through the client
+// shim so the two send the same requests and a difference is the gateway's or
+// the shim's.
 import { spawn, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -206,20 +207,25 @@ async function runAuthScenario(config, scenario) {
   }
 }
 
+// Both legs run the client through the shim, so both send the same requests.
+export async function runThroughShim(url, run) {
+  const shim = await startClientShim(url);
+  try {
+    return await run(shim.url);
+  } finally {
+    await shim.close();
+  }
+}
+
 async function main() {
   const config = settings(process.env, process.argv);
-  if (config.mode === 'direct') {
-    return runReferenceClient(config.referenceDir, config.suiteUrl);
-  }
+  if (config.mode === 'direct') return runThroughShim(config.suiteUrl, (url) => runReferenceClient(config.referenceDir, url));
   const scenario = process.env.MCP_CONFORMANCE_SCENARIO ?? '';
   if (isAuthScenario(scenario)) return runAuthScenario(config, scenario);
   const gateway = await startGateway(config);
-  let shim;
   try {
-    shim = await startClientShim(accessPointUrl(config.inboundPort));
-    return await runReferenceClient(config.referenceDir, shim.url);
+    return await runThroughShim(accessPointUrl(config.inboundPort), (url) => runReferenceClient(config.referenceDir, url));
   } finally {
-    await shim?.close();
     await stop(gateway);
   }
 }

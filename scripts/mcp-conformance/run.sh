@@ -453,10 +453,15 @@ stop_gateway() {
 }
 
 suite_counts() {
-    local leg="$1" dir="$2"
+    local leg="$1" dir="$2" log
     shift 2
-    node "${HERE}/suite-report.mjs" counts --results "${dir}" --leg "${leg}" --requirements "${REQUIREMENTS_FILE}" "$@" 2> /dev/null ||
+    log="${LOGS}/suite-counts-${leg}-$(basename "${dir}").log"
+    node "${HERE}/suite-report.mjs" counts --results "${dir}" --leg "${leg}" --requirements "${REQUIREMENTS_FILE}" "$@" 2> "${log}" && return 0
+    if grep -q 'counts: no results in' "${log}"; then
         echo "no results"
+    else
+        echo "counts unavailable (log: $(relative "${log}"))"
+    fi
 }
 
 suite_detail() {
@@ -807,8 +812,7 @@ start_process "${LOGS}/reference-server.log" "${REFERENCE_SERVER_DIR}" \
 REFERENCE_PID="${STARTED_PID}"
 wait_for_ports "${FIXTURE_PID}" "${FIXTURE_PORT}" || fail 1 "fixtures: REST fixture did not start"
 wait_for_ports "${REFERENCE_PID}" "${REFERENCE_PORT}" || fail 1 "fixtures: reference server did not start"
-node --test "${HERE}/shim.test.mjs" "${HERE}/client-shim.test.mjs" "${HERE}/client-parity.test.mjs" \
-    "${HERE}/client-auth.test.mjs" "${HERE}/client-driver.test.mjs" "${HERE}/is-main.test.mjs" "${HERE}/report-scripts.test.mjs" "${HERE}/suite-report.test.mjs" > "${LOGS}/shim-test.log" 2>&1 ||
+(cd "${HERE}" && node --test) > "${LOGS}/shim-test.log" 2>&1 ||
     fail 1 "fixtures: harness unit tests failed (log: $(relative "${LOGS}/shim-test.log"))"
 start_process "${LOGS}/shim.log" "${HERE}" node shim.mjs --port "${SHIM_PORT}" \
     --upstream "http://127.0.0.1:${REFERENCE_PORT}"

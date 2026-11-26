@@ -3,8 +3,9 @@ import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
 import test from 'node:test';
-import { HARNESS_EXIT_CODE, HARNESS_FAILURE_FILE, hasExited, judgeRequest, recordHarnessFailure, settings } from './client-driver.mjs';
+import { HARNESS_EXIT_CODE, HARNESS_FAILURE_FILE, hasExited, judgeRequest, recordHarnessFailure, runThroughShim, settings } from './client-driver.mjs';
 
 const DRIVER = path.join(import.meta.dirname, 'client-driver.mjs');
 
@@ -129,5 +130,32 @@ test('a scenario that cannot find its token endpoint is a harness failure', () =
     assert.match(fs.readFileSync(path.join(logDir, HARNESS_FAILURE_FILE), 'utf8'), /^gateway auth\/client-credentials-jwt: .+\n$/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the client runs through the shim, which fills the standard headers the client leaves out', async () => {
+  let seen;
+  const upstream = http.createServer((req, res) => {
+    seen = req.headers;
+    req.resume();
+    res.end('{}');
+  });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  const target = `http://127.0.0.1:${upstream.address().port}/mcp`;
+  try {
+    const code = await runThroughShim(target, async (url) => {
+      assert.notEqual(url, target);
+      await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'mcp-protocol-version': '2026-07-28' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'echo' } }),
+      });
+      return 7;
+    });
+    assert.equal(code, 7);
+    assert.equal(seen['mcp-method'], 'tools/call');
+    assert.equal(seen['mcp-name'], 'echo');
+  } finally {
+    upstream.close();
   }
 });

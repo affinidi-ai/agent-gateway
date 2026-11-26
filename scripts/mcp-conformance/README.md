@@ -79,7 +79,7 @@ not be fetched, `130` interrupted (SIGINT), `143` terminated (SIGTERM).
    response as SSE, one `message` event per line, restores the tag to the
    request's typed id, and passes everything else through unchanged, so the
    subscription checks reach the gateway. The shim's own tests
-   (`shim.test.mjs`, `npm test` in this directory) run before it starts. The
+   (every `*.test.mjs` here, found the way `npm test` in this directory finds them) run before it starts. The
    `direct` target still talks to the reference server itself.
 4. **Modern phase.** Builds the gateway (`cargo build`, target dir `target/`),
    writes a fresh env with `env.mjs`, starts the gateway and probes it: a
@@ -100,8 +100,9 @@ not be fetched, `130` interrupted (SIGINT), `143` terminated (SIGTERM).
    `client-driver.mjs` with that server's URL. The driver runs the suite's
    reference client (`everything-client.ts` of the pinned checkout, whose root
    packages are installed with `npm ci --ignore-scripts`) twice per scenario:
-   straight at the suite's server, and through a gateway it starts on a fresh
-   env whose Target is that server. `client-parity.mjs` requires the same
+   at the suite's server, and through a gateway it starts on a fresh
+   env whose Target is that server, both through `client-shim.mjs` so the two
+   runs send the same requests. `client-parity.mjs` requires the same
    suite verdict (the suite's exit status of each scenario run, which can be a
    failure without a failed check) and the same checks with the same statuses
    both ways, and `tools_call`, `request-metadata`,
@@ -109,10 +110,13 @@ not be fetched, `130` interrupted (SIGINT), `143` terminated (SIGTERM).
    pass through the gateway: a passing verdict and no failed or warned check. The
    reference client has no handler for the other four scenarios, so they fail
    the same way on both sides. Between the reference client and the gateway
-   sits `client-shim.mjs`: the reference client omits the `Mcp-Method` and
-   `Mcp-Name` headers and sometimes the `Accept` list, which the gateway
-   rightly rejects on a modern request, so the adapter adds them to requests
-   that carry `MCP-Protocol-Version` and passes everything else through.
+   sits `client-shim.mjs`, on the direct run as well: the reference client omits
+   the `Mcp-Method` and `Mcp-Name` headers and sometimes the `Accept` list,
+   which the gateway rightly rejects on a modern request, so the adapter adds
+   them to requests that carry `MCP-Protocol-Version` and passes everything
+   else through. `http-standard-headers` and `http-custom-headers` therefore
+   check headers the shim fills in: they measure neither the gateway nor the
+   client.
    The suite ends a client that outlives its timeout with a signal; the driver
    then kills the gateway and reference client it started, and the run stops
    if a gateway is still listening after a scenario. The suite splits its
@@ -173,7 +177,7 @@ Outputs, all under the ignored `target/mcp-conformance/`:
 
 | Scenarios | Run | Why |
 | --- | --- | --- |
-| The eight `2026-07-28` client scenarios that need no authorization | Directly and through the gateway, with the same suite verdict and checks required both ways | The reference client is the same client in both runs, so a difference is the gateway's |
+| The eight `2026-07-28` client scenarios that need no authorization | Directly and through the gateway, with the same suite verdict and checks required both ways | The reference client and the shim are the same in both runs, so a difference is the gateway's. The two header scenarios check headers the shim fills in, so they do not measure the gateway or the client |
 | `auth/client-credentials-jwt` | Through the gateway only, counted on its own summary line | In the gateway run the gateway, not the reference client, signs the assertion and fetches the token. Run directly, the reference client does the exchange itself and exits with an error against this server's modern-wire `initialize`, so the two runs test different clients and a comparison would not measure the gateway |
 | `auth/client-credentials-basic` | Not run: a known gap | An `oauth2_client_credentials` provider sends the client secret in the form body and the scenario requires HTTP Basic. `--report` lists it, and it can be reproduced by hand (below) |
 | The other `auth/*` client scenarios (discovery, scope step-up, token-endpoint authentication methods, pre-registration, `iss`, offline access, DPoP, enterprise-managed authorization, workload identity federation) | Not run | They test an MCP client's own OAuth behaviour, such as an authorization-code flow, discovery at request time or a token issued outside the gateway. Target authentication does none of that, so the gateway has nothing to measure. `--report` lists them as gaps of the `client` target |

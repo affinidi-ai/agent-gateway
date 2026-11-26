@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test, { after } from 'node:test';
-import { compare, difference, parseVerdicts, resultDir } from './client-parity.mjs';
+import { compare, difference, parseVerdicts } from './client-parity.mjs';
 
 const roots = [];
 after(() => roots.forEach((root) => fs.rmSync(root, { recursive: true, force: true })));
@@ -27,10 +27,12 @@ const outcomeOf = (direct, gateway, scenarios, mustPass, directVerdicts = PASS, 
   compare({ direct: results(direct), gateway: results(gateway), scenarios, mustPass, directVerdicts, gatewayVerdicts });
 
 test('the newest result of a scenario is used, including one in a group folder', () => {
-  const root = results({ tools_call: [[check('a', 'FAILURE')], [check('a', 'SUCCESS')]], 'auth/basic': [[check('b', 'SUCCESS')]] });
-  assert.match(resultDir(root, 'tools_call'), /tools_call-2026-01-02T/);
-  assert.match(resultDir(root, 'auth/basic'), /auth[\\/]basic-2026-01-01T/);
-  assert.equal(resultDir(root, 'tools'), undefined);
+  const older = { tools_call: [[check('a', 'FAILURE')], [check('a', 'SUCCESS')]], 'auth/basic': [[check('b', 'SUCCESS')]] };
+  const stable = { tools_call: [[check('a', 'SUCCESS')]], 'auth/basic': [[check('b', 'SUCCESS')]] };
+  const outcome = outcomeOf(stable, older, ['tools_call', 'auth/basic'], [], verdicts('tools_call pass\nauth/basic pass'), verdicts('tools_call pass\nauth/basic pass'));
+  assert.equal(outcome.failures, 0);
+  const stale = outcomeOf({ tools_call: [[check('a', 'FAILURE')]] }, { tools_call: [[check('a', 'SUCCESS')], [check('a', 'FAILURE')]] }, ['tools_call'], [], verdicts('tools_call pass'), verdicts('tools_call pass'));
+  assert.equal(stale.failures, 0);
 });
 
 test('verdict lines are parsed and a malformed one is refused', () => {

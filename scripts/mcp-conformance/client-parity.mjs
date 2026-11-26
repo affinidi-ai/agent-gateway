@@ -1,16 +1,20 @@
 // Compares the suite's client-scenario results for the reference client run
-// straight at the suite's server (`direct`) and through the gateway (`gateway`).
+// at the suite's server (`direct`) and through the gateway (`gateway`). Both
+// runs go through client-shim.mjs, so both send the same requests.
 //
 //   parity     every scenario has the same suite verdict (the exit status of its
 //              run) and the same check ids with the same statuses in both runs,
-//              so a difference is the gateway's
+//              so a difference is the gateway's or the shim's. The header
+//              scenarios (http-standard-headers, http-custom-headers) check
+//              headers the shim fills in, so they measure neither the gateway
+//              nor the client
 //   must pass  each named scenario has the passing suite verdict through the
 //              gateway and checks, none of them failed or warned, so parity is
 //              not two empty or two failed runs
 import fs from 'node:fs';
-import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { isMain } from './is-main.mjs';
+import { loadResults } from './suite-report.mjs';
 
 const NOT_PASSING = new Set(['FAILURE', 'WARNING']);
 
@@ -25,26 +29,11 @@ export function parseVerdicts(text) {
   return verdicts;
 }
 
-// The newest result directory of a scenario: `<scenario>-<timestamp>`.
-export function resultDir(root, scenario) {
-  const parent = path.join(root, path.dirname(scenario));
-  const prefix = `${path.basename(scenario)}-`;
-  if (!fs.existsSync(parent)) return undefined;
-  const matches = fs
-    .readdirSync(parent)
-    .filter((name) => name.startsWith(prefix) && /^\d{4}-\d{2}-\d{2}T/.test(name.slice(prefix.length)))
-    .sort();
-  return matches.length ? path.join(parent, matches.at(-1)) : undefined;
-}
-
-export function checkStatuses(root, scenario) {
-  const dir = resultDir(root, scenario);
-  if (!dir) return undefined;
-  const file = path.join(dir, 'checks.json');
-  if (!fs.existsSync(file)) return undefined;
-  return JSON.parse(fs.readFileSync(file, 'utf8'))
-    .map((check) => `${check.id}:${check.status}`)
-    .sort();
+// Scenario name to its sorted `<check id>:<status>` lines, newest run of each.
+export function checkStatuses(root) {
+  return new Map(
+    [...loadResults(root, 'client')].map(([scenario, checks]) => [scenario, checks.map((check) => `${check.id}:${check.status}`).sort()]),
+  );
 }
 
 // The check lines present on one side only, prefixed with the side.
@@ -60,6 +49,7 @@ export function difference(direct, gateway) {
 }
 
 export function compare({ direct, gateway, scenarios, mustPass, directVerdicts, gatewayVerdicts }) {
+  const [directChecks, gatewayChecks] = [checkStatuses(direct), checkStatuses(gateway)];
   const lines = [];
   let failures = 0;
   const report = (ok, name, detail) => {
@@ -67,7 +57,7 @@ export function compare({ direct, gateway, scenarios, mustPass, directVerdicts, 
     if (!ok) failures += 1;
   };
   for (const scenario of scenarios) {
-    const [a, b] = [checkStatuses(direct, scenario), checkStatuses(gateway, scenario)];
+    const [a, b] = [directChecks.get(scenario), gatewayChecks.get(scenario)];
     if (!a || !b) {
       report(false, `parity ${scenario}`, `no result for ${[!a && 'direct', !b && 'gateway'].filter(Boolean).join(' and ')}`);
       continue;
