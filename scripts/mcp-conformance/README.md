@@ -83,9 +83,11 @@ not be fetched, `130` interrupted (SIGINT), `143` terminated (SIGTERM).
    `direct` target still talks to the reference server itself.
 4. **Modern phase.** Builds the gateway (`cargo build`, target dir `target/`),
    writes a fresh env with `env.mjs`, starts the gateway and probes it: a
-   `-32022` answer means the binary does not admit `2026-07-28`. The probe
-   runs unless every selected modern target is `direct` or `fabric`, which use
-   neither that Access Point nor this gateway's modern admission. Then runs the
+   `-32022` answer means the binary does not admit `2026-07-28`. A normal
+   run always probes, since its compat checks need every gateway endpoint to
+   admit the version; only a `--report` run that selects nothing but `direct`
+   and `fabric`, which use neither that Access Point nor this gateway's modern
+   admission, skips the probe. Then runs the
    suite per target, `check-results.mjs`, `compat.mjs admitted` and
    `compat.mjs legacy`. The `fabric` target runs `fabric.feature` through the
    g2g BDD runner (`cargo test --test g2g_bdd`): two gateways

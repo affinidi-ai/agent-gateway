@@ -678,11 +678,12 @@ report_authorization() {
         "${CONFORMANCE}" authorization --url "http://127.0.0.1:${MODERN_INBOUND_PORT}" -o "${RESULTS}/authorization"
 }
 
-# The probe sends one modern request to the Access Point. The direct and fabric
-# targets use neither that Access Point nor this gateway's modern admission, so
-# a run that selects only those does not depend on it. A normal run stops when
-# the probe fails; a report-only run records the failure and goes on, so the
-# gaps still get listed.
+# The probe sends one modern request to the Access Point. A normal run always
+# probes, since its compat checks need every gateway endpoint to admit the
+# version, and stops when the probe fails. Only a report-only run that selects
+# nothing but the direct and fabric targets, which use neither that Access Point
+# nor this gateway's modern admission, skips it; any other report-only run
+# records a failed probe and goes on, so the gaps still get listed.
 probe_needed() {
     local name
     for name in "${MODERN_TARGETS[@]}"; do
@@ -693,7 +694,7 @@ probe_needed() {
 
 probe_modern() {
     local log="${LOGS}/compat-probe.log" status message
-    if ! probe_needed; then
+    if [[ "${REPORT}" == true ]] && ! probe_needed; then
         record INFO "modern: probe skipped; the selected targets do not use the Access Point"
         return
     fi
