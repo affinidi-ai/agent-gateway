@@ -4123,6 +4123,51 @@ fn oauth_provider_received_refresh_request(
     );
 }
 
+fn latest_oauth_provider_token_request(world: &SurfaceWorld) -> crate::bdd_support::mock_server::ReceivedRequest {
+    oauth_provider_requests(world)
+        .into_iter()
+        .rfind(|request| {
+            request
+                .path_and_query
+                .starts_with("/token")
+        })
+        .expect("the OAuth provider received a token request")
+}
+
+#[then(
+    expr = "OAuth provider {string}'s latest token request carries HTTP Basic credentials for client {string} and secret {string}"
+)]
+fn oauth_provider_token_request_carries_basic_credentials(
+    world: &mut SurfaceWorld,
+    _provider: String,
+    client_id: String,
+    secret: String,
+) {
+    let expected = crate::steps::provider_token::http_basic_client_credentials(&client_id, &secret);
+    let request = latest_oauth_provider_token_request(world);
+    assert!(
+        request
+            .headers
+            .get("authorization")
+            .is_some_and(|authorization| *authorization == expected),
+        "the latest token request carried HTTP Basic credentials other than those of client {client_id}"
+    );
+}
+
+#[then(expr = "OAuth provider {string}'s latest token request has no client ID or secret in its form body")]
+fn oauth_provider_token_request_has_no_client_identity_in_its_form(
+    world: &mut SurfaceWorld,
+    _provider: String,
+) {
+    let request = latest_oauth_provider_token_request(world);
+    let form = url::form_urlencoded::parse(request.raw_body.as_bytes())
+        .into_owned()
+        .collect::<HashMap<String, String>>();
+    for field in ["client_id", "client_secret"] {
+        assert!(!form.contains_key(field), "the latest token request carries {field}");
+    }
+}
+
 /// Delegation audit records name a provider by its record id, which is not
 /// its `provider_id` slug when the gateway gave it an id of its own.
 #[then(expr = "the delegation audit trail contains event {string} for OAuth provider {string}")]

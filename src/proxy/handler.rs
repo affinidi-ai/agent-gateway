@@ -2041,6 +2041,29 @@ fn is_jsonrpc_message(body: &str) -> bool {
         })
 }
 
+/// The Legacy SSE message for a request refused with `status` and `body`: a JSON-RPC message,
+/// whatever its HTTP status, and any JSON answered with `200` reach the caller as they are;
+/// anything else becomes a JSON-RPC error with `fallback_message` and the request's id, so the
+/// message stays parseable.
+fn legacy_sse_refusal_message(
+    status: StatusCode,
+    body: &str,
+    request: &serde_json::Value,
+    fallback_message: impl FnOnce() -> String,
+) -> String {
+    let forwardable = is_jsonrpc_message(body)
+        || (status == StatusCode::OK && serde_json::from_str::<serde_json::Value>(body).is_ok());
+    if forwardable {
+        return body.to_string();
+    }
+    serde_json::to_string(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request.get("id"),
+        "error": { "code": -32603, "message": fallback_message() }
+    }))
+    .unwrap_or_default()
+}
+
 fn sse_session_limit_response(
     connection_guard: ConnectionGuard,
     facts: &crate::audit::request_events::RequestFacts<'_>,
@@ -4100,7 +4123,7 @@ async fn proxy_charged_request(
                             .await;
                     }
                 }
-                Err(err_resp) => {
+                Err(err_resp) if !is_notification => {
                     let err_status = err_resp.status();
                     let (err_parts, err_body) = err_resp.into_parts();
                     let err_body_bytes = axum::body::to_bytes(err_body, 1024 * 1024)
@@ -4117,14 +4140,18 @@ async fn proxy_charged_request(
                         err_body_bytes.len()
                     );
 
-                    let error_json = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": json_request.get("id"),
-                        "error": { "code": -32603, "message": format!("Fabric forwarding failed: {} {}", err_status, err_body_str.chars().take(200).collect::<String>()) }
+                    let to_send = legacy_sse_refusal_message(err_status, &err_body_str, &json_request, || {
+                        format!(
+                            "Fabric forwarding failed: {} {}",
+                            err_status,
+                            err_body_str
+                                .chars()
+                                .take(200)
+                                .collect::<String>()
+                        )
                     });
-                    let error_str = serde_json::to_string(&error_json).unwrap_or_default();
                     CHANNEL_SSE_SESSION_MGR
-                        .send_response(&session_id, &error_str)
+                        .send_response(&session_id, &to_send)
                         .await;
                 }
                 _ => {} // Notification — no response
@@ -4746,28 +4773,14 @@ async fn proxy_charged_request(
                     }
                 }
                 Err(resp) if !is_notification => {
-                    // A JSON-RPC error, whatever its HTTP status, and any JSON
-                    // answered with 200 reach the caller verbatim; anything else
-                    // becomes a generic JSON-RPC error so the SSE message stays
-                    // parseable.
                     let (parts, body) = resp.into_parts();
                     let body_bytes_resp = axum::body::to_bytes(body, 10 * 1024 * 1024)
                         .await
                         .unwrap_or_default();
                     let body_str = String::from_utf8_lossy(&body_bytes_resp);
-                    let forwardable = is_jsonrpc_message(&body_str)
-                        || (parts.status == StatusCode::OK
-                            && serde_json::from_str::<serde_json::Value>(&body_str).is_ok());
-                    let to_send = if forwardable {
-                        body_str.into_owned()
-                    } else {
-                        serde_json::to_string(&serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": json_request.get("id"),
-                            "error": { "code": -32603, "message": "Internal error" }
-                        }))
-                        .unwrap_or_default()
-                    };
+                    let to_send = legacy_sse_refusal_message(parts.status, &body_str, &json_request, || {
+                        "Internal error".to_string()
+                    });
                     CHANNEL_SSE_SESSION_MGR
                         .send_response(&session_id, &to_send)
                         .await;
@@ -26349,6 +26362,89 @@ mod fabric_send_tests {
         super::CHANNEL_SSE_SESSION_MGR
             .remove_session(&session_id)
             .await;
+    }
+
+    /// A gateway whose MCP surface targets a Fabric peer it has no connection to, with an
+    /// open Legacy SSE session past its `endpoint` event, and that session's message URL.
+    async fn unconnected_fabric_mcp_legacy_sse_session() -> (FabricPeer, String, axum::body::Body, String) {
+        let peer = fabric_peer_fronted_by(200, json!({}), |_| {
+            json!({
+                "surface_id": "fabric-unconnected-mcp", "name": "Fabric unconnected MCP",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+                "target": {"endpoint": "fabric://not-connected/remote-surface"}
+            })
+        })
+        .await;
+        let (session_id, stream) = super::CHANNEL_SSE_SESSION_MGR
+            .create_session()
+            .await
+            .unwrap();
+        let mut events =
+            crate::mcp::sse_server::build_legacy_sse_response(session_id.clone(), stream, "/mcp").into_body();
+        let (name, _) = next_event(&mut events).await;
+        assert_eq!(name, "endpoint");
+        let url = format!("https://gateway.example/mcp/messages/?session_id={session_id}");
+        (peer, session_id, events, url)
+    }
+
+    #[test]
+    fn a_legacy_sse_request_over_the_fabric_gets_the_json_rpc_error_with_its_reason() {
+        run_on_large_stack(async {
+            let (peer, session_id, mut events, url) = unconnected_fabric_mcp_legacy_sse_session().await;
+
+            let (status, _, _) = answer(post(&peer.state, &url, &tool_call("any_tool"), None).await).await;
+
+            assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+            let (name, data) = next_event(&mut events).await;
+            assert_eq!(name, "message");
+            let message: serde_json::Value = serde_json::from_str(&data).unwrap();
+            assert_eq!(
+                message,
+                json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32603, "message": "Target unavailable",
+                    "data": {"reason": "target_unreachable"}}})
+            );
+            super::CHANNEL_SSE_SESSION_MGR
+                .remove_session(&session_id)
+                .await;
+        });
+    }
+
+    #[test]
+    fn a_legacy_sse_refusal_that_is_not_json_rpc_becomes_a_json_rpc_error_with_the_request_id() {
+        let request = tool_call("any_tool");
+        let problem = json!({"type": "proxy-error", "detail": "Gateway DID not found"}).to_string();
+
+        let message = super::legacy_sse_refusal_message(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &problem,
+            &request,
+            || "Fabric forwarding failed".to_string(),
+        );
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&message).unwrap(),
+            json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32603, "message": "Fabric forwarding failed"}})
+        );
+    }
+
+    #[test]
+    fn a_legacy_sse_notification_over_the_fabric_that_fails_gets_no_message() {
+        run_on_large_stack(async {
+            let (peer, session_id, mut events, url) = unconnected_fabric_mcp_legacy_sse_session().await;
+            let notification = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+
+            let (status, _, _) = answer(post(&peer.state, &url, &notification, None).await).await;
+            assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+            answer(post(&peer.state, &url, &tool_call("any_tool"), None).await).await;
+
+            let (name, data) = next_event(&mut events).await;
+            assert_eq!(name, "message");
+            let message: serde_json::Value = serde_json::from_str(&data).unwrap();
+            assert_eq!(message["id"], 7, "the first message answers the request, not the notification: {message}");
+            super::CHANNEL_SSE_SESSION_MGR
+                .remove_session(&session_id)
+                .await;
+        });
     }
 
     #[test]

@@ -255,6 +255,15 @@ Feature: MCP requests travel across gateways over fabric
     And the MCP response id matches the request id
     And the response reason is "target_unreachable"
 
+  Scenario: A Legacy SSE session over fabric gets the unreachable Target error for a request and no message for a notification
+    Given a fabric with 2 gateways
+    And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo" with 8000-8000 ms response delay
+    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    When the caller sends an MCP notification and then asks gateway 1 MCP surface "charlie" for available tools over one Legacy SSE session
+    Then the MCP response is a JSON-RPC error with code -32603
+    And the MCP response id matches the request id
+    And the response reason is "target_unreachable"
+
   Scenario: A newly paired peer reaches nothing until a surface is exposed
     Given gateway 1 and gateway 2 have just been paired
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"

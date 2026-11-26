@@ -3287,6 +3287,22 @@ fn target_credential_provider_authenticates_its_client(
     provider.client_authentication = Some(TargetAuthClientAuthentication::from_wording(&wording));
 }
 
+#[given(expr = "OAuth provider {string} authenticates its client with {string}")]
+fn oauth_provider_authenticates_its_client(
+    world: &mut SurfaceWorld,
+    provider: String,
+    wording: String,
+) {
+    assert_eq!(
+        delegation_config_mut(world).provider_id,
+        provider,
+        "the client authentication is set only on the surface's own OAuth provider"
+    );
+    world
+        .surface_config
+        .oauth_client_authentication = Some(TargetAuthClientAuthentication::from_wording(&wording));
+}
+
 #[given("the credential provider is refusing token requests")]
 fn target_credential_provider_refuses_tokens(world: &mut SurfaceWorld) {
     target_auth_provider(world).token_status = 401;

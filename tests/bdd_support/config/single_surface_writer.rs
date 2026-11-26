@@ -1374,7 +1374,10 @@ fn oauth_provider_fixture(
         api_key_secret_ref: None,
         authorization_response_issuer,
         max_consent_age_secs,
-        jwt_settings: None,
+        jwt_settings: surface_config
+            .oauth_client_authentication
+            .filter(|_| own)
+            .map(|method| serde_json::json!({ "client_authentication": method.api_value() })),
         consent_confirmation: (own && surface_config.consent_confirmation)
             .then(|| consent_confirmation_json(surface_config)),
         created_at: now,

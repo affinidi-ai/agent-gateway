@@ -584,18 +584,26 @@ async fn latest_token_request_carries_basic_credentials(
     client_id: String,
     secret: String,
 ) {
-    use base64::Engine;
-    // RFC 6749 section 2.3.1: the client ID and secret are form-urlencoded before the Basic encoding.
-    let encode = |value: &str| url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>();
-    let expected = format!(
-        "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", encode(&client_id), encode(&secret)))
-    );
+    let expected = http_basic_client_credentials(&client_id, &secret);
     let authorization = latest_token_request_authorization(world).await;
     assert!(
         authorization.as_deref() == Some(expected.as_str()),
         "the latest token request carried HTTP Basic credentials other than those of client {client_id}"
     );
+}
+
+/// The `Authorization` value of a token request that authenticates `client_id` by HTTP Basic.
+pub(crate) fn http_basic_client_credentials(
+    client_id: &str,
+    secret: &str,
+) -> String {
+    use base64::Engine;
+    // RFC 6749 section 2.3.1: the client ID and secret are form-urlencoded before the Basic encoding.
+    let encode = |value: &str| url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>();
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", encode(client_id), encode(secret)))
+    )
 }
 
 #[then("the credential provider's latest token request carries no HTTP Basic credentials")]
