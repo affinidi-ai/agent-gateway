@@ -7251,14 +7251,7 @@ async fn proxy_charged_request(
                     let wb: Option<serde_json::Value> = None;
                     let vc_issuer = selector.get_vc_issuer();
                     match vc_issuer
-                        .create_agent_identity_presentation_with_binding(
-                            &result.did,
-                            &result.identity_fields,
-                            wb,
-                            None,
-                            None,
-                            &state.key_scope(),
-                        )
+                        .create_audit_presentation(&result.did, &result.identity_fields, wb, &state.key_scope())
                         .await
                     {
                         Ok(jwt) => {
@@ -7507,17 +7500,24 @@ async fn proxy_charged_request(
             delegation_actions_for_vp.clone(),
             authenticated_identity.as_ref(),
         );
-        match vc_issuer
-            .create_agent_identity_presentation_with_binding(
-                &result.did,
-                &result.identity_fields,
-                wb,
-                None,
-                None,
-                &state.key_scope(),
-            )
-            .await
-        {
+        let final_vp = match crate::identity::VpDomain::for_endpoint(&target_url) {
+            Some(receiver) => {
+                vc_issuer
+                    .create_agent_identity_presentation_with_binding(
+                        &result.did,
+                        &result.identity_fields,
+                        wb,
+                        &receiver,
+                        &state.key_scope(),
+                    )
+                    .await
+            }
+            None => Err(anyhow::anyhow!(
+                "the Target {} has no origin to name as the presentation's receiver",
+                loggable::url(&target_url)
+            )),
+        };
+        match final_vp {
             Ok(final_vp_jwt) => {
                 // 1. inject into outbound body (replaces the slot if any existed)
                 if (state
@@ -12613,18 +12613,22 @@ async fn handle_fabric_request_inner(
                 .map(|b| b.inbound_credentials.clone())
                 .unwrap_or_default();
             let chain_len = chained_credentials.len();
-            match vc_issuer
-                .create_agent_identity_presentation_chained(
-                    &result.did,
-                    &result.identity_fields,
-                    fabric_workload_binding,
-                    None,
-                    None,
-                    chained_credentials,
-                    &state.key_scope(),
-                )
-                .await
-            {
+            let fabric_vp = match crate::identity::VpDomain::did(&remote_gateway_did) {
+                Some(peer) => {
+                    vc_issuer
+                        .create_agent_identity_presentation_chained(
+                            &result.did,
+                            &result.identity_fields,
+                            fabric_workload_binding,
+                            &peer,
+                            chained_credentials,
+                            &state.key_scope(),
+                        )
+                        .await
+                }
+                None => Err(anyhow::anyhow!("the peer's Connection Point address {remote_gateway_did} is not a DID")),
+            };
+            match fabric_vp {
                 Ok(vp_jwt) => {
                     channel_info!(
                         config_id,
@@ -25291,10 +25295,11 @@ mod fabric_send_tests {
         assert_eq!(message["extensions"], json!([binding]), "the request for the response credential stays");
     }
 
-    #[tokio::test]
-    async fn the_fabric_forward_vp_injection_record_names_the_authenticated_caller() {
-        let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
-        let (vc_issuer, _issuer_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+    /// Gives `peer`'s surface a managed agent read from the request's
+    /// `agent-identity/v1` extension, which the gateway signs a presentation
+    /// for. Returns the issuer's temp dir, which the caller keeps alive.
+    async fn with_request_agent_identity(peer: &mut FabricPeer) -> tempfile::TempDir {
+        let (vc_issuer, issuer_dir) = crate::identity::test_helpers::test_vc_issuer().await;
         let vc_issuer = Arc::new(vc_issuer);
         peer.state.identity_selector = Some(Arc::new(
             crate::identity::IdentitySelector::new(
@@ -25319,12 +25324,165 @@ mod fabric_send_tests {
             },
         ));
         peer.state.surface = Arc::new(surface);
-        let body = json!({
+        issuer_dir
+    }
+
+    fn message_with_agent_identity() -> serde_json::Value {
+        json!({
             "jsonrpc": "2.0", "id": "m-1", "method": "message/send",
             "params": {"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}], "messageId": "m-1",
                 "extensions": ["https://fabric.affinidi.io/extensions/agent-identity/v1"],
                 "metadata": {"https://fabric.affinidi.io/extensions/agent-identity/v1": {"cloudProvider": "local", "model": "gpt-4"}}}}
-        });
+        })
+    }
+
+    fn fabric_send(body: &serde_json::Value) -> super::FabricSend<'static> {
+        super::FabricSend {
+            channel_name: "Fabric A2A",
+            method: axum::http::Method::POST,
+            uri: "https://gateway.example/a2a"
+                .parse()
+                .unwrap(),
+            headers: axum::http::HeaderMap::new(),
+            source_addr: "127.0.0.1:12345".to_string(),
+            start_time: std::time::Instant::now(),
+            connection_guard: super::ConnectionGuard::new(None, None),
+            body_bytes: axum::body::Bytes::from(body.to_string()),
+            trace_id: "trace-1".to_string(),
+            ucp_operation: None,
+            authenticated_identity: None,
+            source_auth_context: None,
+            payment_context: None,
+            mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
+            mcp_verified_binding: None,
+            mcp_classification: None,
+            subscription_lifetime: None,
+            mcp_continuations: None,
+            payment: None,
+        }
+    }
+
+    /// The presentation a `fabric://` request carries names the peer by the
+    /// Connection Point DID it is sent to.
+    #[tokio::test]
+    async fn the_fabric_request_presentation_names_the_peer_connection_point() {
+        let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+        let _issuer_dir = with_request_agent_identity(&mut peer).await;
+
+        let result =
+            Box::pin(super::handle_fabric_request(peer.state.clone(), fabric_send(&message_with_agent_identity())))
+                .await;
+
+        assert!(result.is_ok(), "the fabric request was refused");
+        let forwards = peer
+            .forwards
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(forwards.len(), 1);
+        assert_eq!(
+            crate::identity::test_helpers::presentation_domains(&forwards[0]["body"]),
+            vec![Some(peer.peer_did.clone())]
+        );
+    }
+
+    /// The presentation a request to an HTTP Target carries names the origin of
+    /// the URL it is sent to.
+    #[test]
+    fn the_target_request_presentation_names_the_target_origin() {
+        run_on_large_stack(target_request_presentation_names_the_target_origin());
+    }
+
+    async fn target_request_presentation_names_the_target_origin() {
+        let (sent, _, origin) = direct_a2a_exchange(json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+
+        assert_eq!(crate::identity::test_helpers::presentation_domains(&sent), vec![Some(origin)]);
+    }
+
+    /// The presentation the gateway signs into its answer to a caller at its
+    /// Access Point names the answer label, never a receiver.
+    #[test]
+    fn the_direct_answer_presentation_names_the_answer_label() {
+        run_on_large_stack(direct_answer_presentation_names_the_answer_label());
+    }
+
+    async fn direct_answer_presentation_names_the_answer_label() {
+        let identity = "https://fabric.affinidi.io/extensions/agent-identity/v1";
+        let (_, answered, _) = direct_a2a_exchange(json!({"jsonrpc": "2.0", "id": "m-1", "result": {
+            "kind": "message", "role": "agent", "messageId": "a-1", "parts": [{"kind": "text", "text": "ok"}],
+            "extensions": [identity], "metadata": {identity: {"cloudProvider": "local", "model": "gpt-4"}}
+        }}))
+        .await;
+
+        assert_eq!(
+            crate::identity::test_helpers::presentation_domains(&answered),
+            vec![Some("urn:agent-gateway:label:answer".to_string())]
+        );
+    }
+
+    /// Sends an A2A message carrying an agent identity to a surface whose HTTP
+    /// Target answers `answer`, and returns the body the Target was sent, the
+    /// body the caller was answered and the Target's origin.
+    async fn direct_a2a_exchange(answer: serde_json::Value) -> (serde_json::Value, serde_json::Value, String) {
+        let target = crate::component_tests::helpers::MockServer::start_with_response(answer.to_string()).await;
+        let endpoint = format!("http://{}/agent", target.addr);
+        let mut peer = fabric_peer_fronted_by(200, json!({}), |_| {
+            json!({
+                "surface_id": "direct-a2a", "name": "Direct A2A",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+                "target": {"endpoint": endpoint}
+            })
+        })
+        .await;
+        let _issuer_dir = with_request_agent_identity(&mut peer).await;
+        let mut surface = (*peer.state.surface).clone();
+        surface
+            .identity_slots
+            .protected = surface
+            .identity_slots
+            .inbound
+            .clone();
+        peer.state.surface = Arc::new(surface);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/a2a")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(message_with_agent_identity().to_string()))
+            .unwrap();
+
+        let response = Box::pin(super::proxy_handler_with_mcp_runtime(
+            "127.0.0.1:12345"
+                .parse()
+                .unwrap(),
+            peer.state.clone(),
+            request,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            None,
+        ))
+        .await;
+
+        let Ok(response) = response else {
+            panic!("the request was refused");
+        };
+        let answered = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let sent = target
+            .last_request_rx
+            .borrow()
+            .clone()
+            .expect("the Target was called");
+        (
+            serde_json::from_str(&sent.body).unwrap(),
+            serde_json::from_slice(&answered).unwrap(),
+            format!("http://{}", target.addr),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_fabric_forward_vp_injection_record_names_the_authenticated_caller() {
+        let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+        let _issuer_dir = with_request_agent_identity(&mut peer).await;
         let caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
             strategy_id: None,
             principal_claim: "sub".to_string(),
@@ -25332,34 +25490,13 @@ mod fabric_send_tests {
             claims: json!({"iss": "https://idp.example.com", "email": "ada@example.com"}),
             verification: Default::default(),
         };
+        let send = super::FabricSend {
+            authenticated_identity: Some(caller),
+            ..fabric_send(&message_with_agent_identity())
+        };
 
-        let (result, events) = crate::audit::producer::capture(Box::pin(super::handle_fabric_request(
-            peer.state.clone(),
-            super::FabricSend {
-                channel_name: "Fabric A2A",
-                method: axum::http::Method::POST,
-                uri: "https://gateway.example/a2a"
-                    .parse()
-                    .unwrap(),
-                headers: axum::http::HeaderMap::new(),
-                source_addr: "127.0.0.1:12345".to_string(),
-                start_time: std::time::Instant::now(),
-                connection_guard: super::ConnectionGuard::new(None, None),
-                body_bytes: axum::body::Bytes::from(body.to_string()),
-                trace_id: "trace-1".to_string(),
-                ucp_operation: None,
-                authenticated_identity: Some(caller),
-                source_auth_context: None,
-                payment_context: None,
-                mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
-                mcp_verified_binding: None,
-                mcp_classification: None,
-                subscription_lifetime: None,
-                mcp_continuations: None,
-                payment: None,
-            },
-        )))
-        .await;
+        let (result, events) =
+            crate::audit::producer::capture(Box::pin(super::handle_fabric_request(peer.state.clone(), send))).await;
 
         if let Err(refused) = result {
             let status = refused.status();

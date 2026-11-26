@@ -39,6 +39,18 @@ fn message_with_presentation(
     })
 }
 
+/// The receiver a caller names in its presentation: the origin the gateway's inbound listener lists
+/// in `external_urls`. Starts the gateway, so its port is known.
+async fn access_point_origin(world: &mut SurfaceWorld) -> String {
+    crate::steps::when::ensure_gateway_running(world).await;
+    let port = world
+        .infra
+        .as_ref()
+        .expect("the gateway is running")
+        .gateway_port;
+    format!("http://localhost:{port}")
+}
+
 async fn send_presentation(
     world: &mut SurfaceWorld,
     presentation: Value,
@@ -83,8 +95,9 @@ async fn caller_lists_key_for_assertions(world: &mut SurfaceWorld) {
 
 #[given("the gateway has accepted a presentation from the caller of a credential from another issuer")]
 async fn gateway_accepted_presentation_of_credential_from_another_issuer(world: &mut SurfaceWorld) {
+    let receiver = access_point_origin(world).await;
     let presentation = presentation_signer(world)
-        .present_credential_from_another_issuer()
+        .present_credential_from_another_issuer(&receiver)
         .await;
     send_presentation(world, presentation, vec![]).await;
     let status = world
@@ -103,8 +116,9 @@ async fn gateway_accepted_presentation_of_credential_from_another_issuer(world: 
 
 #[when("the caller sends a request with a presentation of a credential it issued itself")]
 async fn caller_sends_presentation_of_own_credential(world: &mut SurfaceWorld) {
+    let receiver = access_point_origin(world).await;
     let presentation = presentation_signer(world)
-        .present_own_credential()
+        .present_own_credential(&receiver)
         .await;
     send_presentation(world, presentation, vec![]).await;
 }
@@ -118,9 +132,10 @@ async fn caller_lists_key_for_assertions_from_the_start(world: &mut SurfaceWorld
     "the caller sends a request to the surface with a valid API key and a presentation of a credential it issued itself"
 )]
 async fn caller_with_api_key_sends_presentation_of_own_credential(world: &mut SurfaceWorld) {
+    let receiver = access_point_origin(world).await;
     let header = crate::steps::when::build_valid_api_key_source_auth_header(world);
     let presentation = presentation_signer(world)
-        .present_own_credential()
+        .present_own_credential(&receiver)
         .await;
     send_presentation(world, presentation, vec![header]).await;
 }

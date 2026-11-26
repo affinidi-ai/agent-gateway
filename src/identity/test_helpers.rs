@@ -518,9 +518,12 @@ impl VpChallengeStore for MockVpChallengeStore {
     }
 }
 
+/// The receiver a [`signed_agent_presentation`] names in its proof's `domain`.
+pub const PRESENTATION_RECEIVER: &str = "did:web:receiver.example";
+
 /// An agent identity presentation signed offline with did:peer keys: one key
 /// issues the identity VC as `issuer_did`, another signs the VP as
-/// `holder_did`. `issuer` is a `VCIssuer` that verifies it without network
+/// `holder_did`, for [`PRESENTATION_RECEIVER`]. `issuer` is a `VCIssuer` that verifies it without network
 /// resolution; hold `_temporary` for as long as `issuer` is used.
 pub struct SignedAgentPresentation {
     pub issuer_did: String,
@@ -575,7 +578,7 @@ async fn signed_agent_presentation_about(subject_did: Option<&str>) -> SignedAge
             holder_did: Cow::Borrowed(&holder_did),
             verifiable_credentials: Cow::Owned(vec![credential]),
             challenge: None,
-            domain: None,
+            domain: Some(Cow::Borrowed(PRESENTATION_RECEIVER)),
             proof_purpose: ssi::verification_methods::ProofPurpose::Assertion,
         }))
         .await
@@ -588,6 +591,48 @@ async fn signed_agent_presentation_about(subject_did: Option<&str>) -> SignedAge
         issuer: Arc::new(issuer),
         _temporary,
     }
+}
+
+#[tokio::test]
+async fn a_signed_agent_presentation_names_its_receiver() {
+    let signed = signed_agent_presentation().await;
+    assert_eq!(
+        presentation_domains(&serde_json::json!({"verifiablePresentation": signed.presentation.to_string()})),
+        vec![Some(PRESENTATION_RECEIVER.to_string())]
+    );
+}
+
+/// The proof `domain` of every presentation in `value`, read inside the JSON
+/// text a `verifiablePresentation` carries; `None` for a proof without one.
+pub fn presentation_domains(value: &serde_json::Value) -> Vec<Option<String>> {
+    let mut found = Vec::new();
+    match value {
+        serde_json::Value::String(text) => {
+            if let Ok(decoded @ serde_json::Value::Object(_)) = serde_json::from_str::<serde_json::Value>(text) {
+                found.extend(presentation_domains(&decoded));
+            }
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .for_each(|value| found.extend(presentation_domains(value))),
+        serde_json::Value::Object(map) => {
+            if map.contains_key("verifiableCredential")
+                && let Some(proof) = map.get("proof")
+            {
+                found.push(
+                    proof
+                        .get("domain")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                );
+            }
+            map.iter()
+                .filter(|(key, _)| key.as_str() != "verifiableCredential")
+                .for_each(|(_, value)| found.extend(presentation_domains(value)));
+        }
+        _ => {}
+    }
+    found
 }
 
 /// Installs on `issuer` a key directory where the surface `surface_id` signs

@@ -22,6 +22,7 @@ pub mod test_helpers;
 pub mod utils;
 pub mod vc_issuer;
 pub mod vp_challenge_store;
+pub mod vp_domain;
 
 // did:webvh + UAI modules are behind feature gate until fully integrated
 #[cfg(feature = "didwebvh")]
@@ -40,3 +41,4 @@ pub use state::IdentityApiState;
 pub use store::IdentityStore;
 pub use vc_issuer::*;
 pub use vp_challenge_store::*;
+pub use vp_domain::{VpDomain, VpLabel};

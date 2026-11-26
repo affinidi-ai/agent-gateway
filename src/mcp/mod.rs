@@ -43,11 +43,6 @@ pub use handler::{
     build_tools_call_policy_denied_envelope, build_tools_call_policy_denied_response, fail_closed_tools_list,
     handle_mcp_request, inject_mcp_metadata, is_mcp_request, is_tools_call_request, is_tools_list_request,
 };
-// inject_identity_credential_mcp is currently unused but retained for future
-// outbound MCP identity signing support.
-#[allow(unused_imports)]
-pub use identity::inject_identity_credential_mcp;
-
 #[cfg(feature = "didwebvh")]
 pub use identity::inject_didwebvh_identity_mcp;
 
@@ -55,7 +50,10 @@ pub use initialize::inject_server_metadata;
 pub use logging::handle_logging_message;
 pub use policy::McpPolicyContext;
 pub use tool_analyzer::McpToolRequest;
-pub use validation::{inject_vp_into_mcp_request, inject_vp_into_mcp_response, is_notification, validate_mcp_message};
+pub use validation::{
+    inject_vp_into_fabric_mcp_response, inject_vp_into_mcp_request, inject_vp_into_mcp_response, is_notification,
+    validate_mcp_message,
+};
 
 /// Legacy MCP protocol version implemented by the gateway.
 pub const MCP_LEGACY_VERSION: &str = "2024-11-05";

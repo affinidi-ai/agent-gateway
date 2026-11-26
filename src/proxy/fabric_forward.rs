@@ -666,7 +666,7 @@ fn parse_fabric_response_headers(value: Option<&serde_json::Value>) -> HashMap<S
 }
 
 /// Parse a `fabric://{gateway_id}/{channel_id}` target into its parts.
-fn parse_fabric_target(fabric_target: &str) -> Result<(&str, &str), FabricForwardError> {
+pub(crate) fn parse_fabric_target(fabric_target: &str) -> Result<(&str, &str), FabricForwardError> {
     let fabric_path = fabric_target
         .strip_prefix("fabric://")
         .ok_or_else(|| FabricForwardError::InvalidUrl(fabric_target.to_string()))?;

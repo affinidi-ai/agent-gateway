@@ -2215,27 +2215,8 @@ impl VCIssuer {
         Ok(jwt)
     }
 
-    /// Create a Verifiable Presentation containing a Verifiable Credential for an agent
-    /// This is used when GW1 forwards identity to GW2 with proof of identity
-    pub async fn create_agent_identity_presentation(
-        &self,
-        agent_did: &str,
-        identity_fields: &std::collections::HashMap<String, serde_json::Value>,
-        challenge: Option<&str>,
-        domain: Option<&str>,
-    ) -> Result<String> {
-        self.create_agent_identity_presentation_with_binding(
-            agent_did,
-            identity_fields,
-            None,
-            challenge,
-            domain,
-            &crate::vta::key_directory::KeyScope::default(),
-        )
-        .await
-    }
-
-    /// Create a VP with optional workload binding attestation.
+    /// Create a VP with optional workload binding attestation, naming
+    /// `receiver` in its proof's `domain`.
     /// When `workload_binding` is provided, the VC uses structured `workloadBinding`
     /// instead of flat `identityFields`.
     ///
@@ -2247,16 +2228,14 @@ impl VCIssuer {
         agent_did: &str,
         identity_fields: &std::collections::HashMap<String, serde_json::Value>,
         workload_binding: Option<serde_json::Value>,
-        challenge: Option<&str>,
-        domain: Option<&str>,
+        receiver: &crate::identity::VpDomain,
         scope: &crate::vta::key_directory::KeyScope,
     ) -> Result<String> {
         self.create_agent_identity_presentation_chained(
             agent_did,
             identity_fields,
             workload_binding,
-            challenge,
-            domain,
+            receiver,
             Vec::new(),
             scope,
         )
@@ -2272,8 +2251,58 @@ impl VCIssuer {
         agent_did: &str,
         identity_fields: &std::collections::HashMap<String, serde_json::Value>,
         workload_binding: Option<serde_json::Value>,
-        challenge: Option<&str>,
-        domain: Option<&str>,
+        receiver: &crate::identity::VpDomain,
+        chained_credentials: Vec<serde_json::Value>,
+        scope: &crate::vta::key_directory::KeyScope,
+    ) -> Result<String> {
+        self.sign_agent_presentation(
+            agent_did,
+            identity_fields,
+            workload_binding,
+            Some(receiver),
+            chained_credentials,
+            scope,
+        )
+        .await
+    }
+
+    /// A presentation kept only in the audit log. It is sent to no receiver,
+    /// so it names the audit label.
+    pub async fn create_audit_presentation(
+        &self,
+        agent_did: &str,
+        identity_fields: &std::collections::HashMap<String, serde_json::Value>,
+        workload_binding: Option<serde_json::Value>,
+        scope: &crate::vta::key_directory::KeyScope,
+    ) -> Result<String> {
+        self.create_agent_identity_presentation_with_binding(
+            agent_did,
+            identity_fields,
+            workload_binding,
+            &crate::identity::VpDomain::label(crate::identity::VpLabel::Audit),
+            scope,
+        )
+        .await
+    }
+
+    /// The presentation an agent card carries. The card is public and cached,
+    /// so it names no receiver.
+    pub async fn create_agent_card_presentation(
+        &self,
+        agent_did: &str,
+        identity_fields: &std::collections::HashMap<String, serde_json::Value>,
+        scope: &crate::vta::key_directory::KeyScope,
+    ) -> Result<String> {
+        self.sign_agent_presentation(agent_did, identity_fields, None, None, Vec::new(), scope)
+            .await
+    }
+
+    async fn sign_agent_presentation(
+        &self,
+        agent_did: &str,
+        identity_fields: &std::collections::HashMap<String, serde_json::Value>,
+        workload_binding: Option<serde_json::Value>,
+        receiver: Option<&crate::identity::VpDomain>,
         chained_credentials: Vec<serde_json::Value>,
         scope: &crate::vta::key_directory::KeyScope,
     ) -> Result<String> {
@@ -2399,8 +2428,8 @@ impl VCIssuer {
             holder_key: agent_key.map(Cow::Owned),
             holder_did: Cow::Borrowed(agent_did),
             verifiable_credentials: Cow::Owned(credentials_list),
-            challenge: challenge.map(Cow::Borrowed),
-            domain: domain.map(Cow::Borrowed),
+            challenge: None,
+            domain: receiver.map(|receiver| Cow::Borrowed(receiver.as_str())),
             proof_purpose,
         };
 
@@ -2694,7 +2723,13 @@ mod tests {
         let agent_did = response.did;
 
         let vp_json_str = orchestrator
-            .create_agent_identity_presentation(&agent_did, &identity_fields, None, None)
+            .create_agent_identity_presentation_with_binding(
+                &agent_did,
+                &identity_fields,
+                None,
+                &crate::identity::VpDomain::did("did:web:receiver.example").unwrap(),
+                &Default::default(),
+            )
             .await
             .unwrap();
 
@@ -5432,7 +5467,13 @@ mod tests {
         let identity_fields = HashMap::from([("name".to_string(), json!("agent"))]);
 
         let result = issuer
-            .create_agent_identity_presentation("did:example:no-key", &identity_fields, None, None)
+            .create_agent_identity_presentation_with_binding(
+                "did:example:no-key",
+                &identity_fields,
+                None,
+                &crate::identity::VpDomain::did("did:web:receiver.example").unwrap(),
+                &Default::default(),
+            )
             .await;
 
         let err = result.expect_err("minting without a provisioned agent key must fail, whatever the environment says");
@@ -6586,8 +6627,7 @@ mod tests {
                 &agent_did,
                 &identity_fields,
                 None,
-                None,
-                None,
+                &crate::identity::VpDomain::did("did:web:receiver.example").unwrap(),
                 &Default::default(),
             )
             .await
@@ -6609,8 +6649,7 @@ mod tests {
                 &agent_did,
                 &identity_fields,
                 None,
-                None,
-                None,
+                &crate::identity::VpDomain::did("did:web:receiver.example").unwrap(),
                 &Default::default(),
             )
             .await
@@ -6663,19 +6702,67 @@ mod tests {
                 &agent_did,
                 &identity_fields,
                 None,
-                None,
-                None,
+                &crate::identity::VpDomain::did("did:web:receiver.example").unwrap(),
                 &Default::default(),
             )
             .await
             .expect("the local issuer still issues when no VTA is bound");
 
         let vp: serde_json::Value = serde_json::from_str(&vp).expect("the VP is JSON");
+        assert_eq!(vp["proof"]["domain"], "did:web:receiver.example", "the presentation names its receiver");
         let credential = first_credential(&vp);
         assert_eq!(credential["proof"]["cryptosuite"], "eddsa-rdfc-2022", "the local issuer's suite is unchanged");
         assert_eq!(
             credential["credentialSubject"]["id"], agent_did,
             "the local credential is still bound to the agent"
+        );
+    }
+
+    /// A consent audit presentation is sent to no one, so it names the audit
+    /// label, which no receiver accepts.
+    #[tokio::test]
+    async fn the_audit_presentation_names_the_audit_label() {
+        let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let identity_fields = HashMap::from([("name".to_string(), json!("agent-audit"))]);
+        let agent_did = issuer
+            .issue_or_get_credential(identity_fields.clone(), None, None, None)
+            .await
+            .expect("agent identity")
+            .did;
+
+        let vp = issuer
+            .create_audit_presentation(&agent_did, &identity_fields, None, &Default::default())
+            .await
+            .expect("the audit presentation is issued");
+
+        let vp: serde_json::Value = serde_json::from_str(&vp).expect("the VP is JSON");
+        assert_eq!(vp["proof"]["domain"], "urn:agent-gateway:label:audit");
+    }
+
+    /// An agent card is public and cached, so its presentation names no
+    /// receiver.
+    #[tokio::test]
+    async fn the_agent_card_presentation_names_no_receiver() {
+        let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let identity_fields = HashMap::from([("name".to_string(), json!("agent-card"))]);
+        let agent_did = issuer
+            .issue_or_get_credential(identity_fields.clone(), None, None, None)
+            .await
+            .expect("agent identity")
+            .did;
+
+        let vp = issuer
+            .create_agent_card_presentation(&agent_did, &identity_fields, &Default::default())
+            .await
+            .expect("the card presentation is issued");
+
+        let vp: serde_json::Value = serde_json::from_str(&vp).expect("the VP is JSON");
+        assert_eq!(vp["holder"], agent_did);
+        assert!(
+            vp["proof"]
+                .get("domain")
+                .is_none(),
+            "{vp}"
         );
     }
 }
@@ -7365,8 +7452,7 @@ mod surface_injection_tests {
                 &agent_did,
                 &fields,
                 None,
-                None,
-                None,
+                &crate::identity::VpDomain::did("did:web:receiver.example").unwrap(),
                 &crate::vta::key_directory::KeyScope::surface("surface-1"),
             )
             .await;
@@ -7744,7 +7830,13 @@ mod surface_injection_tests {
         ) -> serde_json::Value {
             let vp = f
                 .issuer
-                .create_agent_identity_presentation(did, &HashMap::new(), None, None)
+                .create_agent_identity_presentation_with_binding(
+                    did,
+                    &HashMap::new(),
+                    None,
+                    &crate::identity::VpDomain::did("did:web:receiver.example").unwrap(),
+                    &Default::default(),
+                )
                 .await
                 .unwrap();
             serde_json::from_str::<serde_json::Value>(&vp).unwrap()["proof"]["proofPurpose"].clone()

@@ -3430,6 +3430,17 @@ async fn active_sender_peer(message: &ReceivedMessage) -> Option<crate::gateways
     }
 }
 
+/// The receiver an answer's presentation names: the forward request's
+/// authenticated sender, which admission matched to a paired peer's
+/// Connection Point DID.
+fn fabric_answer_receiver(message: &ReceivedMessage) -> anyhow::Result<crate::identity::VpDomain> {
+    message
+        .from_did
+        .as_deref()
+        .and_then(crate::identity::VpDomain::did)
+        .ok_or_else(|| anyhow::anyhow!("the forward request names no sender DID to receive the answer's presentation"))
+}
+
 /// The gateway store under the message's storage root.
 async fn message_gateway_store(message: &ReceivedMessage) -> Result<crate::gateways::FileSystemGatewayStore, String> {
     let storage_root =
@@ -7826,52 +7837,56 @@ async fn process_charged_forward_request(
                                     active_variant_id.as_deref(),
                                 );
                                 // Use protocol-specific injection (RESPONSE functions, not request functions!)
-                                let inject_result = if surface_protocol == crate::config::ChannelProtocol::Mcp {
-                                    let (gw2_meta_field, gw2_strip_raw) = resolved_surface
-                                        .protected_identity()
-                                        .and_then(|c| {
-                                            if let crate::source_auth::ManagedIdentityConfig::PayloadExtraction(cfg) = c {
-                                                Some((cfg.meta_field.clone(), cfg.strip_raw_meta))
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .unwrap_or_else(|| ("serverIdentity".to_string(), false));
-                                    // For MCP, use MCP-specific response injection
-                                    crate::mcp::inject_vp_into_mcp_response(
-                                        &response_bytes,
-                                        agent_did,
-                                        &identity_fields,
-                                        gw2_workload_binding.clone(),
-                                        vc_issuer,
-                                        channel_id,
-                                        Vec::new(),
-                                        &gw2_meta_field,
-                                        gw2_strip_raw,
-                                        mcp_metadata_context,
-                                        &key_scope,
-                                    )
-                                    .await
-                                } else {
-                                    // For A2A, use A2A-specific response injection
-                                    crate::a2a::extensions::inject_vp_into_a2a_response(
-                                        &response_bytes,
-                                        agent_did,
-                                        &identity_fields,
-                                        gw2_workload_binding.clone(),
-                                        vc_issuer,
-                                        channel_id,
-                                        Vec::new(),
-                                        &key_scope,
-                                    )
-                                    .await
-                                    .map(|injected| {
-                                        injected.map_or_else(
-                                            || (response_bytes.clone(), None),
-                                            |(body, proof)| (body, Some(proof)),
+                                let inject_result = async {
+                                    let peer = fabric_answer_receiver(&message)?;
+                                    if surface_protocol == crate::config::ChannelProtocol::Mcp {
+                                        let (gw2_meta_field, gw2_strip_raw) = resolved_surface
+                                            .protected_identity()
+                                            .and_then(|c| {
+                                                if let crate::source_auth::ManagedIdentityConfig::PayloadExtraction(cfg) = c {
+                                                    Some((cfg.meta_field.clone(), cfg.strip_raw_meta))
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .unwrap_or_else(|| ("serverIdentity".to_string(), false));
+                                        // For MCP, use MCP-specific response injection
+                                        crate::mcp::inject_vp_into_fabric_mcp_response(
+                                            &response_bytes,
+                                            agent_did,
+                                            &identity_fields,
+                                            gw2_workload_binding.clone(),
+                                            vc_issuer,
+                                            channel_id,
+                                            &gw2_meta_field,
+                                            gw2_strip_raw,
+                                            mcp_metadata_context,
+                                            &peer,
+                                            &key_scope,
                                         )
-                                    })
-                                };
+                                        .await
+                                    } else {
+                                        // For A2A, use A2A-specific response injection
+                                        crate::a2a::extensions::inject_vp_into_fabric_a2a_response(
+                                            &response_bytes,
+                                            agent_did,
+                                            &identity_fields,
+                                            gw2_workload_binding.clone(),
+                                            vc_issuer,
+                                            channel_id,
+                                            &peer,
+                                            &key_scope,
+                                        )
+                                        .await
+                                        .map(|injected| {
+                                            injected.map_or_else(
+                                                || (response_bytes.clone(), None),
+                                                |(body, proof)| (body, Some(proof)),
+                                            )
+                                        })
+                                    }
+                                }
+                                .await;
 
                                 match inject_result {
                                     Ok((modified_bytes, vp_jwt)) => {
@@ -11372,6 +11387,54 @@ mod tests {
             authcrypt_metadata(),
         )
         .with_context("agent_surface_storage_path", storage_context(storage_root))
+    }
+
+    /// The presentation in an answer over Fabric names the Connection Point
+    /// DID that sent the request, and a request with no sender gets none.
+    #[tokio::test]
+    async fn the_fabric_answer_presentation_names_the_sender_of_the_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let (issuer, _issuer_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let identity_fields =
+            std::collections::HashMap::from([("agentIdentity".to_string(), serde_json::json!({"name": "backend"}))]);
+        let agent_did = issuer
+            .issue_or_get_credential(identity_fields.clone(), None, None, None)
+            .await
+            .unwrap()
+            .did;
+        let identity_uri = crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION;
+        let answer = bytes::Bytes::from(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"message": {
+                "role": "agent", "parts": [], "extensions": [identity_uri], "metadata": {identity_uri: {"name": "backend"}}
+            }}})
+            .to_string(),
+        );
+        let request = make_forward_request_msg(temp.path(), Some("did:peer:2.sender-connection-point"), "ch");
+
+        let (signed, _) = crate::a2a::extensions::inject_vp_into_fabric_a2a_response(
+            &answer,
+            &agent_did,
+            &identity_fields,
+            None,
+            &std::sync::Arc::new(issuer),
+            "ch",
+            &fabric_answer_receiver(&request).unwrap(),
+            &Default::default(),
+        )
+        .await
+        .unwrap()
+        .expect("the answer carries the identity extension");
+
+        assert_eq!(
+            crate::identity::test_helpers::presentation_domains(&serde_json::from_slice(&signed).unwrap()),
+            vec![Some("did:peer:2.sender-connection-point".to_string())]
+        );
+        for sender in [None, Some(""), Some("not-a-did")] {
+            assert!(
+                fabric_answer_receiver(&make_forward_request_msg(temp.path(), sender, "ch")).is_err(),
+                "{sender:?}"
+            );
+        }
     }
 
     #[tokio::test]

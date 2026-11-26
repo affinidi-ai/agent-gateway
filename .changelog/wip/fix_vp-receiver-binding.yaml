@@ -1,7 +1,17 @@
 branch: fix/vp-receiver-binding
 changes:
   added: []
-  changed: []
+  changed:
+    - timestamp: '2026-11-26T15:20:00Z'
+      title: Name the receiver in the domain of every agent presentation the gateway signs
+      description: >-
+        Every agent Verifiable Presentation the gateway signs now names its receiver in the proof's
+        `domain`: the peer's Connection Point DID on a Fabric request, the requesting peer's on a
+        Fabric answer, and the origin of the Target or Transit Point destination it is sent to. A
+        presentation sent to no verifying receiver (a direct answer to a caller, a consent audit
+        record, a request to one of the gateway's own MCP Proxies) carries a reserved
+        `urn:agent-gateway:label:` value instead. The agent card presentation stays without a
+        domain.
   fixed: []
   removed: []
   security:

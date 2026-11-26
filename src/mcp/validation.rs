@@ -166,6 +166,7 @@ async fn inject_vp_into_mcp(
     strip_raw_meta: bool,
     target: McpMetaTarget,
     context: McpMetadataContext,
+    receiver: &crate::identity::VpDomain,
     scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<(bytes::Bytes, Option<String>)> {
     let mut message_json: JsonValue = serde_json::from_slice(message_bytes)?;
@@ -200,8 +201,7 @@ async fn inject_vp_into_mcp(
             agent_did,
             identity_fields,
             workload_binding,
-            None,
-            None,
+            receiver,
             inbound_chained_vcs,
             scope,
         )
@@ -236,7 +236,9 @@ async fn inject_vp_into_mcp(
 }
 
 /// Inject the backend agent identity credential VP into an MCP **response**
-/// (`result._meta`, per the MCP spec).
+/// (`result._meta`, per the MCP spec) answering a caller at this gateway's
+/// Access Point, signed for the answer label: the caller is no verifying
+/// receiver.
 pub async fn inject_vp_into_mcp_response(
     response_bytes: &bytes::Bytes,
     agent_did: &str,
@@ -262,6 +264,40 @@ pub async fn inject_vp_into_mcp_response(
         strip_raw_meta,
         McpMetaTarget::Result,
         context,
+        &crate::identity::VpDomain::label(crate::identity::VpLabel::Answer),
+        scope,
+    )
+    .await
+}
+
+/// [`inject_vp_into_mcp_response`] for an answer sent over Fabric to the peer
+/// gateway that asked, whose Connection Point DID is `peer`.
+pub async fn inject_vp_into_fabric_mcp_response(
+    response_bytes: &bytes::Bytes,
+    agent_did: &str,
+    identity_fields: &std::collections::HashMap<String, serde_json::Value>,
+    workload_binding: Option<serde_json::Value>,
+    vc_issuer: &Arc<crate::identity::VCIssuer>,
+    channel_name: &str,
+    meta_field: &str,
+    strip_raw_meta: bool,
+    context: McpMetadataContext,
+    peer: &crate::identity::VpDomain,
+    scope: &crate::vta::key_directory::KeyScope,
+) -> anyhow::Result<(bytes::Bytes, Option<String>)> {
+    inject_vp_into_mcp(
+        response_bytes,
+        agent_did,
+        identity_fields,
+        workload_binding,
+        vc_issuer,
+        channel_name,
+        Vec::new(),
+        meta_field,
+        strip_raw_meta,
+        McpMetaTarget::Result,
+        context,
+        peer,
         scope,
     )
     .await
@@ -278,6 +314,7 @@ pub async fn inject_vp_into_mcp_request(
     meta_field: &str,
     strip_raw_meta: bool,
     context: McpMetadataContext,
+    receiver: &crate::identity::VpDomain,
     scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<(bytes::Bytes, Option<String>)> {
     inject_vp_into_mcp(
@@ -292,6 +329,7 @@ pub async fn inject_vp_into_mcp_request(
         strip_raw_meta,
         McpMetaTarget::TopLevel,
         context,
+        receiver,
         scope,
     )
     .await
@@ -317,6 +355,7 @@ mod tests {
             "agentIdentity",
             true,
             context,
+            &receiver(),
             &Default::default(),
         )
         .await
@@ -386,6 +425,7 @@ mod tests {
             "agentIdentity",
             true,
             modern_context(&request),
+            &receiver(),
             &Default::default(),
         )
         .await
@@ -474,6 +514,10 @@ mod tests {
 
     const CREDENTIAL_EXT: &str = crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION;
 
+    fn receiver() -> crate::identity::VpDomain {
+        crate::identity::VpDomain::did("did:web:receiver.example").unwrap()
+    }
+
     fn identity_fields() -> HashMap<String, serde_json::Value> {
         let mut m = HashMap::new();
         m.insert(
@@ -526,6 +570,7 @@ mod tests {
                     "agentIdentity",
                     true,
                     context,
+                    &receiver(),
                     &scope,
                 )
                 .await
@@ -586,6 +631,7 @@ mod tests {
             "agentIdentity",
             false,
             McpMetadataContext::default(),
+            &receiver(),
             &Default::default(),
         )
         .await
@@ -695,5 +741,40 @@ mod tests {
             Some(did.as_str())
         );
         assert!(out.get("_meta").is_none(), "top-level _meta must not be created on a response");
+        assert_eq!(
+            crate::identity::test_helpers::presentation_domains(&out),
+            vec![Some("urn:agent-gateway:label:answer".to_string())],
+            "a direct answer is signed for the answer label"
+        );
+    }
+
+    /// An answer over Fabric names the peer gateway that asked.
+    #[tokio::test]
+    async fn fabric_response_injection_names_the_peer() {
+        let (issuer, _tmp, did) = issuer_with_did().await;
+        let response = bytes::Bytes::from(
+            serde_json::json!({"jsonrpc": "2.0", "id": "req-1", "result": {"content": []}}).to_string(),
+        );
+
+        let (signed, _vp) = inject_vp_into_fabric_mcp_response(
+            &response,
+            &did,
+            &identity_fields(),
+            None,
+            &issuer,
+            "test-surface",
+            "serverIdentity",
+            false,
+            McpMetadataContext::default(),
+            &receiver(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            crate::identity::test_helpers::presentation_domains(&serde_json::from_slice(&signed).unwrap()),
+            vec![Some("did:web:receiver.example".to_string())]
+        );
     }
 }

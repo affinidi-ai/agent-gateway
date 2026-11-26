@@ -5105,6 +5105,40 @@ fn capture_workload_binding_caller(
     }
 }
 
+/// The receiver a Transit Point's presentation names: the peer's Connection
+/// Point DID for a `fabric://` destination, otherwise the receiver
+/// [`VpDomain::for_endpoint`](crate::identity::VpDomain::for_endpoint) gives.
+/// A `fabric://` peer that cannot be resolved fails as the forward step would.
+async fn transit_point_receiver(
+    state: &OutboundProxyState,
+    destination: &str,
+) -> Result<crate::identity::VpDomain, OutboundPipelineError> {
+    if destination.starts_with("fabric://") {
+        use crate::proxy::fabric_forward::FabricForwardError;
+        let not_forwarded = |e: FabricForwardError| OutboundPipelineError::UpstreamConnectionFailed(e.to_string());
+        let (gateway_id, _) = crate::proxy::fabric_forward::parse_fabric_target(destination).map_err(not_forwarded)?;
+        let manager = state
+            .listener_manager
+            .read()
+            .await
+            .clone()
+            .ok_or(FabricForwardError::ListenerManagerUnavailable)
+            .map_err(not_forwarded)?;
+        return manager
+            .get_gateway_did(gateway_id)
+            .await
+            .as_deref()
+            .and_then(crate::identity::VpDomain::did)
+            .ok_or_else(|| not_forwarded(FabricForwardError::GatewayDidNotFound(gateway_id.to_string())));
+    }
+    crate::identity::VpDomain::for_endpoint(destination).ok_or_else(|| {
+        OutboundPipelineError::IdentityInjectionFailed(format!(
+            "the destination {} names no receiver for the presentation",
+            loggable::url(destination)
+        ))
+    })
+}
+
 /// [5] Trusted Identity Injection — removes the raw `agent-identity/v1` extension
 /// from the request body and inserts a signed `agent-identity-credential/v1`
 /// containing a VP (Verifiable Presentation) JWT issued by the gateway's
@@ -5205,6 +5239,12 @@ async fn step_inject_trusted_identity(
     let parsed_a2a = matches!(protocol, ChannelProtocol::A2a | ChannelProtocol::Ap2)
         .then(|| serde_json::from_slice::<serde_json::Value>(body).ok())
         .flatten();
+    let receiver = transit_point_receiver(
+        state,
+        &ctx.virtual_channel
+            .target_endpoint,
+    )
+    .await?;
     let injected_vp_jwt: Option<String> = match protocol {
         ChannelProtocol::A2a | ChannelProtocol::Ap2
             if parsed_a2a
@@ -5230,6 +5270,7 @@ async fn step_inject_trusted_identity(
                 workload_binding,
                 vc_issuer,
                 channel_name,
+                &receiver,
                 &key_scope,
             )
             .await
@@ -5268,6 +5309,7 @@ async fn step_inject_trusted_identity(
                 &protected_meta_field,
                 protected_strip_raw,
                 ctx.mcp_metadata_context,
+                &receiver,
                 &key_scope,
             )
             .await
@@ -15002,6 +15044,112 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The proof domains of the presentation a Transit Point to `destination`
+    /// signs into a request of `protocol`, or the error injection fails with.
+    async fn transit_point_presentation_domains(
+        state: &OutboundProxyState,
+        destination: &str,
+        protocol: ChannelProtocol,
+    ) -> Result<Vec<Option<String>>, OutboundPipelineError> {
+        let mut ctx = test_pipeline_context();
+        Arc::make_mut(&mut ctx.surface)
+            .identity_slots
+            .protected = Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(
+            crate::source_auth::models::PayloadExtractionConfig {
+                extension_uri: None,
+                meta_field: "agentIdentity".to_string(),
+                fields: Vec::new(),
+                json_schema: None,
+                extension_rules: None,
+                strip_raw_meta: false,
+            },
+        ));
+        ctx.virtual_channel
+            .target_endpoint = destination.to_string();
+        ctx.protocol = Some(protocol.clone());
+        let body = match protocol {
+            ChannelProtocol::Mcp => json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "echo", "_meta": { "agentIdentity": { "cloudProvider": "local", "model": "gpt-4" } } }
+            }),
+            _ => json!({
+                "jsonrpc": "2.0",
+                "method": "message/send",
+                "params": { "message": { "metadata": {
+                    "https://fabric.affinidi.io/extensions/agent-identity/v1": { "cloudProvider": "local", "model": "gpt-4" }
+                }}}
+            }),
+        };
+        ctx.body_bytes = Some(Bytes::from(serde_json::to_vec(&body).unwrap()));
+        step_resolve_agent_identity(state, &mut ctx)
+            .await
+            .unwrap();
+        step_inject_trusted_identity(state, &mut ctx).await?;
+        Ok(crate::identity::test_helpers::presentation_domains(
+            &serde_json::from_slice(
+                ctx.body_bytes
+                    .as_ref()
+                    .unwrap(),
+            )
+            .unwrap(),
+        ))
+    }
+
+    /// A Transit Point's presentation names its destination: the origin of a
+    /// URL, the peer's Connection Point DID over Fabric, or the proxy label for
+    /// one of this gateway's MCP Proxies.
+    #[tokio::test]
+    async fn the_transit_point_presentation_names_its_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let peer = crate::gateways::types::Gateway::new(
+            "Peer".into(),
+            String::new(),
+            "did:peer:2.partner-connection-point".into(),
+            crate::gateways::types::GatewayType::Remote,
+        );
+        let gateways = Arc::new(
+            crate::gateways::FileSystemGatewayStore::new(root.path().join("gateways"), None)
+                .await
+                .unwrap(),
+        );
+        crate::gateways::GatewayStore::create(gateways.as_ref(), &peer)
+            .await
+            .unwrap();
+        let (manager, _manager_issuer_dir) = crate::gateways::test_helpers::test_listener_manager(root.path()).await;
+        let (vc_issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let mut state = test_outbound_state();
+        state.vc_issuer = Some(Arc::new(vc_issuer));
+        state.listener_manager =
+            Arc::new(tokio::sync::RwLock::new(Some(Arc::new(manager.with_gateway_store(gateways)))));
+
+        let fabric = format!("fabric://{}/partner-surface", peer.id);
+        for (destination, protocol, domain) in [
+            ("HTTPS://Partner.Example.com:443/a2a?x=1", ChannelProtocol::A2a, "https://partner.example.com"),
+            ("http://127.0.0.1:9100/mcp", ChannelProtocol::Mcp, "http://127.0.0.1:9100"),
+            (fabric.as_str(), ChannelProtocol::A2a, "did:peer:2.partner-connection-point"),
+            ("proxy://mcp-proxy-1", ChannelProtocol::Mcp, "urn:agent-gateway:label:proxy"),
+        ] {
+            assert_eq!(
+                transit_point_presentation_domains(&state, destination, protocol)
+                    .await
+                    .unwrap(),
+                vec![Some(domain.to_string())],
+                "{destination}"
+            );
+        }
+
+        let refused = transit_point_presentation_domains(&state, "fabric://unknown-peer/surface", ChannelProtocol::A2a)
+            .await
+            .expect_err("a peer with no known DID names no receiver");
+        assert_eq!(refused.status_code(), StatusCode::BAD_GATEWAY, "{refused:?}");
+
+        state.listener_manager = Arc::new(tokio::sync::RwLock::new(None));
+        let refused = transit_point_presentation_domains(&state, &fabric, ChannelProtocol::A2a)
+            .await
+            .expect_err("without a listener manager no peer DID is known");
+        assert_eq!(refused.status_code(), StatusCode::BAD_GATEWAY, "{refused:?}");
     }
 
     // ── step_collect_trust_context ─────────────────────────────────────────

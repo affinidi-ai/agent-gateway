@@ -272,18 +272,12 @@ pub async fn inject_identity_credential_extension(
     workload_binding: Option<serde_json::Value>,
     vc_issuer: &Arc<crate::identity::VCIssuer>,
     channel_name: &str,
+    receiver: &crate::identity::VpDomain,
     scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<(bytes::Bytes, String)> {
     // Create VP containing VC signed by agent DID
     let vp_jwt = vc_issuer
-        .create_agent_identity_presentation_with_binding(
-            agent_did,
-            identity_fields,
-            workload_binding,
-            None,
-            None,
-            scope,
-        )
+        .create_agent_identity_presentation_with_binding(agent_did, identity_fields, workload_binding, receiver, scope)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create identity presentation: {}", e))?;
 
@@ -452,7 +446,8 @@ fn unwrap_task_result_mut(result: &mut JsonValue) -> &mut JsonValue {
     }
 }
 
-/// Inject agent identity credential (VP) extension into A2A response body (outbound)
+/// Inject agent identity credential (VP) extension into an A2A answer to a
+/// caller at this gateway's Access Point, signed for the answer label.
 /// This removes agent-identity/v1 and injects agent-identity-credential/v1 with a signed VP
 /// Response structure differs from request - check multiple locations for message
 /// Returns the modified body AND the VP JWT string (for auditing), or `None`,
@@ -467,6 +462,7 @@ pub async fn inject_identity_credential_into_response(
     channel_name: &str,
     scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<Option<(bytes::Bytes, String)>> {
+    let receiver = crate::identity::VpDomain::label(crate::identity::VpLabel::Answer);
     let mut body_json: JsonValue = serde_json::from_slice(body_bytes)
         .map_err(|e| anyhow::anyhow!("Failed to parse response body as JSON: {}", e))?;
 
@@ -476,14 +472,7 @@ pub async fn inject_identity_credential_into_response(
     }
 
     let vp_jwt = vc_issuer
-        .create_agent_identity_presentation_with_binding(
-            agent_did,
-            identity_fields,
-            workload_binding,
-            None,
-            None,
-            scope,
-        )
+        .create_agent_identity_presentation_with_binding(agent_did, identity_fields, workload_binding, &receiver, scope)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create identity presentation: {}", e))?;
 
@@ -682,7 +671,7 @@ impl AgentIdentityPresenter for crate::identity::VCIssuer {
         identity_fields: &std::collections::HashMap<String, serde_json::Value>,
         scope: &crate::vta::key_directory::KeyScope,
     ) -> anyhow::Result<String> {
-        self.create_agent_identity_presentation_with_binding(agent_did, identity_fields, None, None, None, scope)
+        self.create_agent_card_presentation(agent_did, identity_fields, scope)
             .await
     }
 }
@@ -857,7 +846,8 @@ async fn inject_credential_into_agent_card_inner(
     Ok(())
 }
 
-/// Inject VP into A2A response
+/// Inject VP into an A2A answer to a caller at this gateway's Access Point,
+/// signed for the answer label: the caller is no verifying receiver.
 /// Replaces raw identity extension with credential extension containing VP.
 /// Returns `None`, without signing, when no location carries the identity
 /// extension (see [`visit_credential_locations`]).
@@ -869,6 +859,57 @@ pub async fn inject_vp_into_a2a_response(
     vc_issuer: &Arc<crate::identity::VCIssuer>,
     channel_name: &str,
     inbound_chained_vcs: Vec<serde_json::Value>,
+    scope: &crate::vta::key_directory::KeyScope,
+) -> anyhow::Result<Option<(bytes::Bytes, String)>> {
+    inject_vp_into_a2a_response_for(
+        response_bytes,
+        agent_did,
+        identity_fields,
+        workload_binding,
+        vc_issuer,
+        channel_name,
+        inbound_chained_vcs,
+        &crate::identity::VpDomain::label(crate::identity::VpLabel::Answer),
+        scope,
+    )
+    .await
+}
+
+/// [`inject_vp_into_a2a_response`] for an answer sent over Fabric to the peer
+/// gateway that asked, whose Connection Point DID is `peer`.
+pub async fn inject_vp_into_fabric_a2a_response(
+    response_bytes: &bytes::Bytes,
+    agent_did: &str,
+    identity_fields: &std::collections::HashMap<String, serde_json::Value>,
+    workload_binding: Option<serde_json::Value>,
+    vc_issuer: &Arc<crate::identity::VCIssuer>,
+    channel_name: &str,
+    peer: &crate::identity::VpDomain,
+    scope: &crate::vta::key_directory::KeyScope,
+) -> anyhow::Result<Option<(bytes::Bytes, String)>> {
+    inject_vp_into_a2a_response_for(
+        response_bytes,
+        agent_did,
+        identity_fields,
+        workload_binding,
+        vc_issuer,
+        channel_name,
+        Vec::new(),
+        peer,
+        scope,
+    )
+    .await
+}
+
+async fn inject_vp_into_a2a_response_for(
+    response_bytes: &bytes::Bytes,
+    agent_did: &str,
+    identity_fields: &std::collections::HashMap<String, serde_json::Value>,
+    workload_binding: Option<serde_json::Value>,
+    vc_issuer: &Arc<crate::identity::VCIssuer>,
+    channel_name: &str,
+    inbound_chained_vcs: Vec<serde_json::Value>,
+    receiver: &crate::identity::VpDomain,
     scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<Option<(bytes::Bytes, String)>> {
     let mut response_json: JsonValue = serde_json::from_slice(response_bytes)
@@ -891,8 +932,7 @@ pub async fn inject_vp_into_a2a_response(
             agent_did,
             identity_fields,
             workload_binding,
-            None,
-            None,
+            receiver,
             inbound_chained_vcs,
             scope,
         )
@@ -1689,18 +1729,37 @@ mod tests {
             .expect("serialize body"),
         );
 
-        let err =
-            inject_identity_credential_extension(&request, &did, &identity_fields(), None, &issuer, "ch", &mapped)
-                .await
-                .expect_err("the request's surface cannot issue");
+        let receiver = crate::identity::VpDomain::did("did:web:receiver.example").unwrap();
+
+        let err = inject_identity_credential_extension(
+            &request,
+            &did,
+            &identity_fields(),
+            None,
+            &issuer,
+            "ch",
+            &receiver,
+            &mapped,
+        )
+        .await
+        .expect_err("the request's surface cannot issue");
         assert!(
             err.to_string()
                 .contains("vta-gone"),
             "{err}"
         );
-        inject_identity_credential_extension(&request, &did, &identity_fields(), None, &issuer, "ch", &unmapped)
-            .await
-            .expect("an unmapped surface issues as before");
+        inject_identity_credential_extension(
+            &request,
+            &did,
+            &identity_fields(),
+            None,
+            &issuer,
+            "ch",
+            &receiver,
+            &unmapped,
+        )
+        .await
+        .expect("an unmapped surface issues as before");
 
         inject_identity_credential_into_response(&response, &did, &identity_fields(), None, &issuer, "ch", &mapped)
             .await
@@ -1713,6 +1772,55 @@ mod tests {
         inject_vp_into_a2a_response(&response, &did, &identity_fields(), None, &issuer, "ch", Vec::new(), &mapped)
             .await
             .expect_err("the backend response's surface cannot issue");
+    }
+
+    /// A caller at the Access Point verifies no presentation, so both entry
+    /// points for a direct answer sign it for the answer label, never for a
+    /// receiver.
+    #[tokio::test]
+    async fn a_direct_answer_presentation_names_the_answer_label() {
+        let (issuer, did, _tmp) = issuer_with_identity().await;
+        let response = bytes::Bytes::from(
+            serde_json::to_vec(&json!({ "result": {
+                "kind": "task",
+                "id": "t",
+                "status": { "state": "completed", "message": agent_message() }
+            } }))
+            .expect("serialize body"),
+        );
+
+        let (credential, _) = inject_identity_credential_into_response(
+            &response,
+            &did,
+            &identity_fields(),
+            None,
+            &issuer,
+            "ch",
+            &Default::default(),
+        )
+        .await
+        .unwrap()
+        .expect("the response carries the identity extension");
+        let (backend, _) = inject_vp_into_a2a_response(
+            &response,
+            &did,
+            &identity_fields(),
+            None,
+            &issuer,
+            "ch",
+            Vec::new(),
+            &Default::default(),
+        )
+        .await
+        .unwrap()
+        .expect("the response carries the identity extension");
+
+        for body in [credential, backend] {
+            assert_eq!(
+                crate::identity::test_helpers::presentation_domains(&serde_json::from_slice(&body).unwrap()),
+                vec![Some("urn:agent-gateway:label:answer".to_string())]
+            );
+        }
     }
 
     fn assert_carries_backend_vp(

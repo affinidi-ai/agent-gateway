@@ -64,6 +64,7 @@ impl SigningKey {
     async fn sign_presentation(
         &self,
         credentials: Vec<Value>,
+        receiver: &str,
     ) -> Value {
         let presentation = json!({
             "@context": [CREDENTIALS_V2],
@@ -81,6 +82,7 @@ impl SigningKey {
                 .parse()
                 .expect("an RFC 3339 time"),
         );
+        options.domains = vec![receiver.to_string()];
         let signed = AnySuite::EdDsaRdfc2022
             .sign_with(SignatureEnvironment::default(), presentation, &methods, signer, options, Default::default())
             .await
@@ -309,25 +311,32 @@ impl PresentationSigner {
             .push(entry);
     }
 
-    /// A presentation signed by this caller for authentication, of a credential it issued to itself.
-    pub async fn present_own_credential(&self) -> Value {
+    /// A presentation signed by this caller for authentication, for `receiver`, of a credential it
+    /// issued to itself.
+    pub async fn present_own_credential(
+        &self,
+        receiver: &str,
+    ) -> Value {
         let credential = self
             .signer
             .sign_credential(&self.signer.did)
             .await;
         self.signer
-            .sign_presentation(vec![credential])
+            .sign_presentation(vec![credential], receiver)
             .await
     }
 
-    /// A presentation signed by this caller for authentication, of a credential another issuer, whose
-    /// key is listed for every purpose, issued to it.
-    pub async fn present_credential_from_another_issuer(&self) -> Value {
+    /// A presentation signed by this caller for authentication, for `receiver`, of a credential
+    /// another issuer, whose key is listed for every purpose, issued to it.
+    pub async fn present_credential_from_another_issuer(
+        &self,
+        receiver: &str,
+    ) -> Value {
         let credential = peer_signer()
             .sign_credential(&self.signer.did)
             .await;
         self.signer
-            .sign_presentation(vec![credential])
+            .sign_presentation(vec![credential], receiver)
             .await
     }
 }

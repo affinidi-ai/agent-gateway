@@ -1619,12 +1619,10 @@ pub async fn oauth_callback(
                         let identity_fields: std::collections::HashMap<String, serde_json::Value> =
                             std::collections::HashMap::new();
                         match vc_issuer
-                            .create_agent_identity_presentation_with_binding(
+                            .create_audit_presentation(
                                 &oauth_state.agent_did,
                                 &identity_fields,
                                 Some(workload_binding),
-                                None,
-                                None,
                                 // Appliance-wide: the delegation leg has no
                                 // surface-scoped signing key of its own.
                                 &crate::vta::key_directory::KeyScope::default(),
