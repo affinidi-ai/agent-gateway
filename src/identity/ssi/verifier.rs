@@ -40,6 +40,10 @@ pub struct VpVerificationResult {
     #[allow(unused)]
     pub domain: Option<String>,
     pub challenge: Option<String>,
+    /// When the presentation stops being valid: the earliest expiry across its proofs, each proof
+    /// expiring at its `expires`, or at its `created` plus the VP lifetime when it has none.
+    #[allow(unused)]
+    pub expires_at: DateTime<Utc>,
 }
 
 #[async_trait]
@@ -249,8 +253,32 @@ fn verify_vc_lifetime(vc: &Value) -> Result<()> {
     Ok(())
 }
 
-fn verify_vp_proof_lifetime(proof: &Value) -> Result<()> {
+/// How far a VP proof's `created` may be ahead of this gateway's clock, and how far its `expires`
+/// may run past the VP lifetime from now.
+const VP_CLOCK_SKEW_SECS: i64 = 120;
+
+/// Checks one VP proof's lifetime and returns when it expires: its `expires`, or its `created`
+/// plus the VP lifetime when it has none.
+fn verify_vp_proof_lifetime(proof: &Value) -> Result<DateTime<Utc>> {
     let now = Utc::now();
+    let skew = Duration::seconds(VP_CLOCK_SKEW_SECS);
+    let lifetime = Duration::minutes(VP_LIFETIME_MINUTES);
+
+    let created = proof
+        .get("created")
+        .and_then(|v| v.as_str());
+    let created_dt = match created {
+        Some(created) => {
+            let created_dt: DateTime<Utc> = created
+                .parse()
+                .context("Invalid proof created date format")?;
+            if created_dt > now + skew {
+                anyhow::bail!("VP proof was created in the future (created: {})", created);
+            }
+            Some(created_dt)
+        }
+        None => None,
+    };
 
     if let Some(expires) = proof
         .get("expires")
@@ -262,22 +290,20 @@ fn verify_vp_proof_lifetime(proof: &Value) -> Result<()> {
         if now > expires_dt {
             anyhow::bail!("VP proof has expired (expires: {})", expires);
         }
-        return Ok(());
+        if expires_dt > now + lifetime + skew {
+            anyhow::bail!("VP proof expires too far in the future (expires: {})", expires);
+        }
+        return Ok(expires_dt);
     }
 
-    // Proofs without expires are bounded by their signed created timestamp instead.
-    let created = proof
-        .get("created")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("VP proof has neither expires nor created"))?;
-    let created_dt: DateTime<Utc> = created
-        .parse()
-        .context("Invalid proof created date format")?;
-    if now > created_dt + Duration::minutes(VP_LIFETIME_MINUTES) {
+    let (Some(created), Some(created_dt)) = (created, created_dt) else {
+        anyhow::bail!("VP proof has neither expires nor created");
+    };
+    let expires_dt = created_dt + lifetime;
+    if now > expires_dt {
         anyhow::bail!("VP proof has expired (created: {}, no expires)", created);
     }
-
-    Ok(())
+    Ok(expires_dt)
 }
 
 /// Notes a credential that names a status list. The gateway does not resolve
@@ -771,8 +797,9 @@ impl LocalVerifier {
             anyhow::bail!("VP verifiableCredential must be an object or array");
         };
 
-        // Reject a stale presentation before doing any signature work: the
-        // proof's own `expires`, falling back to its signed `created` time.
+        // Reject a stale or far-future presentation before doing any signature
+        // work: the proof's own `expires`, falling back to its signed `created`
+        // time, each capped against this gateway's clock.
         //
         // Normalised through `proofs_of` so the three unsigned shapes are one
         // case: absent, `"proof": []`, and a `proof` that is neither object nor
@@ -781,8 +808,9 @@ impl LocalVerifier {
         // Every proof is bounded, so adding a second, stale proof cannot buy a
         // presentation more life than its shortest one allows.
         let proofs = proofs_of(presentation, "VP")?;
+        let mut expires_at = DateTime::<Utc>::MAX_UTC;
         for proof in &proofs {
-            verify_vp_proof_lifetime(proof)?;
+            expires_at = expires_at.min(verify_vp_proof_lifetime(proof)?);
         }
 
         let resolver = CompositeResolver::new(self.did_cache.clone());
@@ -883,6 +911,7 @@ impl LocalVerifier {
                 .collect(),
             domain,
             challenge,
+            expires_at,
         })
     }
 }
@@ -1287,12 +1316,107 @@ mod tests {
     }
 
     #[test]
-    fn proof_lifetime_accepts_future_expires() {
-        verify_vp_proof_lifetime(&json!({
-            "created": "2000-01-01T00:00:00Z",
-            "expires": "2999-01-01T00:00:00Z"
-        }))
-        .unwrap();
+    fn proof_lifetime_refuses_expires_beyond_the_cap() {
+        let now = Utc::now();
+        for expires in
+            [now + Duration::minutes(VP_LIFETIME_MINUTES) + Duration::seconds(180), now + Duration::days(365)]
+        {
+            let err = verify_vp_proof_lifetime(&json!({
+                "created": now.to_rfc3339(),
+                "expires": expires.to_rfc3339()
+            }))
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("expires too far in the future"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn proof_lifetime_refuses_created_in_the_future() {
+        let now = Utc::now();
+        let created = (now + Duration::minutes(10)).to_rfc3339();
+        let within_cap = (now + Duration::minutes(VP_LIFETIME_MINUTES)).to_rfc3339();
+        for proof in [json!({ "created": created }), json!({ "created": created, "expires": within_cap })] {
+            let err = verify_vp_proof_lifetime(&proof).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("created in the future"),
+                "{proof}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn proof_lifetime_accepts_created_within_the_skew() {
+        let created = Utc::now() + Duration::seconds(60);
+        let expires_at = verify_vp_proof_lifetime(&json!({ "created": created.to_rfc3339() })).unwrap();
+        assert_eq!(expires_at, created + Duration::minutes(VP_LIFETIME_MINUTES));
+    }
+
+    #[test]
+    fn proof_lifetime_accepts_created_at_the_skew_and_refuses_it_beyond() {
+        let now = Utc::now();
+        let skew = Duration::seconds(VP_CLOCK_SKEW_SECS);
+        let at_skew = now + skew;
+        let expires_at = verify_vp_proof_lifetime(&json!({ "created": at_skew.to_rfc3339() })).unwrap();
+        assert_eq!(expires_at, at_skew + Duration::minutes(VP_LIFETIME_MINUTES));
+
+        let beyond = (now + skew + Duration::seconds(5)).to_rfc3339();
+        let err = verify_vp_proof_lifetime(&json!({ "created": beyond })).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("created in the future"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn proof_lifetime_accepts_expires_at_the_cap_and_refuses_it_beyond() {
+        let now = Utc::now();
+        let cap = now + Duration::minutes(VP_LIFETIME_MINUTES) + Duration::seconds(VP_CLOCK_SKEW_SECS);
+        let expires_at = verify_vp_proof_lifetime(&json!({ "expires": cap.to_rfc3339() })).unwrap();
+        assert_eq!(expires_at, cap);
+
+        let beyond = (cap + Duration::seconds(5)).to_rfc3339();
+        let err = verify_vp_proof_lifetime(&json!({ "expires": beyond })).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expires too far in the future"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn proof_lifetime_accepts_expires_within_the_cap() {
+        let expires = Utc::now() + Duration::minutes(VP_LIFETIME_MINUTES) + Duration::seconds(60);
+        let expires_at = verify_vp_proof_lifetime(&json!({ "expires": expires.to_rfc3339() })).unwrap();
+        assert_eq!(expires_at, expires);
+    }
+
+    #[tokio::test]
+    async fn verify_vp_returns_lifetime_after_created_for_a_trust_agent_proof() {
+        let f = fixture().await;
+        let (vp, _) = bound_presentation(None, None).await;
+        assert!(
+            vp["proof"]
+                .get("expires")
+                .is_none(),
+            "a trust agent proof carries no expires"
+        );
+        let created: DateTime<Utc> = vp["proof"]["created"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        let result = verify(&f, &vp)
+            .await
+            .expect("a trust agent proof within its lifetime verifies");
+
+        assert_eq!(result.expires_at, created + Duration::minutes(VP_LIFETIME_MINUTES));
     }
 
     #[test]
@@ -1302,8 +1426,9 @@ mod tests {
 
     #[test]
     fn proof_lifetime_without_expires_is_bounded_by_created() {
-        let fresh = (Utc::now() - Duration::minutes(1)).to_rfc3339();
-        verify_vp_proof_lifetime(&json!({ "created": fresh })).unwrap();
+        let fresh = Utc::now() - Duration::minutes(1);
+        let expires_at = verify_vp_proof_lifetime(&json!({ "created": fresh.to_rfc3339() })).unwrap();
+        assert_eq!(expires_at, fresh + Duration::minutes(VP_LIFETIME_MINUTES));
 
         let stale = (Utc::now() - Duration::minutes(VP_LIFETIME_MINUTES + 1)).to_rfc3339();
         let err = verify_vp_proof_lifetime(&json!({ "created": stale })).unwrap_err();
@@ -1338,6 +1463,7 @@ mod tests {
             .unwrap();
         assert!(expires > Utc::now());
         assert!(expires <= Utc::now() + Duration::minutes(VP_LIFETIME_MINUTES));
+        assert_eq!(result.expires_at, expires);
     }
 
     #[tokio::test]
