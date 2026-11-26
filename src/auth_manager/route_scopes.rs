@@ -156,6 +156,8 @@ pub(crate) const ROUTE_SCOPES: &[RouteScope] = &[
     ("PUT", "/v1/gateways/{id}/exposed-surfaces", &[GatewaysEdit]),
     ("POST", "/v1/gateways/refresh-surfaces", &[GatewaysEdit]),
     ("POST", "/v1/gateways/{id}/approve", &[GatewaysEdit]),
+    ("POST", "/v1/gateways/{id}/continue", &[GatewaysEdit]),
+    ("GET", "/v1/gateways/{id}/mediator-access", &[GatewaysView]),
     ("GET", "/v1/gateways/{gateway_id}/connection-points", &[GatewaysView]),
     ("GET", "/v1/gateways/payment-logos/{sha256}", &[PaymentGatewaysView]),
     ("GET", "/v1/gateways/payment-providers", &[PaymentGatewaysView]),
@@ -184,6 +186,8 @@ pub(crate) const ROUTE_SCOPES: &[RouteScope] = &[
     ("GET", "/v1/connection-points/{id}/messages/unread-count", &[GatewaysView]),
     ("GET", "/v1/connection-points/{id}/metrics", &[GatewaysView]),
     ("POST", "/v1/connection-points/{id}/reconnect", &[GatewaysEdit]),
+    ("POST", "/v1/connection-points/{id}/continue", &[GatewaysEdit]),
+    ("GET", "/v1/connection-points/{id}/mediator-access", &[GatewaysView]),
 
     // Mediators
     ("GET", "/v1/mediators", &[MediatorsView]),

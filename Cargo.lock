@@ -736,6 +736,7 @@ name = "agent-gateway"
 version = "1.0.10"
 dependencies = [
  "affinidi-data-integrity 0.9.2",
+ "affinidi-did-authentication",
  "affinidi-did-common 0.4.10",
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",

@@ -305,7 +305,7 @@ The bootstrap file. Startup only; changes need a restart.
 | `[tls]` | Certificate and key paths, upstream verification |
 | `[mcp]` | Default MCP revision, validation, timeouts, SSE and stdio transports. Gateway-originated `2026-07-28` consent needs `[mcp.continuations]`; see [`MCP_METADATA.md`](MCP_METADATA.md#protected-continuations). |
 | `[reconnect_policy]` | Backoff for DIDComm connection points and for the background retry of a trust registry connection |
-| `[oob_connection]` | How long an out-of-band pairing invitation stays pending |
+| `[oob_connection]` | `pending_expiry_hours` (default 1): how long a pending acceptance whose temporary Connection Point recorded no expiry stays valid. An acceptance records its invitation's expiry (`expires_time`, capped at seven days, or seven days without one), so this applies only to acceptances stored before that |
 | `[a2a]` | Default A2A revision, body size (`max_body_size`, at least 1 byte; `0` fails startup), timeouts, fabric timeouts and envelope lifetime, inbound cache sizing. See [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md). |
 | `[logging]` | Level, JSON output, log directory, and `delegation_events` (default `true`): `false` writes none of the per-call credential delegation events to the log (see [Governance audit forwarding](OBSERVABILITY.md#governance-audit-forwarding)). Log redaction is not read here; see [Log redaction](#log-redaction). |
 | `[audit]` | How the VP Audit Log file is rotated: `vp_audit_log_max_bytes` (default 8388608) and `vp_audit_log_keep` (default 0, keep every rotated file), and the advisory `vp_audit_log_soft_cap_bytes` the Audit page shows the history against (default 1073741824). See [Governance audit forwarding](OBSERVABILITY.md#governance-audit-forwarding). |
@@ -866,7 +866,7 @@ neither lists them nor acts on them.
   when a payment gateway already exists and the flag has not been set either way, so an upgrade
   never hides a payment gateway that is taking payments.
 - `POST /v1/payment-gateways/connect-via-oob` connects to an agent-pay connection point with the
-  same body as `POST /v1/gateways/connect-via-oob` and creates a payment gateway whose exposure is
+  same body as `POST /v1/gateways/connect-via-oob`, except `await_mediator_access`, which it refuses with `400`, and creates a payment gateway whose exposure is
   `none`. agent-pay's administrator approves every connection, so the gateway stays
   `awaiting-approval` until then. A link already connected as a peer is `409`.
 - `GET /v1/payment-gateways/{id}/info` asks agent-pay for its `gateway-info` summary

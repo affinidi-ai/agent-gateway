@@ -7,6 +7,7 @@ pub mod gateway_info;
 pub mod handlers;
 pub mod issuer_attestation;
 pub mod issuer_exchange;
+pub mod mediator_access;
 pub mod payment_case;
 pub mod payment_logos;
 pub mod payment_manifest;
