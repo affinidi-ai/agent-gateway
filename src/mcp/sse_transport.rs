@@ -820,6 +820,10 @@ pub enum LegacySseError {
     /// A response from the upstream failed the surface's Response authentication.
     #[error("the upstream response failed response authentication: {}", .0.reason())]
     Unauthenticated(ResponseAuthFailure),
+    /// The session endpoint the upstream advertised is outside the base path the request's
+    /// credential may go under; the request was not posted to it.
+    #[error("the Legacy SSE session endpoint is outside the Target base path")]
+    OutsideTargetBase,
     #[error("{0}")]
     Failed(String),
 }
@@ -1124,7 +1128,7 @@ impl UpstreamSseSession {
                     .store(false, std::sync::atomic::Ordering::SeqCst);
                 return Err(match e {
                     LegacySseError::Unauthenticated(failure) => LegacySseError::Unauthenticated(failure),
-                    LegacySseError::Failed(e) => format!("SSE session initialize failed: {e}").into(),
+                    e => format!("SSE session initialize failed: {e}").into(),
                 });
             }
         }
@@ -1147,6 +1151,20 @@ impl UpstreamSseSession {
         }
 
         Ok(session)
+    }
+
+    /// `Ok` when no `credential_base` applies or the session endpoint is under its base path
+    /// ([`crate::proxy::paths::is_within_target_base`]).
+    fn accepts_credentials_under(
+        &self,
+        credential_base: Option<&str>,
+    ) -> Result<(), LegacySseError> {
+        match credential_base {
+            Some(base) if !crate::proxy::paths::is_within_target_base(base, &self.inner.post_url) => {
+                Err(LegacySseError::OutsideTargetBase)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Returns `true` if the background SSE reader is still running.
@@ -1429,7 +1447,10 @@ fn forget_sessions(surface_id: Option<String>) {
 /// incomplete SSE event (`a2a.max_body_size`); a session shared by several
 /// callers keeps the cap it connected with. Every response of the session
 /// must pass `check`; one that fails ends the request as
-/// [`LegacySseError::Unauthenticated`], without a retry.
+/// [`LegacySseError::Unauthenticated`], without a retry. With `credential_base`, the
+/// Target endpoint of a request that carries a credential in its body, the request is posted
+/// only to a session endpoint under that endpoint's base path, and is otherwise refused as
+/// [`LegacySseError::OutsideTargetBase`] without being posted.
 pub async fn send_via_persistent_sse(
     client: &reqwest::Client,
     base_url: &str,
@@ -1437,10 +1458,12 @@ pub async fn send_via_persistent_sse(
     channel_name: &str,
     max_event_bytes: usize,
     check: Option<ResponseCheck<'_>>,
+    credential_base: Option<&str>,
 ) -> Result<String, LegacySseError> {
     let session = UPSTREAM_SSE_SESSIONS
         .get_or_connect(client, base_url, channel_name, max_event_bytes, check)
         .await?;
+    session.accepts_credentials_under(credential_base)?;
     match session
         .send_request(json_rpc_body, check)
         .await
@@ -1462,6 +1485,7 @@ pub async fn send_via_persistent_sse(
             let new_session = UPSTREAM_SSE_SESSIONS
                 .get_or_connect(client, base_url, channel_name, max_event_bytes, check)
                 .await?;
+            new_session.accepts_credentials_under(credential_base)?;
             new_session
                 .send_request(json_rpc_body, check)
                 .await
@@ -1805,7 +1829,7 @@ mod tests {
         };
 
         let answer =
-            send_via_persistent_sse(&reqwest::Client::new(), &base, TOOLS_CALL, "test", 1024 * 1024, Some(check))
+            send_via_persistent_sse(&reqwest::Client::new(), &base, TOOLS_CALL, "test", 1024 * 1024, Some(check), None)
                 .await
                 .expect("the session answers");
 
@@ -1828,9 +1852,16 @@ mod tests {
         ] {
             let base = keyed_legacy_upstream(stream_key, post_key, post_key).await;
 
-            let outcome =
-                send_via_persistent_sse(&reqwest::Client::new(), &base, TOOLS_CALL, "test", 1024 * 1024, Some(check))
-                    .await;
+            let outcome = send_via_persistent_sse(
+                &reqwest::Client::new(),
+                &base,
+                TOOLS_CALL,
+                "test",
+                1024 * 1024,
+                Some(check),
+                None,
+            )
+            .await;
 
             assert!(
                 matches!(outcome, Err(LegacySseError::Unauthenticated(ResponseAuthFailure::KeyMissing))),
@@ -2101,7 +2132,7 @@ mod tests {
             stamp: Some(tls.stamp),
         };
 
-        let outcome = send_via_persistent_sse(&client, &base, TOOLS_CALL, "test", 1024 * 1024, Some(check)).await;
+        let outcome = send_via_persistent_sse(&client, &base, TOOLS_CALL, "test", 1024 * 1024, Some(check), None).await;
 
         assert!(
             matches!(outcome, Err(LegacySseError::Unauthenticated(ResponseAuthFailure::ServerUntrusted))),

@@ -1023,6 +1023,7 @@ async fn send_discovery_request(
                     channel_name,
                     crate::config::A2aConfig::default().max_body_size,
                     check,
+                    None,
                 )
                 .await
                 .map_err(|e| match e {

@@ -1063,6 +1063,65 @@ async fn a_service_level_credential_reaches_a_partner_request_without_the_opt_in
     }
 }
 
+/// A legacy MCP request carrying a service credential in `_meta` that falls back to Legacy SSE
+/// is posted only to a session endpoint under the Target base path: one the Target advertises
+/// outside it is refused with `400 target_path_refused` and gets nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_legacy_sse_session_endpoint_outside_the_target_base_path_gets_no_delegated_credential() {
+    if ran_in_child("ATG_FABRIC_RECEIVE_LEGACY_SSE_BASE_CHILD").await {
+        return;
+    }
+    let mut roots = Vec::new();
+    for (endpoint, refused) in [("/other-app/messages", true), ("/base/messages", false)] {
+        let server = crate::proxy::handler::legacy_sse_fallback_tests::legacy_server(endpoint).await;
+        roots.push(tempfile::tempdir().unwrap());
+        let root = roots.last().unwrap();
+        let mut delegating = surface("mcp", &format!("{}/base", server.url), &[]);
+        delegating.outbound_credentials = vec![
+            serde_json::from_value(json!({ "credential_provider_id": SERVICE_PROVIDER,
+                "inject_as": { "type": "meta", "field": "maps" } }))
+            .unwrap(),
+        ];
+        let _receiver = receiver(root.path(), &delegating).await;
+        install_delegation_stores(root.path(), &server.url, &[]).await;
+        let message = forward_request(
+            root.path(),
+            json!({ "content-type": "application/json", "accept": "application/json, text/event-stream",
+                "mcp-protocol-version": crate::mcp::MCP_LEGACY_VERSION, "x-api-key": CALLER_KEY }),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "lookup", "arguments": {} } }),
+        );
+        let (response, events) = crate::audit::producer::capture(forward_response(&message)).await;
+        let path_refusals: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                DelegationAuditAction::RequestRejected {
+                    stage,
+                    reason: RejectionReason::TargetPathRefused,
+                    ..
+                } => Some(*stage),
+                _ => None,
+            })
+            .collect();
+        let calls = server.tool_calls();
+        if refused {
+            assert_eq!(response["status"], 400, "{endpoint}: {response}");
+            assert!(
+                response
+                    .to_string()
+                    .contains("target_path_refused"),
+                "{endpoint}: {response}"
+            );
+            assert_eq!(path_refusals, [RejectionStage::Forward], "{endpoint}");
+            assert_eq!(calls, Vec::new(), "{endpoint}: the request is not posted to the advertised endpoint");
+        } else {
+            assert_eq!(response["status"], 200, "{endpoint}: {response}");
+            assert_eq!(path_refusals, [], "{endpoint}");
+            assert_eq!(calls.len(), 1, "{endpoint}: {calls:?}");
+            assert_eq!(calls[0].1["params"]["_meta"]["maps"], SERVICE_KEY, "{endpoint}: {}", calls[0].1);
+        }
+    }
+}
+
 /// A public Access Point forwards a request whose peer key it refused, and the
 /// transit token it issues for that request names the peer but no principal, so
 /// an unverified caller never becomes a person the agent can act for.

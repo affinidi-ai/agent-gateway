@@ -8266,6 +8266,13 @@ async fn proxy_charged_request(
                 secrets: state.secrets_store.as_ref(),
                 stamp: target_tls_stamp,
             }),
+            crate::proxy::credential_delegation::carries_delegated_meta_field(&state.surface, &body_bytes).then_some(
+                state
+                    .surface
+                    .target
+                    .endpoint
+                    .as_str(),
+            ),
         )
         .await
         {
@@ -8289,6 +8296,17 @@ async fn proxy_charged_request(
                     .decrement()
                     .await;
                 return Ok(crate::proxy::response_auth::refuse(failure, &audit_facts, &body_bytes));
+            }
+            Err(crate::mcp::sse_transport::LegacySseError::OutsideTargetBase) => {
+                warn!(
+                    channel = %channel_name,
+                    "Refusing a Legacy SSE session endpoint outside the Target base path: the request carries a delegated credential"
+                );
+                record_credential_destination_refusal(&audit_facts, None, None);
+                connection_guard
+                    .decrement()
+                    .await;
+                return Ok(TargetAuthFailure::PathRefused.response());
             }
             Err(e) => {
                 warn!(
@@ -16872,6 +16890,8 @@ pub(crate) fn compute_transit_token_caller_context(
 
 #[cfg(test)]
 mod fabric_send_policy_tests;
+#[cfg(test)]
+pub(crate) mod legacy_sse_fallback_tests;
 #[cfg(test)]
 mod response_auth_tests;
 #[cfg(test)]

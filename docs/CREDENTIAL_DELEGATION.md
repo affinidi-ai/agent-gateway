@@ -1658,7 +1658,15 @@ a binding applies to it. A
 against the REST URL its path arguments build under the proxy's `base_url` (a `.` or `..`
 segment, or a URL outside a base path that is not the root, as for `../admin`), before any grant
 is read, token requested or consent started, and gets the same `400 target_path_refused` and
-audit record; the REST client's own base-path check stays as a second guard. A Target bound by
+audit record; the REST client's own base-path check stays as a second guard. When a legacy MCP
+Target refuses the plain POST and the request falls back to Legacy SSE, on the direct path or
+Fabric receive, the session endpoint the Target advertises is known only after the first
+attempt, so it is checked when it is advertised, after the credential was resolved: a request
+whose body carries a `_meta` field a delegated credential goes into is posted only to a session
+endpoint under the Target base path, and is otherwise refused with `400 target_path_refused`
+and a `target_path_refused` record at `forward`, with nothing posted to it. The fallback sends
+no header of the request, so neither the Target credential nor a delegated credential in a
+header reaches the session endpoint. A Target bound by
 external consent keeps its stricter admission check (400).
 
 A surface's traffic mirror (`target.networking.mirror`) never receives the Target credential or a

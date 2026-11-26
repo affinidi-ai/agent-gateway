@@ -885,8 +885,10 @@ Fabric send checks a delegated credential only on a `2026-07-28` MCP request, th
 carries it to the peer. A `2026-07-28` MCP proxy call, on the direct path and Fabric receive,
 is checked against the REST URL its path arguments build before any credential is resolved or
 consent started, and the REST client's own base-path check (`400`, JSON-RPC error `-32602`)
-described below stays as a second guard. A request
-refused for a delegated credential alone is recorded as a `target_path_refused` refusal at
+described below stays as a second guard. A Legacy SSE fallback's advertised session endpoint
+is checked when it is advertised, and a request whose body carries a delegated credential is
+refused with `400 target_path_refused` when that endpoint is outside the Target base path. A
+request refused for a delegated credential alone is recorded as a `target_path_refused` refusal at
 `forward`. A surface's traffic mirror is sent neither credential, in a header or in `_meta`
 (see [Target base path](CREDENTIAL_DELEGATION.md#target-base-path)).
 

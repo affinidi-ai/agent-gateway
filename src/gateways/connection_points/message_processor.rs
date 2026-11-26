@@ -6660,6 +6660,8 @@ async fn process_charged_forward_request(
         secrets: response_secrets.as_ref(),
         stamp: target_tls_stamp,
     };
+    let legacy_sse_credential_base = crate::proxy::credential_delegation::carries_delegated_meta_field(&surface, &body_bytes)
+        .then_some(surface.target_endpoint());
     if surface_protocol == crate::config::ChannelProtocol::Mcp && modern_request.is_none() && !body_bytes.is_empty() {
         // Check if a persistent session already exists (cheap read lock check)
         let has_session = {
@@ -6681,6 +6683,7 @@ async fn process_charged_forward_request(
                 channel_id,
                 fabric_max_response_bytes(),
                 Some(legacy_sse_check),
+                legacy_sse_credential_base,
             )
             .await
             {
@@ -6713,6 +6716,14 @@ async fn process_charged_forward_request(
                             "body": "",
                         }),
                     };
+                }
+                Err(crate::mcp::sse_transport::LegacySseError::OutsideTargetBase) => {
+                    channel_warn!(
+                        config_id,
+                        "GW2: Refusing a Legacy SSE session endpoint outside the Target base path: the request carries a delegated credential"
+                    );
+                    crate::proxy::handler::record_credential_destination_refusal(&audit_facts, None, None);
+                    return target_auth_failure_result(crate::proxy::handler::TargetAuthFailure::PathRefused);
                 }
                 Err(crate::mcp::sse_transport::LegacySseError::Unauthenticated(failure)) => {
                     return axum_response_to_forward_result(crate::proxy::response_auth::refuse(
@@ -6829,6 +6840,7 @@ async fn process_charged_forward_request(
                     channel_id,
                     fabric_max_response_bytes(),
                     Some(legacy_sse_check),
+                    legacy_sse_credential_base,
                 )
                 .await
                 {
@@ -6864,7 +6876,15 @@ async fn process_charged_forward_request(
                             }),
                         };
                     }
-                    Err(crate::mcp::sse_transport::LegacySseError::Unauthenticated(failure)) => {
+                    Err(crate::mcp::sse_transport::LegacySseError::OutsideTargetBase) => {
+                    channel_warn!(
+                        config_id,
+                        "GW2: Refusing a Legacy SSE session endpoint outside the Target base path: the request carries a delegated credential"
+                    );
+                    crate::proxy::handler::record_credential_destination_refusal(&audit_facts, None, None);
+                    return target_auth_failure_result(crate::proxy::handler::TargetAuthFailure::PathRefused);
+                }
+                Err(crate::mcp::sse_transport::LegacySseError::Unauthenticated(failure)) => {
                         return axum_response_to_forward_result(crate::proxy::response_auth::refuse(
                             failure,
                             &audit_facts,
