@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { apiClient } from '../../api';
 import { AppButton } from '../shared/AppButton';
+import type { MediatorAccessRefusal } from '../shared/MediatorAccessStep';
+import { ADD_GATEWAY_DID_LABELS, mediatorAccessRefusal } from '../../utils/mediatorAccess';
 
 interface ConnectStepProps {
   oobLink: string;
@@ -10,11 +12,16 @@ interface ConnectStepProps {
   didMethod?: string;
   acceptorMediatorId?: string;
   onConnected: (gateway: any) => void;
-  onBack: () => void;
+  /** Left out when there is no earlier step to go back to; the error then offers Retry only. */
+  onBack?: () => void;
   onCancel: () => void;
   /** The connect-via-OOB route that creates the record. */
   endpoint?: string;
   title?: string;
+  /** A gateway paused for mediator access: continue it instead of accepting the link again. */
+  continueGatewayId?: string;
+  /** The mediator still refuses one of the paused gateway's DIDs. */
+  onRefused?: (refusal: MediatorAccessRefusal) => void;
 }
 
 const ConnectStep: React.FC<ConnectStepProps> = ({
@@ -29,6 +36,8 @@ const ConnectStep: React.FC<ConnectStepProps> = ({
   onCancel,
   endpoint = '/gateways/connect-via-oob',
   title = 'Connecting to Gateway',
+  continueGatewayId,
+  onRefused,
 }) => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -36,6 +45,15 @@ const ConnectStep: React.FC<ConnectStepProps> = ({
   const [statusMessage, setStatusMessage] = useState('Initializing connection...');
 
   const connectCalledRef = useRef(false);
+  // A request that finishes after this step has left the screen (the wizard moved to
+  // another pairing or page) must not call its callbacks or set its state.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (connectCalledRef.current) return;
@@ -54,16 +72,19 @@ const ConnectStep: React.FC<ConnectStepProps> = ({
       setProgress(30);
       setStatusMessage('Establishing DIDComm connection...');
 
-      // Call the backend API to accept the OOB invitation and connect to the gateway
-      const response = await apiClient.post(endpoint, {
-        oob_url: oobLink,
-        secret: secret,
-        name: name,
-        description: description,
-        did_method: didMethod || 'web',
-        acceptor_mediator_id: acceptorMediatorId || undefined,
-      });
+      // Send the connection-setup of a paused gateway, or accept the OOB invitation
+      const response = continueGatewayId
+        ? await apiClient.post(`/gateways/${continueGatewayId}/continue`, {})
+        : await apiClient.post(endpoint, {
+            oob_url: oobLink,
+            secret: secret,
+            name: name,
+            description: description,
+            did_method: didMethod || 'web',
+            acceptor_mediator_id: acceptorMediatorId || undefined,
+          });
 
+      if (!mountedRef.current) return;
       setProgress(70);
       setStatusMessage('Retrieving gateway details...');
 
@@ -74,9 +95,16 @@ const ConnectStep: React.FC<ConnectStepProps> = ({
       // Wait a moment before transitioning
       await new Promise(resolve => setTimeout(resolve, 800));
 
+      if (!mountedRef.current) return;
       onConnected(response.data.gateway);
     } catch (err: any) {
+      if (!mountedRef.current) return;
       console.error('Failed to connect to gateway:', err);
+      const refusal = onRefused ? mediatorAccessRefusal(err, ADD_GATEWAY_DID_LABELS) : null;
+      if (refusal && onRefused) {
+        onRefused(refusal);
+        return;
+      }
       setError(
         err.response?.data?.error ||
           err.message ||
@@ -129,16 +157,18 @@ const ConnectStep: React.FC<ConnectStepProps> = ({
                 Cancel
               </AppButton>
               <div className="d-flex gap-2">
-                <AppButton
-                  type="button"
-                  variant="secondary"
-                  size="md"
-                  onClick={onBack}
-                  iconStart={<i className="fas fa-arrow-left"></i>}
-                  data-testid="wizard-back"
-                >
-                  Back
-                </AppButton>
+                {onBack && (
+                  <AppButton
+                    type="button"
+                    variant="secondary"
+                    size="md"
+                    onClick={onBack}
+                    iconStart={<i className="fas fa-arrow-left"></i>}
+                    data-testid="wizard-back"
+                  >
+                    Back
+                  </AppButton>
+                )}
                 <AppButton
                   type="button"
                   variant="primary"
@@ -180,10 +210,12 @@ const ConnectStep: React.FC<ConnectStepProps> = ({
                 </div>
               </div>
 
-              <p className="text-muted small">
-                <i className="fas fa-link me-2"></i>
-                Connecting to: {new URL(oobLink).origin}
-              </p>
+              {oobLink && (
+                <p className="text-muted small">
+                  <i className="fas fa-link me-2"></i>
+                  Connecting to: {new URL(oobLink).origin}
+                </p>
+              )}
             </div>
 
             <div className="alert alert-info" role="alert">

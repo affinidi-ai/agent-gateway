@@ -970,7 +970,13 @@ round must validate the same authorization, surface, provider, route and
 business arguments and win its own atomic claim before reusing the evidence; it
 then makes no payment call, and the original receipt comes back in the response
 headers and in `result._meta`. Evidence of another rail, or expired evidence, is
-refused with `403`. Evidence expiry is never extended by a new upstream round or
+refused with `403`, and so is evidence of an authorization that was later voided
+because the Target did not deliver: the voided receipt's digest is recorded in the
+gateway's [single-use store](CONFIGURATION_REFERENCE.md#single-use-store) for the
+continuation's maximum lifetime, so a restart, or with a shared store another node,
+still refuses it. Evidence the store cannot check is refused. With DynamoDB
+continuations the gateway refuses to start unless `single_use_store` is DynamoDB
+too. Evidence expiry is never extended by a new upstream round or
 renewed consent, and descendant state is also capped to the previous operation's
 remaining lifetime. The direct and isolated receiver JSON/SSE tests run against
 an in-process payment gate and assert one payment call across two rounds,
@@ -1407,15 +1413,19 @@ semantics. Any browser-session linkage must map to this authoritative profile
 identity explicitly, never by email or unqualified subject matching.
 
 Profile replay protection is separate from the legacy synchronous fallback.
-`sts.mcp_replay` selects bounded embedded storage (default capacity 100000,
-single active process) or `{ "backend": "dynamodb", "table": "..." }`.
-Keys bind the profile issuer, grant issuer and token ID. DynamoDB uses an
-atomic conditional PutItem under `StsMcpReplay#<digest>` PK/SK and numeric
-`expires_at`; grant TTL is at most 900 seconds. Configure TTL cleanup and
-grant `dynamodb:PutItem` on the table. Failed or timed-out writes fail closed,
-never fall back to memory. Real DynamoDB multi-replica and IAM conformance
-remain required; a default process-local backend is not restart-safe replay
-protection.
+`sts.mcp_replay` selects `embedded` (the default) or
+`{ "backend": "dynamodb", "table": "..." }`. Keys bind the profile issuer,
+grant issuer and token ID; grant TTL is at most `sts.id_jag_max_lifetime_secs`
+(900 seconds by default). `embedded` records
+redemptions in the gateway's
+[single-use store](CONFIGURATION_REFERENCE.md#single-use-store) (namespace
+`mcp-id-jag`), so they survive a restart and, when `single_use_store` is
+DynamoDB, are shared by every node; its `capacity` (1 to 100000) is still
+validated but no longer bounds anything. `dynamodb` uses an atomic conditional
+PutItem under `StsMcpReplay#<digest>` PK/SK and numeric `expires_at`. Configure
+TTL cleanup and grant `dynamodb:PutItem` on the table. Failed or timed-out
+writes fail closed, never fall back to memory. Real DynamoDB multi-replica and
+IAM conformance remain required.
 
 An MCP Access Point, independent Transit Point or standalone MCP Proxy opts
 into Resource Server enforcement with `mcp_http.authorization`:
@@ -1845,7 +1855,8 @@ active replay records.
 
 A capability query is admitted like a `forward-request` too: its envelope
 `expires_time` is required and validated, and its `(sender DID, message id)`
-pair is remembered in the Fabric seen set until it expires. A replayed query is
+pair is remembered in the Fabric seen set and the single-use store until it
+expires. A replayed query is
 therefore refused, both while it is live and after, and can never recreate an
 expired offer, so an Open bound to that offer stays refused once its replay
 record ends. The sending gateway gives a query a 300 s envelope lifetime.
@@ -2250,7 +2261,7 @@ Resolved Access Point, Transit Point and Fabric requests retain their selected s
 
 ### Resource Server, consent and credentials
 
-The opt-in `sts.mcp_issuer` profile uses a configured HTTPS origin and root or `/api` identity mount ending `/oauth2/mcp`. It shares STS signing, clients, policy, Trust Check and throttling, preserves legacy DID endpoints, and implements managed token-exchange/ID-JAG grants only. Its forms reject duplicate parameters, token exchange rejects subject and actor tokens whose JOSE `typ` is the ID-JAG media type whatever type the client declares (`declares_id_jag_typ`) and any the gateway signed under its DID or the profile issuer, resources/scopes require explicit client allowlists, ID-JAG `aud` and `resource` stay distinct, and access tokens use `at+jwt`. `sts.mcp_replay` is bounded embedded or conditional DynamoDB storage without fallback. Endpoint-local `mcp_http.authorization` enforces resource tokens for all request eras, supplies path-specific metadata and `401`/`403` challenges, feeds verified policy identity, and strips bearer tokens before forwarding. It refuses a token minted for a managed connection that does not exist or whose tenant may not reach the surface or MCP Proxy ([tenant check of STS tokens](SOURCE_AUTH.md#tenant-check-of-sts-tokens)). Fabric receive must enforce its own resource independently. No new browser AS flow follows from these settings, and they do not change which revisions an endpoint admits; full route/distributed conformance is not verified.
+The opt-in `sts.mcp_issuer` profile uses a configured HTTPS origin and root or `/api` identity mount ending `/oauth2/mcp`. It shares STS signing, clients, policy, Trust Check and throttling, preserves legacy DID endpoints, and implements managed token-exchange/ID-JAG grants only. Its forms reject duplicate parameters, token exchange rejects subject and actor tokens whose JOSE `typ` is the ID-JAG media type whatever type the client declares (`declares_id_jag_typ`) and any the gateway signed under its DID or the profile issuer, resources/scopes require explicit client allowlists, ID-JAG `aud` and `resource` stay distinct, and access tokens use `at+jwt`. `sts.mcp_replay` records redemptions in the [single-use store](CONFIGURATION_REFERENCE.md#single-use-store) (`embedded`) or with a conditional DynamoDB put, without fallback. Endpoint-local `mcp_http.authorization` enforces resource tokens for all request eras, supplies path-specific metadata and `401`/`403` challenges, feeds verified policy identity, and strips bearer tokens before forwarding. It refuses a token minted for a managed connection that does not exist or whose tenant may not reach the surface or MCP Proxy ([tenant check of STS tokens](SOURCE_AUTH.md#tenant-check-of-sts-tokens)). Fabric receive must enforce its own resource independently. No new browser AS flow follows from these settings, and they do not change which revisions an endpoint admits; full route/distributed conformance is not verified.
 
 MCP Resource Server alignment must reuse the existing `src/sts/` architecture. It adds no authorization-code grant or PKCE authorization endpoint. The gateway starts a browser sign-in only for legacy [consent confirmation](CREDENTIAL_DELEGATION.md#consent-confirmation), as a client of the callers' identity provider: that sign-in creates no session, asks only for `openid` (with `profile` for a claim other than `sub`), and drops the tokens once it has checked the ID token. Preserve existing DID-issued flows and do not claim compatibility with authorization-code-only clients. `mcp::continuations` provides bounded mandatory AEAD state, authorization/request and vault-identity/scope binding, atomic embedded and DynamoDB stores, monotonic retry rounds and single-use dispatch claims. URL elicitation requires the request-local capability, and decline/cancel persists denial. Modern third-party consent references an existing JWT strategy through `CredentialProvider.consent_identity_strategy_id`, with tenant/PAT and ownership-reference checks. The existing provider callback verifies a nonce-bound OIDC ID token's signature, issuer, client audience, expiry and deterministic issuer/subject match to the initiating STS principal; no account-link registry, email matching, new hosted login or browser-held MCP bearer establishes consent. Callback tickets bind current surface/provider/strategy snapshots. Verified credentials are staged invisibly to ordinary vault lookup, then activated only after a ready retry wins its single-use claim. A vault revocation epoch and composite credential version prevent stale publication across filesystem instances; any revocation conservatively invalidates outstanding staged consents. Client acceptance and legacy vault records never establish modern readiness. Modern gateway consent (MRTR) needs `[mcp.continuations]` in the bootstrap config and `sts.mcp_issuer`; a modern request to an endpoint with `outbound_credentials` while continuations are not configured fails with `503` / `-32603` ("MCP credential service unavailable"), never falling back to legacy consent. Full callback-route coverage, remote-filesystem conformance and distributed refresh coordination are not verified; see `docs/MCP_METADATA.md`.
 

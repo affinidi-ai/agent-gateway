@@ -7,6 +7,9 @@ import { TrustRegistry } from '../types';
 import { DeleteButton } from '../components/shared/DeleteButton';
 import { useSafeNavigate } from '../hooks/useSafeNavigate';
 import FieldHelp from '../components/shared/FieldHelp';
+import { SurfaceSigningSection } from '../components/surface-builder/elements/surface/SurfaceSigningSection';
+import { isSigningEmpty, type SurfaceSigning } from '../components/surface-builder/elements/types';
+import { useOptionalPermissions } from '../context/PermissionsContext';
 
 interface Issuer {
   id: string;
@@ -16,6 +19,7 @@ interface Issuer {
   trust_registry_did?: string;
   authority_did?: string;
   tr_registered?: boolean | null;
+  signing?: SurfaceSigning;
   created_at: string;
   updated_at: string;
 }
@@ -36,6 +40,9 @@ const EditIssuerPage: React.FC<EditIssuerPageProps> = ({ embeddedId, onDone }) =
   const [did, setDid] = useState('');
   const [trustRegistryDid, setTrustRegistryDid] = useState('');
   const [authorityDid, setAuthorityDid] = useState('');
+  const [signing, setSigning] = useState<SurfaceSigning | undefined>(undefined);
+  // The gateway refuses a changed signing choice without `key_management.edit`.
+  const canChooseSigning = useOptionalPermissions()?.hasPermission('key_management.edit') ?? false;
   const [trustRegistries, setTrustRegistries] = useState<TrustRegistry[]>([]);
   const [loading, setLoading] = useState(isEditMode);
   const [saving, setSaving] = useState(false);
@@ -56,6 +63,7 @@ const EditIssuerPage: React.FC<EditIssuerPageProps> = ({ embeddedId, onDone }) =
       if (issuer.trust_registry_did) setTrustRegistryDid(issuer.trust_registry_did);
       if (issuer.authority_did) setAuthorityDid(issuer.authority_did);
       setTrRegistered(issuer.tr_registered);
+      setSigning(issuer.signing);
       setCreatedAt(issuer.created_at || null);
       setUpdatedAt(issuer.updated_at || null);
     } catch (err: any) {
@@ -127,9 +135,12 @@ const EditIssuerPage: React.FC<EditIssuerPageProps> = ({ embeddedId, onDone }) =
         await apiClient.put(`/issuers/${id}`, {
           name: name.trim(),
           description: description.trim(),
+          // An empty block clears the issuer's own choice, so it follows the appliance default.
+          signing: isSigningEmpty(signing) ? {} : signing,
         });
       } else {
         const payload: any = { name: name.trim(), description: description.trim() };
+        if (!isSigningEmpty(signing)) payload.signing = signing;
         if (trustRegistryDid && authorityDid.trim()) {
           payload.trust_registry_did = trustRegistryDid;
           payload.authority_did = authorityDid.trim();
@@ -140,7 +151,17 @@ const EditIssuerPage: React.FC<EditIssuerPageProps> = ({ embeddedId, onDone }) =
     } finally {
       setSaving(false);
     }
-  }, [name, description, id, isEditMode, trustRegistryDid, authorityDid, navigate, onDone]);
+  }, [
+    name,
+    description,
+    signing,
+    id,
+    isEditMode,
+    trustRegistryDid,
+    authorityDid,
+    navigate,
+    onDone,
+  ]);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -269,6 +290,14 @@ const EditIssuerPage: React.FC<EditIssuerPageProps> = ({ embeddedId, onDone }) =
               Explains what this issuer is for, shown alongside its name wherever issuers are
               listed. A description is required for every issuer.
             </small>
+          </div>
+          <div data-testid="issuer-signing">
+            <SurfaceSigningSection
+              signing={signing}
+              setSigning={setSigning}
+              subject="issuer"
+              disabled={!canChooseSigning}
+            />
           </div>
           {isEditMode && did && (
             <div className="mb-3">

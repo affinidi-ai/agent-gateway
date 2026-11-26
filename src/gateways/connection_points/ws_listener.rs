@@ -221,6 +221,9 @@ pub struct ConnectionPointListenerManager {
     starting_listeners: Arc<Mutex<HashSet<String>>>,
     /// Notifies concurrent startup callers when an in-flight startup completes.
     starting_listeners_notify: Arc<Notify>,
+    /// Listeners still connecting after their start returned, so a stop can
+    /// cancel them before they register.
+    pending_listeners: PendingListeners,
     event_hook: Option<Arc<crate::event_hook::EventHook>>,
     /// The issuer exchange in flight per Remote gateway id, shared by every
     /// caller that needs that gateway's issuer DID until it completes.
@@ -237,7 +240,63 @@ pub struct ListenerStartCommand {
     pub mediator_did: String,
     pub mediator_url: String,
     /// Oneshot channel to notify when listener is started (or failed)
-    pub completion_tx: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    pub completion_tx: Option<tokio::sync::oneshot::Sender<Result<ListenerStart, String>>>,
+}
+
+/// How far a listener start got before it returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerStart {
+    /// Authenticated with the mediator and registered.
+    Connected,
+    /// Still connecting in the background. It is registered once it connects,
+    /// unless it is stopped or the node goes to Standby first.
+    Pending,
+    /// Not started: the Connection Point waits for mediator access, and its
+    /// Continue starts the listener.
+    Paused,
+}
+
+/// How long a start waits for the mediator before returning
+/// [`ListenerStart::Pending`], and how long a second start for the same
+/// Connection Point waits for the first one.
+const INITIAL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A listener whose start returned [`ListenerStart::Pending`] and that has not
+/// connected yet.
+struct PendingListener {
+    instance_id: String,
+    abort_handle: AbortHandle,
+}
+
+type PendingListeners = Arc<std::sync::Mutex<HashMap<String, PendingListener>>>;
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartReservation {
+    Reserved,
+    AlreadyActive,
+    InProgress,
+}
+
+/// Removes the pending entry for `cp_id` if it still belongs to listener
+/// `instance_id`, reporting whether it did. A stop removes the entry first, so
+/// a listener that connects after being stopped finds it gone.
+fn take_pending(
+    pending: &std::sync::Mutex<HashMap<String, PendingListener>>,
+    cp_id: &str,
+    instance_id: &str,
+) -> bool {
+    let mut pending = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if pending
+        .get(cp_id)
+        .is_some_and(|entry| entry.instance_id == instance_id)
+    {
+        pending.remove(cp_id);
+        true
+    } else {
+        false
+    }
 }
 
 impl ConnectionPointListenerManager {
@@ -269,6 +328,7 @@ impl ConnectionPointListenerManager {
             listeners_active: Arc::new(AtomicBool::new(true)),
             starting_listeners: Arc::new(Mutex::new(HashSet::new())),
             starting_listeners_notify: Arc::new(Notify::new()),
+            pending_listeners: Arc::new(std::sync::Mutex::new(HashMap::new())),
             event_hook: None,
             issuer_exchanges: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
@@ -292,7 +352,7 @@ impl ConnectionPointListenerManager {
         connection_point: super::types::GatewayConnectionPoint,
         mediator_did: String,
         mediator_url: String,
-    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), String>>, String> {
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<ListenerStart, String>>, String> {
         if !self.is_active() {
             return Err("Connection point listeners are currently deactivated".to_string());
         }
@@ -566,11 +626,16 @@ impl ConnectionPointListenerManager {
         info!("✓ DID cache maintenance task started (runs every 5 minutes)");
     }
 
+    /// Claims the start of `connection_point`'s listener. A start already in
+    /// progress for it is waited for, but only for [`INITIAL_CONNECT_TIMEOUT`],
+    /// so one Connection Point whose mediator is unreachable cannot hold up
+    /// the starts queued behind it.
     async fn reserve_listener_start(
         &self,
         connection_point: &GatewayConnectionPoint,
-    ) -> Result<(), String> {
+    ) -> StartReservation {
         let cp_id = connection_point.id.as_str();
+        let deadline = tokio::time::Instant::now() + INITIAL_CONNECT_TIMEOUT;
         loop {
             let startup_finished = self
                 .starting_listeners_notify
@@ -583,7 +648,7 @@ impl ConnectionPointListenerManager {
                         "WebSocket listener already active for connection point '{}' (ID: {})",
                         connection_point.name, cp_id
                     );
-                    return Err("already-active".to_string());
+                    return StartReservation::AlreadyActive;
                 }
             }
 
@@ -612,16 +677,25 @@ impl ConnectionPointListenerManager {
                         "WebSocket listener already active for connection point '{}' (ID: {})",
                         connection_point.name, cp_id
                     );
-                    return Err("already-active".to_string());
+                    return StartReservation::AlreadyActive;
                 }
-                return Ok(());
+                return StartReservation::Reserved;
             }
 
             debug!(
                 connection_point_id = cp_id,
                 "WebSocket listener startup already in progress; waiting for existing startup"
             );
-            startup_finished.await;
+            if tokio::time::timeout_at(deadline, startup_finished)
+                .await
+                .is_err()
+            {
+                info!(
+                    "WebSocket listener for connection point '{}' (ID: {}) is still connecting from an earlier start",
+                    connection_point.name, cp_id
+                );
+                return StartReservation::InProgress;
+            }
         }
     }
 
@@ -647,20 +721,26 @@ impl ConnectionPointListenerManager {
         mediator_did: String,
         mediator_url: String,
         config: Arc<crate::config::BootstrapConfig>,
-    ) -> Result<(), String> {
+    ) -> Result<ListenerStart, String> {
         if !self.is_active() {
             return Err("Connection point listeners are currently deactivated".to_string());
         }
+        if connection_point.awaiting_mediator_access {
+            info!(
+                "Not starting a listener for connection point '{}': it waits for mediator access",
+                connection_point.id
+            );
+            return Ok(ListenerStart::Paused);
+        }
 
         let cp_id = connection_point.id.clone();
-        if let Err(e) = self
+        match self
             .reserve_listener_start(connection_point)
             .await
         {
-            if e == "already-active" {
-                return Ok(());
-            }
-            return Err(e);
+            StartReservation::Reserved => {}
+            StartReservation::AlreadyActive => return Ok(ListenerStart::Connected),
+            StartReservation::InProgress => return Ok(ListenerStart::Pending),
         }
 
         info!(
@@ -726,6 +806,7 @@ impl ConnectionPointListenerManager {
         let gateway_index_clone = Arc::clone(&self.gateway_index);
         let starting_listeners_clone = Arc::clone(&self.starting_listeners);
         let starting_listeners_notify_clone = Arc::clone(&self.starting_listeners_notify);
+        let pending_listeners_clone = Arc::clone(&self.pending_listeners);
         let message_store_clone = Arc::clone(&self.message_store);
         let cp_clone = connection_point.clone();
         let cp_id_clone = cp_id.clone();
@@ -803,6 +884,7 @@ impl ConnectionPointListenerManager {
                     }
                 }
                 drop(listeners);
+                take_pending(&pending_listeners_clone, &cp_id_clone, &listener_instance_id_clone);
                 let removed_start = starting_listeners_clone
                     .lock()
                     .await
@@ -819,7 +901,7 @@ impl ConnectionPointListenerManager {
         // Authentication can take several seconds, so we give it 30 seconds
         // If it times out, we'll still register the listener so it appears in the UI
         // and pings will wait for actual connection rather than failing immediately
-        let client = match tokio::time::timeout(std::time::Duration::from_secs(30), client_rx.recv()).await {
+        let client = match tokio::time::timeout(INITIAL_CONNECT_TIMEOUT, client_rx.recv()).await {
             Ok(Some(client)) => client,
             Ok(None) => {
                 self.finish_listener_start(&cp_id)
@@ -849,6 +931,18 @@ impl ConnectionPointListenerManager {
                 let starting_listeners_notify_clone = Arc::clone(&self.starting_listeners_notify);
                 let self_ref_clone = self.self_ref.clone();
                 let inbound_acl_clone = inbound_acl.clone();
+                let listeners_active_clone = Arc::clone(&self.listeners_active);
+                let pending_listeners_clone = Arc::clone(&self.pending_listeners);
+                self.pending_listeners
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        cp_id.clone(),
+                        PendingListener {
+                            instance_id: listener_instance_id.clone(),
+                            abort_handle: handle.abort_handle(),
+                        },
+                    );
 
                 tokio::spawn(async move {
                     // No abort timeout: the listener task keeps retrying under the
@@ -890,40 +984,74 @@ impl ConnectionPointListenerManager {
                                         inbound_acl: inbound_acl_clone,
                                     };
 
-                                    let old_listener = {
+                                    // Checked under the listeners lock that a stop
+                                    // drains, so a stop or Standby either sees this
+                                    // listener or this check sees the stop.
+                                    let registration = {
                                         let mut listeners = listeners_clone.write().await;
-                                        let mut idx = gateway_index_clone
-                                            .write()
-                                            .await;
-                                        index_gateway_listener(&listeners, &mut idx, &listener_info);
-                                        listeners.insert(cp_id_clone.clone(), listener_info)
+                                        let still_wanted = listeners_active_clone.load(Ordering::SeqCst)
+                                            && take_pending(
+                                                &pending_listeners_clone,
+                                                &cp_id_clone,
+                                                &listener_instance_id_clone,
+                                            );
+                                        if still_wanted {
+                                            let mut idx = gateway_index_clone
+                                                .write()
+                                                .await;
+                                            index_gateway_listener(&listeners, &mut idx, &listener_info);
+                                            Ok(listeners.insert(cp_id_clone.clone(), listener_info))
+                                        } else {
+                                            Err(listener_info)
+                                        }
                                     };
-                                    if let Some(old_listener) = old_listener {
-                                        old_listener
-                                            .client
-                                            .atm()
-                                            .graceful_shutdown()
-                                            .await;
-                                        old_listener
-                                            .abort_handle
-                                            .abort();
+                                    match registration {
+                                        Ok(old_listener) => {
+                                            if let Some(old_listener) = old_listener {
+                                                old_listener
+                                                    .client
+                                                    .atm()
+                                                    .graceful_shutdown()
+                                                    .await;
+                                                old_listener
+                                                    .abort_handle
+                                                    .abort();
+                                            }
+                                            info!(
+                                                "WebSocket listener registered after delayed connection for connection point '{}'",
+                                                connection_point_clone.name
+                                            );
+                                            Self::spawn_peer_issuer_reconciliation(
+                                                &self_ref_clone,
+                                                connection_point_clone
+                                                    .gateway_id
+                                                    .clone(),
+                                            );
+                                        }
+                                        Err(refused) => {
+                                            warn!(
+                                                "Connection point '{}' was stopped or its node went to Standby while connecting, not registering listener",
+                                                cp_id_clone
+                                            );
+                                            refused
+                                                .client
+                                                .atm()
+                                                .graceful_shutdown()
+                                                .await;
+                                            refused.abort_handle.abort();
+                                        }
                                     }
-                                    info!(
-                                        "WebSocket listener registered after delayed connection for connection point '{}'",
-                                        connection_point_clone.name
-                                    );
-                                    Self::spawn_peer_issuer_reconciliation(
-                                        &self_ref_clone,
-                                        connection_point_clone
-                                            .gateway_id
-                                            .clone(),
-                                    );
                                 }
                                 Ok(None) => {
                                     warn!(
                                         "Connection point '{}' was deleted while establishing connection, not registering listener",
                                         cp_id_clone
                                     );
+                                    take_pending(&pending_listeners_clone, &cp_id_clone, &listener_instance_id_clone);
+                                    client
+                                        .atm()
+                                        .graceful_shutdown()
+                                        .await;
                                     handle_clone.abort();
                                 }
                                 Err(e) => {
@@ -931,11 +1059,17 @@ impl ConnectionPointListenerManager {
                                         "Failed to verify connection point '{}' exists: {}, not registering listener",
                                         cp_id_clone, e
                                     );
+                                    take_pending(&pending_listeners_clone, &cp_id_clone, &listener_instance_id_clone);
+                                    client
+                                        .atm()
+                                        .graceful_shutdown()
+                                        .await;
                                     handle_clone.abort();
                                 }
                             }
                         }
                         None => {
+                            take_pending(&pending_listeners_clone, &cp_id_clone, &listener_instance_id_clone);
                             warn!(
                                 "WebSocket listener task ended before delayed registration for connection point '{}'",
                                 cp_id_clone
@@ -952,12 +1086,11 @@ impl ConnectionPointListenerManager {
                     }
                 });
 
-                // Return OK - listener will be registered when connection succeeds
                 info!(
                     "WebSocket listener task started for connection point '{}' (waiting for connection)",
                     connection_point.name
                 );
-                return Ok(());
+                return Ok(ListenerStart::Pending);
             }
         };
 
@@ -1010,7 +1143,7 @@ impl ConnectionPointListenerManager {
         );
 
         info!("WebSocket listener started successfully for connection point '{}'", connection_point.name);
-        Ok(())
+        Ok(ListenerStart::Connected)
     }
 
     /// Stop a WebSocket listener for a connection point
@@ -1018,7 +1151,7 @@ impl ConnectionPointListenerManager {
         &self,
         connection_point_id: &str,
     ) -> Result<(), String> {
-        let listener = {
+        let (listener, pending) = {
             let mut listeners = self.listeners.write().await;
             let listener = listeners.remove(connection_point_id);
             if let Some(listener) = &listener {
@@ -1030,9 +1163,18 @@ impl ConnectionPointListenerManager {
                     recompute_gateway_index_for(&listeners, &mut idx, &listener.gateway_id);
                 }
             }
-            listener
+            let pending = self
+                .pending_listeners
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(connection_point_id);
+            (listener, pending)
         };
 
+        if let Some(pending) = &pending {
+            info!("Cancelling WebSocket listener still connecting for connection point '{}'", connection_point_id);
+            pending.abort_handle.abort();
+        }
         if let Some(listener) = listener {
             info!("Stopping WebSocket listener for connection point '{}'", listener.name);
             listener
@@ -1041,6 +1183,8 @@ impl ConnectionPointListenerManager {
                 .graceful_shutdown()
                 .await;
             listener.abort_handle.abort();
+            Ok(())
+        } else if pending.is_some() {
             Ok(())
         } else {
             Err(format!("No listener found for connection point {}", connection_point_id))
@@ -1198,7 +1342,13 @@ impl ConnectionPointListenerManager {
         let completion = self.request_start_listener(cp, mediator_did, mediator_url)?;
 
         match tokio::time::timeout(timeout, completion).await {
-            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Ok(ListenerStart::Connected))) => {}
+            Ok(Ok(Ok(ListenerStart::Pending))) => {
+                return Err(format!("listener '{}' is still connecting to its mediator", connection_point_id));
+            }
+            Ok(Ok(Ok(ListenerStart::Paused))) => {
+                return Err(format!("connection point '{}' waits for mediator access", connection_point_id));
+            }
             Ok(Ok(Err(e))) => return Err(format!("listener restart failed: {}", e)),
             Ok(Err(_)) => return Err("listener restart completion channel dropped".to_string()),
             Err(_) => return Err(format!("listener restart timed out after {:?}", timeout)),
@@ -1627,77 +1777,30 @@ impl ConnectionPointListenerManager {
         });
     }
 
-    /// Send settlement completion notification to a target gateway via DIDComm
-    /// Used by settlement sync worker to notify originating gateways of settlement completion
-    pub async fn send_settlement_complete(
-        &self,
-        target_gateway_id: &str,
-        correlation_id: &str,
-        tx_hash: &str,
-    ) -> Result<(), String> {
-        use crate::messages::MessageType;
-
-        // Get target gateway DID from gateway store
-        let target_gateway = match &self.gateway_store {
-            Some(store) => store
-                .get(target_gateway_id)
-                .await
-                .map_err(|e| format!("Failed to get gateway {}: {}", target_gateway_id, e))?
-                .ok_or_else(|| format!("Gateway {} not found", target_gateway_id))?,
-            None => {
-                return Err("Gateway store not available".to_string());
-            }
-        };
-
-        // Get an active DIDComm client from any listener
-        let listeners = self.listeners.read().await;
-        let (client, our_did) = listeners
-            .values()
-            .next()
-            .map(|listener| (listener.client.clone(), listener.gateway_did.clone()))
-            .ok_or_else(|| "No active connection points for sending message".to_string())?;
-        drop(listeners); // Release lock
-
-        info!(
-            "Sending settlement-complete: correlation_id={} tx_hash={} → gateway={}",
-            correlation_id, tx_hash, target_gateway.did
-        );
-
-        let message_body = serde_json::json!({
-            "correlation_id": correlation_id,
-            "tx_hash": tx_hash,
-            "status": "completed",
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-        });
-
-        crate::comm::didcomm::gateway::send_notification_message(
-            &client,
-            &our_did,
-            &target_gateway.did,
-            &MessageType::X402SettlementComplete.to_string(),
-            message_body,
-        )
-        .await?;
-
-        info!(
-            "✅ Settlement completion notification sent: correlation_id={} → gateway={}",
-            correlation_id, target_gateway.did
-        );
-
-        Ok(())
-    }
-
     /// Stop all listeners (for shutdown)
     #[allow(dead_code)]
     pub async fn stop_all_listeners(&self) {
-        let listeners: Vec<ListenerInfo> = {
+        let (listeners, pending): (Vec<ListenerInfo>, Vec<PendingListener>) = {
             let mut listeners = self.listeners.write().await;
-            listeners
+            let pending = self
+                .pending_listeners
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .drain()
-                .map(|(_id, listener)| listener)
-                .collect()
+                .map(|(_id, pending)| pending)
+                .collect();
+            (
+                listeners
+                    .drain()
+                    .map(|(_id, listener)| listener)
+                    .collect(),
+                pending,
+            )
         };
 
+        for pending in pending {
+            pending.abort_handle.abort();
+        }
         for listener in listeners {
             info!("Stopping WebSocket listener for connection point '{}'", listener.name);
             listener
@@ -1964,20 +2067,6 @@ async fn run_websocket_listener<CS: super::ConnectionPointStore + 'static>(
             manager
                 .update_listener_client(&connection_point.id, client.clone())
                 .await;
-        }
-
-        // Initialize/refresh x402 gateway facilitator service with ATM infrastructure
-        if let Err(e) = crate::x402::set_atm_infrastructure(
-            Arc::clone(client.atm()),
-            Arc::clone(client.profile()),
-            connection_point_did.to_string(),
-        )
-        .await
-        {
-            warn!("Failed to initialize x402 gateway facilitator service: {}", e);
-            warn!("  Gateway-to-gateway DIDComm verification will not be available");
-        } else {
-            info!("✓ x402 gateway facilitator service ready for DIDComm verification");
         }
 
         info!("✓ WebSocket connection established for connection point '{}'", connection_point.name);
@@ -2810,6 +2899,68 @@ impl<CS: super::ConnectionPointStore + 'static> OpenAdmission<CS> {
 /// connection-setups on one listener never being redeemed concurrently. Messages that only complete a waiter held by an
 /// in-flight dispatch run inline, because waiting for a slot could wait on the
 /// very dispatch the reply would free.
+/// Settles one queued dispatch whether it finishes or is aborted. A reconnect
+/// drops the listener's dispatch set, aborting dispatches before they answer
+/// or delete their message, and the mediator then redelivers it. An aborted
+/// dispatch therefore forgets the envelope it was handling, unless that
+/// envelope was already remembered when it started, so the redelivery is
+/// processed instead of being dropped as a duplicate. The in-flight count
+/// drops either way.
+struct DispatchSettlement {
+    unanswered: Option<ReceivedMessage>,
+    in_flight: Arc<std::sync::atomic::AtomicU64>,
+    metrics: Arc<RwLock<ConnectionPointMetrics>>,
+    released: bool,
+}
+
+impl DispatchSettlement {
+    fn new(
+        message: &ReceivedMessage,
+        in_flight: Arc<std::sync::atomic::AtomicU64>,
+        metrics: Arc<RwLock<ConnectionPointMetrics>>,
+    ) -> Self {
+        Self {
+            unanswered: (!super::envelope_replay::is_remembered(message)).then(|| message.clone()),
+            in_flight,
+            metrics,
+            released: false,
+        }
+    }
+
+    fn answered(&mut self) {
+        self.unanswered = None;
+    }
+
+    async fn finish(mut self) {
+        let remaining = self.release();
+        self.metrics
+            .write()
+            .await
+            .in_flight_dispatches = remaining;
+    }
+
+    fn release(&mut self) -> u64 {
+        self.released = true;
+        self.in_flight
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1)
+    }
+}
+
+impl Drop for DispatchSettlement {
+    fn drop(&mut self) {
+        if let Some(message) = self.unanswered.take() {
+            super::envelope_replay::forget_unanswered(&message);
+        }
+        if !self.released {
+            let remaining = self.release();
+            if let Ok(mut metrics) = self.metrics.try_write() {
+                metrics.in_flight_dispatches = remaining;
+            }
+        }
+    }
+}
+
 fn dispatches_inline(message_type: &str) -> bool {
     matches!(
         message_type,
@@ -3312,17 +3463,88 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                                         warn!("Cannot process OOB connection-setup: missing required stores");
                                     }
                                 }
+                                message_processor::ProcessingResult::OOBInvitationUnusable {
+                                    acceptor_temporary_did,
+                                    reason,
+                                } => {
+                                    // The acceptor that redeemed the invitation may send its
+                                    // setup again (a mediator redelivery or a Continue retry);
+                                    // its first setup waits for approval, so it is not refused.
+                                    let redeemed_by_sender = match pending_connection_store {
+                                        Some(store) => {
+                                            store
+                                                .awaits_approval_from(&acceptor_temporary_did)
+                                                .await
+                                        }
+                                        None => false,
+                                    };
+                                    if redeemed_by_sender {
+                                        info!(
+                                            "connection-setup from {} on '{}' repeats the one waiting for approval; not answered",
+                                            acceptor_temporary_did, connection_point.name
+                                        );
+                                    } else {
+                                        warn!(
+                                            "connection-setup from {} refused on '{}': {}",
+                                            acceptor_temporary_did, connection_point.name, reason
+                                        );
+                                        send_pairing_rejection(
+                                            client,
+                                            connection_point_did,
+                                            &acceptor_temporary_did,
+                                            message_processor::INVITATION_UNUSABLE_REASON,
+                                        )
+                                        .await;
+                                    }
+                                }
                                 message_processor::ProcessingResult::OOBConnectionRejected { reason } => {
                                     error!("❌ OOB connection-rejected received! Reason: {}", reason);
 
                                     // This is the ACCEPTOR side receiving rejection from INVITER
-                                    // The message is not tied to the sender of the invitation, so it only
-                                    // logs; the pairing and its temporary connection point expire.
-                                    if let Some(_pend_store) = pending_connection_store {
-                                        error!("Connection rejected - pending connection left to expire");
-                                        error!("Rejection reason: {}", reason);
+                                    if let (Some(gw_store), Some(pend_store)) =
+                                        (gateway_store, pending_connection_store)
+                                    {
+                                        let outcome = fail_rejected_pairing(
+                                            connection_point,
+                                            received_msg
+                                                .from_did
+                                                .as_deref(),
+                                            &reason,
+                                            gw_store.as_ref(),
+                                            pend_store,
+                                        )
+                                        .await;
+                                        if outcome == RejectedPairing::Failed {
+                                            // The attempt is over: its temporary connection point has
+                                            // nothing left to receive. Stopping the listener ends this
+                                            // task, so it comes last.
+                                            if let Some(cps) = cp_store
+                                                && let Err(e) = cps
+                                                    .delete(&connection_point.id)
+                                                    .await
+                                            {
+                                                warn!("Failed to delete temporary connection point: {}", e);
+                                            }
+                                            delete_message_after_processing(
+                                                client,
+                                                &message_sha256_hash,
+                                                &connection_point.name,
+                                            )
+                                            .await;
+                                            if let Some(mgr) = manager_weak
+                                                .as_ref()
+                                                .and_then(|weak| weak.upgrade())
+                                                && let Err(e) = mgr
+                                                    .stop_listener(&connection_point.id)
+                                                    .await
+                                            {
+                                                warn!("Failed to stop temporary listener: {}", e);
+                                            }
+                                        }
                                     } else {
-                                        warn!("Cannot cleanup rejected connection: missing pending store");
+                                        warn!(
+                                            "Cannot mark the rejected pairing failed: missing gateway or pending store"
+                                        );
                                     }
                                 }
                                 message_processor::ProcessingResult::ProcessedNoResponse => {
@@ -3416,23 +3638,17 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                                 .name
                                 .clone();
                             let message_sha256_hash_c = message_sha256_hash.clone();
-                            let metrics_c = Arc::clone(metrics);
-                            let in_flight_c = Arc::clone(&in_flight);
+                            let mut settlement =
+                                DispatchSettlement::new(&received_msg, Arc::clone(&in_flight), Arc::clone(metrics));
                             let received_msg_c = received_msg.clone();
 
                             dispatch_set.spawn(async move {
                                 let _permit = permit; // released on drop
                                 dispatch_simple_message(&client_c, &cp_did_c, &cp_id_c, &cp_name_c, received_msg_c)
                                     .await;
+                                settlement.answered();
                                 delete_message_after_processing(&client_c, &message_sha256_hash_c, &cp_name_c).await;
-
-                                let remaining = in_flight_c
-                                    .fetch_sub(1, Ordering::Relaxed)
-                                    .saturating_sub(1);
-                                metrics_c
-                                    .write()
-                                    .await
-                                    .in_flight_dispatches = remaining;
+                                settlement.finish().await;
                             });
 
                             // Reap any completed dispatch tasks so the
@@ -3636,26 +3852,122 @@ fn permanent_mediator_reference(
         .to_string()
 }
 
-/// The deadline of a pairing rebuilt from its temporary connection point: the
-/// recorded expiry, else the connection point's creation time plus the configured
-/// lifetime. A recorded value that cannot be read is an error, never a fresh
-/// deadline, so recovery cannot renew an expired pairing.
-fn resolve_recovered_expires_at(
-    temp_connection_point: &super::types::GatewayConnectionPoint,
-    pending_expiry_hours: u64,
-) -> Result<chrono::DateTime<chrono::Utc>, String> {
-    if let Some(recorded) = temp_connection_point.expires_at {
-        return Ok(recorded);
+/// Tell an acceptor its connection-setup was refused. Best effort: a failed send is logged and
+/// changes nothing else.
+async fn send_pairing_rejection(
+    client: &DIDCommClient,
+    our_did: &str,
+    acceptor_did: &str,
+    reason: &str,
+) {
+    match crate::comm::didcomm::gateway::send_connection_rejected(client, our_did, acceptor_did, reason).await {
+        Ok(()) => info!("Sent connection-rejected to acceptor {}", acceptor_did),
+        Err(e) => warn!("Could not send connection-rejected to acceptor {}: {}", acceptor_did, e),
     }
-    match temp_connection_point
-        .oob_message
-        .get("expires_at")
+}
+
+/// The longest inviter reason kept in a rejected gateway's description.
+const MAX_REJECTION_REASON_CHARS: usize = 200;
+
+/// What a `connection-rejected` did to the acceptance waiting on the connection point it
+/// arrived on.
+#[derive(Debug, PartialEq)]
+enum RejectedPairing {
+    /// The pending gateway is now `failed`, its description giving the inviter's reason.
+    Failed,
+    /// Nothing changed: no acceptance waits there for that sender, or its gateway is not pending.
+    Ignored,
+}
+
+/// The description of a gateway whose pairing the inviter rejected: the reason in
+/// front of the description the operator gave, which is kept.
+fn rejected_description(
+    reason: &str,
+    operator_description: &str,
+) -> String {
+    let operator_description = operator_description.trim();
+    if operator_description.is_empty() {
+        format!("Connection rejected: {reason}")
+    } else {
+        format!("Connection rejected: {reason} — {operator_description}")
+    }
+}
+
+/// Mark the pending gateway of the acceptance waiting on `connection_point` failed with the
+/// inviter's reason, when `from_did` is the inviter its connection-setup went to. The sender is
+/// authcrypt-verified, so another DID cannot fail someone else's pairing.
+async fn fail_rejected_pairing<S: GatewayStore + ?Sized>(
+    connection_point: &GatewayConnectionPoint,
+    from_did: Option<&str>,
+    reason: &str,
+    gateway_store: &S,
+    pending_store: &crate::gateways::PendingConnectionStore,
+) -> RejectedPairing {
+    let Some(pending) = pending_store
+        .get_by_temporary_cp_id(&connection_point.id)
+        .await
+    else {
+        warn!("connection-rejected on '{}' ignored: no acceptance waits on it", connection_point.name);
+        return RejectedPairing::Ignored;
+    };
+    if pending.role != crate::gateways::ConnectionRole::Acceptor
+        || from_did
+            != Some(
+                pending
+                    .their_temporary_did
+                    .as_str(),
+            )
     {
-        Some(value) => serde_json::from_value(value.clone()).map_err(|e| {
-            format!("Temporary connection point {} has an unreadable expiry: {e}", temp_connection_point.id)
-        }),
-        None => Ok(temp_connection_point.created_at + chrono::Duration::hours(pending_expiry_hours as i64)),
+        warn!(
+            "connection-rejected on '{}' ignored: sender {:?} is not the inviter {}",
+            connection_point.name, from_did, pending.their_temporary_did
+        );
+        return RejectedPairing::Ignored;
     }
+    let mut gateway = match gateway_store
+        .get(&connection_point.gateway_id)
+        .await
+    {
+        Ok(Some(gateway))
+            if gateway.status == crate::gateways::types::GatewayStatus::Pending
+                && gateway.did == pending.their_temporary_did =>
+        {
+            gateway
+        }
+        Ok(_) => {
+            warn!(
+                "connection-rejected on '{}' ignored: gateway {} is not pending",
+                connection_point.name, connection_point.gateway_id
+            );
+            return RejectedPairing::Ignored;
+        }
+        Err(e) => {
+            warn!(
+                "connection-rejected on '{}': failed to load gateway {}: {}",
+                connection_point.name, connection_point.gateway_id, e
+            );
+            return RejectedPairing::Ignored;
+        }
+    };
+    let reason: String = reason
+        .chars()
+        .take(MAX_REJECTION_REASON_CHARS)
+        .collect();
+    gateway.status = crate::gateways::types::GatewayStatus::Failed;
+    gateway.description = rejected_description(&reason, &gateway.description);
+    gateway.updated_at = Utc::now();
+    if let Err(e) = gateway_store
+        .update(&gateway)
+        .await
+    {
+        error!("Failed to mark gateway {} failed after its pairing was rejected: {}", gateway.id, e);
+        return RejectedPairing::Ignored;
+    }
+    pending_store
+        .remove(&pending.id)
+        .await;
+    info!("Gateway {} failed: its inviter rejected the pairing ({})", gateway.id, reason);
+    RejectedPairing::Failed
 }
 
 /// Finalize OOB connection as ACCEPTOR after receiving connection-accepted
@@ -3845,8 +4157,7 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
             )
             .await?;
 
-            let recovered_expires_at = resolve_recovered_expires_at(
-                &temp_connection_point,
+            let recovered_expires_at = temp_connection_point.pending_deadline(
                 bootstrap_config
                     .oob_connection
                     .pending_expiry_hours,
@@ -4162,22 +4473,57 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
     connection_point.last_used_at = Some(chrono::Utc::now());
     connection_point.mediator_did = Some(connection_mediator_did.clone());
 
-    let announcement = crate::event_hook::CreationGuard::start(
-        listener_manager
-            .event_hook()
-            .cloned(),
-        crate::event_hook::ConnectionPointPayload::from_record(&connection_point, None),
-    );
+    // A permanent DID the acceptance reserved was announced when it paused.
+    let announced_at_pause = match pending_conn
+        .temporary_cp_id
+        .as_deref()
+    {
+        Some(temporary_id) => cp_store
+            .get(temporary_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|point| point.reserved_permanent)
+            .is_some_and(|reserved| reserved.cp_id == cp_id),
+        None => false,
+    };
+    let hook = listener_manager
+        .event_hook()
+        .cloned();
+    let minted = crate::event_hook::ConnectionPointPayload::from_record(&connection_point, None);
+    let announcement = if announced_at_pause {
+        crate::event_hook::CreationGuard::resume(hook, minted)
+    } else {
+        crate::event_hook::CreationGuard::start(hook, minted)
+    };
     let saved = crate::event_hook::ConnectionPointPayload::from_record(&connection_point, None);
     let record = connection_point.clone();
     let point_store = cp_store.clone();
+    let reserving_id = pending_conn
+        .temporary_cp_id
+        .clone()
+        .filter(|_| announced_at_pause);
     announcement
         .complete(
             async move {
                 let _held_until_saved = mediator_guard;
-                point_store
-                    .create(&record)
-                    .await
+                match &reserving_id {
+                    // Fails if the reserving point was deleted meanwhile, with the keys
+                    // of its reservation.
+                    Some(reserving_id) => {
+                        point_store
+                            .create_reserved(&record, reserving_id)
+                            .await?;
+                        crate::gateways::mediator_access::mark_reservation_consumed(point_store.as_ref(), reserving_id)
+                            .await;
+                    }
+                    None => {
+                        point_store
+                            .create(&record)
+                            .await?
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
             },
             saved,
         )
@@ -4209,8 +4555,14 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
             // Wait for the listener to actually start (event-driven, no polling)
             info!("   ⏳ Waiting for listener to start...");
             match completion_rx.await {
-                Ok(Ok(())) => {
+                Ok(Ok(ListenerStart::Connected)) => {
                     info!("   ✓ Listener started successfully");
+                }
+                Ok(Ok(ListenerStart::Pending)) => {
+                    warn!("   ⚠️  Listener is still connecting to its mediator; it registers once connected");
+                }
+                Ok(Ok(ListenerStart::Paused)) => {
+                    info!("   Listener not started: the connection point waits for mediator access");
                 }
                 Ok(Err(e)) => {
                     warn!("   ⚠️  Listener failed to start: {}", e);
@@ -4332,33 +4684,13 @@ async fn handle_oob_connection_setup_as_inviter<CS: super::ConnectionPointStore 
     .await
     {
         Ok(connection_point) => connection_point,
-        Err(super::message_processor::InvitationRefusal::Unavailable(reason)) => {
-            error!("❌ Invitation for {} not redeemed: {}", our_temporary_did, reason);
-            return Err(reason);
-        }
-        Err(super::message_processor::InvitationRefusal::InvalidSecret) => {
-            error!("❌ Secret validation failed for invitation {}", our_temporary_did);
-
-            // Send connection-rejected message back to acceptor
-            info!("📤 Sending connection-rejected message to acceptor...");
-
-            match crate::comm::didcomm::gateway::send_connection_rejected(
-                client,
-                our_temporary_did,
-                acceptor_temporary_did,
-                "Invalid connection secret",
-            )
-            .await
-            {
-                Ok(_) => {
-                    info!("✓ Connection-rejected message sent successfully");
-                }
-                Err(e) => {
-                    error!("❌ Failed to send connection-rejected message: {}", e);
-                }
+        Err(refusal) => {
+            let detail = refusal.detail();
+            error!("❌ Invitation for {} not redeemed: {}", our_temporary_did, detail);
+            if let Some(reason) = refusal.rejection_reason() {
+                send_pairing_rejection(client, our_temporary_did, acceptor_temporary_did, reason).await;
             }
-
-            return Err("Invalid connection secret".to_string());
+            return Err(detail);
         }
     };
     info!("  Redeemed invitation: {} (ID: {})", connection_point.name, connection_point.id);
@@ -4429,37 +4761,43 @@ async fn handle_oob_connection_setup_as_inviter<CS: super::ConnectionPointStore 
             .await
             .map_err(|e| format!("Inbound gateway connection refused (appliance limit): {}", e.message()))?;
 
-        // Step 2: Create our secure DID for the permanent connection
-        info!("🔑 Creating our secure DID for permanent connection...");
+        // Step 2: Our secure DID for the permanent connection: the one the
+        // connection point reserved, else a new one
+        let our_secure_did = if let Some(reserved) = &connection_point.reserved_permanent {
+            info!("✓ Using the permanent DID reserved with the connection point: {}", reserved.did);
+            reserved.did.clone()
+        } else {
+            info!("🔑 Creating our secure DID for permanent connection...");
 
-        // Get network_config from manager
-        let network_config = manager_weak
-            .as_ref()
-            .and_then(|w| w.upgrade())
-            .and_then(|m| m.network_config.clone())
-            .ok_or_else(|| "Network config not available in listener manager".to_string())?;
+            let network_config = manager_weak
+                .as_ref()
+                .and_then(|w| w.upgrade())
+                .and_then(|m| m.network_config.clone())
+                .ok_or_else(|| "Network config not available in listener manager".to_string())?;
 
-        let secure_cp_id = uuid::Uuid::new_v4().to_string();
-        let (our_secure_did, _secure_secrets, _secure_doc) =
-            crate::gateways::connection_points::handlers::generate_connection_point_identity(
-                &secure_cp_id,
-                &network_config.did.domain,
-                std::path::Path::new(
-                    &bootstrap_config
-                        .storage_paths
-                        .connection_points,
-                ),
-                mediator_url,
-                &connection_point.did_method,
-                #[cfg(feature = "didwebvh")]
-                None,
-                #[cfg(feature = "didwebvh")]
-                None,
-            )
-            .await
-            .map_err(|e| format!("Failed to generate secure DID: {}", e))?;
+            let secure_cp_id = uuid::Uuid::new_v4().to_string();
+            let (our_secure_did, _secure_secrets, _secure_doc) =
+                crate::gateways::connection_points::handlers::generate_connection_point_identity(
+                    &secure_cp_id,
+                    &network_config.did.domain,
+                    std::path::Path::new(
+                        &bootstrap_config
+                            .storage_paths
+                            .connection_points,
+                    ),
+                    mediator_url,
+                    &connection_point.did_method,
+                    #[cfg(feature = "didwebvh")]
+                    None,
+                    #[cfg(feature = "didwebvh")]
+                    None,
+                )
+                .await
+                .map_err(|e| format!("Failed to generate secure DID: {}", e))?;
 
-        info!("✓ Our secure DID created: {}", our_secure_did);
+            info!("✓ Our secure DID created: {}", our_secure_did);
+            our_secure_did
+        };
 
         // Step 3: Create the gateway record with AwaitingApproval status
         // Store the acceptor's information so admin can review and approve
@@ -4597,264 +4935,6 @@ async fn handle_oob_connection_setup_as_inviter<CS: super::ConnectionPointStore 
         super::message_processor::release_invitation(cp_store.as_ref(), &connection_point.id).await;
     }
     outcome
-}
-
-/// Spawn a temporary listener for OOB acceptor to receive connection-accepted message
-/// This listener will automatically cleanup after receiving the message or timing out
-#[allow(dead_code)]
-pub async fn spawn_oob_acceptor_listener<S: GatewayStore + 'static, CS: super::ConnectionPointStore + 'static>(
-    temp_did: String,
-    pending_gateway_id: String,
-    client: DIDCommClient,
-    gateway_store: Arc<S>,
-    pending_store: Arc<crate::gateways::PendingConnectionStore>,
-    bootstrap_config: Arc<crate::config::BootstrapConfig>,
-    cp_store: Arc<CS>,
-    listener_manager: Arc<ConnectionPointListenerManager>,
-    mediator_did: String,
-    mediator_url: String,
-) {
-    crate::observability::spawn_traced_task(&format!("oob_listener.{}", pending_gateway_id), async move {
-        info!("🎧 Starting temporary listener for OOB acceptor (pending gateway: {})", pending_gateway_id);
-        info!("   Listening on temporary DID: {}", temp_did);
-        info!("   Will auto-cleanup after receiving connection-accepted or 5 minute timeout");
-
-        // Set a 5-minute timeout for the entire listener
-        let pending_gateway_id_clone = pending_gateway_id.clone();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            listen_for_connection_accepted(
-                temp_did,
-                pending_gateway_id,
-                client,
-                gateway_store,
-                pending_store,
-                bootstrap_config,
-                cp_store,
-                listener_manager,
-                mediator_did,
-                mediator_url,
-            ),
-        )
-        .await;
-
-        match result {
-            Ok(Ok(())) => {
-                info!("✅ OOB acceptor listener completed successfully");
-            }
-            Ok(Err(e)) => {
-                error!("❌ OOB acceptor listener failed: {}", e);
-            }
-            Err(_) => {
-                warn!("⏱️  OOB acceptor listener timed out after 5 minutes");
-                warn!("   Pending gateway {} may remain in Pending state", pending_gateway_id_clone);
-            }
-        }
-    });
-}
-
-/// Listen for connection-accepted message on temporary DID
-#[allow(dead_code)]
-async fn listen_for_connection_accepted<S: GatewayStore, CS: super::ConnectionPointStore + 'static>(
-    _temp_did: String,
-    _pending_gateway_id: String,
-    client: DIDCommClient,
-    gateway_store: Arc<S>,
-    pending_store: Arc<crate::gateways::PendingConnectionStore>,
-    bootstrap_config: Arc<crate::config::BootstrapConfig>,
-    cp_store: Arc<CS>,
-    listener_manager: Arc<ConnectionPointListenerManager>,
-    mediator_did: String,
-    mediator_url: String,
-) -> Result<(), String> {
-    info!("📥 Polling for messages on temporary DID...");
-
-    // Poll for messages every 2 seconds
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
-    let mut poll_count = 0;
-
-    loop {
-        interval.tick().await;
-        poll_count += 1;
-
-        if poll_count % 10 == 0 {
-            info!("   Still listening... ({} polls)", poll_count);
-        }
-
-        // Fetch messages
-        let response = match client
-            .atm()
-            .fetch_messages(client.profile(), &Default::default())
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                error!("   Failed to fetch messages: {:?}", e);
-                continue;
-            }
-        };
-
-        let messages = response.success;
-
-        if messages.is_empty() {
-            continue;
-        }
-
-        info!("📬 Received {} message(s)", messages.len());
-
-        // Process each message
-        for msg_envelope in messages {
-            info!("   Processing message ID: {}", msg_envelope.msg_id);
-
-            // Unpack the message
-            let msg_str = msg_envelope
-                .msg
-                .as_ref()
-                .ok_or_else(|| "Message content is missing".to_string())?;
-
-            let (message, _metadata): (affinidi_messaging_didcomm::Message, _) = match client
-                .atm()
-                .unpack(msg_str)
-                .await
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    error!("   Failed to unpack message: {:?}", e);
-                    continue;
-                }
-            };
-
-            info!("   Message type: {}", message.typ);
-
-            // Check if it's connection-accepted
-            if message.typ == MessageType::ConnectionAccepted.to_string() {
-                info!("🎉 Received connection-accepted message!");
-
-                // Extract inviter's secure DID from the message body
-                let inviter_secure_did = message
-                    .body
-                    .get("channel_did")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| "Missing channel_did in connection-accepted message".to_string())?;
-
-                info!("   Inviter's secure DID: {}", inviter_secure_did);
-
-                // Call finalize function with the temporary DID (since that's what we stored the gateway under)
-                let inviter_temp_did = message
-                    .from
-                    .as_ref()
-                    .ok_or_else(|| "Missing 'from' field in connection-accepted message".to_string())?;
-
-                let issuer_attestation = message
-                    .body
-                    .get("issuer_attestation")
-                    .and_then(|v| v.as_str());
-
-                let gateway = finalize_oob_connection_as_acceptor(
-                    inviter_temp_did,
-                    inviter_secure_did,
-                    issuer_attestation,
-                    message.thid.as_deref(),
-                    &gateway_store,
-                    &pending_store,
-                    &bootstrap_config,
-                    &cp_store,
-                    &listener_manager,
-                    None,
-                    &mediator_did,
-                    &mediator_url,
-                )
-                .await
-                .map_err(|e| {
-                    error!("❌ Failed to finalize OOB connection: {}", e);
-                    e
-                })?;
-
-                info!("✅ Gateway finalized: {} ({})", gateway.id, gateway.did);
-
-                // Delete the message from mediator
-                let delete_req = affinidi_messaging_sdk::messages::DeleteMessageRequest {
-                    message_ids: vec![msg_envelope.msg_id.clone()],
-                };
-                if let Err(e) = client
-                    .atm()
-                    .delete_messages_direct(client.profile(), &delete_req)
-                    .await
-                {
-                    warn!("   Failed to delete message from mediator: {:?}", e);
-                }
-
-                info!("✅ OOB connection fully established with permanent listener, stopping temporary listener");
-                return Ok(());
-            } else if message.typ == MessageType::ConnectionRejected.to_string() {
-                error!("❌ Received connection-rejected message!");
-
-                // Extract rejection reason
-                let reason = message
-                    .body
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown reason");
-
-                error!("   Rejection reason: {}", reason);
-
-                // Update the pending gateway to failed status
-                let inviter_temp_did = message
-                    .from
-                    .as_ref()
-                    .ok_or_else(|| "Missing 'from' field in connection-rejected message".to_string())?;
-
-                // Find the pending gateway by the inviter's temporary DID
-                if let Ok(Some(mut gateway)) = gateway_store
-                    .get_by_did(inviter_temp_did)
-                    .await
-                {
-                    info!("   Updating gateway {} to Failed status", gateway.id);
-                    gateway.status = crate::gateways::types::GatewayStatus::Failed;
-                    gateway.description = format!("Connection rejected: {}", reason);
-
-                    if let Err(e) = gateway_store
-                        .update(&gateway)
-                        .await
-                    {
-                        error!("   Failed to update gateway status: {}", e);
-                    } else {
-                        info!("   ✓ Gateway status updated to Failed");
-                    }
-                } else {
-                    warn!("   Could not find pending gateway to update");
-                }
-
-                // Remove the pending connection
-                if let Some(pending_conn) = pending_store
-                    .get_by_temporary_did(inviter_temp_did)
-                    .await
-                {
-                    pending_store
-                        .remove(&pending_conn.id)
-                        .await;
-                    info!("   ✓ Removed pending connection state");
-                }
-
-                // Delete the message from mediator
-                let delete_req = affinidi_messaging_sdk::messages::DeleteMessageRequest {
-                    message_ids: vec![msg_envelope.msg_id.clone()],
-                };
-                if let Err(e) = client
-                    .atm()
-                    .delete_messages_direct(client.profile(), &delete_req)
-                    .await
-                {
-                    warn!("   Failed to delete message from mediator: {:?}", e);
-                }
-
-                error!("❌ OOB connection rejected, stopping temporary listener");
-                return Err(format!("Connection rejected: {}", reason));
-            } else {
-                info!("   Skipping non-connection-accepted message type: {}", message.typ);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -5156,7 +5236,8 @@ mod tests {
         let nonce = uuid::Uuid::new_v4();
         fixture
             .runtime
-            .process(&fixture.capability_query(nonce), &MessageType::ForwardStreamQuery);
+            .process(&fixture.capability_query(nonce), &MessageType::ForwardStreamQuery)
+            .await;
         let open = fixture.open(nonce);
         let stream_id = uuid::Uuid::parse_str(
             open.message_body["stream_id"]
@@ -5590,6 +5671,247 @@ mod tests {
         assert_eq!(super::mediator_account_loss(&not_a_report, MEDIATOR_DID), None);
     }
 
+    const REJECTING_INVITER_DID: &str = "did:example:inviter-invitation";
+
+    struct RejectedAcceptance {
+        _directory: tempfile::TempDir,
+        gateways: crate::gateways::FileSystemGatewayStore,
+        pending: crate::gateways::PendingConnectionStore,
+        temporary_point: super::super::types::GatewayConnectionPoint,
+        gateway_id: String,
+    }
+
+    /// A pending acceptance as `connect-via-oob` leaves it: the pending gateway named by the
+    /// inviter's invitation DID, its temporary Connection Point and the pairing state.
+    async fn rejected_acceptance() -> RejectedAcceptance {
+        use super::super::types::{ConnectionPointType, GatewayConnectionPoint};
+        use crate::gateways::filesystem::GatewayStore;
+        use crate::gateways::types::{Gateway, GatewayStatus, GatewayType};
+
+        let directory = tempfile::tempdir().unwrap();
+        let gateways = crate::gateways::FileSystemGatewayStore::new(
+            directory
+                .path()
+                .join("gateways"),
+            None,
+        )
+        .await
+        .unwrap();
+        let pending = crate::gateways::PendingConnectionStore::new(
+            directory
+                .path()
+                .join("pending"),
+        )
+        .await
+        .unwrap();
+        let mut gateway =
+            Gateway::new("Partner".into(), "Partner gateway".into(), REJECTING_INVITER_DID.into(), GatewayType::Remote);
+        gateway.status = GatewayStatus::Pending;
+        gateways
+            .create(&gateway)
+            .await
+            .unwrap();
+        let temporary_point = GatewayConnectionPoint::new(
+            gateway.id.clone(),
+            "did:example:mediator".to_string(),
+            "did:example:acceptor-temporary".to_string(),
+            "Temporary listener".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            serde_json::json!({ "pending_gateway_id": gateway.id }),
+            None,
+            ConnectionPointType::System,
+            String::new(),
+        );
+        pending
+            .store(crate::gateways::PendingOOBConnection {
+                id: temporary_point.id.clone(),
+                our_temporary_did: temporary_point
+                    .connection_point_did
+                    .clone(),
+                our_secure_did: "did:example:acceptor-permanent".to_string(),
+                their_temporary_did: REJECTING_INVITER_DID.to_string(),
+                their_secure_did: None,
+                their_issuer_did: None,
+                mediator_did: "did:example:mediator".to_string(),
+                connection_point_id: String::new(),
+                invitation_id: "invitation-1".to_string(),
+                role: crate::gateways::ConnectionRole::Acceptor,
+                state: crate::gateways::ConnectionState::WaitingForResponse,
+                created_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::days(7),
+                secure_cp_id: None,
+                temporary_cp_id: Some(temporary_point.id.clone()),
+                mediator_record_id: None,
+            })
+            .await;
+        RejectedAcceptance {
+            _directory: directory,
+            gateways,
+            pending,
+            gateway_id: gateway.id,
+            temporary_point,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejection_from_the_inviter_marks_the_pending_gateway_failed_with_its_reason() {
+        use crate::gateways::filesystem::GatewayStore;
+        use crate::gateways::types::GatewayStatus;
+
+        let acceptance = rejected_acceptance().await;
+
+        let outcome = super::fail_rejected_pairing(
+            &acceptance.temporary_point,
+            Some(REJECTING_INVITER_DID),
+            crate::gateways::connection_points::message_processor::INVITATION_UNUSABLE_REASON,
+            &acceptance.gateways,
+            &acceptance.pending,
+        )
+        .await;
+
+        assert_eq!(outcome, super::RejectedPairing::Failed);
+        let gateway = acceptance
+            .gateways
+            .get(&acceptance.gateway_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(gateway.status, GatewayStatus::Failed);
+        assert_eq!(
+            gateway.description,
+            "Connection rejected: This invitation can't be used any more. Ask for a new one. — Partner gateway",
+            "the reason goes in front of the operator's description"
+        );
+        assert!(
+            acceptance
+                .pending
+                .get_by_temporary_cp_id(&acceptance.temporary_point.id)
+                .await
+                .is_none()
+        );
+        acceptance
+            .gateways
+            .delete(&acceptance.gateway_id)
+            .await
+            .unwrap();
+        assert!(
+            acceptance
+                .gateways
+                .get(&acceptance.gateway_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejection_from_another_sender_leaves_the_pending_gateway_pending() {
+        use crate::gateways::filesystem::GatewayStore;
+        use crate::gateways::types::GatewayStatus;
+
+        let acceptance = rejected_acceptance().await;
+
+        for from in [Some("did:example:someone-else"), None] {
+            let outcome = super::fail_rejected_pairing(
+                &acceptance.temporary_point,
+                from,
+                "Invalid connection secret",
+                &acceptance.gateways,
+                &acceptance.pending,
+            )
+            .await;
+            assert_eq!(outcome, super::RejectedPairing::Ignored, "{from:?}");
+        }
+
+        let gateway = acceptance
+            .gateways
+            .get(&acceptance.gateway_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(gateway.status, GatewayStatus::Pending);
+        assert_eq!(gateway.description, "Partner gateway");
+        assert!(
+            acceptance
+                .pending
+                .get_by_temporary_cp_id(&acceptance.temporary_point.id)
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejection_after_the_pairing_completed_changes_nothing() {
+        use crate::gateways::filesystem::GatewayStore;
+        use crate::gateways::types::GatewayStatus;
+
+        let acceptance = rejected_acceptance().await;
+        let mut gateway = acceptance
+            .gateways
+            .get(&acceptance.gateway_id)
+            .await
+            .unwrap()
+            .unwrap();
+        gateway.status = GatewayStatus::Active;
+        acceptance
+            .gateways
+            .update(&gateway)
+            .await
+            .unwrap();
+
+        let outcome = super::fail_rejected_pairing(
+            &acceptance.temporary_point,
+            Some(REJECTING_INVITER_DID),
+            "Invalid connection secret",
+            &acceptance.gateways,
+            &acceptance.pending,
+        )
+        .await;
+
+        assert_eq!(outcome, super::RejectedPairing::Ignored);
+        assert_eq!(
+            acceptance
+                .gateways
+                .get(&acceptance.gateway_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            GatewayStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_rejection_reason_is_cut_short() {
+        use crate::gateways::filesystem::GatewayStore;
+
+        let acceptance = rejected_acceptance().await;
+        let reason = "x".repeat(super::MAX_REJECTION_REASON_CHARS + 50);
+
+        super::fail_rejected_pairing(
+            &acceptance.temporary_point,
+            Some(REJECTING_INVITER_DID),
+            &reason,
+            &acceptance.gateways,
+            &acceptance.pending,
+        )
+        .await;
+
+        let description = acceptance
+            .gateways
+            .get(&acceptance.gateway_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .description;
+        assert_eq!(
+            description,
+            format!("Connection rejected: {} — Partner gateway", "x".repeat(super::MAX_REJECTION_REASON_CHARS))
+        );
+    }
+
     #[tokio::test]
     async fn only_a_paired_connection_point_narrows_its_mediator_account_to_its_peer() {
         use super::super::types::{ConnectionPointType, GatewayConnectionPoint};
@@ -5785,7 +6107,8 @@ mod tests {
         assert!(matches!(
             fixture
                 .runtime
-                .process(&from_peer, &MessageType::ForwardStreamQuery),
+                .process(&from_peer, &MessageType::ForwardStreamQuery)
+                .await,
             super::message_processor::ProcessingResult::RequiresResponse { .. }
         ));
         assert!(fixture.offered(&from_peer, nonce, std::time::Instant::now()), "the active peer is offered streams");
@@ -6536,38 +6859,6 @@ mod connected_event_tests {
         cp
     }
 
-    #[test]
-    fn a_recovered_pairing_keeps_the_recorded_expiry_and_is_never_renewed() {
-        let recorded = chrono::Utc::now() - chrono::Duration::hours(3);
-
-        let mut field = announced_cp();
-        field.expires_at = Some(recorded);
-        assert_eq!(super::resolve_recovered_expires_at(&field, 24).unwrap(), recorded);
-
-        let mut in_message = announced_cp();
-        in_message.expires_at = None;
-        in_message.oob_message = serde_json::json!({ "expires_at": recorded });
-        assert_eq!(super::resolve_recovered_expires_at(&in_message, 24).unwrap(), recorded);
-
-        let mut unrecorded = announced_cp();
-        unrecorded.expires_at = None;
-        unrecorded.oob_message = serde_json::json!({});
-        assert_eq!(
-            super::resolve_recovered_expires_at(&unrecorded, 2).unwrap(),
-            unrecorded.created_at + chrono::Duration::hours(2),
-            "without a recorded expiry the deadline counts from the connection point's creation"
-        );
-
-        let mut unreadable = announced_cp();
-        unreadable.expires_at = None;
-        unreadable.oob_message = serde_json::json!({ "expires_at": "not a date" });
-        assert!(
-            super::resolve_recovered_expires_at(&unreadable, 24)
-                .unwrap_err()
-                .contains("unreadable expiry")
-        );
-    }
-
     async fn store_with(
         cp: &GatewayConnectionPoint
     ) -> (tempfile::TempDir, Option<Arc<FileSystemConnectionPointStore>>) {
@@ -6647,5 +6938,330 @@ mod connected_event_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod listener_lifecycle_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use tokio::sync::RwLock;
+
+    use super::{
+        ConnectionPointMetrics, DispatchSettlement, INITIAL_CONNECT_TIMEOUT, PendingListener, StartReservation,
+        take_pending,
+    };
+    use crate::gateways::connection_points::envelope_replay::{EnvelopeRejection, admit_forward_request, now_secs};
+    use crate::gateways::connection_points::messages::{MessageMetadata, ReceivedMessage};
+    use crate::gateways::connection_points::types::{ConnectionPointType, GatewayConnectionPoint};
+    use crate::gateways::test_helpers::{test_listener, test_listener_manager};
+    use crate::messages::MessageType;
+
+    fn pending_task(instance_id: &str) -> (PendingListener, tokio::task::JoinHandle<()>) {
+        let task = tokio::spawn(std::future::pending::<()>());
+        (
+            PendingListener {
+                instance_id: instance_id.to_string(),
+                abort_handle: task.abort_handle(),
+            },
+            task,
+        )
+    }
+
+    fn connection_point() -> GatewayConnectionPoint {
+        let mut cp = GatewayConnectionPoint::new(
+            "gw-1".to_string(),
+            "did:example:mediator".to_string(),
+            "did:example:cp".to_string(),
+            "CP".to_string(),
+            "desc".to_string(),
+            "oob-1".to_string(),
+            "https://oob.example".to_string(),
+            serde_json::json!({}),
+            None,
+            ConnectionPointType::User,
+            "secret".to_string(),
+        );
+        cp.id = "cp-1".to_string();
+        cp
+    }
+
+    fn forward_request() -> ReceivedMessage {
+        let now = now_secs();
+        let id = uuid::Uuid::new_v4();
+        ReceivedMessage::new(
+            "cp-1".to_string(),
+            "gw-1".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            format!("msg-{id}"),
+            None,
+            Some(format!("did:web:sender-{id}.example")),
+            vec!["did:web:receiver.example".to_string()],
+            Some(now),
+            Some(now + 60),
+            serde_json::json!({}),
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: serde_json::Value::Null,
+            },
+        )
+    }
+
+    fn one_in_flight() -> (Arc<AtomicU64>, Arc<RwLock<ConnectionPointMetrics>>) {
+        (
+            Arc::new(AtomicU64::new(1)),
+            Arc::new(RwLock::new(ConnectionPointMetrics {
+                in_flight_dispatches: 1,
+                ..ConnectionPointMetrics::default()
+            })),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_pending_entry_is_taken_only_by_its_own_listener() {
+        let pending = std::sync::Mutex::new(HashMap::new());
+        let (entry, _task) = pending_task("instance-1");
+        pending
+            .lock()
+            .unwrap()
+            .insert("cp-1".to_string(), entry);
+
+        assert!(!take_pending(&pending, "cp-1", "instance-2"));
+        assert!(take_pending(&pending, "cp-1", "instance-1"));
+        assert!(!take_pending(&pending, "cp-1", "instance-1"));
+    }
+
+    #[tokio::test]
+    async fn stopping_a_listener_still_connecting_cancels_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (manager, _issuer) = test_listener_manager(root.path()).await;
+        let (entry, task) = pending_task("instance-1");
+        manager
+            .pending_listeners
+            .lock()
+            .unwrap()
+            .insert("cp-1".to_string(), entry);
+
+        assert_eq!(
+            manager
+                .stop_listener("cp-1")
+                .await,
+            Ok(())
+        );
+
+        assert!(
+            task.await
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert!(
+            manager
+                .pending_listeners
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            manager
+                .stop_listener("cp-1")
+                .await
+                .is_err(),
+            "nothing is left to stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn going_to_standby_cancels_listeners_still_connecting() {
+        let root = tempfile::tempdir().unwrap();
+        let (manager, _issuer) = test_listener_manager(root.path()).await;
+        let (first, first_task) = pending_task("instance-1");
+        let (second, second_task) = pending_task("instance-2");
+        {
+            let mut pending = manager
+                .pending_listeners
+                .lock()
+                .unwrap();
+            pending.insert("cp-1".to_string(), first);
+            pending.insert("cp-2".to_string(), second);
+        }
+
+        manager
+            .deactivate_and_stop_all_listeners()
+            .await;
+
+        assert!(!manager.is_active());
+        assert!(
+            first_task
+                .await
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert!(
+            second_task
+                .await
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert!(
+            manager
+                .pending_listeners
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_start_waits_only_a_bounded_time_for_the_first() {
+        let root = tempfile::tempdir().unwrap();
+        let (manager, _issuer) = test_listener_manager(root.path()).await;
+        let cp = connection_point();
+        manager
+            .starting_listeners
+            .lock()
+            .await
+            .insert(cp.id.clone());
+
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            manager
+                .reserve_listener_start(&cp)
+                .await,
+            StartReservation::InProgress
+        );
+        assert!(started.elapsed() >= INITIAL_CONNECT_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn a_second_start_proceeds_once_the_first_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let (manager, _issuer) = test_listener_manager(root.path()).await;
+        let cp = connection_point();
+        manager
+            .starting_listeners
+            .lock()
+            .await
+            .insert(cp.id.clone());
+        let finisher = manager.clone();
+
+        tokio::time::pause();
+        let (reservation, ()) = tokio::join!(manager.reserve_listener_start(&cp), async {
+            tokio::task::yield_now().await;
+            finisher
+                .finish_listener_start("cp-1")
+                .await;
+        });
+
+        assert_eq!(reservation, StartReservation::Reserved);
+        assert!(
+            manager
+                .starting_listeners
+                .lock()
+                .await
+                .contains("cp-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_for_a_registered_listener_reports_it_active() {
+        let root = tempfile::tempdir().unwrap();
+        let (manager, _issuer) = test_listener_manager(root.path()).await;
+        manager
+            .listeners
+            .write()
+            .await
+            .insert("cp-1".to_string(), test_listener("instance-1").await);
+
+        assert_eq!(
+            manager
+                .reserve_listener_start(&connection_point())
+                .await,
+            StartReservation::AlreadyActive
+        );
+        assert!(
+            manager
+                .starting_listeners
+                .lock()
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_aborted_dispatch_lets_the_redelivered_request_through() {
+        let (in_flight, metrics) = one_in_flight();
+        let message = forward_request();
+        let settlement = DispatchSettlement::new(&message, Arc::clone(&in_flight), Arc::clone(&metrics));
+        let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel();
+        let admitted = message.clone();
+        let dispatch = tokio::spawn(async move {
+            let _settlement = settlement;
+            admit_forward_request(&admitted)
+                .await
+                .unwrap();
+            admitted_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        admitted_rx.await.unwrap();
+
+        dispatch.abort();
+        assert!(
+            dispatch
+                .await
+                .unwrap_err()
+                .is_cancelled()
+        );
+
+        assert_eq!(admit_forward_request(&message).await, Ok(()), "the redelivery is processed");
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .read()
+                .await
+                .in_flight_dispatches,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answered_dispatch_keeps_the_request_remembered() {
+        let (in_flight, metrics) = one_in_flight();
+        let message = forward_request();
+        let mut settlement = DispatchSettlement::new(&message, Arc::clone(&in_flight), Arc::clone(&metrics));
+        admit_forward_request(&message)
+            .await
+            .unwrap();
+
+        settlement.answered();
+        settlement.finish().await;
+
+        assert!(matches!(admit_forward_request(&message).await, Err(EnvelopeRejection::Duplicate { .. })));
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .read()
+                .await
+                .in_flight_dispatches,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn an_aborted_dispatch_of_a_duplicate_keeps_the_original_remembered() {
+        let (in_flight, metrics) = one_in_flight();
+        let message = forward_request();
+        admit_forward_request(&message)
+            .await
+            .unwrap();
+
+        drop(DispatchSettlement::new(&message, Arc::clone(&in_flight), metrics));
+
+        assert!(matches!(admit_forward_request(&message).await, Err(EnvelopeRejection::Duplicate { .. })));
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
     }
 }

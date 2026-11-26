@@ -1430,7 +1430,7 @@ mod tests {
                         streams.spawn(incoming.run_with_mcp_runtime(sink, versions, None));
                         continue;
                     }
-                    match runtime.process(&received, &message_type) {
+                    match runtime.process(&received, &message_type).await {
                         ProcessingResult::ProcessedNoResponse => {}
                         ProcessingResult::RequiresResponse { response_type, response_body } => {
                             let response = affinidi_messaging_didcomm::Message::build(

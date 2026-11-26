@@ -288,6 +288,11 @@ queries over HTTPS and DIDComm.
 | Trust Check | Runs registry queries for the caller or the target on each request and hands the results to policy. It never denies on its own; the policy decides. |
 | Trust Recorder | Writes an agent's record into a registry when it is seen, so recognition builds up without manual enrolment |
 
+A registry connection moves from Connecting to Awaiting approval to Connected only on setup
+messages sent by that registry's own DID, and never moves back. A rejection from the registry
+or its mediator marks the connection Failed, and it stays Failed until an operator reconnects it.
+Messages about the connection from any other sender are ignored.
+
 See [`POLICY.md`](POLICY.md#trust-check) and
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#trust-recorder).
 
@@ -558,7 +563,8 @@ to them rather than containing them: by environment variable, file, AWS Secrets 
 AWS Systems Manager Parameter Store. Stored records can be encrypted at rest with a master
 key from the environment, a file, or AWS KMS. A configuration from `--generate-bootstrap`
 has encryption at rest off, while the environments the development setup creates have it on;
-enable it on any appliance that holds real credentials. See
+enable it on any appliance that holds real credentials. A record saved while encryption is off
+replaces its older encrypted copy, so turning encryption back on keeps that change. See
 [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#secret-references).
 
 ### Backup and export

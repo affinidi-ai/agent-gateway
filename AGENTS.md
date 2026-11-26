@@ -170,9 +170,11 @@ Access Point panel and on the canvas, and names a new surface `<protocol>_surfac
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The Surface Builder's inbound Identity **From API Key** shows no key picker, since each caller is
-identified by the API key it presents, and blocks Save unless every Caller Context method is API
-Key or API Key Provider; the protected and external Identities' key picker lists only the
-surface's own active keys; see _Surface Builder_ in
+identified by the API key it presents, and blocks Save unless a Caller Context method is API Key
+or API Key Provider. An inbound **From JWT Claims** blocks Save unless a Caller Context method is
+JWT Bearer; on the protected or external Identity or a Transit Point it needs every method to be
+JWT Bearer. Callers of the other methods get no identity. The protected and external Identities'
+key picker lists only the surface's own active keys. See _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 A protected, external or Transit Point Identity whose API key reference is `blocking`
@@ -185,6 +187,40 @@ is refusing requests" while `serving_status` is `not_serving`. The API key detai
 key of a deleted surface is no longer in use. See _Surface Builder_ and
 [_API key delete_](www/default/AGENTS.md#api-key-delete) in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+Verifiable Trust Agents are connections: they live on the Connections page's **Verifiable Trust
+Agent** tab, laid out like Registries: no text above its card, **Add VTA** in the card header as
+its only call to action (no Refresh, nothing in the tab banner, none in the empty state, which says
+"Add your first Verifiable Trust Agent" with View Docs), no filter box, and a full-page wizard
+(`/connections/trust-agents/connect`), never a pop-up; a revoked or degraded connection opens in it
+showing its state and reason, and pairs only after **Pair again**. There is no Trust Agent page and
+no signing tier banner. The tab's Control key card, shown while `GET /v1/vta/status`
+reports a `control_key`, shows the key the gateway signs in to its trust agent with, when it was
+last rotated and when it is next due, and a Rotate control key button for key management editors.
+A connection added by hand with a `did:webvh` identity has a Rotate control key action on its
+row, with a rotation-under-way state and Cancel. **Revoke** needs `vta_connections.delete`: the
+first click arms it with a toast, the next sends it, and a `409` naming what stops signing needs
+one more click to acknowledge. The connect wizard's grant step names the four capabilities the
+grant gives, never "sign-only", and its **Done** waits for the signing key to be minted. The
+gateway-wide default is **Settings → Security → Gateway signing**, editable only with both
+`settings.edit` and `key_management.edit`, follows the `[vta]` configuration block while that is
+enabled and nothing is chosen, and is saved only after a confirmation dialog that lists what
+changing the gateway signer does. See
+_Verifiable Trust Agent tab and Gateway signing_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#verifiable-trust-agent-tab-and-gateway-signing).
+
+Wherever a signing key is chosen (a surface, an issuer, Gateway signing) the field is **Signing key
+source**, with **Gateway secret** and **Verifiable Trust Agent**, which picks a connected agent.
+An Issuer's choice applies to every surface it owns that sets none of its own, before the
+gateway-wide default. On a surface or issuer the field is read-only without
+`key_management.edit`. See _Signing key source_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#signing-key-source).
+
+The Secrets page's Key Management tab says the signing keys are held by a separately operated
+trust agent only while `custody_claim` is true, and otherwise that some tokens are still signed
+with the gateway's own key; the connect wizard's Complete step points to **Settings → Security →
+Gateway signing** for changing the default later. See _Key Management tab_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#key-management-tab).
 
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 
@@ -334,6 +370,15 @@ read-only), and every surface write and template create or update sends
 `trust_check_split: true`; see
 _Trust Check_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-check).
 
+Both peer pairing wizards pause after the gateway mints its DIDs and try to continue at once. Only
+when the mediator refuses a DID (an `explicit_allow` mediator whose administrator has not added
+it) do they show a shared **mediator access** step with the DIDs to add; the user continues from it
+or later from Connections (**Continue**, `?resume=<id>`, which opens the step without testing
+first). On a mediator that admits the DIDs the step never appears. A `pending` gateway's row on Connections
+opens its page, as the Add Gateway wizard's **View Connection** does; see _Mediator access step_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#mediator-access-step) and
+[`docs/FABRIC.md`](docs/FABRIC.md#pausing-for-mediator-access).
+
 The Gateways list shows, under a remote gateway's status, when its peer was last heard from
 (`peer_last_seen_at` on `GET /v1/gateways`), apart from this gateway's own mediator link; see
 _Elsewhere_ under remote gateway issuer DIDs in [`www/default/AGENTS.md`](www/default/AGENTS.md).
@@ -400,14 +445,15 @@ _Agent Cards tab_ in
 
 The read-only Agents page at `/agent-registry` needs `surfaces.view` and lists one row per managed
 agent, built by the gateway from the surfaces that target it; MCP surfaces are left out and no
-status is shown. Its empty state offers a **Create a surface** link, which opens `/surfaces/new`,
-to users with `surfaces.edit` only. Its Agent Card tab shows the card the gateway serves for
-Direct, Proxied and Fabric routes with a **Card source** row, and keeps the surface picker, with a
-Retry, when the card can't be read through the chosen surface. Its list shows the protocol with the
-shared `ProtocolBadge` (`components/shared/ProtocolBadge.tsx`) the Surfaces page and the template
-picker use, never restyled per page, the Identities and Used by surfaces counts as the Surfaces page's square count
-badge, and every row value at the table's body size. Its Connection tab lists each of the agent's
-DIDs with a copy button; see _Agents page_ in
+status is shown. Its header holds an **Add Surface** button (gated on `surfaces.edit` and the surface
+limit, using `useLimitGuard`) that opens `/surfaces/new`, and when no agents are shown, an `EmptyState`
+says "Get started with Agents" with a docs link to the first-surface creation guide. The Agent Card tab
+shows the card the gateway serves for Direct, Proxied and Fabric routes with a **Card source** row, and
+keeps the surface picker, with a Retry, when the card can't be read through the chosen surface. Its list
+shows the protocol with the shared `ProtocolBadge` (`components/shared/ProtocolBadge.tsx`) the Surfaces
+page and the template picker use, never restyled per page, the Identities and Used by surfaces counts as
+the Surfaces page's square count badge, and every row value at the table's body size. Its Connection tab
+lists each of the agent's DIDs with a copy button; see _Agents page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#agents-page).
 
 The Identities page shows one row per surface Managed Agent, with its earlier DIDs (from its
@@ -541,8 +587,8 @@ hands a failed caller to policy only on a public Access Point (`access_point.pub
 every other Access Point refuses it before policy with a `401`, direct or over Fabric: a closed
 one (`public: false`), a legacy one stored without `public`, and any whose
 `caller_authentication.on_failure` is `reject`. Two more refuse it, public or not: an Access
-Point whose inbound identity is `from_jwt_claim` (no caller identity can be derived without a
-valid JWT), and an MCP Access Point that publishes protected resource metadata (a missing or
+Point whose inbound identity is `from_jwt_claim` (a failed caller of any method; a verified
+caller of another method is served with no identity), and an MCP Access Point that publishes protected resource metadata (a missing or
 refused JWT Bearer credential gets the discovery challenge on direct requests, a failed
 credential of another method a plain `401`). Each such refusal's body says only `Caller
 credential missing or invalid`; the reason is logged, not sent. The admin API creates every
@@ -618,6 +664,7 @@ Do not summarise these here. Update the owning document in the same change as th
 | Credential providers, delegation vault, consent modes                          | [`docs/CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md)     |
 | Terms, acceptance, consent-pending sessions                                    | [`docs/TERMS_AND_CONSENT.md`](docs/TERMS_AND_CONSENT.md)             |
 | Integrations, events, notifications, the event hook                            | [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md)                       |
+| Trust agent (VTA) signing, connections, control keys, per-surface keys, limits  | [`docs/TRUST_AGENT_SIGNING.md`](docs/TRUST_AGENT_SIGNING.md)         |
 
 # Ways of working
 

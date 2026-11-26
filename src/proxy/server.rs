@@ -131,7 +131,7 @@ async fn is_surface_browser_origin(
         return false;
     }
     super::handler::match_surface_route(&surfaces, path).is_some_and(|(info, ..)| {
-        info.surface.status == crate::config::agent_surface::SurfaceStatus::Active
+        info.surface.status.is_live()
             && !origins
                 .resolved
                 .is_retired(&info.surface.surface_id)

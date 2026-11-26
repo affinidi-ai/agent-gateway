@@ -1021,6 +1021,43 @@ pub async fn run_axum_proxy(
     }
     crate::config::network::warn_about_unparsed_external_urls(&network_config.listeners);
 
+    network_config
+        .sts
+        .validate()
+        .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+    {
+        let config = &network_config.single_use_store;
+        config.check_shared_with(
+            bootstrap_config
+                .mcp
+                .continuations
+                .as_ref()
+                .map(|continuations| &continuations.storage),
+        )?;
+        let dynamodb = match config {
+            crate::storage::single_use::SingleUseStoreConfig::Dynamodb { .. } => Some(
+                crate::storage::dynamodb_generic_repository::build_dynamodb_client(
+                    bootstrap_config
+                        .aws_region
+                        .as_deref(),
+                    bootstrap_config
+                        .aws_profile
+                        .as_deref(),
+                )
+                .await?,
+            ),
+            crate::storage::single_use::SingleUseStoreConfig::Disk {} => None,
+        };
+        let dir = crate::storage::single_use::journal_dir(&bootstrap_config.storage_paths);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        crate::storage::single_use::install(
+            crate::storage::single_use::SingleUseStore::open(config, &dir, dynamodb, now).await?,
+        )?;
+        info!(path = ?dir, store = ?config, "✓ Single-use store opened");
+    }
+
     // Initialize settings store and load settings from disk
     info!(
         "Initializing settings store with path: {}",
@@ -1045,7 +1082,7 @@ pub async fn run_axum_proxy(
     // Register the settings store globally so the audit vault can read categories.
     crate::storage::settings_store::set_global_settings_store(settings_store.clone());
 
-    // Store gateways storage path globally for x402 gateway facilitator resolution
+    // Store gateways storage path globally for payment gateway logo resolution
     crate::storage::init_gateways_storage_path(
         bootstrap_config
             .storage_paths
@@ -1281,14 +1318,9 @@ pub async fn run_axum_proxy(
         warn!("facilitator_mode.facilitator_via_fabric is ignored: peer x402 verify and settle requests are refused");
     }
 
-    // Initialize transaction store for unified x402 lifecycle tracking
-    // EVERY gateway needs this - it handles BOTH roles:
-    // - GW1 role: receives HTTP payments, sends DIDComm verify/settle requests
-    // - GW2 role: receives DIDComm verify/settle requests from other gateways
-    // Load path from x402.json configuration (cached at startup)
+    // Load the recorded x402 transactions, kept readable for the admin API and
+    // completable by their facilitator gateway's settlement-complete message.
     if let Ok(x402_config) = crate::x402::config_cache::get_or_load_x402_config().await {
-        // Initialize transaction store from x402.json configuration
-        // This is the unified store for verification → settlement lifecycle tracking
         let transaction_storage_path = x402_config
             .transaction_storage
             .as_ref()
@@ -1305,39 +1337,15 @@ pub async fn run_axum_proxy(
             Ok(store) => {
                 let store_arc = Arc::new(store);
 
-                // Store globally for access by ALL components (DIDComm, HTTP middleware, Admin API, workers)
                 crate::gateways::init_transaction_store(Arc::clone(&store_arc)).await;
-                info!(path = ?transaction_storage_path, "✓ Transaction store initialized - handles both GW1 and GW2 roles");
-
-                // Recover unsettled payments on startup (crash recovery)
-                // Worker checks facilitator_gateway_id to determine what to settle
-                info!("Starting crash recovery for unsettled payments...");
-                let txn_store_rec = Arc::clone(&store_arc);
-                let recovery_bootstrap_config = Arc::clone(&bootstrap_config);
-                let facilitator_enabled = config
-                    .facilitator_mode
-                    .facilitator_via_fabric
-                    || config
-                        .facilitator_mode
-                        .facilitator_via_http;
-                tokio::spawn(async move {
-                    crate::x402::recover_unsettled_on_startup(
-                        txn_store_rec,
-                        recovery_bootstrap_config,
-                        facilitator_enabled,
-                    )
-                    .await;
-                });
-
-                // Note: Settlement worker will be started later after gateway_store is available
-                // (needs gateway_store to determine local_gateway_id for facilitator delegation logic)
+                info!(path = ?transaction_storage_path, "✓ x402 transaction store initialized");
             }
             Err(e) => {
-                error!(error = %e, "Failed to initialize transaction store - x402 payment processing will fail");
+                error!(error = %e, "Failed to initialize x402 transaction store - recorded x402 transactions are unavailable");
             }
         }
     } else {
-        warn!("Failed to load x402.json config - x402 payment processing disabled");
+        warn!("Failed to load x402.json config - recorded x402 transactions are unavailable");
     }
 
     // Initialize MPP transaction store for payment audit trail
@@ -1524,8 +1532,8 @@ pub async fn run_axum_proxy(
     let mut channels_by_port: HashMap<u16, Vec<crate::config::agent_surface::AgentSurface>> = HashMap::new();
     for surface in config.surfaces.iter() {
         // Skip disabled channels at startup
-        if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
-            info!("Skipping disabled channel '{}' at startup", surface.name);
+        if !surface.status.is_live() {
+            info!("Skipping inactive surface '{}' ({:?}) at startup", surface.name, surface.status);
             continue;
         }
 
@@ -1555,7 +1563,7 @@ pub async fn run_axum_proxy(
     let active_count = config
         .surfaces
         .iter()
-        .filter(|s| s.status == crate::config::agent_surface::SurfaceStatus::Active)
+        .filter(|s| s.status.is_live())
         .count();
     info!(
         "Initial startup: Mapped {} active channels across {} configured ports",
@@ -1713,7 +1721,7 @@ pub async fn run_axum_proxy(
             match surface_store.list_all().await {
                 Ok(surfaces) => {
                     for surface in &surfaces {
-                        if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
+                        if !surface.status.is_live() {
                             continue;
                         }
                         if let Err(e) = policy_manager
@@ -1817,6 +1825,7 @@ pub async fn run_axum_proxy(
             credential_provider_store: None,
             delegation_vault_store: None,
             sts_client_store: None,
+            vta_connection_store: None,
             api_key_store: api_key_store
                 .clone()
                 .map(|store| store as Arc<dyn crate::api_keys::store::ApiKeyStore>),
@@ -1853,9 +1862,7 @@ pub async fn run_axum_proxy(
                         .admit_all(
                             surfaces
                                 .iter()
-                                .filter(|surface| {
-                                    surface.status == crate::config::agent_surface::SurfaceStatus::Active
-                                }),
+                                .filter(|surface| surface.status.is_live()),
                         )
                         .await;
                 }
@@ -1998,6 +2005,10 @@ pub async fn run_axum_proxy(
                         e
                     )
                 })?;
+
+                for warning in saml_config.role_warnings() {
+                    warn!("{}", warning);
+                }
 
                 crate::source_auth::client_ip::warn_if_login_throttle_shares_one_limit(
                     "login_throttle",
@@ -2212,6 +2223,47 @@ pub async fn run_axum_proxy(
                 Err(e) => warn!("Failed to read the Authorities; STS client authority DIDs stay unclassified: {}", e),
             }
         }
+
+        // VTA connection store (which Verifiable Trust Agent signs for this
+        // appliance). A bootstrap `[vta]` block is migrated into it once, under
+        // a fixed id, so the migration is idempotent across restarts.
+        let vta_connection_store: Option<Arc<dyn crate::vta::connections::VtaConnectionStorage>> = {
+            let path = PathBuf::from(
+                &bootstrap_config
+                    .storage_paths
+                    .authorities,
+            )
+            .parent()
+            .map(|p| p.join("vta_connections"))
+            .unwrap_or_else(|| PathBuf::from("_storage/vta_connections"));
+            match crate::vta::connections::FileSystemVtaConnectionStore::new(path).await {
+                Ok(store) => {
+                    let store: Arc<dyn crate::vta::connections::VtaConnectionStorage> = Arc::new(store);
+                    // Migration failure must not stop the gateway: the
+                    // bootstrap block still drives the connector directly, so
+                    // the only loss is the record's visibility in the API.
+                    match crate::vta::connections::migrate_bootstrap_connection(&bootstrap_config.vta, store.as_ref())
+                        .await
+                    {
+                        Ok(Some(connection)) => {
+                            info!(id = %connection.id, "VTA bootstrap connection recorded");
+                        }
+                        Ok(None) => {}
+                        Err(e) => error!("Failed to migrate the [vta] block into a connection record: {}", e),
+                    }
+                    // Take every verified VTA address off the data plane before
+                    // any listener accepts a request. Reserving at first *use*
+                    // would be too late: a surface could be configured and
+                    // exercised before the connection it shadows has signed.
+                    crate::vta::isolation::sync_connection_reservations(store.as_ref()).await;
+                    Some(store)
+                }
+                Err(e) => {
+                    error!("Failed to initialize VTA connection store: {}", e);
+                    None
+                }
+            }
+        };
 
         // ── Credential Delegation stores ──────────────────────────────────
         let credential_provider_store: Option<
@@ -2801,6 +2853,7 @@ pub async fn run_axum_proxy(
             .clone()
             .map(|store| store as Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>);
         identity_state.sts_client_store = sts_client_store.clone();
+        identity_state.vta_connection_store = vta_connection_store.clone();
 
         // Initialize gateway-level OPA policy manager
         let gateway_policy_manager = Arc::new(crate::policies::GatewayPolicyManager::new());
@@ -3233,8 +3286,20 @@ pub async fn run_axum_proxy(
                     }
 
                     match result {
-                        Ok(_) => {
+                        Ok(crate::gateways::connection_points::ListenerStart::Connected) => {
                             info!("✅ Listener started successfully for connection point {}", cmd.connection_point.id);
+                        }
+                        Ok(crate::gateways::connection_points::ListenerStart::Pending) => {
+                            warn!(
+                                "Listener for connection point {} is still connecting to its mediator",
+                                cmd.connection_point.id
+                            );
+                        }
+                        Ok(crate::gateways::connection_points::ListenerStart::Paused) => {
+                            info!(
+                                "Listener for connection point {} not started: it waits for mediator access",
+                                cmd.connection_point.id
+                            );
                         }
                         Err(e) => {
                             error!(
@@ -3418,7 +3483,13 @@ pub async fn run_axum_proxy(
                                         }
                                     };
 
-                                    // Start the listener
+                                    // The list was read once, and a pairing continued since then
+                                    // may have deleted or changed this point; start from what is
+                                    // stored now.
+                                    let Some(cp) = listenable_point(cp_store_clone.as_ref(), &cp).await else {
+                                        info!("  └─ Skipped: '{}' is gone or waits for mediator access", cp.name);
+                                        continue;
+                                    };
                                     info!("  └─ Starting listener...");
                                     if let Err(e) = manager_clone
                                         .start_listener(&cp, mediator_did, mediator_url, config_clone.clone())
@@ -3426,6 +3497,16 @@ pub async fn run_axum_proxy(
                                     {
                                         error!("     ❌ Failed to start listener for '{}': {}", cp.name, e);
                                         failed += 1;
+                                    } else if listenable_point(cp_store_clone.as_ref(), &cp)
+                                        .await
+                                        .is_none()
+                                    {
+                                        // Deleted while its listener started: stop it, so no
+                                        // listener is left on a DID whose pairing is over.
+                                        let _ = manager_clone
+                                            .stop_listener(&cp.id)
+                                            .await;
+                                        info!("     Stopped the listener of '{}': it was deleted meanwhile", cp.name);
                                     } else {
                                         info!("     ✅ Listener started successfully for '{}'", cp.name);
                                         started += 1;
@@ -3513,12 +3594,18 @@ pub async fn run_axum_proxy(
                 }
             });
 
-            // Clean up pending OOB gateways from previous sessions
-            // Since temporary DID secrets are in-memory only, we cannot restart listeners after server restart
-            // These gateways should be cleaned up as they're from incomplete handshakes
+            // Clean up pending OOB gateways from previous sessions. An acceptance whose
+            // temporary connection point is still unexpired keeps waiting for approval (its
+            // listener is restarted with the other connection points); one without is removed.
+            // A gateway paused for mediator access keeps its keys and state on disk and is
+            // kept until its invitation expires.
             if let Some(ref gw_store) = gateway_store {
                 let gw_store_clone = gw_store.clone();
                 let pending_store_clone = pending_connection_store.clone();
+                let paused_cp_store = cp_store.clone();
+                let pending_expiry_hours = bootstrap_config
+                    .oob_connection
+                    .pending_expiry_hours;
                 let started_at = chrono::Utc::now();
 
                 tokio::spawn(async move {
@@ -3527,54 +3614,18 @@ pub async fn run_axum_proxy(
                     // Small delay after startup
                     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
-                    match gw_store_clone
-                        .list_all()
-                        .await
-                    {
-                        Ok(gateways) => {
-                            let pending_gateways: Vec<_> = gateways
-                                .into_iter()
-                                .filter(|gw| gw.is_left_pending_by_an_earlier_run(started_at))
-                                .collect();
-
-                            if pending_gateways.is_empty() {
-                                info!("No pending gateways from previous sessions");
-                            } else {
-                                warn!("Found {} pending gateway(s) from previous session(s)", pending_gateways.len());
-                                warn!("These are from incomplete OOB handshakes that cannot be resumed");
-
-                                for gateway in pending_gateways {
-                                    warn!("  - Cleaning up pending gateway: {} (ID: {})", gateway.name, gateway.id);
-
-                                    // Delete the gateway
-                                    if let Err(e) = gw_store_clone
-                                        .delete(&gateway.id)
-                                        .await
-                                    {
-                                        error!("Failed to delete pending gateway '{}': {}", gateway.name, e);
-                                    } else {
-                                        info!("  ✓ Deleted pending gateway '{}'", gateway.name);
-                                    }
-
-                                    // Also clean up the pending connection if it exists
-                                    if let Some(pending_conn) = pending_store_clone
-                                        .get_by_temporary_did(&gateway.did)
-                                        .await
-                                    {
-                                        pending_store_clone
-                                            .remove(&pending_conn.id)
-                                            .await;
-                                        info!("  ✓ Cleaned up pending connection state");
-                                    }
-                                }
-
-                                info!("✓ Pending gateway cleanup complete");
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to list gateways for pending cleanup: {}", e);
-                        }
-                    }
+                    let now = chrono::Utc::now();
+                    remove_lapsed_pauses(gw_store_clone.as_ref(), paused_cp_store.as_ref(), &pending_store_clone, now)
+                        .await;
+                    remove_abandoned_pending_gateways(
+                        gw_store_clone.as_ref(),
+                        paused_cp_store.as_ref(),
+                        &pending_store_clone,
+                        pending_expiry_hours,
+                        started_at,
+                        now,
+                    )
+                    .await;
                 });
             }
 
@@ -3592,45 +3643,6 @@ pub async fn run_axum_proxy(
             *slot = Some(listener_mgr.clone());
             crate::gateways::init_listener_manager(listener_mgr.clone()).await;
             info!("✓ Listener manager set in shared slot - fabric:// protocol now available for all channels");
-
-            // Start settlement workers now that listener manager and gateway_store are available
-            // 1. Settlement worker: Processes pending settlements from transaction store
-            // 2. Settlement sync worker: Sends settlement completion notifications via DIDComm
-            if let Ok(x402_config) = crate::x402::config_cache::get_or_load_x402_config().await
-                && x402_config
-                    .settlement_storage
-                    .is_some()
-                && let Some(txn_store) = crate::gateways::connection_points::message_processor::get_transaction_store()
-            {
-                // Convert gateway_store to trait object
-                let gateway_store_trait: Option<Arc<dyn crate::gateways::filesystem::GatewayStore>> = gateway_store
-                    .as_ref()
-                    .map(|s| s.clone() as Arc<dyn crate::gateways::filesystem::GatewayStore>);
-
-                // Start settlement worker WITH gateway_store (needed for local_gateway_id)
-                if let Some(worker_config) = crate::x402::settlement_worker::get_worker_config_from_x402_config(
-                    txn_store.clone(),
-                    x402_config.clone(),
-                    Arc::clone(&bootstrap_config),
-                    gateway_store_trait.clone(),
-                )
-                .await
-                {
-                    let _worker_handle = crate::x402::settlement_worker::start_settlement_worker(worker_config);
-                    info!(
-                        "✓ Settlement worker started (processes local transactions + those where we are the facilitator)"
-                    );
-                }
-
-                // Start settlement sync worker (sends settlement-complete notifications)
-                let _sync_worker_handle = crate::x402::settlement_worker::start_settlement_sync_worker(
-                    txn_store,
-                    Some(listener_mgr.clone()),
-                    gateway_store.clone(), // Use original FileSystemGatewayStore for sync worker
-                    60,                    // Poll every 60 seconds
-                );
-                info!("✓ Settlement sync worker started (sends completion notifications via DIDComm)");
-            }
         }
 
         // Update channel manager with listener_manager (for fabric:// protocol support in new channels)
@@ -3959,9 +3971,11 @@ pub async fn run_axum_proxy(
             metrics_store.clone(),
             sts_client_store,
             mcp_replay,
+            vta_connection_store,
             terms_manager.clone(),
             pat_authenticator.clone(),
-        );
+        )
+        .await;
 
         let reference_stores = crate::credential_providers::references::ReferenceStores {
             surfaces: identity_state
@@ -4323,7 +4337,7 @@ pub async fn run_axum_proxy(
                     .map(|s| s.surface_id.clone())
                     .collect();
                 for surface in surfaces {
-                    if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
+                    if !surface.status.is_live() {
                         continue;
                     }
                     if existing_surface_ids.contains(&surface.surface_id) {
@@ -4516,7 +4530,7 @@ pub async fn run_axum_proxy(
                     .map(|s| s.surface_id.clone())
                     .collect();
                 for surface in surfaces {
-                    if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
+                    if !surface.status.is_live() {
                         continue;
                     }
                     if existing_surface_ids.contains(&surface.surface_id) {
@@ -4988,6 +5002,23 @@ async fn rederive_planes_on_activation(
     {
         warn!("API key store refresh on activation failed: {e}");
     }
+    if let Some(store) = identity_state
+        .vta_connection_store
+        .as_ref()
+        && let Err(e) = store
+            .refresh_from_disk()
+            .await
+    {
+        warn!("Trust agent connection store refresh on activation failed: {e}");
+    }
+    crate::vta::connection_key_rotation::resume_published().await;
+    // Gateway signing is read from the dashboard settings on every signing
+    // call, so the settings another node saved apply from the first request.
+    if let Some(settings) = crate::storage::settings_store::global_settings_store()
+        && let Err(e) = settings.load().await
+    {
+        warn!("Dashboard settings reload on activation failed: {e}");
+    }
     crate::payments_ledger::reload_global().await;
     crate::identity::handlers::deleted_surface_api_keys::revoke_api_keys_of_deleted_surfaces(identity_state).await;
 
@@ -5013,7 +5044,7 @@ async fn rederive_planes_on_activation(
         match store.list_all().await {
             Ok(surfaces) => {
                 for surface in &surfaces {
-                    if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
+                    if !surface.status.is_live() {
                         continue;
                     }
                     if let Err(e) = identity_state
@@ -5190,6 +5221,179 @@ async fn initialize_saml_state(
             &saml_config.login_throttle,
         )),
     })
+}
+
+/// The stored record of a connection point the start-up pass listed, when its listener
+/// should run: still stored and not waiting for mediator access. The pass lists the
+/// points once, and a pairing that continues meanwhile can delete its temporary point
+/// after that; a listener started from the list would then stay on that point's DID and
+/// could be picked to send for the paired gateway. A point that cannot be read is
+/// started as listed.
+async fn listenable_point<P: ConnectionPointStore + ?Sized>(
+    store: &P,
+    listed: &crate::gateways::connection_points::types::GatewayConnectionPoint,
+) -> Option<crate::gateways::connection_points::types::GatewayConnectionPoint> {
+    match store.get(&listed.id).await {
+        Ok(Some(point)) => (!point.awaiting_mediator_access).then_some(point),
+        Ok(None) => None,
+        Err(e) => {
+            warn!("Could not re-read connection point '{}' before starting its listener: {}", listed.id, e);
+            Some(listed.clone())
+        }
+    }
+}
+
+/// Removes the gateways paused for mediator access whose invitation has expired, with
+/// their system connection points and pending pairing. User connection points are kept,
+/// as a gateway delete keeps them. A gateway whose connection points cannot be read is kept.
+async fn remove_lapsed_pauses<P: crate::gateways::connection_points::ConnectionPointStore + ?Sized>(
+    gateway_store: &crate::gateways::FileSystemGatewayStore,
+    cp_store: &P,
+    pending_store: &crate::gateways::PendingConnectionStore,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    use crate::gateways::GatewayStore;
+    use crate::gateways::connection_points::ConnectionPointType;
+
+    let gateways = match gateway_store.list_all().await {
+        Ok(gateways) => gateways,
+        Err(e) => {
+            error!("Failed to list gateways for the expired-pause cleanup: {}", e);
+            return;
+        }
+    };
+    for gateway in gateways {
+        if gateway.status != crate::gateways::types::GatewayStatus::AwaitingMediatorAccess {
+            continue;
+        }
+        // A pause counts as lapsed only after a successful read shows it.
+        let points = match cp_store
+            .list_by_gateway_checked(&gateway.id)
+            .await
+        {
+            Ok(points) => points,
+            Err(e) => {
+                warn!(
+                    "Keeping gateway '{}' ({}) paused for mediator access: could not read its connection points: {}",
+                    gateway.name, gateway.id, e
+                );
+                continue;
+            }
+        };
+        let expires_at = points
+            .iter()
+            .find(|point| point.awaiting_mediator_access)
+            .and_then(|point| point.recorded_expires_at());
+        if !gateway.pause_has_lapsed(expires_at, now) {
+            continue;
+        }
+        info!(
+            "Removing gateway '{}' ({}): its invitation expired while it waited for mediator access",
+            gateway.name, gateway.id
+        );
+        let ids: Vec<String> = points
+            .iter()
+            .filter(|point| point.cp_type != ConnectionPointType::User)
+            .map(|point| point.id.clone())
+            .collect();
+        for id in &ids {
+            if let Err(e) = cp_store.delete(id).await {
+                warn!("Failed to delete connection point {} of an expired pause: {}", id, e);
+            }
+        }
+        pending_store
+            .remove_for_connection_points(&ids)
+            .await;
+        // The startup pass may have deleted the expired temporary point already; its
+        // pending pairing is still found by the inviter's temporary DID.
+        if let Some(pending) = pending_store
+            .get_by_temporary_did(&gateway.did)
+            .await
+        {
+            pending_store
+                .remove(&pending.id)
+                .await;
+        }
+        if let Err(e) = gateway_store
+            .delete(&gateway.id)
+            .await
+        {
+            error!("Failed to delete gateway '{}' of an expired pause: {}", gateway.id, e);
+        }
+    }
+}
+
+/// Removes the `pending` gateways an earlier run left whose acceptance can no longer
+/// complete: its temporary connection point is gone or past its deadline. The deadline
+/// is the one recovery uses: the recorded expiry, else the point's creation time plus
+/// `pending_expiry_hours`. An acceptance still inside it keeps waiting for approval. A
+/// gateway whose connection points cannot be read is kept.
+async fn remove_abandoned_pending_gateways<P: crate::gateways::connection_points::ConnectionPointStore + ?Sized>(
+    gateway_store: &crate::gateways::FileSystemGatewayStore,
+    cp_store: &P,
+    pending_store: &crate::gateways::PendingConnectionStore,
+    pending_expiry_hours: u64,
+    started_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    use crate::gateways::GatewayStore;
+
+    let gateways = match gateway_store.list_all().await {
+        Ok(gateways) => gateways,
+        Err(e) => {
+            error!("Failed to list gateways for pending cleanup: {}", e);
+            return;
+        }
+    };
+    for gateway in gateways
+        .into_iter()
+        .filter(|gw| gw.is_left_pending_by_an_earlier_run(started_at))
+    {
+        let points = match cp_store
+            .list_by_gateway_checked(&gateway.id)
+            .await
+        {
+            Ok(points) => points,
+            Err(e) => {
+                warn!(
+                    "Keeping pending gateway '{}' ({}): could not read its connection points: {}",
+                    gateway.name, gateway.id, e
+                );
+                continue;
+            }
+        };
+        let still_waiting = points
+            .iter()
+            .filter(|point| point.is_temporary_point_of(&gateway.id))
+            .any(|point| {
+                point
+                    .pending_deadline(pending_expiry_hours)
+                    .is_ok_and(|deadline| deadline > now)
+            });
+        if still_waiting {
+            info!(
+                "Pending gateway '{}' ({}) keeps waiting for approval until its invitation expires",
+                gateway.name, gateway.id
+            );
+            continue;
+        }
+        warn!("Cleaning up pending gateway '{}' ({}): its handshake cannot complete", gateway.name, gateway.id);
+        if let Err(e) = gateway_store
+            .delete(&gateway.id)
+            .await
+        {
+            error!("Failed to delete pending gateway '{}': {}", gateway.name, e);
+            continue;
+        }
+        if let Some(pending_conn) = pending_store
+            .get_by_temporary_did(&gateway.did)
+            .await
+        {
+            pending_store
+                .remove(&pending_conn.id)
+                .await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6314,6 +6518,571 @@ mod tests {
                 .unwrap()
                 .count(),
             1
+        );
+    }
+}
+
+#[cfg(test)]
+mod startup_sweep_tests {
+    use super::{remove_abandoned_pending_gateways, remove_lapsed_pauses};
+    use crate::gateways::connection_points::ConnectionPointStore;
+    use crate::gateways::connection_points::types::{ConnectionPointType, GatewayConnectionPoint};
+    use crate::gateways::types::{Gateway, GatewayStatus, GatewayType};
+    use crate::gateways::{
+        ConnectionRole, ConnectionState, FileSystemConnectionPointStore, FileSystemGatewayStore, GatewayStore,
+        PendingConnectionStore, PendingOOBConnection,
+    };
+    use chrono::{DateTime, Duration, Utc};
+    use tempfile::TempDir;
+
+    struct Stores {
+        _dir: TempDir,
+        gateways: FileSystemGatewayStore,
+        points: FileSystemConnectionPointStore,
+        pending: PendingConnectionStore,
+    }
+
+    async fn stores() -> Stores {
+        let dir = TempDir::new().unwrap();
+        Stores {
+            gateways: FileSystemGatewayStore::new(dir.path().join("gateways"), None)
+                .await
+                .unwrap(),
+            points: FileSystemConnectionPointStore::new(
+                dir.path()
+                    .join("connection_points"),
+            )
+            .await
+            .unwrap(),
+            pending: PendingConnectionStore::new(dir.path().join("pending"))
+                .await
+                .unwrap(),
+            _dir: dir,
+        }
+    }
+
+    fn gateway(
+        id: &str,
+        status: GatewayStatus,
+        created_at: DateTime<Utc>,
+    ) -> Gateway {
+        let mut gateway = Gateway::new(
+            id.to_string(),
+            "Partner".to_string(),
+            format!("did:peer:2.temporary-{id}"),
+            GatewayType::Remote,
+        );
+        gateway.id = id.to_string();
+        gateway.status = status;
+        gateway.created_at = created_at;
+        gateway
+    }
+
+    fn temporary_point(
+        gateway_id: &str,
+        expires_at: DateTime<Utc>,
+        awaiting: bool,
+    ) -> GatewayConnectionPoint {
+        let mut point = GatewayConnectionPoint::new(
+            gateway_id.to_string(),
+            "med-1".to_string(),
+            format!("did:peer:2.temporary-{gateway_id}"),
+            "temporary".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            serde_json::json!({ "pending_gateway_id": gateway_id }),
+            None,
+            ConnectionPointType::System,
+            String::new(),
+        );
+        point.id = format!("tmp-{gateway_id}");
+        point.expires_at = Some(expires_at);
+        point.awaiting_mediator_access = awaiting;
+        point
+    }
+
+    fn pending_for(gateway: &Gateway) -> PendingOOBConnection {
+        let now = Utc::now();
+        PendingOOBConnection {
+            id: format!("tmp-{}", gateway.id),
+            invitation_id: "invitation".to_string(),
+            our_temporary_did: gateway.did.clone(),
+            our_secure_did: "did:peer:2.permanent".to_string(),
+            their_temporary_did: "did:peer:2.inviter".to_string(),
+            their_secure_did: None,
+            their_issuer_did: None,
+            mediator_did: "did:web:mediator.example".to_string(),
+            connection_point_id: String::new(),
+            role: ConnectionRole::Acceptor,
+            state: ConnectionState::WaitingForResponse,
+            created_at: now,
+            expires_at: now + Duration::days(7),
+            secure_cp_id: Some("permanent".to_string()),
+            temporary_cp_id: Some(format!("tmp-{}", gateway.id)),
+            mediator_record_id: None,
+        }
+    }
+
+    async fn seed(
+        stores: &Stores,
+        gateway: &Gateway,
+        point: &GatewayConnectionPoint,
+    ) {
+        stores
+            .gateways
+            .create(gateway)
+            .await
+            .unwrap();
+        stores
+            .points
+            .create(point)
+            .await
+            .unwrap();
+        stores
+            .pending
+            .store(pending_for(gateway))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_lapsed_pause_sweep_keeps_an_unexpired_pause_and_removes_an_expired_one_with_its_state() {
+        let stores = stores().await;
+        let now = Utc::now();
+        let waiting = gateway("waiting", GatewayStatus::AwaitingMediatorAccess, now - Duration::days(1));
+        let lapsed = gateway("lapsed", GatewayStatus::AwaitingMediatorAccess, now - Duration::days(9));
+        seed(&stores, &waiting, &temporary_point("waiting", now + Duration::days(2), true)).await;
+        seed(&stores, &lapsed, &temporary_point("lapsed", now - Duration::hours(1), true)).await;
+
+        remove_lapsed_pauses(&stores.gateways, &stores.points, &stores.pending, now).await;
+
+        assert!(
+            stores
+                .gateways
+                .get("waiting")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            stores
+                .points
+                .get("tmp-waiting")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            stores
+                .pending
+                .get("tmp-waiting")
+                .await
+                .is_some()
+        );
+        assert!(
+            stores
+                .gateways
+                .get("lapsed")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            stores
+                .points
+                .get("tmp-lapsed")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            stores
+                .pending
+                .get("tmp-lapsed")
+                .await
+                .is_none()
+        );
+    }
+
+    /// A connection point store whose reads of a gateway's points always fail.
+    struct UnreadablePoints;
+
+    #[async_trait::async_trait]
+    impl ConnectionPointStore for UnreadablePoints {
+        async fn create(
+            &self,
+            _: &GatewayConnectionPoint,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Option<GatewayConnectionPoint>> {
+            anyhow::bail!("disk read failed")
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<GatewayConnectionPoint>> {
+            anyhow::bail!("disk read failed")
+        }
+
+        async fn list_by_gateway(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Vec<GatewayConnectionPoint>> {
+            anyhow::bail!("disk read failed")
+        }
+
+        async fn update(
+            &self,
+            _: &GatewayConnectionPoint,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn update_if_exists(
+            &self,
+            _: &GatewayConnectionPoint,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn delete(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<()> {
+            panic!("nothing may be deleted when the points cannot be read")
+        }
+    }
+
+    #[tokio::test]
+    async fn both_sweeps_keep_their_gateways_when_the_connection_points_cannot_be_read() {
+        let stores = stores().await;
+        let now = Utc::now();
+        let paused = gateway("paused", GatewayStatus::AwaitingMediatorAccess, now - Duration::days(9));
+        let pending = gateway("pending", GatewayStatus::Pending, now - Duration::days(9));
+        seed(&stores, &paused, &temporary_point("paused", now - Duration::hours(1), true)).await;
+        seed(&stores, &pending, &temporary_point("pending", now - Duration::hours(1), false)).await;
+
+        remove_lapsed_pauses(&stores.gateways, &UnreadablePoints, &stores.pending, now).await;
+        remove_abandoned_pending_gateways(&stores.gateways, &UnreadablePoints, &stores.pending, 1, now, now).await;
+
+        for id in ["paused", "pending"] {
+            assert!(
+                stores
+                    .gateways
+                    .get(id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{id} is kept"
+            );
+            assert!(
+                stores
+                    .pending
+                    .get(&format!("tmp-{id}"))
+                    .await
+                    .is_some(),
+                "{id}'s pairing is kept"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pause_whose_temporary_point_cannot_be_read_is_kept() {
+        let stores = stores().await;
+        let now = Utc::now();
+        let paused = gateway("paused", GatewayStatus::AwaitingMediatorAccess, now - Duration::days(9));
+        stores
+            .gateways
+            .create(&paused)
+            .await
+            .unwrap();
+        stores
+            .pending
+            .store(pending_for(&paused))
+            .await;
+        // Its temporary point is stored, but cannot be read (as one that cannot be decrypted).
+        tokio::fs::write(
+            stores
+                ._dir
+                .path()
+                .join("connection_points")
+                .join("tmp-paused.json"),
+            b"not json",
+        )
+        .await
+        .unwrap();
+
+        remove_lapsed_pauses(&stores.gateways, &stores.points, &stores.pending, now).await;
+
+        assert!(
+            stores
+                .gateways
+                .get("paused")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            stores
+                .pending
+                .get("tmp-paused")
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_pause_whose_temporary_point_is_gone_loses_its_pending_pairing_too() {
+        let stores = stores().await;
+        let now = Utc::now();
+        let lapsed = gateway("lapsed", GatewayStatus::AwaitingMediatorAccess, now - Duration::days(9));
+        stores
+            .gateways
+            .create(&lapsed)
+            .await
+            .unwrap();
+        let mut pairing = pending_for(&lapsed);
+        pairing.our_temporary_did = "did:peer:2.acceptor-temporary".to_string();
+        pairing.their_temporary_did = lapsed.did.clone();
+        stores
+            .pending
+            .store(pairing)
+            .await;
+
+        remove_lapsed_pauses(&stores.gateways, &stores.points, &stores.pending, now).await;
+
+        assert!(
+            stores
+                .gateways
+                .get("lapsed")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            stores
+                .pending
+                .get("tmp-lapsed")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_lapsed_pause_sweep_keeps_the_user_connection_points_of_the_gateway() {
+        let stores = stores().await;
+        let now = Utc::now();
+        let lapsed = gateway("lapsed", GatewayStatus::AwaitingMediatorAccess, now - Duration::days(9));
+        seed(&stores, &lapsed, &temporary_point("lapsed", now - Duration::hours(1), true)).await;
+        let mut user_point = temporary_point("lapsed", now + Duration::days(30), false);
+        user_point.id = "user-invitation".to_string();
+        user_point.cp_type = ConnectionPointType::User;
+        stores
+            .points
+            .create(&user_point)
+            .await
+            .unwrap();
+
+        remove_lapsed_pauses(&stores.gateways, &stores.points, &stores.pending, now).await;
+
+        assert!(
+            stores
+                .points
+                .get("tmp-lapsed")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            stores
+                .points
+                .get("user-invitation")
+                .await
+                .unwrap()
+                .is_some(),
+            "a User point is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_acceptance_that_recorded_no_expiry_waits_for_the_configured_lifetime() {
+        let stores = stores().await;
+        let started_at = Utc::now();
+        let before = started_at - Duration::hours(1);
+        let unrecorded = |gateway_id: &str, created_at: DateTime<Utc>| {
+            let mut point = temporary_point(gateway_id, started_at, false);
+            point.expires_at = None;
+            point.created_at = created_at;
+            point
+        };
+        let waiting = gateway("waiting", GatewayStatus::Pending, before);
+        let lapsed = gateway("lapsed", GatewayStatus::Pending, before);
+        seed(&stores, &waiting, &unrecorded("waiting", started_at - Duration::minutes(30))).await;
+        seed(&stores, &lapsed, &unrecorded("lapsed", started_at - Duration::hours(2))).await;
+
+        remove_abandoned_pending_gateways(&stores.gateways, &stores.points, &stores.pending, 1, started_at, started_at)
+            .await;
+
+        assert!(
+            stores
+                .gateways
+                .get("waiting")
+                .await
+                .unwrap()
+                .is_some(),
+            "an acceptance created 30 minutes ago keeps waiting for its 1-hour lifetime"
+        );
+        assert!(
+            stores
+                .pending
+                .get("tmp-waiting")
+                .await
+                .is_some()
+        );
+        assert!(
+            stores
+                .gateways
+                .get("lapsed")
+                .await
+                .unwrap()
+                .is_none(),
+            "an acceptance older than its lifetime is removed"
+        );
+        assert!(
+            stores
+                .pending
+                .get("tmp-lapsed")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_temporary_point_keeps_a_pending_acceptance_waiting() {
+        let stores = stores().await;
+        let started_at = Utc::now();
+        let stuck = gateway("stuck", GatewayStatus::Pending, started_at - Duration::hours(1));
+        let mut permanent = temporary_point("stuck", started_at, false);
+        permanent.id = "permanent-stuck".to_string();
+        permanent.expires_at = None;
+        permanent.oob_message = serde_json::json!({});
+        permanent.created_at = started_at - Duration::minutes(5);
+        seed(&stores, &stuck, &permanent).await;
+
+        remove_abandoned_pending_gateways(&stores.gateways, &stores.points, &stores.pending, 1, started_at, started_at)
+            .await;
+
+        assert!(
+            stores
+                .gateways
+                .get("stuck")
+                .await
+                .unwrap()
+                .is_none(),
+            "a pending gateway whose temporary point is gone is removed, whatever its other points"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_acceptance_inside_its_invitation_lifetime_survives_a_restart() {
+        let stores = stores().await;
+        let started_at = Utc::now();
+        let before = started_at - Duration::hours(3);
+        let waiting = gateway("waiting", GatewayStatus::Pending, before);
+        let abandoned = gateway("abandoned", GatewayStatus::Pending, before);
+        seed(&stores, &waiting, &temporary_point("waiting", started_at + Duration::days(3), false)).await;
+        seed(&stores, &abandoned, &temporary_point("abandoned", started_at - Duration::minutes(5), false)).await;
+
+        remove_abandoned_pending_gateways(&stores.gateways, &stores.points, &stores.pending, 1, started_at, started_at)
+            .await;
+
+        assert!(
+            stores
+                .gateways
+                .get("waiting")
+                .await
+                .unwrap()
+                .is_some(),
+            "an unexpired acceptance keeps waiting"
+        );
+        assert!(
+            stores
+                .pending
+                .get("tmp-waiting")
+                .await
+                .is_some()
+        );
+        assert!(
+            stores
+                .gateways
+                .get("abandoned")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            stores
+                .pending
+                .get("tmp-abandoned")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_startup_pass_starts_only_points_still_stored_and_not_paused() {
+        let stores = stores().await;
+        let listed = temporary_point("gw-listed", Utc::now() + Duration::days(1), false);
+        stores
+            .points
+            .create(&listed)
+            .await
+            .unwrap();
+        assert_eq!(
+            super::listenable_point(&stores.points, &listed)
+                .await
+                .map(|point| point.id),
+            Some(listed.id.clone())
+        );
+
+        let mut paused = listed.clone();
+        paused.awaiting_mediator_access = true;
+        stores
+            .points
+            .update(&paused)
+            .await
+            .unwrap();
+        assert!(
+            super::listenable_point(&stores.points, &listed)
+                .await
+                .is_none(),
+            "a point paused since it was listed gets no listener"
+        );
+
+        stores
+            .points
+            .delete(&listed.id)
+            .await
+            .unwrap();
+        assert!(
+            super::listenable_point(&stores.points, &listed)
+                .await
+                .is_none(),
+            "a point deleted since it was listed, such as a finished pairing's temporary point, gets no listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_startup_pass_starts_a_point_it_cannot_re_read_as_listed() {
+        let listed = temporary_point("gw-unreadable", Utc::now() + Duration::days(1), false);
+        assert_eq!(
+            super::listenable_point(&UnreadablePoints, &listed)
+                .await
+                .map(|point| point.id),
+            Some(listed.id.clone())
         );
     }
 }

@@ -3,7 +3,6 @@ import { useNavigate } from 'react-router-dom';
 import { usePermissions } from '../../context/PermissionsContext';
 import { apiClient } from '../../api';
 import { AppButton } from '../../components/shared/AppButton';
-import { Badge } from '../../components/shared/Badge';
 import SearchInput from '../../components/shared/SearchInput';
 import { DeleteButton } from '../../components/shared/DeleteButton';
 import { TwoStepButton } from '../../components/shared/TwoStepButton';
@@ -191,12 +190,6 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
       <div className="card-header py-3 d-flex justify-content-between align-items-center">
         <h6 className="m-0 font-weight-bold text-primary">
           <i className="fas fa-id-card"></i> Credential Providers
-          <Badge
-            value={filtered.length}
-            suffix={searchTerm ? ` of ${providers.length}` : undefined}
-            className="ms-2"
-            ariaLabel={`${filtered.length}${searchTerm ? ` of ${providers.length}` : ''} credential providers`}
-          />
         </h6>
         <div className="d-flex align-items-center gap-2">
           {!externalProvided && (

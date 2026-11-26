@@ -357,6 +357,29 @@ rotate stay parent-gated for every caller. A permanent deletion is attributed to
 whether it was orphan cleanup. Deleting a key a stored surface still names takes that surface
 out of service; see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#tenant-check-of-provider-keys).
 
+### Trust agent connections
+
+Trust agent connections (`/v1/vta/connections`, resource kind `vta-connections`) are tenant-owned
+records: one a tenant PAT creates belongs to its tenant, and the `vta-bootstrap` record that
+mirrors the `[vta]` block is appliance-wide. A tenant PAT lists and reads its own tenant's
+connections and appliance-wide ones; another tenant's answers `404`, and so does a connection
+outside the PAT's resource pattern on the pairing and rotation routes. A tenant's connection
+may name only a public `https` endpoint, checked when saved and again each time a client is built
+for it, which then connects only to the addresses checked (see
+[`TRUST_AGENT_SIGNING.md`](TRUST_AGENT_SIGNING.md)). A connection's
+`control_key_ref` must name a secret its tenant may reference. A surface's or issuer's
+`signing.connection_id` (a variant sets none; it signs with its surface's) must name a connection of its own
+tenant or an appliance-wide one, and an unknown id is refused the same way, so a save never
+reveals whether another tenant's connection exists. The key inventory
+(`GET /v1/key-management/inventory`) lists only the connections the caller may read. The status
+(`GET /v1/vta/status`) lists the reserved addresses of only those connections for a tenant token
+or a token limited to some connections, and shows the `[vta]` block's control DID and key only to
+an appliance token that may read the `vta-bootstrap` connection. The
+gateway-wide default signing key source and the `[vta]` block's control key are appliance-wide
+settings, not tenant records. See [`TRUST_AGENT_SIGNING.md`](TRUST_AGENT_SIGNING.md#tenancy).
+A token with explicit scopes reaches these routes with the permission each one checks, listed
+in [`RBAC.md`](RBAC.md).
+
 ### References between records
 
 - A tenant-owned resource may reference same-tenant or global dependencies.
@@ -426,7 +449,9 @@ trust-ping, Issuer Trust Registry retry, and Trust Registry record-list/reconnec
 enforce owning-record tenancy plus canonical scope; Trust Registry
 list/get/action routes also carry explicit feature guards. Tenant-ownership
 impact reads filter the root and every graph edge by tenant/scope, and
-resource-scoped PATs cannot reassign ownership. Surface reference validation
+resource-scoped PATs cannot reassign ownership. A surface that signs through the appliance's own
+trust agent without naming a context signs, once moved, in its new tenant's context and as a new
+DID (see [`TRUST_AGENT_SIGNING.md`](TRUST_AGENT_SIGNING.md)). Surface reference validation
 includes the caller Trust Check list, the Managed Agent target list, each Transit
 Point's Trust Check list and the secrets, JWT verification strategies, API-key
 parents and certificates its `source_auth` names, every Trust Recorder entry, and the

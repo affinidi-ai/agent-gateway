@@ -34,6 +34,11 @@ pub struct SurfaceConfigBuilder {
     pub mcp_inbound_identity_strip_raw: bool,
     /// The inbound identity is the `sub` claim of the caller's JWT (`from_jwt_claim`).
     pub jwt_claim_inbound_identity: bool,
+    /// The inbound identity is the API key the caller presents (`from_api_key`).
+    pub api_key_inbound_identity: bool,
+    /// The Access Point maps this caller header into the identity binding
+    /// extension's `verifiablePresentation`.
+    pub identity_binding_header: Option<String>,
     pub target_auth: Option<SurfaceTargetAuthConfig>,
     pub target_auth_provider: Option<SurfaceTargetAuthProviderConfig>,
     pub mcp_tool_policy: Option<McpToolPolicyFixture>,
@@ -86,6 +91,9 @@ pub struct SurfaceConfigBuilder {
     pub transit_token_lifetime_secs: Option<u64>,
     /// The appliance's `transit_token_max_lifetime_secs` in `gateway.json`.
     pub transit_token_max_lifetime_secs: Option<u64>,
+    /// `sts.id_jag_max_lifetime_secs` in `gateway.json`: the longest remaining lifetime an
+    /// ID-JAG presented for redemption may have.
+    pub sts_id_jag_max_lifetime_secs: Option<u64>,
     pub didwebvh_identity: Option<DidWebVhIdentityFixture>,
     pub caller_trust_check_list: Vec<serde_json::Value>,
     pub trust_recorder_entries: Vec<serde_json::Value>,
@@ -133,6 +141,15 @@ pub struct SurfaceConfigBuilder {
     pub stored_consent_age_secs: Option<i64>,
     /// The gateway writes its log files to `_storage/logs`, the directory the log routes act on.
     pub writes_log_directory: bool,
+    /// The gateway starts with a `[vta]` block that points at a mock trust agent.
+    pub control_key_trust_agent: Option<ControlKeyTrustAgentSetup>,
+    /// `[vta] control_key_rotation_days` of that block.
+    pub control_key_rotation_days: Option<u32>,
+    /// `[vta] connection_key_switch_timeout_secs`, so a rotation the trust agent refuses rolls back quickly.
+    pub connection_key_switch_timeout_secs: Option<u64>,
+    /// `[vta] context_did_method = "did_webvh"` with this `context_did_hosting`: `vta_server`
+    /// (the trust agent's webvh server `host-1`) or `gateway`.
+    pub context_did_webvh_hosting: Option<&'static str>,
     /// The gateway serves a dashboard build from `www/` at `/`, falling back to its
     /// `index.html` for every path no other route takes, as a deployed dashboard does.
     pub serves_dashboard: bool,
@@ -252,6 +269,14 @@ impl SurfaceConfigBuilder {
     }
 }
 
+/// The trust agent a gateway is configured against, and where it keeps its control key.
+#[derive(Debug, Clone)]
+pub struct ControlKeyTrustAgentSetup {
+    pub base_url: String,
+    pub key_path: std::path::PathBuf,
+    pub control_did_method: &'static str,
+}
+
 impl Default for SurfaceConfigBuilder {
     fn default() -> Self {
         Self {
@@ -270,6 +295,8 @@ impl Default for SurfaceConfigBuilder {
             mcp_inbound_identity: false,
             mcp_inbound_identity_strip_raw: false,
             jwt_claim_inbound_identity: false,
+            api_key_inbound_identity: false,
+            identity_binding_header: None,
             target_auth: None,
             target_auth_provider: None,
             mcp_tool_policy: None,
@@ -311,6 +338,7 @@ impl Default for SurfaceConfigBuilder {
             transit_source_auth: false,
             transit_token_lifetime_secs: None,
             transit_token_max_lifetime_secs: None,
+            sts_id_jag_max_lifetime_secs: None,
             didwebvh_identity: None,
             caller_trust_check_list: Vec::new(),
             trust_recorder_entries: Vec::new(),
@@ -331,6 +359,10 @@ impl Default for SurfaceConfigBuilder {
             logs_no_delegation_events: false,
             stored_consent_age_secs: None,
             writes_log_directory: false,
+            control_key_trust_agent: None,
+            control_key_rotation_days: None,
+            context_did_webvh_hosting: None,
+            connection_key_switch_timeout_secs: None,
             serves_dashboard: false,
             gateway_prefixes: Vec::new(),
             stored_api_keys: Vec::new(),

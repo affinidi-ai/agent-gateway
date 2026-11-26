@@ -216,6 +216,22 @@ code exchanges of delegated user tokens are not counted either.
 
 No label carries a URL, provider id, secret or tenant.
 
+## Trust agent metrics
+
+Calls the gateway makes to a [trust agent](TRUST_AGENT_SIGNING.md) are counted per client. No
+label carries a DID, key id, connection id or tenant.
+
+| Metric | Labels | Counts |
+| --- | --- | --- |
+| `agent_gateway_vta_call_total` | `operation` (the Trust Task slug, such as `auth` or `sign-jws`), `result` (`ok`, `error`, `circuit_open`, `busy`) | Each Trust Task call; `busy` when the client was at its concurrency limit and `circuit_open` while its circuit breaker was open, neither sent |
+| `agent_gateway_vta_call_duration_seconds` | `operation` | Histogram of the round trip of each sent call, including its one retry |
+| `agent_gateway_vta_circuit_open_total` | none | Each time five consecutive failed calls opened a client's circuit breaker for 30 s |
+| `agent_gateway_vta_quota_exceeded_total` | none | Each signature refused because `[vta] sign_quota_max` was used up for the current window |
+
+A rising `circuit_open` or `error` rate means signing through the trust agent is failing, and
+the surfaces that sign through it fail closed. A non-zero quota rate means a looping caller or a
+quota set too low.
+
 ## Consent confirmation link metric
 
 `agent_gateway_consent_confirmation_links_total{provider_id,surface_id,outcome,reason}` is a
@@ -1040,6 +1056,66 @@ for when a save changes a pin.
   carries `surface_id` and `channel_name`. A save that leaves the list as it was, a new surface
   without origins, and the load-time normalisation of a stored surface record none. Each is also
   logged at info.
+
+**Trust agent security records.** Raised by the trust agent connection routes
+(`/v1/vta/connections/*`, `POST /v1/vta/control-key/rotate`) and by a refused signing change
+(group Key management); see [`TRUST_AGENT_SIGNING.md`](TRUST_AGENT_SIGNING.md#security-records).
+Each is recorded for the outcome the gateway reached, after the write it describes and before the
+response is sent.
+
+- `trust_agent_connection_created`, `trust_agent_connection_updated` (`previous_enabled`,
+  `enabled`), `trust_agent_connection_deleted`: a connection was added, edited (enabled or
+  disabled) or deleted.
+- `trust_agent_pairing_started`: pairing began and the grant request was issued
+  (`previous_state`, `state`).
+- `trust_agent_connection_verified`: the gateway checked the grant on the trust agent and stored
+  the pairing state it found (`previous_state`, `state`, such as `connected` or `degraded`),
+  whether the answer was `200`, `409` or `502`.
+- `trust_agent_connection_revoked`: the gateway stopped signing through a connection
+  (`previous_state`, `state`).
+- A delete, a revoke and an update that disables a connection carry
+  `acknowledge_signing_users` and `acknowledge_stranded_agents`: whether the caller acknowledged
+  that what signs through the connection, and the agents whose keys it holds, stop signing.
+- `trust_agent_signing_key_provisioned`, `trust_agent_signing_key_rotated`: a connection's active
+  signing key changed (`previous_key_id`, `key_id`).
+- `trust_agent_control_key_rotated`: a control key rotation of a connection (`connection_id`) or of
+  the `[vta]` block (no `connection_id`) came to an `outcome`: `rotated`, `rolled_back`,
+  `cancelled`, or `started` when it was still under way as the request was answered (its end is
+  recorded when it comes). `previous_control_did` and `control_did` are the DIDs it moved between,
+  where the route knows them.
+- `trust_agent_change_refused`: a write on those routes was refused. `action` is the change
+  attempted (`create_connection`, `update_connection`, `delete_connection`, `pair_connection`,
+  `verify_connection`, `revoke_connection`, `rotate_signing_key`, `provision_signing_key`,
+  `rotate_control_key`, `cancel_control_key_rotation`), `status` the HTTP status and `reason`
+  `unauthenticated` (401), `forbidden` (403: a role, an access token's scopes, a tenant token
+  acting on an appliance-wide connection or on the `[vta]` block's control key), `conflict` (409:
+  the bootstrap connection, a rotation under way, or a disconnect not acknowledged) or
+  `not_visible` (404 for a connection outside what the caller may see; a `404` for a connection
+  that does not exist is not recorded). A refusal by authentication before the route is recorded
+  too. The connection id comes from the path, bounded to 128 id characters.
+- `signing_change_refused`: a surface, issuer or settings save that changed a signing choice was
+  refused with `403` for lack of `key_management.edit`. `owner` is `surface`, `issuer` or
+  `gateway_default`, with `owner_id` for a stored surface or issuer.
+
+Every record names its `actor` as policy change events do, its `recorded_at` time (RFC 3339)
+and, when the connection belongs to a tenant, `tenant_id` (also on the top level). None carries
+key material, a grant, a request body or an error text; DIDs and key ids are public identifiers.
+
+Each of these records is also a link of the **security record chain**, appended whether or not a
+sink selects its event: `seq` (from 1), `prev_hash` (the previous record's `record_hash`, or
+`genesis`) and `record_hash`, the SHA-256 hex of `seq`, `prev_hash`, the event name and the RFC
+8785 canonical JSON of the record without those three fields, joined by `0x1e`. The chain is kept
+in `{audit directory}/security/records.jsonl`, one record per line, with its head in `head.json`
+next to it, both owner-only (`0600`); the audit directory is the log directory, or
+`_storage/audit`. A restart continues the chain from the head, and verifies the stored records at
+startup, logging `The security record chain does not verify` at error level, naming the first
+record that does not follow, after an edit, a removal or a reorder. Each record is also one
+line of the `security_audit` log target (`warn` for the two refusal events, `info` otherwise)
+with its `seq`, `record_hash` and content, and goes to the VP Audit Log and integrations that
+select it: a copy that leaves the host, so a local edit cannot be hidden by also rewriting the
+chain. A record that cannot be appended is logged at error level on `security_audit` and still
+sent to the sinks without a link; the request is not failed, since a refusal stays a refusal and
+a change that was stored is not undone.
 
 **Policy input capture events.** Raised by the dashboard WebSocket when a user starts or stops
 listening to a surface's policy input (group Policies); see

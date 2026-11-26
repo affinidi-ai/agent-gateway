@@ -171,6 +171,9 @@ fn post_process_hook(
         ProcessingResult::OOBConnectionSetup(_) => {
             info!("🔗 OOB connection setup received");
         }
+        ProcessingResult::OOBInvitationUnusable { reason, .. } => {
+            warn!("OOB connection setup on an unusable invitation: {}", reason);
+        }
         ProcessingResult::OOBConnectionRejected { reason } => {
             error!("❌ OOB connection rejected: {}", reason);
         }

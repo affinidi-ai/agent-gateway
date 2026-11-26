@@ -98,7 +98,6 @@ test.describe("Agents page", () => {
     await serveAgents(page);
     await openAgents(page);
 
-    await expect(page.getByTestId("agents-count")).toHaveText("2");
     await page.getByTestId(`agents-row-${timeAsker.id}`).click();
 
     await expect(page).toHaveURL(new RegExp(`/agent-registry/${timeAsker.id}$`));
@@ -127,7 +126,6 @@ test.describe("Agents page", () => {
     await filter.fill("morty");
     await expect(page.getByTestId(`agents-row-${oxygen.id}`)).toBeVisible();
     await expect(page.getByTestId(`agents-row-${timeAsker.id}`)).toHaveCount(0);
-    await expect(page.getByTestId("agents-count")).toHaveText("1 of 2");
 
     await filter.fill("no such agent");
     await expect(page.getByTestId("agents-no-match")).toBeVisible();
@@ -145,7 +143,7 @@ test.describe("Agents page", () => {
     await serveAgents(page, { agents: [] });
     await openAgents(page);
 
-    await page.getByTestId("agents-add-surface-link").click();
+    await page.getByTestId("agents-add-surface-button").click();
 
     await expect(page).toHaveURL(/\/surfaces\/new$/);
   });

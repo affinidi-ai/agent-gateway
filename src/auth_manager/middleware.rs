@@ -499,13 +499,14 @@ async fn access_token_request(
 }
 
 /// Records `response` as the refusal of `request` when it refuses a policy
-/// change, and returns it unchanged.
+/// change or a trust agent change, and returns it unchanged.
 fn record_refusal(
     request: &Request,
     actor: &crate::audit::events::Actor,
     response: Response,
 ) -> Response {
     crate::audit::policy_refusals::record_refused(request, response.status(), actor.clone());
+    crate::audit::trust_agent_changes::record_refused(request, response.status(), actor.clone());
     response
 }
 
@@ -1953,6 +1954,9 @@ mod tests {
         "/issuers/{id}/did.jsonl",
         "/departments/{id}/did.json",
         "/departments/{id}/did.jsonl",
+        "/vta-auth/did.jsonl",
+        "/vta-auth/{connection_id}/did.jsonl",
+        "/vta-issuer/{token}/did.jsonl",
     ];
 
     fn route_file_prefix(file: &str) -> &'static str {

@@ -225,10 +225,16 @@ impl DidWebvhVerifier {
         let vk_bytes = resolve_verification_method(&proof.verification_method, &doc)?;
         let verifying_key = VerifyingKey::from_bytes(&vk_bytes)?;
 
-        // Canonicalize entry without proofs for signature base
+        // Canonicalize entry without proofs for signature base.
+        //
+        // `serde_json_canonicalizer` rather than `serde_jcs`: this entry came
+        // from outside, and under this binary's `arbitrary_precision` build
+        // `serde_jcs` panics on any number it carries — which would let a
+        // published DID log abort the process that resolves it. Both implement
+        // RFC 8785, so a log that verified before still verifies.
         let mut without_proof = entry.clone();
         without_proof.proof = Vec::new();
-        let doc_jcs = serde_jcs::to_string(&without_proof)?;
+        let doc_jcs = serde_json_canonicalizer::to_string(&without_proof)?;
 
         let proof_config = serde_json::json!({
             "type": "DataIntegrityProof",
@@ -236,7 +242,7 @@ impl DidWebvhVerifier {
             "verificationMethod": &proof.verification_method,
             "proofPurpose": &proof.proof_purpose
         });
-        let proof_config_jcs = serde_jcs::to_string(&proof_config)?;
+        let proof_config_jcs = serde_json_canonicalizer::to_string(&proof_config)?;
 
         let hash_data: Vec<u8> =
             [Sha256::digest(proof_config_jcs.as_bytes()).as_slice(), Sha256::digest(doc_jcs.as_bytes()).as_slice()]
@@ -417,14 +423,14 @@ mod tests {
         entry.version_id = format!("1-{}", hash);
 
         // Step 3: sign the entry with the finalised versionId (eddsa-jcs-2022 algorithm)
-        let doc_jcs = serde_jcs::to_string(&entry).unwrap(); // proof is still empty here
+        let doc_jcs = serde_json_canonicalizer::to_string(&entry).unwrap(); // proof is still empty here
         let proof_config = serde_json::json!({
             "type": "DataIntegrityProof",
             "cryptosuite": "eddsa-jcs-2022",
             "verificationMethod": "did:example:123#key-1",
             "proofPurpose": "assertionMethod"
         });
-        let proof_config_jcs = serde_jcs::to_string(&proof_config).unwrap();
+        let proof_config_jcs = serde_json_canonicalizer::to_string(&proof_config).unwrap();
         let hash_data: Vec<u8> =
             [Sha256::digest(proof_config_jcs.as_bytes()).as_slice(), Sha256::digest(doc_jcs.as_bytes()).as_slice()]
                 .concat();

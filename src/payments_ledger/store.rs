@@ -125,9 +125,25 @@ impl Segment {
 /// needs it: the window keeps it past its capacity and a restart loads it from
 /// whichever segment holds it.
 pub(super) fn awaits_settlement(row: &PaymentLedgerRow) -> bool {
+    undecided(row) && !row.reconcile_failed
+}
+
+/// Whether the payment on `row` may still be settled or have its outcome
+/// learnt. A row closed as paid, voided, failed or rejected, or superseded by
+/// a later row, keeps its outcome. A row the reconciler gave up on is still
+/// undecided, so a late answer can close it.
+pub(super) fn undecided(row: &PaymentLedgerRow) -> bool {
     matches!(row.outcome, super::LedgerOutcome::Authorized | super::LedgerOutcome::Unconfirmed)
-        && !row.reconcile_failed
         && row.superseded_by.is_none()
+}
+
+/// What [`DelegatedPaymentStore::update`] did with a row.
+#[derive(Debug)]
+pub enum Updated {
+    /// The change was applied and written; the row as it now is.
+    Written(PaymentLedgerRow),
+    /// The change refused the row as it is; nothing was written.
+    Refused(PaymentLedgerRow),
 }
 
 /// How far back a restart looks for rows that still await settlement: past the
@@ -222,6 +238,32 @@ impl Window {
             .filter(|held| awaits_settlement(&held.row))
             .filter_map(|held| Segment::of_row_id(&held.row.id))
             .collect()
+    }
+}
+
+impl Inner {
+    /// Queues `stored` for the next flush in place of any older version of the
+    /// same row, so the disk never ends on a stale version and a row changed
+    /// many times while the disk is failing takes one place in the queue.
+    /// Returns `false` when the queue is full and the row was not queued.
+    fn queue_for_disk(
+        &mut self,
+        stored: Arc<StoredLedgerRow>,
+        limit: usize,
+    ) -> bool {
+        if let Some(queued) = self
+            .pending
+            .iter_mut()
+            .find(|queued| queued.row.id == stored.row.id)
+        {
+            *queued = stored;
+        } else if self.pending.len() < limit {
+            self.pending.push_back(stored);
+        } else {
+            self.unwritten += 1;
+            return false;
+        }
+        true
     }
 }
 
@@ -327,12 +369,7 @@ impl DelegatedPaymentStore {
         inner
             .window
             .insert(stored.clone(), self.limits.window_rows);
-        if inner.pending.len() < self.limits.pending_rows {
-            inner
-                .pending
-                .push_back(stored);
-        } else {
-            inner.unwritten += 1;
+        if !inner.queue_for_disk(stored, self.limits.pending_rows) {
             crate::metrics::backends::prometheus::track_payment_ledger_unwritten_row();
         }
         Ok(())
@@ -367,17 +404,22 @@ impl DelegatedPaymentStore {
     }
 
     /// Applies `change` to the row with `id`, stamps `updated_at` and writes the
-    /// new version to the row's segment before returning it.
+    /// new version to the row's segment before returning it. `change` sees the
+    /// row as it is now and returns `false` to leave it unchanged, so a row is
+    /// only ever moved from the state its change expects.
     pub async fn update(
         &self,
         id: &str,
-        change: impl FnOnce(&mut PaymentLedgerRow),
-    ) -> anyhow::Result<PaymentLedgerRow> {
+        change: impl FnOnce(&mut PaymentLedgerRow) -> bool,
+    ) -> anyhow::Result<Updated> {
         let _updating = self.updating.lock().await;
         let Some((mut row, tenant_id)) = self.get(id).await else {
             bail!("ledger row {id} is not recorded");
         };
-        change(&mut row);
+        let current = row.clone();
+        if !change(&mut row) {
+            return Ok(Updated::Refused(current));
+        }
         row.id = id.to_string();
         row.updated_at = Some(Utc::now());
         let stored = Arc::new(StoredLedgerRow { row: row.clone(), tenant_id });
@@ -386,7 +428,7 @@ impl DelegatedPaymentStore {
             .replace(stored.clone());
         self.write_now(stored, u64::MAX)
             .await?;
-        Ok(row)
+        Ok(Updated::Written(row))
     }
 
     /// The rows in the window that `keep` admits, with their tenants, oldest first.
@@ -454,25 +496,24 @@ impl DelegatedPaymentStore {
         });
         match written {
             Ok(appended) => {
-                *self
-                    .inner()
-                    .segments
-                    .entry(segment)
-                    .or_default() += appended.bytes;
+                {
+                    let mut inner = self.inner();
+                    *inner
+                        .segments
+                        .entry(segment)
+                        .or_default() += appended.bytes;
+                    inner
+                        .pending
+                        .retain(|queued| queued.row.id != stored.row.id);
+                }
                 self.index_cases(std::slice::from_ref(&stored))
                     .await;
                 Ok(())
             }
             Err(e) => {
                 crate::metrics::backends::prometheus::track_payment_ledger_unwritten_row();
-                let mut inner = self.inner();
-                if inner.pending.len() < self.limits.pending_rows {
-                    inner
-                        .pending
-                        .push_back(stored);
-                } else {
-                    inner.unwritten += 1;
-                }
+                self.inner()
+                    .queue_for_disk(stored, self.limits.pending_rows);
                 Err(e.context("failed to write a payment row to the disk; it is queued for the next flush"))
             }
         }
@@ -707,9 +748,15 @@ impl DelegatedPaymentStore {
         if !failed.is_empty() {
             let mut inner = self.inner();
             for stored in failed.into_iter().rev() {
-                inner
+                let newer_is_queued = inner
                     .pending
-                    .push_front(stored);
+                    .iter()
+                    .any(|queued| queued.row.id == stored.row.id);
+                if !newer_is_queued {
+                    inner
+                        .pending
+                        .push_front(stored);
+                }
             }
             while inner.pending.len() > self.limits.pending_rows {
                 inner.pending.pop_back();
@@ -1622,7 +1669,10 @@ mod tests {
         assert_eq!(open[0].0.id, held.id);
 
         reloaded
-            .update(&held.id, |row| row.outcome = LedgerOutcome::Voided)
+            .update(&held.id, |row| {
+                row.outcome = LedgerOutcome::Voided;
+                true
+            })
             .await
             .unwrap();
         drop(reloaded);
@@ -1650,8 +1700,14 @@ mod tests {
             .await;
 
         let (first, second) = tokio::join!(
-            store.update(&held.id, |row| row.settle_attempts += 1),
-            store.update(&held.id, |row| row.settle_attempts += 1),
+            store.update(&held.id, |row| {
+                row.settle_attempts += 1;
+                true
+            }),
+            store.update(&held.id, |row| {
+                row.settle_attempts += 1;
+                true
+            }),
         );
         first.unwrap();
         second.unwrap();
@@ -1782,7 +1838,10 @@ mod tests {
         assert_eq!(store.get(&settled.id).await, None);
 
         store
-            .update(&held.id, |row| row.outcome = LedgerOutcome::Paid)
+            .update(&held.id, |row| {
+                row.outcome = LedgerOutcome::Paid;
+                true
+            })
             .await
             .unwrap();
         assert_eq!(
@@ -2049,5 +2108,49 @@ mod tests {
         assert_eq!(Segment::of_row_id(&id).map(Segment::file_name), Some("ledger-2023-11-14T22.jsonl".to_string()));
         assert_eq!(Segment::of_row_id(&uuid::Uuid::new_v4().to_string()), None);
         assert_eq!(Segment::of_row_id("nope"), None);
+    }
+
+    #[test]
+    fn a_row_queued_again_replaces_its_older_version() {
+        let mut inner = Inner::default();
+        let first = row("s-1", LedgerOutcome::Authorized, Duration::zero());
+        let mut changed = first.clone();
+        changed.outcome = LedgerOutcome::Voided;
+        let other = row("s-1", LedgerOutcome::Paid, Duration::zero());
+
+        assert!(inner.queue_for_disk(Arc::new(StoredLedgerRow { row: first, tenant_id: None }), 2));
+        assert!(inner.queue_for_disk(
+            Arc::new(StoredLedgerRow {
+                row: changed.clone(),
+                tenant_id: None
+            }),
+            2
+        ));
+        assert_eq!(inner.pending.len(), 1, "one place per row");
+        assert_eq!(inner.pending[0].row, changed, "the newest version is the one written");
+
+        assert!(inner.queue_for_disk(
+            Arc::new(StoredLedgerRow {
+                row: other.clone(),
+                tenant_id: None
+            }),
+            2
+        ));
+        let third = row("s-1", LedgerOutcome::Paid, Duration::zero());
+        assert!(!inner.queue_for_disk(Arc::new(StoredLedgerRow { row: third, tenant_id: None }), 2));
+        assert_eq!(inner.unwritten, 1, "a new row past the limit is counted, not queued");
+
+        let mut other_changed = other;
+        other_changed.outcome = LedgerOutcome::Rejected;
+        assert!(
+            inner.queue_for_disk(
+                Arc::new(StoredLedgerRow {
+                    row: other_changed,
+                    tenant_id: None
+                }),
+                2
+            ),
+            "a row already queued is replaced even at the limit"
+        );
     }
 }

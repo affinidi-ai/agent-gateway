@@ -20,6 +20,23 @@ struct CachedDocument {
     expires_at: Instant,
 }
 
+/// Verify a stored did:webvh log with the library that writes the gateway's logs: the SCID, the
+/// hash chain, every entry's proof and its authorisation, and what follows a deactivation. A log
+/// that fails any of them is an error. Takes the stored lines as they are, because re-serialising
+/// them through the gateway's own types can change what was signed.
+pub(crate) async fn verify_log_with_library(
+    did: &str,
+    raw_entries: &[String],
+) -> Result<()> {
+    let jsonl = raw_entries.join("\n");
+    let mut lib_state = didwebvh_rs::DIDWebVHState::default();
+    let _ = lib_state
+        .resolve_log(did, &jsonl, None)
+        .await
+        .map_err(|e| anyhow!("DID log validation failed: {}", e))?;
+    Ok(())
+}
+
 impl DidWebvhResolver {
     pub fn new(storage: Arc<dyn DidLogStorage>) -> Self {
         Self { storage, cache: DashMap::new() }
@@ -30,13 +47,7 @@ impl DidWebvhResolver {
         did: &str,
         raw_entries: &[String],
     ) -> Result<()> {
-        let jsonl = raw_entries.join("\n");
-        let mut lib_state = didwebvh_rs::DIDWebVHState::default();
-        let _ = lib_state
-            .resolve_log(did, &jsonl, None)
-            .await
-            .map_err(|e| anyhow!("DID log validation failed: {}", e))?;
-        Ok(())
+        verify_log_with_library(did, raw_entries).await
     }
 
     /// Validate entries using the library's cryptographic log resolver.

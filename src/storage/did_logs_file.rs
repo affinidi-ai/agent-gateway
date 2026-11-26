@@ -67,6 +67,9 @@ impl DidLogStorage for FileDidLogStorage {
         file.write_all(format!("{raw_json}\n").as_bytes())
             .await?;
         file.flush().await?;
+        file.sync_all()
+            .await
+            .with_context(|| format!("sync {:?}", path))?;
         Ok(())
     }
 

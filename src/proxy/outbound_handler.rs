@@ -5149,6 +5149,11 @@ async fn step_inject_trusted_identity(
         .as_ref()
         .unwrap_or(&surface_protocol);
 
+    let key_scope = crate::vta::key_directory::KeyScope::serving(
+        &ctx.surface,
+        ctx.active_variant_id
+            .as_deref(),
+    );
     let injected_vp_jwt: Option<String> = match protocol {
         ChannelProtocol::A2a | ChannelProtocol::Ap2 => {
             let (signed, vp_jwt) = crate::a2a::extensions::inject_identity_credential_extension(
@@ -5158,6 +5163,7 @@ async fn step_inject_trusted_identity(
                 workload_binding,
                 vc_issuer,
                 channel_name,
+                &key_scope,
             )
             .await
             .map_err(|e| {
@@ -5195,6 +5201,7 @@ async fn step_inject_trusted_identity(
                 &protected_meta_field,
                 protected_strip_raw,
                 ctx.mcp_metadata_context,
+                &key_scope,
             )
             .await
             .map_err(|e| {

@@ -224,7 +224,7 @@ fn get_response_headers_value(world: &SurfaceWorld) -> &HashMap<String, String> 
     &get_caller_response(world).headers
 }
 
-fn get_response_body_value(world: &SurfaceWorld) -> &serde_json::Value {
+pub(crate) fn get_response_body_value(world: &SurfaceWorld) -> &serde_json::Value {
     &get_caller_response(world).body
 }
 
@@ -2210,7 +2210,7 @@ fn both_responses_same_did(world: &mut SurfaceWorld) {
     );
 }
 
-fn get_mcp_request_for_actor<'a>(
+pub(crate) fn get_mcp_request_for_actor<'a>(
     world: &'a SurfaceWorld,
     server_name: &str,
 ) -> &'a crate::bdd_support::mock_server::ReceivedRequest {
@@ -3153,6 +3153,85 @@ fn named_managed_agent_received_two_binding_vps_for_different_dids(
     let first = get_did_from_a2a_binding_request(&observations.requests[0], "first managed agent request");
     let second = get_did_from_a2a_binding_request(&observations.requests[1], "second managed agent request");
     assert_ne!(first, second, "identity-binding VP holder DIDs should differ");
+}
+
+fn assert_managed_agent_vp_identifies(
+    world: &SurfaceWorld,
+    agent_name: &str,
+    expected: &[(&str, &str)],
+) {
+    let request = get_observed_request_for_actor(world, agent_name, TargetActorKind::ManagedAgent);
+    let context = format!("managed agent '{agent_name}'");
+    let binding = get_a2a_binding_extension(request, &context);
+    let vp = &binding["verifiablePresentation"];
+    assert!(is_valid_vp(vp), "{context} identity-binding VP should be valid, got: {vp}");
+    let subject = first_credential_subject_from_vp(vp);
+    for (field, value) in expected {
+        assert_eq!(
+            identity_field_value_from_subject(&subject, field).and_then(serde_json::Value::as_str),
+            Some(*value),
+            "{context} identity-binding VP should identify the caller by '{field}' = '{value}', got credentialSubject: {subject}"
+        );
+    }
+}
+
+#[then(
+    expr = "managed agent {string} received the forwarded request with a VP proving the Agent DID of the token's subject"
+)]
+fn named_managed_agent_received_a_binding_vp_for_the_token_subject(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    assert_managed_agent_vp_identifies(
+        world,
+        &agent_name,
+        &[("credential_type", "jwt_claim"), ("claim", "sub"), ("value", "test-user")],
+    );
+}
+
+#[then(
+    expr = "managed agent {string} received the forwarded request with a VP proving the Agent DID of the presented API key"
+)]
+fn named_managed_agent_received_a_binding_vp_for_the_presented_api_key(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    let secret_id = world
+        .surface_config
+        .source_auth
+        .iter()
+        .chain(
+            &world
+                .surface_config
+                .additional_source_auth,
+        )
+        .find_map(|auth| match auth {
+            crate::world::SurfaceSourceAuthConfig::ApiKey(config) => Some(config.secret_id.clone()),
+            _ => None,
+        })
+        .expect("an API Key source authentication method must be configured");
+    assert_managed_agent_vp_identifies(
+        world,
+        &agent_name,
+        &[("credential_type", "api_key"), ("secret_id", secret_id.as_str())],
+    );
+}
+
+#[then(expr = "managed agent {string} received the forwarded request with no caller identity")]
+fn named_managed_agent_received_no_caller_identity(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    let request = get_observed_request_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
+    let body = request.json_body();
+    for uri in [AGENT_IDENTITY_BINDING_URI, AGENT_IDENTITY_CREDENTIAL_URI] {
+        let pointer = format!("/params/message/metadata/{}", uri.replace('/', "~1"));
+        assert!(
+            body.pointer(&pointer)
+                .is_none(),
+            "managed agent '{agent_name}' should receive no caller identity proof '{uri}', got body: {body}"
+        );
+    }
 }
 
 #[then(expr = "managed agent {string} received two forwarded requests with VPs proving the same caller Agent DID")]

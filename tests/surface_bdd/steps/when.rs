@@ -720,10 +720,43 @@ pub(crate) async fn build_new_surface_payload(
         .surface_config
         .source_auth
     {
+        let methods: Vec<serde_json::Value> = std::iter::once(auth)
+            .chain(
+                &world
+                    .surface_config
+                    .additional_source_auth,
+            )
+            .map(config::source_auth::caller_authentication_method_json)
+            .collect();
+        access_point.insert("caller_authentication".to_string(), serde_json::json!({ "methods": methods }));
+    }
+    if let Some(header) = &world
+        .surface_config
+        .identity_binding_header
+    {
         access_point.insert(
-            "caller_authentication".to_string(),
-            serde_json::json!({ "methods": [config::source_auth::caller_authentication_method_json(auth)] }),
+            "header_metadata_mapping".to_string(),
+            serde_json::json!({
+                "extension_uri": AGENT_IDENTITY_BINDING_URI,
+                "headers": [{ "header": header, "field": "verifiablePresentation" }]
+            }),
         );
+    }
+    let inbound = if world
+        .surface_config
+        .jwt_claim_inbound_identity
+    {
+        Some(serde_json::json!({ "type": "from_jwt_claim", "claim": "sub", "namespace_claims": ["iss"] }))
+    } else if world
+        .surface_config
+        .api_key_inbound_identity
+    {
+        Some(serde_json::json!({ "type": "from_api_key" }))
+    } else {
+        None
+    };
+    if let Some(inbound) = inbound {
+        payload["identity_slots"] = serde_json::json!({ "inbound": inbound });
     }
     payload
 }
@@ -1990,6 +2023,15 @@ async fn send_preflight_for_post(
     });
 }
 
+#[when(expr = "the operator attempts to create the surface for route {string}")]
+async fn operator_tries_to_create_the_surface(
+    world: &mut SurfaceWorld,
+    route: String,
+) {
+    let payload = build_new_surface_payload(world, &route, false).await;
+    create_surface(world, payload).await;
+}
+
 #[when(expr = "the operator attempts to create a surface for route {string} with invalid configuration")]
 async fn invalid_surface_create_request_submitted(
     world: &mut SurfaceWorld,
@@ -2697,7 +2739,7 @@ fn build_api_key_source_auth_header(
     (api_key_source_auth(world).0, key_value)
 }
 
-fn build_valid_api_key_source_auth_header(world: &SurfaceWorld) -> (String, String) {
+pub(crate) fn build_valid_api_key_source_auth_header(world: &SurfaceWorld) -> (String, String) {
     api_key_source_auth(world)
 }
 
@@ -2711,6 +2753,92 @@ async fn request_with_invalid_api_key(world: &mut SurfaceWorld) {
 async fn request_with_valid_api_key(world: &mut SurfaceWorld) {
     let header = build_valid_api_key_source_auth_header(world);
     send_request_and_record(world, vec![header]).await;
+}
+
+const AGENT_IDENTITY_BINDING_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity-binding/v1";
+const TRUST_REGISTRY_EXTENSION_URI: &str = "https://fabric.affinidi.io/extensions/trust-registry";
+
+/// `body`, an A2A message, carrying the caller's own identity proofs (an
+/// identity binding VP and an identity credential naming a DID it asserts) and
+/// a trust-registry `agent_did` asserting the same DID.
+fn with_caller_identity_proof(mut body: serde_json::Value) -> serde_json::Value {
+    let message = body
+        .pointer_mut("/params/message")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("an A2A message/send request");
+    message.insert(
+        "extensions".to_string(),
+        serde_json::json!([AGENT_IDENTITY_BINDING_URI, AGENT_IDENTITY_CREDENTIAL_URI]),
+    );
+    message.insert(
+        "metadata".to_string(),
+        serde_json::json!({
+            AGENT_IDENTITY_BINDING_URI: {"verifiablePresentation": "caller-made-presentation"},
+            AGENT_IDENTITY_CREDENTIAL_URI: {"did": "did:web:asserted.example", "verifiablePresentation": "caller-made-presentation"},
+            TRUST_REGISTRY_EXTENSION_URI: {"agent_did": "did:web:asserted.example"}
+        }),
+    );
+    body
+}
+
+#[when(expr = "the caller sends a request to the surface with a valid API key and a trust-registry agent DID {string}")]
+async fn request_with_valid_api_key_and_trust_registry_agent_did(
+    world: &mut SurfaceWorld,
+    agent_did: String,
+) {
+    let header = build_valid_api_key_source_auth_header(world);
+    let mut body = build_request_body(&world.surface_config.protocol);
+    body["params"]["message"]["metadata"] =
+        serde_json::json!({ TRUST_REGISTRY_EXTENSION_URI: { "agent_did": agent_did } });
+    send_json_request_and_record(world, body, vec![header]).await;
+}
+
+#[when("the caller asks the MCP surface for available tools with a valid API key and an identity proof of its own")]
+async fn caller_asks_mcp_surface_with_valid_api_key_and_own_identity_proof(world: &mut SurfaceWorld) {
+    let header = build_valid_api_key_source_auth_header(world);
+    let mut body = build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha"));
+    body["params"]["_meta"] = serde_json::json!({
+        AGENT_IDENTITY_BINDING_URI: {"verifiablePresentation": "caller-made-presentation"}
+    });
+    send_json_request_and_record(world, body, vec![header]).await;
+}
+
+#[when("the caller sends a request to the surface with a valid API key and an identity proof of its own")]
+async fn request_with_valid_api_key_and_own_identity_proof(world: &mut SurfaceWorld) {
+    let header = build_valid_api_key_source_auth_header(world);
+    let body = with_caller_identity_proof(build_request_body(&world.surface_config.protocol));
+    send_json_request_and_record(world, body, vec![header]).await;
+}
+
+#[when(
+    "the caller sends a request to the surface with a valid API key and an identity proof of its own beside a value nested too deeply to read"
+)]
+async fn request_with_valid_api_key_and_own_identity_proof_nested_too_deeply(world: &mut SurfaceWorld) {
+    let header = build_valid_api_key_source_auth_header(world);
+    let mut body = with_caller_identity_proof(build_request_body(&world.surface_config.protocol));
+    let mut nested = serde_json::json!(1);
+    for _ in 0..200 {
+        nested = serde_json::json!([nested]);
+    }
+    body["params"]["message"]["metadata"]["nested"] = nested;
+    send_json_request_and_record(world, body, vec![header]).await;
+}
+
+#[when("the caller sends a request to the surface with an invalid API key and an identity proof of its own")]
+async fn request_with_invalid_api_key_and_own_identity_proof(world: &mut SurfaceWorld) {
+    let header = build_api_key_source_auth_header(world, "bdd-invalid-api-key".to_string());
+    let body = with_caller_identity_proof(build_request_body(&world.surface_config.protocol));
+    send_json_request_and_record(world, body, vec![header]).await;
+}
+
+#[when("the caller sends a request to the surface with a valid token and an identity proof of its own")]
+async fn request_with_valid_token_and_own_identity_proof(world: &mut SurfaceWorld) {
+    ensure_gateway_running(world).await;
+    let issuer = get_jwt_source_auth_issuer(world);
+    let audience = caller_token_audience(world);
+    let token = create_valid_jwt_for_issuer_with_audience(issuer, audience);
+    let body = with_caller_identity_proof(build_request_body(&world.surface_config.protocol));
+    send_json_request_and_record(world, body, vec![("authorization".to_string(), format!("Bearer {token}"))]).await;
 }
 
 #[when(expr = "the caller sends a request to the surface path {string} with a valid alternate variant API key")]

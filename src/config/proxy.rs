@@ -143,7 +143,16 @@ impl BootstrapConfig {
 
         // Read and parse x402.json
         let contents = std::fs::read_to_string(x402_path)?;
-        let config: X402Config = serde_json::from_str(&contents)?;
+        let mut config: X402Config = serde_json::from_str(&contents)?;
+        if config
+            .facilitator_private_keys
+            .take()
+            .is_some()
+        {
+            warn!(
+                "{x402_path}: facilitator_private_keys is ignored and not kept: the gateway signs no x402 settlement. Remove the keys from the file."
+            );
+        }
 
         info!("Loaded x402 config: enabled={}, verification_mode={:?}", config.enabled, config.verification_mode);
         Ok(config)
@@ -202,6 +211,7 @@ impl GatewayConfig {
                 mcp_legacy_metadata_output: None,
                 _retired_protocol_mode: Default::default(),
                 mcp_http: None,
+                signing: None,
                 caller_key: None,
                 trust_check_split: false,
                 transit_point_source_auth: false,
@@ -329,12 +339,12 @@ impl GatewayConfig {
         // Multiple channels can share the same port if they have different routes
         let mut seen_route_port_combos = std::collections::HashSet::new();
         for surface in self.surfaces.iter() {
-            // Disabled surfaces register no routes anywhere (inbound routing
+            // Disabled and deleted surfaces register no routes anywhere (inbound routing
             // and `group_outbound_vcs_by_port` both skip them), so they must
             // not hold a route claim here either — disabling one copy is the
             // remediation for a duplicated surface, and it has to allow the
             // gateway to boot.
-            if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+            if !surface.status.is_live() {
                 continue;
             }
             let channel_id = surface
@@ -395,26 +405,29 @@ impl GatewayConfig {
 /// Validate a loaded surface's `source_auth` at boot: every rule of a save but
 /// the DID Auth session TTL bound, which a stored value is held to at runtime
 /// (see [`GatewayConfig::did_auth_session_ttl_adjustments`]). A
-/// `from_jwt_claim` identity without `jwt_bearer` as its only method, and an
-/// inbound `from_api_key` identity beside a method other than an API key, are
-/// only warned about here: stored surfaces predating the rule booted with
-/// them, and saving them enforces it.
+/// `from_jwt_claim` identity without a `jwt_bearer` method to read (on the
+/// protected or external slot or a Transit Point, without `jwt_bearer` as its
+/// only method), and an inbound `from_api_key` identity without an API key
+/// method to read, are only warned about here: stored surfaces predating the
+/// rule booted with them, and saving them enforces it.
 fn validate_source_auth_surface(surface: &crate::config::agent_surface::AgentSurface) -> anyhow::Result<()> {
     use crate::source_auth::SourceAuthConfig;
 
     validate_stored_source_auth_methods(surface)?;
     if let Err(error) = validate_jwt_claim_identity(surface) {
-        warn!("{error}; callers that authenticate with another method are refused until the surface is fixed");
+        warn!(
+            "{error}; callers it cannot identify are refused until the surface is fixed, and the next save refuses it"
+        );
     }
     if surface.inbound_identity_from_api_key()
-        && surface
+        && !surface
             .source_auth_methods()
             .iter()
-            .any(|method| !matches!(method, SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_)))
+            .any(|method| matches!(method, SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_)))
     {
         warn!(
-            "Channel '{}': inbound identity from_api_key requires every source authentication method to be api_key \
-             or api_key_provider; callers that authenticate with another method are refused until the surface is fixed",
+            "Channel '{}': inbound identity from_api_key needs an api_key or api_key_provider source authentication \
+             method; its verified callers are refused until the surface is fixed, and the next save refuses it",
             surface.name
         );
     }
@@ -970,20 +983,30 @@ fn validate_method_selection(
     Ok(())
 }
 
-/// `from_jwt_claim` derives a DID from the caller's verified JWT, so every
-/// caller must authenticate with a JWT.
+/// `from_jwt_claim` derives a DID from the caller's verified JWT. On the
+/// inbound slot it needs a `jwt_bearer` method to read, and callers of the
+/// other methods get no identity; on the protected or external slot or a
+/// Transit Point every caller must authenticate with a JWT.
 fn validate_jwt_claim_identity(surface: &crate::config::agent_surface::AgentSurface) -> anyhow::Result<()> {
     use crate::source_auth::{ManagedIdentityConfig, SourceAuthConfig};
 
+    let methods = surface.source_auth_methods();
+    if matches!(surface.inbound_identity(), Some(ManagedIdentityConfig::FromJwtClaim { .. }))
+        && !methods
+            .iter()
+            .any(|method| matches!(method, SourceAuthConfig::JwtBearer(_)))
+    {
+        anyhow::bail!(
+            "Channel '{}': inbound from_jwt_claim identity needs a jwt_bearer source authentication method",
+            surface.name
+        );
+    }
     let transit_identities = surface
         .transit
         .iter()
         .flat_map(|transit| transit.points.iter())
         .filter_map(|point| point.managed_identity.clone());
     let uses_jwt_claim = [
-        surface
-            .inbound_identity()
-            .cloned(),
         surface
             .external_identity()
             .cloned(),
@@ -993,7 +1016,6 @@ fn validate_jwt_claim_identity(surface: &crate::config::agent_surface::AgentSurf
     .flatten()
     .chain(transit_identities)
     .any(|identity| matches!(identity, ManagedIdentityConfig::FromJwtClaim { .. }));
-    let methods = surface.source_auth_methods();
     let jwt_bearer_only = !methods.is_empty()
         && methods
             .iter()
@@ -1452,26 +1474,24 @@ mod tests {
     }
 
     #[test]
-    fn from_jwt_claim_identity_requires_jwt_bearer_as_the_only_method() {
+    fn inbound_from_jwt_claim_identity_needs_a_jwt_bearer_method_to_read() {
         let inbound = serde_json::json!({"identity_slots": {"inbound": {"type": "from_jwt_claim"}}});
-        let mixed =
-            surface_with_caller_auth(serde_json::json!([jwt_method(), api_key_method("X-API-Key")]), inbound.clone());
-        let error = validate_source_auth_config(&mixed, None)
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "Channel 'multi': from_jwt_claim identity requires jwt_bearer as the only source authentication method"
-        );
-
-        let none = surface_with_caller_auth(serde_json::json!([]), inbound.clone());
-        let error = validate_source_auth_config(&none, None)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("from_jwt_claim identity requires"), "{error}");
-
-        let jwt_only = surface_with_caller_auth(serde_json::json!([jwt_method()]), inbound);
-        validate_source_auth_config(&jwt_only, None).unwrap();
+        for methods in
+            [serde_json::json!([jwt_method()]), serde_json::json!([jwt_method(), api_key_method("X-API-Key")])]
+        {
+            let surface = surface_with_caller_auth(methods.clone(), inbound.clone());
+            validate_source_auth_config(&surface, None).unwrap_or_else(|error| panic!("{methods}: {error}"));
+        }
+        for methods in [serde_json::json!([]), serde_json::json!([api_key_method("X-API-Key")])] {
+            let surface = surface_with_caller_auth(methods.clone(), inbound.clone());
+            assert_eq!(
+                validate_source_auth_config(&surface, None)
+                    .unwrap_err()
+                    .to_string(),
+                "Channel 'multi': inbound from_jwt_claim identity needs a jwt_bearer source authentication method",
+                "{methods}"
+            );
+        }
     }
 
     #[test]
@@ -2114,5 +2134,47 @@ mod tests {
                 "{on_disk}"
             );
         }
+    }
+
+    #[test]
+    fn facilitator_private_keys_are_dropped_when_x402_json_loads() {
+        let directory = tempfile::tempdir().unwrap();
+        let x402_json = directory
+            .path()
+            .join("x402.json");
+        let mut bootstrap: BootstrapConfig =
+            toml::from_str(&crate::render_default_bootstrap_toml("", "").unwrap()).unwrap();
+        bootstrap.config_files.x402 = x402_json
+            .to_string_lossy()
+            .into_owned();
+
+        std::fs::write(
+            &x402_json,
+            serde_json::json!({
+                "rpc_endpoints": {"eip155:84532": "https://sepolia.base.org"},
+                "facilitator_private_keys": {"eip155:84532": {"private_key": "0xkey", "address": "0xaddress"}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let loaded = bootstrap
+            .load_x402_config()
+            .unwrap();
+        assert!(
+            loaded
+                .facilitator_private_keys
+                .is_none(),
+            "the keys are not kept in memory"
+        );
+        assert_eq!(loaded.rpc_endpoints["eip155:84532"], "https://sepolia.base.org");
+
+        std::fs::write(&x402_json, "{}").unwrap();
+        assert!(
+            bootstrap
+                .load_x402_config()
+                .unwrap()
+                .facilitator_private_keys
+                .is_none()
+        );
     }
 }

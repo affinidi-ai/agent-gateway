@@ -8,10 +8,10 @@
 //! `_storage/audit/delegation-audit.jsonl` if no log directory is configured.
 
 use crate::audit::events::{
-    Actor, AuthScheme, DelegationFailureReason, IdentityBindingFailure, PolicyChangeAction, PolicyChangeSource,
-    PolicyField, PolicyMode, PolicySlot, PolicyTargetKind, RateLimitScope, RefusalReason, RejectionReason,
-    RejectionStage, RequestFailureOutcome, TargetAuthField, TargetAuthLeg, TargetAuthMethodKind, TargetAuthRejection,
-    TargetKind,
+    Actor, AuthScheme, ControlKeyRotationOutcome, DelegationFailureReason, IdentityBindingFailure, PolicyChangeAction,
+    PolicyChangeSource, PolicyField, PolicyMode, PolicySlot, PolicyTargetKind, RateLimitScope, RefusalReason,
+    RejectionReason, RejectionStage, RequestFailureOutcome, SecurityRefusalReason, SigningOwnerKind, TargetAuthField,
+    TargetAuthLeg, TargetAuthMethodKind, TargetAuthRejection, TargetKind, TrustAgentAction,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
@@ -596,6 +596,74 @@ pub struct AuthorityForceDeleteDetails {
     pub referrers: Vec<ReferrerDetails>,
 }
 
+/// A change to a trust agent connection or to a key the gateway signs or signs in with, made or
+/// refused through the management API. A security record: hash-chained by
+/// [`crate::audit::security_chain`], whose link it carries. Names connections, keys and
+/// identifiers by id; never key material, a grant, a request body or an error text.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct TrustAgentChangeDetails {
+    pub actor: Actor,
+    /// When the record was made, RFC 3339; part of what its hash covers.
+    pub recorded_at: String,
+    /// Absent for the `[vta]` block's control key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
+    /// The connection's tenant; absent for an appliance-wide connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    /// On a refusal: the change attempted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<TrustAgentAction>,
+    /// On a refusal: the HTTP status the caller received.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<SecurityRefusalReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// The connection's pairing state before and after.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// The signing key id retired and the one now active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ControlKeyRotationOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_control_did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_did: Option<String>,
+    /// On a disconnect: whether the caller acknowledged that what signs through the connection,
+    /// and the agents whose keys it holds, stop signing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledge_signing_users: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledge_stranded_agents: Option<bool>,
+    #[serde(flatten)]
+    pub chain: Option<crate::audit::security_chain::ChainLink>,
+}
+
+/// A save refused with `403` because it changed a signing choice without
+/// `key_management.edit`. A security record, hash-chained like [`TrustAgentChangeDetails`].
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct SigningChangeRefusalDetails {
+    pub actor: Actor,
+    pub recorded_at: String,
+    pub owner: SigningOwnerKind,
+    /// The surface's or issuer's id; absent for the gateway default and for a new resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
+    pub status: u16,
+    #[serde(flatten)]
+    pub chain: Option<crate::audit::security_chain::ChainLink>,
+}
+
 /// A dashboard user starting or stopping a policy input capture on a surface, named by the
 /// record's `surface_id`. A stop says why it ended.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -871,6 +939,29 @@ pub enum DelegationAuditAction {
     McpProxyPinChanged(Box<McpProxyPinChangeDetails>),
     /// A save changed a surface's `browser_origins`.
     BrowserOriginsChanged(Box<BrowserOriginsChangeDetails>),
+    /// A trust agent connection was created.
+    TrustAgentConnectionCreated(Box<TrustAgentChangeDetails>),
+    /// A trust agent connection was edited, enabled or disabled.
+    TrustAgentConnectionUpdated(Box<TrustAgentChangeDetails>),
+    /// A trust agent connection was deleted.
+    TrustAgentConnectionDeleted(Box<TrustAgentChangeDetails>),
+    /// Pairing with a trust agent began: the grant request was issued.
+    TrustAgentPairingStarted(Box<TrustAgentChangeDetails>),
+    /// The gateway checked a connection's grant on its trust agent and stored the state it found.
+    TrustAgentConnectionVerified(Box<TrustAgentChangeDetails>),
+    /// A connection was revoked: the gateway stopped signing through it.
+    TrustAgentConnectionRevoked(Box<TrustAgentChangeDetails>),
+    /// A signing key was minted in a trust agent and made the connection's active key.
+    TrustAgentSigningKeyProvisioned(Box<TrustAgentChangeDetails>),
+    /// A connection's active signing key was replaced by one already in its trust agent.
+    TrustAgentSigningKeyRotated(Box<TrustAgentChangeDetails>),
+    /// A control key rotation, of a connection or of the `[vta]` block, ended, rolled back,
+    /// was cancelled or was left running.
+    TrustAgentControlKeyRotated(Box<TrustAgentChangeDetails>),
+    /// A trust agent change was refused; `action` names the change attempted.
+    TrustAgentChangeRefused(Box<TrustAgentChangeDetails>),
+    /// A save that changed a signing choice was refused for lack of `key_management.edit`.
+    SigningChangeRefused(Box<SigningChangeRefusalDetails>),
     /// A dashboard user started capturing a surface's policy input.
     PolicyInputCaptureStarted(Box<PolicyInputCaptureDetails>),
     /// A dashboard user's policy input capture on a surface ended.
@@ -933,6 +1024,17 @@ impl DelegationAuditAction {
                 | Self::AuthorityForceDeleted(_)
                 | Self::McpProxyPinChanged(_)
                 | Self::BrowserOriginsChanged(_)
+                | Self::TrustAgentConnectionCreated(_)
+                | Self::TrustAgentConnectionUpdated(_)
+                | Self::TrustAgentConnectionDeleted(_)
+                | Self::TrustAgentPairingStarted(_)
+                | Self::TrustAgentConnectionVerified(_)
+                | Self::TrustAgentConnectionRevoked(_)
+                | Self::TrustAgentSigningKeyProvisioned(_)
+                | Self::TrustAgentSigningKeyRotated(_)
+                | Self::TrustAgentControlKeyRotated(_)
+                | Self::TrustAgentChangeRefused(_)
+                | Self::SigningChangeRefused(_)
                 | Self::PolicyInputCaptureStarted(_)
                 | Self::PolicyInputCaptureStopped(_)
         )
@@ -1176,6 +1278,7 @@ pub async fn init_audit_logger(
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("_storage/audit"));
     let audit_path = dir.join("delegation-audit.jsonl");
+    crate::audit::security_chain::init(dir.join("security"));
     if AUDIT_PATH
         .set(audit_path.clone())
         .is_err()
@@ -1870,6 +1973,17 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::AuthorityForceDeleted(_) => "authority_force_deleted",
         DelegationAuditAction::McpProxyPinChanged(_) => "mcp_proxy_pin_changed",
         DelegationAuditAction::BrowserOriginsChanged(_) => "browser_origins_changed",
+        DelegationAuditAction::TrustAgentConnectionCreated(_) => "trust_agent_connection_created",
+        DelegationAuditAction::TrustAgentConnectionUpdated(_) => "trust_agent_connection_updated",
+        DelegationAuditAction::TrustAgentConnectionDeleted(_) => "trust_agent_connection_deleted",
+        DelegationAuditAction::TrustAgentPairingStarted(_) => "trust_agent_pairing_started",
+        DelegationAuditAction::TrustAgentConnectionVerified(_) => "trust_agent_connection_verified",
+        DelegationAuditAction::TrustAgentConnectionRevoked(_) => "trust_agent_connection_revoked",
+        DelegationAuditAction::TrustAgentSigningKeyProvisioned(_) => "trust_agent_signing_key_provisioned",
+        DelegationAuditAction::TrustAgentSigningKeyRotated(_) => "trust_agent_signing_key_rotated",
+        DelegationAuditAction::TrustAgentControlKeyRotated(_) => "trust_agent_control_key_rotated",
+        DelegationAuditAction::TrustAgentChangeRefused(_) => "trust_agent_change_refused",
+        DelegationAuditAction::SigningChangeRefused(_) => "signing_change_refused",
         DelegationAuditAction::PolicyInputCaptureStarted(_) => "policy_input_capture_started",
         DelegationAuditAction::PolicyInputCaptureStopped(_) => "policy_input_capture_stopped",
     }

@@ -42,11 +42,12 @@ fn message_with_presentation(
 async fn send_presentation(
     world: &mut SurfaceWorld,
     presentation: Value,
+    headers: Vec<(String, String)>,
 ) {
     let holder = presentation_signer(world)
         .did()
         .to_string();
-    send_json_request_and_record(world, message_with_presentation(&holder, &presentation), vec![]).await;
+    send_json_request_and_record(world, message_with_presentation(&holder, &presentation), headers).await;
 }
 
 #[given("the surface has a request policy that requires a verified caller identity")]
@@ -85,7 +86,7 @@ async fn gateway_accepted_presentation_of_credential_from_another_issuer(world: 
     let presentation = presentation_signer(world)
         .present_credential_from_another_issuer()
         .await;
-    send_presentation(world, presentation).await;
+    send_presentation(world, presentation, vec![]).await;
     let status = world
         .caller_response
         .as_ref()
@@ -105,5 +106,21 @@ async fn caller_sends_presentation_of_own_credential(world: &mut SurfaceWorld) {
     let presentation = presentation_signer(world)
         .present_own_credential()
         .await;
-    send_presentation(world, presentation).await;
+    send_presentation(world, presentation, vec![]).await;
+}
+
+#[given("the caller's DID document lists its key for assertions")]
+async fn caller_lists_key_for_assertions_from_the_start(world: &mut SurfaceWorld) {
+    world.presentation_signer = Some(PresentationSigner::publish(&["authentication", "assertionMethod"]).await);
+}
+
+#[when(
+    "the caller sends a request to the surface with a valid API key and a presentation of a credential it issued itself"
+)]
+async fn caller_with_api_key_sends_presentation_of_own_credential(world: &mut SurfaceWorld) {
+    let header = crate::steps::when::build_valid_api_key_source_auth_header(world);
+    let presentation = presentation_signer(world)
+        .present_own_credential()
+        .await;
+    send_presentation(world, presentation, vec![header]).await;
 }
