@@ -478,6 +478,7 @@ report_run() {
         # shellcheck disable=SC2086
         "$@" --scenario "${scenario}" ${flags} >> "${log}" 2>&1 ||
             echo "${scenario}" >> "${REPORT_DIR}/${name}.failed"
+        stop_on_client_failure
         count=$((count + 1))
     done 3< <("${HERE}/report-scenarios.sh" "${CONFORMANCE}" "${leg}" "${SPEC_VERSION}")
     [[ ${count} -gt 0 ]] || fail 1 "suite ${name}: the suite lists no ${leg} scenario"
@@ -572,10 +573,31 @@ run_fabric_suite() {
 # The client target runs each client scenario twice with the suite's reference
 # client: straight at the suite's own server, and through a gateway that
 # client-driver.mjs starts with that server as its Target.
+#
+# The suite splits --command on spaces and runs it through a shell, so the
+# driver's path goes in the environment: a checkout path with a space would
+# otherwise split into several arguments. A driver that could not run the
+# scenario at all (it could not start a gateway, say) leaves a marker, because
+# the suite sees only a failed client: that stops the harness in a normal and in
+# a report-only run, and is never taken as the scenario's verdict.
+#
+# The callers redirect this function's output into a suite log, and `fail` prints
+# its summary through the redirect, so a harness failure is left in
+# CLIENT_HARNESS_FAILURE for the caller to stop on once the redirect has ended.
+CLIENT_HARNESS_FAILURE=""
+
+stop_on_client_failure() {
+    [[ -z "${CLIENT_HARNESS_FAILURE}" ]] || fail 1 "suite client: ${CLIENT_HARNESS_FAILURE}"
+}
+
 client_scenario() {
-    local mode="$1" status=0 waited=0
+    local mode="$1" status=0 waited=0 failure="${LOGS}/client-gateway/harness-failure.txt"
     shift
+    CLIENT_HARNESS_FAILURE=""
+    rm -f "${failure}"
+    # shellcheck disable=SC2016
     env MCP_CONFORMANCE_DRIVER_MODE="${mode}" \
+        MCP_CONFORMANCE_DRIVER_SCRIPT="${HERE}/client-driver.mjs" \
         MCP_CONFORMANCE_DRIVER_REFERENCE="${REFERENCE_DIR}" \
         MCP_CONFORMANCE_DRIVER_BINARY="${BINARY}" \
         MCP_CONFORMANCE_DRIVER_WORK="${WORK}/env/client" \
@@ -584,11 +606,17 @@ client_scenario() {
         MCP_CONFORMANCE_DRIVER_OUTBOUND_PORT="${CLIENT_OUTBOUND_PORT}" \
         MCP_CONFORMANCE_DRIVER_FIXTURE_URL="http://127.0.0.1:${FIXTURE_PORT}" \
         "${CONFORMANCE}" client "$@" \
-        -o "${RESULTS}/client-${mode}" --command "node ${HERE}/client-driver.mjs" || status=$?
+        -o "${RESULTS}/client-${mode}" --command 'node "$MCP_CONFORMANCE_DRIVER_SCRIPT"' || status=$?
+    if [[ -e "${failure}" ]]; then
+        CLIENT_HARNESS_FAILURE="the driver could not run a scenario: $(tr '\n' ' ' < "${failure}")(log: $(relative "${failure}"))"
+        return "${status}"
+    fi
     # A gateway left behind by one scenario would answer the next one.
     while port_open "${CLIENT_INBOUND_PORT}"; do
-        [[ ${waited} -lt 20 ]] ||
-            fail 1 "suite client: a gateway is still listening on port ${CLIENT_INBOUND_PORT} after a scenario"
+        if [[ ${waited} -ge 20 ]]; then
+            CLIENT_HARNESS_FAILURE="a gateway is still listening on port ${CLIENT_INBOUND_PORT} after a scenario"
+            break
+        fi
         sleep 0.5
         waited=$((waited + 1))
     done
@@ -605,6 +633,7 @@ run_client_mode() {
         echo "=== ${scenario} ===" >> "${log}"
         verdict=pass
         client_scenario "${mode}" --scenario "${scenario}" --spec-version "${SPEC_VERSION}" >> "${log}" 2>&1 || verdict=fail
+        stop_on_client_failure
         echo "${scenario} ${verdict}" >> "${verdicts}"
     done
 }
@@ -615,6 +644,7 @@ run_client_auth() {
     local log="${LOGS}/suite-client-auth.log" name ok=true counts
     name="suite client: ${CLIENT_AUTH_SCENARIO}, the gateway fetches and attaches the token"
     client_scenario gateway --scenario "${CLIENT_AUTH_SCENARIO}" --spec-version "${SPEC_VERSION}" --force > "${log}" 2>&1 || ok=false
+    stop_on_client_failure
     counts="$(suite_counts client "${RESULTS}/client-gateway" --scenarios "${CLIENT_AUTH_SCENARIO}")"
     if [[ "${ok}" == true ]]; then
         record PASS "${name}; ${counts}"
@@ -771,7 +801,7 @@ REFERENCE_PID="${STARTED_PID}"
 wait_for_ports "${FIXTURE_PID}" "${FIXTURE_PORT}" || fail 1 "fixtures: REST fixture did not start"
 wait_for_ports "${REFERENCE_PID}" "${REFERENCE_PORT}" || fail 1 "fixtures: reference server did not start"
 node --test "${HERE}/shim.test.mjs" "${HERE}/client-shim.test.mjs" "${HERE}/client-parity.test.mjs" \
-    "${HERE}/client-auth.test.mjs" "${HERE}/client-driver.test.mjs" "${HERE}/suite-report.test.mjs" > "${LOGS}/shim-test.log" 2>&1 ||
+    "${HERE}/client-auth.test.mjs" "${HERE}/client-driver.test.mjs" "${HERE}/is-main.test.mjs" "${HERE}/suite-report.test.mjs" > "${LOGS}/shim-test.log" 2>&1 ||
     fail 1 "fixtures: harness unit tests failed (log: $(relative "${LOGS}/shim-test.log"))"
 start_process "${LOGS}/shim.log" "${HERE}" node shim.mjs --port "${SHIM_PORT}" \
     --upstream "http://127.0.0.1:${REFERENCE_PORT}"

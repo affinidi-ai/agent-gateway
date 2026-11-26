@@ -10,6 +10,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
+import { isMain } from './is-main.mjs';
 
 const NOT_PASSING = new Set(['FAILURE', 'WARNING']);
 
@@ -90,7 +91,7 @@ export function compare({ direct, gateway, scenarios, mustPass, directVerdicts, 
   return { lines, failures };
 }
 
-if (import.meta.filename === process.argv[1]) {
+if (isMain(import.meta)) {
   const { values } = parseArgs({
     options: {
       direct: { type: 'string' },

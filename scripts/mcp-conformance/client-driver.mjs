@@ -9,10 +9,17 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { callThroughGateway, discoverTokenEndpoint, isAuthScenario, seedTargetAuth } from './client-auth.mjs';
+import { isMain } from './is-main.mjs';
 import { startClientShim } from './client-shim.mjs';
 
 const HERE = import.meta.dirname;
 const START_TIMEOUT_MS = 30_000;
+
+// A failure to run a scenario at all, as opposed to a client that ran and
+// failed: the suite sees only a failed client either way, so the driver leaves
+// this marker for the harness and exits with its own code.
+export const HARNESS_EXIT_CODE = 70;
+export const HARNESS_FAILURE_FILE = 'harness-failure.txt';
 
 export function settings(env, argv) {
   const suiteUrl = argv.at(-1);
@@ -27,13 +34,17 @@ export function settings(env, argv) {
   if (mode !== 'direct' && mode !== 'gateway') {
     throw new Error(`MCP_CONFORMANCE_DRIVER_MODE must be direct or gateway, not ${mode}`);
   }
-  const base = { mode, suiteUrl, referenceDir: required('MCP_CONFORMANCE_DRIVER_REFERENCE') };
+  const base = {
+    mode,
+    suiteUrl,
+    referenceDir: required('MCP_CONFORMANCE_DRIVER_REFERENCE'),
+    logDir: required('MCP_CONFORMANCE_DRIVER_LOGS'),
+  };
   if (mode === 'direct') return base;
   return {
     ...base,
     binary: required('MCP_CONFORMANCE_DRIVER_BINARY'),
     workDir: required('MCP_CONFORMANCE_DRIVER_WORK'),
-    logDir: required('MCP_CONFORMANCE_DRIVER_LOGS'),
     inboundPort: Number(required('MCP_CONFORMANCE_DRIVER_INBOUND_PORT')),
     outboundPort: Number(required('MCP_CONFORMANCE_DRIVER_OUTBOUND_PORT')),
     fixtureUrl: required('MCP_CONFORMANCE_DRIVER_FIXTURE_URL'),
@@ -42,6 +53,12 @@ export function settings(env, argv) {
 
 export function hasExited(child) {
   return child.exitCode !== null || child.signalCode !== null;
+}
+
+export function recordHarnessFailure(logDir, mode, scenario, error) {
+  const message = String(error?.message ?? error).replace(/\s+/g, ' ').trim();
+  fs.mkdirSync(logDir, { recursive: true });
+  fs.writeFileSync(path.join(logDir, HARNESS_FAILURE_FILE), `${mode} ${scenario}: ${message}\n`);
 }
 
 export function accessPointUrl(inboundPort) {
@@ -193,13 +210,23 @@ async function main() {
   }
 }
 
-if (import.meta.filename === process.argv[1]) {
+if (isMain(import.meta)) {
   killChildrenOnSignal(children);
   main().then(
     (code) => process.exit(code),
     (error) => {
       console.error(`client-driver: ${error.message}`);
-      process.exit(1);
+      try {
+        recordHarnessFailure(
+          process.env.MCP_CONFORMANCE_DRIVER_LOGS,
+          process.env.MCP_CONFORMANCE_DRIVER_MODE,
+          process.env.MCP_CONFORMANCE_SCENARIO ?? 'scenario',
+          error,
+        );
+      } catch (writeError) {
+        console.error(`client-driver: could not record the failure: ${writeError.message}`);
+      }
+      process.exit(HARNESS_EXIT_CODE);
     },
   );
 }

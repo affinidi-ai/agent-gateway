@@ -2165,7 +2165,9 @@ headers the reference client leaves out, and sends
 `application/json, text/event-stream` in place of a missing or wildcard
 `Accept`. The gateway rejects a modern request without them (`-32020`, and
 `406`), as the specification requires of a server that reads the body. A
-request without `MCP-Protocol-Version` passes through unchanged.
+request without `MCP-Protocol-Version` passes through unchanged. A scenario the
+driver cannot run at all, such as one whose gateway does not start, stops the
+harness, in a report-only run too; it is never counted as a verdict or a gap.
 
 The target also runs one authorization scenario, `auth/client-credentials-jwt`,
 through the gateway only, and does not compare it with a direct run: directly,

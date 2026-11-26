@@ -113,7 +113,14 @@ not be fetched, `130` interrupted (SIGINT), `143` terminated (SIGTERM).
    that carry `MCP-Protocol-Version` and passes everything else through.
    The suite ends a client that outlives its timeout with a signal; the driver
    then kills the gateway and reference client it started, and the run stops
-   if a gateway is still listening after a scenario.
+   if a gateway is still listening after a scenario. The suite splits its
+   `--command` on spaces, so the driver's path reaches it through the
+   environment (`MCP_CONFORMANCE_DRIVER_SCRIPT`) and a checkout path with a space
+   works. A driver that cannot run a scenario at all, for instance because its
+   gateway does not start, exits `70` and writes
+   `run/logs/client-gateway/harness-failure.txt`; the suite sees only a failed
+   client, so the harness reads that file and stops with a failure, in a report-only
+   run too, rather than counting the scenario as a verdict or a gap.
    Last, `auth/client-credentials-jwt` runs through the gateway only:
    `client-auth.mjs` follows the suite server's `401` challenge to the token
    endpoint, writes a credential provider and its secrets into the env and
@@ -157,6 +164,7 @@ Outputs, all under the ignored `target/mcp-conformance/`:
 | `env/<modern\|legacy>/` | The generated gateway envs and `targets.json` |
 | `env/client/<scenario>/` | The env of the gateway started for one client scenario |
 | `run/logs/client-gateway/gateway-<scenario>.log` | The log of that gateway, kept with the other run logs |
+| `run/logs/client-gateway/harness-failure.txt` | Written only when the driver could not run a scenario (exit `70`); the harness fails when it exists |
 | `run/logs/client-<direct\|gateway>.verdicts` | The suite's verdict (`pass` or `fail`) of each client scenario run, which `client-parity.mjs` compares |
 
 ### What the client target covers
@@ -222,7 +230,8 @@ The run ignores the suite's exit status and the baselines, and does not run
 many gaps it finds. A failed probe does not stop it: the summary shows an
 `INFO` line and `run/gaps.md` a `Harness notes` section, and the scenarios
 still run. It still exits non-zero when the harness itself fails: a
-build error, a gateway or fixture that does not start, a port in use, a gateway
+build error, a gateway or fixture that does not start, a client scenario whose
+driver could not start its gateway, a port in use, a gateway
 still listening after its client scenario ended, or a target for which the
 suite ran no scenario or saved no result.
 
@@ -260,11 +269,12 @@ MCP_CONFORMANCE_DRIVER_REFERENCE="$PWD/target/mcp-conformance/reference" \
 MCP_CONFORMANCE_DRIVER_BINARY="$PWD/target/debug/agent-gateway" \
 MCP_CONFORMANCE_DRIVER_WORK="$PWD/target/mcp-conformance/env/client" \
 MCP_CONFORMANCE_DRIVER_LOGS="$PWD/target/mcp-conformance/run/logs/client-gateway" \
+MCP_CONFORMANCE_DRIVER_SCRIPT="$PWD/scripts/mcp-conformance/client-driver.mjs" \
 MCP_CONFORMANCE_DRIVER_INBOUND_PORT=18790 MCP_CONFORMANCE_DRIVER_OUTBOUND_PORT=18791 \
 MCP_CONFORMANCE_DRIVER_FIXTURE_URL=http://127.0.0.1:18761 \
 scripts/mcp-conformance/node_modules/.bin/conformance client \
   --scenario auth/client-credentials-basic --spec-version 2026-07-28 --force \
-  --command "node scripts/mcp-conformance/client-driver.mjs"
+  --command 'node "$MCP_CONFORMANCE_DRIVER_SCRIPT"'
 ```
 
 ## Checks beyond the suite

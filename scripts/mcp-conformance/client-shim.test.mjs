@@ -86,11 +86,12 @@ test('the adapter forwards the request with the added headers and returns the re
 });
 
 test('driver settings need a mode, a reference checkout and the suite URL', () => {
-  const env = { MCP_CONFORMANCE_DRIVER_MODE: 'direct', MCP_CONFORMANCE_DRIVER_REFERENCE: '/ref' };
+  const env = { MCP_CONFORMANCE_DRIVER_MODE: 'direct', MCP_CONFORMANCE_DRIVER_REFERENCE: '/ref', MCP_CONFORMANCE_DRIVER_LOGS: '/logs' };
   assert.deepEqual(settings(env, ['node', 'driver', 'http://localhost:1/mcp']), {
     mode: 'direct',
     suiteUrl: 'http://localhost:1/mcp',
     referenceDir: '/ref',
+    logDir: '/logs',
   });
   assert.throws(() => settings(env, ['node', 'driver']), /server URL/);
   assert.throws(() => settings({ ...env, MCP_CONFORMANCE_DRIVER_MODE: 'other' }, ['n', 'd', 'http://x']), /direct or gateway/);

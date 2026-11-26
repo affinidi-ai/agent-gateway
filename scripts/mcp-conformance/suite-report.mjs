@@ -9,6 +9,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
+import { isMain } from './is-main.mjs';
 
 const FAILING = new Set(['FAILURE', 'WARNING']);
 const MESSAGE_LIMIT = 500;
@@ -206,7 +207,7 @@ function gaps(values) {
   }
 }
 
-if (import.meta.filename === process.argv[1]) {
+if (isMain(import.meta)) {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
     options: {
