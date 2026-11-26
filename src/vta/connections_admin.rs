@@ -504,9 +504,11 @@ type IssuerStoreExt = Option<Extension<Arc<dyn crate::issuers::IssuerStore>>>;
 
 /// Moves every saved signing choice that names key `previous` of connection
 /// `connection_id` (a surface's, an issuer's, Gateway signing) to `next`, so
-/// what is shown and stored is the key that signs. Best effort: one that
-/// cannot be saved is logged and still signs with `next`, since a retired key
-/// signs with the connection's active one.
+/// what is shown and stored is the key that signs. Each one is read again
+/// under its write lock and only its key is changed, so an edit saved since
+/// the listing is kept. Best effort: one that cannot be saved is logged and
+/// still signs with `next`, since a retired key signs with the connection's
+/// active one.
 async fn follow_key_rotation(
     surfaces: &SurfaceStoreExt,
     issuers: &IssuerStoreExt,
@@ -523,48 +525,68 @@ async fn follow_key_rotation(
         }
     };
     if let Some(Extension(store)) = surfaces {
-        for mut surface in store
+        for listed in store
             .list_all()
             .await
             .unwrap_or_default()
             .into_iter()
             .filter(|surface| names_previous(surface.signing.as_ref()))
         {
-            moved(&mut surface.signing);
-            if let Err(e) = store.save(&surface).await {
-                warn!(surface_id = %surface.surface_id, error = %e, "a surface's signing choice still names a rotated key");
+            let _locked = crate::identity::handlers::surface_grants::lock_surface(&listed.surface_id).await;
+            let saved = match store
+                .get(&listed.surface_id)
+                .await
+            {
+                Ok(Some(mut surface)) if names_previous(surface.signing.as_ref()) => {
+                    moved(&mut surface.signing);
+                    store.save(&surface).await
+                }
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = saved {
+                warn!(surface_id = %listed.surface_id, error = %e, "a surface's signing choice still names a rotated key");
             }
         }
     }
     if let Some(Extension(store)) = issuers {
-        for mut issuer in store
+        for listed in store
             .list_all()
             .await
             .unwrap_or_default()
             .into_iter()
             .filter(|issuer| names_previous(issuer.signing.as_ref()))
         {
-            moved(&mut issuer.signing);
-            if let Err(e) = store.update(&issuer).await {
-                warn!(issuer_id = %issuer.id, error = %e, "an issuer's signing choice still names a rotated key");
+            let _locked = crate::issuers::lock_issuer(&listed.id).await;
+            let saved = match store.get(&listed.id).await {
+                Ok(Some(mut issuer)) if names_previous(issuer.signing.as_ref()) => {
+                    moved(&mut issuer.signing);
+                    store.update(&issuer).await
+                }
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = saved {
+                warn!(issuer_id = %listed.id, error = %e, "an issuer's signing choice still names a rotated key");
             }
         }
     }
     if let Some(settings) = crate::storage::settings_store::global_settings_store() {
-        let mut current = settings.get();
-        if names_previous(
-            current
-                .default_signing
-                .as_ref(),
-        ) {
-            moved(&mut current.default_signing);
-            let saved = match settings.update(current) {
-                Ok(()) => settings.save().await,
-                Err(e) => Err(e),
-            };
-            if let Err(e) = saved {
-                warn!(error = %e, "Gateway signing still names a rotated key");
-            }
+        let saved = settings
+            .modify(|current| {
+                let follows = names_previous(
+                    current
+                        .default_signing
+                        .as_ref(),
+                );
+                if follows {
+                    moved(&mut current.default_signing);
+                }
+                follows
+            })
+            .await;
+        if let Err(e) = saved {
+            warn!(error = %e, "Gateway signing still names a rotated key");
         }
     }
 }
@@ -3836,6 +3858,210 @@ mod tests {
         );
     }
 
+    /// Lists what it was given, as a listing read before a concurrent edit,
+    /// and reads and writes the store as it is now.
+    struct ListedEarlier<S> {
+        store: S,
+        surfaces: Vec<crate::config::agent_surface::AgentSurface>,
+        issuers: Vec<crate::issuers::types::Issuer>,
+    }
+
+    #[async_trait::async_trait]
+    impl<S: crate::surfaces::AgentSurfaceStore> crate::surfaces::AgentSurfaceStore for ListedEarlier<S> {
+        async fn save(
+            &self,
+            surface: &crate::config::agent_surface::AgentSurface,
+        ) -> anyhow::Result<()> {
+            self.store.save(surface).await
+        }
+
+        async fn get(
+            &self,
+            surface_id: &str,
+        ) -> anyhow::Result<Option<crate::config::agent_surface::AgentSurface>> {
+            self.store
+                .get(surface_id)
+                .await
+        }
+
+        async fn get_checked(
+            &self,
+            surface_id: &str,
+        ) -> anyhow::Result<Option<crate::config::agent_surface::AgentSurface>> {
+            self.store
+                .get_checked(surface_id)
+                .await
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::config::agent_surface::AgentSurface>> {
+            Ok(self.surfaces.clone())
+        }
+
+        async fn delete(
+            &self,
+            surface_id: &str,
+        ) -> anyhow::Result<()> {
+            self.store
+                .delete(surface_id)
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<S: crate::issuers::IssuerStore> crate::issuers::IssuerStore for ListedEarlier<S> {
+        async fn create(
+            &self,
+            issuer: &crate::issuers::types::Issuer,
+        ) -> anyhow::Result<()> {
+            self.store
+                .create(issuer)
+                .await
+        }
+
+        async fn get(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<crate::issuers::types::Issuer>> {
+            self.store.get(id).await
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::issuers::types::Issuer>> {
+            Ok(self.issuers.clone())
+        }
+
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<()> {
+            self.store.delete(id).await
+        }
+
+        async fn update(
+            &self,
+            issuer: &crate::issuers::types::Issuer,
+        ) -> anyhow::Result<()> {
+            self.store
+                .update(issuer)
+                .await
+        }
+
+        async fn find_by_did(
+            &self,
+            did: &str,
+        ) -> anyhow::Result<Option<crate::issuers::types::Issuer>> {
+            self.store
+                .find_by_did(did)
+                .await
+        }
+    }
+
+    /// A rotation re-reads each choice it moves, so an edit saved after it
+    /// listed them is kept, and a choice moved off the old key meanwhile is
+    /// left alone.
+    #[tokio::test]
+    async fn a_rotation_keeps_an_edit_saved_after_it_listed_the_choices() {
+        let keyed = |key: &str| {
+            let mut signing = vta_signing(Some("conn"));
+            if let Some(signing) = signing.as_mut() {
+                signing.key_id = Some(key.to_string());
+            }
+            signing
+        };
+        let surfaces_dir = tempfile::tempdir().unwrap();
+        let surface_store = crate::surfaces::FileSystemAgentSurfaceStore::new(
+            surfaces_dir
+                .path()
+                .to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let listed_surfaces =
+            vec![signing_surface("s-renamed", None, keyed("key-1")), signing_surface("s-moved", None, keyed("key-1"))];
+        let mut renamed = listed_surfaces[0].clone();
+        renamed.name = "renamed since".to_string();
+        let mut moved_off = listed_surfaces[1].clone();
+        moved_off.signing = keyed("key-7");
+        for surface in [&renamed, &moved_off] {
+            crate::surfaces::AgentSurfaceStore::save(&surface_store, surface)
+                .await
+                .unwrap();
+        }
+        let surface_store: Arc<dyn crate::surfaces::AgentSurfaceStore> = Arc::new(ListedEarlier {
+            store: surface_store,
+            surfaces: listed_surfaces,
+            issuers: Vec::new(),
+        });
+
+        let issuers_dir = tempfile::tempdir().unwrap();
+        let issuer_store = crate::issuers::FileSystemIssuerStore::new(
+            issuers_dir
+                .path()
+                .to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let mut listed_issuer = crate::issuers::types::Issuer::new(
+            "issuer-a".into(),
+            "Research".into(),
+            "did:example:issuer".into(),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        );
+        listed_issuer.signing = keyed("key-1");
+        let mut edited_issuer = listed_issuer.clone();
+        edited_issuer.name = "Research and Development".to_string();
+        crate::issuers::IssuerStore::create(&issuer_store, &edited_issuer)
+            .await
+            .unwrap();
+        let issuer_store: Arc<dyn crate::issuers::IssuerStore> = Arc::new(ListedEarlier {
+            store: issuer_store,
+            surfaces: Vec::new(),
+            issuers: vec![listed_issuer],
+        });
+
+        follow_key_rotation(
+            &Some(Extension(Arc::clone(&surface_store))),
+            &Some(Extension(Arc::clone(&issuer_store))),
+            "conn",
+            "key-1",
+            "key-2",
+        )
+        .await;
+
+        let surface = |id: &'static str| {
+            let store = Arc::clone(&surface_store);
+            async move {
+                store
+                    .get(id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        let key_of = |signing: Option<crate::config::agent_surface::SurfaceSigningConfig>| {
+            signing.and_then(|signing| signing.key_id)
+        };
+        let renamed = surface("s-renamed").await;
+        assert_eq!(renamed.name, "renamed since");
+        assert_eq!(key_of(renamed.signing).as_deref(), Some("key-2"));
+        assert_eq!(
+            key_of(
+                surface("s-moved")
+                    .await
+                    .signing
+            )
+            .as_deref(),
+            Some("key-7")
+        );
+        let issuer = issuer_store
+            .get("issuer-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(issuer.name, "Research and Development");
+        assert_eq!(key_of(issuer.signing).as_deref(), Some("key-2"));
+    }
+
     #[tokio::test]
     async fn a_disconnect_is_refused_while_a_surface_signs_through_the_connection_unless_acknowledged() {
         let (state, _dir) = admin_state(None).await;
@@ -4156,7 +4382,7 @@ mod tests {
     /// The `[vta]` block's own configured DID is what is offered for granting.
     #[tokio::test]
     async fn the_bootstrap_block_offers_its_configured_auth_did() {
-        let var = "TG_TEST_VTA_BOOTSTRAP_DID_KEY";
+        let var = "AG_TEST_VTA_BOOTSTRAP_DID_KEY";
         let mut config = bootstrap_config(Some(&format!("env://{var}")));
         config.auth_did = Some("did:webvh:QmScid:gw.example.com:vta-auth".to_string());
         let connection = VtaConnection::from_bootstrap(&config).expect("a bootstrap record");
@@ -4173,7 +4399,7 @@ mod tests {
     /// appeared nowhere readable — redacted in logs, encrypted on disk.
     #[tokio::test]
     async fn pairing_the_bootstrap_connection_resolves_the_did_from_the_block() {
-        let var = "TG_TEST_VTA_BOOTSTRAP_DID_KEY";
+        let var = "AG_TEST_VTA_BOOTSTRAP_DID_KEY";
         let seed = std::env::var(var).expect("`.cargo/config.toml` [env] provides the test seed");
         let config = bootstrap_config(Some(&format!("env://{var}")));
         let connection = VtaConnection::from_bootstrap(&config).expect("a bootstrap record");

@@ -39,3 +39,12 @@ pub trait IssuerStore: Send + Sync {
         did: &str,
     ) -> Result<Option<Issuer>>;
 }
+
+static ISSUER_LOCKS: std::sync::LazyLock<crate::storage::id_locks::IdLocks> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Hold the lock of issuer `id`, which serialises the read-modify-write
+/// updates of that issuer, so one never saves over a change made meanwhile.
+pub async fn lock_issuer(id: &str) -> crate::storage::id_locks::IdLockGuard<'_> {
+    ISSUER_LOCKS.lock(id).await
+}
