@@ -13,6 +13,7 @@ import {
 } from '../../utils/toaster';
 
 jest.mock('../../utils/toaster', () => ({
+  ...jest.requireActual('../../utils/toaster'),
   showToast: jest.fn(),
   showKeepOpenWarningToast: jest.fn(),
   showSuccessCountdownToast: jest.fn(),
@@ -99,11 +100,6 @@ function MockSurfaceFormShell(props: any) {
     </div>
   );
 }
-
-jest.mock('../../utils/toaster', () => ({
-  ...jest.requireActual('../../utils/toaster'),
-  showToast: jest.fn(),
-}));
 
 if (typeof globalThis.crypto?.randomUUID !== 'function') {
   Object.defineProperty(globalThis, 'crypto', {
@@ -429,8 +425,13 @@ describe('AddSurfacePage create warnings', () => {
       'This Access Point is public. Anyone who can reach it can call your agent without credentials.';
     await create([publicMessage]);
 
-    expect(keepOpenToast).not.toHaveBeenCalled();
-    expect(successToast).toHaveBeenCalledWith(expect.stringContaining('created'));
+    const shown = [
+      ...successToast.mock.calls.map(c => c[0]),
+      ...keepOpenToast.mock.calls.map(c => c[0]),
+    ];
+    expect(shown).toHaveLength(1);
+    expect(shown[0]).toContain('created');
+    expect(shown[0]).not.toContain(publicMessage);
     expect(await screen.findByTestId('location')).toHaveTextContent(/^\/surfaces null$/);
   });
 
