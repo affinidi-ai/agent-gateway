@@ -3888,6 +3888,19 @@ async fn mcp_tool_call_with_city_argument_over_legacy_sse(
     send_over_legacy_sse_session_and_record(world, vec![body]).await;
 }
 
+#[when(
+    expr = "the caller sends an MCP notification and then invokes the MCP tool {string} for city {string} over Legacy SSE"
+)]
+async fn mcp_notification_then_tool_call_over_legacy_sse(
+    world: &mut SurfaceWorld,
+    tool_name: String,
+    city: String,
+) {
+    let notification = build_mcp_initialized_notification_body();
+    let call = build_mcp_tool_call_body(&tool_name, serde_json::json!({ "city": city }));
+    send_over_legacy_sse_session_and_record(world, vec![notification, call]).await;
+}
+
 #[when(expr = "the caller invokes the MCP tool {string} for city {string} over Streamable HTTP")]
 async fn mcp_tool_call_with_city_argument_over_streamable_http(
     world: &mut SurfaceWorld,

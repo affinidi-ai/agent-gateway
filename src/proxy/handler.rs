@@ -4680,23 +4680,19 @@ async fn proxy_charged_request(
                             .await;
                     }
                 }
-                Err(resp) => {
-                    // `handle_mcp_proxy_request` returns Err with HTTP 200 +
-                    // JSON-RPC error envelope for in-protocol failures (e.g.
-                    // disabled proxy, unknown tool). For those, forward the
-                    // body verbatim so the caller sees the actual error
-                    // shape rather than a generic "Internal error". For
-                    // out-of-band HTTP errors (non-200, non-JSON), fall back
-                    // to a synthesized JSON-RPC envelope so the SSE message
-                    // stays parseable.
+                Err(resp) if !is_notification => {
+                    // A JSON-RPC error, whatever its HTTP status, and any JSON
+                    // answered with 200 reach the caller verbatim; anything else
+                    // becomes a generic JSON-RPC error so the SSE message stays
+                    // parseable.
                     let (parts, body) = resp.into_parts();
                     let body_bytes_resp = axum::body::to_bytes(body, 10 * 1024 * 1024)
                         .await
                         .unwrap_or_default();
                     let body_str = String::from_utf8_lossy(&body_bytes_resp);
-                    let forwardable = parts.status == StatusCode::OK
-                        && !body_str.is_empty()
-                        && serde_json::from_str::<serde_json::Value>(&body_str).is_ok();
+                    let forwardable = is_jsonrpc_message(&body_str)
+                        || (parts.status == StatusCode::OK
+                            && serde_json::from_str::<serde_json::Value>(&body_str).is_ok());
                     let to_send = if forwardable {
                         body_str.into_owned()
                     } else {
@@ -8359,15 +8355,17 @@ async fn proxy_charged_request(
                             connection_guard
                                 .decrement()
                                 .await;
-                            let (status, message) = match &e {
+                            return Err(match &e {
                                 crate::mcp::sse_transport::SseConsumeError::Body(body_error) => {
-                                    body_error.status_and_message()
+                                    upstream_body_failure_response(&state.surface, body_error, &body_bytes)
                                 }
-                                crate::mcp::sse_transport::SseConsumeError::NoResponse => {
-                                    (StatusCode::BAD_GATEWAY, "Failed to read MCP tools/list response")
-                                }
-                            };
-                            return Err(create_error_response(status, message));
+                                crate::mcp::sse_transport::SseConsumeError::NoResponse => target_unreachable_response(
+                                    &state.surface,
+                                    StatusCode::BAD_GATEWAY,
+                                    &body_bytes,
+                                    "Failed to read MCP tools/list response",
+                                ),
+                            });
                         }
                     }
                 } else {
@@ -8517,8 +8515,7 @@ async fn proxy_charged_request(
                     });
                 }
 
-                let (status, message) = e.status_and_message();
-                create_error_response(status, message)
+                upstream_body_failure_response(&state.surface, &e, &body_bytes)
             })?;
         (status, response_headers, response_body)
     };
@@ -10586,6 +10583,25 @@ fn handle_upstream_error(
         StatusCode::BAD_GATEWAY
     };
     target_unreachable_response(&state.surface, status_code, request_body, error_message)
+}
+
+/// The answer to a Target whose response body could not be read: one that stalled, came too
+/// late or broke off did not answer, as [`target_unreachable_response`] says; one too large or
+/// compressed keeps the problem JSON.
+fn upstream_body_failure_response(
+    surface: &crate::config::agent_surface::AgentSurface,
+    error: &crate::proxy::upstream_body::UpstreamBodyError,
+    request_body: &[u8],
+) -> Response {
+    use crate::proxy::upstream_body::UpstreamBodyError;
+
+    let (status, message) = error.status_and_message();
+    match error {
+        UpstreamBodyError::TimedOut | UpstreamBodyError::Read(_) => {
+            target_unreachable_response(surface, status, request_body, message)
+        }
+        UpstreamBodyError::TooLarge(_) | UpstreamBodyError::Compressed => create_error_response(status, message),
+    }
 }
 
 const TARGET_UNREACHABLE: &str = "target_unreachable";
@@ -15941,14 +15957,7 @@ async fn handle_mcp_proxy_request_inner(
         && let Some(retry_after) = breaker.refusing_for().await
     {
         error!(channel = channel_name, proxy_id = proxy_id, retry_after = ?retry_after, "Circuit breaker is open");
-        return Err(crate::mcp::errors::create_mcp_error_response(
-            json_request
-                .get("id")
-                .cloned(),
-            crate::mcp::errors::error_codes::INTERNAL_ERROR,
-            &format!("MCP proxy error: Circuit breaker open, retry after {:?}", retry_after),
-            None,
-        ));
+        return Err(circuit_open_response(&state.surface, body_bytes, retry_after));
     }
     let executed = match prepared {
         Ok(prepared) => {
@@ -16247,6 +16256,15 @@ async fn handle_mcp_proxy_request_inner(
                 record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
             }
             Err(refusal.response_for(&state.surface, body_bytes))
+        }
+        Err(error) if crate::mcp_proxies::handlers::is_circuit_open_error(&error) => {
+            error!(channel = channel_name, proxy_id = proxy_id, "Circuit breaker is open");
+            Err(target_unreachable_response(
+                &state.surface,
+                StatusCode::SERVICE_UNAVAILABLE,
+                body_bytes,
+                "MCP proxy circuit breaker is open",
+            ))
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::Failed(e)) => {
             error!(
@@ -24433,6 +24451,131 @@ allow if {
             String::from_utf8(body_of(super::circuit_open_response(&a2a, request, retry_after)).await).unwrap();
         assert!(problem.contains("Service temporarily unavailable"), "{problem}");
         assert!(!problem.contains("jsonrpc"), "{problem}");
+    }
+
+    /// A Target that sends `head` and the start of a body, then sends nothing more.
+    async fn stalling_endpoint(head: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut connection, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = connection
+                        .read(&mut [0u8; 65536])
+                        .await;
+                    let _ = connection
+                        .write_all(head.as_bytes())
+                        .await;
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                });
+            }
+        });
+        format!("http://{address}/agent")
+    }
+
+    fn surface_with_one_second_timeout(
+        surface_id: &str,
+        endpoint: &str,
+    ) -> crate::config::agent_surface::AgentSurface {
+        let mut surface = mcp_surface(surface_id, endpoint, None);
+        surface.target.networking =
+            Some(serde_json::from_value(serde_json::json!({"timeout": {"request_secs": 1, "idle_secs": 1}})).unwrap());
+        surface
+    }
+
+    #[tokio::test]
+    async fn a_target_that_stalls_its_body_answers_an_mcp_request_with_a_json_rpc_error_with_the_request_id() {
+        for (head, method) in [
+            ("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 200\r\n\r\n{\"jsonrpc\"", "ping"),
+            ("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\nevent: message\r\n", "tools/list"),
+        ] {
+            let endpoint = stalling_endpoint(head).await;
+            let surface = surface_with_one_second_timeout("mcp-stall", &endpoint);
+            let state = bare_proxy_state(surface.clone(), None);
+            let request = serde_json::json!({"jsonrpc": "2.0", "id": "req-stall", "method": method});
+
+            let response = send_to_surface(&state, surface, legacy_mcp_request("/mcp-stall", &request)).await;
+
+            assert_eq!(response.status(), axum::http::StatusCode::GATEWAY_TIMEOUT, "{method}");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body_of(response).await).unwrap(),
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "req-stall",
+                    "error": {"code": -32603, "message": "Target unavailable", "data": {"reason": "target_unreachable"}},
+                }),
+                "{method}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_open_circuit_refuses_a_legacy_mcp_proxy_call_with_503_and_the_json_rpc_error() {
+        use crate::mcp_proxies::filesystem::McpProxyStore;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            crate::mcp_proxies::FileSystemMcpProxyStore::new(directory.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let proxy = crate::mcp_proxies::types::McpProxy::new(
+            "Breaker".into(),
+            String::new(),
+            unreachable_endpoint().await,
+            serde_json::json!({"openapi": "3.0.0", "info": {"title": "Tools", "version": "1.0"}, "paths": {
+                "/alpha": {"get": {"operationId": "alpha", "responses": {"200": {"description": "OK"}}}}
+            }})
+            .to_string(),
+            "/mcp".into(),
+            "/breaker".into(),
+        );
+        store
+            .create(&proxy)
+            .await
+            .unwrap();
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "proxy-breaker", "name": "Proxy breaker",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/proxy-breaker", "protocol": "mcp"},
+            "target": {
+                "endpoint": format!("proxy://{}", proxy.id),
+                "networking": {"circuit_breaker": {"failure_threshold": 1, "success_threshold": 1, "timeout_secs": 60, "window_secs": 60}}
+            }
+        }))
+        .unwrap();
+        let policies = std::sync::Arc::new(crate::policies::SurfacePolicyManager::new());
+        policies
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+        let breaker = policies
+            .get_circuit_breaker("proxy-breaker")
+            .await
+            .expect("the surface configures a circuit breaker");
+        let _ = breaker
+            .call(async { Err::<(), _>("the Target failed") })
+            .await;
+        let state = crate::state::ProxyState {
+            mcp_proxy_store: Some(store),
+            ..bare_proxy_state(surface.clone(), Some(policies))
+        };
+        let request = serde_json::json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "alpha", "arguments": {}}});
+
+        let response = send_to_surface(&state, surface, legacy_mcp_request("/proxy-breaker", &request)).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body_of(response).await).unwrap(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "error": {"code": -32603, "message": "Target unavailable", "data": {"reason": "target_unreachable"}},
+            })
+        );
     }
 
     #[tokio::test]
