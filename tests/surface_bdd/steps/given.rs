@@ -4299,6 +4299,9 @@ fn surface_injects_delegated_credentials_as_header(
 }
 
 #[given(expr = "the surface injects delegated credentials from OAuth provider {string} into MCP metadata key {string}")]
+#[given(
+    expr = "the surface injects delegated credentials from API-key provider {string} into MCP metadata key {string}"
+)]
 fn surface_injects_delegated_credentials_into_meta(
     world: &mut SurfaceWorld,
     _provider: String,

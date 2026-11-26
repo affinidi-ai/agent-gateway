@@ -283,6 +283,46 @@ async fn mcp_server_redirects_every_request(
     redirect_every_request(world, &name, TargetActorKind::McpServer, &path).await;
 }
 
+#[given(expr = "MCP server {string} serves only Legacy SSE, advertising its message endpoint at {string}")]
+async fn mcp_server_serves_only_legacy_sse(
+    world: &mut SurfaceWorld,
+    name: String,
+    endpoint: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&name, TargetActorKind::McpServer);
+    ensure_gateway_running(world).await;
+    world
+        .mock_for_target(&name)
+        .serve_legacy_sse(endpoint)
+        .await;
+}
+
+#[then(expr = "MCP server {string} received no request at path {string}")]
+async fn mcp_server_received_no_request_at_path(
+    world: &mut SurfaceWorld,
+    name: String,
+    path: String,
+) {
+    let requests = world
+        .mock_for_target(&name)
+        .requests()
+        .await;
+    let reached: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request
+                .path_and_query
+                .split('?')
+                .next()
+                == Some(path.as_str())
+        })
+        .map(|request| format!("{} {}", request.method, request.path_and_query))
+        .collect();
+    assert!(reached.is_empty(), "MCP server {name} must receive no request at {path}, got {reached:?}");
+}
+
 #[given(expr = "REST API {string} answers every request with a redirect to its path {string}")]
 async fn rest_api_redirects_every_request(
     world: &mut SurfaceWorld,

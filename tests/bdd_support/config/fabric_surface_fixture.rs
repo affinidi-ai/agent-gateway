@@ -54,6 +54,17 @@ pub struct SurfaceSpec {
     pub access_point_public: Option<bool>,
     /// The Access Point's configured agent card location on the Target's origin.
     pub agent_card_path: Option<String>,
+    /// The Target's base path on the harness mock's origin, such as `/base`.
+    pub target_base_path: Option<String>,
+    /// An API key credential provider a service-level delegated credential
+    /// binding sends to the Target in a header.
+    pub service_credential: Option<ServiceCredentialSpec>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceCredentialSpec {
+    pub provider_id: String,
+    pub header_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +149,8 @@ impl SurfaceSpec {
             legacy_access_point: false,
             access_point_public: None,
             agent_card_path: None,
+            target_base_path: None,
+            service_credential: None,
         }
     }
 }

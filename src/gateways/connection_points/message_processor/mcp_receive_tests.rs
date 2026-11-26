@@ -1606,6 +1606,37 @@ async fn fabric_consent_flow() {
                 "{events:?}"
             );
         }
+        {
+            let mut proxied = surface.clone();
+            proxied.target.endpoint = "proxy://missing-proxy".to_string();
+            let body = json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {
+                "name": "getItem", "arguments": {"id": "1"}, "_meta": body["params"]["_meta"].clone()
+            }});
+            let (message, mut stream) = make_request(&body, &proxied, &sender_did, &bearer);
+            stream
+                .headers
+                .insert("mcp-name", axum::http::HeaderValue::from_static("getItem"));
+            let (result, events) =
+                crate::audit::producer::capture(Box::pin(super::process_forward_request_with_mcp_runtime(
+                    &message,
+                    Some(stream),
+                    versions,
+                    Some(runtime.clone()),
+                )))
+                .await;
+            let missing = decode(result).await;
+            assert_ne!(missing.1["result"]["resultType"], "input_required", "{:?}", missing.1);
+            assert_eq!(missing.0, 404, "{:?}", missing.1);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(
+                        event.event,
+                        DelegationAuditAction::ConsentRequired | DelegationAuditAction::ElicitationSent
+                    )),
+                "a proxy that cannot be loaded starts no consent: {events:?}"
+            );
+        }
         let mut proxied = surface.clone();
         proxied.target.endpoint = format!("proxy://{}", proxy.id);
         let call = |id: &str| {

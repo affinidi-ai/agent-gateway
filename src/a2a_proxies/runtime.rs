@@ -443,7 +443,11 @@ async fn resolve_direct_line_credential(
     allow_local: bool,
 ) -> Result<Option<String>, A2aProxyRuntimeError> {
     if !caller.permits_target_credential() {
-        warn!(channel = channel_name, proxy_id = %proxy.id, "Refusing to attach the Direct Line credential: the caller was not authenticated");
+        debug!(
+            channel = channel_name,
+            proxy_id = %proxy.id,
+            "Not attaching the Direct Line credential: the request may not carry it"
+        );
         return Ok(None);
     }
     let store =
@@ -923,9 +927,12 @@ mod tests {
         mode: RuleMode::Warn,
     };
 
+    /// A caller the credential is withheld from gets none, logged at debug without claiming why:
+    /// a withholding credential rule logs its own warning naming the rule.
     #[tokio::test]
     async fn an_unauthenticated_caller_gets_no_direct_line_credential() {
         let (proxy, backend) = direct_line_proxy();
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
 
         let credential = resolve_direct_line_credential(
             &proxy,
@@ -940,6 +947,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(credential, None);
+        let text = logs.text();
+        let line: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("Not attaching the Direct Line credential"))
+            .collect();
+        assert_eq!(line.len(), 1, "{text}");
+        assert!(line[0].contains("DEBUG"), "{}", line[0]);
+        assert!(!text.contains("WARN"), "{text}");
+        assert!(!text.contains("was not authenticated"), "{text}");
     }
 
     async fn credential_for(

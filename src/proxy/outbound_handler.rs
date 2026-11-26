@@ -5500,14 +5500,6 @@ fn carries_delegated_transit_credential(ctx: &OutboundPipelineContext) -> bool {
             .is_some_and(|prepared| prepared.attaches_credentials())
 }
 
-/// Whether a Transit Point request carries a Target credential or a delegated credential.
-fn carries_transit_credential(ctx: &OutboundPipelineContext) -> bool {
-    ctx.virtual_channel
-        .target_auth
-        .is_some()
-        || carries_delegated_transit_credential(ctx)
-}
-
 /// Whether a delegated credential binding applies to a Transit Point request, so that
 /// [`step_inject_credentials`] or [`step_prepare_modern_credentials`] would put one into it: a
 /// binding for every request (tool-scoped bindings never apply on a Transit Point), on a
@@ -5528,108 +5520,123 @@ fn delegated_transit_binding_applies(ctx: &OutboundPipelineContext) -> bool {
                 .is_some())
 }
 
-/// Where a legacy request through a Transit Point to the MCP Proxy `proxy_id` would send its
-/// REST request ([`crate::mcp_proxies::handlers::legacy_tool_call_destination`]). A proxy the
-/// surface cannot use, or a body that is not JSON, counts as inside the base here and is
-/// refused when forwarded.
-async fn transit_proxy_tool_call_destination(
+/// The MCP Proxy `proxy_id` a Transit Point names, when the surface's tenant may reference it
+/// ([`crate::proxy::credential_destination::owned_proxy`]); one it cannot load is refused as the
+/// Transit Point refuses an MCP Proxy it cannot serve.
+async fn transit_proxy(
     state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
     proxy_id: &str,
-    tenant_id: Option<&str>,
-    body: Option<&[u8]>,
-) -> crate::mcp_proxies::handlers::ToolCallDestination {
-    use crate::mcp_proxies::McpProxyStore;
-    use crate::mcp_proxies::handlers::ToolCallDestination;
-    let Some(request) = body.and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok()) else {
-        return ToolCallDestination::InsideBase;
-    };
-    let Some(store) = state.mcp_proxy_store.as_ref() else {
-        return ToolCallDestination::InsideBase;
-    };
-    match store.get(proxy_id).await {
-        Ok(Some(proxy)) if crate::tenancy::can_reference(tenant_id, proxy.tenant_id.as_deref()) => {
-            crate::mcp_proxies::handlers::legacy_tool_call_destination(&proxy, &request)
-        }
-        _ => ToolCallDestination::InsideBase,
-    }
+) -> Result<crate::mcp_proxies::types::McpProxy, OutboundPipelineError> {
+    let proxy = crate::proxy::credential_destination::owned_proxy(
+        state
+            .mcp_proxy_store
+            .as_deref(),
+        proxy_id,
+        ctx.surface
+            .tenant_id
+            .as_deref(),
+    )
+    .await;
+    proxy.map_err(|_| refuse_mcp_proxy_transit(ctx, "mcp_proxy_unavailable"))
 }
 
-/// Whether a Transit Point request would leave its destination's base path: the path a
-/// `fabric://` destination appends, or the URL an `http(s)` one is sent, which may be the
-/// configured agent card location only when `card_location_allowed`. A `proxy://` destination
-/// builds its own URL and is checked there.
-fn transit_request_leaves_target_base(
-    ctx: &OutboundPipelineContext,
-    card_location_allowed: bool,
-) -> bool {
-    let endpoint = &ctx
+/// Where a Transit Point request carrying a Target credential (`target_credential`) or a
+/// delegated credential (`delegated_credential`) would send it
+/// ([`crate::proxy::credential_destination::verdict`]): the path a `fabric://` destination
+/// appends, the REST URL a tool call to a `proxy://` MCP Proxy builds, or the URL an `http(s)`
+/// destination is sent. An MCP Proxy that cannot be loaded is refused here.
+async fn transit_credential_destination(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+    target_credential: bool,
+    delegated_credential: bool,
+) -> Result<crate::mcp_proxies::handlers::ToolCallDestination, OutboundPipelineError> {
+    use crate::mcp_proxies::handlers::ToolCallDestination;
+    use crate::proxy::credential_destination::{Destination, ProxyCall, verdict};
+    if !target_credential && !delegated_credential {
+        return Ok(ToolCallDestination::InsideBase);
+    }
+    let endpoint = ctx
         .virtual_channel
-        .target_endpoint;
+        .target_endpoint
+        .clone();
     if endpoint.starts_with("fabric://") {
-        return !crate::proxy::paths::appended_path_stays_below_base(&transit_fabric_path(ctx));
+        let path = transit_fabric_path(ctx);
+        return Ok(verdict(target_credential, delegated_credential, Destination::AppendedPath(&path)).await);
     }
-    if crate::mcp_proxies::types::endpoint_proxy_id(endpoint).is_some() {
-        return false;
-    }
-    !crate::proxy::paths::is_target_credential_destination(
-        endpoint,
-        ctx.original_method.as_str(),
-        &transit_http_target_url(ctx),
-        ctx.virtual_channel
-            .agent_card_path
+    if let Some(proxy_id) = crate::mcp_proxies::types::endpoint_proxy_id(&endpoint) {
+        let proxy = transit_proxy(state, ctx, proxy_id).await?;
+        let Some(request) = ctx
+            .body_bytes
             .as_deref()
-            .filter(|_| card_location_allowed),
-    )
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+        else {
+            return Ok(ToolCallDestination::InsideBase);
+        };
+        let call = Destination::ProxyCall {
+            proxy: &proxy,
+            call: ProxyCall::Legacy(&request),
+        };
+        return Ok(verdict(target_credential, delegated_credential, call).await);
+    }
+    let url = transit_http_target_url(ctx);
+    let card_location = ctx
+        .virtual_channel
+        .agent_card_path
+        .clone();
+    let method = ctx.original_method.clone();
+    let destination = Destination::Url {
+        endpoint: &endpoint,
+        method: method.as_str(),
+        url: &url,
+        card_location: card_location.as_deref(),
+    };
+    Ok(verdict(target_credential, delegated_credential, destination).await)
 }
 
 /// Refuses a Transit Point request that leaves its destination's base path while a delegated
 /// credential binding applies to it, before any grant is read, token requested or consent
 /// started, internal or external consent. A delegated credential never goes to the agent card
 /// location outside the base path: a discovery read carries none. Through an MCP Proxy, a tool
-/// call is checked against the REST URL its path arguments build.
+/// call is checked against the REST URL its path arguments build, and an MCP Proxy that cannot
+/// be loaded, or whose catalog cannot be parsed, is refused before any grant is read.
 async fn step_refuse_delegated_credential_outside_target_base(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
-    if !delegated_transit_binding_applies(ctx) {
-        return Ok(());
+    use crate::mcp_proxies::handlers::ToolCallDestination;
+    let delegated = delegated_transit_binding_applies(ctx);
+    match transit_credential_destination(state, ctx, false, delegated).await? {
+        ToolCallDestination::InsideBase => Ok(()),
+        ToolCallDestination::OutsideBase => Err(refuse_path_outside_target_base(ctx)),
+        ToolCallDestination::CatalogUnavailable => Err(refuse_mcp_proxy_transit(ctx, "mcp_proxy_catalog_unavailable")),
     }
-    let leaves = match crate::mcp_proxies::types::endpoint_proxy_id(
-        &ctx.virtual_channel
-            .target_endpoint,
-    ) {
-        Some(proxy_id) => {
-            use crate::mcp_proxies::handlers::ToolCallDestination;
-            match transit_proxy_tool_call_destination(
-                state,
-                proxy_id,
-                ctx.surface
-                    .tenant_id
-                    .as_deref(),
-                ctx.body_bytes.as_deref(),
-            )
-            .await
-            {
-                ToolCallDestination::CatalogUnavailable => {
-                    return Err(refuse_mcp_proxy_transit(ctx, "mcp_proxy_catalog_unavailable"));
-                }
-                destination => destination == ToolCallDestination::OutsideBase,
-            }
-        }
-        None => transit_request_leaves_target_base(ctx, false),
-    };
-    if leaves {
-        warn!(request_id = %ctx.request_id, "Refusing a Transit Point request outside its base path: it would carry a delegated credential");
-        return Err(refuse_path_outside_target_base(ctx));
+}
+
+/// Refuses a Transit Point request about to be forwarded whose destination leaves the base path
+/// while it carries the Target credential or a delegated credential attached to it, in a header
+/// or `_meta`.
+async fn step_refuse_credential_outside_target_base(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+) -> Result<(), OutboundPipelineError> {
+    let target_credential = ctx
+        .virtual_channel
+        .target_auth
+        .is_some();
+    let delegated = carries_delegated_transit_credential(ctx);
+    match transit_credential_destination(state, ctx, target_credential, delegated).await? {
+        crate::mcp_proxies::handlers::ToolCallDestination::OutsideBase => Err(refuse_path_outside_target_base(ctx)),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Records and refuses with `400 target_path_refused` a Transit Point request whose path
 /// leaves the target endpoint's base path while it carries a Target or delegated credential,
 /// whatever the `fallback`: the caller's error.
 fn refuse_path_outside_target_base(ctx: &OutboundPipelineContext) -> OutboundPipelineError {
-    crate::proxy::handler::record_credential_destination_refusal(
+    crate::proxy::credential_destination::refuse_outside_base(
         &transit_audit_facts(ctx),
         Some(&ctx.virtual_channel.alias),
         ctx.virtual_channel
@@ -6832,7 +6839,6 @@ async fn step_forward_request_mcp_proxy(
     ctx: &mut OutboundPipelineContext,
     proxy_id: &str,
 ) -> Result<reqwest::Response, OutboundPipelineError> {
-    use crate::mcp_proxies::McpProxyStore;
     use crate::mcp_proxies::handlers::{McpProxyCallError, TransitProxyAnswer};
 
     ctx.proxy_backend_status = None;
@@ -6856,23 +6862,7 @@ async fn step_forward_request_mcp_proxy(
     {
         return Err(modern_mcp_unsupported(ctx));
     }
-    let proxy = match state.mcp_proxy_store.as_ref() {
-        Some(store) => store
-            .get(proxy_id)
-            .await
-            .ok()
-            .flatten(),
-        None => None,
-    }
-    .filter(|proxy| {
-        crate::tenancy::can_reference(
-            ctx.surface
-                .tenant_id
-                .as_deref(),
-            proxy.tenant_id.as_deref(),
-        )
-    })
-    .ok_or_else(|| refuse_mcp_proxy_transit(ctx, "mcp_proxy_unavailable"))?;
+    let proxy = transit_proxy(state, ctx, proxy_id).await?;
     let grant = proxy_grant(ctx, &proxy)?;
     let request = ctx
         .body_bytes
@@ -6972,9 +6962,7 @@ async fn step_forward_request_mcp_proxy(
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::UNAUTHORIZED);
             Ok(own_answer(status, headers, Vec::new()))
         }
-        Err(McpProxyCallError::OutsideTargetBase) => {
-            Err(refuse_external_grant(ctx, "tool_call_outside_the_mcp_proxy_base_path"))
-        }
+        Err(McpProxyCallError::OutsideTargetBase) => Err(refuse_path_outside_target_base(ctx)),
         Err(McpProxyCallError::Failed(message)) => {
             warn!(
                 request_id = %ctx.request_id,
@@ -7173,10 +7161,7 @@ async fn step_forward_request_fabric(
         .clone();
 
     let path = transit_fabric_path(ctx);
-    if carries_transit_credential(ctx) && transit_request_leaves_target_base(ctx, false) {
-        warn!(request_id = %ctx.request_id, "Refusing a Transit Point request that climbs out of its path: it would carry a Target or delegated credential");
-        return Err(refuse_path_outside_target_base(ctx));
-    }
+    step_refuse_credential_outside_target_base(state, ctx).await?;
 
     let is_modern = matches!(
         ctx.mcp_classification
@@ -7328,12 +7313,7 @@ async fn step_forward_request_http(
 ) -> Result<reqwest::Response, OutboundPipelineError> {
     let target_url = transit_http_target_url(ctx);
 
-    if carries_transit_credential(ctx)
-        && transit_request_leaves_target_base(ctx, !carries_delegated_transit_credential(ctx))
-    {
-        warn!(request_id = %ctx.request_id, "Refusing a Transit Point request outside its base path: it would carry a Target or delegated credential");
-        return Err(refuse_path_outside_target_base(ctx));
-    }
+    step_refuse_credential_outside_target_base(state, ctx).await?;
 
     // Defense-in-depth SSRF guard at the forwarding layer. `pinned_forward_client`
     // fails closed on an unparseable URL, resolves DNS once to block a host that
@@ -26337,7 +26317,30 @@ mod tests {
         let (status, answer) =
             send_through_the_pipeline(&state, "POST", "/outbound/mcp/partner", &tool_call("1")).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
-        assert_ne!(answer["reason"], "connector_unavailable", "the grant is never looked up: {answer}");
+        assert_ne!(
+            answer["error"]["data"]["reason"], "connector_unavailable",
+            "the grant is never looked up: {answer}"
+        );
+        assert_ne!(answer["reason"], "connector_unavailable", "{answer}");
+
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(transit_surface(
+            json!([{"alias": "partner", "protocol": "mcp", "require_transit_token": false,
+                "allow_unauthenticated_callers": true, "target_endpoint": "proxy://missing-proxy",
+                "transit_credentials": external}]),
+            json!([]),
+        ));
+        let (status, answer) =
+            send_through_the_pipeline(&state, "POST", "/outbound/mcp/partner", &tool_call("1")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
+        assert_ne!(
+            answer["error"]["data"]["reason"], "connector_unavailable",
+            "a proxy that cannot be loaded has no grant looked up: {answer}"
+        );
+        assert_ne!(answer["reason"], "connector_unavailable", "{answer}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1074,7 +1074,16 @@ async fn spawn_node(
                     egress_allowlist.push(mock.url());
                 }
                 // Plain surfaces forward directly to the mock URL.
-                None => surface.target_endpoint = mock.url(),
+                None => {
+                    surface.target_endpoint = format!(
+                        "{}{}",
+                        mock.url(),
+                        surface
+                            .target_base_path
+                            .as_deref()
+                            .unwrap_or_default()
+                    )
+                }
             }
             mocks.insert(surface.surface_id.clone(), mock);
         }

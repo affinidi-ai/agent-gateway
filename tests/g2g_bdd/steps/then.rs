@@ -810,6 +810,33 @@ async fn vp_audit_log_records_fabric_request_refused_for_unauthenticated_target_
     );
 }
 
+#[then(
+    expr = "the VP Audit Log of gateway {int} records that a Fabric request to surface {string} was refused with reason {string}"
+)]
+async fn vp_audit_log_records_fabric_request_refused_with_reason(
+    world: &mut G2gWorld,
+    gateway: usize,
+    surface_name: String,
+    reason: String,
+) {
+    let (_, surface_id) = world.surface(&surface_name);
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(|event| {
+            event["event"]["request_rejected"]["reason"] == reason.as_str()
+                && event["via_fabric"] == true
+                && event["surface_id"] == surface_id.as_str()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
+    assert!(
+        found,
+        "expected gateway {gateway} to record a Fabric request to surface '{surface_id}' refused with reason {reason}, got {events:?}"
+    );
+}
+
 #[then(expr = "gateway {int} issued no managed agent identity")]
 async fn gateway_issued_no_managed_agent_identity(
     world: &mut G2gWorld,

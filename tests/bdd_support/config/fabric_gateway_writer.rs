@@ -12,9 +12,10 @@ use std::path::Path;
 use crate::bdd_support::config::DEFAULT_HEADER_METADATA_EXTENSION_URI;
 use crate::bdd_support::config::agent_surface::AgentSurfaceFixture;
 use crate::bdd_support::config::config_tree::{
-    GatewayBootstrapFixture, PolicyDefinitionFixture, SecretFixture, write_gateway_config_tree,
+    CredentialProviderFixture, GatewayBootstrapFixture, PolicyDefinitionFixture, SecretFixture,
+    write_gateway_config_tree,
 };
-use crate::bdd_support::config::fabric_surface_fixture::{SourceAuthSpec, SurfaceSpec};
+use crate::bdd_support::config::fabric_surface_fixture::{ServiceCredentialSpec, SourceAuthSpec, SurfaceSpec};
 use crate::bdd_support::config::gateway_bootstrap::GatewayBootstrapSurface;
 use crate::bdd_support::config::modern_consent;
 use crate::bdd_support::config::policy_definitions::{
@@ -73,6 +74,11 @@ pub fn write_fabric_gateway_config(
                 .insert(TARGET_AUTH_PROVIDER_ID.to_string(), target_auth_provider_fixture(provider));
             assert!(replaced.is_none(), "only one surface per gateway may authenticate with the credential provider");
         }
+        if let Some(service) = &surface.service_credential {
+            config_tree
+                .credential_providers
+                .insert(service.provider_id.clone(), service_credential_provider_fixture(service));
+        }
     }
 
     write_gateway_config_tree(base_dir, &config_tree, true);
@@ -118,7 +124,43 @@ fn secret_fixtures(surface: &SurfaceSpec) -> Vec<SecretFixture> {
     if let Some(provider) = &surface.target_auth_provider {
         secrets.extend(target_auth_provider_secrets(provider));
     }
+    if let Some(service) = &surface.service_credential {
+        secrets.push(SecretFixture::new(service_credential_secret_id(service), SERVICE_CREDENTIAL_VALUE));
+    }
     secrets
+}
+
+/// The API key a service credential provider sends to the Target.
+pub const SERVICE_CREDENTIAL_VALUE: &str = "bdd-service-api-key";
+
+fn service_credential_secret_id(service: &ServiceCredentialSpec) -> String {
+    format!("{}-api-key", service.provider_id)
+}
+
+fn service_credential_provider_fixture(service: &ServiceCredentialSpec) -> CredentialProviderFixture {
+    let now = chrono::Utc::now();
+    CredentialProviderFixture {
+        id: service.provider_id.clone(),
+        tenant_id: None,
+        name: service.provider_id.clone(),
+        provider_id: service.provider_id.clone(),
+        provider_type: "api_key".to_string(),
+        authorization_endpoint: None,
+        token_endpoint: None,
+        client_id_secret_ref: None,
+        client_secret_secret_ref: None,
+        default_scopes: Vec::new(),
+        callback_path: String::new(),
+        callback_url: None,
+        token_refresh_enabled: false,
+        api_key_secret_ref: Some(service_credential_secret_id(service)),
+        authorization_response_issuer: None,
+        max_consent_age_secs: None,
+        jwt_settings: None,
+        consent_confirmation: None,
+        created_at: now,
+        updated_at: now,
+    }
 }
 
 fn policy_fixtures(surface: &SurfaceSpec) -> Vec<PolicyDefinitionFixture> {
@@ -232,6 +274,15 @@ fn build_surface_fixture(
                 "inbound",
                 serde_json::json!({ "type": "static", "did": modern_consent::CALLER_AGENT_DID }),
             );
+    }
+    if let Some(service) = &surface.service_credential {
+        fixture = fixture.with_outbound_credential(serde_json::json!({
+            "credential_provider_id": service.provider_id,
+            "scopes": [],
+            "required_for": "all",
+            "consent_mode": "on_demand",
+            "inject_as": { "type": "custom_header", "name": service.header_name, "format": "{value}" },
+        }));
     }
     if let Some(target_auth) = &surface.target_auth {
         fixture = fixture.with_target_auth(static_secret_target_auth_json(

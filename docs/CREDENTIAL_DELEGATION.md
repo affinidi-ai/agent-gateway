@@ -1203,8 +1203,9 @@ so is a request refused for leaving the Target base path, with outcome `rejected
 `fallback` (a request carrying only a delegated credential is recorded as `target_path_refused`). An
 `a2a-proxy://` Target sends its A2A proxy's Direct Line credential rather than `target.auth`:
 that credential follows `target_source_auth` (withheld, the request goes on
-without it, no audit record is written, and the one warning is the Direct Line runtime's
-"Refusing to attach the Direct Line credential" line per request), on the direct path and Fabric receive alike, and
+without it, no audit record is written, and the one warning per request is "Withholding the A2A
+proxy backend credential", naming the rule; the Direct Line runtime logs that it sends no
+credential at debug only), on the direct path and Fabric receive alike, and
 `target_https` does not apply to it because it goes to the proxy's own Direct Line endpoint. A
 caller whose authentication failed, including one that carries credentials for more than one
 `caller_authentication` method (`ambiguous_credentials`), and a public discovery read, never get
@@ -1669,7 +1670,12 @@ for `/admin` or `//admin`), before that credential is resolved or the grant read
 same `400 target_path_refused` and audit record; the proxy's and the REST client's own checks
 stay as a second guard. A proxy whose spec cannot be parsed is refused there too, before any
 credential is resolved, as its call would be: `503` "MCP tool catalog is unavailable" for a
-`2026-07-28` call, the proxy's own error for a legacy call, and `503` on a Transit Point. Each
+`2026-07-28` call, the proxy's own error for a legacy call, and `503` on a Transit Point. So is
+a proxy that cannot be loaded (none with that id, or one the surface's tenant may not
+reference, or a store that cannot be read), with the answer its dispatch gives: a `2026-07-28`
+call on the direct path or Fabric receive gets no consent prompt and no grant read for a
+request that could never be served. Every leg loads the proxy it checks in one way, scoped to
+the surface's tenant. Each
 proxy's spec is parsed once and kept while its id, base URL and spec stay the same, so the
 check and the call it guards share one parse. When a legacy MCP
 Target refuses the plain POST and the request falls back to Legacy SSE, on the direct path or
@@ -1683,7 +1689,10 @@ only to a session endpoint under the Target base path, and is otherwise refused 
 `400 target_path_refused` and a `target_path_refused` record at `forward`, with nothing posted
 to it, not even the session's `initialize`. The fallback sends no header of the request, so
 neither the Target credential nor a delegated credential in a header reaches the session
-endpoint. A Target bound by
+endpoint. Many Legacy SSE servers advertise a root endpoint such as `/messages?sessionId=...`;
+on a Target such as `https://host/mcp`, a fallback request carrying a `_meta` delegated
+credential is then refused, so set the Target endpoint to the base path both share, such as
+`https://host`. A Target bound by
 external consent keeps its stricter admission check (400).
 
 A surface's traffic mirror (`target.networking.mirror`) never receives the Target credential, a

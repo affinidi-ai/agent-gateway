@@ -7,6 +7,7 @@ pub mod caller_key;
 pub mod card_preview;
 pub mod channel_logging;
 pub mod credential_delegation;
+pub(crate) mod credential_destination;
 pub mod fabric_forward;
 pub(crate) mod fabric_hops;
 pub mod fabric_identity;
