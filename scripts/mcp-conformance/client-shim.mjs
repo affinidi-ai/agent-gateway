@@ -64,6 +64,7 @@ export function startClientShim(gatewayUrl) {
         { host: upstream.hostname, port: upstream.port, path: upstream.pathname, method: req.method, headers },
         (reply) => {
           res.writeHead(reply.statusCode, reply.headers);
+          reply.on('error', () => res.destroy());
           reply.pipe(res);
         },
       );

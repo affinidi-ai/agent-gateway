@@ -168,6 +168,44 @@ test('a client that disconnects mid-stream closes the forwarded request', async 
   }
 });
 
+test('an upstream that dies after its headers closes the client response and leaves nothing unhandled', async () => {
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('data: first\n\n');
+      setTimeout(() => res.socket.destroy(), 50);
+    });
+  });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  const shim = await startClientShim(`http://127.0.0.1:${upstream.address().port}/mcp`);
+  const unhandled = [];
+  const record = (error) => unhandled.push(error);
+  process.on('uncaughtException', record);
+  let client;
+  try {
+    const outcome = await new Promise((resolve) => {
+      client = http.request(shim.url, { method: 'POST', headers: { 'content-type': 'application/json' } }, (reply) => {
+        reply.on('error', () => resolve('closed'));
+        reply.on('close', () => resolve('closed'));
+        reply.resume();
+      });
+      client.on('error', () => resolve('closed'));
+      setTimeout(() => resolve('still open'), 2_000).unref();
+      client.end(request('tools/list', {}));
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(outcome, 'closed');
+    assert.deepEqual(unhandled.map((error) => error.message), []);
+  } finally {
+    process.off('uncaughtException', record);
+    client?.destroy();
+    upstream.closeAllConnections();
+    await shim.close();
+    await new Promise((resolve) => upstream.close(resolve));
+  }
+});
+
 async function unusedPort() {
   const listener = net.createServer();
   await new Promise((resolve) => listener.listen(0, '127.0.0.1', resolve));
