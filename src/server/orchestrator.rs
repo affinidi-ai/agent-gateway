@@ -3556,6 +3556,9 @@ pub async fn run_axum_proxy(
                 let gw_store_clone = gw_store.clone();
                 let pending_store_clone = pending_connection_store.clone();
                 let paused_cp_store = cp_store.clone();
+                let pending_expiry_hours = bootstrap_config
+                    .oob_connection
+                    .pending_expiry_hours;
                 let started_at = chrono::Utc::now();
 
                 tokio::spawn(async move {
@@ -3571,6 +3574,7 @@ pub async fn run_axum_proxy(
                         gw_store_clone.as_ref(),
                         paused_cp_store.as_ref(),
                         &pending_store_clone,
+                        pending_expiry_hours,
                         started_at,
                         now,
                     )
@@ -5254,13 +5258,15 @@ async fn remove_lapsed_pauses<P: crate::gateways::connection_points::ConnectionP
 }
 
 /// Removes the `pending` gateways an earlier run left whose acceptance can no longer
-/// complete: none of their connection points records an unexpired invitation. An
-/// acceptance still inside its invitation's lifetime keeps waiting for approval. A
+/// complete: its temporary connection point is gone or past its deadline. The deadline
+/// is the one recovery uses: the recorded expiry, else the point's creation time plus
+/// `pending_expiry_hours`. An acceptance still inside it keeps waiting for approval. A
 /// gateway whose connection points cannot be read is kept.
 async fn remove_abandoned_pending_gateways<P: crate::gateways::connection_points::ConnectionPointStore + ?Sized>(
     gateway_store: &crate::gateways::FileSystemGatewayStore,
     cp_store: &P,
     pending_store: &crate::gateways::PendingConnectionStore,
+    pending_expiry_hours: u64,
     started_at: chrono::DateTime<chrono::Utc>,
     now: chrono::DateTime<chrono::Utc>,
 ) {
@@ -5290,11 +5296,14 @@ async fn remove_abandoned_pending_gateways<P: crate::gateways::connection_points
                 continue;
             }
         };
-        let still_waiting = points.iter().any(|point| {
-            point
-                .recorded_expires_at()
-                .is_some_and(|expires_at| expires_at > now)
-        });
+        let still_waiting = points
+            .iter()
+            .filter(|point| point.is_temporary_point_of(&gateway.id))
+            .any(|point| {
+                point
+                    .pending_deadline(pending_expiry_hours)
+                    .is_ok_and(|deadline| deadline > now)
+            });
         if still_waiting {
             info!(
                 "Pending gateway '{}' ({}) keeps waiting for approval until its invitation expires",
@@ -6516,9 +6525,9 @@ mod startup_sweep_tests {
             String::new(),
             String::new(),
             String::new(),
-            serde_json::json!({}),
+            serde_json::json!({ "pending_gateway_id": gateway_id }),
             None,
-            ConnectionPointType::OobAcceptor,
+            ConnectionPointType::System,
             String::new(),
         );
         point.id = format!("tmp-{gateway_id}");
@@ -6691,7 +6700,7 @@ mod startup_sweep_tests {
         seed(&stores, &pending, &temporary_point("pending", now - Duration::hours(1), false)).await;
 
         remove_lapsed_pauses(&stores.gateways, &UnreadablePoints, &stores.pending, now).await;
-        remove_abandoned_pending_gateways(&stores.gateways, &UnreadablePoints, &stores.pending, now, now).await;
+        remove_abandoned_pending_gateways(&stores.gateways, &UnreadablePoints, &stores.pending, 1, now, now).await;
 
         for id in ["paused", "pending"] {
             assert!(
@@ -6833,6 +6842,85 @@ mod startup_sweep_tests {
     }
 
     #[tokio::test]
+    async fn a_pending_acceptance_that_recorded_no_expiry_waits_for_the_configured_lifetime() {
+        let stores = stores().await;
+        let started_at = Utc::now();
+        let before = started_at - Duration::hours(1);
+        let unrecorded = |gateway_id: &str, created_at: DateTime<Utc>| {
+            let mut point = temporary_point(gateway_id, started_at, false);
+            point.expires_at = None;
+            point.created_at = created_at;
+            point
+        };
+        let waiting = gateway("waiting", GatewayStatus::Pending, before);
+        let lapsed = gateway("lapsed", GatewayStatus::Pending, before);
+        seed(&stores, &waiting, &unrecorded("waiting", started_at - Duration::minutes(30))).await;
+        seed(&stores, &lapsed, &unrecorded("lapsed", started_at - Duration::hours(2))).await;
+
+        remove_abandoned_pending_gateways(&stores.gateways, &stores.points, &stores.pending, 1, started_at, started_at)
+            .await;
+
+        assert!(
+            stores
+                .gateways
+                .get("waiting")
+                .await
+                .unwrap()
+                .is_some(),
+            "an acceptance created 30 minutes ago keeps waiting for its 1-hour lifetime"
+        );
+        assert!(
+            stores
+                .pending
+                .get("tmp-waiting")
+                .await
+                .is_some()
+        );
+        assert!(
+            stores
+                .gateways
+                .get("lapsed")
+                .await
+                .unwrap()
+                .is_none(),
+            "an acceptance older than its lifetime is removed"
+        );
+        assert!(
+            stores
+                .pending
+                .get("tmp-lapsed")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_temporary_point_keeps_a_pending_acceptance_waiting() {
+        let stores = stores().await;
+        let started_at = Utc::now();
+        let stuck = gateway("stuck", GatewayStatus::Pending, started_at - Duration::hours(1));
+        let mut permanent = temporary_point("stuck", started_at, false);
+        permanent.id = "permanent-stuck".to_string();
+        permanent.expires_at = None;
+        permanent.oob_message = serde_json::json!({});
+        permanent.created_at = started_at - Duration::minutes(5);
+        seed(&stores, &stuck, &permanent).await;
+
+        remove_abandoned_pending_gateways(&stores.gateways, &stores.points, &stores.pending, 1, started_at, started_at)
+            .await;
+
+        assert!(
+            stores
+                .gateways
+                .get("stuck")
+                .await
+                .unwrap()
+                .is_none(),
+            "a pending gateway whose temporary point is gone is removed, whatever its other points"
+        );
+    }
+
+    #[tokio::test]
     async fn a_pending_acceptance_inside_its_invitation_lifetime_survives_a_restart() {
         let stores = stores().await;
         let started_at = Utc::now();
@@ -6842,7 +6930,7 @@ mod startup_sweep_tests {
         seed(&stores, &waiting, &temporary_point("waiting", started_at + Duration::days(3), false)).await;
         seed(&stores, &abandoned, &temporary_point("abandoned", started_at - Duration::minutes(5), false)).await;
 
-        remove_abandoned_pending_gateways(&stores.gateways, &stores.points, &stores.pending, started_at, started_at)
+        remove_abandoned_pending_gateways(&stores.gateways, &stores.points, &stores.pending, 1, started_at, started_at)
             .await;
 
         assert!(

@@ -158,6 +158,46 @@ impl GatewayConnectionPoint {
         })
     }
 
+    /// The deadline of a pending acceptance on this temporary connection point: the
+    /// recorded expiry, else its creation time plus `pending_expiry_hours`. A recorded
+    /// value that cannot be read is an error, never a fresh deadline, so an expired
+    /// pairing is never renewed.
+    pub fn pending_deadline(
+        &self,
+        pending_expiry_hours: u64,
+    ) -> Result<chrono::DateTime<chrono::Utc>, String> {
+        if let Some(recorded) = self.expires_at {
+            return Ok(recorded);
+        }
+        match self
+            .oob_message
+            .get("expires_at")
+        {
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|e| format!("Temporary connection point {} has an unreadable expiry: {e}", self.id)),
+            None => i64::try_from(pending_expiry_hours)
+                .ok()
+                .and_then(chrono::Duration::try_hours)
+                .and_then(|lifetime| {
+                    self.created_at
+                        .checked_add_signed(lifetime)
+                })
+                .ok_or_else(|| format!("pending_expiry_hours {pending_expiry_hours} is out of range")),
+        }
+    }
+
+    /// Whether this is the temporary connection point of the pending gateway
+    /// `gateway_id`: the one whose pairing recovery rebuilds.
+    pub fn is_temporary_point_of(
+        &self,
+        gateway_id: &str,
+    ) -> bool {
+        self.oob_message
+            .get("pending_gateway_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(gateway_id)
+    }
+
     pub fn new(
         gateway_id: String,
         mediator_id: String,
@@ -213,5 +253,92 @@ impl GatewayConnectionPoint {
 impl StorableEntity for GatewayConnectionPoint {
     fn id(&self) -> &str {
         &self.id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConnectionPointType, GatewayConnectionPoint};
+
+    fn temporary_point() -> GatewayConnectionPoint {
+        GatewayConnectionPoint::new(
+            "gw-1".to_string(),
+            "did:example:mediator".to_string(),
+            "did:example:cp".to_string(),
+            "CP".to_string(),
+            "desc".to_string(),
+            "oob-1".to_string(),
+            "https://oob.example".to_string(),
+            serde_json::json!({}),
+            None,
+            ConnectionPointType::System,
+            "secret".to_string(),
+        )
+    }
+
+    #[test]
+    fn a_recovered_pairing_keeps_the_recorded_expiry_and_is_never_renewed() {
+        let recorded = chrono::Utc::now() - chrono::Duration::hours(3);
+
+        let mut field = temporary_point();
+        field.expires_at = Some(recorded);
+        assert_eq!(
+            field
+                .pending_deadline(24)
+                .unwrap(),
+            recorded
+        );
+
+        let mut in_message = temporary_point();
+        in_message.expires_at = None;
+        in_message.oob_message = serde_json::json!({ "expires_at": recorded });
+        assert_eq!(
+            in_message
+                .pending_deadline(24)
+                .unwrap(),
+            recorded
+        );
+
+        let mut unrecorded = temporary_point();
+        unrecorded.expires_at = None;
+        unrecorded.oob_message = serde_json::json!({});
+        assert_eq!(
+            unrecorded
+                .pending_deadline(2)
+                .unwrap(),
+            unrecorded.created_at + chrono::Duration::hours(2),
+            "without a recorded expiry the deadline counts from the connection point's creation"
+        );
+
+        let mut unreadable = temporary_point();
+        unreadable.expires_at = None;
+        unreadable.oob_message = serde_json::json!({ "expires_at": "not a date" });
+        assert!(
+            unreadable
+                .pending_deadline(24)
+                .unwrap_err()
+                .contains("unreadable expiry")
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_lifetime_is_an_error_not_a_panic() {
+        let mut unrecorded = temporary_point();
+        unrecorded.expires_at = None;
+        assert!(
+            unrecorded
+                .pending_deadline(u64::MAX)
+                .unwrap_err()
+                .contains("out of range")
+        );
+    }
+
+    #[test]
+    fn the_temporary_point_is_the_one_naming_the_pending_gateway() {
+        let mut point = temporary_point();
+        point.oob_message = serde_json::json!({ "pending_gateway_id": "gw-1" });
+        assert!(point.is_temporary_point_of("gw-1"));
+        assert!(!point.is_temporary_point_of("gw-2"));
+        assert!(!temporary_point().is_temporary_point_of("gw-1"));
     }
 }

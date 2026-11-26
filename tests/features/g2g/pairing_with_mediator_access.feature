@@ -12,20 +12,32 @@ Feature: Pairing that waits for mediator access
     Then gateway 2 waited for the mediator to admit its DIDs "connection_point, permanent"
     And gateway 1 waited for the mediator to admit its DIDs "temporary, permanent"
 
-  Scenario: Two gateways paired through both pauses ping each other
+  Scenario Outline: Two gateways paired through both pauses can ping in each direction
     Given a fabric with 2 gateways that pause for mediator access when they pair
-    When gateway 1 and gateway 2 ping each other
-    Then the ping from gateway 1 to gateway 2 succeeds
-    And the ping from gateway 2 to gateway 1 succeeds
+    When gateway <from> pings gateway <to>
+    Then the ping from gateway <from> to gateway <to> succeeds
 
-  Scenario: Two gateways paired in one call ping each other as before
+    Examples:
+      | from | to |
+      | 1    | 2  |
+      | 2    | 1  |
+
+  Scenario Outline: Two gateways paired in one call can ping in each direction as before
     Given a fabric with 2 gateways
-    When gateway 1 and gateway 2 ping each other
-    Then the ping from gateway 1 to gateway 2 succeeds
-    And the ping from gateway 2 to gateway 1 succeeds
+    When gateway <from> pings gateway <to>
+    Then the ping from gateway <from> to gateway <to> succeeds
 
-  Scenario: Gateways restarted while paused still pair and ping each other
+    Examples:
+      | from | to |
+      | 1    | 2  |
+      | 2    | 1  |
+
+  Scenario Outline: Gateways restarted while paused still pair and can ping in each direction
     Given a fabric with 2 gateways that pause for mediator access and restart while paused
-    When gateway 1 and gateway 2 ping each other
-    Then the ping from gateway 1 to gateway 2 succeeds
-    And the ping from gateway 2 to gateway 1 succeeds
+    When gateway <from> pings gateway <to>
+    Then the ping from gateway <from> to gateway <to> succeeds
+
+    Examples:
+      | from | to |
+      | 1    | 2  |
+      | 2    | 1  |

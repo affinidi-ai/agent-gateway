@@ -3852,28 +3852,6 @@ fn permanent_mediator_reference(
         .to_string()
 }
 
-/// The deadline of a pairing rebuilt from its temporary connection point: the
-/// recorded expiry, else the connection point's creation time plus the configured
-/// lifetime. A recorded value that cannot be read is an error, never a fresh
-/// deadline, so recovery cannot renew an expired pairing.
-fn resolve_recovered_expires_at(
-    temp_connection_point: &super::types::GatewayConnectionPoint,
-    pending_expiry_hours: u64,
-) -> Result<chrono::DateTime<chrono::Utc>, String> {
-    if let Some(recorded) = temp_connection_point.expires_at {
-        return Ok(recorded);
-    }
-    match temp_connection_point
-        .oob_message
-        .get("expires_at")
-    {
-        Some(value) => serde_json::from_value(value.clone()).map_err(|e| {
-            format!("Temporary connection point {} has an unreadable expiry: {e}", temp_connection_point.id)
-        }),
-        None => Ok(temp_connection_point.created_at + chrono::Duration::hours(pending_expiry_hours as i64)),
-    }
-}
-
 /// Tell an acceptor its connection-setup was refused. Best effort: a failed send is logged and
 /// changes nothing else.
 async fn send_pairing_rejection(
@@ -4179,8 +4157,7 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
             )
             .await?;
 
-            let recovered_expires_at = resolve_recovered_expires_at(
-                &temp_connection_point,
+            let recovered_expires_at = temp_connection_point.pending_deadline(
                 bootstrap_config
                     .oob_connection
                     .pending_expiry_hours,
@@ -6880,38 +6857,6 @@ mod connected_event_tests {
         );
         cp.mediator_did = Some("did:example:mediator".to_string());
         cp
-    }
-
-    #[test]
-    fn a_recovered_pairing_keeps_the_recorded_expiry_and_is_never_renewed() {
-        let recorded = chrono::Utc::now() - chrono::Duration::hours(3);
-
-        let mut field = announced_cp();
-        field.expires_at = Some(recorded);
-        assert_eq!(super::resolve_recovered_expires_at(&field, 24).unwrap(), recorded);
-
-        let mut in_message = announced_cp();
-        in_message.expires_at = None;
-        in_message.oob_message = serde_json::json!({ "expires_at": recorded });
-        assert_eq!(super::resolve_recovered_expires_at(&in_message, 24).unwrap(), recorded);
-
-        let mut unrecorded = announced_cp();
-        unrecorded.expires_at = None;
-        unrecorded.oob_message = serde_json::json!({});
-        assert_eq!(
-            super::resolve_recovered_expires_at(&unrecorded, 2).unwrap(),
-            unrecorded.created_at + chrono::Duration::hours(2),
-            "without a recorded expiry the deadline counts from the connection point's creation"
-        );
-
-        let mut unreadable = announced_cp();
-        unreadable.expires_at = None;
-        unreadable.oob_message = serde_json::json!({ "expires_at": "not a date" });
-        assert!(
-            super::resolve_recovered_expires_at(&unreadable, 24)
-                .unwrap_err()
-                .contains("unreadable expiry")
-        );
     }
 
     async fn store_with(

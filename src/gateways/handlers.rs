@@ -2143,6 +2143,7 @@ mod tests {
                 pending_id: temp_cp_id.clone(),
                 temp_cp_id,
                 pending_gateway_id: gateway.id.clone(),
+                write_done: None,
             };
             Self {
                 _dir: dir,
@@ -2171,6 +2172,7 @@ mod tests {
                 pending_gateway_id: cleanup
                     .pending_gateway_id
                     .clone(),
+                write_done: None,
             }
         }
 
@@ -2224,6 +2226,29 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         cancelled.abort();
+        for _ in 0..100 {
+            if acceptance.leftovers().await == (false, false, false, 0) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(acceptance.leftovers().await, (false, false, false, 0));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_acceptance_cleans_up_only_after_its_outstanding_write_ends() {
+        let acceptance = UnfinishedAcceptance::start().await;
+        let mut guard = AcceptanceGuard(Some(acceptance.cleanup_clone()));
+        let write_done = guard.write_barrier();
+        drop(guard);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            acceptance.leftovers().await,
+            (true, true, true, 2),
+            "nothing is removed while the write is outstanding"
+        );
+
+        drop(write_done);
         for _ in 0..100 {
             if acceptance.leftovers().await == (false, false, false, 0) {
                 return;
@@ -2703,7 +2728,9 @@ async fn remove_generated_identities(
 
 /// What an acceptance that does not finish leaves behind, and how it is removed: the
 /// pairing, the temporary connection point, the pending gateway, the DIDComm client and
-/// the generated keys.
+/// the generated keys. It starts only after an outstanding write of the temporary point
+/// has ended, so that write cannot store the point after the cleanup removed its gateway
+/// and keys.
 struct AcceptanceCleanup<S, P> {
     pending_store: Arc<crate::gateways::PendingConnectionStore>,
     cp_store: Arc<P>,
@@ -2714,10 +2741,16 @@ struct AcceptanceCleanup<S, P> {
     pending_id: String,
     temp_cp_id: String,
     pending_gateway_id: String,
+    /// Resolves when the write handed to its own task ends, stored or not.
+    write_done: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl<S: GatewayStore, P: ConnectionPointStore> AcceptanceCleanup<S, P> {
-    async fn run(self) {
+    async fn run(mut self) {
+        if let Some(write_done) = self.write_done.take() {
+            // Resolves with an error when the write's sender is dropped, which is the signal.
+            let _ = write_done.await;
+        }
         self.pending_store
             .remove(&self.pending_id)
             .await;
@@ -2763,6 +2796,16 @@ impl<S: GatewayStore + 'static, P: ConnectionPointStore + 'static> AcceptanceGua
 
     fn finished(mut self) {
         self.0 = None;
+    }
+
+    /// For a write of the temporary point that runs on its own task: the cleanup waits
+    /// until the returned sender is dropped, so the write must own it until it ends.
+    fn write_barrier(&mut self) -> tokio::sync::oneshot::Sender<()> {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        if let Some(cleanup) = self.0.as_mut() {
+            cleanup.write_done = Some(wait);
+        }
+        done
     }
 }
 
@@ -3450,7 +3493,7 @@ pub async fn connect_via_oob<
     info!("    Role: {:?}", pending_connection.role);
     info!("    State: {:?}", pending_connection.state);
 
-    let cleanup = AcceptanceGuard(Some(AcceptanceCleanup {
+    let mut cleanup = AcceptanceGuard(Some(AcceptanceCleanup {
         pending_store: pending_store.clone(),
         cp_store: cp_store.clone(),
         store: store.clone(),
@@ -3463,6 +3506,7 @@ pub async fn connect_via_oob<
         pending_id: pending_connection.id.clone(),
         temp_cp_id: temp_cp_id.clone(),
         pending_gateway_id: pending_gateway_id.clone(),
+        write_done: None,
     }));
     let acceptor_lock = match req
         .acceptor_mediator_id
@@ -3593,20 +3637,14 @@ pub async fn connect_via_oob<
                 });
             let record = point.clone();
             let point_store = cp_store.clone();
+            let write_done = cleanup.write_barrier();
             temp_announcement
                 .complete(
                     async move {
-                        let stored = point_store
+                        let _write_done = write_done;
+                        point_store
                             .create(&record)
-                            .await;
-                        // Handed over on the write's own task, so a cancelled request cannot
-                        // report the reserved DID failed while its record is stored.
-                        if stored.is_ok()
-                            && let Some(reservation) = reservation
-                        {
-                            reservation.hand_over();
-                        }
-                        stored
+                            .await
                     },
                     temp_payload,
                 )
@@ -3614,6 +3652,11 @@ pub async fn connect_via_oob<
                 .map_err(|e| {
                     (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create temporary connection point: {}", e))
                 })?;
+            // Handed over by the request: a request cancelled during the write reports the
+            // reserved DID failed, and its cleanup removes the stored record after the write.
+            if let Some(reservation) = reservation {
+                reservation.hand_over();
+            }
 
             info!("⏸  Gateway {} waits for the mediator to admit its DIDs", paused_gateway.id);
             let name =
@@ -3704,9 +3747,11 @@ pub async fn connect_via_oob<
         // Store the temporary connection point
         let record = temp_connection_point.clone();
         let point_store = cp_store.clone();
+        let write_done = cleanup.write_barrier();
         temp_announcement
             .complete(
                 async move {
+                    let _write_done = write_done;
                     point_store
                         .create(&record)
                         .await
