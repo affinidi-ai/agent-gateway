@@ -4071,6 +4071,7 @@ async fn proxy_charged_request(
                     subscription_lifetime: None,
                     mcp_continuations: mcp_continuations.clone(),
                     payment: payment.as_ref(),
+                    agent_context: agent_context.as_ref(),
                 },
             ))
             .await;
@@ -4342,6 +4343,7 @@ async fn proxy_charged_request(
                 subscription_lifetime,
                 mcp_continuations,
                 payment: payment.as_ref(),
+                agent_context: agent_context.as_ref(),
             },
         ))
         .await;
@@ -11078,6 +11080,7 @@ struct FabricSend<'a> {
     subscription_lifetime: Option<crate::mcp::subscriptions::SubscriptionLifetime>,
     mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
     payment: Option<&'a agent_pay_gate::Intake>,
+    agent_context: Option<&'a crate::surface_context::AgentContext>,
 }
 
 /// Handle requests through the fabric:// protocol by forwarding via gateway
@@ -11127,6 +11130,7 @@ async fn handle_fabric_request_inner(
         mut subscription_lifetime,
         mcp_continuations,
         payment,
+        agent_context,
     } = request;
     let source_auth_failed =
         matches!(source_auth_context, Some(crate::surface_context::SourceAuthContext::Failed { .. }));
@@ -13318,9 +13322,13 @@ async fn handle_fabric_request_inner(
         .cloned()
         .zip(injected_target_header);
     let refusal_trace_id = trace_id.clone();
-    let caller_did = extension_identity
-        .as_ref()
-        .and_then(|identity| identity.did.as_deref());
+    let caller_did = agent_context
+        .and_then(|ctx| ctx.did.as_deref())
+        .or_else(|| {
+            extension_identity
+                .as_ref()
+                .and_then(|identity| identity.did.as_deref())
+        });
     let response_policy = DirectResponsePolicy::for_request(
         &state,
         DirectRequest {
@@ -13329,7 +13337,7 @@ async fn handle_fabric_request_inner(
             method: method.as_ref(),
             path: uri.path(),
             caller_did,
-            agent: None,
+            agent: agent_context,
             extension_identity: extension_identity.as_ref(),
             identity: authenticated_identity.as_ref(),
             actor_did: caller_did,
@@ -14429,6 +14437,7 @@ async fn handle_fabric_request_inner(
                         })
                     });
                 if !crate::proxy::paths::is_well_known_agent_card_path(uri.path())
+                    && !response_body.is_empty()
                     && let Some(policy) = response_policy.as_ref()
                     && let Some(refusal) = policy
                         .refusal(status, response_body.as_bytes(), content_type)
@@ -25552,6 +25561,7 @@ mod fabric_send_tests {
                 subscription_lifetime: None,
                 mcp_continuations: None,
                 payment: None,
+                agent_context: None,
             },
         )))
         .await;
@@ -25620,6 +25630,7 @@ mod fabric_send_tests {
                 subscription_lifetime: None,
                 mcp_continuations: None,
                 payment: None,
+                agent_context: None,
             },
         ))
         .await;
@@ -25694,6 +25705,7 @@ mod fabric_send_tests {
                 subscription_lifetime: None,
                 mcp_continuations: None,
                 payment: None,
+                agent_context: None,
             },
         )
         .await;
@@ -25804,6 +25816,7 @@ mod fabric_send_tests {
                 subscription_lifetime: None,
                 mcp_continuations: None,
                 payment: None,
+                agent_context: None,
             },
         )))
         .await;
@@ -26738,6 +26751,7 @@ mod fabric_send_tests {
                 subscription_lifetime: None,
                 mcp_continuations: None,
                 payment: None,
+                agent_context: None,
             },
         ))
         .await;
@@ -26923,6 +26937,7 @@ mod fabric_send_tests {
                     subscription_lifetime: None,
                     mcp_continuations: None,
                     payment: None,
+                    agent_context: None,
                 },
             ))
             .await;

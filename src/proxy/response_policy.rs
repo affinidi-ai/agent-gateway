@@ -230,14 +230,18 @@ pub fn response_context(
 /// What a response policy sees of each event of a buffered `text/event-stream`
 /// answer with `status`: one context per event that carries data, with that
 /// event's JSON as the body, as a direct caller's event stream is checked. Empty
-/// when `body` holds no such event.
+/// when `body` holds no such event, and `None` when an event's data is not JSON,
+/// which a direct caller's stream refuses too.
 pub fn event_stream_contexts(
     status: u16,
     body: &[u8],
-) -> Vec<ResponseContext> {
+) -> Option<Vec<ResponseContext>> {
     let text = String::from_utf8_lossy(body)
         .replace("\r\n", "\n")
         .replace('\r', "\n");
+    let text = text
+        .strip_prefix('\u{feff}')
+        .unwrap_or(&text);
     text.split("\n\n")
         .filter_map(|event| {
             let data: Vec<&str> = event
@@ -250,16 +254,18 @@ pub fn event_stream_contexts(
                 .collect();
             (!data.is_empty()).then(|| serde_json::from_str::<Value>(&data.join("\n")).ok())
         })
-        .map(|event| ResponseContext {
-            status_code: status,
-            is_error: status >= 400
-                || event
-                    .as_ref()
-                    .and_then(|event| event.get("error"))
-                    .is_some_and(|error| !error.is_null()),
-            body: event,
-            content_type: Some(mime::TEXT_EVENT_STREAM.to_string()),
-            method: None,
+        .map(|event| {
+            let event = event?;
+            Some(ResponseContext {
+                status_code: status,
+                is_error: status >= 400
+                    || event
+                        .get("error")
+                        .is_some_and(|error| !error.is_null()),
+                body: Some(event),
+                content_type: Some(mime::TEXT_EVENT_STREAM.to_string()),
+                method: None,
+            })
         })
         .collect()
 }
@@ -267,21 +273,48 @@ pub fn event_stream_contexts(
 /// What a response policy sees of a whole Target answer with `status`, `body`
 /// and `content_type`: one context per event when it is still framed as an
 /// event stream (see [`event_stream_contexts`]), otherwise one for the answer.
+/// `None` when an event of the stream is not JSON.
 pub fn answer_contexts(
     status: u16,
     body: &[u8],
     content_type: Option<&str>,
-) -> Vec<ResponseContext> {
+) -> Option<Vec<ResponseContext>> {
     let events = match content_type {
         Some(content_type) if crate::mcp::sse_transport::is_sse_content_type(content_type) => {
-            event_stream_contexts(status, body)
+            event_stream_contexts(status, body)?
         }
         _ => Vec::new(),
     };
-    if events.is_empty() {
+    Some(if events.is_empty() {
         vec![response_context(status, body, content_type)]
     } else {
         events
+    })
+}
+
+/// The reason recorded when an event-stream answer is refused because one of
+/// its events is not JSON.
+pub const UNREADABLE_EVENT_REASON: &str = "unreadable_event_stream";
+
+/// Records the refusal of an event-stream answer one of whose events is not
+/// JSON, under response policy `policy_id` with the request fields `context`
+/// carries, and returns that refusal.
+pub fn refuse_unreadable_answer(
+    policy_id: &str,
+    context: crate::observability::PolicyDecisionEvent<'_>,
+) -> ResponsePolicyDecision {
+    crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+        scope: crate::observability::PolicyScope::Response,
+        allow: false,
+        reason: Some(UNREADABLE_EVENT_REASON),
+        policy_id: Some(policy_id),
+        policy_definition_id: Some(policy_id),
+        ..context
+    });
+    ResponsePolicyDecision {
+        allow: false,
+        reason: Some(UNREADABLE_EVENT_REASON.to_string()),
+        error: None,
     }
 }
 
@@ -781,7 +814,7 @@ mod tests {
     fn each_data_event_of_an_event_stream_is_its_own_context() {
         let body = b"event: message\r\ndata: {\"id\":1,\"result\":{\"kind\":\"task\"}}\r\n\r\n: keep-alive\n\ndata: {\"id\":1,\"error\":{\"code\":-1}}\n\n";
 
-        let contexts = event_stream_contexts(200, body);
+        let contexts = event_stream_contexts(200, body).unwrap();
 
         assert_eq!(contexts.len(), 2);
         assert_eq!(contexts[0].body, Some(serde_json::json!({"id": 1, "result": {"kind": "task"}})));
@@ -797,7 +830,58 @@ mod tests {
 
     #[test]
     fn a_body_with_no_data_event_gives_no_contexts() {
-        assert!(event_stream_contexts(200, b"{\"result\":{}}").is_empty());
+        assert!(event_stream_contexts(200, b"{\"result\":{}}").is_some_and(|contexts| contexts.is_empty()));
+    }
+
+    #[test]
+    fn a_leading_byte_order_mark_does_not_hide_the_first_event() {
+        let body = "\u{feff}data: {\"result\":{\"secret\":\"s\"}}\n\n".as_bytes();
+
+        let contexts = event_stream_contexts(200, body).unwrap();
+
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].body, Some(serde_json::json!({"result": {"secret": "s"}})));
+    }
+
+    #[test]
+    fn an_event_that_is_not_json_makes_the_stream_unreadable() {
+        let body = b"data: {\"result\":{}}\n\ndata: not json\n\n";
+
+        assert!(event_stream_contexts(200, body).is_none());
+        assert!(answer_contexts(200, body, Some("text/event-stream")).is_none());
+    }
+
+    #[test]
+    fn an_event_stream_is_recognised_in_any_letter_case() {
+        let body = b"data: {\"result\":{\"a\":1}}\n\ndata: {\"result\":{\"b\":2}}\n\n";
+
+        let contexts = answer_contexts(200, body, Some("Text/Event-Stream")).unwrap();
+
+        assert_eq!(contexts.len(), 2);
+    }
+
+    #[test]
+    fn refusing_an_unreadable_answer_records_a_deny() {
+        use crate::observability::policy_audit::POLICY_DECISION_COLLECTOR;
+        let collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let decision = POLICY_DECISION_COLLECTOR.sync_scope(collector.clone(), || {
+            refuse_unreadable_answer("pol-1", crate::observability::PolicyDecisionEvent::default())
+        });
+
+        assert!(!decision.allow);
+        let recorded = collector
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].decision, "deny");
+        assert_eq!(
+            recorded[0]
+                .deny_reason
+                .as_deref(),
+            Some(UNREADABLE_EVENT_REASON)
+        );
     }
 
     fn input_with_body(body: Value) -> ResponsePolicyInput {

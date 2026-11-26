@@ -6,7 +6,7 @@ use axum::{http::HeaderMap, response::Response};
 use crate::channel_info;
 use crate::proxy::response_policy::{
     CallerContext, ResponseContext, ResponsePolicyDecision, ResponsePolicyInput, SurfaceContext,
-    a2a_proxy_answer_under, answer_contexts, check_response_policy_on_each, denied_response,
+    a2a_proxy_answer_under, answer_contexts, check_response_policy_on_each, denied_response, refuse_unreadable_answer,
 };
 use crate::state::ProxyState;
 
@@ -293,35 +293,34 @@ impl DirectResponsePolicy {
         &self,
         response: ResponseContext,
     ) -> ResponsePolicyDecision {
-        self.check_each(vec![response])
+        self.check_each(Some(vec![response]))
             .await
     }
 
     /// Evaluates the policy on each part of one Target answer and records one
-    /// decision for the answer.
+    /// decision for the answer. `None` is an event-stream answer with an event
+    /// that is not JSON, which is refused.
     async fn check_each(
         &self,
-        responses: Vec<ResponseContext>,
+        responses: Option<Vec<ResponseContext>>,
     ) -> ResponsePolicyDecision {
+        let context = crate::observability::PolicyDecisionEvent {
+            surface_id: Some(&self.config_id),
+            surface_name: Some(&self.surface.name),
+            trace_id: Some(&self.trace_id),
+            http_method: Some(&self.method),
+            path: Some(&self.path),
+            identity: self.identity.as_ref(),
+            actor_did: self.actor_did.as_deref(),
+            ..Default::default()
+        };
+        let Some(responses) = responses else {
+            return refuse_unreadable_answer(&self.policy_id, context);
+        };
         let inputs = responses
             .into_iter()
             .map(|response| ResponsePolicyInput::new(response, self.caller.clone(), self.surface.clone()));
-        check_response_policy_on_each(
-            &self.policy_manager,
-            &self.policy_id,
-            inputs,
-            crate::observability::PolicyDecisionEvent {
-                surface_id: Some(&self.config_id),
-                surface_name: Some(&self.surface.name),
-                trace_id: Some(&self.trace_id),
-                http_method: Some(&self.method),
-                path: Some(&self.path),
-                identity: self.identity.as_ref(),
-                actor_did: self.actor_did.as_deref(),
-                ..Default::default()
-            },
-        )
-        .await
+        check_response_policy_on_each(&self.policy_manager, &self.policy_id, inputs, context).await
     }
 
     /// The `403` the caller gets when the policy refuses a whole Target answer

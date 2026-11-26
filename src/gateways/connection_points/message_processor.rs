@@ -22,7 +22,7 @@ use crate::{channel_debug, channel_error, channel_info, channel_warn};
 mod forward_refusal;
 use forward_refusal::ForwardRefusal;
 mod response_policy;
-use response_policy::{FabricResponsePolicy, FabricResponseRequest, FabricToolsListGate};
+use response_policy::{FabricResponsePolicy, FabricResponseRequest, FabricToolsListGate, RefusedExchange};
 
 /// Global metrics store for GW2 - set during initialization
 static GLOBAL_METRICS_STORE: OnceCell<Arc<crate::metrics::MetricsStore>> = OnceCell::const_new();
@@ -7138,6 +7138,24 @@ async fn process_charged_forward_request(
                 && let Some(policy) = response_policy.as_ref()
                 && let Some(refusal) = policy.refusal_of_buffered(status, &response_body, content_type).await
             {
+                if !is_modern_response {
+                    let request_payload = serde_json::from_slice(&body_bytes).unwrap_or_else(|_| {
+                        serde_json::json!({"_raw_body": String::from_utf8_lossy(&body_bytes), "method": method.to_uppercase()})
+                    });
+                    let surface_id = surface.config_id().unwrap_or(channel_id);
+                    RefusedExchange {
+                        surface_id,
+                        capture_channel: channel_id,
+                        source: message.from_did.as_deref().unwrap_or("unknown"),
+                        destination: &target_url,
+                        caller_identity: caller_identity.as_deref(),
+                        request: &request_payload,
+                        request_bytes,
+                        latency_ms: start_time.elapsed().as_millis() as u64,
+                    }
+                    .record(&serde_json::from_str(crate::proxy::response_policy::DENIED_BODY).unwrap_or_default())
+                    .await;
+                }
                 return refusal;
             }
             if let Some((receipt, protocol)) = stream_receipt.as_ref()
@@ -9379,6 +9397,25 @@ async fn handle_mcp_proxy_forward(
                     })
                     .await
             {
+                RefusedExchange {
+                    surface_id: surface
+                        .config_id()
+                        .unwrap_or(channel_id),
+                    capture_channel: &surface.name,
+                    source: message
+                        .from_did
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    destination: &format!("proxy://{proxy_id}"),
+                    caller_identity: caller_identity.as_deref(),
+                    request: &mcp_request,
+                    request_bytes,
+                    latency_ms: start_time
+                        .elapsed()
+                        .as_millis() as u64,
+                }
+                .record(&denied)
+                .await;
                 return ProcessingResult::RequiresResponse {
                     response_type: MessageType::ForwardResponse.to_string(),
                     response_body: serde_json::json!({

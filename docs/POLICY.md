@@ -885,12 +885,14 @@ answer only; the proxy's own JSON-RPC errors pass unchecked. On a modern MCP res
 the complete result only; notifications sent before it, JSON-RPC errors, `input_required` and
 other result types are not checked. An A2A answer framed as an event stream is checked event by
 event, each event's JSON as `input.response.body`, directly and over Fabric, and refused when
-any event is denied; one decision is recorded for the answer. On a `tools/list` answer the
+any event is denied or an event's data is not JSON (recorded with reason
+`unreadable_event_stream`); one decision is recorded for the answer. On a `tools/list` answer the
 policy sees the list after MCP tool gating has removed the tools the caller may not see,
 directly and over Fabric, on every Target kind. Responses the gateway makes itself are not
 checked, nor is the public agent card (a request for `/.well-known/agent-card.json` or another
 well-known card path, or over Fabric the surface's configured card location), nor an empty
-answer from a Legacy SSE session (the answer to a notification). Other discovery documents and
+answer from a Legacy SSE session (the answer to a notification), nor an empty answer a peer
+gateway sends back to a surface with a `fabric://` Target. Other discovery documents and
 an extended agent card are checked. A denied answer is refused with `403 response_policy_denied`, or, on an MCP
 Proxy Target, with a JSON-RPC `-32000` error that carries the deny reason. A denied modern MCP
 result ends its stream when the Target answered with an event stream, and is refused with
