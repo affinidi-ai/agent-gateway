@@ -36,6 +36,11 @@ impl std::error::Error for TooManyPendingAuthnRequests {}
 /// The attributes of an assertion: every value of each attribute, in the order the identity provider sent them.
 pub type SamlAttributes = HashMap<String, Vec<String>>;
 
+/// The key under which the role values of every attribute statement are kept, apart from the
+/// first-statement attributes. It holds a NUL, which no XML attribute name can, so it never
+/// collides with an attribute of the assertion.
+pub const ROLE_VALUES_KEY: &str = "\u{0}role-values";
+
 /// SAML Service Provider implementation
 pub struct SamlService {
     /// SAML configuration
@@ -469,9 +474,9 @@ impl SamlService {
     }
 }
 
-/// The attributes the gateway reads: those of the first attribute statement, except that the role
-/// attribute carries the values of every statement, so a role is never missed for the statement it
-/// sits in.
+/// The attributes the gateway reads: those of the first attribute statement, plus the values of
+/// the role attribute from every statement under [`ROLE_VALUES_KEY`], so a role is never missed for
+/// the statement it sits in and never leaks into an identity or profile attribute.
 fn collect_attributes_with_roles_from_all_statements(
     statements: &[AttributeStatement],
     role_attribute: &str,
@@ -480,10 +485,9 @@ fn collect_attributes_with_roles_from_all_statements(
         .first()
         .map(|first| collect_attributes(std::slice::from_ref(first)))
         .unwrap_or_default();
-    match collect_attributes(statements).remove(role_attribute) {
-        Some(roles) => attributes.insert(role_attribute.to_string(), roles),
-        None => attributes.remove(role_attribute),
-    };
+    if let Some(roles) = collect_attributes(statements).remove(role_attribute) {
+        attributes.insert(ROLE_VALUES_KEY.to_string(), roles);
+    }
     attributes
 }
 
@@ -817,7 +821,7 @@ mod tests {
         );
         assert_eq!(collected["uid"], vec!["first"]);
         assert!(!collected.contains_key("name"));
-        assert_eq!(collected["role"], vec!["gw-all", "gw-admins"]);
+        assert_eq!(collected[ROLE_VALUES_KEY], vec!["gw-all", "gw-admins"]);
     }
 
     #[test]
@@ -826,8 +830,28 @@ mod tests {
             &[statement(vec![attribute("uid", &["first"])]), statement(vec![attribute("role", &["gw-admins"])])],
             "role",
         );
-        assert_eq!(collected["role"], vec!["gw-admins"]);
+        assert_eq!(collected[ROLE_VALUES_KEY], vec!["gw-admins"]);
         assert_eq!(collected["uid"], vec!["first"]);
+    }
+
+    #[test]
+    fn a_claim_that_is_both_the_role_and_another_attribute_keeps_its_first_statement_value_for_the_attribute() {
+        let collected = collect_attributes_with_roles_from_all_statements(
+            &[statement(vec![attribute("claim", &["first"])]), statement(vec![attribute("claim", &["later"])])],
+            "claim",
+        );
+        assert_eq!(collected["claim"], vec!["first"]);
+        assert_eq!(collected[ROLE_VALUES_KEY], vec!["first", "later"]);
+    }
+
+    #[test]
+    fn a_role_claim_absent_from_the_first_statement_does_not_appear_as_an_attribute() {
+        let collected = collect_attributes_with_roles_from_all_statements(
+            &[statement(vec![attribute("uid", &["first"])]), statement(vec![attribute("claim", &["later"])])],
+            "claim",
+        );
+        assert!(!collected.contains_key("claim"));
+        assert_eq!(collected[ROLE_VALUES_KEY], vec!["later"]);
     }
 
     #[test]

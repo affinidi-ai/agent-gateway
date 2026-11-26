@@ -4,7 +4,7 @@ use tracing::{info, warn};
 
 use crate::auth::auth_config::SamlConfig;
 use crate::auth::saml::graph_api::GraphApiClient;
-use crate::auth::saml::service::SamlAttributes;
+use crate::auth::saml::service::{ROLE_VALUES_KEY, SamlAttributes};
 use crate::auth::storage::{PasskeyStorage, UserData};
 use crate::auth::types::{UserRole, UserStatus};
 
@@ -365,7 +365,7 @@ fn determine_role(
     config: &SamlConfig,
 ) -> Result<UserRole, RoleRefused> {
     let values = attributes
-        .get(&config.attribute_mapping.role)
+        .get(ROLE_VALUES_KEY)
         .map(Vec::as_slice)
         .unwrap_or_default();
     let mapped = values
@@ -552,7 +552,7 @@ mod tests {
         mut attributes: SamlAttributes,
         role: &str,
     ) -> SamlAttributes {
-        attributes.insert(SamlAttributeMapping::default().role, vec![role.to_string()]);
+        attributes.insert(ROLE_VALUES_KEY.to_string(), vec![role.to_string()]);
         attributes
     }
 
@@ -1155,7 +1155,7 @@ mod tests {
         roles: &[&str],
     ) -> SamlAttributes {
         attributes.insert(
-            SamlAttributeMapping::default().role,
+            ROLE_VALUES_KEY.to_string(),
             roles
                 .iter()
                 .map(|role| role.to_string())
