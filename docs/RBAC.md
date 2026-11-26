@@ -87,7 +87,7 @@ was issued, or `null` when it is not scope-restricted. It never returns the toke
 
 Choosing which backend signs is key management. A surface save (`POST`, `PUT` or `PATCH
 /v1/surfaces…`, and the variant routes), an issuer save (`POST` or `PUT /v1/issuers…`) or a
-settings write (`POST` or `DELETE /v1/settings`) that changes the stored signing choice
+settings write (`POST /v1/settings`) that changes the stored signing choice
 (`signing`, or the gateway-wide `default_signing`) also needs `key_management.edit`, under the
 caller's role and, for a personal access token, its scopes; without it the save is refused with
 `403` and nothing is stored. Creating a surface or an issuer with a non-empty `signing` counts as
@@ -210,7 +210,8 @@ families ([`connections_admin.rs`](../src/vta/connections_admin.rs)):
 Changing the gateway-wide default signing key source (`default_signing` in
 `POST /v1/settings`, the dashboard's **Gateway signing**) needs `key_management.edit` as well as
 `settings.edit`, because it changes the issuer of every token and credential the gateway issues
-for surfaces and issuers that set no source of their own. The built-in defaults grant all five
+for surfaces and issuers that set no source of their own. **Reset to Defaults**
+(`DELETE /v1/settings`) keeps `default_signing`, so it needs `settings.edit` only. The built-in defaults grant all five
 `vta_connections.*` and `key_management.*` permissions to `administrator` only. A personal access
 token needs the permission among its feature scopes; one created without scopes follows its
 owner's role. Trust agent connections are tenant-owned records: see
