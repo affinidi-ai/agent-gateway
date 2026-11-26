@@ -110,7 +110,7 @@ export function gapRows(results, failedScenarios) {
       rows.push({ scenario, check: check.id, status: check.status, message: redact(check.errorMessage ?? check.description ?? '') });
     }
   }
-  const withRows = new Set(rows.map((row) => row.scenario));
+  const withRows = new Set(rows.filter((row) => row.status === 'FAILURE').map((row) => row.scenario));
   for (const scenario of failedScenarios.filter((name) => !withRows.has(name))) {
     rows.push({ scenario, check: '-', status: 'FAILURE', message: NO_CHECK_MESSAGE });
   }

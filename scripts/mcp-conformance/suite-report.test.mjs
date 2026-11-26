@@ -207,6 +207,18 @@ test('a scenario the suite failed without a failed check is still a gap', () => 
   assert.match(rows[0].message, /without a failed check/);
 });
 
+test('a failed scenario whose only check is a warning still gets the no-check row', () => {
+  const rows = gapRows(results({ warned: [check('w', 'WARNING', 'soft'), check('ok', 'SUCCESS')], failed: [check('f', 'FAILURE')] }), ['warned', 'failed']);
+  assert.deepEqual(
+    rows.map((row) => [row.scenario, row.check, row.status]),
+    [
+      ['failed', 'f', 'FAILURE'],
+      ['warned', 'w', 'WARNING'],
+      ['warned', '-', 'FAILURE'],
+    ],
+  );
+});
+
 test('passing results leave no gap rows', () => {
   assert.deepEqual(gapRows(results({ fine: [check('ok', 'SUCCESS'), check('note', 'INFO')] }), []), []);
 });

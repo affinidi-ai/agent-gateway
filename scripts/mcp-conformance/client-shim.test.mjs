@@ -124,3 +124,52 @@ test('a driver with nothing running exits on a signal without killing anything',
   target.emit('SIGINT');
   assert.deepEqual(exits, [1]);
 });
+
+test('a client that disconnects mid-stream closes the forwarded request', async () => {
+  let upstreamClosed;
+  const closed = new Promise((resolve) => (upstreamClosed = resolve));
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('data: first\n\n');
+    });
+    res.on('close', () => upstreamClosed(res.writableFinished));
+  });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  const shim = await startClientShim(`http://127.0.0.1:${upstream.address().port}/mcp`);
+  try {
+    await new Promise((resolve, reject) => {
+      const client = http.request(shim.url, { method: 'POST', headers: { 'content-type': 'application/json' } }, (reply) => {
+        reply.once('data', () => {
+          client.destroy();
+          resolve();
+        });
+      });
+      client.on('error', () => {});
+      client.once('error', reject);
+      client.end(request('tools/list', {}));
+    }).catch(() => {});
+    assert.equal(await closed, false);
+  } finally {
+    await shim.close();
+    await new Promise((resolve) => upstream.close(resolve));
+  }
+});
+
+test('a completed response leaves the shim quiet and a failed forward still answers 502', async () => {
+  const errors = [];
+  const onError = (error) => errors.push(error);
+  process.on('uncaughtException', onError);
+  const shim = await startClientShim('http://127.0.0.1:9/mcp');
+  try {
+    const reply = await fetch(shim.url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: request('tools/list', {}) });
+    assert.equal(reply.status, 502);
+    assert.match(await reply.text(), /^client-shim: /);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(errors, []);
+  } finally {
+    process.off('uncaughtException', onError);
+    await shim.close();
+  }
+});

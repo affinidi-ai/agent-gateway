@@ -67,7 +67,12 @@ export function startClientShim(gatewayUrl) {
           reply.pipe(res);
         },
       );
+      res.on('close', () => {
+        if (!res.writableFinished) forward.destroy();
+      });
       forward.on('error', (error) => {
+        if (res.destroyed) return;
+        if (res.headersSent) return res.destroy();
         res.writeHead(502, { 'content-type': 'text/plain' });
         res.end(`client-shim: ${error.message}`);
       });
