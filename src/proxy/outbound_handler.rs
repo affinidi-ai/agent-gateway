@@ -7113,22 +7113,33 @@ fn transit_fabric_path(ctx: &OutboundPipelineContext) -> String {
 }
 
 /// The extra top-level fields of a Transit Point's legacy Fabric `forward-request`: the `_meta`
-/// fields its delegated credentials went into
-/// ([`crate::proxy::credential_delegation::DELEGATED_META_FIELDS`]), so the receiving gateway
-/// keeps them under its Target base path and out of its traffic mirror.
+/// fields ([`crate::proxy::credential_delegation::DELEGATED_META_FIELDS`]) and the headers
+/// ([`crate::proxy::credential_delegation::DELEGATED_HEADER_NAMES`]) its delegated credentials
+/// went into, each listed only when there is one, so the receiving gateway keeps them under its
+/// Target base path and the `_meta` fields out of its traffic mirror.
 fn transit_fabric_extra_body(ctx: &OutboundPipelineContext) -> Option<serde_json::Map<String, serde_json::Value>> {
-    if ctx
+    let header_names: Vec<&str> = ctx
+        .delegated_credential_headers
+        .keys()
+        .map(axum::http::HeaderName::as_str)
+        .collect();
+    let mut extra = serde_json::Map::new();
+    if !ctx
         .delegated_meta_fields
         .is_empty()
     {
-        return None;
+        extra.insert(
+            crate::proxy::credential_delegation::DELEGATED_META_FIELDS.to_string(),
+            serde_json::json!(ctx.delegated_meta_fields),
+        );
     }
-    let mut extra = serde_json::Map::new();
-    extra.insert(
-        crate::proxy::credential_delegation::DELEGATED_META_FIELDS.to_string(),
-        serde_json::json!(ctx.delegated_meta_fields),
-    );
-    Some(extra)
+    if !header_names.is_empty() {
+        extra.insert(
+            crate::proxy::credential_delegation::DELEGATED_HEADER_NAMES.to_string(),
+            serde_json::json!(header_names),
+        );
+    }
+    (!extra.is_empty()).then_some(extra)
 }
 
 /// The URL an `http(s)` Transit Point destination is sent the request on.
@@ -24755,9 +24766,8 @@ mod tests {
         }
     }
 
-    /// A Transit Point's Fabric request names the `_meta` fields its delegated credentials went
-    /// into, and only those: a header credential is not named, and a request without one names
-    /// none.
+    /// A Transit Point's Fabric request names the `_meta` fields and the headers its delegated
+    /// credentials went into, and a request without one names none.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_transit_point_fabric_request_names_the_meta_fields_it_put_a_delegated_credential_into() {
         let directory = tempfile::tempdir().unwrap();
@@ -24770,9 +24780,17 @@ mod tests {
             name: "authorization".into(),
             value: "Bearer person-token".into(),
         };
+        let custom = crate::proxy::credential_delegation::ResolvedCredentialInjection::Header {
+            name: "X-Partner-Grant".into(),
+            value: "partner-token".into(),
+        };
         for (injections, named) in [
-            (vec![meta.clone(), header.clone()], Some(json!({"delegated_meta_fields": ["calendar"]}))),
-            (vec![header], None),
+            (
+                vec![meta.clone(), header.clone()],
+                Some(json!({"delegated_meta_fields": ["calendar"], "delegated_header_names": ["authorization"]})),
+            ),
+            (vec![header], Some(json!({"delegated_header_names": ["authorization"]}))),
+            (vec![custom], Some(json!({"delegated_header_names": ["x-partner-grant"]}))),
             (Vec::new(), None),
         ] {
             let mut ctx =

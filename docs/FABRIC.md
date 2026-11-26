@@ -708,8 +708,13 @@ own bindings' fields (see [Target base path](CREDENTIAL_DELEGATION.md#target-bas
 the receiving gateway cannot read whole (not an array, an entry that is not a string, or more
 than 256 entries) is never cut short: every `_meta` field of the request is then held as
 carrying a delegated credential, so the Legacy SSE session endpoint is checked and the mirror
-gets no `_meta` at all. A sender that does not name them is held only to the receiving surface's
-own bindings.
+gets no `_meta` at all. It also names, in `delegated_header_names`, the headers its delegated
+credentials went in, read by the same rules. A request whose sender names any `_meta` field or
+header, or lists either in a way the receiving gateway cannot read whole, is held to the Target
+base path whatever path it reads: a card read routed to a configured agent card location outside
+the base path is refused with `400 target_path_refused`, though a card read without them is
+served from that location. A sender that does not name them is held only to the receiving
+surface's own bindings.
 
 The setting applies to one route only. Another `fabric://` Target or Transit Point on the same
 gateway sends no delegated credential unless it opts in too. A Transit Point on a surface without

@@ -433,6 +433,67 @@ async fn a_public_path_over_fabric_other_than_the_card_reaches_the_target_withou
     assert_eq!(header_values(&request.headers, TARGET_KEY_HEADER), [TARGET_KEY]);
 }
 
+/// A card read whose sending gateway names a header or `_meta` field it put a delegated
+/// credential into, or names them in a list the receiving gateway cannot read whole, is not
+/// sent to a card location outside the Target base path: it is refused with
+/// `target_path_refused`. The same read without such a list is served from the card location.
+#[tokio::test]
+async fn a_card_read_carrying_a_credential_the_sender_delegated_is_not_sent_outside_the_base_path() {
+    if ran_in_child("ATG_FABRIC_CARD_SENDER_DELEGATED_CHILD").await {
+        return;
+    }
+    let target = ProtectedTarget::open().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut value = serde_json::to_value(surface("a2a", &format!("{}/base", target.url), &[])).unwrap();
+    value["access_point"]["public"] = json!(true);
+    value["access_point"]["agent_card_path"] = json!("/card");
+    let _receiver = receiver(root.path(), &serde_json::from_value(value).unwrap()).await;
+
+    for (case, named) in [
+        ("named header", json!({ "delegated_header_names": ["x-partner-grant"] })),
+        ("named _meta field", json!({ "delegated_meta_fields": ["calendar"] })),
+        ("unreadable header list", json!({ "delegated_header_names": "x-partner-grant" })),
+    ] {
+        let mut message = peer_request(root.path(), "GET", "/.well-known/agent-card.json");
+        message.message_body["headers"]["x-partner-grant"] = json!("partner-grant");
+        for (key, list) in named.as_object().unwrap() {
+            message.message_body[key] = list.clone();
+        }
+        let before = target.received().len();
+        let (response, events) = crate::audit::producer::capture(forward_response(&message)).await;
+        assert_eq!(response["status"], 400, "{case}: {response}");
+        assert!(
+            response
+                .to_string()
+                .contains("target_path_refused"),
+            "{case}: {response}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(
+                    event.event,
+                    DelegationAuditAction::RequestRejected {
+                        reason: RejectionReason::TargetPathRefused,
+                        ..
+                    }
+                )),
+            "{case}: {events:?}"
+        );
+        assert_eq!(target.received().len(), before, "{case}: the card location was called");
+    }
+
+    let mut plain = peer_request(root.path(), "GET", "/.well-known/agent-card.json");
+    plain.message_body["delegated_header_names"] = json!([]);
+    let response = forward_response(&plain).await;
+    assert_eq!(response["status"], 200, "{response}");
+    let request = target
+        .received()
+        .pop()
+        .unwrap();
+    assert_eq!(request.path, "/card");
+}
+
 /// The outcome of each `target_auth_failed` record in `events`, with its HTTP status.
 fn target_auth_outcomes(
     events: &[crate::delegation_vault::audit::DelegationAuditEvent]

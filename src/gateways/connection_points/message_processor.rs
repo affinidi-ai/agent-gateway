@@ -5759,9 +5759,13 @@ async fn process_charged_forward_request(
     let target_url = fabric_target_url(&surface, config_id, path, is_agent_card_request || credentialed_card_fetch);
     let forwards_to_target_url = !surface.dispatches_to_a2a_proxy()
         && (!surface.target_endpoint().starts_with("proxy://") || modern_request.is_some());
-    let carries_delegated_credential = !is_agent_card_request
+    // A credential the sending gateway put into the request goes with it whatever path it
+    // reads, a card read included, so only this surface's own bindings follow the card rule.
+    let carries_delegated_credential = crate::proxy::credential_delegation::sender_named_delegated_credential(
+        &message.message_body,
+    ) || (!is_agent_card_request
         && !credentialed_card_fetch
-        && surface.agent_keyed_binding_applies(crate::mcp::tool_analyzer::called_tool_name(&body_bytes).as_deref());
+        && surface.agent_keyed_binding_applies(crate::mcp::tool_analyzer::called_tool_name(&body_bytes).as_deref()));
     // An MCP proxy Target that cannot be loaded refuses a modern request here, before any
     // credential or grant is resolved for it.
     let modern_proxy = match (modern_request.as_ref(), surface.target_endpoint().strip_prefix("proxy://")) {

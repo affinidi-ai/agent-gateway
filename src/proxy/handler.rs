@@ -12357,7 +12357,12 @@ async fn handle_fabric_request_inner(
                 .header_metadata_mapping_if_supported();
             let bound_target = crate::proxy::target_grant::binds_the_target(&state.surface);
             let credential_headers = target_credential_header_names(&state.surface);
-            let mirror_request = mirror::MirrorRequest::new(mirror_config, method.clone(), body_bytes.to_vec())
+            let mirror_body = crate::proxy::credential_delegation::mirror_body(
+                &state.surface,
+                &body_bytes,
+                &crate::proxy::credential_delegation::SenderDelegatedMeta::NONE,
+            );
+            let mirror_request = mirror::MirrorRequest::new(mirror_config, method.clone(), mirror_body)
                 .headers_from(&headers, |name| {
                     forwards_target_header(
                         name,
@@ -25233,6 +25238,85 @@ mod fabric_send_tests {
                 "{path}"
             );
         }
+    }
+
+    /// The traffic mirror of a `fabric://` Target gets none of the `_meta` fields the surface's
+    /// delegated credential bindings inject into, even when the caller set one itself; other
+    /// `_meta` stays.
+    #[tokio::test]
+    async fn a_fabric_send_mirror_gets_no_bound_meta_field_the_caller_set() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let mirror = format!("http://{}", listener.local_addr().unwrap());
+        let mirrored = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let log = mirrored.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(move |body: axum::body::Bytes| {
+                    let log = log.clone();
+                    async move {
+                        log.lock()
+                            .unwrap()
+                            .push(serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null));
+                        axum::http::StatusCode::OK
+                    }
+                }),
+            )
+            .await
+        });
+        let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+        let mut surface = serde_json::to_value(&*peer.state.surface).unwrap();
+        surface["outbound_credentials"] = json!([{
+            "credential_provider_id": "calendar-provider",
+            "inject_as": {"type": "meta", "field": "calendar"}
+        }]);
+        surface["target"]["networking"] =
+            json!({"mirror": {"endpoint": format!("{mirror}/mirror"), "percentage": 100, "wait_for_response": true}});
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(surface).unwrap();
+        peer.state.served_surface = Arc::new(surface.clone());
+        peer.state.surface = Arc::new(surface);
+        let body = json!({
+            "jsonrpc": "2.0", "id": "m-1", "method": "message/send",
+            "params": {"_meta": {"calendar": "caller-set-grant", "trace": "kept"},
+                "message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}], "messageId": "m-1"}}
+        });
+
+        let _ = Box::pin(super::handle_fabric_request(
+            peer.state.clone(),
+            super::FabricSend {
+                channel_name: "Fabric A2A",
+                method: axum::http::Method::POST,
+                uri: "https://gateway.example/a2a"
+                    .parse()
+                    .unwrap(),
+                headers: axum::http::HeaderMap::new(),
+                source_addr: "127.0.0.1:12345".to_string(),
+                start_time: std::time::Instant::now(),
+                connection_guard: super::ConnectionGuard::new(None, None),
+                body_bytes: axum::body::Bytes::from(body.to_string()),
+                trace_id: "trace-1".to_string(),
+                ucp_operation: None,
+                authenticated_identity: None,
+                source_auth_context: None,
+                payment_context: None,
+                mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
+                mcp_verified_binding: None,
+                mcp_classification: None,
+                subscription_lifetime: None,
+                mcp_continuations: None,
+                payment: None,
+            },
+        ))
+        .await;
+
+        let mirrored = mirrored
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(mirrored.len(), 1, "{mirrored:?}");
+        assert_eq!(mirrored[0]["params"]["_meta"], json!({"trace": "kept"}), "{}", mirrored[0]);
     }
 
     #[tokio::test]

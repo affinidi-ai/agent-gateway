@@ -1651,8 +1651,12 @@ request that carries no delegated credential, such as a `2026-07-28` `tools/list
 binding scoped to tools, is not refused for its path. It is recorded as a `request_rejected` record at `forward` with reason
 `target_path_refused`, or as `target_auth_failed` when the leg also has a Target credential. On
 Fabric receive a discovery read (the agent card) is not counted as carrying a delegated
-credential, since that leg injects none into it; the direct path counts every request a binding
-applies to. The configured agent card location outside the base path takes only the Target
+credential of the receiving surface's bindings, since that leg injects none into it, but one
+whose sending gateway names a delegated `_meta` field or header (`delegated_meta_fields`,
+`delegated_header_names`, or a list of either it cannot read whole; see
+[Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric)) is, so a card
+read carrying a credential a Transit Point put in it is refused at a card location outside the
+base path; the direct path counts every request a binding applies to. The configured agent card location outside the base path takes only the Target
 credential, never a delegated one: the direct path serves the card read itself, a Transit
 Point sends a discovery read no delegated credential, and Fabric receive clears every delegated
 credential from the gateway's own card fetch, so a request routed there for another path, such
@@ -1699,14 +1703,15 @@ A surface's traffic mirror (`target.networking.mirror`) never receives the Targe
 delegated credential this gateway injects, or one a sending gateway names as delegated over
 Fabric, on the direct path, on Fabric send or from an MCP proxy Target. The mirrored copy carries
 the caller's headers without the caller's own credentials or any header named like a credential
-header. On the direct path, including a legacy `proxy://` tool call, and on a legacy `proxy://`
-tool call received over Fabric, its body has none of the `_meta` fields delegated credentials
+header. On the direct path, including a legacy `proxy://` tool call, on Fabric send, and on a
+legacy `proxy://` tool call received over Fabric, its body has none of the `_meta` fields delegated credentials
 go into, even when the caller set them: the fields of the surface's own bindings, and on Fabric
 receive those the sending gateway names in `delegated_meta_fields`, the empty name included, or
 the whole `_meta` when that list cannot be read whole (see
 [Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric)). Custom
-metadata, DID identity and the identity binding VP stay in the body. On Fabric send the copy is taken before
-the gateway adds any credential to the body. Fabric receive otherwise, and Transit Points, send
+metadata, DID identity and the identity binding VP stay in the body. On Fabric send the copy is
+taken before the gateway adds any credential to the body, and a value the caller set in a field
+of the surface's own bindings is left out too. Fabric receive otherwise, and Transit Points, send
 no traffic mirror. A request from another gateway's Transit Point that reaches this surface over
 HTTP is an ordinary caller's request here: a credential that gateway put into a `_meta` field
 the surface has no binding for is part of the caller's own metadata, which the gateway cannot

@@ -1443,7 +1443,31 @@ impl SenderDelegatedMeta {
 /// array, an entry that is not a string, or more than [`MAX_SENDER_DELEGATED_META_FIELDS`]
 /// entries) is held as [`SenderDelegatedMeta::Every`], never cut short.
 pub fn sender_delegated_meta_fields(forward_request: &serde_json::Value) -> SenderDelegatedMeta {
-    let Some(named) = forward_request.get(DELEGATED_META_FIELDS) else {
+    sender_named(forward_request, DELEGATED_META_FIELDS)
+}
+
+/// The top-level `forward-request` field a sending gateway lists, in a Fabric request, the
+/// headers it put a delegated credential in.
+pub const DELEGATED_HEADER_NAMES: &str = "delegated_header_names";
+
+/// Whether a sending gateway says, in a received Fabric `forward-request` body, it put a
+/// delegated credential into the request: it names a `_meta` field
+/// ([`DELEGATED_META_FIELDS`]) or a header ([`DELEGATED_HEADER_NAMES`]), or lists either in a
+/// way that cannot be read whole, read as [`sender_delegated_meta_fields`] reads its list.
+pub fn sender_named_delegated_credential(forward_request: &serde_json::Value) -> bool {
+    [DELEGATED_META_FIELDS, DELEGATED_HEADER_NAMES]
+        .into_iter()
+        .any(|key| sender_named(forward_request, key) != SenderDelegatedMeta::NONE)
+}
+
+/// The names a sending gateway lists under `key`: every name, or [`SenderDelegatedMeta::Every`]
+/// for a list that is not an array, has an entry that is not a string, or has more than
+/// [`MAX_SENDER_DELEGATED_META_FIELDS`] entries.
+fn sender_named(
+    forward_request: &serde_json::Value,
+    key: &str,
+) -> SenderDelegatedMeta {
+    let Some(named) = forward_request.get(key) else {
         return SenderDelegatedMeta::NONE;
     };
     let Some(entries) = named
@@ -2256,6 +2280,28 @@ mod tests {
             json!({"delegated_meta_fields": null}),
         ] {
             assert_eq!(super::sender_delegated_meta_fields(&unreadable), SenderDelegatedMeta::Every, "{unreadable}");
+        }
+    }
+
+    #[test]
+    fn a_sender_names_a_delegated_credential_by_a_meta_field_a_header_or_an_unreadable_list() {
+        use serde_json::json;
+        let over: Vec<String> = (0..=super::MAX_SENDER_DELEGATED_META_FIELDS)
+            .map(|index| format!("x-header-{index}"))
+            .collect();
+        for named in [
+            json!({"delegated_meta_fields": ["calendar"]}),
+            json!({"delegated_header_names": ["x-partner-grant"]}),
+            json!({"delegated_header_names": [""]}),
+            json!({"delegated_header_names": "x-partner-grant"}),
+            json!({"delegated_header_names": ["x-partner-grant", 7]}),
+            json!({ "delegated_header_names": over }),
+            json!({"delegated_meta_fields": null}),
+        ] {
+            assert!(super::sender_named_delegated_credential(&named), "{named}");
+        }
+        for none in [json!({}), json!({"delegated_meta_fields": [], "delegated_header_names": []})] {
+            assert!(!super::sender_named_delegated_credential(&none), "{none}");
         }
     }
 
