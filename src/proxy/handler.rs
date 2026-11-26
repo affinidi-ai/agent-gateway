@@ -25472,6 +25472,7 @@ mod fabric_send_tests {
                 subscription_lifetime: None,
                 mcp_continuations: None,
                 payment: None,
+                agent_context: None,
             },
         ))
         .await;
