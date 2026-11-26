@@ -269,7 +269,7 @@ describe('ConnectTrustAgentWizardPage', () => {
     await waitFor(() =>
       expect(calls.some(c => c.url === '/api/v1/vta/connections/agent-1/keys')).toBe(true)
     );
-    expect(screen.getByTestId('wizard-submit')).toBeDisabled();
+    await waitFor(() => expect(screen.getByTestId('wizard-submit')).toBeDisabled());
 
     mintKey(json(connected));
 
