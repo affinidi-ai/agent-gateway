@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { HARNESS_EXIT_CODE, HARNESS_FAILURE_FILE, hasExited, recordHarnessFailure, settings } from './client-driver.mjs';
+import { HARNESS_EXIT_CODE, HARNESS_FAILURE_FILE, hasExited, judgeRequest, recordHarnessFailure, settings } from './client-driver.mjs';
 
 const DRIVER = path.join(import.meta.dirname, 'client-driver.mjs');
 
@@ -92,4 +92,42 @@ test('a driver that cannot read its settings still exits with the harness code',
   const run = spawnSync(process.execPath, [DRIVER, 'http://127.0.0.1:9/mcp'], { encoding: 'utf8', env: { PATH: process.env.PATH } });
   assert.equal(run.status, HARNESS_EXIT_CODE);
   assert.match(run.stderr, /MCP_CONFORMANCE_DRIVER_MODE is required/);
+});
+
+test('a reply other than 200 is a failed client, and a request that dies is too, never a harness failure', async () => {
+  const lines = [];
+  const log = (line) => lines.push(line);
+  assert.equal(await judgeRequest(async () => ({ status: 200, body: '{}' }), log), 0);
+  assert.equal(await judgeRequest(async () => ({ status: 502, body: 'bad gateway' }), log), 1);
+  assert.equal(await judgeRequest(async () => Promise.reject(new Error('socket hang up')), log), 1);
+  assert.equal(await judgeRequest(async () => Promise.reject(new Error('terminated')), log), 1);
+  assert.deepEqual(lines, [
+    'tools/list through the gateway: HTTP 200 {}',
+    'tools/list through the gateway: HTTP 502 bad gateway',
+    'tools/list through the gateway failed: socket hang up',
+    'tools/list through the gateway failed: terminated',
+  ]);
+});
+
+test('a scenario that cannot find its token endpoint is a harness failure', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'client-driver-'));
+  try {
+    const logDir = path.join(dir, 'logs');
+    const run = spawnSync(process.execPath, [DRIVER, 'http://127.0.0.1:9/mcp'], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ...GATEWAY_ENV,
+        MCP_CONFORMANCE_DRIVER_REFERENCE: dir,
+        MCP_CONFORMANCE_DRIVER_WORK: path.join(dir, 'work'),
+        MCP_CONFORMANCE_DRIVER_LOGS: logDir,
+        MCP_CONFORMANCE_SCENARIO: 'auth/client-credentials-jwt',
+        MCP_CONFORMANCE_CONTEXT: '{}',
+      },
+    });
+    assert.equal(run.status, HARNESS_EXIT_CODE);
+    assert.match(fs.readFileSync(path.join(logDir, HARNESS_FAILURE_FILE), 'utf8'), /^gateway auth\/client-credentials-jwt: .+\n$/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

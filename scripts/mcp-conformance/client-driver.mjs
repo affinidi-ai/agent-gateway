@@ -172,9 +172,25 @@ function runReferenceClient(referenceDir, url) {
   });
 }
 
+// The request is the scenario itself: a reply other than 200, or a connection
+// reset or body cut off on the way, is the gateway failing it, so it is a
+// failed client and not a harness failure.
+export async function judgeRequest(send, log = console.log) {
+  let reply;
+  try {
+    reply = await send();
+  } catch (error) {
+    log(`tools/list through the gateway failed: ${error.message}`);
+    return 1;
+  }
+  log(`tools/list through the gateway: HTTP ${reply.status} ${reply.body}`);
+  return reply.status === 200 ? 0 : 1;
+}
+
 // The gateway, not this driver, asks for the token: the driver only finds the
 // token endpoint, stores the scenario's client as a credential provider and
-// sends one request that carries no credential.
+// sends one request that carries no credential. Finding the endpoint and
+// starting the gateway are setup, and a failure there is a harness failure.
 async function runAuthScenario(config, scenario) {
   const context = JSON.parse(process.env.MCP_CONFORMANCE_CONTEXT ?? '{}');
   const discovered = await discoverTokenEndpoint(config.suiteUrl);
@@ -184,9 +200,7 @@ async function runAuthScenario(config, scenario) {
   });
   try {
     const version = process.env.MCP_CONFORMANCE_PROTOCOL_VERSION ?? '2026-07-28';
-    const reply = await callThroughGateway(accessPointUrl(config.inboundPort), version);
-    console.log(`tools/list through the gateway: HTTP ${reply.status} ${reply.body}`);
-    return reply.status === 200 ? 0 : 1;
+    return await judgeRequest(() => callThroughGateway(accessPointUrl(config.inboundPort), version));
   } finally {
     await stop(gateway);
   }
