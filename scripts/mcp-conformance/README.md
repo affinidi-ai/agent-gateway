@@ -232,7 +232,9 @@ many gaps it finds. A failed probe does not stop it: the summary shows an
 still run. It still exits non-zero when the harness itself fails: a
 build error, a gateway or fixture that does not start, a client scenario whose
 driver could not start its gateway, a port in use, a gateway
-still listening after its client scenario ended, or a target for which the
+still listening after its client scenario ended, a suite `list` command that
+fails (the scenario list is read in full before any scenario runs, so a list
+that stops partway is not a short report), or a target for which the
 suite ran no scenario or saved no result.
 
 `run/gaps.md` has one section per target with the number of passed checks and

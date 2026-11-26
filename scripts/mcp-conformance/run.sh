@@ -469,10 +469,16 @@ suite_detail() {
 # each runs). The suite's exit status marks a scenario it failed, which can
 # happen without a failed check.
 report_run() {
-    local name="$1" log="$2" leg="$3" scenario flags count=0
+    local name="$1" log="$2" leg="$3" scenario flags count=0 list
     shift 3
+    list="${REPORT_DIR}/${name}.scenarios"
     : > "${log}"
     : > "${REPORT_DIR}/${name}.failed"
+    # The list goes through a file, not a process substitution, so that its exit
+    # status is known before any scenario runs (bash 3.2 cannot wait for a
+    # process substitution) and a list that stops partway is not a short report.
+    "${HERE}/report-scenarios.sh" "${CONFORMANCE}" "${leg}" "${SPEC_VERSION}" > "${list}" ||
+        fail 1 "suite ${name}: the suite could not list its ${leg} scenarios"
     while read -r scenario flags <&3; do
         echo "=== ${scenario} ===" >> "${log}"
         # shellcheck disable=SC2086
@@ -480,7 +486,7 @@ report_run() {
             echo "${scenario}" >> "${REPORT_DIR}/${name}.failed"
         stop_on_client_failure
         count=$((count + 1))
-    done 3< <("${HERE}/report-scenarios.sh" "${CONFORMANCE}" "${leg}" "${SPEC_VERSION}")
+    done 3< "${list}"
     [[ ${count} -gt 0 ]] || fail 1 "suite ${name}: the suite lists no ${leg} scenario"
     record INFO "suite ${name}: ${count} scenarios run, verdict ignored"
     REPORT_TARGETS+=("${name}")
@@ -801,7 +807,7 @@ REFERENCE_PID="${STARTED_PID}"
 wait_for_ports "${FIXTURE_PID}" "${FIXTURE_PORT}" || fail 1 "fixtures: REST fixture did not start"
 wait_for_ports "${REFERENCE_PID}" "${REFERENCE_PORT}" || fail 1 "fixtures: reference server did not start"
 node --test "${HERE}/shim.test.mjs" "${HERE}/client-shim.test.mjs" "${HERE}/client-parity.test.mjs" \
-    "${HERE}/client-auth.test.mjs" "${HERE}/client-driver.test.mjs" "${HERE}/is-main.test.mjs" "${HERE}/suite-report.test.mjs" > "${LOGS}/shim-test.log" 2>&1 ||
+    "${HERE}/client-auth.test.mjs" "${HERE}/client-driver.test.mjs" "${HERE}/is-main.test.mjs" "${HERE}/report-scripts.test.mjs" "${HERE}/suite-report.test.mjs" > "${LOGS}/shim-test.log" 2>&1 ||
     fail 1 "fixtures: harness unit tests failed (log: $(relative "${LOGS}/shim-test.log"))"
 start_process "${LOGS}/shim.log" "${HERE}" node shim.mjs --port "${SHIM_PORT}" \
     --upstream "http://127.0.0.1:${REFERENCE_PORT}"

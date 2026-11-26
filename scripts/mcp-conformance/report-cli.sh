@@ -28,6 +28,13 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "${url}" && -n "${out}" ]] || { echo "report-cli.sh: --url and -o are required" >&2; exit 2; }
 
+list="$(mktemp)"
+trap 'rm -f "${list}"' EXIT
+# A file rather than a process substitution: bash 3.2 cannot wait for one, and a
+# list that stops partway must not become a short report.
+"${HERE}/report-scenarios.sh" "${MCP_CONFORMANCE_REAL_CLI}" server "${MCP_CONFORMANCE_REPORT_SPEC}" > "${list}" ||
+    { echo "report-cli.sh: the suite could not list its server scenarios" >&2; exit 1; }
+
 : > "${MCP_CONFORMANCE_REPORT_FAILED}"
 count=0
 while read -r scenario flags <&3; do
@@ -36,5 +43,5 @@ while read -r scenario flags <&3; do
     "${MCP_CONFORMANCE_REAL_CLI}" server --url "${url}" --scenario "${scenario}" ${flags} -o "${out}" 2>&1 ||
         echo "${scenario}" >> "${MCP_CONFORMANCE_REPORT_FAILED}"
     count=$((count + 1))
-done 3< <("${HERE}/report-scenarios.sh" "${MCP_CONFORMANCE_REAL_CLI}" server "${MCP_CONFORMANCE_REPORT_SPEC}")
+done 3< "${list}"
 [[ ${count} -gt 0 ]] || { echo "report-cli.sh: the suite lists no server scenario" >&2; exit 1; }
