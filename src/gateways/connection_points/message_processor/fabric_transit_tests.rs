@@ -1063,6 +1063,67 @@ async fn a_service_level_credential_reaches_a_partner_request_without_the_opt_in
     }
 }
 
+/// A partner request that is no card fetch but whose path resolves to the configured agent card
+/// location outside the Target base path gets no delegated credential: it is refused with
+/// `400 target_path_refused` and the Target is not called. The same request under the base path
+/// still carries the service credential.
+#[tokio::test]
+async fn a_request_resolving_to_the_card_location_outside_the_base_path_gets_no_delegated_credential() {
+    if ran_in_child("ATG_FABRIC_RECEIVE_CARD_LOCATION_DELEGATED_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let mut delegating = surface("a2a", &format!("{}/base", target.url), &[]);
+    delegating
+        .access_point
+        .agent_card_path = Some("/card".to_string());
+    delegating.outbound_credentials = vec![binding(SERVICE_PROVIDER)];
+    let _receiver = receiver(root.path(), &delegating).await;
+    install_delegation_stores(root.path(), &target.url, &[]).await;
+    let send = |path: &str| {
+        let mut message = forward_request(
+            root.path(),
+            json!({ "content-type": "application/json", "x-api-key": CALLER_KEY }),
+            a2a_body(),
+        );
+        message.message_body["method"] = json!("GET");
+        message.message_body["path"] = json!(path);
+        message
+    };
+
+    let (response, events) = crate::audit::producer::capture(forward_response(&send("/%2e%2e/card"))).await;
+    assert_eq!(response["status"], 400, "{response}");
+    assert!(
+        response
+            .to_string()
+            .contains("target_path_refused"),
+        "{response}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event.event,
+                DelegationAuditAction::RequestRejected {
+                    stage: RejectionStage::Forward,
+                    reason: RejectionReason::TargetPathRefused,
+                    ..
+                }
+            ))
+            .count(),
+        1,
+        "{events:?}"
+    );
+    assert!(target.received().is_empty(), "the Target is not called");
+
+    let response = forward_response(&send("/inside")).await;
+    assert_eq!(response["status"], 200, "{response}");
+    let received = target.received();
+    assert_eq!(received.len(), 1);
+    assert_eq!(header_values(&received[0], "x-service-key"), [SERVICE_KEY]);
+}
+
 /// A legacy MCP request carrying a service credential in `_meta` that falls back to Legacy SSE
 /// is posted only to a session endpoint under the Target base path: one the Target advertises
 /// outside it is refused with `400 target_path_refused` and gets nothing.

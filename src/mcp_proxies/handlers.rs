@@ -2337,6 +2337,29 @@ pub(crate) async fn modern_tool_call_leaves_base(
     super::modern_rest::path_arguments_leave_base(&proxy.base_url, &tool.metadata, &arguments)
 }
 
+/// Whether a legacy `tools/call` `request` of `proxy` has path arguments that take its REST
+/// URL out of the proxy's base directory, as the call builds it. `false` for any other
+/// request, and for a call the proxy refuses for another reason.
+pub(crate) fn legacy_tool_call_leaves_base(
+    proxy: &McpProxy,
+    request: &serde_json::Value,
+) -> bool {
+    let Ok(PreparedMcpRequest {
+        server,
+        call: McpCall::ToolsCall { tool_name, arguments, .. },
+        ..
+    }) = prepare_mcp_request(proxy, request.clone(), None, &proxy.id)
+    else {
+        return false;
+    };
+    let Some(tool) = server.get_tool(&tool_name) else {
+        return false;
+    };
+    StoredToolCall::prepare(proxy, &server.openapi_spec, tool).is_ok_and(|stored| {
+        super::modern_rest::path_arguments_leave_base(stored.directory.as_str(), &stored.metadata, &arguments)
+    })
+}
+
 pub(crate) async fn handle_modern_surface_request(
     proxy: &McpProxy,
     surface: &crate::config::agent_surface::AgentSurface,

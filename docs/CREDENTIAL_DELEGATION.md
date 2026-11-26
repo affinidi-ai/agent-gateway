@@ -1639,9 +1639,12 @@ alike on the direct path and Fabric receive, and for `2026-07-28` requests on a 
 whose Target has `fabric_delegated_credentials` on: the request would carry one when a binding
 applies to it, that is a binding for every request, or a binding scoped to tools when the
 request is a `tools/call` of one of them. On a Transit Point it also happens before any grant
-is read, token requested or consent started, legacy or `2026-07-28`, when a binding for every
-request applies (a binding scoped to tools never applies on a Transit Point) and the request is
-not a discovery read, on a destination that does not withhold delegated credentials; the
+is read, token requested or consent started, legacy or `2026-07-28`, internal or external
+consent, when a binding for every request or the Transit Point's `consent_mode: external`
+binding applies (a binding scoped to tools never applies on a Transit Point) and the request is
+not a discovery read, on a destination that does not withhold delegated credentials; through
+a `proxy://` MCP Proxy the tool call is checked against the REST URL its path arguments build.
+The refusal counts as a failed call in the connection metrics and task activity, and the
 forward step refuses again any request a credential was attached to, in a header or `_meta`. A
 request that carries no delegated credential, such as a `2026-07-28` `tools/list` against a
 binding scoped to tools, is not refused for its path. It is recorded as a `request_rejected` record at `forward` with reason
@@ -1649,16 +1652,18 @@ binding scoped to tools, is not refused for its path. It is recorded as a `reque
 Fabric receive a discovery read (the agent card) is not counted as carrying a delegated
 credential, since that leg injects none into it; the direct path counts every request a binding
 applies to. The configured agent card location outside the base path takes only the Target
-credential, never a delegated one: the direct path serves the card read itself and a Transit
-Point sends a discovery read no delegated credential, so a request routed there for another
-path, such as a direct `GET {route}/.well-known/not-a-card` or a Transit Point
-`GET {listen path}/x/.well-known/agent-card.json`, is refused with `400 target_path_refused` when
-a binding applies to it. A
-`2026-07-28` tool call to an MCP proxy Target, on the direct path and Fabric receive, is checked
-against the REST URL its path arguments build under the proxy's `base_url` (a `.` or `..`
-segment, or a URL outside a base path that is not the root, as for `../admin`), before any grant
-is read, token requested or consent started, and gets the same `400 target_path_refused` and
-audit record; the REST client's own base-path check stays as a second guard. When a legacy MCP
+credential, never a delegated one: the direct path serves the card read itself, a Transit
+Point sends a discovery read no delegated credential, and Fabric receive clears every delegated
+credential from the gateway's own card fetch, so a request routed there for another path, such
+as a direct `GET {route}/.well-known/not-a-card`, a Transit Point
+`GET {listen path}/x/.well-known/agent-card.json` or a partner's `GET /%2e%2e/card`, is refused
+with `400 target_path_refused` when a binding applies to it. A tool call to an MCP proxy Target
+is checked against the REST URL its path arguments build under the proxy's `base_url` (a `.` or
+`..` segment, or a URL outside a base path that is not the root, as for `../admin`) before
+anything is resolved: a `2026-07-28` call on the direct path and Fabric receive before any grant
+is read, token requested or consent started, and a legacy call with a Target credential before
+that credential is resolved. It gets the same `400 target_path_refused` and audit record; the
+REST client's own base-path check stays as a second guard. When a legacy MCP
 Target refuses the plain POST and the request falls back to Legacy SSE, on the direct path or
 Fabric receive, the session endpoint the Target advertises is known only after the first
 attempt, so it is checked when it is advertised, after the credential was resolved: a request

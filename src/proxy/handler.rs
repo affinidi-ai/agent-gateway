@@ -15892,6 +15892,17 @@ async fn handle_mcp_proxy_request_inner(
         trace_id: Some(&trace_id),
         via_fabric: false,
     };
+    if let Some(target_auth) = state.surface.target_auth()
+        && crate::mcp_proxies::handlers::legacy_tool_call_leaves_base(&proxy, &json_request)
+    {
+        warn!(
+            channel = channel_name,
+            "Refusing an MCP proxy tool call outside the proxy's base path before resolving its Target credential"
+        );
+        let refusal = TargetAuthFailure::PathRefused;
+        record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
+        return Err(refusal.response());
+    }
     // Resolve target auth header if configured on the channel
     let target_credential = if let Some(target_auth) = state.surface.target_auth() {
         match resolve_target_credential(

@@ -5740,6 +5740,7 @@ async fn process_charged_forward_request(
     let forwards_to_target_url = !surface.dispatches_to_a2a_proxy()
         && (!surface.target_endpoint().starts_with("proxy://") || modern_request.is_some());
     let carries_delegated_credential = !is_agent_card_request
+        && !credentialed_card_fetch
         && surface.agent_keyed_binding_applies(crate::mcp::tool_analyzer::called_tool_name(&body_bytes).as_deref());
     if forwards_to_target_url
         && (surface.target_auth().is_some() || carries_delegated_credential)
@@ -5749,7 +5750,9 @@ async fn process_charged_forward_request(
                 surface.target_endpoint(),
                 method,
                 &target_url,
-                surface.agent_card_location_path(),
+                surface
+                    .agent_card_location_path()
+                    .filter(|_| !carries_delegated_credential),
             ),
         }
     {
@@ -9155,6 +9158,17 @@ async fn handle_mcp_proxy_forward(
             .and_then(serde_json::Value::as_str),
         via_fabric: true,
     };
+    if let Some(target_auth) = surface.target_auth()
+        && crate::mcp_proxies::handlers::legacy_tool_call_leaves_base(&proxy, &mcp_request)
+    {
+        channel_warn!(
+            config_id,
+            "Refusing an MCP proxy tool call outside the proxy's base path before resolving its Target credential"
+        );
+        let refusal = crate::proxy::handler::TargetAuthFailure::PathRefused;
+        crate::proxy::handler::record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
+        return target_auth_failure_result(refusal);
+    }
     // Resolve target auth header if configured on the channel
     let vault = get_delegation_vault_store();
     let target_credential = if let Some(target_auth) = surface.target_auth() {
