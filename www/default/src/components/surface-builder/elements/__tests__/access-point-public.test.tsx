@@ -8,7 +8,11 @@ import { SurfaceMetaProvider } from '../../SurfaceMetaContext';
 import { nodesFromSurface } from '../../nodesFromSurface';
 import { showSurfaceSaveToast } from '../saveWarnings';
 import { withCallerAccessSettled } from '../access-point/publicAccess';
-import { showToast } from '../../../../utils/toaster';
+import {
+  showKeepOpenWarningToast,
+  showSuccessCountdownToast,
+  showToast,
+} from '../../../../utils/toaster';
 import type { AgentSurface } from '../../../../api';
 
 // The Public access switch is the URL banner's footer, so the stub renders only that.
@@ -21,9 +25,13 @@ jest.mock(
 jest.mock('../../../../utils/toaster', () => ({
   ...jest.requireActual('../../../../utils/toaster'),
   showToast: jest.fn(),
+  showKeepOpenWarningToast: jest.fn(),
+  showSuccessCountdownToast: jest.fn(),
 }));
 
 const toast = showToast as jest.Mock;
+const keepOpenToast = showKeepOpenWarningToast as jest.Mock;
+const successToast = showSuccessCountdownToast as jest.Mock;
 
 const PUBLIC_MESSAGE =
   'This Access Point is public. Anyone who can reach it can call your agent without credentials.';
@@ -240,13 +248,18 @@ describe('withCallerAccessSettled', () => {
 });
 
 describe('showSurfaceSaveToast', () => {
-  beforeEach(() => toast.mockReset());
+  beforeEach(() => {
+    toast.mockReset();
+    keepOpenToast.mockReset();
+    successToast.mockReset();
+  });
 
   it("leaves out the Access Point's Warning headers, a variant's too", () => {
     showSurfaceSaveToast('Saved', storedSurface({ public: true }), {
       headerWarnings: [PUBLIC_MESSAGE, `variant 'beta': ${NOT_READY_MESSAGE}`],
     });
-    expect(toast.mock.calls).toEqual([['success', 'Saved']]);
+    expect(successToast.mock.calls).toEqual([['Saved']]);
+    expect(keepOpenToast).not.toHaveBeenCalled();
   });
 
   it('shows every other Warning header in one toast, in order, each once', () => {
@@ -262,23 +275,21 @@ describe('showSurfaceSaveToast', () => {
         ],
       }
     );
-    expect(toast.mock.calls).toEqual([
-      [
-        'warning',
-        'Saved, with warnings:\nfrom the gateway\nalso from the gateway',
-        expect.anything(),
-      ],
+    expect(toast).not.toHaveBeenCalled();
+    expect(successToast).not.toHaveBeenCalled();
+    expect(keepOpenToast.mock.calls).toEqual([
+      ['Saved, with warnings:\nfrom the gateway\nalso from the gateway'],
     ]);
   });
 
   it('adds no public warning of its own', () => {
     showSurfaceSaveToast('Saved', storedSurface({ public: true }));
-    expect(toast.mock.calls).toEqual([['success', 'Saved']]);
+    expect(successToast.mock.calls).toEqual([['Saved']]);
   });
 
   it('leaves the warning about a stored surface with no Caller Context to the gateway', () => {
     showSurfaceSaveToast('Saved', storedSurface({}));
-    expect(toast.mock.calls).toEqual([['success', 'Saved']]);
+    expect(successToast.mock.calls).toEqual([['Saved']]);
   });
 
   it('shows success alone for a closed surface with a Caller Context', () => {
@@ -286,7 +297,8 @@ describe('showSurfaceSaveToast', () => {
       'Saved',
       storedSurface({ public: false, caller_authentication: API_KEY_AUTH })
     );
-    expect(toast).toHaveBeenCalledTimes(1);
-    expect(toast).toHaveBeenCalledWith('success', 'Saved');
+    expect(toast).not.toHaveBeenCalled();
+    expect(keepOpenToast).not.toHaveBeenCalled();
+    expect(successToast.mock.calls).toEqual([['Saved']]);
   });
 });

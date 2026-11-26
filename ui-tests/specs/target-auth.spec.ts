@@ -365,7 +365,7 @@ test.describe('Managed Agent Target authentication: credential provider', () => 
 
         await saveButton(page).click();
         await expect.poll(() => saved.length).toBe(1);
-        await expect(page.getByTestId('surface-save-warnings')).toContainText(warning);
+        await expect(page.locator('#app-toast')).toContainText(warning);
     });
 
     test('while target_https is enforce the gateway refuses an http Target and its 400 is shown on the page', async ({page}) => {

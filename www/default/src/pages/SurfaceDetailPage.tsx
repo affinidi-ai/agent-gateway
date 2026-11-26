@@ -2,7 +2,6 @@ import React, { useEffect, useState, useCallback, useRef, useReducer, useMemo } 
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { AgentSurface, apiClient } from '../api';
 import { showToast } from '../utils/toaster';
-import SaveWarningsBanner from '../components/surface-builder/SaveWarningsBanner';
 import { usePermissions } from '../context/PermissionsContext';
 import { usePageTitle } from '../context/PageTitleContext';
 import { useApp } from '../context/AppContext';
@@ -1789,7 +1788,7 @@ const SurfaceDetailPage: React.FC = () => {
         canEdit={canEdit}
         builder={builder}
         topBanner={
-          error || refusingRequests || (saveWarnings && saveWarnings.length > 0) ? (
+          error || refusingRequests ? (
             <>
               {refusingRequests && (
                 <div
@@ -1811,7 +1810,6 @@ const SurfaceDetailPage: React.FC = () => {
                   {error}
                 </div>
               )}
-              <SaveWarningsBanner warnings={saveWarnings} />
             </>
           ) : null
         }

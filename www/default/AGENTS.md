@@ -444,11 +444,19 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   The dashboard shows none of these after a save (`shownSaveWarnings` in
   `elements/saveWarnings.ts` drops them, a variant's prefix ignored). Every other `Warning` header is shown.
   `showSurfaceSaveToast` (`elements/saveWarnings.ts`) shows a save in one toast, since a later
-  toast replaces an earlier one: "<saved>" alone as `success`, or "<saved>, with warnings:"
-  and one line per warning as a `warning` toast, the shown `Warning` headers first, then the
-  dashboard's own non-blocking issues (`validateSurfacePayload`), each message once. The same
-  headers fill `SaveWarningsBanner` on the edit page, and a create that drew any opens the new
-  surface's page so the banner lists them.
+  toast replaces an earlier one: "<saved>" alone, or "<saved>, with warnings:" and one line per
+  warning, the shown `Warning` headers first, then the dashboard's own non-blocking issues
+  (`validateSurfacePayload`), each message once. Both are laid out as the "Changes discarded."
+  undo toast (`showCountdownToast` in `utils/toaster.ts`), with its countdown bar and inline
+  close button. "<saved>" alone is `showSuccessCountdownToast`: the success icon and colour, no
+  other button, closing after 3 seconds. A toast with warnings is `showKeepOpenWarningToast`:
+  **Keep Opened** where Undo is, closing after 8 seconds unless Keep Opened is pressed, which
+  stops the countdown and removes the bar and the button until the toast is closed. Every
+  toast (`showToast` and the countdown toasts) closes with the same × button
+  (`closeButtonHtml`, `#app-toast-close`, title "Dismiss"), the last item of its row, never
+  pinned to a corner. The warnings toast is the only place a save's warnings are listed, with
+  no banner above the canvas. A create that drew any opens the new surface's page, carrying
+  them so the Transit Point a warning names shows it in its panel.
 - **Transit Settings** has no listener authentication control: the gateway does not support
   `transit.source_auth` and refuses a save that sets it. **Transit Token Mode** is shown, not
   chosen: only the embedded token exists, signed and readable by the agent, not encrypted, so
@@ -726,8 +734,7 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
     target endpoint does, since the gateway checks it as written. The Managed Agent editors learn whether the
     Access Point checks its callers from `accessPointChecksCallers` in `SurfaceMetaContext`,
     which the surface pages set from the draft payload (`hasCallerAuthentication`). After a
-    save in `warn` the header's message shows in the save toast and the surface page's save
-    warnings banner; in `enforce` the gateway's 400 shows in the page's error alert. The
+    save in `warn` the header's message shows in the save toast; in `enforce` the gateway's 400 shows in the page's error alert. The
     whole-surface caller check is a `warning` issue in `validateSurfacePayload`, left out when
     the stored surface already had it on the same leg with the same setting and endpoint.
   - **Advice with no gateway rule.** The same box also shows a passthrough fallback (the

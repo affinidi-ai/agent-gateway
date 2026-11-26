@@ -497,7 +497,7 @@ const AddSurfacePage: React.FC = () => {
         headerWarnings: serverWarnings,
       });
       // Warnings from the gateway go with the operator to the new surface's
-      // page, which lists them, since the toast goes after a few seconds.
+      // page, where the Transit Point a warning names shows it in its panel.
       const shown = shownSaveWarnings(serverWarnings);
       if (shown.length > 0 && created?.surface_id) {
         navigate(`/surfaces/${encodeURIComponent(created.surface_id)}`, {

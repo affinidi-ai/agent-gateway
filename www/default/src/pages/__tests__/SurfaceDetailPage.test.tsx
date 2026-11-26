@@ -5,12 +5,21 @@ import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-rou
 import SurfaceDetailPage from '../SurfaceDetailPage';
 import { apiClient } from '../../api';
 import type { AgentSurface } from '../../api';
-import { showToast } from '../../utils/toaster';
+import {
+  showKeepOpenWarningToast,
+  showSuccessCountdownToast,
+  showToast,
+} from '../../utils/toaster';
 
 jest.mock('../../utils/toaster', () => ({
   ...jest.requireActual('../../utils/toaster'),
   showToast: jest.fn(),
+  showKeepOpenWarningToast: jest.fn(),
+  showSuccessCountdownToast: jest.fn(),
 }));
+
+const keepOpenToast = showKeepOpenWarningToast as jest.Mock;
+const successToast = showSuccessCountdownToast as jest.Mock;
 jest.mock('../../components/surface-builder/SurfaceCanvas', () => ({
   getIncompleteReason: () => null,
 }));
@@ -118,6 +127,8 @@ const renderAt = (state: unknown, search = '', hash = '') =>
 beforeEach(() => {
   jest.restoreAllMocks();
   (showToast as jest.Mock).mockReset();
+  keepOpenToast.mockReset();
+  successToast.mockReset();
   jest.spyOn(apiClient, 'getSurface').mockResolvedValue(surface);
 });
 
@@ -127,7 +138,6 @@ describe('SurfaceDetailPage save warnings', () => {
     await screen.findByTestId('meta-warnings');
 
     expect(screen.getByTestId('meta-warnings')).toHaveTextContent(createWarning);
-    expect(screen.getByTestId('surface-save-warnings')).toHaveTextContent(createWarning);
     expect(screen.getByTestId('location-state')).toHaveTextContent('null');
   });
 
@@ -148,7 +158,6 @@ describe('SurfaceDetailPage save warnings', () => {
 
     await waitFor(() => expect(apiClient.getSurface).toHaveBeenCalledWith('s2'));
     expect(await screen.findByTestId('meta-warnings')).toBeEmptyDOMElement();
-    expect(screen.queryByTestId('surface-save-warnings')).toBeNull();
   });
 
   it('ignores route state that is not a list of warnings', async () => {
@@ -158,7 +167,7 @@ describe('SurfaceDetailPage save warnings', () => {
     expect(screen.getByTestId('meta-warnings')).toBeEmptyDOMElement();
   });
 
-  it('shows the warnings an update answered with, in the banner and the one toast', async () => {
+  it('shows the warnings an update answered with in the one keep-open toast, with no banner', async () => {
     const updateWarning = createWarning.replace('crm', 'hr');
     jest.spyOn(apiClient, 'updateSurface').mockImplementation(async (_id, _payload, options) => {
       options?.onWarnings?.([updateWarning]);
@@ -166,16 +175,13 @@ describe('SurfaceDetailPage save warnings', () => {
     });
     renderAt(null);
     fireEvent.click(await screen.findByTitle('Save changes'));
-    await waitFor(() => expect(showToast).toHaveBeenCalled());
+    await waitFor(() => expect(keepOpenToast).toHaveBeenCalled());
 
     expect(screen.getByTestId('meta-warnings')).toHaveTextContent(updateWarning);
-    expect(screen.getByTestId('surface-save-warnings')).toHaveTextContent(updateWarning);
-    expect(showToast).toHaveBeenCalledTimes(1);
-    expect(showToast).toHaveBeenCalledWith(
-      'warning',
-      expect.stringContaining(updateWarning),
-      expect.objectContaining({ autoRemove: true })
-    );
+    expect(screen.queryByText('The last save drew a warning')).not.toBeInTheDocument();
+    expect(showToast).not.toHaveBeenCalled();
+    expect(keepOpenToast).toHaveBeenCalledTimes(1);
+    expect(keepOpenToast).toHaveBeenCalledWith(expect.stringContaining(updateWarning));
   });
 });
 
@@ -243,15 +249,21 @@ describe('SurfaceDetailPage save', () => {
   const save = async () => {
     fireEvent.click(screen.getByTestId('surface-save-button'));
     await waitFor(() => expect(updateSurface).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(toast).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(
+        toast.mock.calls.length + keepOpenToast.mock.calls.length + successToast.mock.calls.length
+      ).toBe(1)
+    );
     return updateSurface.mock.calls[0][1] as AgentSurface;
   };
 
-  const warningToasts = () => toast.mock.calls.filter(c => c[0] === 'warning').map(c => c[1]);
+  const warningToasts = () => keepOpenToast.mock.calls.map(c => c[0]);
 
   beforeEach(() => {
     jest.restoreAllMocks();
     toast.mockReset();
+    keepOpenToast.mockReset();
+    successToast.mockReset();
     updateSurface = jest.spyOn(apiClient, 'updateSurface');
   });
 
@@ -267,8 +279,7 @@ describe('SurfaceDetailPage save', () => {
     expect(sent.access_point.public).toBe(true);
     expect(sent.access_point.caller_authentication).not.toHaveProperty('on_failure');
     expect(warningToasts()).toEqual([]);
-    expect(toast).toHaveBeenCalledWith('success', 'Agent Surface "orders" saved');
-    expect(screen.queryByTestId('surface-save-warnings')).not.toBeInTheDocument();
+    expect(successToast).toHaveBeenCalledWith('Agent Surface "orders" saved');
   });
 
   it('saves a surface stored without public and no Caller Context, showing no gateway warning', async () => {
@@ -279,7 +290,6 @@ describe('SurfaceDetailPage save', () => {
 
     expect(sent.access_point).not.toHaveProperty('public');
     expect(warningToasts()).toEqual([]);
-    expect(screen.queryByTestId('surface-save-warnings')).not.toBeInTheDocument();
     expect(toast.mock.calls.some(c => c[0] === 'error')).toBe(false);
   });
 
@@ -305,8 +315,7 @@ describe('SurfaceDetailPage save', () => {
 
     expect(sent.access_point.public).toBe(false);
     expect(warningToasts()).toEqual([]);
-    expect(toast).toHaveBeenCalledWith('success', 'Agent Surface "orders" saved');
-    expect(screen.queryByTestId('surface-save-warnings')).not.toBeInTheDocument();
+    expect(successToast).toHaveBeenCalledWith('Agent Surface "orders" saved');
     expect(toast.mock.calls.some(c => c[0] === 'error')).toBe(false);
   });
 

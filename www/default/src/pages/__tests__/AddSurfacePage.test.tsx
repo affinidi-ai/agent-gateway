@@ -6,9 +6,20 @@ import AddSurfacePage from '../AddSurfacePage';
 import { apiClient } from '../../api';
 import type { AgentSurface } from '../../api';
 import { fetchRoutingConfig } from '../../components/surface-builder/elements/access-point/defaults';
-import { showToast } from '../../utils/toaster';
+import {
+  showKeepOpenWarningToast,
+  showSuccessCountdownToast,
+  showToast,
+} from '../../utils/toaster';
 
-jest.mock('../../utils/toaster', () => ({ showToast: jest.fn() }));
+jest.mock('../../utils/toaster', () => ({
+  showToast: jest.fn(),
+  showKeepOpenWarningToast: jest.fn(),
+  showSuccessCountdownToast: jest.fn(),
+}));
+
+const keepOpenToast = showKeepOpenWarningToast as jest.Mock;
+const successToast = showSuccessCountdownToast as jest.Mock;
 jest.mock('../../components/surface-builder/SurfaceCanvas', () => ({
   getIncompleteReason: () => null,
 }));
@@ -261,6 +272,8 @@ describe('AddSurfacePage caller access on create', () => {
   beforeEach(() => {
     jest.restoreAllMocks();
     toast.mockReset();
+    keepOpenToast.mockReset();
+    successToast.mockReset();
     routingConfig.mockReset();
     routingConfig.mockResolvedValue({
       available_listen_addresses: ['https://gw.example'],
@@ -296,10 +309,10 @@ describe('AddSurfacePage caller access on create', () => {
 
     await waitFor(() => expect(createSurface).toHaveBeenCalledTimes(1));
     await waitFor(() =>
-      expect(toast).toHaveBeenCalledWith('success', expect.stringContaining('created'))
+      expect(successToast).toHaveBeenCalledWith(expect.stringContaining('created'))
     );
     expect(toast.mock.calls.filter(c => c[0] === 'error')).toEqual([]);
-    expect(toast.mock.calls.filter(c => c[0] === 'warning')).toEqual([]);
+    expect(keepOpenToast).not.toHaveBeenCalled();
   });
 
   it('shows the not-ready notice from the draft until Public access is on', async () => {
@@ -322,9 +335,9 @@ describe('AddSurfacePage caller access on create', () => {
     create();
 
     await waitFor(() =>
-      expect(toast).toHaveBeenCalledWith('success', expect.stringContaining('created'))
+      expect(successToast).toHaveBeenCalledWith(expect.stringContaining('created'))
     );
-    expect(toast.mock.calls.filter(c => c[0] === 'warning')).toEqual([]);
+    expect(keepOpenToast).not.toHaveBeenCalled();
     expect(createSurface).toHaveBeenCalledTimes(1);
     expect(createSurface.mock.calls[0][0].access_point.public).toBe(true);
   });
@@ -353,6 +366,8 @@ describe('AddSurfacePage create warnings', () => {
   beforeEach(() => {
     jest.restoreAllMocks();
     (showToast as jest.Mock).mockReset();
+    keepOpenToast.mockReset();
+    successToast.mockReset();
     routingConfig.mockReset();
     routingConfig.mockResolvedValue({
       available_listen_addresses: ['https://gw.example'],
@@ -379,17 +394,19 @@ describe('AddSurfacePage create warnings', () => {
     renderAt();
     await routeSeeded();
     fireEvent.click(screen.getByTitle('Create surface'));
-    await waitFor(() => expect(showToast).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(keepOpenToast.mock.calls.length + successToast.mock.calls.length).toBe(1)
+    );
   };
 
   it("opens the new surface's page with the gateway warnings, in one toast", async () => {
     await create([warning]);
 
-    expect(showToast).toHaveBeenCalledTimes(1);
-    expect(showToast).toHaveBeenCalledWith(
-      'warning',
-      expect.stringContaining(`created, with warnings:\n${warning}`),
-      expect.objectContaining({ autoRemove: true })
+    expect(showToast).not.toHaveBeenCalled();
+    expect(successToast).not.toHaveBeenCalled();
+    expect(keepOpenToast).toHaveBeenCalledTimes(1);
+    expect(keepOpenToast).toHaveBeenCalledWith(
+      expect.stringContaining(`created, with warnings:\n${warning}`)
     );
     expect(await screen.findByTestId('location')).toHaveTextContent(
       `/surfaces/new-id ${JSON.stringify({ saveWarnings: [warning] })}`
@@ -401,7 +418,7 @@ describe('AddSurfacePage create warnings', () => {
       "variant 'beta': This Access Point is not ready for external access. Add source authentication (a caller_authentication method), or set access_point.public to true to allow callers without credentials.";
     await create([notReady, warning]);
 
-    expect((showToast as jest.Mock).mock.calls[0][1]).not.toContain(notReady);
+    expect(keepOpenToast.mock.calls[0][0]).not.toContain(notReady);
     expect(await screen.findByTestId('location')).toHaveTextContent(
       `/surfaces/new-id ${JSON.stringify({ saveWarnings: [warning] })}`
     );
@@ -412,19 +429,20 @@ describe('AddSurfacePage create warnings', () => {
       'This Access Point is public. Anyone who can reach it can call your agent without credentials.';
     await create([publicMessage]);
 
-    expect((showToast as jest.Mock).mock.calls[0][1]).not.toContain(publicMessage);
+    expect(keepOpenToast).not.toHaveBeenCalled();
+    expect(successToast).toHaveBeenCalledWith(expect.stringContaining('created'));
     expect(await screen.findByTestId('location')).toHaveTextContent(/^\/surfaces null$/);
   });
 
   it('returns to the surface list when the gateway answers with none', async () => {
     await create([]);
 
-    expect(showToast).toHaveBeenCalledTimes(1);
-    expect(showToast).not.toHaveBeenCalledWith(
-      expect.anything(),
-      expect.stringContaining('Transit Point'),
-      expect.anything()
-    );
+    const shown = [
+      ...successToast.mock.calls.map(c => c[0]),
+      ...keepOpenToast.mock.calls.map(c => c[0]),
+    ];
+    expect(shown).toHaveLength(1);
+    expect(shown[0]).not.toContain('Transit Point');
     expect(await screen.findByTestId('location')).toHaveTextContent(/^\/surfaces null$/);
   });
 });
