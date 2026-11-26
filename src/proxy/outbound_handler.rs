@@ -24782,6 +24782,27 @@ mod tests {
             apply_credential_injections(&mut ctx, &injections).unwrap();
             assert_eq!(transit_fabric_extra_body(&ctx).map(serde_json::Value::Object), named, "{injections:?}");
         }
+
+        let fields: Vec<String> = std::iter::once(String::new())
+            .chain((0..300).map(|index| format!("field-{index}")))
+            .collect();
+        let injections: Vec<_> = fields
+            .iter()
+            .map(|field| crate::proxy::credential_delegation::ResolvedCredentialInjection::McpMeta {
+                field: field.clone(),
+                value: "person-token".into(),
+            })
+            .collect();
+        let mut ctx =
+            credential_header_case(&state, None, &[], Method::POST, "/outbound/surfaces/order/partner-a/rpc").await;
+        ctx.body_bytes =
+            Some(Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read"}}"#));
+        apply_credential_injections(&mut ctx, &injections).unwrap();
+        assert_eq!(
+            transit_fabric_extra_body(&ctx).map(serde_json::Value::Object),
+            Some(json!({ "delegated_meta_fields": fields })),
+            "every field is named, the empty one included, with no cap"
+        );
     }
 
     /// A Transit Point context whose surface has one delegated credential binding,

@@ -1183,9 +1183,25 @@ async fn a_legacy_sse_session_endpoint_outside_the_target_base_path_gets_no_dele
     }
 }
 
+/// How a sending gateway names the `_meta` fields it put a delegated credential into, and the
+/// `_meta` the request carries: a named field, the empty name, and lists the receiver cannot
+/// read whole (too long, a non-string entry, not an array), which hold every `_meta` field.
+fn sender_named_meta_cases() -> Vec<(&'static str, Value, Value)> {
+    let many: Vec<String> = (0..300)
+        .map(|index| format!("field-{index}"))
+        .collect();
+    vec![
+        ("named field", json!(["calendar"]), json!({ "calendar": "sender-grant" })),
+        ("empty name", json!([""]), json!({ "": "sender-grant" })),
+        ("over the bound", json!(many), json!({ "field-299": "sender-grant" })),
+        ("non-string entry", json!(["calendar", 7]), json!({ "maps": "sender-grant" })),
+        ("not an array", json!("calendar"), json!({ "maps": "sender-grant" })),
+    ]
+}
+
 /// A legacy MCP request whose sending gateway says it put a delegated credential into
-/// `_meta.calendar` is posted only to a Legacy SSE session endpoint under the Target base
-/// path, though the receiving surface has no binding of its own for that field.
+/// `_meta` is posted only to a Legacy SSE session endpoint under the Target base path,
+/// though the receiving surface has no binding of its own for that field.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_legacy_sse_session_endpoint_outside_the_base_path_gets_no_credential_the_sender_delegated() {
     if ran_in_child("ATG_FABRIC_RECEIVE_LEGACY_SSE_SENDER_FIELDS_CHILD").await {
@@ -1193,48 +1209,51 @@ async fn a_legacy_sse_session_endpoint_outside_the_base_path_gets_no_credential_
     }
     let mut roots = Vec::new();
     for (endpoint, refused) in [("/other-app/messages", true), ("/base/messages", false)] {
-        let server = crate::proxy::handler::legacy_sse_fallback_tests::legacy_server(endpoint).await;
-        roots.push(tempfile::tempdir().unwrap());
-        let root = roots.last().unwrap();
-        let _receiver = receiver(root.path(), &surface("mcp", &format!("{}/base", server.url), &[])).await;
-        let mut message = forward_request(
-            root.path(),
-            json!({ "content-type": "application/json", "accept": "application/json, text/event-stream",
-                "mcp-protocol-version": crate::mcp::MCP_LEGACY_VERSION, "x-api-key": CALLER_KEY }),
-            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                "params": { "name": "lookup", "arguments": {}, "_meta": { "calendar": "sender-grant" } } }),
-        );
-        message.message_body[crate::proxy::credential_delegation::DELEGATED_META_FIELDS] = json!(["calendar"]);
-        let (response, events) = crate::audit::producer::capture(forward_response(&message)).await;
-        let path_refusals = events
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event.event,
-                    DelegationAuditAction::RequestRejected {
-                        stage: RejectionStage::Forward,
-                        reason: RejectionReason::TargetPathRefused,
-                        ..
-                    }
-                )
-            })
-            .count();
-        let calls = server.tool_calls();
-        if refused {
-            assert_eq!(response["status"], 400, "{endpoint}: {response}");
-            assert!(
-                response
-                    .to_string()
-                    .contains("target_path_refused"),
-                "{endpoint}: {response}"
+        for (case, named, meta) in sender_named_meta_cases() {
+            let server = crate::proxy::handler::legacy_sse_fallback_tests::legacy_server(endpoint).await;
+            roots.push(tempfile::tempdir().unwrap());
+            let root = roots.last().unwrap();
+            let _receiver = receiver(root.path(), &surface("mcp", &format!("{}/base", server.url), &[])).await;
+            let mut message = forward_request(
+                root.path(),
+                json!({ "content-type": "application/json", "accept": "application/json, text/event-stream",
+                    "mcp-protocol-version": crate::mcp::MCP_LEGACY_VERSION, "x-api-key": CALLER_KEY }),
+                json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": "lookup", "arguments": {}, "_meta": meta.clone() } }),
             );
-            assert_eq!(path_refusals, 1, "{endpoint}");
-            assert_eq!(calls, Vec::new(), "{endpoint}: nothing is posted to the advertised endpoint");
-        } else {
-            assert_eq!(response["status"], 200, "{endpoint}: {response}");
-            assert_eq!(path_refusals, 0, "{endpoint}");
-            assert_eq!(calls.len(), 1, "{endpoint}: {calls:?}");
-            assert_eq!(calls[0].1["params"]["_meta"]["calendar"], "sender-grant", "{endpoint}");
+            message.message_body[crate::proxy::credential_delegation::DELEGATED_META_FIELDS] = named;
+            let calls_before = server.tool_calls().len();
+            let (response, events) = crate::audit::producer::capture(forward_response(&message)).await;
+            let path_refusals = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.event,
+                        DelegationAuditAction::RequestRejected {
+                            stage: RejectionStage::Forward,
+                            reason: RejectionReason::TargetPathRefused,
+                            ..
+                        }
+                    )
+                })
+                .count();
+            let calls = server.tool_calls()[calls_before..].to_vec();
+            if refused {
+                assert_eq!(response["status"], 400, "{case} {endpoint}: {response}");
+                assert!(
+                    response
+                        .to_string()
+                        .contains("target_path_refused"),
+                    "{case} {endpoint}: {response}"
+                );
+                assert_eq!(path_refusals, 1, "{case} {endpoint}");
+                assert_eq!(calls, Vec::new(), "{case} {endpoint}: nothing is posted to the advertised endpoint");
+            } else {
+                assert_eq!(response["status"], 200, "{case} {endpoint}: {response}");
+                assert_eq!(path_refusals, 0, "{case} {endpoint}");
+                assert_eq!(calls.len(), 1, "{case} {endpoint}: {calls:?}");
+                assert_eq!(calls[0].1["params"]["_meta"], meta, "{case} {endpoint}");
+            }
         }
     }
 }
@@ -1297,22 +1316,34 @@ async fn a_fabric_received_proxy_tool_call_mirror_gets_no_credential_the_sender_
     value["target"]["networking"] =
         json!({ "mirror": { "endpoint": format!("{mirror}/mirror"), "percentage": 100, "wait_for_response": true } });
     let _receiver = receiver(root.path(), &serde_json::from_value(value).unwrap()).await;
-    let mut message = forward_request(
-        root.path(),
-        json!({ "content-type": "application/json", "x-api-key": CALLER_KEY }),
-        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "getItem",
-            "arguments": { "id": "1" }, "_meta": { "calendar": "sender-grant", "trace": "kept" } } }),
-    );
-    message.message_body[crate::proxy::credential_delegation::DELEGATED_META_FIELDS] = json!(["calendar"]);
+    for (case, named, mut meta) in sender_named_meta_cases() {
+        meta["trace"] = json!("kept");
+        let mut message = forward_request(
+            root.path(),
+            json!({ "content-type": "application/json", "x-api-key": CALLER_KEY }),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "getItem",
+                "arguments": { "id": "1" }, "_meta": meta } }),
+        );
+        message.message_body[crate::proxy::credential_delegation::DELEGATED_META_FIELDS] = named;
+        let mirrored_before = mirrored.lock().unwrap().len();
 
-    let response = forward_response(&message).await;
-    assert_eq!(response["status"], 200, "{response}");
-    let mirrored = mirrored
-        .lock()
-        .unwrap()
-        .clone();
-    assert_eq!(mirrored.len(), 1, "{mirrored:?}");
-    assert_eq!(mirrored[0]["params"]["_meta"], json!({ "trace": "kept" }), "{}", mirrored[0]);
+        let response = forward_response(&message).await;
+        assert_eq!(response["status"], 200, "{case}: {response}");
+        let sent = mirrored.lock().unwrap()[mirrored_before..].to_vec();
+        assert_eq!(sent.len(), 1, "{case}: {sent:?}");
+        assert!(
+            !sent[0]
+                .to_string()
+                .contains("sender-grant"),
+            "{case}: {}",
+            sent[0]
+        );
+        if matches!(case, "named field" | "empty name") {
+            assert_eq!(sent[0]["params"]["_meta"], json!({ "trace": "kept" }), "{case}: {}", sent[0]);
+        } else {
+            assert_eq!(sent[0]["params"].get("_meta"), None, "{case}: the whole _meta is dropped: {}", sent[0]);
+        }
+    }
 }
 
 /// A public Access Point forwards a request whose peer key it refused, and the

@@ -701,11 +701,15 @@ request, including A2A. The receiving gateway, and its Target, can use that acce
 expires. When the receiving gateway forwards the request to its Target it logs the name of each
 forwarded header, never its value, so a delegated credential stays out of the logs whatever header
 carries it. A Transit Point's legacy `forward-request` names, in `delegated_meta_fields`, the
-`_meta` fields its delegated credentials went into; the receiving gateway posts such a request
-only to a Legacy SSE session endpoint under its Target base path and leaves those fields out of
-its traffic mirror, as it does for its own bindings' fields (see
-[Target base path](CREDENTIAL_DELEGATION.md#target-base-path)). A sender that does not name them
-is held only to the receiving surface's own bindings.
+`_meta` fields its delegated credentials went into, every one of them and the empty name `""`
+among them; the receiving gateway posts such a request only to a Legacy SSE session endpoint
+under its Target base path and leaves those fields out of its traffic mirror, as it does for its
+own bindings' fields (see [Target base path](CREDENTIAL_DELEGATION.md#target-base-path)). A list
+the receiving gateway cannot read whole (not an array, an entry that is not a string, or more
+than 256 entries) is never cut short: every `_meta` field of the request is then held as
+carrying a delegated credential, so the Legacy SSE session endpoint is checked and the mirror
+gets no `_meta` at all. A sender that does not name them is held only to the receiving surface's
+own bindings.
 
 The setting applies to one route only. Another `fabric://` Target or Transit Point on the same
 gateway sends no delegated credential unless it opts in too. A Transit Point on a surface without

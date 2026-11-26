@@ -1702,8 +1702,10 @@ the caller's headers without the caller's own credentials or any header named li
 header. On the direct path, including a legacy `proxy://` tool call, and on a legacy `proxy://`
 tool call received over Fabric, its body has none of the `_meta` fields delegated credentials
 go into, even when the caller set them: the fields of the surface's own bindings, and on Fabric
-receive those the sending gateway names in `delegated_meta_fields`. Custom metadata, DID
-identity and the identity binding VP stay in the body. On Fabric send the copy is taken before
+receive those the sending gateway names in `delegated_meta_fields`, the empty name included, or
+the whole `_meta` when that list cannot be read whole (see
+[Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric)). Custom
+metadata, DID identity and the identity binding VP stay in the body. On Fabric send the copy is taken before
 the gateway adds any credential to the body. Fabric receive otherwise, and Transit Points, send
 no traffic mirror. A request from another gateway's Transit Point that reaches this surface over
 HTTP is an ordinary caller's request here: a credential that gateway put into a `_meta` field

@@ -7709,7 +7709,11 @@ async fn proxy_charged_request(
         && mirror::selected(mirror_config.percentage)
     {
         let mirror_endpoint_for_log = loggable::url(&mirror_config.endpoint);
-        let mirror_body = crate::proxy::credential_delegation::mirror_body(&state.surface, &body_bytes, &[]);
+        let mirror_body = crate::proxy::credential_delegation::mirror_body(
+            &state.surface,
+            &body_bytes,
+            &crate::proxy::credential_delegation::SenderDelegatedMeta::NONE,
+        );
         let mirror_request = mirror::MirrorRequest::new(mirror_config, method.clone(), mirror_body)
             .headers_from(&headers, |name| {
                 forwards_target_header(
@@ -8278,14 +8282,18 @@ async fn proxy_charged_request(
                 secrets: state.secrets_store.as_ref(),
                 stamp: target_tls_stamp,
             }),
-            crate::proxy::credential_delegation::carries_delegated_meta_field(&state.surface, &body_bytes, &[])
-                .then_some(
-                    state
-                        .surface
-                        .target
-                        .endpoint
-                        .as_str(),
-                ),
+            crate::proxy::credential_delegation::carries_delegated_meta_field(
+                &state.surface,
+                &body_bytes,
+                &crate::proxy::credential_delegation::SenderDelegatedMeta::NONE,
+            )
+            .then_some(
+                state
+                    .surface
+                    .target
+                    .endpoint
+                    .as_str(),
+            ),
         )
         .await
         {
@@ -15998,7 +16006,7 @@ async fn handle_mcp_proxy_request_inner(
                 state.policy_manager.as_ref(),
                 channel_name,
                 sent_token.as_ref(),
-                &[],
+                &crate::proxy::credential_delegation::SenderDelegatedMeta::NONE,
             )
             .await;
             if let Err(error) = &executed
