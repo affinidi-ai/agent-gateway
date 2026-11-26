@@ -34,14 +34,21 @@ REQUIREMENTS_FILE="${HERE}/node_modules/@modelcontextprotocol/conformance/requir
 SUITE_VERSION="$(sed -n 's|.*"@modelcontextprotocol/conformance": "\(.*\)".*|\1|p' "${HERE}/package.json")"
 SUITE_TARGETS=(direct access-point transit owned-proxy proxy-surface fabric)
 OWNED_SCENARIOS=(tools-list tools-call-simple-text caching)
-# The suite's client scenarios for ${SPEC_VERSION} that need no authorization.
-# The reference client has no handler for some of them; those fail the same way
-# with and without the gateway, which client-parity.mjs checks.
+# The suite's client scenarios for ${SPEC_VERSION} that need no authorization:
+# the reference client runs each one directly and through the gateway, and
+# client-parity.mjs requires the same result both ways. The reference client has
+# no handler for some of them; those fail the same way with and without the
+# gateway.
 CLIENT_SCENARIOS=(tools_call request-metadata sep-2322-client-request-state json-schema-2020-12-preservation
     json-schema-ref-no-deref http-standard-headers http-custom-headers http-invalid-tool-headers)
 CLIENT_MUST_PASS=(tools_call request-metadata sep-2322-client-request-state json-schema-2020-12-preservation)
 # The extension scenario in which the gateway itself asks the suite's
-# authorization server for a token and attaches it to the forwarded request.
+# authorization server for a token and attaches it to the forwarded request. It
+# runs through the gateway only and is not compared with a direct run: directly,
+# the reference client does the token exchange itself, so the two runs would
+# test different clients. The suite's other client auth/* scenarios test an MCP
+# client's own OAuth behaviour (discovery, code flow, scope step-up, DPoP), which
+# Target authentication does not do, and are not run; a --report run lists them.
 CLIENT_AUTH_SCENARIO="auth/client-credentials-jwt"
 
 PORT_BASE="${MCP_CONFORMANCE_PORT_BASE:-18760}"

@@ -2152,8 +2152,9 @@ statuses both ways, and four scenarios (`tools_call`, `request-metadata`,
 `sep-2322-client-request-state`, `json-schema-2020-12-preservation`) to pass
 through the gateway: a passing verdict and no failed or warned check. The other
 four fail the same way with and without the gateway, because the reference
-client has no handler for them. The scenarios are the suite's `2026-07-28`
-client scenarios that need no authorization.
+client has no handler for them. The scenarios compared this way are the
+suite's `2026-07-28` client scenarios that need no authorization; the
+authorization scenarios are not compared with a direct run, as described below.
 
 The gateway forwards the caller's headers and `_meta` and runs no handshake of
 its own, so this target shows that a conforming caller stays conforming through
@@ -2167,7 +2168,9 @@ headers the reference client leaves out, and sends
 request without `MCP-Protocol-Version` passes through unchanged.
 
 The target also runs one authorization scenario, `auth/client-credentials-jwt`,
-through the gateway only. Every `auth/*` scenario expects the client to find
+through the gateway only, and does not compare it with a direct run: directly,
+the reference client does the token exchange itself, so the gateway is not what
+the direct run tests. Every `auth/*` scenario expects the client to find
 the token endpoint from a `401` challenge, and the gateway's token endpoints
 are credential provider settings. So `client-auth.mjs` follows the challenge
 itself, stores the scenario's client as an `oauth2_client_credentials_jwt_auth`
@@ -2182,7 +2185,8 @@ sends the scenario's credentials to that endpoint, `client-auth.mjs` follows and
 stores only URLs on the origin of the server under test or on loopback, and
 writes the scenario's secrets readable by the running user only.
 
-The other `auth/*` scenarios are not run: they need an authorization-code flow,
+The other `auth/*` client scenarios test an MCP client's own OAuth behaviour and
+are not run: they need an authorization-code flow,
 discovery or scope step-up at request time, dynamic or metadata-document client
 registration, DPoP, or a token issued outside the gateway, none of which Target
 authentication does. `auth/client-credentials-basic` is not run either, because

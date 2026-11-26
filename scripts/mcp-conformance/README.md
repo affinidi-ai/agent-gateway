@@ -142,7 +142,7 @@ gateway starts and exists only in its environment.
 | `owned-proxy` | Standalone MCP Proxy `/owned/api` over the REST fixture | `tools-list`, `tools-call-simple-text`, `caching` | `owned.yaml` |
 | `proxy-surface` | Access Point `/conformance/owned-mcp` with Target `proxy://conformance-owned` | Same subset | `owned.yaml` |
 | `fabric` | Access Point on gateway 1 with Target `fabric://` gateway 2, whose surface forwards to the reference server through the shim | Full requirement set | `fabric.yaml` |
-| `client` | Access Point `/conformance/mcp` of a gateway started per scenario, forwarding to the suite's own server | The eight `2026-07-28` client scenarios that need no authorization, and `auth/client-credentials-jwt` | None: `client-parity.mjs` compares with the direct run |
+| `client` | Access Point `/conformance/mcp` of a gateway started per scenario, forwarding to the suite's own server | The eight `2026-07-28` client scenarios that need no authorization, compared with a direct run; `auth/client-credentials-jwt` through the gateway only. See [What the client target covers](#what-the-client-target-covers) | None: `client-parity.mjs` compares the eight with the direct run |
 | `legacy-surface` | Access Point `/conformance/legacy-mcp` whose stored record deliberately still carries the retired `mcp_protocol_mode: 'legacy'`, which is ignored | `compat.mjs` only | |
 
 Outputs, all under the ignored `target/mcp-conformance/`:
@@ -158,6 +158,15 @@ Outputs, all under the ignored `target/mcp-conformance/`:
 | `env/client/<scenario>/` | The env of the gateway started for one client scenario |
 | `run/logs/client-gateway/gateway-<scenario>.log` | The log of that gateway, kept with the other run logs |
 | `run/logs/client-<direct\|gateway>.verdicts` | The suite's verdict (`pass` or `fail`) of each client scenario run, which `client-parity.mjs` compares |
+
+### What the client target covers
+
+| Scenarios | Run | Why |
+| --- | --- | --- |
+| The eight `2026-07-28` client scenarios that need no authorization | Directly and through the gateway, with the same suite verdict and checks required both ways | The reference client is the same client in both runs, so a difference is the gateway's |
+| `auth/client-credentials-jwt` | Through the gateway only, counted on its own summary line | In the gateway run the gateway, not the reference client, signs the assertion and fetches the token. Run directly, the reference client does the exchange itself and exits with an error against this server's modern-wire `initialize`, so the two runs test different clients and a comparison would not measure the gateway |
+| `auth/client-credentials-basic` | Not run: a known gap | An `oauth2_client_credentials` provider sends the client secret in the form body and the scenario requires HTTP Basic. `--report` lists it, and it can be reproduced by hand (below) |
+| The other `auth/*` client scenarios (discovery, scope step-up, token-endpoint authentication methods, pre-registration, `iss`, offline access, DPoP, enterprise-managed authorization, workload identity federation) | Not run | They test an MCP client's own OAuth behaviour, such as an authorization-code flow, discovery at request time or a token issued outside the gateway. Target authentication does none of that, so the gateway has nothing to measure. `--report` lists them as gaps of the `client` target |
 
 ### Reading a suite line
 
