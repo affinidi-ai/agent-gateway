@@ -203,6 +203,11 @@ pub fn response_policy_key(policy_definition_id: &str) -> String {
 /// The body of the `403` a caller gets when a response policy refuses an answer.
 pub const DENIED_BODY: &str = r#"{"error":"Response blocked","code":"response_policy_denied"}"#;
 
+/// [`DENIED_BODY`] as JSON, as a refused exchange is recorded.
+pub fn denied_body() -> Value {
+    serde_json::json!({"error": "Response blocked", "code": "response_policy_denied"})
+}
+
 /// The `403` a caller gets when a response policy refuses an answer.
 pub fn denied_response() -> axum::response::Response {
     axum::response::Response::builder()
@@ -229,9 +234,10 @@ pub fn response_context(
 
 /// What a response policy sees of each event of a buffered `text/event-stream`
 /// answer with `status`: one context per event that carries data, with that
-/// event's JSON as the body, as a direct caller's event stream is checked. Empty
-/// when `body` holds no such event, and `None` when an event's data is not JSON,
-/// which a direct caller's stream refuses too.
+/// event's JSON object as the body, as a direct caller's event stream is
+/// checked. Empty when `body` is only comments and fields with no data event,
+/// and `None` when it holds a line that is not an event-stream field or when an
+/// event's data is not a JSON object, which a direct caller's stream refuses too.
 pub fn event_stream_contexts(
     status: u16,
     body: &[u8],
@@ -242,11 +248,30 @@ pub fn event_stream_contexts(
     let text = text
         .strip_prefix('\u{feff}')
         .unwrap_or(&text);
+    let is_event_stream_line = |line: &str| {
+        line.is_empty()
+            || line.starts_with(':')
+            || ["data", "event", "id", "retry"]
+                .iter()
+                .any(|field| {
+                    line.strip_prefix(field)
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+                })
+    };
+    if !text
+        .lines()
+        .all(is_event_stream_line)
+    {
+        return None;
+    }
     text.split("\n\n")
         .filter_map(|event| {
             let data: Vec<&str> = event
                 .lines()
-                .filter_map(|line| line.strip_prefix("data:"))
+                .filter_map(|line| {
+                    line.strip_prefix("data:")
+                        .or_else(|| (line == "data").then_some(""))
+                })
                 .map(|data| {
                     data.strip_prefix(' ')
                         .unwrap_or(data)
@@ -255,7 +280,7 @@ pub fn event_stream_contexts(
             (!data.is_empty()).then(|| serde_json::from_str::<Value>(&data.join("\n")).ok())
         })
         .map(|event| {
-            let event = event?;
+            let event = event.filter(Value::is_object)?;
             Some(ResponseContext {
                 status_code: status,
                 is_error: status >= 400
@@ -272,24 +297,20 @@ pub fn event_stream_contexts(
 
 /// What a response policy sees of a whole Target answer with `status`, `body`
 /// and `content_type`: one context per event when it is still framed as an
-/// event stream (see [`event_stream_contexts`]), otherwise one for the answer.
-/// `None` when an event of the stream is not JSON.
+/// event stream (see [`event_stream_contexts`]), none when that stream carries
+/// no data event (nothing reaches the caller to check), otherwise one for the
+/// answer. `None` when an event of the stream is not a JSON object.
 pub fn answer_contexts(
     status: u16,
     body: &[u8],
     content_type: Option<&str>,
 ) -> Option<Vec<ResponseContext>> {
-    let events = match content_type {
+    match content_type {
         Some(content_type) if crate::mcp::sse_transport::is_sse_content_type(content_type) => {
-            event_stream_contexts(status, body)?
+            event_stream_contexts(status, body)
         }
-        _ => Vec::new(),
-    };
-    Some(if events.is_empty() {
-        vec![response_context(status, body, content_type)]
-    } else {
-        events
-    })
+        _ => Some(vec![response_context(status, body, content_type)]),
+    }
 }
 
 /// Lets an answer through unchecked because the gateway has no policy manager
@@ -446,7 +467,9 @@ pub async fn check_response_policy(
 
 /// Evaluates response policy `policy_id` on each of `inputs`, the parts of one
 /// answer, until one is refused, and records one response-scope decision for
-/// the answer: the refusal, or the allow when every part is allowed.
+/// the answer: the refusal, or the allow when every part is allowed. With no
+/// parts it refuses and records an evaluation error, since the policy decided
+/// nothing; a caller with nothing to check does not call it.
 pub async fn check_response_policy_on_each(
     policy_manager: &crate::policies::surface_manager::SurfacePolicyManager,
     policy_id: &str,
@@ -458,9 +481,9 @@ pub async fn check_response_policy_on_each(
         .await;
     let key = response_policy_key(policy_id);
     let mut decision = ResponsePolicyDecision {
-        allow: true,
+        allow: false,
         reason: None,
-        error: None,
+        error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
     };
     for input in inputs {
         decision = evaluate_response_policy(policy_manager, &key, input);
@@ -857,8 +880,13 @@ mod tests {
     }
 
     #[test]
-    fn a_body_with_no_data_event_gives_no_contexts() {
-        assert!(event_stream_contexts(200, b"{\"result\":{}}").is_some_and(|contexts| contexts.is_empty()));
+    fn only_comments_and_fields_give_no_contexts_and_anything_else_is_unreadable() {
+        assert!(
+            event_stream_contexts(200, b": keep-alive\n\nretry: 100\n\n").is_some_and(|contexts| contexts.is_empty())
+        );
+        assert!(event_stream_contexts(200, b"{\"result\":{\"secret\":\"s\"}}").is_none());
+        assert!(answer_contexts(200, b"{\"result\":{\"secret\":\"s\"}}", Some("text/event-stream")).is_none());
+        assert!(event_stream_contexts(200, b"data: {\"a\":1}\n\nsecret line\n\n").is_none());
     }
 
     #[test]
@@ -886,6 +914,109 @@ mod tests {
         let contexts = answer_contexts(200, body, Some("Text/Event-Stream")).unwrap();
 
         assert_eq!(contexts.len(), 2);
+    }
+
+    #[test]
+    fn event_stream_framing_edge_cases() {
+        use serde_json::json;
+        type Case<'a> = (&'a str, &'a [u8], Option<Vec<Value>>);
+        let cases: [Case; 9] = [
+            (
+                "lone CR line endings",
+                b"data: {\"a\":1}\r\rdata: {\"b\":2}\r\r",
+                Some(vec![json!({"a": 1}), json!({"b": 2})]),
+            ),
+            ("multi-line data", b"data: {\"a\":\ndata: 1}\n\n", Some(vec![json!({"a": 1})])),
+            ("data without a space", b"data:{\"a\":1}\n\n", Some(vec![json!({"a": 1})])),
+            (
+                "last event without a blank line",
+                b"data: {\"a\":1}\n\ndata: {\"b\":2}",
+                Some(vec![json!({"a": 1}), json!({"b": 2})]),
+            ),
+            ("empty data", b"data:\n\n", None),
+            ("data line with no colon", b"data\n\n", None),
+            ("no data lines", b": keep-alive\n\nevent: ping\n\n", Some(vec![])),
+            ("array event", b"data: [{\"result\":{\"secret\":\"s\"}}]\n\n", None),
+            ("string event", b"data: \"s\"\n\n", None),
+        ];
+        for (name, body, expected) in cases {
+            let bodies = event_stream_contexts(200, body).map(|contexts| {
+                contexts
+                    .into_iter()
+                    .map(|context| context.body.unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(bodies, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn only_an_event_stream_answer_is_split_and_one_without_events_has_nothing_to_check() {
+        let lengths = |body: &[u8], content_type| answer_contexts(200, body, Some(content_type)).map(|c| c.len());
+
+        assert_eq!(lengths(b": keep-alive\n\n", "text/event-stream"), Some(0));
+        assert_eq!(lengths(b"data: x\n\n", "application/json"), Some(1));
+        assert_eq!(lengths(b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\n", "text/event-stream"), Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_part_the_policy_cannot_decide_refuses_the_answer_with_one_error_record() {
+        use crate::observability::policy_audit::POLICY_DECISION_COLLECTOR;
+        let manager = manager_with(
+            "package surface.policy\n\ndefault allow := true\n\nallow := false if {\n    input.response.body.boom\n}\n\nallow := true if {\n    input.response.body.boom\n}\n",
+        );
+        let collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let decision = POLICY_DECISION_COLLECTOR
+            .scope(
+                collector.clone(),
+                check_response_policy_on_each(
+                    &manager,
+                    "pol-1",
+                    [
+                        input_with_body(serde_json::json!({"ok": true})),
+                        input_with_body(serde_json::json!({"boom": true})),
+                        input_with_body(serde_json::json!({"ok": true})),
+                    ],
+                    crate::observability::PolicyDecisionEvent::default(),
+                ),
+            )
+            .await;
+
+        assert!(!decision.allow);
+        let recorded = collector
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].decision, "error");
+    }
+
+    #[tokio::test]
+    async fn no_parts_to_check_is_recorded_as_an_error_not_an_allow() {
+        use crate::observability::policy_audit::POLICY_DECISION_COLLECTOR;
+        let manager = manager_with(ALLOW_ALL);
+        let collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let decision = POLICY_DECISION_COLLECTOR
+            .scope(
+                collector.clone(),
+                check_response_policy_on_each(
+                    &manager,
+                    "pol-1",
+                    Vec::new(),
+                    crate::observability::PolicyDecisionEvent::default(),
+                ),
+            )
+            .await;
+
+        assert!(!decision.allow);
+        let recorded = collector
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].decision, "error");
     }
 
     #[test]
@@ -975,6 +1106,11 @@ mod tests {
             .clone();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].decision, "allow");
+    }
+
+    #[test]
+    fn the_denied_body_as_json_is_the_body_a_refused_caller_gets() {
+        assert_eq!(denied_body(), serde_json::from_str::<Value>(DENIED_BODY).unwrap());
     }
 
     #[test]

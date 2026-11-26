@@ -13325,13 +13325,7 @@ async fn handle_fabric_request_inner(
         .cloned()
         .zip(injected_target_header);
     let refusal_trace_id = trace_id.clone();
-    let caller_did = agent_context
-        .and_then(|ctx| ctx.did.as_deref())
-        .or_else(|| {
-            extension_identity
-                .as_ref()
-                .and_then(|identity| identity.did.as_deref())
-        });
+    let caller_did = response_policy::fabric_send_caller_did(agent_context, extension_identity.as_ref());
     let response_policy = DirectResponsePolicy::for_request(
         &state,
         DirectRequest {

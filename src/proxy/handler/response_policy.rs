@@ -219,6 +219,26 @@ pub(super) fn direct_caller_identity(
     CallerIdentity::from_gateway_computed(caller_did, std::collections::HashMap::new())
 }
 
+/// The caller DID the response policy of a surface with a `fabric://` Target
+/// sees: the agent context's, else the caller's own identity only when it was
+/// verified, never a DID nothing in the request proves.
+pub(super) fn fabric_send_caller_did<'a>(
+    agent: Option<&'a crate::surface_context::AgentContext>,
+    extension_identity: Option<&'a crate::surface_context::ExtensionIdentityContext>,
+) -> Option<&'a str> {
+    agent
+        .and_then(|ctx| ctx.did.as_deref())
+        .or_else(|| {
+            extension_identity
+                .filter(|identity| {
+                    identity
+                        .verification
+                        .is_verified()
+                })
+                .and_then(|identity| identity.did.as_deref())
+        })
+}
+
 /// The direct request a [`DirectResponsePolicy`] decides for.
 pub(super) struct DirectRequest<'a> {
     pub(super) config_id: &'a str,
@@ -301,11 +321,23 @@ impl DirectResponsePolicy {
     /// Evaluates the policy on each part of one Target answer and records one
     /// decision for the answer. `None` is an event-stream answer with an event
     /// that is not JSON, which is refused. Without a policy manager the answer
-    /// goes back unchecked, logged and recorded as an error.
+    /// goes back unchecked, logged and recorded as an error. An answer with no
+    /// part to check (an event stream with no data event) goes back with no
+    /// decision.
     async fn check_each(
         &self,
         responses: Option<Vec<ResponseContext>>,
     ) -> ResponsePolicyDecision {
+        if responses
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+        {
+            return ResponsePolicyDecision {
+                allow: true,
+                reason: None,
+                error: None,
+            };
+        }
         let context = crate::observability::PolicyDecisionEvent {
             surface_id: Some(&self.config_id),
             surface_name: Some(&self.surface.name),
@@ -419,6 +451,174 @@ mod tests {
             identity: None,
             actor_did: Some("did:example:caller"),
         }
+    }
+
+    /// A Target that refuses the plain POST with `405`, so the direct MCP forward
+    /// falls back to Legacy SSE, and answers over its Legacy SSE session: a
+    /// `tools/list` with the tools `get_news` and `summarize`, any other request
+    /// with a result naming a secret.
+    async fn legacy_sse_only_target() -> String {
+        use axum::response::IntoResponse;
+        use axum::response::sse::{Event, Sse};
+        use futures::StreamExt;
+
+        let (events, receiver) = tokio::sync::mpsc::channel::<Event>(16);
+        let receiver = Arc::new(tokio::sync::Mutex::new(Some(receiver)));
+        let app = axum::Router::new()
+            .route(
+                "/sse",
+                axum::routing::get(move || {
+                    let receiver = receiver.clone();
+                    async move {
+                        let Some(receiver) = receiver.lock().await.take() else {
+                            return axum::http::StatusCode::CONFLICT.into_response();
+                        };
+                        let endpoint = futures::stream::once(async {
+                            Event::default()
+                                .event("endpoint")
+                                .data("/messages")
+                        });
+                        Sse::new(
+                            endpoint
+                                .chain(tokio_stream::wrappers::ReceiverStream::new(receiver))
+                                .map(Ok::<_, std::convert::Infallible>),
+                        )
+                        .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/messages",
+                axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                    let events = events.clone();
+                    async move {
+                        if request.get("id").is_some() {
+                            let result = if request["method"] == "tools/list" {
+                                serde_json::json!({"tools": [
+                                    {"name": "get_news", "inputSchema": {"type": "object"}},
+                                    {"name": "summarize", "inputSchema": {"type": "object"}}
+                                ]})
+                            } else {
+                                serde_json::json!({"secret": "s"})
+                            };
+                            let answer = serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
+                            let _ = events
+                                .send(Event::default().data(answer.to_string()))
+                                .await;
+                        }
+                        axum::http::StatusCode::ACCEPTED
+                    }
+                }),
+            )
+            .fallback(|| async { axum::http::StatusCode::METHOD_NOT_ALLOWED });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        url
+    }
+
+    /// An MCP surface on `target` with `target_extra` merged into its Target.
+    fn mcp_surface(
+        target: &str,
+        target_extra: serde_json::Value,
+    ) -> crate::config::agent_surface::AgentSurface {
+        let mut target_config = serde_json::json!({"endpoint": target});
+        if let (Some(config), Some(extra)) = (target_config.as_object_mut(), target_extra.as_object()) {
+            config.extend(extra.clone());
+        }
+        serde_json::from_value(serde_json::json!({
+            "surface_id": "legacy-sse", "name": "legacy-sse",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": target_config
+        }))
+        .unwrap()
+    }
+
+    /// Sends the JSON-RPC `method` call to the MCP Access Point of `surface`
+    /// under `policy_manager`, and returns the status and body.
+    async fn send_mcp(
+        surface: crate::config::agent_surface::AgentSurface,
+        policy_manager: Arc<crate::policies::SurfacePolicyManager>,
+        method: &str,
+    ) -> (axum::http::StatusCode, String) {
+        let mut router = super::super::variant_routing_tests::router(surface);
+        router.policy_manager = Some(policy_manager);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION)
+            .body(axum::body::Body::from(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": {}}).to_string(),
+            ))
+            .unwrap();
+        let response = Box::pin(super::super::multi_channel_proxy_handler_with_mcp_runtime(
+            "127.0.0.1:12345"
+                .parse()
+                .unwrap(),
+            router,
+            request,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            None,
+        ))
+        .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_response_policy_refuses_an_answer_from_a_legacy_sse_session() {
+        let target = legacy_sse_only_target().await;
+        let surface =
+            mcp_surface(&target, serde_json::json!({"response_policy": {"policy_definition_id": "deny-responses"}}));
+
+        let (status, body) = send_mcp(surface, deny_all_manager(), "tools/call").await;
+
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("response_policy_denied"), "{body}");
+        assert!(!body.contains("secret"), "the Target's answer reached the caller: {body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_tool_gating_hides_a_tool_from_a_legacy_sse_tools_list() {
+        let target = legacy_sse_only_target().await;
+        let surface = mcp_surface(
+            &target,
+            serde_json::json!({"mcp_tool_gating": {"default_effect": "deny", "gates": [
+                {"id": "allow-news", "action": {"effect": "allow", "patterns": ["^get_news$"]}}
+            ]}}),
+        );
+        let manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+        manager
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+
+        let (status, body) = send_mcp(surface, manager, "tools/list").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert!(body.contains("get_news"), "{body}");
+        assert!(!body.contains("summarize"), "a gated tool reached the caller: {body}");
+    }
+
+    #[test]
+    fn a_fabric_send_caller_did_comes_only_from_a_verified_identity() {
+        use crate::surface_context::{ExtensionIdentityContext, IdentityVerification};
+        let identity = |verification| ExtensionIdentityContext {
+            verification,
+            did: Some("did:example:caller".to_string()),
+            identity_hash: None,
+        };
+
+        assert_eq!(fabric_send_caller_did(None, Some(&identity(IdentityVerification::Vp))), Some("did:example:caller"));
+        assert_eq!(fabric_send_caller_did(None, Some(&identity(IdentityVerification::Unverified))), None);
+        assert_eq!(fabric_send_caller_did(None, None), None);
     }
 
     #[tokio::test]

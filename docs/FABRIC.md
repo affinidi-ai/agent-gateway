@@ -654,7 +654,11 @@ request received by the destination gateway:
 The sending and receiving gateways enforce their own policies independently. For MCP surfaces, tool
 gating on each side composes: a tool hidden or denied by either surface remains unavailable. The
 same holds for response policies: the answer meets the receiving surface's, then the sending
-surface's.
+surface's. The receiving surface settles a payment it took on its own delivery, so a refusal by
+the sending surface's response policy does not void a payment the receiving surface already
+captured. The sending surface relays the peer's answers marked with an `error` field, and its
+`402`s, without checking them, and checks the peer gateway's own refusals as error answers; see
+[`POLICY.md`](POLICY.md).
 
 Fabric finds the destination surface by id, never by its Access Point route, but a surface reached
 only over Fabric, or used only for its Transit Points, still needs a route a surface prefix serves:

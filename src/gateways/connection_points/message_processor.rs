@@ -22,7 +22,9 @@ use crate::{channel_debug, channel_error, channel_info, channel_warn};
 mod forward_refusal;
 use forward_refusal::ForwardRefusal;
 mod response_policy;
-use response_policy::{FabricResponsePolicy, FabricResponseRequest, FabricToolsListGate, RefusedExchange};
+use response_policy::{
+    FabricResponsePolicy, FabricResponseRequest, FabricToolsListGate, RefusedExchange, answers_with_public_agent_card,
+};
 
 /// Global metrics store for GW2 - set during initialization
 static GLOBAL_METRICS_STORE: OnceCell<Arc<crate::metrics::MetricsStore>> = OnceCell::const_new();
@@ -6045,7 +6047,9 @@ async fn process_charged_forward_request(
 
     // An agent card request at a configured card location goes to that path on the
     // Target's origin, dropping any sub-path of the Target endpoint.
-    let target_url = if (is_agent_card_request || credentialed_card_fetch) && surface.agent_card_location_path().is_some() {
+    let sent_to_card_url =
+        (is_agent_card_request || credentialed_card_fetch) && surface.agent_card_location_path().is_some();
+    let target_url = if sent_to_card_url {
         let url = crate::proxy::handler::agent_card::card_target_url(&surface);
         channel_info!(config_id, "Agent card location override applied: {}", loggable::url(&url));
         url
@@ -7128,44 +7132,6 @@ async fn process_charged_forward_request(
             ) {
                 response_body = filtered;
             }
-            let content_type = response_headers
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-                .and_then(|(_, values)| values.first())
-                .map(String::as_str);
-            if !(crate::proxy::paths::is_public_agent_card_read(method, path)
-                || crate::proxy::handler::is_fabric_card_fetch(&resolved_surface, method, path))
-                && let Some(policy) = response_policy.as_ref()
-                && let Some(refusal) = policy.refusal_of_buffered(status, &response_body, content_type).await
-            {
-                if !is_modern_response {
-                    let request_payload = serde_json::from_slice(&body_bytes).unwrap_or_else(|_| {
-                        serde_json::json!({"_raw_body": String::from_utf8_lossy(&body_bytes), "method": method.to_uppercase()})
-                    });
-                    let surface_id = surface.config_id().unwrap_or(channel_id);
-                    RefusedExchange {
-                        surface_id,
-                        capture_channel: channel_id,
-                        source: message.from_did.as_deref().unwrap_or("unknown"),
-                        destination: &target_url,
-                        caller_identity: caller_identity.as_deref(),
-                        request: &request_payload,
-                        request_bytes,
-                        latency_ms: start_time.elapsed().as_millis() as u64,
-                    }
-                    .record(&serde_json::from_str(crate::proxy::response_policy::DENIED_BODY).unwrap_or_default())
-                    .await;
-                }
-                return refusal;
-            }
-            if let Some((receipt, protocol)) = stream_receipt.as_ref()
-                && let Some(injected) = receipt
-                    .inject_into_json(protocol, response_body.as_bytes())
-                    .and_then(|body| String::from_utf8(body).ok())
-            {
-                response_body = injected;
-                body_modified = true;
-            }
 
             // GW2: Inject trust registry extension into agent card responses for fabric requests
             if (is_agent_card_request || credentialed_card_fetch) && status == 200 && !response_body.is_empty() {
@@ -7344,6 +7310,51 @@ async fn process_charged_forward_request(
                         }
                     }
                 }
+            }
+
+            // The surface's response policy sees the answer as the caller will, after the
+            // response custom metadata, as on the direct path; the payment receipt the
+            // gateway adds comes after it.
+            let content_type = response_headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                .and_then(|(_, values)| values.first())
+                .map(String::as_str);
+            if !answers_with_public_agent_card(
+                method,
+                path,
+                crate::proxy::handler::is_fabric_card_fetch(&resolved_surface, method, path),
+                sent_to_card_url,
+            ) && let Some(policy) = response_policy.as_ref()
+                && let Some(refusal) = policy.refusal_of_buffered(status, &response_body, content_type).await
+            {
+                if !is_modern_response {
+                    let request_payload = serde_json::from_slice(&body_bytes).unwrap_or_else(|_| {
+                        serde_json::json!({"_raw_body": String::from_utf8_lossy(&body_bytes), "method": method.to_uppercase()})
+                    });
+                    let surface_id = surface.config_id().unwrap_or(channel_id);
+                    RefusedExchange {
+                        surface_id,
+                        capture_channel: channel_id,
+                        source: message.from_did.as_deref().unwrap_or("unknown"),
+                        destination: &target_url,
+                        caller_identity: caller_identity.as_deref(),
+                        request: &request_payload,
+                        request_bytes,
+                        latency_ms: start_time.elapsed().as_millis() as u64,
+                    }
+                    .record(&crate::proxy::response_policy::denied_body())
+                    .await;
+                }
+                return refusal;
+            }
+            if let Some((receipt, protocol)) = stream_receipt.as_ref()
+                && let Some(injected) = receipt
+                    .inject_into_json(protocol, response_body.as_bytes())
+                    .and_then(|body| String::from_utf8(body).ok())
+            {
+                response_body = injected;
+                body_modified = true;
             }
 
             // Inject responding gateway DID for fabric-to-fabric connections

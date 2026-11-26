@@ -97,12 +97,24 @@ impl FabricResponsePolicy {
 
     /// Evaluates the policy on each of `responses` with `policy_manager` and
     /// records one decision. Without a policy manager the answer goes back
-    /// unchecked, as on the direct path, logged and recorded as an error.
+    /// unchecked, as on the direct path, logged and recorded as an error. An
+    /// answer with no part to check (an event stream with no data event) goes
+    /// back with no decision.
     async fn check_each_with(
         &self,
         policy_manager: Option<&crate::policies::SurfacePolicyManager>,
         responses: Option<Vec<ResponseContext>>,
     ) -> ResponsePolicyDecision {
+        if responses
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+        {
+            return ResponsePolicyDecision {
+                allow: true,
+                reason: None,
+                error: None,
+            };
+        }
         let context = crate::observability::PolicyDecisionEvent {
             flow: crate::observability::PolicyFlow::Fabric,
             surface_id: Some(&self.surface_id),
@@ -154,6 +166,20 @@ impl FabricResponsePolicy {
     ) -> axum::response::Response {
         crate::proxy::response_policy::a2a_proxy_answer_under(answer, |response| self.check(response)).await
     }
+}
+
+/// Whether the answer to a Fabric request `method` `path` is the public agent
+/// card, which the response policy does not check: a `GET` or `HEAD` of a
+/// well-known card path, or a `GET` of the surface's configured card location
+/// (`card_location_fetch`) that was `sent_to_card_url`. A configured location
+/// sent anywhere else reaches an ordinary Target route, whose answer is checked.
+pub(super) fn answers_with_public_agent_card(
+    method: &str,
+    path: &str,
+    card_location_fetch: bool,
+    sent_to_card_url: bool,
+) -> bool {
+    crate::proxy::paths::is_public_agent_card_read(method, path) || (card_location_fetch && sent_to_card_url)
 }
 
 /// A Fabric exchange whose Target answer the response policy refused, recorded in
@@ -292,6 +318,123 @@ impl FabricToolsListGate<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn neither_response_policy_refusal_counts_as_delivered() {
+        use crate::config::ChannelProtocol;
+        use crate::proxy::handler::agent_pay_gate::delivered;
+        let mcp_proxy_refusal =
+            serde_json::json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32000, "message": "no"}});
+
+        assert!(!delivered(
+            &ChannelProtocol::A2a,
+            axum::http::StatusCode::FORBIDDEN,
+            Some(crate::proxy::response_policy::DENIED_BODY.as_bytes())
+        ));
+        assert!(!delivered(
+            &ChannelProtocol::Mcp,
+            axum::http::StatusCode::OK,
+            Some(
+                mcp_proxy_refusal
+                    .to_string()
+                    .as_bytes()
+            )
+        ));
+    }
+
+    /// Funds agent-pay only held for a peer's request are voided, not captured,
+    /// when the receiving surface's response policy refuses the Target's answer.
+    #[tokio::test]
+    async fn funds_held_for_a_fabric_request_whose_answer_the_response_policy_refuses_are_voided() {
+        use super::super::fabric_transit_tests::{
+            CALLER_KEY, forward_request, forward_response, ran_in_child, receiver, surface,
+        };
+        use crate::payments_ledger::SettleAction;
+        use crate::payments_ledger::settlement::SettlementStatus;
+        use crate::payments_ledger::settlement::tests::{Scripted, answer};
+        use crate::proxy::handler::agent_pay_gate::{install_test_transport, tests::MockGate};
+
+        if ran_in_child("ATG_FABRIC_RESPONSE_POLICY_VOID_CHILD").await {
+            return;
+        }
+        let app = axum::Router::new().fallback(|| async {
+            axum::Json(serde_json::json!({"jsonrpc": "2.0", "id": 7, "result": {"secret": "s"}}))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let target = format!("http://{}", listener.local_addr().unwrap());
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .ok();
+        });
+        let gateway = format!("fabric-response-policy-gate-{}", uuid::Uuid::new_v4());
+        install_test_transport(
+            &gateway,
+            MockGate::answering(
+                200,
+                &[
+                    ("Payment-Receipt", "authorization-receipt"),
+                    ("payment-authorization", "auth-fabric-response-policy"),
+                    ("payment-capture-deadline", "2099-01-01T00:00:00Z"),
+                ],
+                serde_json::json!({}),
+            ),
+        );
+        let settlement = Scripted::settling(vec![answer(SettlementStatus::Voided)]);
+        crate::payments_ledger::settlement::install_test_client(&gateway, settlement.clone());
+        let mut charged = surface("a2a", &target, &[]);
+        charged.target.payment_policy = Some(
+            serde_json::from_value(serde_json::json!({"type": "agent_pay", "payment_gateway_id": gateway,
+                "payment_surface_id": "pay-1", "require_all": true}))
+            .unwrap(),
+        );
+        charged.target.response_policy =
+            Some(serde_json::from_value(serde_json::json!({"policy_definition_id": "deny-every-response"})).unwrap());
+        let policies = crate::policies::SurfacePolicyManager::new();
+        policies
+            .load_policy_text("response:deny-every-response", "package surface.policy\n\ndefault allow := false\n")
+            .unwrap();
+        super::super::init_policy_manager(std::sync::Arc::new(policies)).await;
+        let root = tempfile::tempdir().unwrap();
+        let _receiver = receiver(root.path(), &charged).await;
+        let message = forward_request(
+            root.path(),
+            serde_json::json!({ "x-api-key": CALLER_KEY, "Content-Type": "application/json",
+                "payment-signature": format!("proof-{}", uuid::Uuid::new_v4()) }),
+            serde_json::json!({ "jsonrpc": "2.0", "id": 7, "method": "message/send",
+                "params": { "message": { "role": "user", "messageId": "m-1", "parts": [{ "kind": "text", "text": "hi" }] } } }),
+        );
+
+        let response = forward_response(&message).await;
+
+        assert_eq!(response["status"], 403, "{response}");
+        let mut settled = Vec::new();
+        for _ in 0..200 {
+            settled = settlement
+                .settled
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, action, _)| *action)
+                .collect();
+            if !settled.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(settled, vec![SettleAction::Void]);
+    }
+
+    #[test]
+    fn only_the_public_agent_card_skips_the_response_policy_over_fabric() {
+        assert!(answers_with_public_agent_card("GET", "/a2a/.well-known/agent-card.json", false, false));
+        assert!(answers_with_public_agent_card("GET", "/cards/main.json", true, true));
+        assert!(!answers_with_public_agent_card("GET", "/cards/main.json", true, false));
+        assert!(!answers_with_public_agent_card("POST", "/a2a/.well-known/agent-card.json", false, false));
+        assert!(!answers_with_public_agent_card("GET", "/api?x=/.well-known/agent.json", false, false));
+    }
 
     fn surface_with_response_policies() -> crate::config::agent_surface::AgentSurface {
         let mut surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
