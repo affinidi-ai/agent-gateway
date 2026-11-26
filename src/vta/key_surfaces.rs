@@ -176,7 +176,7 @@ pub fn surfaces(vta_enabled: bool) -> Vec<KeySurface> {
             name: "VTA control key",
             disposition: Disposition::Stays,
             severity: Severity::Forgery,
-            location: "secrets store, or TG_VTA_CONTROL_KEY_SEED, or ephemeral",
+            location: "secrets store, or the `[vta] auth_key_source` file or environment variable, or ephemeral",
             forgeable: "Requests to the trust agent under this gateway's authority",
             rationale: "Cannot move: it is the key that authenticates *to* the trust agent, so \
                         holding it there would be circular. This is the irreducible residue of the \

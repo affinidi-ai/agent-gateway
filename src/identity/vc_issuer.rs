@@ -6609,7 +6609,7 @@ mod live_tests {
     use serde_json::json;
     use std::collections::HashMap;
 
-    const LIVE_SEED_VAR: &str = "VTA_LIVE_CONTROL_SEED";
+    const LIVE_SEED_VAR: &str = "AG_TEST_VTA_LIVE_CONTROL_SEED";
 
     /// Mint a signing key in the granted context and return the config that
     /// names it. Self-contained on purpose: the key is what `keys/sign-jws`
