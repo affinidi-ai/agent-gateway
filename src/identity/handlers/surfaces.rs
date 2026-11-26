@@ -3539,6 +3539,93 @@ fn validate_surface_mcp_tool_gating(surface: &AgentSurface) -> Result<(), Surfac
     Ok(())
 }
 
+/// A variant signs with its surface's choice, so a variant that sets a signing choice of its own
+/// is refused rather than stored and ignored. The surface's own choice is checked with its
+/// references.
+fn refuse_variant_signing(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
+    let variants: Vec<String> = surface
+        .variants
+        .iter()
+        .filter(|variant| {
+            variant
+                .overrides
+                .signing
+                .as_ref()
+                .is_some_and(|signing| !signing.is_empty())
+        })
+        .map(|variant| format!("'{}'", variant.alias))
+        .collect();
+    if variants.is_empty() {
+        return Ok(());
+    }
+    Err(SurfaceApiError::BadRequest(format!(
+        "Surface '{}': variant {} sets signing, which a variant cannot override; a variant signs with its \
+         surface's choice, so remove the variant's signing",
+        surface.name,
+        variants.join(", ")
+    )))
+}
+
+/// The signing choice a surface signs with: its own block, else its issuer's.
+async fn effective_signing(
+    state: &IdentityApiState,
+    surface: &AgentSurface,
+) -> Result<Option<crate::config::agent_surface::SurfaceSigningConfig>, SurfaceApiError> {
+    if let Some(own) = surface
+        .signing
+        .as_ref()
+        .filter(|signing| !signing.is_empty())
+    {
+        return Ok(Some(own.clone()));
+    }
+    let (Some(store), Some(issuer_id)) = (state.issuer_store.as_ref(), surface.issuer_id.as_deref()) else {
+        return Ok(None);
+    };
+    let issuer = crate::issuers::IssuerStore::get(store.as_ref(), issuer_id)
+        .await
+        .map_err(|e| SurfaceApiError::InternalError(format!("issuer `{issuer_id}` could not be read: {e}")))?;
+    Ok(issuer
+        .and_then(|issuer| issuer.signing)
+        .filter(|signing| !signing.is_empty()))
+}
+
+/// A save that changes which signing choice the surface signs with also needs
+/// `key_management.edit`: its own block, or the issuer it follows when it sets
+/// none, so moving `issuer_id` onto an issuer with another signer counts too.
+async fn require_signing_permission(
+    state: &IdentityApiState,
+    stored: Option<&AgentSurface>,
+    surface: &AgentSurface,
+    editor: &super::signing_choice::SigningEditor,
+) -> Result<(), SurfaceApiError> {
+    let same_issuer = stored.is_some_and(|stored| stored.issuer_id == surface.issuer_id);
+    let changed = if same_issuer {
+        super::signing_choice::signing_changed(
+            stored.and_then(|stored| stored.signing.as_ref()),
+            surface.signing.as_ref(),
+        )
+    } else {
+        let before = match stored {
+            Some(stored) => effective_signing(state, stored).await?,
+            None => None,
+        };
+        let after = effective_signing(state, surface).await?;
+        super::signing_choice::signing_changed(before.as_ref(), after.as_ref())
+    };
+    if changed
+        && !editor
+            .may_change_signing()
+            .await
+    {
+        crate::audit::trust_agent_changes::signing_change_refused(
+            crate::audit::events::SigningOwnerKind::Surface,
+            stored.map(|stored| stored.surface_id.as_str()),
+        );
+        return Err(SurfaceApiError::Forbidden(super::signing_choice::SIGNING_CHANGE_FORBIDDEN.to_string()));
+    }
+    Ok(())
+}
+
 /// A variant's Transit Point is enforced with the MCP tool gating, policy,
 /// response policy and per-caller rate limit of the surface's Transit Point of
 /// the same alias, so one that sets any of them to something else is refused
@@ -3619,6 +3706,7 @@ pub async fn create_surface(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
+    signing_editor: super::signing_choice::SigningEditor,
     JsonWithSent(mut surface, _): JsonWithSent<AgentSurface>,
 ) -> Result<
     (StatusCode, axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResponse<AgentSurface>>>),
@@ -3702,6 +3790,9 @@ pub async fn create_surface(
         resource_scope(&scope),
     )
     .await?;
+    // After the references are checked, so an issuer the caller may not
+    // reference is refused the same way whether or not it signs.
+    require_signing_permission(&state, None, &surface, &signing_editor).await?;
     validate_trust_checks(&surface)?;
     super::surface_tenancy::validate_authority_sources(&state, &mut surface, None).await?;
     super::surface_tenancy::validate_external_consent_bindings(&state, &mut surface, None).await?;
@@ -3721,6 +3812,8 @@ pub async fn create_surface(
 
     // Validate MCP Tool Gating regex patterns (base + every variant).
     validate_surface_mcp_tool_gating(&surface)?;
+
+    refuse_variant_signing(&surface)?;
 
     // Re-run the shape check against every resolved variant so a
     // variant override can't blank out a required field unnoticed.
@@ -3833,6 +3926,7 @@ pub async fn update_surface(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
+    signing_editor: super::signing_choice::SigningEditor,
     JsonWithSent(mut surface, sent): JsonWithSent<AgentSurface>,
 ) -> Result<SavedSurface, SurfaceApiError> {
     let store = state
@@ -3884,6 +3978,7 @@ pub async fn update_surface(
         resource_scope(&scope),
         resource_scoped(&delegation),
         management_actor(&caller, &delegation).as_ref(),
+        &signing_editor,
     )
     .await?;
     Ok((
@@ -4677,6 +4772,7 @@ async fn validate_and_save_surface(
     scope: Option<&PatResourceScope>,
     resource_scoped: bool,
     actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
+    signing_editor: &super::signing_choice::SigningEditor,
 ) -> Result<(AgentSurface, Vec<SurfaceWarning>), SurfaceApiError> {
     drop_inbound_api_key_ids(&mut surface);
     // Normalize the route BEFORE the shape check so the historical "missing
@@ -4724,6 +4820,7 @@ async fn validate_and_save_surface(
         existing,
     )?;
     super::surface_tenancy::validate_surface_references(state, &surface, existing, context, scope).await?;
+    require_signing_permission(state, existing, &surface, signing_editor).await?;
     validate_trust_checks(&surface)?;
     super::surface_tenancy::validate_authority_sources(state, &mut surface, existing).await?;
     super::surface_tenancy::validate_external_consent_bindings(state, &mut surface, existing).await?;
@@ -4732,6 +4829,7 @@ async fn validate_and_save_surface(
     let warnings = validate_surface_payment_policies(state.gateway_store.as_ref(), &mut surface, existing).await?;
     validate_delegation_source_auth(&surface)?;
     validate_surface_mcp_tool_gating(&surface)?;
+    refuse_variant_signing(&surface)?;
     validate_resolved_variants(&surface)?;
     reject_target_trust_checks_unless_target_runs_them(&surface)?;
     validate_workload_binding_config(&surface)?;
@@ -4875,6 +4973,7 @@ pub async fn patch_surface(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
+    signing_editor: super::signing_choice::SigningEditor,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<SavedSurface, SurfaceApiError> {
@@ -4925,6 +5024,7 @@ pub async fn patch_surface(
         resource_scope(&scope),
         resource_scoped(&delegation),
         management_actor(&caller, &delegation).as_ref(),
+        &signing_editor,
     )
     .await?;
     Ok((
@@ -4966,6 +5066,7 @@ pub async fn patch_variant(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
+    signing_editor: super::signing_choice::SigningEditor,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<SavedSurface, SurfaceApiError> {
@@ -5045,6 +5146,7 @@ pub async fn patch_variant(
         resource_scope(&scope),
         resource_scoped(&delegation),
         management_actor(&caller, &delegation).as_ref(),
+        &signing_editor,
     )
     .await?;
     Ok((
@@ -5712,6 +5814,7 @@ pub async fn create_variant(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
+    signing_editor: super::signing_choice::SigningEditor,
     Json(body): Json<CreateVariantRequest>,
 ) -> Result<
     (StatusCode, axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResponse<SurfaceVariant>>>),
@@ -5795,6 +5898,7 @@ pub async fn create_variant(
         resource_scope(&scope),
         resource_scoped(&delegation),
         management_actor(&caller, &delegation).as_ref(),
+        &signing_editor,
     )
     .await?;
     let new_variant = saved
@@ -5830,6 +5934,7 @@ pub async fn update_variant(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
+    signing_editor: super::signing_choice::SigningEditor,
     JsonWithSent(body, sent): JsonWithSent<UpdateVariantRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResponse<SurfaceVariant>>>), SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
@@ -5964,6 +6069,7 @@ pub async fn update_variant(
         resource_scope(&scope),
         resource_scoped(&delegation),
         management_actor(&caller, &delegation).as_ref(),
+        &signing_editor,
     )
     .await?;
 
@@ -5999,6 +6105,7 @@ pub async fn delete_variant(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
+    signing_editor: super::signing_choice::SigningEditor,
 ) -> Result<Json<DeleteSurfaceResponse>, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
@@ -6047,6 +6154,7 @@ pub async fn delete_variant(
         resource_scope(&scope),
         resource_scoped(&delegation),
         management_actor(&caller, &delegation).as_ref(),
+        &signing_editor,
     )
     .await?;
 
@@ -6074,6 +6182,7 @@ pub async fn promote_variant_to_default(
     scope: Option<Extension<PatResourceScope>>,
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
+    signing_editor: super::signing_choice::SigningEditor,
 ) -> Result<SavedSurface, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
@@ -6114,6 +6223,7 @@ pub async fn promote_variant_to_default(
         resource_scope(&scope),
         resource_scoped(&delegation),
         management_actor(&caller, &delegation).as_ref(),
+        &signing_editor,
     )
     .await?;
 
@@ -9077,6 +9187,7 @@ mod validation_tests {
             mcp_legacy_metadata_output: None,
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
+            signing: None,
             caller_key: None,
             trust_check_split: false,
             transit_point_source_auth: false,
@@ -12994,6 +13105,38 @@ mod tests {
         let mut after = surface_recording(&["tr-1"]);
         after.name = "renamed".into();
         assert!(!trust_recorder_changed(&before, &after));
+    }
+
+    fn surface_with_variant_overrides(overrides: serde_json::Value) -> AgentSurface {
+        AgentSurface {
+            name: "signed".into(),
+            variants: vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "v-beta", "alias": "beta", "name": "beta", "enabled": true, "overrides": overrides
+                }))
+                .unwrap(),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_variant_that_sets_signing_is_refused_on_save() {
+        let surface = surface_with_variant_overrides(serde_json::json!({
+            "signing": {"backend": "vta", "connection_id": "vta-a", "context_id": "ctx-a", "key_id": "key-a"}
+        }));
+        let Err(SurfaceApiError::BadRequest(message)) = refuse_variant_signing(&surface) else {
+            panic!("a variant's signing must not be saved");
+        };
+        assert!(message.contains("variant 'beta' sets signing"), "{message}");
+    }
+
+    #[test]
+    fn a_variant_without_signing_or_with_an_empty_block_is_saved() {
+        refuse_variant_signing(&surface_with_variant_overrides(serde_json::json!({})))
+            .expect("a variant that sets no signing is saved");
+        refuse_variant_signing(&surface_with_variant_overrides(serde_json::json!({"signing": {}})))
+            .expect("an empty block sets nothing");
     }
 
     #[test]

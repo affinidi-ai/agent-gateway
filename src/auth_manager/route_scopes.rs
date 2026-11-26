@@ -208,6 +208,24 @@ pub(crate) const ROUTE_SCOPES: &[RouteScope] = &[
     (ANY, "/v1/departments/{id}/register-trust-registry", &[IssuersEdit]),
     (ANY, "/v1/admin/departments/migrate-to-webvh", &[IssuersEdit]),
 
+    // Verifiable Trust Agent connections and key management
+    ("POST", "/v1/vta/connections", &[VtaConnectionsEdit]),
+    ("GET", "/v1/vta/connections", &[VtaConnectionsView]),
+    ("GET", "/v1/vta/connections/{id}", &[VtaConnectionsView]),
+    ("PUT", "/v1/vta/connections/{id}", &[VtaConnectionsEdit]),
+    ("DELETE", "/v1/vta/connections/{id}", &[VtaConnectionsDelete]),
+    ("POST", "/v1/vta/connections/{id}/pair", &[VtaConnectionsEdit]),
+    ("POST", "/v1/vta/connections/{id}/verify", &[VtaConnectionsEdit]),
+    ("POST", "/v1/vta/connections/{id}/revoke", &[VtaConnectionsDelete]),
+    ("GET", "/v1/vta/connections/{id}/status", &[VtaConnectionsView]),
+    ("POST", "/v1/vta/connections/{id}/rotate", &[KeyManagementEdit]),
+    ("POST", "/v1/vta/connections/{id}/control-key/rotate", &[KeyManagementEdit]),
+    ("POST", "/v1/vta/connections/{id}/control-key/rotate/cancel", &[KeyManagementEdit]),
+    ("POST", "/v1/vta/connections/{id}/keys", &[KeyManagementEdit]),
+    ("GET", "/v1/vta/status", &[VtaConnectionsView]),
+    ("POST", "/v1/vta/control-key/rotate", &[KeyManagementEdit]),
+    ("GET", "/v1/key-management/inventory", &[KeyManagementView]),
+
     // Authorities
     ("GET", "/v1/authorities", &[AuthoritiesView]),
     ("POST", "/v1/authorities", &[AuthoritiesEdit]),

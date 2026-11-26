@@ -67,9 +67,13 @@ describe('AgentPayRoute', () => {
 });
 
 describe('connectionsPermissions', () => {
-  it('admits a payment-gateways-only caller only while agent-pay is on', () => {
-    expect(connectionsPermissions(true)).toEqual(['gateways.view', 'payment_gateways.view']);
-    expect(connectionsPermissions(false)).toEqual(['gateways.view']);
+  it('admits a payment-gateways-only caller only while agent-pay is on, and a trust-agents-only caller always', () => {
+    expect(connectionsPermissions(true)).toEqual([
+      'gateways.view',
+      'payment_gateways.view',
+      'vta_connections.view',
+    ]);
+    expect(connectionsPermissions(false)).toEqual(['gateways.view', 'vta_connections.view']);
   });
 });
 

@@ -87,6 +87,15 @@ module.exports = {
                 name: "vendors",
                 priority: 20,
               },
+              // The Surface Builder, shared by the surface pages and the onboarding wizard.
+              // Kept out of `common` so neither chunk passes the 1 MB asset limit.
+              surfaceBuilder: {
+                test: /[\\/]src[\\/]components[\\/]surface-builder[\\/]/,
+                name: "surface-builder",
+                minChunks: 2,
+                priority: 15,
+                reuseExistingChunk: true,
+              },
               // Common code shared across multiple routes
               common: {
                 minChunks: 2,

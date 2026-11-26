@@ -38,6 +38,8 @@ export function usePolicyInputCaptureFlag(): {
   };
 }
 
-/** Permissions any one of which opens Connections: a payment-gateways-only caller only while agent-pay is on. */
+/** Permissions any one of which opens Connections: a payment-gateways-only caller only while agent-pay is on, and a trust-agents-only caller always. */
 export const connectionsPermissions = (agentPayOn: boolean): readonly string[] =>
-  agentPayOn ? ['gateways.view', 'payment_gateways.view'] : ['gateways.view'];
+  agentPayOn
+    ? ['gateways.view', 'payment_gateways.view', 'vta_connections.view']
+    : ['gateways.view', 'vta_connections.view'];

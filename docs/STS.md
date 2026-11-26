@@ -76,7 +76,7 @@ VP (`urn:affinidi:params:oauth:token-type:vp`).
   credential, `assertionMethod` or `authentication` for the presentation); a VP
   that breaks this is refused like one with a bad signature (see
   [Peer issuer DIDs](FABRIC.md#peer-issuer-dids)).
-- **Issued tokens** are EdDSA-signed via `VCIssuer::sign_jwt_with_gateway_key`,
+- **Issued tokens** are EdDSA-signed via `VCIssuer::sign_jwt_with_gateway_key`, which signs through the VTA signing library (see [Local signing](TRUST_AGENT_SIGNING.md#local-signing)),
   verifiable by resolving the gateway DID document or the JWKS endpoint. An
   issued **ID-JAG additionally carries the explicit JOSE `typ:
   oauth-id-jag+jwt` header** (`ID_JAG_JWT_TYP`, via
@@ -172,7 +172,12 @@ own DID) is verified against the gateway's **own published JWKS automatically**
 strategy from `signing_public_jwks()` when `iss == get_issuer_did()`), so
 loopback redemption where the issuer and the redeeming resource-AS are the same
 gateway needs **no** operator-configured verification strategy for the gateway's
-own DID; genuinely external issuers still resolve a configured strategy by `iss`
+own DID. The same self-trust covers an `iss` that is an earlier issuer DID of this
+gateway (a signer Gateway signing moved off within the last 20 minutes, or the current
+signer while it cannot be resolved, each only while its trust agent connection is still in
+use, the `[vta]` key, or the gateway's own key while a token it signed may be outstanding) and a
+`did:key` whose key the gateway publishes, each verified against the published JWKS;
+see [`TRUST_AGENT_SIGNING.md`](TRUST_AGENT_SIGNING.md#publication). Genuinely external issuers still resolve a configured strategy by `iss`
 — then required to be an actual ID-JAG — explicit `typ: oauth-id-jag+jwt`
 (`parse_jose_typ`), `aud` = this gateway, present `jti`, unexpired `exp`
 (`validate_id_jag`, which **requires `jti`**). The grant's remaining lifetime

@@ -134,6 +134,18 @@ flowchart LR
 | **Trust registry injection**              | Rules that attach trust-registry metadata to supported requests or responses.                                                                                                                                                                                       |
 | **Recorder status**                       | The last known outcome of a surface's Trust Recorder for one managed agent identity: Recorded, Partly recorded, Failed, Skipped or Not attempted yet. It is not a live check of the trust registry. See [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#recorder-status). |
 
+## Trust agent
+
+| Term | Meaning |
+| --- | --- |
+| **Trust agent** (VTA) | A Verifiable Trust Agent: a service that holds private keys and signs on request, within an access entry's grant. The gateway delegates its signing to one so that many stealable keys become one authority that can be withdrawn. It is a key-management improvement, not by itself a custody claim. _Avoid: signer, vault._ |
+| **Local signing** | What the gateway does with its own keys when no trust agent signs for it: the keys and DIDs stay as they are on disk, and every signature is made by the VTA library running inside the gateway process. It holds no custody claim: the keys are on the gateway's own host. _Avoid: embedded trust agent, built-in trust agent._ |
+| **Gateway signing** | The gateway-wide default signing key source (`default_signing` in the settings, Settings → Security → Gateway signing): what signs tokens, ID-JAGs, credentials, payment evidence and the issuer attestation for every surface and issuer that sets no source of its own. Changing it changes the issuer DID of what is issued from then on. _Avoid: audit signing._ |
+| **Control key** | The key the gateway authenticates to a trust agent with. When it is a `did:key` held in a file it is rotated with `acl/swap-key`, on demand or on an optional schedule. _Avoid: auth key, admin key._ |
+| **Signing key source** | What signs for a surface, an issuer or the whole gateway: **Gateway secret** (the gateway's own key) or **Verifiable Trust Agent** (a key in a connected trust agent, named by connection, context and key). A surface that sets none follows its issuer, then Gateway signing. _Avoid: signer type, key backend._ |
+| **Trust agent connection** | The gateway's record of one trust agent: its endpoint, DID, control key, pairing state and signing keys (`/v1/vta/connections`). The `[vta]` block's own agent is the connection `vta-bootstrap`. Tenant-owned or appliance-wide. _Avoid: VTA config, VTA link._ |
+| **Trust agent context** | A namespace inside a trust agent that holds keys and signs as one DID; a credential signed in it names that DID as its issuer. _Avoid: VTA tenant, VTA account._ |
+
 ## Terms and consent
 
 | Term                        | Meaning                                                                                                                                                    |
@@ -209,7 +221,7 @@ Gateway OPA runs before surface-level or transit-level OPA, and a gateway deny i
 | **Gateway record** | A stored record describing one gateway: its DID, type, status, exposure mode and exposed surfaces, and gateway-level OPA policy. The persisted `exposed_channels` field is a legacy code/wire name for exposed surfaces. Distinct from a Gateway instance. |
 | **Self gateway**   | The Gateway record representing the local Gateway instance.                                                                                                           |
 | **Remote gateway** | A Gateway record representing a peer Gateway instance in the fabric.                                                                                                  |
-| **Issuer**         | The ownership unit for surfaces. Carries a DID and DID document.                                                                                                      |
+| **Issuer**         | The ownership unit for surfaces. Carries a DID and DID document, and may set which backend signs for the surfaces it owns (local, or a connected trust agent).        |
 | **Mediator**       | A stored record describing a DIDComm mediator.                                                                                                                        |
 | **Event hook**     | A single receiver URL that the gateway calls whenever a Connection Point is created, connects, or is deleted, so a service deployed alongside the gateway can react. The Deployment operator sets it through environment variables; dashboard users cannot change it. Events are sent in the background and retried a few times, so a slow or unavailable receiver never delays or fails the request. Not a webhook integration, which a dashboard user creates for their own notifications. |
 | **Mediator directory** | A list of extra mediators the gateway reads from one operator-configured URL and shows next to the mediators stored on it. Entries are read-only until a Connection Point is created on one, which then stores a provided record that does not count toward the mediator limit. A mediator the operator stored for the same DID is a separate row. Set through an environment variable, like the event hook. |

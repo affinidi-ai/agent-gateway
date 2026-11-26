@@ -733,6 +733,24 @@ fn write_single_surface_config_inner(
                     .as_deref()
             }),
     );
+    if let Some(setup) = &surface_config.control_key_trust_agent {
+        write_trust_agent_block(base_dir, setup, surface_config.control_key_rotation_days);
+    }
+    if let Some(secs) = surface_config.connection_key_switch_timeout_secs {
+        let path = base_dir.join("config.toml");
+        let mut config = std::fs::read_to_string(&path).unwrap();
+        config.push_str(&format!("\n[vta]\nconnection_key_switch_timeout_secs = {secs}\n"));
+        std::fs::write(&path, config).unwrap();
+    }
+    if let Some(hosting) = surface_config.context_did_webvh_hosting {
+        let path = base_dir.join("config.toml");
+        let mut config = std::fs::read_to_string(&path).unwrap();
+        config.push_str(&format!(
+            "\n[vta]\ncontext_did_method = \"did_webvh\"\ncontext_did_hosting = \"{hosting}\"\n\
+             context_did_server_id = \"host-1\"\n"
+        ));
+        std::fs::write(&path, config).unwrap();
+    }
     if surface_config.logs_at_info {
         log_info(base_dir);
     } else if surface_config.keeps_gateway_log {
@@ -824,6 +842,29 @@ fn edit_gateway_json(
     let mut gateway: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     edit(&mut gateway);
     std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
+}
+
+/// Appends the `[vta]` table of a gateway configured against `setup.base_url`, with its
+/// control key in a file.
+fn write_trust_agent_block(
+    base_dir: &Path,
+    setup: &super::single_surface_fixture::ControlKeyTrustAgentSetup,
+    rotation_days: Option<u32>,
+) {
+    let path = base_dir.join("config.toml");
+    let mut config = std::fs::read_to_string(&path).unwrap();
+    config.push_str(&format!(
+        "\n[vta]\nenabled = true\nbase_url = \"{}\"\nvta_did = \"{}\"\ncontext_id = \"gateway\"\n\
+         signing_key_id = \"gateway-jwt-1\"\ncontrol_did_method = \"{}\"\nauth_key_source = \"file://{}\"\n",
+        setup.base_url,
+        crate::bdd_support::trust_agent::TRUST_AGENT_DID,
+        setup.control_did_method,
+        setup.key_path.display(),
+    ));
+    if let Some(days) = rotation_days {
+        config.push_str(&format!("control_key_rotation_days = {days}\n"));
+    }
+    std::fs::write(&path, config).unwrap();
 }
 
 /// Lowers the gateway's log level from the harness default `error` to `info`.

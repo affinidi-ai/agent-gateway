@@ -224,7 +224,7 @@ fn get_response_headers_value(world: &SurfaceWorld) -> &HashMap<String, String> 
     &get_caller_response(world).headers
 }
 
-fn get_response_body_value(world: &SurfaceWorld) -> &serde_json::Value {
+pub(crate) fn get_response_body_value(world: &SurfaceWorld) -> &serde_json::Value {
     &get_caller_response(world).body
 }
 
@@ -2210,7 +2210,7 @@ fn both_responses_same_did(world: &mut SurfaceWorld) {
     );
 }
 
-fn get_mcp_request_for_actor<'a>(
+pub(crate) fn get_mcp_request_for_actor<'a>(
     world: &'a SurfaceWorld,
     server_name: &str,
 ) -> &'a crate::bdd_support::mock_server::ReceivedRequest {

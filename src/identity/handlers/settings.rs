@@ -104,21 +104,70 @@ async fn require_settings_edit(
     storage: &PasskeyStorage,
     rbac_config: &RbacConfig,
 ) -> Result<(), AppError> {
+    require_permission(user_id, storage, rbac_config, &Feature::SettingsEdit, None).await
+}
+
+/// Whether the calling user's role holds `feature` and, for a request made with an access token,
+/// the token's scopes include it.
+async fn require_permission(
+    user_id: &str,
+    storage: &PasskeyStorage,
+    rbac_config: &RbacConfig,
+    feature: &Feature,
+    pat: Option<&crate::auth_manager::pat::PatContext>,
+) -> Result<(), AppError> {
     let user = storage
         .load_user_by_id(user_id)
         .await
         .map_err(|e| AppError::InternalError(format!("Failed to load user for RBAC check: {}", e)))?
         .ok_or_else(|| AppError::BadRequest("User not found".to_string()))?;
 
-    if !rbac_config.has_permission(&user.role, &Feature::SettingsEdit) {
+    if !rbac_config.has_permission(&user.role, feature)
+        || !crate::auth_manager::middleware::pat_scope_allows(pat, feature)
+    {
         warn!(
             user_id = %user_id,
-            feature = "settings.edit",
+            feature = %feature.as_str(),
             "System settings modification rejected — insufficient permissions"
         );
         return Err(AppError::Forbidden("Insufficient permissions".to_string()));
     }
     Ok(())
+}
+
+/// Records a refused change of the gateway-wide signing choice.
+fn signing_change_refused(error: &AppError) {
+    if matches!(error, AppError::Forbidden(_)) {
+        crate::audit::trust_agent_changes::signing_change_refused(
+            crate::audit::events::SigningOwnerKind::GatewayDefault,
+            None,
+        );
+    }
+}
+
+/// The gateway-wide signing choice is checked like a surface's or an issuer's, and may only
+/// sign through a trust agent connection that belongs to the whole appliance.
+async fn validate_default_signing(
+    state: &IdentityApiState,
+    signing: &crate::config::agent_surface::SurfaceSigningConfig,
+) -> Result<(), AppError> {
+    use super::signing_choice::{SigningChoiceError, SigningOwner, validate_signing_choice};
+
+    validate_signing_choice(
+        signing,
+        SigningOwner::Appliance,
+        state
+            .vta_connection_store
+            .as_deref(),
+        &state.bootstrap_config.vta,
+    )
+    .await
+    .map_err(|error| match error {
+        SigningChoiceError::Invalid(message) => {
+            AppError::BadRequest(format!("default_signing is not valid: {message}"))
+        }
+        SigningChoiceError::Store(message) => AppError::InternalError(message),
+    })
 }
 
 /// Update settings request
@@ -134,6 +183,10 @@ pub struct UpdateSettingsRequest {
     pub log_timestamp_format: Option<String>,
     pub bucket_seconds: Option<u64>,
     pub feature_flags: Option<HashMap<String, bool>>,
+    /// Appliance-wide signing backend. An **empty** object clears it, returning
+    /// the appliance to whatever `[vta]` resolves, so the UI can offer "back to
+    /// default" without a second endpoint. Omitting the field leaves it alone.
+    pub default_signing: Option<crate::config::agent_surface::SurfaceSigningConfig>,
     pub prometheus_auth_enabled: Option<bool>,
     pub prometheus_auth_username: Option<String>,
     /// Plaintext password — hashed with bcrypt before storing.
@@ -150,6 +203,7 @@ pub async fn update_settings(
     Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
     State(state): State<IdentityApiState>,
+    pat: Option<Extension<crate::auth_manager::pat::PatContext>>,
     Json(req): Json<UpdateSettingsRequest>,
 ) -> Result<Json<DashboardSettings>, AppError> {
     // RBAC: require settings.edit permission
@@ -188,6 +242,32 @@ pub async fn update_settings(
     }
     if let Some(flags) = req.feature_flags {
         settings.feature_flags = flags;
+    }
+    if let Some(signing) = req.default_signing {
+        // An empty block means "no appliance override", which is how the UI
+        // returns to the `[vta]`-resolved default.
+        let signing = (!signing.is_empty()).then_some(signing);
+        if super::signing_choice::signing_changed(
+            settings
+                .default_signing
+                .as_ref(),
+            signing.as_ref(),
+        ) {
+            require_permission(
+                &user_id,
+                &passkey_storage,
+                &rbac_config,
+                &Feature::KeyManagementEdit,
+                pat.as_ref()
+                    .map(|Extension(pat)| pat),
+            )
+            .await
+            .inspect_err(signing_change_refused)?;
+        }
+        if let Some(signing) = &signing {
+            validate_default_signing(&state, signing).await?;
+        }
+        settings.default_signing = signing;
     }
     if let Some(enabled) = req.prometheus_auth_enabled {
         if enabled
@@ -281,12 +361,34 @@ pub async fn reset_settings(
     Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
     State(state): State<IdentityApiState>,
+    pat: Option<Extension<crate::auth_manager::pat::PatContext>>,
 ) -> Result<Json<DashboardSettings>, AppError> {
     // RBAC: require settings.edit permission
     require_settings_edit(&user_id, &passkey_storage, &rbac_config).await?;
 
     // Reset to default settings
     let default_settings = DashboardSettings::default();
+    if super::signing_choice::signing_changed(
+        state
+            .settings_store
+            .get()
+            .default_signing
+            .as_ref(),
+        default_settings
+            .default_signing
+            .as_ref(),
+    ) {
+        require_permission(
+            &user_id,
+            &passkey_storage,
+            &rbac_config,
+            &Feature::KeyManagementEdit,
+            pat.as_ref()
+                .map(|Extension(pat)| pat),
+        )
+        .await
+        .inspect_err(signing_change_refused)?;
+    }
 
     // Update and save
     state

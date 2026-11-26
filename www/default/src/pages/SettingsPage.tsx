@@ -10,6 +10,7 @@ import SystemSettingsTab from './SettingsPage/SystemSettingsTab';
 import SystemTab from './SettingsPage/SystemTab';
 import NetworkingTab from './SettingsPage/NetworkingTab';
 import VpAuditTab from './SettingsPage/VpAuditTab';
+import { GatewaySigningSection } from './SettingsPage/GatewaySigningSection';
 import LimitsTab from './SettingsPage/LimitsTab';
 import UsersPage from './UsersPage';
 import TermsPage from './TermsPage';
@@ -391,6 +392,7 @@ const SettingsPage: React.FC = () => {
               </>
             }
           >
+            <GatewaySigningSection />
             <VpAuditTab settings={state.settings} updateSettings={actions.updateSettings} />
           </Tab>
         )}
