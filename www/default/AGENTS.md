@@ -1898,9 +1898,10 @@ surface has been deleted." (`api-key-surface-deleted-info`) at the top of Key In
 The Secrets page's **Key Management** tab (`?tab=key-management`,
 `key-management-tab-trigger`, `pages/SecretsPage/KeyManagementTab.tsx`) is shown only with
 `key_management.view` and reads `GET /v1/key-management/inventory`. It opens with a status alert
-naming the deployment tier and, from `custody_claim`, either "Signing keys are held by a
-separately-operated trust agent; the gateway keeps only the key it signs in to that agent with."
-or, while anything still signs with the gateway's own key, "Some tokens are still signed with the
+naming the deployment tier and, from `custody_claim`, either "The tokens and credentials the
+gateway issues as itself are signed by a separately-operated trust agent. Some keys stay on the
+gateway, such as the key it signs in to that agent with and those of agents onboarded before it
+was connected." or, while anything still signs with the gateway's own key, "Some tokens are still signed with the
 gateway's own key, so not every signing key is held by a separate party.", then one card
 per trust agent connection the caller may see (its keys with `kid`, status, public key and
 retirement, `KeyManagementTables.tsx`), a **Surface mapping** card (which backend, context and key

@@ -162,7 +162,7 @@ const KeyManagementTab: React.FC = () => {
         <div>
           <strong>Deployment: {inventory.tier}.</strong>{' '}
           {inventory.custody_claim
-            ? 'Signing keys are held by a separately-operated trust agent; the gateway keeps only the key it signs in to that agent with.'
+            ? 'The tokens and credentials the gateway issues as itself are signed by a separately-operated trust agent. Some keys stay on the gateway, such as the key it signs in to that agent with and those of agents onboarded before it was connected.'
             : "Some tokens are still signed with the gateway's own key, so not every signing key is held by a separate party."}
         </div>
       </div>

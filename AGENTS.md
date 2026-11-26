@@ -216,8 +216,9 @@ gateway-wide default. On a surface or issuer the field is read-only without
 `key_management.edit`. See _Signing key source_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#signing-key-source).
 
-The Secrets page's Key Management tab says the signing keys are held by a separately operated
-trust agent only while `custody_claim` is true, and otherwise that some tokens are still signed
+The Secrets page's Key Management tab says the tokens and credentials the gateway issues as
+itself are signed by a separately operated trust agent, and that some keys stay on the gateway,
+only while `custody_claim` is true, and otherwise that some tokens are still signed
 with the gateway's own key; the connect wizard's Complete step points to **Settings → Security →
 Gateway signing** for changing the default later. See _Key Management tab_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#key-management-tab).
