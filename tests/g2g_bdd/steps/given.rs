@@ -353,6 +353,23 @@ pub async fn gateway_has_surface_backed_by_mcp_proxy(
         .bind_target_to_surface(&target_name, gw_index, &surface_id);
 }
 
+#[given(expr = "the MCP proxy of surface {string} offers the weather tools")]
+pub fn mcp_proxy_offers_the_weather_tools(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    let (gw_index, surface_id) = world.surface(&surface_name);
+    let spec = world
+        .topology
+        .plan_mut(gw_index)
+        .surfaces
+        .iter_mut()
+        .find(|spec| spec.surface_id == surface_id)
+        .and_then(|spec| spec.mcp_proxy.as_mut())
+        .unwrap_or_else(|| panic!("surface '{surface_id}' has no MCP proxy"));
+    spec.openapi_spec = Some(crate::bdd_support::config::mcp_proxy::WEATHER_OPENAPI_SPEC.to_string());
+}
+
 /// The reference server the MCP conformance harness serves; `run.sh` passes
 /// the shim in front of it as `MCP_CONFORMANCE_UPSTREAM_URL`. The surface has
 /// no mock target.

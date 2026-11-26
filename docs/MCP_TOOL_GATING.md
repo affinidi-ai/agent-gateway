@@ -153,11 +153,15 @@ and policies. Set new gating on the surface's Transit Point.
   pass-through would bypass the response-leg filter/gating entirely (other SSE
   responses still stream through untouched). The buffered stream gets the
   upstream response bounds (`docs/PROTOCOLS.md`): `502` over
-  `a2a.max_body_size`, `504` on an idle gap or past `request_secs`.
+  `a2a.max_body_size`, `504` on an idle gap or past `request_secs`. When the
+  Target refuses the plain POST and the gateway answers through a Legacy SSE
+  session instead, the per-tool policies and gating filter that `tools/list`
+  answer too (`filter_direct_tools_list` in `src/proxy/handler/response_policy.rs`).
 - **Fail-closed shape**: the Transit Point, `fabric://` send and Fabric receive
   gating sites build their un-inspectable `tools/list` reply with
   `crate::mcp::fail_closed_tools_list` (the direct Access Point passes an
-  unparsable response through), which echoes the request id rather than
+  unparsable response through, except one from a Legacy SSE session, which it
+  also fails closed), which echoes the request id rather than
   answering `id: null` and adds `resultType` plus private cache hints when the
   request was admitted as modern. **Cache scope**: a caller-scoped gate makes
   the list authorization-dependent even when it removes nothing, so a modern
@@ -199,7 +203,11 @@ and policies. Set new gating on the surface's Transit Point.
   the `ForwardResponse` (the response is already de-SSE'd on this leg, so SSE
   targets are covered). Both build their input via the shared
   `build_fabric_gating_input` (mirrors the direct-path `PolicyInput`) and reuse
-  `CompiledMcpToolGating::filter_tools_list_value`. Without this a deny-by-default
+  `CompiledMcpToolGating::filter_tools_list_value`. The same filter runs, through
+  `FabricToolsListGate` in `message_processor/response_policy.rs`, on the
+  `tools/list` answer an MCP Target gives through a Legacy SSE session (both
+  return paths) and on an MCP proxy (`proxy://`) Target's answer, each before the
+  surface's response policy sees it. Without this a deny-by-default
   surface would still expose and execute every tool for a cross-gateway caller.
 - **G2G (`fabric://`) send leg** — a surface whose *own* target is `fabric://` is
   forwarded to the remote gateway from

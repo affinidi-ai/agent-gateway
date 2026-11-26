@@ -303,7 +303,12 @@ fn a2a_proxy_answer_is_checked(
     status: axum::http::StatusCode,
     body: &[u8],
 ) -> bool {
-    status.is_success() && !serde_json::from_slice::<Value>(body).is_ok_and(|answer| answer.get("error").is_some())
+    status.is_success()
+        && !serde_json::from_slice::<Value>(body).is_ok_and(|answer| {
+            answer
+                .get("error")
+                .is_some_and(|error| !error.is_null())
+        })
 }
 
 /// An `a2a-proxy://` `answer`, or [`denied_response`] when `check` refuses it.
@@ -713,6 +718,17 @@ mod tests {
 
         assert_eq!(status, 200);
         assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), sent);
+    }
+
+    #[tokio::test]
+    async fn an_a2a_proxy_answer_with_a_null_error_is_checked() {
+        let answer =
+            a2a_answer(serde_json::json!({"jsonrpc": "2.0", "id": 1, "error": null, "result": {"secret": "s"}}));
+
+        let (status, body) = answered(a2a_proxy_answer_under(answer, |_| async { decided(false) }).await).await;
+
+        assert_eq!(status, 403);
+        assert_eq!(body, DENIED_BODY);
     }
 
     #[tokio::test]

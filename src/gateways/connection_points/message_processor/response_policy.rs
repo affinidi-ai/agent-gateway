@@ -194,6 +194,23 @@ impl FabricToolsListGate<'_> {
         )
         .unwrap_or(answer)
     }
+
+    /// The JSON `answer` to a `tools/list` without the tools MCP tool gating
+    /// hides from this caller; the answer to any other request, unchanged.
+    pub(super) fn apply_value(
+        &self,
+        answer: Value,
+    ) -> Value {
+        if !crate::mcp::is_tools_list_request(&self.request_body) {
+            return answer;
+        }
+        let gated = self.apply(answer.to_string());
+        serde_json::from_str(&gated).unwrap_or_else(|error| {
+            tracing::warn!(%error, "MCP tool gating could not read the gated tools/list answer; failing closed");
+            serde_json::from_str(&crate::mcp::fail_closed_tools_list(&self.request_body, self.metadata))
+                .expect("the fail-closed tools/list answer is JSON")
+        })
+    }
 }
 
 #[cfg(test)]

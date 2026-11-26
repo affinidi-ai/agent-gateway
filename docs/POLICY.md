@@ -888,8 +888,10 @@ event, each event's JSON as `input.response.body`, directly and over Fabric, and
 any event is denied; one decision is recorded for the answer. On a `tools/list` answer the
 policy sees the list after MCP tool gating has removed the tools the caller may not see,
 directly and over Fabric, on every Target kind. Responses the gateway makes itself are not
-checked, nor is an agent card, nor an empty answer from a Legacy SSE session (the answer to a
-notification). A denied answer is refused with `403 response_policy_denied`, or, on an MCP
+checked, nor is the public agent card (a request for `/.well-known/agent-card.json` or another
+well-known card path, or over Fabric the surface's configured card location), nor an empty
+answer from a Legacy SSE session (the answer to a notification). Other discovery documents and
+an extended agent card are checked. A denied answer is refused with `403 response_policy_denied`, or, on an MCP
 Proxy Target, with a JSON-RPC `-32000` error that carries the deny reason. A denied modern MCP
 result ends its stream when the Target answered with an event stream, and is refused with
 `502` when it answered with a single JSON response. Without a policy manager to evaluate it

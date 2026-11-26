@@ -6491,11 +6491,6 @@ async fn proxy_charged_request(
         start_time,
     };
 
-    // A2A Proxy target adapter: the surface remains the public A2A/AP2 endpoint,
-    // while the target endpoint dispatches to an internal configured adapter.
-    // Dispatch happens after the normal gateway/source-auth/body/trust/OPA
-    // controls above, but before any network upstream request is built. The
-    // payment is taken once the proxy is known to be there to serve it.
     let response_policy = DirectResponsePolicy::for_request(
         &state,
         DirectRequest {
@@ -6512,6 +6507,11 @@ async fn proxy_charged_request(
             actor_did: request_agent_did.as_deref(),
         },
     );
+    // A2A Proxy target adapter: the surface remains the public A2A/AP2 endpoint,
+    // while the target endpoint dispatches to an internal configured adapter.
+    // Dispatch happens after the normal gateway/source-auth/body/trust/OPA
+    // controls above, but before any network upstream request is built. The
+    // payment is taken once the proxy is known to be there to serve it.
     if is_a2a_proxy_target {
         let Some(proxy_id) =
             crate::a2a_proxies::A2aProxyTargetAdapter::proxy_id_from_endpoint(&state.surface.target.endpoint)
@@ -8360,6 +8360,14 @@ async fn proxy_charged_request(
                     .decrement()
                     .await;
                 let json_response = match serde_json::from_str::<serde_json::Value>(&json_response) {
+                    _ if !crate::mcp::is_tools_list_request(&body_bytes) => json_response,
+                    Err(_) if surface_mcp_tool_gating(&state).is_some() => {
+                        channel_warn!(
+                            config_id,
+                            "MCP tools/list answer from a Legacy SSE session unparsable under gating; failing closed"
+                        );
+                        crate::mcp::fail_closed_tools_list(&body_bytes, mcp_metadata_context)
+                    }
                     Ok(mut answer) => {
                         filter_direct_tools_list(
                             &mut answer,
@@ -14420,7 +14428,7 @@ async fn handle_fabric_request_inner(
                                 .as_str()
                         })
                     });
-                if !is_agent_card_request
+                if !crate::proxy::paths::is_well_known_agent_card_path(uri.path())
                     && let Some(policy) = response_policy.as_ref()
                     && let Some(refusal) = policy
                         .refusal(status, response_body.as_bytes(), content_type)

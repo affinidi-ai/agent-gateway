@@ -7133,7 +7133,8 @@ async fn process_charged_forward_request(
                 .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
                 .and_then(|(_, values)| values.first())
                 .map(String::as_str);
-            if !(is_agent_card_request || credentialed_card_fetch)
+            if !(crate::proxy::paths::is_well_known_agent_card_path(path)
+                || crate::proxy::handler::is_fabric_card_fetch(&resolved_surface, method, path))
                 && let Some(policy) = response_policy.as_ref()
                 && let Some(refusal) = policy.refusal_of_buffered(status, &response_body, content_type).await
             {
@@ -9370,11 +9371,7 @@ async fn handle_mcp_proxy_forward(
     };
     match executed {
         Ok(mcp_response) => {
-            let mcp_response = serde_json::to_string(&mcp_response)
-                .ok()
-                .map(|answer| tools_list_gate.apply(answer))
-                .and_then(|answer| serde_json::from_str(&answer).ok())
-                .unwrap_or(mcp_response);
+            let mcp_response = tools_list_gate.apply_value(mcp_response);
             if let Some(policy) = response_policy
                 && let Some(denied) =
                     crate::proxy::response_policy::mcp_proxy_refusal(&mcp_response, mcp_request.get("id"), |response| {

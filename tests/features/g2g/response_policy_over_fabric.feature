@@ -1,6 +1,7 @@
 Feature: Surface response policies over Fabric
   A gateway evaluates the response policy of the surface a peer gateway reaches over
-  Fabric on every answer its Target gives, as it does for a direct caller, and records
+  Fabric on its Target's answers as it does for a direct caller (the complete result of
+  a modern MCP response, and every answer other than the public agent card), and records
   each decision.
 
   Scenario: A response policy refuses an A2A answer to a Fabric caller
@@ -61,6 +62,17 @@ Feature: Surface response policies over Fabric
     Then the response status is 200
     And the agent card points callers at gateway 1 surface "charlie"
 
+  Scenario: A response policy refuses a discovery document other than the agent card fetched over Fabric
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And the VP Audit Log of gateway 2 keeps every audit event
+    And surface "alpha" has a response policy that denies every response
+    When the caller sends a GET request to gateway 1 surface "charlie" path "/.well-known/ucp"
+    Then the response status is 403
+    And the response says "response_policy_denied"
+    And the VP Audit Log of gateway 2 records a response policy "deny" on the Fabric request
+
   Scenario: A response policy refuses a legacy MCP answer to a Fabric caller
     Given a fabric with 2 gateways
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
@@ -99,6 +111,17 @@ Feature: Surface response policies over Fabric
     And the caller receives no result from MCP server "bravo"
     And MCP server "bravo" received the forwarded MCP request
     And the VP Audit Log of gateway 2 records a response policy "deny" on the Fabric request
+
+  Scenario: MCP tool gating hides a tool from an MCP Proxy's tool list sent over Fabric
+    Given a fabric with 2 gateways
+    And gateway 2 exposes MCP surface "alpha" backed by REST API "bravo" through an MCP proxy endpoint
+    And the MCP proxy of surface "alpha" offers the weather tools
+    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And surface "alpha" lists only MCP tool "get_weather"
+    When the caller asks gateway 1 MCP surface "charlie" for available tools
+    Then the response status is 200
+    And the MCP response tool catalog includes a tool named "get_weather"
+    And the response does not say "get_forecast"
 
   Scenario: A response policy refuses an MCP Proxy answer to a Fabric caller
     Given a fabric with 2 gateways

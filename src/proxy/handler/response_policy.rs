@@ -348,3 +348,110 @@ impl DirectResponsePolicy {
         a2a_proxy_answer_under(answer, |response| self.check(response)).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn surface(response_policy: Option<&str>) -> crate::config::agent_surface::AgentSurface {
+        let mut target = serde_json::json!({"endpoint": "https://agent.example"});
+        if let Some(id) = response_policy {
+            target["response_policy"] = serde_json::json!({"policy_definition_id": id});
+        }
+        serde_json::from_value(serde_json::json!({
+            "surface_id": "orders", "name": "orders",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+            "target": target
+        }))
+        .unwrap()
+    }
+
+    async fn state(
+        surface: crate::config::agent_surface::AgentSurface,
+        policy_manager: Option<Arc<crate::policies::SurfacePolicyManager>>,
+    ) -> ProxyState {
+        let surface_id = surface.surface_id.clone();
+        let mut router = super::super::variant_routing_tests::router(surface);
+        router.policy_manager = policy_manager;
+        router
+            .base_proxy_state(&surface_id)
+            .await
+            .unwrap()
+    }
+
+    fn deny_all_manager() -> Arc<crate::policies::SurfacePolicyManager> {
+        let manager = crate::policies::SurfacePolicyManager::new();
+        manager
+            .load_policy_text("response:deny-responses", "package surface.policy\n\ndefault allow := false\n")
+            .unwrap();
+        Arc::new(manager)
+    }
+
+    fn request() -> DirectRequest<'static> {
+        DirectRequest {
+            config_id: "orders",
+            trace_id: "trace-1",
+            method: "POST",
+            path: "/a2a",
+            caller_did: Some("did:example:caller"),
+            agent: None,
+            extension_identity: None,
+            identity: None,
+            actor_did: Some("did:example:caller"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_surface_without_a_response_policy_meets_none() {
+        let state = state(surface(None), Some(deny_all_manager())).await;
+
+        assert!(DirectResponsePolicy::for_request(&state, request()).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_gateway_without_a_policy_manager_lets_the_answer_through() {
+        let state = state(surface(Some("deny-responses")), None).await;
+
+        assert!(DirectResponsePolicy::for_request(&state, request()).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_refused_answer_is_a_403_recorded_with_the_caller_and_the_request() {
+        let state = state(surface(Some("deny-responses")), Some(deny_all_manager())).await;
+        let policy = DirectResponsePolicy::for_request(&state, request()).unwrap();
+        let collector = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let refusal = crate::observability::policy_audit::POLICY_DECISION_COLLECTOR
+            .scope(collector.clone(), policy.refusal(200, b"{\"result\":{}}", Some("application/json")))
+            .await;
+
+        assert_eq!(refusal.map(|response| response.status()), Some(axum::http::StatusCode::FORBIDDEN));
+        let recorded = collector
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].scope, "response");
+        assert_eq!(recorded[0].decision, "deny");
+        assert_eq!(
+            recorded[0]
+                .surface_id
+                .as_deref(),
+            Some("orders")
+        );
+        assert_eq!(
+            recorded[0]
+                .caller_did
+                .as_deref(),
+            Some("did:example:caller")
+        );
+        assert_eq!(
+            policy
+                .caller
+                .identity_source
+                .as_deref(),
+            Some("gateway-computed")
+        );
+    }
+}
