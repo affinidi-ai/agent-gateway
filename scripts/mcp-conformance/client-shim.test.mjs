@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import http from 'node:http';
+import net from 'node:net';
 import test from 'node:test';
 import { encodeHeaderValue, standardHeaders, startClientShim, withStandardHeaders } from './client-shim.mjs';
 import { accessPointUrl, killChildrenOnSignal, settings } from './client-driver.mjs';
@@ -125,6 +126,8 @@ test('a driver with nothing running exits on a signal without killing anything',
   assert.deepEqual(exits, [1]);
 });
 
+const CANCEL_TIMEOUT_MS = 5_000;
+
 test('a client that disconnects mid-stream closes the forwarded request', async () => {
   let upstreamClosed;
   const closed = new Promise((resolve) => (upstreamClosed = resolve));
@@ -138,8 +141,15 @@ test('a client that disconnects mid-stream closes the forwarded request', async 
   });
   await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
   const shim = await startClientShim(`http://127.0.0.1:${upstream.address().port}/mcp`);
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      upstream.closeAllConnections();
+      reject(new Error(`the forwarded request was still open ${CANCEL_TIMEOUT_MS} ms after the client disconnected`));
+    }, CANCEL_TIMEOUT_MS);
+  });
   try {
-    await new Promise((resolve, reject) => {
+    const disconnected = new Promise((resolve) => {
       const client = http.request(shim.url, { method: 'POST', headers: { 'content-type': 'application/json' } }, (reply) => {
         reply.once('data', () => {
           client.destroy();
@@ -147,21 +157,30 @@ test('a client that disconnects mid-stream closes the forwarded request', async 
         });
       });
       client.on('error', () => {});
-      client.once('error', reject);
       client.end(request('tools/list', {}));
-    }).catch(() => {});
-    assert.equal(await closed, false);
+    });
+    await Promise.race([disconnected, timeout]);
+    assert.equal(await Promise.race([closed, timeout]), false);
   } finally {
+    clearTimeout(timer);
     await shim.close();
     await new Promise((resolve) => upstream.close(resolve));
   }
 });
 
+async function unusedPort() {
+  const listener = net.createServer();
+  await new Promise((resolve) => listener.listen(0, '127.0.0.1', resolve));
+  const { port } = listener.address();
+  await new Promise((resolve) => listener.close(resolve));
+  return port;
+}
+
 test('a completed response leaves the shim quiet and a failed forward still answers 502', async () => {
   const errors = [];
   const onError = (error) => errors.push(error);
   process.on('uncaughtException', onError);
-  const shim = await startClientShim('http://127.0.0.1:9/mcp');
+  const shim = await startClientShim(`http://127.0.0.1:${await unusedPort()}/mcp`);
   try {
     const reply = await fetch(shim.url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: request('tools/list', {}) });
     assert.equal(reply.status, 502);
