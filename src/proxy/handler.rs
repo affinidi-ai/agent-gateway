@@ -5343,15 +5343,15 @@ async fn proxy_charged_request(
     if caller_identified
         && !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
         && identity_result.is_none()
-        && let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) = state
+        && let Some(inbound_identity @ crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. }) = state
             .surface
             .inbound_identity()
     {
         let mode_label = "from_jwt_claim";
         let started = std::time::Instant::now();
-        let Some(claims) = authenticated_identity
+        let Some(caller) = authenticated_identity
             .as_ref()
-            .and_then(|i| i.jwt_claims())
+            .filter(|i| i.jwt_claims().is_some())
         else {
             crate::metrics::backends::prometheus::track_managed_identity_resolve(
                 &channel_name,
@@ -5366,11 +5366,14 @@ async fn proxy_charged_request(
                 .await;
             return Err(from_jwt_claim_without_claims());
         };
-        match crate::identity::credential_identity::resolve_jwt_claim_identity(claim, namespace_claims, claims) {
-            Ok(crate::identity::credential_identity::CredentialIdentity::Derived {
+        match crate::identity::credential_identity::global_resolver()
+            .resolve_verified_caller(inbound_identity, caller, None, None)
+            .await
+        {
+            Ok(crate::identity::credential_identity::VerifiedCallerIdentity {
                 identity_fields,
                 identity_hash,
-                ..
+                verification,
             }) => {
                 let vc_issuer_opt = state
                     .identity_selector
@@ -5429,7 +5432,7 @@ async fn proxy_charged_request(
                             "Resolved inbound agent DID from JWT claim"
                         );
                         identity_result = Some(crate::identity::IdentityResult {
-                            verification: crate::surface_context::IdentityVerification::SourceAuth,
+                            verification,
                             hash: identity_hash,
                             did: response.did,
                             is_new: response.is_new,
@@ -5456,7 +5459,6 @@ async fn proxy_charged_request(
                     }
                 }
             }
-            Ok(_) => unreachable!("resolve_jwt_claim_identity only returns Derived"),
             Err(e) => {
                 let result_label = match &e {
                     crate::identity::credential_identity::CredentialIdentityError::JwtClaimMissing(_) => {
@@ -5507,7 +5509,7 @@ async fn proxy_charged_request(
         .map(|result| crate::surface_context::ExtensionIdentityContext {
             verification: result.verification,
             did: Some(result.did.clone()),
-            identity_hash: Some(result.hash.clone()),
+            identity_hash: crate::surface_context::ExtensionIdentityContext::hash_field(&result.hash),
         });
     bind_api_key_caller_did(
         &state.surface,
@@ -10847,11 +10849,21 @@ async fn resolve_configured_caller_identity(
             }
         }
         Ok(None) => return Ok(None),
-        Err(e @ crate::identity::credential_identity::CredentialIdentityError::ApiKeyIdMissing) => {
+        Err(
+            e @ (crate::identity::credential_identity::CredentialIdentityError::ApiKeyIdMissing
+            | crate::identity::credential_identity::CredentialIdentityError::CertificateIdMissing),
+        ) => {
             warn!(channel = channel_name, leg, error = %e, "Failed to derive inbound credential-based identity");
+            let mode = match e {
+                crate::identity::credential_identity::CredentialIdentityError::CertificateIdMissing => {
+                    crate::source_auth::CallerCredential::Mtls
+                }
+                _ => crate::source_auth::CallerCredential::ApiKey,
+            }
+            .identity_mode();
             crate::metrics::backends::prometheus::track_managed_identity_resolve(
                 channel_name,
-                "from_api_key",
+                mode,
                 e.reason_label(),
                 0.0,
             );
@@ -10868,7 +10880,8 @@ async fn resolve_configured_caller_identity(
     Ok(Some(identity))
 }
 
-const CALLER_IDENTITY_UNRESOLVED: &str = "Caller identity could not be resolved";
+pub(crate) const CALLER_IDENTITY_UNRESOLVED: &str = "Caller identity could not be resolved";
+const CALLER_IDENTITY_NEEDS_API_KEY: &str = "Caller identity requires API key authentication";
 
 /// Whether the configured caller identity runs on this request. It fills in
 /// when the body carried no identity; on an inbound `from_api_key` slot it
@@ -10957,23 +10970,30 @@ async fn resolve_presented_api_key_identity(
                 .as_secs_f64(),
         );
     };
-    let Some(crate::source_auth::AuthenticatedIdentity::ApiKey { key_name, provider_agent_id }) =
-        authenticated_identity
-    else {
-        warn!(channel = channel_name, leg, "Inbound from_api_key identity without API key source auth — refused");
-        track("api_key_unavailable");
-        return Err(create_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Caller identity requires API key authentication",
-        ));
+    let derived = match authenticated_identity {
+        Some(caller) => {
+            crate::identity::credential_identity::global_resolver()
+                .resolve_verified_caller(
+                    &crate::source_auth::ManagedIdentityConfig::FromApiKey { api_key_id: None },
+                    caller,
+                    None,
+                    state.secrets_store.as_ref(),
+                )
+                .await
+        }
+        None => Err(crate::identity::credential_identity::CredentialIdentityError::ApiKeyCallerMissing),
     };
-    let from_provider = provider_agent_id.is_some();
-
-    let (identity_fields, identity_hash) = match crate::identity::credential_identity::global_resolver()
-        .resolve_presented_api_key(key_name, from_provider, state.secrets_store.as_ref())
-        .await
-    {
+    let crate::identity::credential_identity::VerifiedCallerIdentity {
+        identity_fields,
+        identity_hash,
+        verification,
+    } = match derived {
         Ok(derived) => derived,
+        Err(e @ crate::identity::credential_identity::CredentialIdentityError::ApiKeyCallerMissing) => {
+            warn!(channel = channel_name, leg, "Inbound from_api_key identity without API key source auth — refused");
+            track(e.reason_label());
+            return Err(create_error_response(StatusCode::INTERNAL_SERVER_ERROR, CALLER_IDENTITY_NEEDS_API_KEY));
+        }
         Err(e) => {
             warn!(channel = channel_name, leg, error = %e, "Failed to derive caller identity from the presented API key");
             track(e.reason_label());
@@ -11028,11 +11048,7 @@ async fn resolve_presented_api_key_identity(
         debug!(channel = channel_name, leg, did = %response.did, "Resolved caller DID from the presented API key");
     }
     Ok(Some(crate::identity::IdentityResult {
-        verification: if from_provider {
-            crate::surface_context::IdentityVerification::SourceAuth
-        } else {
-            crate::surface_context::IdentityVerification::Unverified
-        },
+        verification,
         hash: identity_hash,
         did: response.did,
         is_new: response.is_new,
@@ -11493,15 +11509,15 @@ async fn handle_fabric_request_inner(
     if caller_identified
         && !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
         && identity_result.is_none()
-        && let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) = state
+        && let Some(inbound_identity @ crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. }) = state
             .surface
             .inbound_identity()
     {
         let mode_label = "from_jwt_claim";
         let started = std::time::Instant::now();
-        let Some(claims) = authenticated_identity
+        let Some(caller) = authenticated_identity
             .as_ref()
-            .and_then(|i| i.jwt_claims())
+            .filter(|i| i.jwt_claims().is_some())
         else {
             crate::metrics::backends::prometheus::track_managed_identity_resolve(
                 channel_name,
@@ -11516,11 +11532,14 @@ async fn handle_fabric_request_inner(
                 .await;
             return Err(from_jwt_claim_without_claims());
         };
-        match crate::identity::credential_identity::resolve_jwt_claim_identity(claim, namespace_claims, claims) {
-            Ok(crate::identity::credential_identity::CredentialIdentity::Derived {
+        match crate::identity::credential_identity::global_resolver()
+            .resolve_verified_caller(inbound_identity, caller, None, None)
+            .await
+        {
+            Ok(crate::identity::credential_identity::VerifiedCallerIdentity {
                 identity_fields,
                 identity_hash,
-                ..
+                verification,
             }) => {
                 let vc_issuer_opt = state
                     .identity_selector
@@ -11579,7 +11598,7 @@ async fn handle_fabric_request_inner(
                             "Resolved inbound agent DID from JWT claim on fabric path"
                         );
                         identity_result = Some(crate::identity::IdentityResult {
-                            verification: crate::surface_context::IdentityVerification::SourceAuth,
+                            verification,
                             hash: identity_hash,
                             did: response.did,
                             is_new: response.is_new,
@@ -11606,7 +11625,6 @@ async fn handle_fabric_request_inner(
                     }
                 }
             }
-            Ok(_) => unreachable!("resolve_jwt_claim_identity only returns Derived"),
             Err(e) => {
                 let result_label = match &e {
                     crate::identity::credential_identity::CredentialIdentityError::JwtClaimMissing(_) => {
@@ -11641,7 +11659,7 @@ async fn handle_fabric_request_inner(
         .map(|result| crate::surface_context::ExtensionIdentityContext {
             verification: result.verification,
             did: Some(result.did.clone()),
-            identity_hash: Some(result.hash.clone()),
+            identity_hash: crate::surface_context::ExtensionIdentityContext::hash_field(&result.hash),
         });
 
     // Access-Point Inbound OPA Policy check (fabric:// path).
@@ -16733,8 +16751,8 @@ const CALLER_IDENTITY_PROOFS: [&str; 2] = [
 
 /// `body_bytes` without the identity proofs its caller put in it, for a caller
 /// that gets no inbound identity, so none of its own reaches the Target: the
-/// MCP `_meta` entries, and the A2A and AP2 message `metadata` entries (in
-/// `params.message`, `message` or a bare message), of a request or of each
+/// MCP `_meta` entries, and the A2A and AP2 message `metadata` entries (at each
+/// of [`crate::a2a::extensions::MESSAGE_POINTERS`]), of a request or of each
 /// request of a JSON-RPC batch. The extension URIs in `extensions` stay: they
 /// also ask for the responding agent's credential. A body with no proof, an
 /// empty one, or one of another protocol is returned byte for byte. A body the
@@ -16775,11 +16793,13 @@ fn remove_mcp_identity_proofs(request: &mut serde_json::Value) -> bool {
         .fold(false, |removed, key| crate::mcp::meta::remove_metadata_key(request, key) | removed)
 }
 
-/// Remove the caller identity proofs from an A2A or AP2 message's `metadata`;
-/// whether any was there.
+/// Remove the caller identity proofs from the `metadata` at every A2A or AP2
+/// message location; whether any was there. Unlike a Transit Point's removal of
+/// asserted identity, this removes only the two proofs and keeps the extension
+/// URIs, by design.
 fn remove_a2a_identity_proofs(request: &mut serde_json::Value) -> bool {
     let mut removed = false;
-    for pointer in ["/params/message", "/message", ""] {
+    for pointer in crate::a2a::extensions::MESSAGE_POINTERS {
         if let Some(metadata) = request
             .pointer_mut(pointer)
             .and_then(|message| message.get_mut("metadata"))
@@ -23696,6 +23716,32 @@ allow if {
         }
 
         #[tokio::test]
+        async fn protected_mtls_without_certificate_id_is_a_fixed_500() {
+            let (issuer, _dir) = test_vc_issuer().await;
+            let state = state_with(
+                surface_with(
+                    "pak-protected-no-cert",
+                    None,
+                    Some(ManagedIdentityConfig::FromMtls { certificate_id: None }),
+                ),
+                Some(issuer),
+            );
+
+            let response = resolve(&state, Some(&provider_key("atgk_pak_caller")), false)
+                .await
+                .unwrap_err();
+
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = body_text(response).await;
+            assert!(body.contains(super::super::CALLER_IDENTITY_UNRESOLVED), "{body}");
+            assert!(!body.contains("certificate_id"), "{body}");
+            let mtls_count = crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
+                .with_label_values(&["pak-protected-no-cert", "from_mtls", "certificate_id_missing"])
+                .get();
+            assert_eq!(mtls_count, 1);
+        }
+
+        #[tokio::test]
         async fn missing_vc_issuer_resolves_no_identity() {
             let state = state_with(inbound_from_api_key("pak-no-issuer"), None);
 
@@ -23896,7 +23942,7 @@ allow if {
             let mtls = surface_with(
                 "pak-precedence-mtls",
                 Some(ManagedIdentityConfig::FromMtls {
-                    certificate_id: "cert-1".into(),
+                    certificate_id: Some("cert-1".into()),
                 }),
                 None,
             );
@@ -24034,7 +24080,7 @@ allow if {
                 surface_with(
                     "pak-agent-did-mtls",
                     Some(ManagedIdentityConfig::FromMtls {
-                        certificate_id: "cert-1".into(),
+                        certificate_id: Some("cert-1".into()),
                     }),
                     None,
                 ),

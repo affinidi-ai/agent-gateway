@@ -982,7 +982,7 @@ fn build_a2a_message_send_body_with_parts(parts: Vec<serde_json::Value>) -> serd
 /// Send an A2A request to an A2A-proxy surface, negotiating A2A 1.0 unless the
 /// scenario sets `A2A-Version` itself, so it is served whichever versions the
 /// surface accepts.
-async fn send_a2a_proxy_request_and_record(
+pub(crate) async fn send_a2a_proxy_request_and_record(
     world: &mut SurfaceWorld,
     body: serde_json::Value,
     mut headers: Vec<(String, String)>,
@@ -3540,12 +3540,22 @@ async fn transit_point_url(
     agent_name: &str,
     transit_point: &str,
 ) -> String {
+    let path = transit_point_path(world, transit_point);
+    outbound_url(world, agent_name, &path).await
+}
+
+/// The URL managed agent `agent_name` calls the outbound `path` at, once the
+/// gateway's outbound listener is ready.
+async fn outbound_url(
+    world: &mut SurfaceWorld,
+    agent_name: &str,
+    path: &str,
+) -> String {
     world
         .actors
         .expect_target_kind(agent_name, TargetActorKind::ManagedAgent);
     ensure_gateway_running(world).await;
 
-    let path = transit_point_path(world, transit_point);
     let infra = world
         .infra
         .as_mut()
@@ -3559,7 +3569,7 @@ async fn transit_point_url(
     format!("http://127.0.0.1:{outbound_port}{path}")
 }
 
-async fn record_transit_point_response(
+pub(crate) async fn record_transit_point_response(
     world: &mut SurfaceWorld,
     response: reqwest::Response,
 ) {
@@ -3582,7 +3592,18 @@ pub(crate) async fn send_a2a_body_through_transit_point(
     headers: Vec<(String, String)>,
     body: serde_json::Value,
 ) {
-    let url = transit_point_url(world, agent_name, transit_point).await;
+    let path = transit_point_path(world, transit_point);
+    send_a2a_body_through_transit_point_path(world, agent_name, &path, headers, body).await;
+}
+
+pub(crate) async fn send_a2a_body_through_transit_point_path(
+    world: &mut SurfaceWorld,
+    agent_name: &str,
+    path: &str,
+    headers: Vec<(String, String)>,
+    body: serde_json::Value,
+) {
+    let url = outbound_url(world, agent_name, path).await;
 
     world.sent_body = Some(body.clone());
     let client = reqwest::Client::new();

@@ -1,7 +1,10 @@
 //! Proxy configuration implementation
 
+mod identity_warnings;
+
 use super::network::NetworkConfig;
 use super::types::*;
+use identity_warnings::{transit_caller_identity_warnings, unnamed_mtls_identity_warnings};
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 
@@ -406,10 +409,12 @@ impl GatewayConfig {
 /// the DID Auth session TTL bound, which a stored value is held to at runtime
 /// (see [`GatewayConfig::did_auth_session_ttl_adjustments`]). A
 /// `from_jwt_claim` identity without a `jwt_bearer` method to read (on the
-/// protected or external slot or a Transit Point, without `jwt_bearer` as its
-/// only method), and an inbound `from_api_key` identity without an API key
-/// method to read, are only warned about here: stored surfaces predating the
-/// rule booted with them, and saving them enforces it.
+/// protected or external slot, without `jwt_bearer` as its only method), an
+/// inbound `from_api_key` identity without an API key method to read, and a
+/// Transit Point, of the surface or an enabled variant, whose own identity takes
+/// its DID from a caller credential its `source_auth` does not verify, are only
+/// warned about here: stored surfaces predating the rule booted with them, and
+/// saving them enforces it.
 fn validate_source_auth_surface(surface: &crate::config::agent_surface::AgentSurface) -> anyhow::Result<()> {
     use crate::source_auth::SourceAuthConfig;
 
@@ -430,6 +435,12 @@ fn validate_source_auth_surface(surface: &crate::config::agent_surface::AgentSur
              method; its verified callers are refused until the surface is fixed, and the next save refuses it",
             surface.name
         );
+    }
+    for warning in transit_caller_identity_warnings(surface) {
+        warn!("{warning}");
+    }
+    for warning in unnamed_mtls_identity_warnings(surface) {
+        warn!("{warning}");
     }
     Ok(())
 }
@@ -985,8 +996,10 @@ fn validate_method_selection(
 
 /// `from_jwt_claim` derives a DID from the caller's verified JWT. On the
 /// inbound slot it needs a `jwt_bearer` method to read, and callers of the
-/// other methods get no identity; on the protected or external slot or a
-/// Transit Point every caller must authenticate with a JWT.
+/// other methods get no identity; on the protected or external slot every
+/// caller must authenticate with a JWT. A Transit Point's own `from_jwt_claim`
+/// reads its own caller's JWT instead, and is held to the Transit Point's
+/// `source_auth` when the surface is saved.
 fn validate_jwt_claim_identity(surface: &crate::config::agent_surface::AgentSurface) -> anyhow::Result<()> {
     use crate::source_auth::{ManagedIdentityConfig, SourceAuthConfig};
 
@@ -1001,11 +1014,6 @@ fn validate_jwt_claim_identity(surface: &crate::config::agent_surface::AgentSurf
             surface.name
         );
     }
-    let transit_identities = surface
-        .transit
-        .iter()
-        .flat_map(|transit| transit.points.iter())
-        .filter_map(|point| point.managed_identity.clone());
     let uses_jwt_claim = [
         surface
             .external_identity()
@@ -1014,7 +1022,6 @@ fn validate_jwt_claim_identity(surface: &crate::config::agent_surface::AgentSurf
     ]
     .into_iter()
     .flatten()
-    .chain(transit_identities)
     .any(|identity| matches!(identity, ManagedIdentityConfig::FromJwtClaim { .. }));
     let jwt_bearer_only = !methods.is_empty()
         && methods
@@ -1136,7 +1143,7 @@ fn ignored_transit_token_max_lifetime(
 mod tests {
     use super::*;
 
-    fn surface_with_caller_auth(
+    pub(super) fn surface_with_caller_auth(
         methods: serde_json::Value,
         extra: serde_json::Value,
     ) -> crate::config::agent_surface::AgentSurface {
@@ -1157,11 +1164,11 @@ mod tests {
         serde_json::from_value(surface).unwrap()
     }
 
-    fn jwt_method() -> serde_json::Value {
+    pub(super) fn jwt_method() -> serde_json::Value {
         serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-1", "audiences": ["api://agent"]})
     }
 
-    fn api_key_method(header: &str) -> serde_json::Value {
+    pub(super) fn api_key_method(header: &str) -> serde_json::Value {
         serde_json::json!({
             "type": "api_key",
             "extraction": {"source": "http_header", "field": header},
@@ -1495,22 +1502,29 @@ mod tests {
     }
 
     #[test]
-    fn from_jwt_claim_on_the_protected_slot_or_a_transit_point_also_requires_jwt_bearer() {
+    fn from_jwt_claim_on_the_protected_slot_also_requires_jwt_bearer() {
         let methods = serde_json::json!([jwt_method(), api_key_method("X-API-Key")]);
-        for extra in [
+        let surface = surface_with_caller_auth(
+            methods,
             serde_json::json!({"identity_slots": {"protected": {"type": "from_jwt_claim"}}}),
+        );
+        let error = validate_source_auth_config(&surface, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("from_jwt_claim identity requires"), "{error}");
+    }
+
+    #[test]
+    fn a_transit_point_from_jwt_claim_is_not_held_to_the_access_point_methods() {
+        let surface = surface_with_caller_auth(
+            serde_json::json!([api_key_method("X-API-Key")]),
             serde_json::json!({"transit": {"points": [{
                 "alias": "partner",
                 "target_endpoint": "https://partner.example",
                 "managed_identity": {"type": "from_jwt_claim"}
             }]}}),
-        ] {
-            let surface = surface_with_caller_auth(methods.clone(), extra);
-            let error = validate_source_auth_config(&surface, None)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("from_jwt_claim identity requires"), "{error}");
-        }
+        );
+        validate_source_auth_config(&surface, None).unwrap();
     }
 
     #[test]

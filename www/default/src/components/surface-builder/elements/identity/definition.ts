@@ -4,7 +4,7 @@ import { findSlotById } from '../edges/archetypes';
 import { registry } from '../registry';
 import IdentityPanel from './IdentityPanel';
 import IdentityPayloadFullscreenPanel from './IdentityPayloadFullscreenPanel';
-import { isInboundIdentity } from './placement';
+import { isInboundIdentity, isTransitPointIdentity, transitPointCallerAllows } from './placement';
 import { DOCS_URL } from '../../../../config/docs';
 import { readMethods } from '../caller-auth/methods';
 
@@ -19,7 +19,21 @@ const callerMethods = (allNodes: CanvasNode[]) => {
   return callerAuth ? readMethods(callerAuth.config) : [];
 };
 
+export const TRANSIT_POINT_API_KEY_NEEDS_API_KEY_CALLER =
+  "Identity 'From API Key' on a Transit Point needs that Transit Point's caller authentication to be API Key or API Key Provider";
+
+export const TRANSIT_POINT_JWT_CLAIM_NEEDS_JWT_CALLER =
+  "Identity 'From JWT Claims' on a Transit Point needs that Transit Point's caller authentication to be JWT Bearer";
+
+export const TRANSIT_POINT_MTLS_NEEDS_MTLS_CALLER =
+  "Identity 'From mTLS certificate' on a Transit Point needs that Transit Point's caller authentication to be mTLS";
+
 const INBOUND_API_KEY_CALLER_METHODS = new Set<unknown>(['api_key', 'api_key_provider']);
+
+const transitPointAllows = (type: string, allNodes: DependencyNode[], node?: DependencyNode) =>
+  transitPointCallerAllows(type, allNodes.find(n => n.id === node?.parentId)?.config?.source_auth);
+
+const isNamed = (id: unknown) => typeof id === 'string' && id.trim() !== '';
 
 export const identityDefinition: NodeDefinition = {
   type: 'identity',
@@ -74,10 +88,19 @@ export const identityDefinition: NodeDefinition = {
         <li><strong>From API key</strong>: on the Access Point → Managed
         Agent request edge, each caller is identified by the API key it
         presents (the Caller Context needs an API Key or API Key Provider method);
-        elsewhere, derive identity from the configured API key id.</li>
+        on a Transit Point, each caller is identified by the API key it
+        presents to that Transit Point (its caller authentication must be
+        API Key or API Key Provider); elsewhere, derive identity from the
+        configured API key id.</li>
         <li><strong>From mTLS</strong>: take the identity from the other
         side's TLS client certificate (the caller's certificate on an
-        inbound edge, the upstream's on an outbound edge).</li>
+        inbound edge, the upstream's on an outbound edge). On a Transit
+        Point whose caller authentication is mTLS, each caller is
+        identified by the client certificate it presents.</li>
+        <li><strong>From JWT claims</strong>: read the identity from a
+        claim of the caller's verified JWT (the Caller Context needs a JWT
+        Bearer method; on a Transit Point, its caller authentication must
+        be JWT Bearer).</li>
         <li><strong>Static</strong>: always present a fixed DID for the
         upstream (useful for stub agents and tests).</li>
       </ul>
@@ -127,8 +150,9 @@ export const identityDefinition: NodeDefinition = {
     },
     {
       description:
-        'from_jwt_claim outside the inbound slot needs every caller method to be JWT Bearer',
-      condition: (c, _ctx, node) => c.type === 'from_jwt_claim' && !isInboundIdentity(node),
+        'from_jwt_claim on the protected or external slot needs every caller method to be JWT Bearer',
+      condition: (c, _ctx, node) =>
+        c.type === 'from_jwt_claim' && !isInboundIdentity(node) && !isTransitPointIdentity(node),
       check: (_c, ctx) =>
         ctx.allNodes.some(n => {
           const methods = n.type === 'caller-auth' ? readMethods(n.config) : [];
@@ -147,6 +171,32 @@ export const identityDefinition: NodeDefinition = {
         ),
       severity: 'error',
       message: INBOUND_API_KEY_NEEDS_API_KEY_CALLER,
+    },
+    {
+      description:
+        "A Transit Point from_api_key without api_key_id identifies each caller by the key it presents, so the Transit Point's caller authentication must be API Key or API Key Provider",
+      condition: (c, _ctx, node) =>
+        c.type === 'from_api_key' && !isNamed(c.api_key_id) && isTransitPointIdentity(node),
+      check: (_c, ctx, node) => transitPointAllows('from_api_key', ctx.allNodes, node),
+      severity: 'error',
+      message: TRANSIT_POINT_API_KEY_NEEDS_API_KEY_CALLER,
+    },
+    {
+      description:
+        'A Transit Point from_jwt_claim reads the JWT that Transit Point verified, so its caller authentication must be JWT Bearer',
+      condition: (c, _ctx, node) => c.type === 'from_jwt_claim' && isTransitPointIdentity(node),
+      check: (_c, ctx, node) => transitPointAllows('from_jwt_claim', ctx.allNodes, node),
+      severity: 'error',
+      message: TRANSIT_POINT_JWT_CLAIM_NEEDS_JWT_CALLER,
+    },
+    {
+      description:
+        "A Transit Point from_mtls without certificate_id identifies each caller by its client certificate, so the Transit Point's caller authentication must be mTLS",
+      condition: (c, _ctx, node) =>
+        c.type === 'from_mtls' && !isNamed(c.certificate_id) && isTransitPointIdentity(node),
+      check: (_c, ctx, node) => transitPointAllows('from_mtls', ctx.allNodes, node),
+      severity: 'error',
+      message: TRANSIT_POINT_MTLS_NEEDS_MTLS_CALLER,
     },
   ],
   ConfigPanel: IdentityPanel,
@@ -234,8 +284,9 @@ export function identityConfigToWire(ic: Record<string, any> | undefined): any |
   if (!ic || typeof ic !== 'object') return undefined;
   const value: Record<string, any> = {};
   if (ic.type) value.type = ic.type;
-  if (ic.type === 'from_api_key' && ic.api_key_id) value.api_key_id = ic.api_key_id;
-  if (ic.type === 'from_mtls' && ic.certificate_id) value.certificate_id = ic.certificate_id;
+  if (ic.type === 'from_api_key' && isNamed(ic.api_key_id)) value.api_key_id = ic.api_key_id;
+  if (ic.type === 'from_mtls' && isNamed(ic.certificate_id))
+    value.certificate_id = ic.certificate_id;
   // Backend `ManagedIdentityConfig::Static` expects the DID under `did`
   // (the panel edits it as `static_did`).
   if (ic.type === 'static' && ic.static_did) value.did = ic.static_did;
@@ -266,9 +317,19 @@ function identityIncompleteReason(
   node?: DependencyNode
 ): string | null {
   if (!config.type) return 'Select an identity extraction type';
-  if (config.type === 'from_api_key' && !config.api_key_id && !isInboundIdentity(node))
+  if (
+    config.type === 'from_api_key' &&
+    !isNamed(config.api_key_id) &&
+    !isInboundIdentity(node) &&
+    !isTransitPointIdentity(node)
+  )
     return SELECT_OWN_API_KEY;
-  if (config.type === 'from_mtls' && !config.certificate_id) return 'Select a certificate';
+  if (
+    config.type === 'from_mtls' &&
+    !isNamed(config.certificate_id) &&
+    !isTransitPointIdentity(node)
+  )
+    return 'Select a certificate';
   if (config.type === 'static' && !config.static_did) return 'Enter a static DID';
   return null;
 }

@@ -29,7 +29,7 @@ fn get_sent_body(world: &SurfaceWorld) -> &serde_json::Value {
         .expect("sent_body must be set")
 }
 
-fn get_observed_target_requests<'a>(
+pub(crate) fn get_observed_target_requests<'a>(
     target: &'a ObservedTarget,
     context: &str,
 ) -> &'a [crate::bdd_support::mock_server::ReceivedRequest] {
@@ -48,7 +48,7 @@ fn get_observed_target_request<'a>(
     assert_called_exactly_once(get_observed_target_requests(target, context), context)
 }
 
-fn get_observed_target_for_actor<'a>(
+pub(crate) fn get_observed_target_for_actor<'a>(
     world: &'a SurfaceWorld,
     actor_name: &str,
     expected_kind: TargetActorKind,
@@ -62,7 +62,7 @@ fn get_observed_target_for_actor<'a>(
     world.collaborator_target(collaborator_key)
 }
 
-fn get_observed_request_for_actor<'a>(
+pub(crate) fn get_observed_request_for_actor<'a>(
     world: &'a SurfaceWorld,
     actor_name: &str,
     expected_kind: TargetActorKind,
@@ -180,7 +180,7 @@ fn get_caller_response(world: &SurfaceWorld) -> &crate::world::RecordedResponse 
         .expect("caller_response must be set")
 }
 
-fn get_admin_response(world: &SurfaceWorld) -> &crate::world::RecordedResponse {
+pub(crate) fn get_admin_response(world: &SurfaceWorld) -> &crate::world::RecordedResponse {
     world
         .admin_response
         .as_ref()
@@ -1847,7 +1847,7 @@ const AGENT_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent-id
 const AGENT_IDENTITY_CREDENTIAL_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity-credential/v1";
 const TRUST_REGISTRY_EXTENSION_URI: &str = "https://fabric.affinidi.io/extensions/trust-registry";
 
-fn is_valid_vp(v: &serde_json::Value) -> bool {
+pub(crate) fn is_valid_vp(v: &serde_json::Value) -> bool {
     match v {
         serde_json::Value::String(s) => {
             let parts: Vec<&str> = s.split('.').collect();
@@ -2852,7 +2852,7 @@ fn first_vp_credential(presentation: &serde_json::Value) -> Option<&serde_json::
     }
 }
 
-fn get_holder_did_from_vp(vp: &serde_json::Value) -> String {
+pub(crate) fn get_holder_did_from_vp(vp: &serde_json::Value) -> String {
     let decoded = decode_vp(vp);
     decoded
         .get("holder")
@@ -3016,7 +3016,7 @@ fn mcp_response_tool_catalog_tool_has_no_output_schema(
     assert_eq!(tool.get("outputSchema"), None, "tool '{name}' must advertise no output schema. Tool: {tool}");
 }
 
-fn get_a2a_binding_extension(
+pub(crate) fn get_a2a_binding_extension(
     request: &crate::bdd_support::mock_server::ReceivedRequest,
     context: &str,
 ) -> serde_json::Value {
@@ -3035,7 +3035,7 @@ fn get_a2a_binding_extension(
         })
 }
 
-fn get_did_from_a2a_binding_request(
+pub(crate) fn get_did_from_a2a_binding_request(
     request: &crate::bdd_support::mock_server::ReceivedRequest,
     context: &str,
 ) -> String {
@@ -3065,7 +3065,7 @@ fn decode_json_or_jwt(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn first_credential_subject_from_vp(vp: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn first_credential_subject_from_vp(vp: &serde_json::Value) -> serde_json::Value {
     let decoded = decode_vp(vp);
     let presentation = presentation_from_decoded_vp(&decoded);
     let credential = first_vp_credential(presentation)

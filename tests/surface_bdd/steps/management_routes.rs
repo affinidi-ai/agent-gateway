@@ -479,6 +479,19 @@ async fn personal_access_token_lists_agents(world: &mut SurfaceWorld) {
     record(world, Caller::PersonalAccessToken, Method::GET, AGENTS_PATH, None).await;
 }
 
+#[when("the operator lists the agents")]
+async fn operator_lists_agents(world: &mut SurfaceWorld) {
+    ensure_admin_session(world).await;
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("the operator session must exist")
+        .send_recorded_json::<Value>(Method::GET, AGENTS_PATH, None)
+        .await
+        .expect("listing the agents as the operator");
+    world.admin_response = Some(response);
+}
+
 #[when("the personal access token reads the surface's agent")]
 async fn personal_access_token_reads_surface_agent(world: &mut SurfaceWorld) {
     let path = surface_agent_path(world, "");

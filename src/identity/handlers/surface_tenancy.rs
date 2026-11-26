@@ -2326,9 +2326,9 @@ fn collect_managed_identity_reference(
     references: &mut Vec<SurfaceReferenceKey>,
 ) {
     match identity {
-        crate::source_auth::ManagedIdentityConfig::FromMtls { certificate_id } => {
-            push_reference(references, ResourceKind::Certificates, certificate_id)
-        }
+        crate::source_auth::ManagedIdentityConfig::FromMtls {
+            certificate_id: Some(certificate_id),
+        } => push_reference(references, ResourceKind::Certificates, certificate_id),
         crate::source_auth::ManagedIdentityConfig::FromApiKey { api_key_id: Some(api_key_id) }
             if !api_key_id.starts_with(crate::api_keys::KEY_ID_PREFIX) =>
         {
@@ -2358,9 +2358,11 @@ fn collect_identity_injection_references(
 }
 
 /// The API Key Provider key ids a surface, or one of its views, derives a DID from (`keys`),
-/// and the Caller Context API Key `secret_id`s shaped like a key id on a view whose inbound
-/// Identity is From API Key (`legacy_secrets`), which a secret stored before the prefix was
-/// reserved can still carry. Both sorted and without duplicates.
+/// and the API Key `secret_id`s shaped like a key id that a view takes a caller's DID from
+/// (`legacy_secrets`): its Caller Context's when its inbound Identity is From API Key, and a
+/// Transit Point's own when that point's Identity is From API Key without a stored key. A
+/// secret stored before the prefix was reserved can still carry one. Both sorted and without
+/// duplicates.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProviderKeyIds {
     pub keys: Vec<String>,
@@ -2416,6 +2418,19 @@ impl ProviderKeyIds {
                     .managed_identity
                     .as_ref(),
             );
+            if point
+                .managed_identity
+                .as_ref()
+                .and_then(ManagedIdentityConfig::caller_credential)
+                == Some(crate::source_auth::CallerCredential::ApiKey)
+                && let Some(SourceAuthConfig::ApiKey(config)) = point.source_auth.as_ref()
+                && config
+                    .secret_id
+                    .starts_with(crate::api_keys::KEY_ID_PREFIX)
+            {
+                self.legacy_secrets
+                    .push(config.secret_id.clone());
+            }
         }
         if matches!(view.inbound_identity(), Some(ManagedIdentityConfig::FromApiKey { .. })) {
             for method in view
@@ -3917,6 +3932,45 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_key_shaped_secret_a_caller_bound_transit_point_takes_its_did_from_is_a_legacy_secret() {
+        let point = |alias: &str, managed_identity: serde_json::Value, secret_id: &str| {
+            serde_json::from_value(serde_json::json!({
+                "id": format!("{alias}-id"), "alias": alias, "target_endpoint": "https://partner.example",
+                "protocol": "a2a", "managed_identity": managed_identity,
+                "source_auth": {"type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"},
+                    "secret_id": secret_id}
+            }))
+            .unwrap()
+        };
+        let surface = AgentSurface {
+            transit: Some(crate::config::agent_surface::TransitConfig {
+                points: vec![
+                    point("bound", serde_json::json!({"type": "from_api_key"}), "atgk_point_caller"),
+                    point("plain", serde_json::json!({"type": "from_api_key"}), "plain-caller"),
+                    point(
+                        "stored",
+                        serde_json::json!({"type": "from_api_key", "api_key_id": "plain-stored"}),
+                        "atgk_stored_caller",
+                    ),
+                    point(
+                        "certificate",
+                        serde_json::json!({"type": "from_mtls", "certificate_id": "cert"}),
+                        "atgk_mtls_caller",
+                    ),
+                ],
+                outbound_listen_address: None,
+                shared: Default::default(),
+            }),
+            ..Default::default()
+        };
+
+        let ids = provider_key_ids(&surface).unwrap();
+
+        assert_eq!(ids.legacy_secrets, ["atgk_point_caller"]);
+        assert!(ids.keys.is_empty());
     }
 
     fn legs_surface() -> AgentSurface {

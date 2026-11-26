@@ -34,7 +34,8 @@ pub struct SurfaceConfigBuilder {
     pub mcp_inbound_identity_strip_raw: bool,
     /// The inbound identity is the `sub` claim of the caller's JWT (`from_jwt_claim`).
     pub jwt_claim_inbound_identity: bool,
-    /// The inbound identity is the API key the caller presents (`from_api_key`).
+    /// The inbound identity is the DID of the API key the caller presents
+    /// (`from_api_key`), presented to the Target in an identity presentation.
     pub api_key_inbound_identity: bool,
     /// The Access Point maps this caller header into the identity binding
     /// extension's `verifiablePresentation`.
@@ -104,6 +105,8 @@ pub struct SurfaceConfigBuilder {
     /// The outbound listener is also published at [`PROTECTED_RESOURCE_PUBLIC_ORIGIN`], the
     /// https origin a Transit Point's `mcp_http.authorization` resource must use.
     pub outbound_public_origin: bool,
+    /// The outbound listener serves https and asks each caller for a client certificate.
+    pub outbound_client_certificates: Option<OutboundClientCertificatesFixture>,
     pub a2a_settings: Option<serde_json::Value>,
     /// The stored `access_point.public`; `None` stores what the admin API
     /// writes (see [`AccessPointFixture::public`](crate::bdd_support::config::agent_surface::AccessPointFixture)).
@@ -161,6 +164,14 @@ pub struct SurfaceConfigBuilder {
     pub stored_surfaces_on_routes: Vec<StoredSurfaceFixture>,
     /// The key id the seeded surface's protected Identity takes its DID from.
     pub protected_identity_api_key_id: Option<String>,
+    /// The seeded surface's identity slot (`inbound` or `protected`) that is `from_mtls`
+    /// naming no stored certificate.
+    pub unnamed_certificate_identity_slot: Option<String>,
+    /// The seeded surface's inbound Identity gives every caller this static DID.
+    pub inbound_static_did: Option<String>,
+    /// An enabled variant, by alias, whose Transit Points are the surface's but with the one
+    /// named taking the managed agent's identity from its caller's API key.
+    pub variant_caller_key_transit_point: Option<(String, String)>,
     /// When the API Key Provider's key was created; when the gateway starts if absent.
     pub api_key_provider_key_created_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The gateway starts in Standby mode.
@@ -311,6 +322,7 @@ impl Default for SurfaceConfigBuilder {
             a2a_proxy_target: None,
             protected_resource: None,
             outbound_public_origin: false,
+            outbound_client_certificates: None,
             custom_metadata: None,
             credential_delegation: None,
             oauth_provider_base_url: None,
@@ -366,6 +378,9 @@ impl Default for SurfaceConfigBuilder {
             other_stored_surfaces: Vec::new(),
             stored_surfaces_on_routes: Vec::new(),
             protected_identity_api_key_id: None,
+            unnamed_certificate_identity_slot: None,
+            inbound_static_did: None,
+            variant_caller_key_transit_point: None,
             api_key_provider_key_created_at: None,
             starts_standby: false,
             sign_in_event_stream: None,
@@ -513,6 +528,26 @@ pub struct SurfaceTransitPointConfig {
     /// The Transit Point presents the surface's managed agent identity to its
     /// destination (`identity_injection.inject_vp`) without an identity of its own.
     pub inject_vp: bool,
+    /// The managed agent's identity is the DID of the API key the Transit
+    /// Point's caller presented (`from_api_key` with no `api_key_id`).
+    pub identity_from_caller_api_key: bool,
+    /// The managed agent's identity is the DID of this claim of the JWT the
+    /// Transit Point's caller presented (`from_jwt_claim`).
+    pub identity_from_jwt_claim: Option<String>,
+    /// The managed agent's identity is the DID of the client certificate the
+    /// Transit Point's caller presented (`from_mtls` with no `certificate_id`).
+    pub identity_from_caller_certificate: bool,
+}
+
+/// The outbound listener serves https with `server_certificate_pem` and asks each caller for a
+/// client certificate (`[tls.client_auth] direct`), checked against the CA the certificate store
+/// holds as `ca_id`.
+#[derive(Debug, Clone)]
+pub struct OutboundClientCertificatesFixture {
+    pub ca_id: String,
+    pub ca_certificate_pem: String,
+    pub server_certificate_pem: String,
+    pub server_private_key_pem: String,
 }
 
 impl SurfaceTransitPointConfig {
@@ -538,6 +573,9 @@ impl SurfaceTransitPointConfig {
             target_base_path: None,
             per_caller_rate_limit_per_minute: None,
             inject_vp: false,
+            identity_from_caller_api_key: false,
+            identity_from_jwt_claim: None,
+            identity_from_caller_certificate: false,
         }
     }
 }

@@ -12,7 +12,7 @@ use crate::bdd_support::config::api_keys::UnreadableKeyFolders;
 use crate::bdd_support::dashboard_socket::DashboardSocket;
 use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::jwt::JwksServer;
-use crate::bdd_support::mock_server::{MockResponse, MockServer, MockTls, ReceivedRequest};
+use crate::bdd_support::mock_server::{MockResponse, MockServer, MockTls, ReceivedRequest, TestCertificateAuthority};
 use crate::bdd_support::oidc::OidcProvider;
 use crate::bdd_support::passkey::SoftPasskey;
 use crate::bdd_support::presentation_signer::PresentationSigner;
@@ -225,6 +225,16 @@ pub struct SurfaceWorld {
     pub tls_certificates: HashMap<String, MockTls>,
     /// The certificate the managed agent serves https with, when it does.
     pub managed_agent_tls: Option<MockTls>,
+    /// The A2A message metadata and extensions each managed agent's request through a Transit
+    /// Point presented to its destination, by managed agent.
+    pub presented_identity_extensions: HashMap<String, serde_json::Value>,
+    /// The presented identity extension the next Transit Point request carries a copy of, sent
+    /// by whoever calls.
+    pub copied_identity_extension: Option<serde_json::Value>,
+    /// The CA that issues the client certificates Transit Point callers present.
+    pub client_certificate_ca: Option<TestCertificateAuthority>,
+    /// The certificate the outbound listener serves https with, when it does.
+    pub outbound_listener_tls: Option<MockTls>,
     pub temp_dir: TempDir,
     pub debug: bool,
     pub runtimes: RuntimeRegistry,
@@ -325,6 +335,10 @@ impl SurfaceWorld {
             client_certificates: HashMap::new(),
             tls_certificates: HashMap::new(),
             managed_agent_tls: None,
+            presented_identity_extensions: HashMap::new(),
+            copied_identity_extension: None,
+            client_certificate_ca: None,
+            outbound_listener_tls: None,
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
             runtimes: RuntimeRegistry::default(),

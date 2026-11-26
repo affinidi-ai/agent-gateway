@@ -20,6 +20,12 @@ use crate::tenancy::{
 };
 use crate::trust_registry_verification::recorder_status::{RecorderStatus, global_store};
 
+mod transit_identity;
+
+use transit_identity::{
+    unnamespaced_transit_claim_warnings, validate_mtls_identities, validate_transit_caller_identities,
+};
+
 fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
     context
         .as_ref()
@@ -137,6 +143,16 @@ pub(crate) const INBOUND_API_KEY_WITH_RESOURCE_TOKENS: &str = "Identity 'From AP
 pub(crate) const INBOUND_API_KEY_ON_MCP_PROXY: &str =
     "Identity 'From API Key' is not supported on a proxy:// MCP Proxy target; choose another inbound Identity mode";
 pub(crate) const API_KEY_IDENTITY_NEEDS_ID: &str = "Identity 'From API Key' needs a non-empty api_key_id";
+fn labelled_bad_request(
+    label: &str,
+    message: &str,
+) -> SurfaceApiError {
+    if label.is_empty() {
+        SurfaceApiError::BadRequest(message.to_string())
+    } else {
+        SurfaceApiError::BadRequest(format!("{label}: {message}"))
+    }
+}
 
 /// The inbound slot identifies each caller by the key it presents, so a stored
 /// `api_key_id` there is never read. Variants replace `identity_slots`
@@ -174,21 +190,15 @@ fn configured_api_key_id<'a>(
 
 /// Refuse `from_api_key` identities the request path cannot resolve: an
 /// inbound slot on a surface with a caller method other than an API key, whose
-/// callers it could not identify, and a stored slot without a key.
+/// callers it could not identify, and a protected or external slot without a
+/// key. A Transit Point's is checked by [`validate_transit_caller_identities`].
 fn validate_api_key_identities(
     surface: &AgentSurface,
     label: &str,
 ) -> Result<(), SurfaceApiError> {
     use crate::source_auth::SourceAuthConfig;
 
-    let refuse = |message: &str| {
-        let prefix = if label.is_empty() {
-            String::new()
-        } else {
-            format!("{label}: ")
-        };
-        SurfaceApiError::BadRequest(format!("{prefix}{message}"))
-    };
+    let refuse = |message: &str| labelled_bad_request(label, message);
     let inbound_from_api_key = surface.inbound_identity_from_api_key();
     if inbound_from_api_key {
         if !surface
@@ -217,20 +227,6 @@ fn validate_api_key_identities(
 
     let protected = surface.managed_identity();
     configured_api_key_id(protected.as_ref(), "identity_slots.protected").map_err(|message| refuse(&message))?;
-    for point in surface
-        .transit
-        .iter()
-        .flat_map(|transit| transit.points.iter())
-    {
-        let slot = format!("transit.points['{}'].managed_identity", point.alias);
-        configured_api_key_id(
-            point
-                .managed_identity
-                .as_ref(),
-            &slot,
-        )
-        .map_err(|message| refuse(&message))?;
-    }
     configured_api_key_id(surface.external_identity(), "identity_slots.external")
         .map_err(|message| refuse(&message))?;
     Ok(())
@@ -413,6 +409,8 @@ fn validate_resolved_variants(surface: &AgentSurface) -> Result<(), SurfaceApiEr
         validate_required_fields(&resolved, &label)?;
         validate_identity_extraction(&resolved, &label)?;
         validate_api_key_identities(&resolved, &label)?;
+        validate_transit_caller_identities(&resolved, &label)?;
+        validate_mtls_identities(&resolved, &label)?;
 
         // Block cloud-metadata URLs on variant target endpoints (SSRF protection)
         if (resolved
@@ -1292,7 +1290,9 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResp
 /// each Transit Point that serves callers it does not authenticate where other hosts reach it, each
 /// that accepts the Access Point's own tokens ([`shared_audience_warnings`]),
 /// each whose JWT verification strategy names an issuer the surface also
-/// accepts through another ([`shared_issuer_warnings`]), each whose stored
+/// accepts through another ([`shared_issuer_warnings`]), each whose DID comes
+/// from a JWT claim not namespaced by `iss` under a strategy the Access Point
+/// does not use ([`unnamespaced_transit_claim_warnings`]), each whose stored
 /// principal claim names no caller ([`unusable_principal_claim_warnings`]),
 /// each to a peer
 /// gateway that does not require the transit token ([`fabric_hop_limit_warnings`]),
@@ -1338,6 +1338,7 @@ async fn save_warnings(
         .chain(crate::proxy::server::listen_path_warnings(&state.network_config, surface))
         .chain(shared_audience_warnings(surface))
         .chain(shared_issuer_warnings(surface, &issuers))
+        .chain(unnamespaced_transit_claim_warnings(surface))
         .chain(unusable_principal_claim_warnings(surface, &issuers))
         .chain(modern_delegation_warnings(surface))
         .chain(fabric_hop_limit_warnings(surface))
@@ -3743,6 +3744,8 @@ pub async fn create_surface(
     validate_required_fields(&surface, "")?;
     validate_identity_extraction(&surface, "")?;
     validate_api_key_identities(&surface, "")?;
+    validate_transit_caller_identities(&surface, "")?;
+    validate_mtls_identities(&surface, "")?;
     validate_source_auth(&surface, None)?;
     reject_public_predicate_route(&surface)?;
     refuse_unservable_route(&surface, None, &current_network_config(&state.bootstrap_config, &state.network_config))?;
@@ -4782,6 +4785,8 @@ async fn validate_and_save_surface(
     validate_required_fields(&surface, "")?;
     validate_identity_extraction(&surface, "")?;
     validate_api_key_identities(&surface, "")?;
+    validate_transit_caller_identities(&surface, "")?;
+    validate_mtls_identities(&surface, "")?;
     reject_public_predicate_route(&surface)?;
     refuse_unservable_route(
         &surface,
@@ -7326,13 +7331,19 @@ mod validation_tests {
         for (case, surface) in [
             ("no identity", surface_with(point(true, serde_json::json!({})), false)),
             ("the surface's identity without a VP", surface_with(point(true, serde_json::json!({})), true)),
-            (
-                "an inbound-only identity",
-                surface_with(
-                    point(true, serde_json::json!({ "managed_identity": { "type": "from_jwt_claim" } })),
+            ("the surface's from_jwt_claim with a VP", {
+                let mut surface = surface_with(
+                    point(true, serde_json::json!({ "identity_injection": { "inject_vp": true } })),
                     false,
-                ),
-            ),
+                );
+                surface
+                    .identity_slots
+                    .protected = Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim {
+                    claim: "oid".to_string(),
+                    namespace_claims: Vec::new(),
+                });
+                surface
+            }),
         ] {
             assert_eq!(fabric_delegation_identity_warnings(&surface), warning, "{case}");
         }
@@ -7351,6 +7362,13 @@ mod validation_tests {
                 surface_with(point(true, serde_json::json!({ "identity_injection": { "inject_vp": true } })), true),
             ),
             ("the switch off", surface_with(point(false, serde_json::json!({})), false)),
+            (
+                "its own identity from its caller's JWT",
+                surface_with(
+                    point(true, serde_json::json!({ "managed_identity": { "type": "from_jwt_claim" } })),
+                    false,
+                ),
+            ),
         ] {
             assert!(fabric_delegation_identity_warnings(&surface).is_empty(), "{case}");
         }
@@ -9119,7 +9137,7 @@ mod validation_tests {
         assert_eq!(patched.access_point.a2a, Some(a2a_block(&["0.3", "1.0"], A2aValidation::Envelope)));
     }
 
-    fn base_surface() -> AgentSurface {
+    pub(super) fn base_surface() -> AgentSurface {
         AgentSurface {
             surface_id: "s1".to_string(),
             tenant_id: None,
@@ -9481,7 +9499,7 @@ mod validation_tests {
         validate_resolved_variants(&s).expect("a private mirror is allowed");
     }
 
-    fn api_key_caller(secret_id: &str) -> serde_json::Value {
+    pub(super) fn api_key_caller(secret_id: &str) -> serde_json::Value {
         serde_json::json!({
             "type": "api_key",
             "extraction": { "source": "http_header", "field": "X-API-Key" },
@@ -9489,7 +9507,7 @@ mod validation_tests {
         })
     }
 
-    fn provider_caller() -> serde_json::Value {
+    pub(super) fn provider_caller() -> serde_json::Value {
         serde_json::json!({
             "type": "api_key_provider",
             "extraction": { "source": "http_header", "field": "X-API-Key" },
@@ -9497,7 +9515,7 @@ mod validation_tests {
         })
     }
 
-    fn jwt_caller() -> serde_json::Value {
+    pub(super) fn jwt_caller() -> serde_json::Value {
         serde_json::json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [] })
     }
 
@@ -9519,7 +9537,7 @@ mod validation_tests {
         s
     }
 
-    fn refusal(result: Result<(), SurfaceApiError>) -> String {
+    pub(super) fn refusal(result: Result<(), SurfaceApiError>) -> String {
         match result {
             Err(SurfaceApiError::BadRequest(message)) => message,
             _ => panic!("expected BadRequest"),
@@ -9620,18 +9638,6 @@ mod validation_tests {
             );
         }
 
-        let transit = with_transit(
-            base_surface(),
-            serde_json::json!({ "points": [{
-                "alias": "partner", "target_endpoint": "https://partner.example",
-                "managed_identity": { "type": "from_api_key", "api_key_id": "" }
-            }] }),
-        );
-        assert!(
-            refusal(validate_api_key_identities(&transit, ""))
-                == format!("transit.points['partner'].managed_identity: {API_KEY_IDENTITY_NEEDS_ID}")
-        );
-
         let mut keyed = base_surface();
         keyed.identity_slots.protected = from_api_key(Some("managed-key"));
         keyed.identity_slots.external = from_api_key(Some("external-key"));
@@ -9731,7 +9737,7 @@ mod validation_tests {
     }
 
     /// Attach a transit config (parsed from JSON for brevity) to a surface.
-    fn with_transit(
+    pub(super) fn with_transit(
         mut s: AgentSurface,
         transit: serde_json::Value,
     ) -> AgentSurface {

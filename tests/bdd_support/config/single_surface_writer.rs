@@ -202,6 +202,19 @@ fn transit_point_json(
             "inject_vp": true,
         });
     }
+    if transit_point.identity_from_caller_api_key {
+        transit_point_json["managed_identity"] = serde_json::json!({ "type": "from_api_key" });
+        transit_point_json["identity_injection"] = serde_json::json!({ "inject_vp": true });
+    }
+    if let Some(claim) = &transit_point.identity_from_jwt_claim {
+        transit_point_json["managed_identity"] =
+            serde_json::json!({ "type": "from_jwt_claim", "claim": claim, "namespace_claims": [] });
+        transit_point_json["identity_injection"] = serde_json::json!({ "inject_vp": true });
+    }
+    if transit_point.identity_from_caller_certificate {
+        transit_point_json["managed_identity"] = serde_json::json!({ "type": "from_mtls" });
+        transit_point_json["identity_injection"] = serde_json::json!({ "inject_vp": true });
+    }
     if !transit_point
         .trust_check_list
         .is_empty()
@@ -425,8 +438,16 @@ fn write_single_surface_config_inner(
                 transit_point_json(transit_point, target_endpoint, delegation_binding.as_ref())
             })
             .collect::<Vec<_>>();
+        let outbound_scheme = if surface_config
+            .outbound_client_certificates
+            .is_some()
+        {
+            "https"
+        } else {
+            "http"
+        };
         let mut transit_json = serde_json::json!({
-            "outbound_listen_address": format!("http://localhost:{outbound_port}"),
+            "outbound_listen_address": format!("{outbound_scheme}://localhost:{outbound_port}"),
             "points": points
         });
         if let Some(policy) = &surface_config.transit_shared_policy {
@@ -441,6 +462,21 @@ fn write_single_surface_config_inner(
         }
         if let Some(secs) = surface_config.transit_token_lifetime_secs {
             transit_json["transit_token_lifetime_secs"] = serde_json::json!(secs);
+        }
+        if let Some((variant, alias)) = &surface_config.variant_caller_key_transit_point {
+            let mut variant_points = points.clone();
+            let point = variant_points
+                .iter_mut()
+                .find(|point| point["alias"] == alias.as_str())
+                .unwrap_or_else(|| panic!("variant '{variant}' overrides unknown Transit Point '{alias}'"));
+            point["managed_identity"] = serde_json::json!({ "type": "from_api_key" });
+            point["identity_injection"] = serde_json::json!({ "inject_vp": true });
+            surface_fixture
+                .variants
+                .push(serde_json::json!({
+                    "id": format!("{variant}-id"), "alias": variant, "name": variant, "description": "",
+                    "enabled": true, "overrides": { "transit": { "points": variant_points } }
+                }));
         }
         surface_fixture = surface_fixture.with_transit(transit_json);
     }
@@ -519,7 +555,9 @@ fn write_single_surface_config_inner(
     }
 
     if surface_config.api_key_inbound_identity {
-        surface_fixture = surface_fixture.with_identity_slot("inbound", serde_json::json!({"type": "from_api_key"}));
+        surface_fixture = surface_fixture
+            .with_identity_slot("inbound", serde_json::json!({ "type": "from_api_key" }))
+            .with_target_identity_injection(serde_json::json!({ "inject_vp": true }));
     }
 
     if surface_config.mcp_inbound_identity {
@@ -533,6 +571,14 @@ fn write_single_surface_config_inner(
             inbound_slot["strip_raw_meta"] = serde_json::json!(true);
         }
         surface_fixture = surface_fixture.with_identity_slot("inbound", inbound_slot);
+    }
+
+    if let Some(slot) = &surface_config.unnamed_certificate_identity_slot {
+        surface_fixture = surface_fixture.with_identity_slot(slot.as_str(), serde_json::json!({ "type": "from_mtls" }));
+    }
+    if let Some(did) = &surface_config.inbound_static_did {
+        surface_fixture =
+            surface_fixture.with_identity_slot("inbound", serde_json::json!({ "type": "static", "did": did }));
     }
 
     if let Some(key_id) = &surface_config.protected_identity_api_key_id {
@@ -706,6 +752,9 @@ fn write_single_surface_config_inner(
     }
     if surface_config.outbound_public_origin {
         add_public_origin(base_dir, 1, PROTECTED_RESOURCE_PUBLIC_ORIGIN);
+    }
+    if let Some(certificates) = &surface_config.outbound_client_certificates {
+        serve_outbound_with_client_certificates(base_dir, certificates);
     }
     if let Some(max_secs) = surface_config.transit_token_max_lifetime_secs {
         set_transit_token_max_lifetime(base_dir, max_secs);
@@ -1048,6 +1097,72 @@ fn set_transit_token_max_lifetime(
     let mut gateway: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     gateway["transit_token_max_lifetime_secs"] = serde_json::json!(max_secs);
     std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
+}
+
+/// Serves the outbound listener (the second) over https with the scenario's server certificate,
+/// asks each caller for a client certificate during the handshake (`[tls.client_auth] direct`),
+/// and stores the CA those certificates are checked against.
+fn serve_outbound_with_client_certificates(
+    base_dir: &Path,
+    certificates: &crate::bdd_support::config::single_surface_fixture::OutboundClientCertificatesFixture,
+) {
+    let path = base_dir.join("gateway.json");
+    let mut gateway: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let listener = &mut gateway["listeners"][1];
+    assert_eq!(listener["listener_type"], "outbound", "the second listener must be the outbound one");
+    listener["protocol"] = serde_json::json!("https");
+    let port = listener["port"]
+        .as_u64()
+        .expect("outbound listener port");
+    listener["external_urls"] = serde_json::json!([format!("https://localhost:{port}")]);
+    std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
+
+    let tls_dir = base_dir.join("tls");
+    std::fs::create_dir_all(&tls_dir).unwrap();
+    let cert_path = tls_dir.join("cert.pem");
+    let key_path = tls_dir.join("key.pem");
+    std::fs::write(&cert_path, &certificates.server_certificate_pem).unwrap();
+    std::fs::write(&key_path, &certificates.server_private_key_pem).unwrap();
+    let config_path = base_dir.join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    assert!(config.contains("\n[tls]\ncert_path = "), "the gateway config must have a tls table");
+    let mut lines: Vec<String> = config
+        .lines()
+        .map(|line| {
+            if line.starts_with("cert_path = ") {
+                format!("cert_path = \"{}\"", cert_path.display())
+            } else if line.starts_with("key_path = ") {
+                format!("key_path = \"{}\"", key_path.display())
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    lines.extend(["".to_string(), "[tls.client_auth]".to_string(), "direct = \"optional\"".to_string()]);
+    std::fs::write(&config_path, lines.join("\n") + "\n").unwrap();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let ca = serde_json::json!({
+        "id": certificates.ca_id,
+        "name": certificates.ca_id,
+        "certificate_id": certificates.ca_id,
+        "description": "BDD client certificate CA",
+        "tags": ["bdd"],
+        "kind": "ca",
+        "certificate_pem": certificates.ca_certificate_pem,
+        "private_key_pem": null,
+        "expires_at": null,
+        "created_at": now,
+        "updated_at": now,
+        "active": true,
+    });
+    let certificates_dir = base_dir.join("_storage/certificates");
+    std::fs::create_dir_all(&certificates_dir).unwrap();
+    std::fs::write(
+        certificates_dir.join(format!("{}.json", certificates.ca_id)),
+        serde_json::to_string_pretty(&ca).unwrap(),
+    )
+    .unwrap();
 }
 
 /// Adds a public origin to the listener at `listener` (the inbound listener is first, the

@@ -235,6 +235,29 @@ pub async fn inject_custom_metadata_extension(
     Ok(bytes::Bytes::from(modified_json))
 }
 
+/// Every place the gateway reads an A2A message from in a request or response
+/// body, as JSON pointers: the request's `params.message` and `message`, the
+/// bare body, and a response's `result.status.message`, `result.message` and
+/// `result`.
+pub(crate) const MESSAGE_POINTERS: [&str; 6] =
+    ["/params/message", "/message", "", "/result/status/message", "/result/message", "/result"];
+
+/// Whether an A2A body carries a message: an object at one of the
+/// [`MESSAGE_POINTERS`], where the bare body and `result`, which are objects in
+/// any body, count only when shaped like a message (`parts`, `role` or
+/// `messageId`). Task operations such as `tasks/get` carry a task `id` instead.
+pub fn has_message(body: &JsonValue) -> bool {
+    MESSAGE_POINTERS
+        .iter()
+        .any(|&pointer| match body.pointer(pointer) {
+            Some(JsonValue::Object(message)) if matches!(pointer, "" | "/result") => ["parts", "role", "messageId"]
+                .iter()
+                .any(|field| message.contains_key(*field)),
+            Some(message) => message.is_object(),
+            None => false,
+        })
+}
+
 /// Inject agent identity credential (VP) extension into the A2A request body
 /// This is called when GW1 has computed a DID for an agent and wants to forward it to GW2
 /// The VP contains a VC signed by the agent's DID, proving the identity
@@ -355,6 +378,57 @@ pub async fn inject_identity_credential_extension(
         serde_json::to_vec(&body_json).map_err(|e| anyhow::anyhow!("Failed to serialize modified JSON: {}", e))?;
 
     Ok((bytes::Bytes::from(modified_json), vp_jwt))
+}
+
+/// The extensions through which an A2A message asserts an agent identity: the
+/// raw identity, a signed credential and a caller binding.
+const ASSERTED_IDENTITY_EXTENSIONS: [&str; 3] = [
+    crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION,
+    crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION,
+    crate::config::AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION,
+];
+
+/// Removes every agent identity the body asserts, from the `extensions` and the
+/// `metadata` at each of the [`MESSAGE_POINTERS`], so none is forwarded. A JSON
+/// object is always returned re-serialized, so a duplicate key the parser
+/// dropped is not forwarded either; an empty body is returned unchanged, and
+/// `None` for any other body that is not exactly one JSON object, such as a
+/// batch, whose identities could not all be removed.
+pub fn remove_asserted_identity(body_bytes: &bytes::Bytes) -> Option<bytes::Bytes> {
+    if body_bytes.is_empty() {
+        return Some(body_bytes.clone());
+    }
+    let mut body_json = serde_json::from_slice::<JsonValue>(body_bytes)
+        .ok()
+        .filter(JsonValue::is_object)?;
+    for pointer in MESSAGE_POINTERS {
+        let Some(message) = body_json
+            .pointer_mut(pointer)
+            .and_then(JsonValue::as_object_mut)
+        else {
+            continue;
+        };
+        if let Some(extensions) = message
+            .get_mut("extensions")
+            .and_then(JsonValue::as_array_mut)
+        {
+            extensions.retain(|e| {
+                !e.as_str()
+                    .is_some_and(|uri| ASSERTED_IDENTITY_EXTENSIONS.contains(&uri))
+            });
+        }
+        if let Some(metadata) = message
+            .get_mut("metadata")
+            .and_then(JsonValue::as_object_mut)
+        {
+            for uri in ASSERTED_IDENTITY_EXTENSIONS {
+                metadata.remove(uri);
+            }
+        }
+    }
+    serde_json::to_vec(&body_json)
+        .ok()
+        .map(bytes::Bytes::from)
 }
 
 /// A JSON-RPC `result` read as a Task or Message. A v1.0 `SendMessage` result
@@ -1727,5 +1801,154 @@ mod tests {
         let (injected, _did) = inject_backend_vp(&body).await;
 
         assert!(injected.is_none());
+    }
+
+    #[test]
+    fn asserted_identity_is_removed_from_a_message() {
+        let body = bytes::Bytes::from(
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "message/send", "params": { "message": {
+                "messageId": "m", "role": "user", "parts": [],
+                "extensions": [IDENTITY_URI, CREDENTIAL_URI, "https://example.com/other"],
+                "metadata": { IDENTITY_URI: { "name": "copied" }, CREDENTIAL_URI: "vp", "kept": true }
+            } } })
+            .to_string(),
+        );
+
+        let removed: serde_json::Value =
+            serde_json::from_slice(&remove_asserted_identity(&body).expect("one JSON object")).unwrap();
+
+        assert_eq!(removed["params"]["message"]["extensions"], json!(["https://example.com/other"]));
+        assert_eq!(removed["params"]["message"]["metadata"], json!({ "kept": true }));
+    }
+
+    #[test]
+    fn a_body_without_a_message_is_kept_unchanged() {
+        let request = json!({ "jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": { "id": "t" } });
+        let body = bytes::Bytes::from(request.to_string());
+
+        let removed: serde_json::Value =
+            serde_json::from_slice(&remove_asserted_identity(&body).expect("one JSON object")).unwrap();
+
+        assert_eq!(removed, request);
+        assert!(!has_message(&request));
+        assert_eq!(remove_asserted_identity(&bytes::Bytes::new()), Some(bytes::Bytes::new()));
+    }
+
+    #[test]
+    fn asserted_identity_is_removed_from_every_message_location() {
+        let asserted = || {
+            json!({
+                "extensions": [IDENTITY_URI, CREDENTIAL_URI, "https://example.com/other"],
+                "metadata": { IDENTITY_URI: { "name": "copied" }, CREDENTIAL_URI: "vp", "kept": true }
+            })
+        };
+        let with = |mut base: serde_json::Value, pointer: &str| {
+            let target = if pointer.is_empty() {
+                &mut base
+            } else {
+                base.pointer_mut(pointer)
+                    .unwrap()
+            };
+            for (key, value) in asserted()
+                .as_object()
+                .unwrap()
+            {
+                target[key] = value.clone();
+            }
+            base
+        };
+        for (case, body, pointers) in [
+            (
+                "top-level metadata with no message",
+                with(json!({ "jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": { "id": "t" } }), ""),
+                vec![""],
+            ),
+            (
+                "result.message",
+                with(
+                    json!({ "jsonrpc": "2.0", "id": 1, "result": { "message": { "role": "agent" } } }),
+                    "/result/message",
+                ),
+                vec!["/result/message"],
+            ),
+            (
+                "both params.message and message",
+                with(
+                    with(
+                        json!({ "jsonrpc": "2.0", "id": 1, "method": "message/send",
+                            "params": { "message": { "role": "user" } }, "message": { "role": "user" } }),
+                        "/params/message",
+                    ),
+                    "/message",
+                ),
+                vec!["/params/message", "/message"],
+            ),
+        ] {
+            let removed: serde_json::Value = serde_json::from_slice(
+                &remove_asserted_identity(&bytes::Bytes::from(body.to_string())).expect("one JSON object"),
+            )
+            .unwrap();
+
+            for pointer in pointers {
+                let location = removed
+                    .pointer(pointer)
+                    .unwrap();
+                assert_eq!(location["extensions"], json!(["https://example.com/other"]), "{case}: {removed}");
+                assert_eq!(location["metadata"], json!({ "kept": true }), "{case}: {removed}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_body_with_duplicate_keys_is_forwarded_re_serialized() {
+        let body = bytes::Bytes::from_static(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"copied"},"params":{"id":"t"}}"#,
+        );
+
+        let removed = remove_asserted_identity(&body).expect("one JSON object");
+
+        assert_ne!(removed, body);
+        assert!(!String::from_utf8_lossy(&removed).contains("copied"), "{removed:?}");
+        let parsed: serde_json::Value = serde_json::from_slice(&removed).unwrap();
+        assert_eq!(parsed["params"], json!({ "id": "t" }));
+    }
+
+    #[test]
+    fn only_an_object_message_counts_as_a_message() {
+        for (case, body, expected) in [
+            ("params.message", json!({ "params": { "message": { "role": "user" } } }), true),
+            ("message", json!({ "message": { "parts": [] } }), true),
+            ("bare message", json!({ "messageId": "m", "parts": [] }), true),
+            ("result.status.message", json!({ "result": { "status": { "message": {} } } }), true),
+            ("result.message", json!({ "result": { "message": {} } }), true),
+            (
+                "task request",
+                json!({ "jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": { "id": "t" } }),
+                false,
+            ),
+            ("a message that is not an object", json!({ "params": { "message": "text" } }), false),
+            ("batch", json!([{ "params": { "message": { "role": "user" } } }]), false),
+        ] {
+            assert_eq!(has_message(&body), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn a_body_that_is_not_one_json_object_has_no_identity_removed() {
+        let message = json!({ "jsonrpc": "2.0", "id": 1, "method": "message/send", "params": { "message": {
+            "messageId": "m", "role": "user", "parts": [], "extensions": [IDENTITY_URI] } } });
+        for (case, body) in [
+            (
+                "batch",
+                json!([message])
+                    .to_string()
+                    .into_bytes(),
+            ),
+            ("byte order mark", [b"\xEF\xBB\xBF".as_slice(), message.to_string().as_bytes()].concat()),
+            ("string", br#""text""#.to_vec()),
+            ("not JSON", b"not json".to_vec()),
+        ] {
+            assert_eq!(remove_asserted_identity(&bytes::Bytes::from(body)), None, "{case}");
+        }
     }
 }
