@@ -292,6 +292,34 @@ pub fn answer_contexts(
     })
 }
 
+/// Lets an answer through unchecked because the gateway has no policy manager
+/// to evaluate response policy `policy_id` with: logs it at error level and
+/// records an `error` decision (`no_policy_manager`) with the request fields
+/// `context` carries, so the unchecked answer is visible.
+pub fn pass_without_policy_manager(
+    policy_id: &str,
+    context: crate::observability::PolicyDecisionEvent<'_>,
+) -> ResponsePolicyDecision {
+    let error = crate::observability::PolicyEvaluationError::NoPolicyManager;
+    tracing::error!(
+        policy_id,
+        "No policy manager to evaluate the surface response policy; the answer goes back unchecked"
+    );
+    crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+        scope: crate::observability::PolicyScope::Response,
+        allow: true,
+        error: Some(error),
+        policy_id: Some(policy_id),
+        policy_definition_id: Some(policy_id),
+        ..context
+    });
+    ResponsePolicyDecision {
+        allow: true,
+        reason: None,
+        error: Some(error),
+    }
+}
+
 /// The reason recorded when an event-stream answer is refused because one of
 /// its events is not JSON.
 pub const UNREADABLE_EVENT_REASON: &str = "unreadable_event_stream";

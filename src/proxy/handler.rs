@@ -8361,40 +8361,43 @@ async fn proxy_charged_request(
                 connection_guard
                     .decrement()
                     .await;
-                let json_response = match serde_json::from_str::<serde_json::Value>(&json_response) {
-                    _ if !crate::mcp::is_tools_list_request(&body_bytes) => json_response,
-                    Err(_) if surface_mcp_tool_gating(&state).is_some() => {
-                        channel_warn!(
-                            config_id,
-                            "MCP tools/list answer from a Legacy SSE session unparsable under gating; failing closed"
-                        );
-                        crate::mcp::fail_closed_tools_list(&body_bytes, mcp_metadata_context)
+                let json_response = if !crate::mcp::is_tools_list_request(&body_bytes) {
+                    json_response
+                } else {
+                    match serde_json::from_str::<serde_json::Value>(&json_response) {
+                        Ok(mut answer) => {
+                            filter_direct_tools_list(
+                                &mut answer,
+                                &DirectToolsListRequest {
+                                    state: &state,
+                                    method: method.as_ref(),
+                                    path: uri.path(),
+                                    headers: &headers,
+                                    source_auth: source_auth_context.as_ref(),
+                                    mcp: mcp_classification
+                                        .as_ref()
+                                        .and_then(crate::mcp::modern_mcp_context),
+                                    agent: agent_context.as_ref(),
+                                    a2a: a2a_context.as_ref(),
+                                    extension_identity: extension_identity.as_ref(),
+                                    payment: payment_context.as_ref(),
+                                    identity_binding: identity_binding.as_ref(),
+                                    trace_id: &trace_id,
+                                    identity: authenticated_identity.as_ref(),
+                                    actor_did: request_agent_did.as_deref(),
+                                },
+                            );
+                            answer.to_string()
+                        }
+                        Err(_) if surface_mcp_tool_gating(&state).is_some() => {
+                            channel_warn!(
+                                config_id,
+                                "MCP tools/list answer from a Legacy SSE session unparsable under gating; failing closed"
+                            );
+                            crate::mcp::fail_closed_tools_list(&body_bytes, mcp_metadata_context)
+                        }
+                        Err(_) => json_response,
                     }
-                    Ok(mut answer) => {
-                        filter_direct_tools_list(
-                            &mut answer,
-                            &DirectToolsListRequest {
-                                state: &state,
-                                method: method.as_ref(),
-                                path: uri.path(),
-                                headers: &headers,
-                                source_auth: source_auth_context.as_ref(),
-                                mcp: mcp_classification
-                                    .as_ref()
-                                    .and_then(crate::mcp::modern_mcp_context),
-                                agent: agent_context.as_ref(),
-                                a2a: a2a_context.as_ref(),
-                                extension_identity: extension_identity.as_ref(),
-                                payment: payment_context.as_ref(),
-                                identity_binding: identity_binding.as_ref(),
-                                trace_id: &trace_id,
-                                identity: authenticated_identity.as_ref(),
-                                actor_did: request_agent_did.as_deref(),
-                            },
-                        );
-                        serde_json::to_string(&answer).unwrap_or(json_response)
-                    }
-                    Err(_) => json_response,
                 };
                 if !json_response.is_empty()
                     && let Some(policy) = response_policy.as_ref()
@@ -14257,6 +14260,60 @@ async fn handle_fabric_request_inner(
                     response_body
                 };
 
+                // The sending surface's response policy, before the answer is captured as
+                // delivered. The peer's empty `202` acknowledgement of a notification is
+                // not a Target answer and is not checked.
+                let content_type = response_headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                    .and_then(|(_, value)| {
+                        value.as_str().or_else(|| {
+                            value
+                                .as_array()?
+                                .first()?
+                                .as_str()
+                        })
+                    });
+                if !crate::proxy::paths::is_public_agent_card_read(method.as_str(), uri.path())
+                    && !(status == StatusCode::ACCEPTED.as_u16() && response_body.is_empty())
+                    && let Some(policy) = response_policy.as_ref()
+                    && let Some(refusal) = policy
+                        .refusal_of_fabric_answer(status, response_body.as_bytes(), content_type)
+                        .await
+                {
+                    if !is_modern_response && let Some(ref metrics) = state.metrics_store {
+                        let latency_ms = start_time
+                            .elapsed()
+                            .as_millis() as u64;
+                        metrics
+                            .record_connection_with_ucp(
+                                state
+                                    .surface
+                                    .config_id_string(),
+                                source_addr.clone(),
+                                state
+                                    .surface
+                                    .target
+                                    .endpoint
+                                    .clone(),
+                                crate::metrics::ConnectionStatus::Failed,
+                                Some(latency_ms),
+                                None,
+                                crate::metrics::ConnectionDirection::Request,
+                                trace_id.clone(),
+                                ucp_operation.clone(),
+                                None,
+                                None,
+                                latency_ms,
+                            )
+                            .await;
+                    }
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Err(refusal);
+                }
+
                 // Broadcast payload capture AFTER all transformations (4-stage pipeline)
                 // This ensures Stage 4 shows the actual final response sent to the agent
                 if state
@@ -14424,30 +14481,6 @@ async fn handle_fabric_request_inner(
                 }
                 .instrument(_inspect_span)
                 .await?;
-
-                let content_type = response_headers
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-                    .and_then(|(_, value)| {
-                        value.as_str().or_else(|| {
-                            value
-                                .as_array()?
-                                .first()?
-                                .as_str()
-                        })
-                    });
-                if !crate::proxy::paths::is_well_known_agent_card_path(uri.path())
-                    && !response_body.is_empty()
-                    && let Some(policy) = response_policy.as_ref()
-                    && let Some(refusal) = policy
-                        .refusal(status, response_body.as_bytes(), content_type)
-                        .await
-                {
-                    connection_guard
-                        .decrement()
-                        .await;
-                    return Err(refusal);
-                }
 
                 // Build response using Response::builder() like the test that worked
                 let _build_span = tracing::info_span!("fabric.build_response", otel.name = "Build HTTP Response");
@@ -14774,11 +14807,8 @@ async fn handle_fabric_request_inner(
             request,
             modern_limits,
             discovery_support,
-            move |mut message| async move {
+            move |message| async move {
                 use crate::mcp::modern_sse::SseReadError;
-                if let Some(receipt) = &stream_receipt {
-                    receipt.inject_into_message(&crate::config::ChannelProtocol::Mcp, &mut message);
-                }
                 let headers = crate::proxy::fabric_stream::wire::encode_headers(&processing_headers)
                     .map_err(|_| SseReadError::ResponseRejected)?;
                 let response_body = serde_json::to_string(&message).map_err(|_| SseReadError::InvalidMessage)?;
@@ -14816,8 +14846,12 @@ async fn handle_fabric_request_inner(
                 )
                 .await
                 .map_err(|_| SseReadError::EventTooLarge)?;
+                let mut message = serde_json::from_slice(&bytes).map_err(|_| SseReadError::InvalidMessage)?;
+                if let Some(receipt) = &stream_receipt {
+                    receipt.inject_into_message(&crate::config::ChannelProtocol::Mcp, &mut message);
+                }
                 Ok(crate::mcp::modern_sse::ProcessedResponse {
-                    message: serde_json::from_slice(&bytes).map_err(|_| SseReadError::InvalidMessage)?,
+                    message,
                     headers: Some(headers),
                 })
             },
@@ -16088,6 +16122,22 @@ async fn handle_mcp_proxy_request_inner(
                 {
                     return Err(axum::response::Json(denied).into_response());
                 }
+            } else if let Some(response_policy_id) = state
+                .surface
+                .response_policy_definition_id()
+            {
+                crate::proxy::response_policy::pass_without_policy_manager(
+                    response_policy_id,
+                    crate::observability::PolicyDecisionEvent {
+                        surface_id: Some(config_id),
+                        surface_name: Some(state.surface.name.as_str()),
+                        trace_id: Some(&trace_id),
+                        http_method: Some("POST"),
+                        path: Some(uri.path()),
+                        identity: authenticated_identity,
+                        ..Default::default()
+                    },
+                );
             }
 
             // Trust Recorder — writes TrAdmin records to configured TRs on the

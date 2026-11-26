@@ -1875,6 +1875,21 @@ pub async fn vp_audit_log_records_target_credential_refused_by_target(
     assert!(found, "gateway {gateway} recorded no Target credential refused by the target: {events:?}");
 }
 
+#[then(expr = "the VP Audit Log of gateway {int} records no response policy decision")]
+pub async fn vp_audit_log_records_no_response_policy_decision(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(|event| event["event"]["policy_decision"]["scope"] == "response")
+        .await
+        .unwrap_or_else(|error| panic!("read the VP Audit Log of gateway {gateway}: {error:#}"));
+    assert!(!found, "gateway {gateway} recorded a response policy decision: {events:?}");
+}
+
 #[then(expr = "the VP Audit Log of gateway {int} records no Target credential refused by the target")]
 pub async fn vp_audit_log_records_no_target_credential_refused_by_target(
     world: &mut G2gWorld,

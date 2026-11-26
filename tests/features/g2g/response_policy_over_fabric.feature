@@ -57,10 +57,12 @@ Feature: Surface response policies over Fabric
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
     And managed agent "bravo" serves an agent card
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And the VP Audit Log of gateway 2 keeps every audit event
     And surface "alpha" has a response policy that denies every response
     When the caller fetches the agent card from gateway 1 surface "charlie"
     Then the response status is 200
     And the agent card points callers at gateway 1 surface "charlie"
+    And the VP Audit Log of gateway 2 records no response policy decision
 
   Scenario: A response policy refuses a discovery document other than the agent card fetched over Fabric
     Given a fabric with 2 gateways

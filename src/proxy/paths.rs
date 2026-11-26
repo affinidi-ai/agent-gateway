@@ -63,6 +63,22 @@ pub fn is_well_known_agent_card_path(path: &str) -> bool {
     path.ends_with("/.well-known/agent-card.json") || path.ends_with("/.well-known/agent.json")
 }
 
+/// Whether a request reads the public agent card: a `GET` or `HEAD` whose path,
+/// without its query or fragment, is a well-known agent card path. Its answer is
+/// the only Target answer over Fabric that the surface response policy does not
+/// check; any other method to that path, or a card path only in the query, is
+/// checked.
+pub fn is_public_agent_card_read(
+    method: &str,
+    path: &str,
+) -> bool {
+    let path = path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(path);
+    (method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")) && is_well_known_agent_card_path(path)
+}
+
 /// Whether a request fetches the extended agent card over the A2A HTTP+JSON
 /// binding: `{route}/extendedAgentCard` (1.0, also tenant-scoped as
 /// `{route}/{tenant}/extendedAgentCard`) or `{route}/v1/card` (0.3).
@@ -496,6 +512,17 @@ pub fn spa_collision_warning(collisions: &[(String, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_get_or_head_of_a_well_known_card_path_reads_the_public_agent_card() {
+        assert!(is_public_agent_card_read("GET", "/a2a/.well-known/agent-card.json"));
+        assert!(is_public_agent_card_read("head", "/a2a/.well-known/agent.json"));
+        assert!(!is_public_agent_card_read("POST", "/a2a/.well-known/agent-card.json"));
+        assert!(!is_public_agent_card_read("GET", "/a2a/.well-known/ucp"));
+        assert!(is_public_agent_card_read("GET", "/a2a/.well-known/agent-card.json?v=1"));
+        assert!(!is_public_agent_card_read("GET", "/api/secret?x=/.well-known/agent-card.json"));
+        assert!(!is_public_agent_card_read("GET", "/api/secret#/.well-known/agent.json"));
+    }
 
     #[test]
     fn only_a_get_or_head_for_a_public_path_is_a_public_request() {

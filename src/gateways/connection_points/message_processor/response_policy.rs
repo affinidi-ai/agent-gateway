@@ -9,7 +9,7 @@ use super::{
 };
 use crate::proxy::response_policy::{
     CallerContext, ResponseContext, ResponsePolicyDecision, ResponsePolicyInput, SurfaceContext, answer_contexts,
-    check_response_policy_on_each, denied_response, refuse_unreadable_answer,
+    check_response_policy_on_each, denied_response, pass_without_policy_manager, refuse_unreadable_answer,
 };
 
 /// The response policy of the surface variant serving a Fabric request, with the
@@ -97,19 +97,12 @@ impl FabricResponsePolicy {
 
     /// Evaluates the policy on each of `responses` with `policy_manager` and
     /// records one decision. Without a policy manager the answer goes back
-    /// unchecked, as on the direct path.
+    /// unchecked, as on the direct path, logged and recorded as an error.
     async fn check_each_with(
         &self,
         policy_manager: Option<&crate::policies::SurfacePolicyManager>,
         responses: Option<Vec<ResponseContext>>,
     ) -> ResponsePolicyDecision {
-        let Some(policy_manager) = policy_manager else {
-            return ResponsePolicyDecision {
-                allow: true,
-                reason: None,
-                error: None,
-            };
-        };
         let context = crate::observability::PolicyDecisionEvent {
             flow: crate::observability::PolicyFlow::Fabric,
             surface_id: Some(&self.surface_id),
@@ -120,6 +113,9 @@ impl FabricResponsePolicy {
             identity: self.identity.as_ref(),
             actor_did: self.actor_did.as_deref(),
             ..Default::default()
+        };
+        let Some(policy_manager) = policy_manager else {
+            return pass_without_policy_manager(&self.policy_id, context);
         };
         let Some(responses) = responses else {
             return refuse_unreadable_answer(&self.policy_id, context);
@@ -398,13 +394,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fabric_response_policy_without_a_policy_manager_lets_the_answer_through() {
+    async fn a_fabric_response_policy_without_a_policy_manager_lets_the_answer_through_and_records_why() {
         let policy = FabricResponsePolicy::for_request(&served(None), fabric_response_request()).unwrap();
 
         let (decision, decisions) = fabric_response_checked(&policy, None).await;
 
         assert!(decision.allow);
-        assert!(decisions.is_empty());
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].scope, "response");
+        assert_eq!(decisions[0].decision, "error");
+        assert_eq!(
+            decisions[0]
+                .deny_reason
+                .as_deref(),
+            Some("no_policy_manager")
+        );
     }
 
     async fn fabric_response_checked(

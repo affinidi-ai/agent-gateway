@@ -6,7 +6,8 @@ use axum::{http::HeaderMap, response::Response};
 use crate::channel_info;
 use crate::proxy::response_policy::{
     CallerContext, ResponseContext, ResponsePolicyDecision, ResponsePolicyInput, SurfaceContext,
-    a2a_proxy_answer_under, answer_contexts, check_response_policy_on_each, denied_response, refuse_unreadable_answer,
+    a2a_proxy_answer_under, answer_contexts, check_response_policy_on_each, denied_response,
+    pass_without_policy_manager, refuse_unreadable_answer, response_context,
 };
 use crate::state::ProxyState;
 
@@ -235,7 +236,7 @@ pub(super) struct DirectRequest<'a> {
 /// caller it sees and the request fields its decisions are recorded with.
 pub(super) struct DirectResponsePolicy {
     policy_id: String,
-    policy_manager: std::sync::Arc<crate::policies::SurfacePolicyManager>,
+    policy_manager: Option<std::sync::Arc<crate::policies::SurfacePolicyManager>>,
     surface: SurfaceContext,
     caller: CallerContext,
     config_id: String,
@@ -248,7 +249,7 @@ pub(super) struct DirectResponsePolicy {
 
 impl DirectResponsePolicy {
     /// The response policy `request` meets on the surface `state` serves, or
-    /// `None` when the surface has none or the gateway has no policy manager.
+    /// `None` when the surface has none.
     pub(super) fn for_request(
         state: &ProxyState,
         request: DirectRequest<'_>,
@@ -257,7 +258,7 @@ impl DirectResponsePolicy {
             .surface
             .response_policy_definition_id()?
             .to_string();
-        let policy_manager = state.policy_manager.clone()?;
+        let policy_manager = state.policy_manager.clone();
         let caller = CallerContext {
             did: request
                 .caller_did
@@ -299,7 +300,8 @@ impl DirectResponsePolicy {
 
     /// Evaluates the policy on each part of one Target answer and records one
     /// decision for the answer. `None` is an event-stream answer with an event
-    /// that is not JSON, which is refused.
+    /// that is not JSON, which is refused. Without a policy manager the answer
+    /// goes back unchecked, logged and recorded as an error.
     async fn check_each(
         &self,
         responses: Option<Vec<ResponseContext>>,
@@ -314,19 +316,37 @@ impl DirectResponsePolicy {
             actor_did: self.actor_did.as_deref(),
             ..Default::default()
         };
+        let Some(policy_manager) = self.policy_manager.as_deref() else {
+            return pass_without_policy_manager(&self.policy_id, context);
+        };
         let Some(responses) = responses else {
             return refuse_unreadable_answer(&self.policy_id, context);
         };
         let inputs = responses
             .into_iter()
             .map(|response| ResponsePolicyInput::new(response, self.caller.clone(), self.surface.clone()));
-        check_response_policy_on_each(&self.policy_manager, &self.policy_id, inputs, context).await
+        check_response_policy_on_each(policy_manager, &self.policy_id, inputs, context).await
     }
 
     /// The `403` the caller gets when the policy refuses a whole Target answer
     /// with `status`, `body` and `content_type`, or `None` when it may go back.
-    /// An answer still framed as an event stream is checked event by event.
     pub(super) async fn refusal(
+        &self,
+        status: u16,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) -> Option<Response> {
+        let decision = self
+            .check(response_context(status, body, content_type))
+            .await;
+        (!decision.allow).then(denied_response)
+    }
+
+    /// The `403` the caller gets when the policy refuses the answer a peer
+    /// gateway sent back for a `fabric://` Target, or `None` when it may go
+    /// back. An answer still framed as an event stream is checked event by
+    /// event, as on Fabric receive.
+    pub(super) async fn refusal_of_fabric_answer(
         &self,
         status: u16,
         body: &[u8],
@@ -409,10 +429,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_gateway_without_a_policy_manager_lets_the_answer_through() {
+    async fn a_gateway_without_a_policy_manager_lets_the_answer_through_and_records_why() {
         let state = state(surface(Some("deny-responses")), None).await;
+        let policy = DirectResponsePolicy::for_request(&state, request()).unwrap();
+        let collector = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        assert!(DirectResponsePolicy::for_request(&state, request()).is_none());
+        let refusal = crate::observability::policy_audit::POLICY_DECISION_COLLECTOR
+            .scope(collector.clone(), policy.refusal(200, b"{\"result\":{}}", Some("application/json")))
+            .await;
+
+        assert!(refusal.is_none());
+        let recorded = collector
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].decision, "error");
+        assert_eq!(
+            recorded[0]
+                .deny_reason
+                .as_deref(),
+            Some("no_policy_manager")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_direct_answer_framed_as_an_event_stream_is_checked_whole() {
+        let manager = crate::policies::SurfacePolicyManager::new();
+        manager
+            .load_policy_text("response:deny-responses", "package surface.policy\n\ndefault allow := true\n")
+            .unwrap();
+        let state = state(surface(Some("deny-responses")), Some(Arc::new(manager))).await;
+        let policy = DirectResponsePolicy::for_request(&state, request()).unwrap();
+        let body = b"data: not json\n\n";
+
+        assert!(
+            policy
+                .refusal(200, body, Some("text/event-stream"))
+                .await
+                .is_none()
+        );
+        assert!(
+            policy
+                .refusal_of_fabric_answer(200, body, Some("text/event-stream"))
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
