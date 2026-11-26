@@ -700,7 +700,12 @@ every protocol: modern MCP requests, legacy MCP `_meta` injection, and header in
 request, including A2A. The receiving gateway, and its Target, can use that access token until it
 expires. When the receiving gateway forwards the request to its Target it logs the name of each
 forwarded header, never its value, so a delegated credential stays out of the logs whatever header
-carries it.
+carries it. A Transit Point's legacy `forward-request` names, in `delegated_meta_fields`, the
+`_meta` fields its delegated credentials went into; the receiving gateway posts such a request
+only to a Legacy SSE session endpoint under its Target base path and leaves those fields out of
+its traffic mirror, as it does for its own bindings' fields (see
+[Target base path](CREDENTIAL_DELEGATION.md#target-base-path)). A sender that does not name them
+is held only to the receiving surface's own bindings.
 
 The setting applies to one route only. Another `fabric://` Target or Transit Point on the same
 gateway sends no delegated credential unless it opts in too. A Transit Point on a surface without

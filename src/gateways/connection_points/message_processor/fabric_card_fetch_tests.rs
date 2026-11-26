@@ -1113,6 +1113,59 @@ async fn a_legacy_proxy_tool_call_outside_the_base_path_requests_no_target_token
     assert_eq!(token_endpoint.requests(), 1, "token requests");
 }
 
+/// A legacy tool call over Fabric to an MCP proxy Target whose spec cannot be read is refused
+/// as the proxy refuses it, before the Target credential's token is requested.
+#[tokio::test]
+async fn a_legacy_proxy_tool_call_with_an_unreadable_catalog_requests_no_target_token() {
+    use crate::mcp_proxies::filesystem::McpProxyStore;
+    if ran_in_child("ATG_FABRIC_LEGACY_PROXY_BROKEN_CATALOG_CHILD").await {
+        return;
+    }
+    let token_endpoint = TokenEndpoint::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let proxies = Arc::new(
+        crate::mcp_proxies::FileSystemMcpProxyStore::new(root.path().join("proxies"))
+            .await
+            .unwrap(),
+    );
+    let proxy = crate::mcp_proxies::types::McpProxy::new(
+        "Broken".into(),
+        String::new(),
+        "http://127.0.0.1:9/base".into(),
+        "openapi: [not, a, spec".into(),
+        "/mcp".into(),
+        "/items-broken".into(),
+    );
+    proxies
+        .create(&proxy)
+        .await
+        .unwrap();
+    super::init_mcp_proxy_store(proxies).await;
+    let mut value = serde_json::to_value(surface("mcp", &format!("proxy://{}", proxy.id), &[])).unwrap();
+    value["target"]["auth"] = json!({ "method": { "credential_provider": { "provider_id": TARGET_PROVIDER } } });
+    let _receiver = receiver(root.path(), &serde_json::from_value(value).unwrap()).await;
+    install_target_provider(root.path(), &token_endpoint.url).await;
+    let message = forward_request(
+        root.path(),
+        json!({ "content-type": "application/json", "x-api-key": CALLER_KEY }),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "getItem", "arguments": { "id": "1" } } }),
+    )
+    .with_context("secrets_storage_path", json!(root.path().join("secrets")));
+
+    let response = token_endpoint
+        .egress()
+        .scope(forward_response(&message))
+        .await;
+    assert!(
+        response
+            .to_string()
+            .contains("error"),
+        "{response}"
+    );
+    assert_eq!(token_endpoint.requests(), 0, "token requests");
+}
+
 /// A peer's agent card fetch reaches a Target protected by a client credentials
 /// provider with the provider's token as a bearer token, obtained with one token
 /// request, and never with the peer's own `Authorization`.

@@ -1559,7 +1559,53 @@ async fn fabric_consent_flow() {
             .create(&proxy)
             .await
             .unwrap();
+        let mut broken = proxy.clone();
+        broken.id = uuid::Uuid::new_v4().to_string();
+        broken.endpoint_path = "/items-broken".into();
+        broken.openapi_spec = "openapi: [not, a, spec".into();
+        proxies
+            .create(&broken)
+            .await
+            .unwrap();
         super::init_mcp_proxy_store(proxies).await;
+        {
+            let mut proxied = surface.clone();
+            proxied.target.endpoint = format!("proxy://{}", broken.id);
+            let body = json!({"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {
+                "name": "getItem", "arguments": {"id": "1"}, "_meta": body["params"]["_meta"].clone()
+            }});
+            let (message, mut stream) = make_request(&body, &proxied, &sender_did, &bearer);
+            stream
+                .headers
+                .insert("mcp-name", axum::http::HeaderValue::from_static("getItem"));
+            let (result, events) =
+                crate::audit::producer::capture(Box::pin(super::process_forward_request_with_mcp_runtime(
+                    &message,
+                    Some(stream),
+                    versions,
+                    Some(runtime.clone()),
+                )))
+                .await;
+            let unavailable = decode(result).await;
+            assert_eq!(unavailable.0, 503, "{:?}", unavailable.1);
+            assert!(
+                unavailable
+                    .1
+                    .to_string()
+                    .contains("MCP tool catalog is unavailable"),
+                "{:?}",
+                unavailable.1
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(
+                        event.event,
+                        DelegationAuditAction::ConsentRequired | DelegationAuditAction::ElicitationSent
+                    )),
+                "{events:?}"
+            );
+        }
         let mut proxied = surface.clone();
         proxied.target.endpoint = format!("proxy://{}", proxy.id);
         let call = |id: &str| {

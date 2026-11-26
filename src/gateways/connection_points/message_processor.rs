@@ -3967,20 +3967,20 @@ fn fabric_target_url(
     }
 }
 
-/// Whether a `2026-07-28` tool call to the MCP proxy `proxy_id` builds a REST URL outside the
-/// proxy's base path ([`crate::mcp_proxies::handlers::modern_tool_call_leaves_base`]). A proxy
-/// that cannot be loaded is `false` here and refused when the request is dispatched.
-async fn modern_proxy_tool_call_leaves_base(
+/// Where a `2026-07-28` tool call to the MCP proxy `proxy_id` would send its REST request
+/// ([`crate::mcp_proxies::handlers::modern_tool_call_destination`]). A proxy that cannot be
+/// loaded counts as inside the base here and is refused when the request is dispatched.
+async fn modern_proxy_tool_call_destination(
     proxy_id: &str,
     request: &crate::mcp::request_validation::ValidatedModernMessage,
-) -> bool {
+) -> crate::mcp_proxies::handlers::ToolCallDestination {
     use crate::mcp_proxies::McpProxyStore;
     let Some(store) = GLOBAL_MCP_PROXY_STORE.get() else {
-        return false;
+        return crate::mcp_proxies::handlers::ToolCallDestination::InsideBase;
     };
     match store.get(proxy_id).await {
-        Ok(Some(proxy)) => crate::mcp_proxies::handlers::modern_tool_call_leaves_base(&proxy, request).await,
-        _ => false,
+        Ok(Some(proxy)) => crate::mcp_proxies::handlers::modern_tool_call_destination(&proxy, request).await,
+        _ => crate::mcp_proxies::handlers::ToolCallDestination::InsideBase,
     }
 }
 
@@ -5742,20 +5742,32 @@ async fn process_charged_forward_request(
     let carries_delegated_credential = !is_agent_card_request
         && !credentialed_card_fetch
         && surface.agent_keyed_binding_applies(crate::mcp::tool_analyzer::called_tool_name(&body_bytes).as_deref());
-    if forwards_to_target_url
-        && (surface.target_auth().is_some() || carries_delegated_credential)
-        && match (modern_request.as_ref(), surface.target_endpoint().strip_prefix("proxy://")) {
-            (Some(request), Some(proxy_id)) => modern_proxy_tool_call_leaves_base(proxy_id, request).await,
-            _ => !crate::proxy::paths::is_target_credential_destination(
-                surface.target_endpoint(),
-                method,
-                &target_url,
-                surface
-                    .agent_card_location_path()
-                    .filter(|_| !carries_delegated_credential),
-            ),
+    let carries_a_credential = forwards_to_target_url && (surface.target_auth().is_some() || carries_delegated_credential);
+    let leaves_target_base = match (modern_request.as_ref(), surface.target_endpoint().strip_prefix("proxy://")) {
+        (Some(request), Some(proxy_id)) if carries_a_credential => {
+            use crate::mcp_proxies::handlers::ToolCallDestination;
+            let destination = modern_proxy_tool_call_destination(proxy_id, request).await;
+            if destination == ToolCallDestination::CatalogUnavailable {
+                return axum_response_to_forward_result(
+                    crate::mcp_proxies::handlers::catalog_unavailable(request).into_response(),
+                )
+                .await;
+            }
+            destination == ToolCallDestination::OutsideBase
         }
-    {
+        _ => {
+            carries_a_credential
+                && !crate::proxy::paths::is_target_credential_destination(
+                    surface.target_endpoint(),
+                    method,
+                    &target_url,
+                    surface
+                        .agent_card_location_path()
+                        .filter(|_| !carries_delegated_credential),
+                )
+        }
+    };
+    if leaves_target_base {
         channel_warn!(
             config_id,
             "Refusing a request outside the Target base path: it would carry a Target or delegated credential"
@@ -6663,8 +6675,10 @@ async fn process_charged_forward_request(
         secrets: response_secrets.as_ref(),
         stamp: target_tls_stamp,
     };
-    let legacy_sse_credential_base = crate::proxy::credential_delegation::carries_delegated_meta_field(&surface, &body_bytes)
-        .then_some(surface.target_endpoint());
+    let sender_meta_fields = crate::proxy::credential_delegation::sender_delegated_meta_fields(&message.message_body);
+    let legacy_sse_credential_base =
+        crate::proxy::credential_delegation::carries_delegated_meta_field(&surface, &body_bytes, &sender_meta_fields)
+            .then_some(surface.target_endpoint());
     if surface_protocol == crate::config::ChannelProtocol::Mcp && modern_request.is_none() && !body_bytes.is_empty() {
         // Check if a persistent session already exists (cheap read lock check)
         let has_session = {
@@ -9158,8 +9172,11 @@ async fn handle_mcp_proxy_forward(
             .and_then(serde_json::Value::as_str),
         via_fabric: true,
     };
+    let destination = surface
+        .target_auth()
+        .map(|_| crate::mcp_proxies::handlers::legacy_tool_call_destination(&proxy, &mcp_request));
     if let Some(target_auth) = surface.target_auth()
-        && crate::mcp_proxies::handlers::legacy_tool_call_leaves_base(&proxy, &mcp_request)
+        && destination == Some(crate::mcp_proxies::handlers::ToolCallDestination::OutsideBase)
     {
         channel_warn!(
             config_id,
@@ -9169,9 +9186,13 @@ async fn handle_mcp_proxy_forward(
         crate::proxy::handler::record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
         return target_auth_failure_result(refusal);
     }
-    // Resolve target auth header if configured on the channel
+    // Resolve target auth header if configured on the channel; a proxy whose catalog cannot be
+    // read is refused below, as the proxy refuses it, without resolving the credential.
     let vault = get_delegation_vault_store();
-    let target_credential = if let Some(target_auth) = surface.target_auth() {
+    let target_credential = if let Some(target_auth) = surface
+        .target_auth()
+        .filter(|_| destination != Some(crate::mcp_proxies::handlers::ToolCallDestination::CatalogUnavailable))
+    {
         let secrets_store: Option<Arc<dyn crate::secrets::SecretsStore>> = match message
             .context
             .get("secrets_storage_path")
@@ -9271,6 +9292,7 @@ async fn handle_mcp_proxy_forward(
                     policy_manager,
                     &surface.name,
                     sent_token.as_ref(),
+                    &crate::proxy::credential_delegation::sender_delegated_meta_fields(&message.message_body),
                 )
                 .await;
                 if let Err(error) = &executed

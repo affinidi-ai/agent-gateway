@@ -1352,10 +1352,12 @@ pub fn without_delegated_credentials_in_mcp_meta(
 
 /// The body a surface's traffic mirror is sent for `body`: without the `_meta` field of any
 /// delegated credential binding of the Access Point Target that injects into `_meta`, whoever
-/// set it.
+/// set it, nor any of `sender_fields`, the `_meta` fields a sending gateway put a delegated
+/// credential into ([`sender_delegated_meta_fields`]).
 pub fn mirror_body(
     surface: &crate::config::agent_surface::AgentSurface,
     body: &bytes::Bytes,
+    sender_fields: &[String],
 ) -> bytes::Bytes {
     let fields: Vec<&str> = surface
         .agent_keyed_outbound_credentials()
@@ -1363,17 +1365,46 @@ pub fn mirror_body(
             crate::config::types::CredentialInjection::Meta { field } => Some(field.as_str()),
             _ => None,
         })
+        .chain(
+            sender_fields
+                .iter()
+                .map(String::as_str),
+        )
         .collect();
     without_delegated_credentials_in_mcp_meta(body, &fields)
 }
 
-/// Whether `body` carries a `_meta` field a delegated credential binding of the Access Point
-/// Target injects into, whoever set it.
+/// Whether `body` carries a `_meta` field a delegated credential goes into: one a binding of the
+/// Access Point Target injects into, whoever set it, or one of `sender_fields`.
 pub fn carries_delegated_meta_field(
     surface: &crate::config::agent_surface::AgentSurface,
     body: &bytes::Bytes,
+    sender_fields: &[String],
 ) -> bool {
-    mirror_body(surface, body) != *body
+    mirror_body(surface, body, sender_fields) != *body
+}
+
+/// The top-level `forward-request` field a sending gateway lists, in a Fabric request, the
+/// `_meta` fields it put a delegated credential into.
+pub const DELEGATED_META_FIELDS: &str = "delegated_meta_fields";
+
+/// The most `_meta` fields [`sender_delegated_meta_fields`] reads from one request.
+const MAX_SENDER_DELEGATED_META_FIELDS: usize = 32;
+
+/// The `_meta` fields a sending gateway says, in a received Fabric `forward-request` body, it
+/// put a delegated credential into ([`DELEGATED_META_FIELDS`]): each non-empty string, at most
+/// [`MAX_SENDER_DELEGATED_META_FIELDS`] of them. Anything else is ignored.
+pub fn sender_delegated_meta_fields(forward_request: &serde_json::Value) -> Vec<String> {
+    forward_request
+        .get(DELEGATED_META_FIELDS)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|field| !field.is_empty())
+        .take(MAX_SENDER_DELEGATED_META_FIELDS)
+        .map(str::to_string)
+        .collect()
 }
 
 /// Why a binding with no stored credential is refused without asking for
@@ -2131,6 +2162,22 @@ mod tests {
 
         assert_eq!(parsed["params"]["_meta"], serde_json::json!({ "region": "eu" }));
         assert_eq!(parsed["params"]["name"].as_str(), Some("schedule_meeting"));
+    }
+
+    #[test]
+    fn sender_delegated_meta_fields_reads_only_non_empty_strings_and_at_most_32() {
+        use serde_json::json;
+        assert_eq!(
+            super::sender_delegated_meta_fields(&json!({"delegated_meta_fields": ["calendar", "", 7, null, "maps"]})),
+            ["calendar", "maps"]
+        );
+        for ignored in [json!({}), json!({"delegated_meta_fields": "calendar"}), json!({"delegated_meta_fields": {}})] {
+            assert!(super::sender_delegated_meta_fields(&ignored).is_empty(), "{ignored}");
+        }
+        let many: Vec<String> = (0..40)
+            .map(|index| format!("field-{index}"))
+            .collect();
+        assert_eq!(super::sender_delegated_meta_fields(&json!({"delegated_meta_fields": many})).len(), 32);
     }
 
     #[test]

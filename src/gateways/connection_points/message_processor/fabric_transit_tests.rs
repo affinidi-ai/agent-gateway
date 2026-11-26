@@ -1183,6 +1183,138 @@ async fn a_legacy_sse_session_endpoint_outside_the_target_base_path_gets_no_dele
     }
 }
 
+/// A legacy MCP request whose sending gateway says it put a delegated credential into
+/// `_meta.calendar` is posted only to a Legacy SSE session endpoint under the Target base
+/// path, though the receiving surface has no binding of its own for that field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_legacy_sse_session_endpoint_outside_the_base_path_gets_no_credential_the_sender_delegated() {
+    if ran_in_child("ATG_FABRIC_RECEIVE_LEGACY_SSE_SENDER_FIELDS_CHILD").await {
+        return;
+    }
+    let mut roots = Vec::new();
+    for (endpoint, refused) in [("/other-app/messages", true), ("/base/messages", false)] {
+        let server = crate::proxy::handler::legacy_sse_fallback_tests::legacy_server(endpoint).await;
+        roots.push(tempfile::tempdir().unwrap());
+        let root = roots.last().unwrap();
+        let _receiver = receiver(root.path(), &surface("mcp", &format!("{}/base", server.url), &[])).await;
+        let mut message = forward_request(
+            root.path(),
+            json!({ "content-type": "application/json", "accept": "application/json, text/event-stream",
+                "mcp-protocol-version": crate::mcp::MCP_LEGACY_VERSION, "x-api-key": CALLER_KEY }),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "lookup", "arguments": {}, "_meta": { "calendar": "sender-grant" } } }),
+        );
+        message.message_body[crate::proxy::credential_delegation::DELEGATED_META_FIELDS] = json!(["calendar"]);
+        let (response, events) = crate::audit::producer::capture(forward_response(&message)).await;
+        let path_refusals = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event,
+                    DelegationAuditAction::RequestRejected {
+                        stage: RejectionStage::Forward,
+                        reason: RejectionReason::TargetPathRefused,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let calls = server.tool_calls();
+        if refused {
+            assert_eq!(response["status"], 400, "{endpoint}: {response}");
+            assert!(
+                response
+                    .to_string()
+                    .contains("target_path_refused"),
+                "{endpoint}: {response}"
+            );
+            assert_eq!(path_refusals, 1, "{endpoint}");
+            assert_eq!(calls, Vec::new(), "{endpoint}: nothing is posted to the advertised endpoint");
+        } else {
+            assert_eq!(response["status"], 200, "{endpoint}: {response}");
+            assert_eq!(path_refusals, 0, "{endpoint}");
+            assert_eq!(calls.len(), 1, "{endpoint}: {calls:?}");
+            assert_eq!(calls[0].1["params"]["_meta"]["calendar"], "sender-grant", "{endpoint}");
+        }
+    }
+}
+
+/// The traffic mirror of a legacy MCP proxy tool call received over Fabric gets none of the
+/// `_meta` fields the sending gateway says it put a delegated credential into, though the
+/// receiving surface has no binding for them; other `_meta` stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fabric_received_proxy_tool_call_mirror_gets_no_credential_the_sender_delegated() {
+    use crate::mcp_proxies::filesystem::McpProxyStore;
+    if ran_in_child("ATG_FABRIC_RECEIVE_PROXY_MIRROR_SENDER_FIELDS_CHILD").await {
+        return;
+    }
+    async fn serve(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        url
+    }
+    let backend = serve(axum::Router::new().fallback(|| async { axum::Json(json!({"ok": true})) })).await;
+    let mirrored = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let log = mirrored.clone();
+    let mirror = serve(axum::Router::new().fallback(move |body: axum::body::Bytes| {
+        let log = log.clone();
+        async move {
+            log.lock()
+                .unwrap()
+                .push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+            axum::http::StatusCode::OK
+        }
+    }))
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let proxies = Arc::new(
+        crate::mcp_proxies::FileSystemMcpProxyStore::new(root.path().join("proxies"))
+            .await
+            .unwrap(),
+    );
+    let proxy = crate::mcp_proxies::types::McpProxy::new(
+        "Items".into(),
+        String::new(),
+        backend,
+        json!({"openapi": "3.0.0", "info": {"title": "Items", "version": "1.0"}, "paths": {
+            "/items/{id}": {"get": {"operationId": "getItem",
+                "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                "responses": {"200": {"description": "OK"}}}}
+        }})
+        .to_string(),
+        "/mcp".into(),
+        "/items-mirrored".into(),
+    );
+    proxies
+        .create(&proxy)
+        .await
+        .unwrap();
+    super::init_mcp_proxy_store(proxies).await;
+    let mut value = serde_json::to_value(surface("mcp", &format!("proxy://{}", proxy.id), &[])).unwrap();
+    value["target"]["networking"] =
+        json!({ "mirror": { "endpoint": format!("{mirror}/mirror"), "percentage": 100, "wait_for_response": true } });
+    let _receiver = receiver(root.path(), &serde_json::from_value(value).unwrap()).await;
+    let mut message = forward_request(
+        root.path(),
+        json!({ "content-type": "application/json", "x-api-key": CALLER_KEY }),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "getItem",
+            "arguments": { "id": "1" }, "_meta": { "calendar": "sender-grant", "trace": "kept" } } }),
+    );
+    message.message_body[crate::proxy::credential_delegation::DELEGATED_META_FIELDS] = json!(["calendar"]);
+
+    let response = forward_response(&message).await;
+    assert_eq!(response["status"], 200, "{response}");
+    let mirrored = mirrored
+        .lock()
+        .unwrap()
+        .clone();
+    assert_eq!(mirrored.len(), 1, "{mirrored:?}");
+    assert_eq!(mirrored[0]["params"]["_meta"], json!({ "trace": "kept" }), "{}", mirrored[0]);
+}
+
 /// A public Access Point forwards a request whose peer key it refused, and the
 /// transit token it issues for that request names the peer but no principal, so
 /// an unverified caller never becomes a person the agent can act for.

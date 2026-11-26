@@ -6516,34 +6516,47 @@ async fn proxy_charged_request(
     let carries_delegated_credential = state
         .surface
         .agent_keyed_binding_applies(called_tool);
-    if (state
+    let carries_a_credential = state
         .surface
         .target_auth()
         .is_some()
-        || carries_delegated_credential)
-        && match (
-            modern_request.as_ref(),
-            state
-                .surface
-                .target
-                .endpoint
-                .strip_prefix("proxy://"),
-        ) {
-            (Some(request), Some(proxy_id)) => match load_owned_proxy(&state, proxy_id).await {
-                Ok(proxy) => crate::mcp_proxies::handlers::modern_tool_call_leaves_base(&proxy, request).await,
-                Err(_) => false,
-            },
-            _ => !crate::proxy::paths::is_target_credential_destination(
-                &state.surface.target.endpoint,
-                method.as_str(),
-                &target_url,
-                state
-                    .surface
-                    .agent_card_location_path()
-                    .filter(|_| !carries_delegated_credential),
-            ),
+        || carries_delegated_credential;
+    let leaves_target_base = match (
+        modern_request.as_ref(),
+        state
+            .surface
+            .target
+            .endpoint
+            .strip_prefix("proxy://"),
+    ) {
+        (Some(request), Some(proxy_id)) if carries_a_credential => {
+            use crate::mcp_proxies::handlers::ToolCallDestination;
+            let destination = match load_owned_proxy(&state, proxy_id).await {
+                Ok(proxy) => crate::mcp_proxies::handlers::modern_tool_call_destination(&proxy, request).await,
+                Err(_) => ToolCallDestination::InsideBase,
+            };
+            if destination == ToolCallDestination::CatalogUnavailable {
+                connection_guard
+                    .decrement()
+                    .await;
+                return Err(crate::mcp_proxies::handlers::catalog_unavailable(request).into_response());
+            }
+            destination == ToolCallDestination::OutsideBase
         }
-    {
+        _ => {
+            carries_a_credential
+                && !crate::proxy::paths::is_target_credential_destination(
+                    &state.surface.target.endpoint,
+                    method.as_str(),
+                    &target_url,
+                    state
+                        .surface
+                        .agent_card_location_path()
+                        .filter(|_| !carries_delegated_credential),
+                )
+        }
+    };
+    if leaves_target_base {
         warn!(
             channel = channel_name,
             "Refusing a request outside the Target base path: it would carry a Target or delegated credential"
@@ -7697,7 +7710,7 @@ async fn proxy_charged_request(
         && mirror::selected(mirror_config.percentage)
     {
         let mirror_endpoint_for_log = loggable::url(&mirror_config.endpoint);
-        let mirror_body = crate::proxy::credential_delegation::mirror_body(&state.surface, &body_bytes);
+        let mirror_body = crate::proxy::credential_delegation::mirror_body(&state.surface, &body_bytes, &[]);
         let mirror_request = mirror::MirrorRequest::new(mirror_config, method.clone(), mirror_body)
             .headers_from(&headers, |name| {
                 forwards_target_header(
@@ -8266,13 +8279,14 @@ async fn proxy_charged_request(
                 secrets: state.secrets_store.as_ref(),
                 stamp: target_tls_stamp,
             }),
-            crate::proxy::credential_delegation::carries_delegated_meta_field(&state.surface, &body_bytes).then_some(
-                state
-                    .surface
-                    .target
-                    .endpoint
-                    .as_str(),
-            ),
+            crate::proxy::credential_delegation::carries_delegated_meta_field(&state.surface, &body_bytes, &[])
+                .then_some(
+                    state
+                        .surface
+                        .target
+                        .endpoint
+                        .as_str(),
+                ),
         )
         .await
         {
@@ -15892,8 +15906,12 @@ async fn handle_mcp_proxy_request_inner(
         trace_id: Some(&trace_id),
         via_fabric: false,
     };
+    let destination = state
+        .surface
+        .target_auth()
+        .map(|_| crate::mcp_proxies::handlers::legacy_tool_call_destination(&proxy, &json_request));
     if let Some(target_auth) = state.surface.target_auth()
-        && crate::mcp_proxies::handlers::legacy_tool_call_leaves_base(&proxy, &json_request)
+        && destination == Some(crate::mcp_proxies::handlers::ToolCallDestination::OutsideBase)
     {
         warn!(
             channel = channel_name,
@@ -15903,8 +15921,13 @@ async fn handle_mcp_proxy_request_inner(
         record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
         return Err(refusal.response());
     }
-    // Resolve target auth header if configured on the channel
-    let target_credential = if let Some(target_auth) = state.surface.target_auth() {
+    // Resolve target auth header if configured on the channel; a proxy whose catalog cannot be
+    // read is refused below, as the proxy refuses it, without resolving the credential.
+    let target_credential = if let Some(target_auth) = state
+        .surface
+        .target_auth()
+        .filter(|_| destination != Some(crate::mcp_proxies::handlers::ToolCallDestination::CatalogUnavailable))
+    {
         match resolve_target_credential(
             target_auth,
             &TargetAuthContext::of_proxy(state).for_mcp_proxy(Some(&proxy.base_url)),
@@ -15997,6 +16020,7 @@ async fn handle_mcp_proxy_request_inner(
                 state.policy_manager.as_ref(),
                 channel_name,
                 sent_token.as_ref(),
+                &[],
             )
             .await;
             if let Err(error) = &executed
@@ -21309,12 +21333,17 @@ allow if {
             .create(&proxy)
             .await
             .unwrap();
+        let mut broken = proxy.clone();
+        broken.id = uuid::Uuid::new_v4().to_string();
+        broken.endpoint_path = "/items-broken".into();
+        broken.openapi_spec = "openapi: [not, a, spec".into();
+        store
+            .create(&broken)
+            .await
+            .unwrap();
         let mut state = state.clone();
         state.mcp_proxy_store = Some(store);
-        std::sync::Arc::make_mut(&mut state.surface)
-            .target
-            .endpoint = format!("proxy://{}", proxy.id);
-        let send = |id: &str| {
+        let send_to = |proxy_id: &str, id: &str| {
             let message = json!({"jsonrpc": "2.0", "id": 30, "method": "tools/call", "params": {
                 "name": "getItem", "arguments": {"id": id}, "_meta": {
                     "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
@@ -21332,7 +21361,10 @@ allow if {
                 .header("mcp-name", "getItem")
                 .body(axum::body::Body::from(serde_json::to_vec(&message).unwrap()))
                 .unwrap();
-            let state = state.clone();
+            let mut state = state.clone();
+            std::sync::Arc::make_mut(&mut state.surface)
+                .target
+                .endpoint = format!("proxy://{proxy_id}");
             let runtime = runtime.clone();
             async move {
                 let (response, events) =
@@ -21383,6 +21415,13 @@ allow if {
                 (status, body, path_refusals, grant_work)
             }
         };
+        let send = |id: &str| send_to(&proxy.id, id);
+
+        let (status, body, path_refusals, grant_work) = send_to(&broken.id, "1").await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains("MCP tool catalog is unavailable"), "{body}");
+        assert_eq!(path_refusals, 0, "{body}");
+        assert_eq!(grant_work, 0, "no grant is read and no consent started: {body}");
 
         for climbing in ["../admin", ".."] {
             let (status, body, path_refusals, grant_work) = send(climbing).await;

@@ -711,6 +711,20 @@ mod consume_sse_tests {
     }
 }
 
+/// `Ok` when no `credential_base` applies or the session endpoint `post_url` is under its base
+/// path ([`crate::proxy::paths::is_within_target_base`]).
+fn session_endpoint_within(
+    credential_base: Option<&str>,
+    post_url: &str,
+) -> Result<(), LegacySseError> {
+    match credential_base {
+        Some(base) if !crate::proxy::paths::is_within_target_base(base, post_url) => {
+            Err(LegacySseError::OutsideTargetBase)
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Resolve the Legacy-SSE session POST URL from an `endpoint` event, locked to
 /// the SSE stream's own origin.
 ///
@@ -960,13 +974,16 @@ impl UpstreamSseSession {
     ///
     /// Opens `GET {base_url}/sse`, reads the `endpoint` event, spawns a
     /// background task to read responses, and returns the session handle.
-    /// The stream and every response to the session's own messages pass `check`.
+    /// The stream and every response to the session's own messages pass `check`. With
+    /// `credential_base`, an advertised endpoint outside it is refused as
+    /// [`LegacySseError::OutsideTargetBase`] before the session is initialized.
     pub async fn connect(
         client: &reqwest::Client,
         base_url: &str,
         channel_name: &str,
         max_event_bytes: usize,
         check: Option<ResponseCheck<'_>>,
+        credential_base: Option<&str>,
     ) -> Result<Self, LegacySseError> {
         use tokio::time::{Duration, timeout};
 
@@ -1024,6 +1041,7 @@ impl UpstreamSseSession {
         .map_err(|_| "Timeout waiting for endpoint event".to_string())??;
 
         let post_url = resolve_session_post_url(&raw_endpoint, &sse_url)?;
+        session_endpoint_within(credential_base, &post_url)?;
 
         info!(channel = channel_name, "UpstreamSseSession: posting messages to {}", loggable::origin(&post_url));
 
@@ -1159,12 +1177,7 @@ impl UpstreamSseSession {
         &self,
         credential_base: Option<&str>,
     ) -> Result<(), LegacySseError> {
-        match credential_base {
-            Some(base) if !crate::proxy::paths::is_within_target_base(base, &self.inner.post_url) => {
-                Err(LegacySseError::OutsideTargetBase)
-            }
-            _ => Ok(()),
-        }
+        session_endpoint_within(credential_base, &self.inner.post_url)
     }
 
     /// Returns `true` if the background SSE reader is still running.
@@ -1341,7 +1354,8 @@ impl UpstreamSseSessionManager {
     /// [`session_key`]. Evicts dead sessions automatically. A new session of a surface with
     /// Response authentication evicts that surface's sessions on `base_url` under the same
     /// setting with older certificates; its sessions under another setting, such as another
-    /// surface variant's, are kept.
+    /// surface variant's, are kept. A new session is connected with `credential_base`
+    /// ([`UpstreamSseSession::connect`]).
     pub async fn get_or_connect(
         &self,
         client: &reqwest::Client,
@@ -1349,6 +1363,7 @@ impl UpstreamSseSessionManager {
         channel_name: &str,
         max_event_bytes: usize,
         check: Option<ResponseCheck<'_>>,
+        credential_base: Option<&str>,
     ) -> Result<Arc<UpstreamSseSession>, LegacySseError> {
         let key = session_key(base_url, check);
         // Fast path: read lock — return cached session if alive
@@ -1375,7 +1390,9 @@ impl UpstreamSseSessionManager {
             sessions.remove(&key);
         }
 
-        let session = UpstreamSseSession::connect(client, base_url, channel_name, max_event_bytes, check).await?;
+        let session =
+            UpstreamSseSession::connect(client, base_url, channel_name, max_event_bytes, check, credential_base)
+                .await?;
         let session = Arc::new(session);
         sessions.retain(|stored, _| !stored.is_superseded_by(&key));
         sessions.insert(key, session.clone());
@@ -1461,7 +1478,7 @@ pub async fn send_via_persistent_sse(
     credential_base: Option<&str>,
 ) -> Result<String, LegacySseError> {
     let session = UPSTREAM_SSE_SESSIONS
-        .get_or_connect(client, base_url, channel_name, max_event_bytes, check)
+        .get_or_connect(client, base_url, channel_name, max_event_bytes, check, credential_base)
         .await?;
     session.accepts_credentials_under(credential_base)?;
     match session
@@ -1483,7 +1500,7 @@ pub async fn send_via_persistent_sse(
                 .await
                 .remove(&session_key(base_url, check));
             let new_session = UPSTREAM_SSE_SESSIONS
-                .get_or_connect(client, base_url, channel_name, max_event_bytes, check)
+                .get_or_connect(client, base_url, channel_name, max_event_bytes, check, credential_base)
                 .await?;
             new_session.accepts_credentials_under(credential_base)?;
             new_session
@@ -1577,6 +1594,7 @@ mod tests {
             &format!("http://{address}"),
             "test",
             1024 * 1024,
+            None,
             None,
         )
         .await
@@ -1679,6 +1697,7 @@ mod tests {
             &format!("http://{address}"),
             "test",
             1024 * 1024,
+            None,
             None,
         )
         .await
@@ -1896,7 +1915,7 @@ mod tests {
         let manager = UpstreamSseSessionManager::new();
 
         let outcome = manager
-            .get_or_connect(&reqwest::Client::new(), &base, "test", 1024 * 1024, Some(check))
+            .get_or_connect(&reqwest::Client::new(), &base, "test", 1024 * 1024, Some(check), None)
             .await
             .err();
 
@@ -2016,7 +2035,7 @@ mod tests {
         };
 
         manager
-            .get_or_connect(&reqwest::Client::new(), &base, "test", 1024 * 1024, Some(check))
+            .get_or_connect(&reqwest::Client::new(), &base, "test", 1024 * 1024, Some(check), None)
             .await
             .map_err(|error| error.to_string())
             .expect("the session connects");
@@ -2181,7 +2200,7 @@ mod tests {
         };
 
         manager
-            .get_or_connect(&reqwest::Client::new(), &base, "test", 1024 * 1024, Some(check))
+            .get_or_connect(&reqwest::Client::new(), &base, "test", 1024 * 1024, Some(check), None)
             .await
             .map_err(|error| error.to_string())
             .expect("the session connects");

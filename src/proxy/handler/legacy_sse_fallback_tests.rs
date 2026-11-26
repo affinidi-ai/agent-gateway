@@ -34,9 +34,26 @@ impl LegacyServer {
             .cloned()
             .collect()
     }
+
+    /// How many messages, the session's own `initialize` among them, were posted to the
+    /// session endpoint.
+    pub(crate) fn session_post_count(&self) -> usize {
+        self.session_posts
+            .lock()
+            .unwrap()
+            .len()
+    }
 }
 
 pub(crate) async fn legacy_server(endpoint: &'static str) -> LegacyServer {
+    legacy_server_answering_sessions(endpoint, StatusCode::ACCEPTED).await
+}
+
+/// [`legacy_server`], answering every session POST with `session_status`.
+pub(crate) async fn legacy_server_answering_sessions(
+    endpoint: &'static str,
+    session_status: StatusCode,
+) -> LegacyServer {
     use futures::StreamExt;
     let (events, receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
     let receiver = Arc::new(tokio::sync::Mutex::new(Some(receiver)));
@@ -72,9 +89,11 @@ pub(crate) async fn legacy_server(endpoint: &'static str) -> LegacyServer {
                     .lock()
                     .unwrap()
                     .push((uri.path().to_string(), message.clone()));
-                let _ =
-                    events.send(json!({"jsonrpc": "2.0", "id": message["id"], "result": {"content": []}}).to_string());
-                StatusCode::ACCEPTED.into_response()
+                if session_status.is_success() {
+                    let _ = events
+                        .send(json!({"jsonrpc": "2.0", "id": message["id"], "result": {"content": []}}).to_string());
+                }
+                session_status.into_response()
             }
         },
     );
@@ -233,6 +252,19 @@ async fn a_session_endpoint_outside_the_target_base_path_gets_no_delegated_crede
     assert!(body.contains("target_path_refused"), "{body}");
     assert_eq!(path_refusals(&events), vec![(RejectionStage::Forward, Some(400))]);
     assert_eq!(server.tool_calls(), Vec::new(), "the request is not posted to the advertised endpoint");
+}
+
+/// The advertised endpoint is checked before the session is initialized, so one that would
+/// refuse the session's `initialize` still gets the path refusal, and nothing at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_endpoint_outside_the_base_path_is_refused_before_the_session_is_initialized() {
+    let server = legacy_server_answering_sessions("/other-app/messages", StatusCode::NOT_FOUND).await;
+    let (router, _directory) = router(&format!("{}/base", server.url)).await;
+    let (status, body, events) = call(router).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("target_path_refused"), "{body}");
+    assert_eq!(path_refusals(&events), vec![(RejectionStage::Forward, Some(400))]);
+    assert_eq!(server.session_post_count(), 0, "nothing, not even the initialize, is posted");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
