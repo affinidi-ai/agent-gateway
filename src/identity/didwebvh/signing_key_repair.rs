@@ -295,7 +295,7 @@ pub(crate) async fn append_signing_key_version(
 
     let secret = build_signing_secret(&serde_json::to_value(signing_key)?).map_err(|e| anyhow::anyhow!(e))?;
     let update = didwebvh_rs::prelude::update_did(
-        didwebvh_rs::prelude::UpdateDIDConfig::builder()
+        didwebvh_rs::prelude::UpdateDIDConfig::<crate::vta::local::VtaDiSigner, crate::vta::local::VtaDiSigner>::builder_generic()
             .state(state)
             .signing_key(secret)
             .document(document)

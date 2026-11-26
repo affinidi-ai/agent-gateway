@@ -8,6 +8,8 @@ import { formatDateTime, timeAgo } from '../../../../utils/stringUtils';
 import { getIssuers } from '../../../../utils/issuersCache';
 import type { Issuer } from '../../../../types';
 import FieldHelp from '../../../shared/FieldHelp';
+import { SurfaceSigningSection } from './SurfaceSigningSection';
+import { useOptionalPermissions } from '../../../../context/PermissionsContext';
 
 /**
  * Right-panel editor for the Surface element. Pulls its values from
@@ -16,6 +18,8 @@ import FieldHelp from '../../../shared/FieldHelp';
  */
 const SurfacePanel: React.FC<ConfigPanelProps> = ({ hasAttemptedSave }) => {
   const meta = useOptionalSurfaceMeta();
+  // The gateway refuses a changed signing choice without `key_management.edit`.
+  const canChooseSigning = useOptionalPermissions()?.hasPermission('key_management.edit') ?? false;
 
   const [issuers, setIssuers] = useState<Issuer[]>([]);
   useEffect(() => {
@@ -58,6 +62,8 @@ const SurfacePanel: React.FC<ConfigPanelProps> = ({ hasAttemptedSave }) => {
     setTerminateTraceId,
     setIssuerId,
     setDidwebvh,
+    signing,
+    setSigning,
     onSaveAsTemplate,
   } = meta;
 
@@ -145,6 +151,13 @@ const SurfacePanel: React.FC<ConfigPanelProps> = ({ hasAttemptedSave }) => {
             Owning issuer. Drives Trust Check / Trust Recorder authority defaults.
           </Form.Text>
         </Form.Group>
+
+        <SurfaceSigningSection
+          signing={signing}
+          setSigning={setSigning}
+          disabled={disabled || !canChooseSigning}
+          owner={issuers.find(d => d.id === issuerId)}
+        />
       </div>
 
       <div className="config-section">

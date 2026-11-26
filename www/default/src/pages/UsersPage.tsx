@@ -274,20 +274,6 @@ const UsersPage: React.FC = () => {
             <div className="d-flex justify-content-between align-items-center">
               <h6 className="m-0 font-weight-bold text-primary">
                 <i className="fas fa-users"></i> User Management
-                <Badge
-                  value={filteredUsers.length}
-                  suffix={
-                    searchTerm || roleFilter !== 'all' || statusFilter !== 'all'
-                      ? ` of ${users.length}`
-                      : undefined
-                  }
-                  className="ms-2"
-                  ariaLabel={`${filteredUsers.length}${
-                    searchTerm || roleFilter !== 'all' || statusFilter !== 'all'
-                      ? ` of ${users.length}`
-                      : ''
-                  } users`}
-                />
               </h6>
             </div>
           </div>

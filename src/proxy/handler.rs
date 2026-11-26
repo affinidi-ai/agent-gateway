@@ -7255,6 +7255,7 @@ async fn proxy_charged_request(
                             wb,
                             None,
                             None,
+                            &state.key_scope(),
                         )
                         .await
                     {
@@ -7505,7 +7506,14 @@ async fn proxy_charged_request(
             authenticated_identity.as_ref(),
         );
         match vc_issuer
-            .create_agent_identity_presentation_with_binding(&result.did, &result.identity_fields, wb, None, None)
+            .create_agent_identity_presentation_with_binding(
+                &result.did,
+                &result.identity_fields,
+                wb,
+                None,
+                None,
+                &state.key_scope(),
+            )
             .await
         {
             Ok(final_vp_jwt) => {
@@ -8788,6 +8796,7 @@ async fn proxy_charged_request(
                     &vc_issuer,
                     &channel_name,
                     identity_response_kind,
+                    &state.key_scope(),
                 )
                 .await
                 .map_err(|e| {
@@ -9181,6 +9190,7 @@ async fn proxy_charged_request(
                         response_wb,
                         &vc_issuer,
                         &channel_name,
+                        &state.key_scope(),
                     )
                     .await
                     {
@@ -12593,6 +12603,7 @@ async fn handle_fabric_request_inner(
                     None,
                     None,
                     chained_credentials,
+                    &state.key_scope(),
                 )
                 .await
             {
@@ -13908,6 +13919,7 @@ async fn handle_fabric_request_inner(
                             &vc_issuer,
                             channel_name,
                             identity_response_kind,
+                            &state.key_scope(),
                         )
                         .await
                         {
@@ -15112,11 +15124,12 @@ async fn put_identity_credential_into_agent_card(
     vc_issuer: &Arc<crate::identity::VCIssuer>,
     channel_name: &str,
     response_kind: crate::proxy::backend_identity::IdentityResponseKind,
+    scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<()> {
     if response_kind.trusts_upstream_identity_credential() {
-        crate::a2a::inject_credential_into_agent_card(card, resolved_identity, vc_issuer, channel_name).await
+        crate::a2a::inject_credential_into_agent_card(card, resolved_identity, vc_issuer, channel_name, scope).await
     } else {
-        crate::a2a::replace_credential_in_agent_card(card, resolved_identity, vc_issuer, channel_name).await
+        crate::a2a::replace_credential_in_agent_card(card, resolved_identity, vc_issuer, channel_name, scope).await
     }
 }
 
@@ -16608,6 +16621,7 @@ async fn inject_backend_agent_vp(
                 &protected_meta_field,
                 protected_strip_raw,
                 mcp_metadata_context,
+                &state.key_scope(),
             )
             .await
         }
@@ -16620,6 +16634,7 @@ async fn inject_backend_agent_vp(
                 &vc_issuer,
                 channel_name,
                 inbound_chained_vcs.clone(),
+                &state.key_scope(),
             )
             .await
             .map(|injected| injected.map_or_else(|| (response_body.clone(), None), |(body, proof)| (body, Some(proof))))

@@ -234,7 +234,12 @@ integrations cannot be listed, or the other node still holds the journal), keeps
 background.
 
 Also on becoming Active, before it reloads its configuration, a node reconciles with disk its
-policy definitions, global policies, agent surfaces, gateways and API keys. API keys another node
+policy definitions, global policies, agent surfaces, gateways, API keys and trust agent
+connections, and re-reads the dashboard settings, which hold Gateway signing. Clients it built
+for trust agent connections before the promotion are dropped and rebuilt from the records as
+stored now on their next use, so a connection another node disabled, revoked or repointed, or a
+Gateway signing change it saved, applies from the first request. A control-key rotation the
+previous Active node left under way is resumed. API keys another node
 created, rotated or revoked while this node was Standby therefore authenticate, or stop
 authenticating, without a restart. A store that cannot be reconciled is logged and keeps what it
 held. The node then revokes the API keys of surfaces that no longer exist, as it does when it

@@ -376,12 +376,6 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
             <div className="d-flex justify-content-between align-items-center">
               <h6 className="m-0 font-weight-bold text-primary">
                 <i className="fas fa-server"></i> Agent Gateways
-                <Badge
-                  value={filteredGateways.length}
-                  suffix={effectiveSearchTerm ? ` of ${gateways.length}` : undefined}
-                  className="ms-2"
-                  ariaLabel={`${filteredGateways.length}${effectiveSearchTerm ? ` of ${gateways.length}` : ''} gateways`}
-                />
               </h6>
               {hasPermission('gateways.edit') && (
                 <>
@@ -602,12 +596,6 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
             <div className="d-flex justify-content-between align-items-center">
               <h6 className="m-0 font-weight-bold text-primary">
                 <i className="fas fa-share-alt"></i> Connection Points
-                <Badge
-                  value={filteredConnectionPoints.length}
-                  suffix={effectiveSearchTerm ? ` of ${connectionPoints.length}` : undefined}
-                  className="ms-2"
-                  ariaLabel={`${filteredConnectionPoints.length}${effectiveSearchTerm ? ` of ${connectionPoints.length}` : ''} connection points`}
-                />
               </h6>
               {hasSelfGateway && hasPermission('gateways.edit') && (
                 <>

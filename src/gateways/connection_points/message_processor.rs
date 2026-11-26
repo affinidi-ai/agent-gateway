@@ -1814,8 +1814,17 @@ fn require_peer_issuer(
     if issuer_matches_peer(verified.issuer_did.as_deref(), peer_issuers) {
         Ok(verified)
     } else {
+        // Name the remedy, not just the mismatch. The overwhelmingly common
+        // cause is a peer that moved its issuer DID — to a trust agent, say —
+        // after this connection recorded the old one. The attested issuer is
+        // deliberately not settable through the API, so an operator who does
+        // not know about re-attestation sees every request from that peer fail
+        // with nothing pointing at the cure.
         anyhow::bail!(
-            "identity presentation issuer {:?} is not an issuer of the sending connection {peer_issuers}",
+            "identity presentation issuer {:?} is not an issuer of the sending connection \
+             {peer_issuers}; if the peer has moved its issuer DID, re-attest the connection \
+             (DELETE then POST /v1/gateways/{{id}}/issuer), or add the new issuer with \
+             POST /v1/gateways/{{id}}/trusted-issuers",
             verified.issuer_did
         )
     }
@@ -7139,7 +7148,13 @@ async fn process_charged_forward_request(
                         && let Some(vc_issuer) = GLOBAL_VC_ISSUER.get()
                     {
                         card_changed |=
-                            crate::a2a::inject_credential_into_agent_card(&mut agent_card, &resolved_identity, vc_issuer, channel_id)
+                            crate::a2a::inject_credential_into_agent_card(
+                                &mut agent_card,
+                                &resolved_identity,
+                                vc_issuer,
+                                channel_id,
+                                &crate::vta::key_directory::KeyScope::serving(&resolved_surface, active_variant_id.as_deref()),
+                            )
                                 .await
                                 .inspect_err(|e| {
                                     channel_warn!(config_id, "GW2: Failed to inject identity credential into agent card: {}", e)
@@ -7806,6 +7821,10 @@ async fn process_charged_forward_request(
                                     None
                                 };
 
+                                let key_scope = crate::vta::key_directory::KeyScope::serving(
+                                    &resolved_surface,
+                                    active_variant_id.as_deref(),
+                                );
                                 // Use protocol-specific injection (RESPONSE functions, not request functions!)
                                 let inject_result = if surface_protocol == crate::config::ChannelProtocol::Mcp {
                                     let (gw2_meta_field, gw2_strip_raw) = resolved_surface
@@ -7830,6 +7849,7 @@ async fn process_charged_forward_request(
                                         &gw2_meta_field,
                                         gw2_strip_raw,
                                         mcp_metadata_context,
+                                        &key_scope,
                                     )
                                     .await
                                 } else {
@@ -7842,6 +7862,7 @@ async fn process_charged_forward_request(
                                         vc_issuer,
                                         channel_id,
                                         Vec::new(),
+                                        &key_scope,
                                     )
                                     .await
                                     .map(|injected| {

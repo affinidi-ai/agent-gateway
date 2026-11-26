@@ -15,19 +15,6 @@ const PoliciesPage: React.FC = () => {
   const [activeTab, setActiveTab] = useState<PolicyType>(initialTab);
   const [searchTerm, setSearchTerm] = useState('');
 
-  const [gatewayCount, setGatewayCount] = useState(0);
-  const [agentSurfaceCount, setAgentSurfaceCount] = useState(0);
-
-  const filterActive = searchTerm.trim().length > 0;
-  const tabBadge = (count: number) => {
-    if (!filterActive) return null;
-    return (
-      <span className="badge text-bg-primary ms-2" style={{ verticalAlign: 'middle' }}>
-        {count}
-      </span>
-    );
-  };
-
   return (
     <div className="container-fluid" data-testid="page-policies">
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
@@ -56,7 +43,7 @@ const PoliciesPage: React.FC = () => {
           tabAttrs={{ 'data-testid': 'policies-gateway-tab-trigger' }}
           title={
             <>
-              <i className="fas fa-shield-alt"></i> Gateway {tabBadge(gatewayCount)}
+              <i className="fas fa-shield-alt"></i> Gateway
             </>
           }
         >
@@ -65,7 +52,6 @@ const PoliciesPage: React.FC = () => {
             label="Gateway"
             icon="fa-shield-alt"
             externalSearchTerm={searchTerm}
-            onFilteredCountChange={setGatewayCount}
           />
         </Tab>
 
@@ -75,7 +61,6 @@ const PoliciesPage: React.FC = () => {
           title={
             <>
               <i className="fas fa-exchange-alt"></i> Agent Surfaces
-              {tabBadge(agentSurfaceCount)}
             </>
           }
         >
@@ -84,7 +69,6 @@ const PoliciesPage: React.FC = () => {
             label="Agent Surface"
             icon="fa-exchange-alt"
             externalSearchTerm={searchTerm}
-            onFilteredCountChange={setAgentSurfaceCount}
           />
         </Tab>
       </Tabs>

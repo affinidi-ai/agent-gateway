@@ -139,6 +139,15 @@ pub struct SurfaceConfigBuilder {
     pub stored_consent_age_secs: Option<i64>,
     /// The gateway writes its log files to `_storage/logs`, the directory the log routes act on.
     pub writes_log_directory: bool,
+    /// The gateway starts with a `[vta]` block that points at a mock trust agent.
+    pub control_key_trust_agent: Option<ControlKeyTrustAgentSetup>,
+    /// `[vta] control_key_rotation_days` of that block.
+    pub control_key_rotation_days: Option<u32>,
+    /// `[vta] connection_key_switch_timeout_secs`, so a rotation the trust agent refuses rolls back quickly.
+    pub connection_key_switch_timeout_secs: Option<u64>,
+    /// `[vta] context_did_method = "did_webvh"` with this `context_did_hosting`: `vta_server`
+    /// (the trust agent's webvh server `host-1`) or `gateway`.
+    pub context_did_webvh_hosting: Option<&'static str>,
     /// The gateway serves a dashboard build from `www/` at `/`, falling back to its
     /// `index.html` for every path no other route takes, as a deployed dashboard does.
     pub serves_dashboard: bool,
@@ -258,6 +267,14 @@ impl SurfaceConfigBuilder {
     }
 }
 
+/// The trust agent a gateway is configured against, and where it keeps its control key.
+#[derive(Debug, Clone)]
+pub struct ControlKeyTrustAgentSetup {
+    pub base_url: String,
+    pub key_path: std::path::PathBuf,
+    pub control_did_method: &'static str,
+}
+
 impl Default for SurfaceConfigBuilder {
     fn default() -> Self {
         Self {
@@ -339,6 +356,10 @@ impl Default for SurfaceConfigBuilder {
             logs_no_delegation_events: false,
             stored_consent_age_secs: None,
             writes_log_directory: false,
+            control_key_trust_agent: None,
+            control_key_rotation_days: None,
+            context_did_webvh_hosting: None,
+            connection_key_switch_timeout_secs: None,
             serves_dashboard: false,
             gateway_prefixes: Vec::new(),
             stored_api_keys: Vec::new(),

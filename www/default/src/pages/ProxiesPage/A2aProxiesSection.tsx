@@ -2,7 +2,6 @@ import React, { useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useLimitGuard } from '../../hooks/useLimitGuard';
 import { AppButton } from '../../components/shared/AppButton';
-import { Badge } from '../../components/shared/Badge';
 import { DeleteButton } from '../../components/shared/DeleteButton';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { DOCS_URL } from '../../config/docs';
@@ -46,12 +45,6 @@ const A2aProxiesSection: React.FC<A2aProxiesSectionProps> = ({
       <div className="card-header py-3 d-flex justify-content-between align-items-center">
         <h6 className="m-0 font-weight-bold text-primary">
           <i className="fas fa-robot me-1" aria-hidden="true" /> A2A Proxies
-          <Badge
-            value={filteredProxies.length}
-            suffix={searchTerm ? ` of ${proxies.length}` : undefined}
-            className="ms-2"
-            ariaLabel={`${filteredProxies.length}${searchTerm ? ` of ${proxies.length}` : ''} A2A proxies`}
-          />
         </h6>
         {canEdit && (
           <>

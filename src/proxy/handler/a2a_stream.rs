@@ -292,6 +292,7 @@ impl AccessPointEvents {
             workload_binding,
             &selector.get_vc_issuer(),
             &self.request.channel_name,
+            &self.state.key_scope(),
         )
         .await
         {

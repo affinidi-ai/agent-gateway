@@ -50,7 +50,6 @@ const PaymentSurfacesSection: React.FC<{ gatewayId: string }> = ({ gatewayId }) 
       <div className="card-header bg-light d-flex justify-content-between align-items-center">
         <h6 className="m-0 font-weight-bold text-primary">
           <i className="fas fa-receipt" aria-hidden="true"></i> Payment Surfaces
-          <Badge value={surfaces.length} className="ms-2" />
         </h6>
         <AppButton
           variant="outline-primary"

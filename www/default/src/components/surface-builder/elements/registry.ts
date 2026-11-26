@@ -23,6 +23,7 @@ import {
   transitPointChecksDestination,
 } from './trust-check/definition';
 import { TRANSIT_POINT_FIELDS } from './agentSurfaceSchema';
+import { isSigningEmpty } from './types';
 import { STORED_TARGET_AUTH_KEY, storedTargetAuth } from './_shared/providerTargetAuth';
 import { MANAGED_AGENT_TARGET_AUTH_FORM_KEYS } from './managed-agent/targetAuth';
 import { TRANSIT_POINT_TARGET_AUTH_FORM_KEYS } from './transit-point/targetAuth';
@@ -286,6 +287,10 @@ class ElementRegistry {
       status: ctx.surfaceMeta.status ?? 'active',
       tags: ctx.surfaceMeta.tags,
       ...(ctx.surfaceMeta.issuer_id ? { issuer_id: ctx.surfaceMeta.issuer_id } : {}),
+      // Omitted entirely when nothing is set: an empty block and no block mean
+      // the same thing to the backend, and sending one would make a surface
+      // that inherits look configured.
+      ...(isSigningEmpty(ctx.surfaceMeta.signing) ? {} : { signing: ctx.surfaceMeta.signing }),
     };
 
     interface Pending {

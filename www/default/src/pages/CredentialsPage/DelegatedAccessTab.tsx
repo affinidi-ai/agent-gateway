@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { usePermissions } from '../../context/PermissionsContext';
 import { AppButton } from '../../components/shared/AppButton';
-import { Badge } from '../../components/shared/Badge';
 import { TwoStepButton } from '../../components/shared/TwoStepButton';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { showToast } from '../../utils/toaster';
@@ -84,16 +83,6 @@ const DelegatedAccessTab: React.FC<DelegatedAccessTabProps> = ({
       <div className="card-header py-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
         <h6 className="m-0 font-weight-bold text-primary">
           <i className="fas fa-user-check"></i> Delegated Access
-          {!vaultError && (
-            <Badge
-              value={shown.length}
-              suffix={searchTerm ? ` of ${active.length}` : undefined}
-              className="ms-2"
-              ariaLabel={`${shown.length}${searchTerm ? ` of ${active.length}` : ''} active ${
-                (searchTerm ? active.length : shown.length) === 1 ? 'delegation' : 'delegations'
-              }`}
-            />
-          )}
           {endingSoon > 0 && (
             <span
               className="badge text-bg-warning ms-2 align-middle"

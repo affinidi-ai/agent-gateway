@@ -180,7 +180,9 @@ changes nothing.
 ## Peer issuer DIDs
 
 A gateway sends fabric envelopes from a per-pairing Connection Point DID but signs the identity
-credentials it issues with its gateway DID. An issuer attestation
+credentials it issues with its gateway DID, or with the DID of the trust agent context it issues
+through: a `did:key`, or a `did:webvh` with `[vta] context_did_method = "did_webvh"`, which the
+receiver resolves from its hosted log and which keeps the same DID across a key rotation. An issuer attestation
 ([`issuer_attestation.rs`](../src/gateways/issuer_attestation.rs)) is a typed JWT
 (`gateway-issuer-attestation+jwt`) binding those two DIDs together: `sub` is the sender's Connection
 Point DID, `aud` the receiver's temporary DID, and `nonce` the handshake thread id.
@@ -198,6 +200,11 @@ Trust is connection-scoped, never per surface or appliance-wide, so a peer canno
 presentation another gateway issued. A sender with neither an established nor a trusted issuer is
 rejected with 403; a sender with trusted issuers but a failed attestation exchange is admitted for
 those issuers only.
+
+The attestation names only the sender's gateway-wide issuer. A sender surface or issuer that signs
+through its own trust agent issues credentials under that trust agent context's DID, which the
+receiver accepts only once its operator adds that DID to the connection's `trusted_issuer_dids`
+(see [`TRUST_AGENT_SIGNING.md`](TRUST_AGENT_SIGNING.md#issuer-dids)).
 
 Earlier builds had a per-surface allowlist, `AgentSurface.trusted_binding_issuers`, which accepted
 a presentation from any peer that forwarded it. The field no longer exists. A stored surface that
