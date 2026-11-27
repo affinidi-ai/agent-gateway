@@ -1696,10 +1696,18 @@ mod tests {
             .expect("serialize body"),
         );
 
-        let err =
-            inject_identity_credential_extension(&request, &did, &identity_fields(), None, &issuer, "ch", None, &mapped)
-                .await
-                .expect_err("the request's surface cannot issue");
+        let err = inject_identity_credential_extension(
+            &request,
+            &did,
+            &identity_fields(),
+            None,
+            &issuer,
+            "ch",
+            None,
+            &mapped,
+        )
+        .await
+        .expect_err("the request's surface cannot issue");
         assert!(
             err.to_string()
                 .contains("vta-gone"),
@@ -1717,9 +1725,19 @@ mod tests {
             .expect("an unmapped surface issues as before")
             .expect("the response carries the identity extension");
 
-        inject_vp_into_a2a_response(&response, &did, &identity_fields(), None, &issuer, "ch", Vec::new(), None, &mapped)
-            .await
-            .expect_err("the backend response's surface cannot issue");
+        inject_vp_into_a2a_response(
+            &response,
+            &did,
+            &identity_fields(),
+            None,
+            &issuer,
+            "ch",
+            Vec::new(),
+            None,
+            &mapped,
+        )
+        .await
+        .expect_err("the backend response's surface cannot issue");
     }
 
     fn assert_carries_backend_vp(
