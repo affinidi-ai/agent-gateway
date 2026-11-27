@@ -119,7 +119,9 @@ Feature: Source authentication and target authentication over fabric
     And the VP Audit Log of gateway 1 keeps every audit event
     When the caller asks gateway 1 MCP surface "charlie" for available tools
     Then the response status is 500
-    And the response says "target_auth_rejected"
+    And the MCP response is a JSON-RPC error with code -32603
+    And the MCP response id matches the request id
+    And the response reason is "target_auth_rejected"
     And MCP server "bravo" was not called
     And the VP Audit Log of gateway 1 records the Target credential as refused by the target
 
@@ -142,7 +144,22 @@ Feature: Source authentication and target authentication over fabric
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     When the caller asks gateway 1 MCP surface "charlie" for available tools
     Then the response status is 500
+    And the MCP response is a JSON-RPC error with code -32603
+    And the MCP response id matches the request id
     And the response says "Target authentication failed"
+    And the response reason is "target_auth_misconfigured"
+    And MCP server "bravo" was not called
+
+  Scenario: gateway 1 refuses forwarding over fabric when its credential provider refuses a token
+    Given a fabric with 2 gateways
+    And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
+    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And surface "charlie" authenticates to its managed agent with a client credentials provider
+    And the credential provider of surface "charlie" is refusing token requests
+    When the caller asks gateway 1 MCP surface "charlie" for available tools
+    Then the response status is 500
+    And the MCP response is a JSON-RPC error with code -32603
+    And the MCP response id matches the request id
     And the response reason is "target_auth_misconfigured"
     And MCP server "bravo" was not called
 

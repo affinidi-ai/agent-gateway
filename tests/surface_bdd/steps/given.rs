@@ -3278,8 +3278,29 @@ fn target_credential_provider_authenticates_its_client(
     world: &mut SurfaceWorld,
     wording: String,
 ) {
-    jwt_bearer_target_auth_provider(world).client_authentication =
-        Some(TargetAuthClientAuthentication::from_wording(&wording));
+    let provider = target_auth_provider(world);
+    assert_ne!(
+        provider.grant,
+        TargetAuthProviderGrant::AuthorizationCode,
+        "a JWT Bearer or client credentials provider sets the client authentication of its token requests"
+    );
+    provider.client_authentication = Some(TargetAuthClientAuthentication::from_wording(&wording));
+}
+
+#[given(expr = "OAuth provider {string} authenticates its client with {string}")]
+fn oauth_provider_authenticates_its_client(
+    world: &mut SurfaceWorld,
+    provider: String,
+    wording: String,
+) {
+    assert_eq!(
+        delegation_config_mut(world).provider_id,
+        provider,
+        "the client authentication is set only on the surface's own OAuth provider"
+    );
+    world
+        .surface_config
+        .oauth_client_authentication = Some(TargetAuthClientAuthentication::from_wording(&wording));
 }
 
 #[given("the credential provider is refusing token requests")]
@@ -3777,6 +3798,19 @@ fn named_mcp_surface_targeting_mock(
         .actors
         .record_surface_id(&surface_name, "bdd-surface");
     configure_mcp_surface_protocol(world);
+}
+
+#[given(expr = "MCP server {string} is unreachable")]
+fn mcp_server_is_unreachable(
+    world: &mut SurfaceWorld,
+    server_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&server_name, TargetActorKind::McpServer);
+    world
+        .surface_config
+        .override_target_url = Some("http://127.0.0.1:1".to_string());
 }
 
 #[given(expr = "REST API {string} exposes a Weather OpenAPI")]

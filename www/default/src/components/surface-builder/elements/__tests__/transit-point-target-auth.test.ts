@@ -21,15 +21,29 @@ import {
 } from '../testing/targetAuthFixtures';
 
 describe('Transit Point auth type of a stored static secret', () => {
-  it('reads a Bearer format as bearer only under the Authorization header', () => {
+  it('reads a Bearer format as bearer only under the Authorization header, in any letter case', () => {
     expect(staticSecretAuthType('Authorization', 'Bearer {value}')).toBe('bearer');
-    expect(staticSecretAuthType('authorization', 'Bearer {value}')).toBe('custom_header');
+    expect(staticSecretAuthType('authorization', 'bearer {value}')).toBe('bearer');
     expect(staticSecretAuthType('X-Partner', 'Bearer {value}')).toBe('custom_header');
   });
 
-  it('keeps the api key and custom header readings', () => {
+  it('keeps the api key and custom header readings, and shows Basic as a custom header', () => {
     expect(staticSecretAuthType('X-API-Key', '{value}')).toBe('api_key');
     expect(staticSecretAuthType('X-Auth', 'Token {value}')).toBe('custom_header');
+    expect(staticSecretAuthType('Authorization', 'Basic {value}')).toBe('custom_header');
+  });
+
+  it('saves a bearer header under the stored spelling of Authorization', () => {
+    const saved = (headerName: string) =>
+      transitPointTargetAuth({
+        auth_type: 'bearer',
+        auth_secret: 's',
+        auth_header_name: headerName,
+        auth_header_format: 'Bearer {value}',
+      });
+    expect(saved('authorization')).toEqual(staticSecret('authorization', 'Bearer {value}'));
+    expect(saved('X-API-Key')).toEqual(staticSecret('Authorization', 'Bearer {value}'));
+    expect(saved('')).toEqual(staticSecret('Authorization', 'Bearer {value}'));
   });
 });
 

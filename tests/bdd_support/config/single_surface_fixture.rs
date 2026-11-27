@@ -63,8 +63,12 @@ pub struct SurfaceConfigBuilder {
     pub oauth_authorization_response_issuer: Option<String>,
     /// The seconds the surface's OAuth provider lets a consent be used.
     pub oauth_max_consent_age_secs: Option<u64>,
+    /// How the surface's OAuth provider authenticates its client at the token endpoint.
+    pub oauth_client_authentication: Option<TargetAuthClientAuthentication>,
     /// OAuth providers the gateway has besides the surface's own, by provider id.
     pub additional_oauth_providers: Vec<String>,
+    /// Credential providers stored exactly as given, as a record an older gateway wrote.
+    pub stored_credential_providers: Vec<crate::bdd_support::config::config_tree::CredentialProviderFixture>,
     /// The surface's OAuth provider is stored as the admin API now creates one: with a
     /// record id of its own, which its callback path ends in, instead of its provider id.
     pub oauth_callback_path_ends_in_record_id: bool,
@@ -329,7 +333,9 @@ impl Default for SurfaceConfigBuilder {
             oauth_callback_base_url: None,
             oauth_authorization_response_issuer: None,
             oauth_max_consent_age_secs: None,
+            oauth_client_authentication: None,
             additional_oauth_providers: Vec::new(),
+            stored_credential_providers: Vec::new(),
             oauth_callback_path_ends_in_record_id: false,
             identity_provider: false,
             identity_provider_endpoints: None,
@@ -687,7 +693,7 @@ pub enum TargetAuthProviderGrant {
     JwtBearer,
 }
 
-/// How a JWT Bearer provider's client identifies itself with its grant.
+/// How a credential provider's client identifies itself with its token requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetAuthClientAuthentication {
     ClientIdOnly,

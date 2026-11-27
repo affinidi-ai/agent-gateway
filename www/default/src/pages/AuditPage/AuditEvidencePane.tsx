@@ -5,7 +5,14 @@ import AuditFieldList from './AuditFieldList';
 import AuditJourney from './AuditJourney';
 import AuditProvenance from './AuditProvenance';
 import AuditTrustChain from './AuditTrustChain';
-import { extractEmbeddedDecisions, policyChange, policyDecision, trustCheck } from './auditHelpers';
+import {
+  extractEmbeddedDecisions,
+  policyChange,
+  policyDecision,
+  secretForceDelete,
+  targetAuthChange,
+  trustCheck,
+} from './auditHelpers';
 import { signedVpEntry, traceSiblings } from './evidence';
 import { fieldGroups } from './fieldGroups';
 import { buildJourney } from './journey';
@@ -39,7 +46,7 @@ const AuditEvidencePane: React.FC<AuditEvidencePaneProps> = ({
   const pd = policyDecision(entry);
   const tc = trustCheck(entry);
 
-  if (policyChange(entry)) {
+  if (policyChange(entry) || targetAuthChange(entry) || secretForceDelete(entry)) {
     return (
       <div className="audit-evidence" data-testid="audit-evidence">
         <section className="audit-evidence-block">

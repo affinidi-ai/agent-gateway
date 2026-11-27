@@ -232,6 +232,22 @@ export function sameHeaderName(a: string, b: string): boolean {
   return fold(a) === fold(b);
 }
 
+export type StoredHeaderKind = 'bearer' | 'basic' | 'api_key' | 'custom';
+
+/**
+ * The authentication type both editors show a stored Target header as, read as the gateway
+ * reads it: Bearer or Basic for an `Authorization` header whose format starts with that scheme
+ * and a space in any letter case, API Key for an `X-API-Key` header, Custom for any other. Names
+ * are compared with `sameHeaderName`, and the stored values are not trimmed.
+ */
+export function storedHeaderKind(headerName: string, headerFormat: string): StoredHeaderKind {
+  if (sameHeaderName(headerName, 'Authorization')) {
+    if (/^bearer /i.test(headerFormat)) return 'bearer';
+    if (/^basic /i.test(headerFormat)) return 'basic';
+  }
+  return sameHeaderName(headerName, 'X-API-Key') ? 'api_key' : 'custom';
+}
+
 export function headerNameProblem(name: string): string | null {
   if (!name || !/^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$/.test(name)) {
     return 'Header name must be an HTTP header name';

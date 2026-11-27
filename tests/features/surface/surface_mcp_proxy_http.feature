@@ -169,7 +169,17 @@ Feature: Routing through a proxy:// MCP target
     Given the gateway authenticates to the managed agent with missing secret "bdd-missing-target-secret" in header "x-target-api-key", falling back to "reject"
     When the caller invokes the MCP tool "get_weather" for city "Paris"
     Then the response status is 500
+    And the response is a JSON-RPC error with code -32603
+    And the MCP response id matches the request id
     And the response mentions "Target authentication failed"
+    And the response reason is "target_auth_misconfigured"
+    And REST API "bravo" was not called
+
+  Scenario: A missing Target credential refuses a tool call over Legacy SSE with its reason and no answer to a notification
+    Given the gateway authenticates to the managed agent with missing secret "bdd-missing-target-secret" in header "x-target-api-key", falling back to "reject"
+    When the caller sends an MCP notification and then invokes the MCP tool "get_weather" for city "Paris" over Legacy SSE
+    Then the response is a JSON-RPC error with code -32603
+    And the MCP response id matches the request id
     And the response reason is "target_auth_misconfigured"
     And REST API "bravo" was not called
 
@@ -348,6 +358,8 @@ Feature: Routing through a proxy:// MCP target
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     When the caller invokes the MCP tool "get_weather" for city "../../admin" with a valid API key
     Then the response status is 400
+    And the response is a JSON-RPC error with code -32603
+    And the MCP response id matches the request id
     And the response reason is "target_path_refused"
     And REST API "bravo" was not called
 
@@ -387,6 +399,8 @@ Feature: Routing through a proxy:// MCP target
     And the gateway enforces the credential rule "target_https"
     When the caller invokes the MCP tool "get_weather" for city "Paris" with a valid API key
     Then the response status is 500
+    And the response is a JSON-RPC error with code -32603
+    And the MCP response id matches the request id
     And the response reason is "target_auth_misconfigured"
     And REST API "bravo" was not called
 

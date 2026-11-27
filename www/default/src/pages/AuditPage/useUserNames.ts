@@ -43,9 +43,9 @@ export function clearUserNames(): void {
 }
 
 /**
- * Resolves the user ids policy change records name to usernames. Records hold
+ * Resolves the user ids change records name to usernames. Records hold
  * ids only; an id the dashboard cannot resolve stays an id. The users list is
- * asked for only once `needed`: the page shows a policy change and the viewer
+ * asked for only once `needed`: the page shows a record `changeActor` names an actor for and the viewer
  * has `users.view`. Call it once per page and pass the resolver down.
  */
 export function useUserNames(needed: boolean): UserNameResolver {

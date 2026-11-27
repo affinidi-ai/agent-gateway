@@ -92,6 +92,44 @@ async fn operator_has_created_provider(
 }
 
 #[given(
+    expr = "the API key credential provider {string} is stored with API key secret {string} and client secrets {string} and {string}"
+)]
+fn api_key_provider_stored_with_client_secrets(
+    world: &mut SurfaceWorld,
+    provider_id: String,
+    api_key_secret: String,
+    client_id_secret: String,
+    client_secret_secret: String,
+) {
+    let now = chrono::Utc::now();
+    world
+        .surface_config
+        .stored_credential_providers
+        .push(crate::bdd_support::config::config_tree::CredentialProviderFixture {
+            id: provider_id.clone(),
+            tenant_id: None,
+            name: provider_id.clone(),
+            provider_id,
+            provider_type: "api_key".to_string(),
+            authorization_endpoint: None,
+            token_endpoint: Some("https://192.0.2.1/token".to_string()),
+            client_id_secret_ref: Some(client_id_secret),
+            client_secret_secret_ref: Some(client_secret_secret),
+            default_scopes: Vec::new(),
+            callback_path: String::new(),
+            callback_url: None,
+            token_refresh_enabled: false,
+            api_key_secret_ref: Some(api_key_secret),
+            authorization_response_issuer: None,
+            max_consent_age_secs: None,
+            jwt_settings: None,
+            consent_confirmation: None,
+            created_at: now,
+            updated_at: now,
+        });
+}
+
+#[given(
     expr = "the operator has created the surface for route {string} authenticating its target with credential provider {string} and its callers with secret {string}"
 )]
 async fn operator_has_created_provider_surface(

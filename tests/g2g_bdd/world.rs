@@ -15,6 +15,7 @@ use serde_json::Value;
 use crate::bdd_support::actors::ActorRegistry;
 use crate::bdd_support::admin_client::{AdminApiClient, GatewayRecord};
 use crate::bdd_support::config::fabric_surface_fixture::{SourceAuthSpec, SurfaceSpec};
+use crate::bdd_support::config::toml::FABRIC_GATEWAY_TIMEOUT_MS;
 use crate::bdd_support::dashboard_socket::DashboardSocket;
 use crate::bdd_support::gateway_process::G2G_TEST_AUTH_TOKEN;
 use crate::bdd_support::json_rpc::{
@@ -225,13 +226,9 @@ fn expected_probe_status(
     }
 }
 
-fn fabric_route_probe_stage(
-    topology: &TopologyBuilder,
-    link: &FabricLink,
-) -> Option<FabricRouteProbeStage> {
-    let target = surface_spec(topology, link.to_gw, &link.to_surface);
-
-    let target_credential_unavailable = target
+/// Whether `surface` refuses every request because its Target credential cannot be obtained.
+fn target_credential_unavailable(surface: &SurfaceSpec) -> bool {
+    surface
         .target_auth
         .as_ref()
         .is_some_and(|target_auth| {
@@ -240,11 +237,20 @@ fn fabric_route_probe_stage(
                 .is_none()
                 && target_auth.fallback == "reject"
         })
-        || target
+        || surface
             .target_auth_provider
             .as_ref()
-            .is_some_and(|provider| provider.token_status != 200 && provider.fallback == "reject");
-    if target_credential_unavailable {
+            .is_some_and(|provider| provider.token_status != 200 && provider.fallback == "reject")
+}
+
+fn fabric_route_probe_stage(
+    topology: &TopologyBuilder,
+    link: &FabricLink,
+) -> Option<FabricRouteProbeStage> {
+    let target = surface_spec(topology, link.to_gw, &link.to_surface);
+    let sender = surface_spec(topology, link.from_gw, &link.from_surface);
+
+    if target_credential_unavailable(target) || target_credential_unavailable(sender) {
         return None;
     }
 
@@ -270,7 +276,7 @@ fn fabric_route_probe_stage(
 }
 
 /// A route that never answers `200`, so no probe can show it ready: the target's mock
-/// answers another status, the sending surface's Target credential goes in the header the
+/// answers another status or later than the sending gateway waits, the sending surface's Target credential goes in the header the
 /// receiving surface checks with a value it does not accept, or the receiving surface
 /// authenticates its Target's responses, which the mock proves only once the scenario says so.
 fn route_refuses_by_design(
@@ -278,14 +284,21 @@ fn route_refuses_by_design(
     link: &FabricLink,
     target: &SurfaceSpec,
 ) -> bool {
-    let mock_refuses = topology
+    let plan = topology
         .plans
-        .get(&link.to_gw)
+        .get(&link.to_gw);
+    let mock_refuses = plan
         .and_then(|plan| {
             plan.mock_statuses
                 .get(&link.to_surface)
         })
         .is_some_and(|status| *status != 200);
+    let mock_answers_too_late = plan
+        .and_then(|plan| {
+            plan.mock_response_delays
+                .get(&link.to_surface)
+        })
+        .is_some_and(|(min_delay_ms, _)| *min_delay_ms >= FABRIC_GATEWAY_TIMEOUT_MS);
     let source = surface_spec(topology, link.from_gw, &link.from_surface);
     let credential_refused = match (&source.target_auth, &target.source_auth) {
         (Some(target_auth), Some(SourceAuthSpec::ApiKey { header_name, valid_key, .. })) => {
@@ -299,7 +312,7 @@ fn route_refuses_by_design(
         }
         _ => false,
     };
-    mock_refuses || credential_refused || target.response_auth.is_some()
+    mock_refuses || mock_answers_too_late || credential_refused || target.response_auth.is_some()
 }
 
 fn surface_spec<'a>(

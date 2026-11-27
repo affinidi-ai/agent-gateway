@@ -1982,8 +1982,10 @@ mod tests {
     /// at least [`MIN_LINEAR_INPUT_BYTES`] long, so every machine compares the same two sizes.
     /// The two texts are masked in turn, [`LINEAR_TIMING_ROUNDS`] times each, and each keeps
     /// its fastest run, so a slower stretch of a busy test run slows both alike. The bound
-    /// compares the build with itself, so it holds however slow the build is, coverage
-    /// instrumentation included.
+    /// compares the build with itself, so it holds however slow the build is. Under coverage
+    /// instrumentation on a shared runner the larger text, past the CPU caches, slows by more
+    /// than the bound allows, so the timing tests run in the unit test job and not under
+    /// `cfg(coverage)`.
     fn assert_masking_is_linear(build: impl Fn(usize) -> (String, String)) {
         assert_linear_masking_by(mask_credentials, build);
     }
@@ -2025,6 +2027,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(coverage, ignore = "timed in the unit test job; see assert_masking_is_linear")]
     fn surface_ids_are_kept_by_the_configured_redaction_rules_in_linear_time() {
         let redactor = crate::observability::log_redact::example_redactor();
         let id = "fb735810-d02c-4e7c-b555-123456789012 ";
@@ -2039,6 +2042,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(coverage, ignore = "timed in the unit test job; see assert_masking_is_linear")]
     fn header_like_pieces_are_kept_in_linear_time() {
         let kept = |text: String| (text.clone(), text);
         assert_masking_is_linear(|scale| kept(format!("{}x.a.b", "Ci-".repeat(2_000 * scale))));
@@ -2051,6 +2055,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(coverage, ignore = "timed in the unit test job; see assert_masking_is_linear")]
     fn a_jwt_after_a_long_glued_run_is_masked_in_linear_time() {
         for unit in ["a-", "a-Ci-", "Ci-a.", "eyJh-Ci."] {
             assert_masking_is_linear(|scale| {
