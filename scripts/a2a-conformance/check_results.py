@@ -38,6 +38,7 @@ OUTCOMES = ('pass', 'fail', 'skip', 'xfail')
 DIRECT = 'direct'
 TEST_PREFIX = 'tests.compatibility.'
 MESSAGE_LIMIT = 300
+DOCUMENT_TYPE = b'<!DOCTYPE'
 
 
 @dataclass(frozen=True)
@@ -74,9 +75,22 @@ def short(message: str | None) -> str:
     return text if len(text) <= MESSAGE_LIMIT else f'{text[:MESSAGE_LIMIT]}...'
 
 
+def junit_root(path: Path) -> ET.Element:
+    """Parse a report that declares no document type, so the parser is given no entity to expand or fetch.
+
+    A NUL byte is refused too: the parser reads UTF-16 without being told to,
+    and a document type written in it is not found by a search of the bytes.
+    Every UTF-16 report holds a NUL byte, and no other report may.
+    """
+    data = path.read_bytes()
+    if DOCUMENT_TYPE in data or b'\x00' in data:
+        raise ValueError(f'{path}: a JUnit report must not declare a document type or hold a NUL byte')
+    return ET.fromstring(data)
+
+
 def junit_results(path: Path) -> dict[str, Result]:
     results: dict[str, Result] = {}
-    for case in ET.parse(path).getroot().iter('testcase'):
+    for case in junit_root(path).iter('testcase'):
         test = f'{case.get("classname", "").removeprefix(TEST_PREFIX)}::{case.get("name")}'
         result = Result('pass')
         for child in case:

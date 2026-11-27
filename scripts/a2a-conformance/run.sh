@@ -669,7 +669,8 @@ rm -rf "${RUN}"
 mkdir -p "${LOGS}" "${RESULTS}"
 RUN_CREATED=true
 
-# 2. Harness self-tests: the scoring has to be right before it scores anything.
+# 2. Harness self-tests: the scoring and the Direct Line stand-in have to be
+# right before a run relies on them.
 if "${PYTHON}" -m unittest discover -s "${HERE}" -p 'test_*.py' > "${LOGS}/self-test.log" 2>&1; then
     record PASS "self-test: $(grep -E '^Ran ' "${LOGS}/self-test.log")"
 else

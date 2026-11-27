@@ -3,7 +3,9 @@
 It serves the three calls the A2A proxy makes: start a conversation, post the
 caller's text as an activity, and poll the conversation for the reply. The
 reply repeats the text after REPLY_PREFIX, so a result can be told from an
-empty success.
+empty success. A request body is read up to MAX_BODY bytes, which is more than
+the gateway accepts from its own caller; a longer one, or a Content-Length
+that is not a number, is refused without being read.
 
 Usage: directline.py --port <port>
 """
@@ -19,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 BASE_PATH = '/v3/directline'
 REPLY_PREFIX = 'conformance reply: '
 BOT_ID = 'conformance-bot'
+MAX_BODY = 16 * 1024 * 1024
 ACTIVITIES = re.compile(rf'^{BASE_PATH}/conversations/([^/]+)/activities$')
 
 conversations: dict[str, list[dict]] = {}
@@ -34,8 +37,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def read_json(self) -> dict:
-        length = int(self.headers.get('Content-Length') or 0)
+    def read_json(self) -> dict | None:
+        """The request body as an object, or None once a body it will not read has been refused."""
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            length = -1
+        if not 0 <= length <= MAX_BODY:
+            self.answer(413 if length > MAX_BODY else 400, {'error': f'Content-Length must be a number from 0 to {MAX_BODY}'})
+            return None
         try:
             body = json.loads(self.rfile.read(length) or b'{}')
         except ValueError:
@@ -45,6 +55,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = self.path.split('?', 1)[0]
         body = self.read_json()
+        if body is None:
+            return
         if path == f'{BASE_PATH}/conversations':
             conversation = str(uuid.uuid4())
             with lock:

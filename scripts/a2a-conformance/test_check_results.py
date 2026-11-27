@@ -63,6 +63,39 @@ class Results(unittest.TestCase):
         parsed = check_results.junit_results(self.directory / 'junit-mandatory.xml')
         self.assertEqual(parsed, {'tests.mandatory.protocol.test_card::test_get': Result('pass')})
 
+    def test_a_message_outside_ascii_is_read(self):
+        (self.directory / 'junitreport.xml').write_text(
+            '<?xml version="1.0" encoding="utf-8"?><testsuite><testcase classname="tests.compatibility.card" name="test_get">'
+            '<failure message="naïve — 日本"/></testcase></testsuite>', encoding='utf-8')
+        parsed = check_results.junit_results(self.directory / 'junitreport.xml')
+        self.assertEqual(parsed, {'card::test_get': Result('fail', 'naïve — 日本')})
+
+    def test_a_report_that_declares_a_document_type_is_refused(self):
+        for declaration in ('<!DOCTYPE testsuite [<!ENTITY a "expanded">]>',
+                            '<!DOCTYPE testsuite [<!ENTITY a SYSTEM "file:///etc/hostname">]>',
+                            '<!DOCTYPE testsuite SYSTEM "http://127.0.0.1:9/suite.dtd">'):
+            (self.directory / 'junitreport.xml').write_text(
+                f'{declaration}<testsuite><testcase classname="tests.compatibility.card" name="test_get">'
+                '<failure message="&a;"/></testcase></testsuite>')
+            with self.subTest(declaration=declaration), self.assertRaisesRegex(ValueError, 'must not declare a document type'):
+                check_results.junit_results(self.directory / 'junitreport.xml')
+
+    def test_a_document_type_written_in_utf_16_is_refused(self):
+        report = ('<!DOCTYPE testsuite [<!ENTITY a "expanded">]><testsuite>'
+                  '<testcase classname="tests.compatibility.card" name="&a;"/></testsuite>')
+        for encoding in ('utf-16', 'utf-16-le', 'utf-16-be'):
+            (self.directory / 'junitreport.xml').write_bytes(report.encode(encoding))
+            with self.subTest(encoding=encoding), self.assertRaisesRegex(ValueError, 'hold a NUL byte'):
+                check_results.junit_results(self.directory / 'junitreport.xml')
+
+    def test_a_report_in_another_single_byte_encoding_is_still_read(self):
+        (self.directory / 'junitreport.xml').write_bytes(
+            '<?xml version="1.0" encoding="iso-8859-1"?><testsuite>'
+            '<testcase classname="tests.compatibility.card" name="test_get"><failure message="naïve"/></testcase>'
+            '</testsuite>'.encode('iso-8859-1'))
+        parsed = check_results.junit_results(self.directory / 'junitreport.xml')
+        self.assertEqual(parsed, {'card::test_get': Result('fail', 'naïve')})
+
     def test_a_long_message_is_cut_at_the_limit(self):
         self.assertEqual(check_results.short('x' * check_results.MESSAGE_LIMIT), 'x' * check_results.MESSAGE_LIMIT)
         self.assertEqual(check_results.short('x' * (check_results.MESSAGE_LIMIT + 1)),
@@ -406,6 +439,18 @@ class Main(unittest.TestCase):
                 self.assertIn('FAIL  direct:', output)
                 self.assertNotIn('access-point:', output)
                 self.assertFalse(report.exists())
+
+    def test_a_report_that_declares_a_document_type_is_reported_not_raised(self):
+        self.suite('direct', testcase('test_etag'))
+        directory = self.work / 'results' / 'access-point'
+        directory.mkdir(parents=True)
+        (directory / 'junitreport.xml').write_text(
+            f'<!DOCTYPE testsuite [<!ENTITY a "x">]><testsuite>{testcase("test_etag")}</testsuite>')
+        (directory / 'probes.json').write_text(NO_PROBES)
+        code, output = self.main('direct,access-point')
+        self.assertEqual(code, 1)
+        self.assertIn('FAIL  access-point:', output)
+        self.assertIn('must not declare a document type', output)
 
     def test_a_baseline_of_the_wrong_shape_is_reported_not_raised(self):
         code, output = self.access_point('fail', 'expected = "card::test_etag"\n')

@@ -95,8 +95,9 @@ Both run on the JSON-RPC binding only, the one binding the gateway serves.
    by a killed run is replaced once its PID no longer runs the harness. The
    harness never stops a process it did not start. The previous run's outputs
    are removed only after every check passes.
-2. **Self-tests.** `test_check_results.py` runs first: the scoring has to be
-   right before it scores anything.
+2. **Self-tests.** `test_check_results.py` and `test_directline.py` run first:
+   the scoring and the Direct Line stand-in have to be right before a run
+   relies on them.
 3. **Pinned dependencies.** Fetches the suite, restores its checkout to the
    pinned commit with nothing else in it, and installs the suite's packages and
    the test agent's packages into their own virtual environments.
@@ -110,7 +111,9 @@ Both run on the JSON-RPC binding only, the one binding the gateway serves.
    surface: the admin API creates a new A2A proxy surface with `1.0` only,
    which the 0.3 suite could not call at all.
 6. **Score.** `check_results.py` compares every target with the direct run and
-   the baselines.
+   the baselines. It refuses a JUnit report that declares a document type or
+   holds a NUL byte, as every UTF-16 report does. No report the suite writes
+   has either, so the XML parser is never given an entity to expand or fetch.
 
 `env.py` builds everything from scratch under `target/a2a-conformance/`:
 `config.toml` from the binary's own `--generate-bootstrap`, a certificate from
@@ -215,7 +218,10 @@ them, each for one reason:
 `directline.py` stands in for the Direct Line service behind the A2A proxy. It
 answers every text with one text reply, so the suite's checks that need a
 task, an artifact or a stream cannot pass on the `a2a-proxy` target; its
-baseline marks those entries "Not a finding".
+baseline marks those entries "Not a finding". It listens on `127.0.0.1` only
+and reads a request body of at most 16 MiB, which is above the 10 MiB default
+of the gateway's `a2a.max_body_size`. It refuses a longer one, or a
+`Content-Length` that is not a number, without reading it.
 
 ## Updating a pin
 
