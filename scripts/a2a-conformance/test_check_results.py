@@ -50,6 +50,24 @@ class Results(unittest.TestCase):
         self.assertEqual(parsed['core.test_a.TestSend::test_skipped'], Result('skip', 'send_message failed: timed out'))
         self.assertEqual(parsed['core.test_a.TestSend::test_should'].outcome, 'xfail')
 
+    def test_a_test_that_is_skipped_and_then_errors_counts_as_failed(self):
+        (self.directory / 'junitreport.xml').write_text(
+            '<testsuite><testcase classname="tests.compatibility.card" name="test_get">'
+            '<skipped type="pytest.skip" message="no card"/><error message="teardown failed"/></testcase></testsuite>')
+        parsed = check_results.junit_results(self.directory / 'junitreport.xml')
+        self.assertEqual(parsed, {'card::test_get': Result('fail', 'teardown failed')})
+
+    def test_a_test_outside_the_compatibility_tests_keeps_its_whole_name(self):
+        (self.directory / 'junit-mandatory.xml').write_text(
+            '<testsuite><testcase classname="tests.mandatory.protocol.test_card" name="test_get"/></testsuite>')
+        parsed = check_results.junit_results(self.directory / 'junit-mandatory.xml')
+        self.assertEqual(parsed, {'tests.mandatory.protocol.test_card::test_get': Result('pass')})
+
+    def test_a_long_message_is_cut_at_the_limit(self):
+        self.assertEqual(check_results.short('x' * check_results.MESSAGE_LIMIT), 'x' * check_results.MESSAGE_LIMIT)
+        self.assertEqual(check_results.short('x' * (check_results.MESSAGE_LIMIT + 1)),
+                         'x' * check_results.MESSAGE_LIMIT + '...')
+
     def test_probe_results_are_scored_with_the_suite_results(self):
         (self.directory / 'junitreport.xml').write_text(JUNIT)
         (self.directory / 'probes.json').write_text(json.dumps(SLASH_PROBE))
@@ -79,6 +97,15 @@ class Results(unittest.TestCase):
         (self.directory / 'probes.json').write_text(json.dumps([{'test': 'harness.x::y', 'outcome': 'maybe'}]))
         with self.assertRaises(ValueError):
             check_results.load_results(self.directory)
+
+    def test_probe_results_of_the_wrong_shape_are_errors(self):
+        (self.directory / 'junitreport.xml').write_text(JUNIT)
+        for text in ('not json', '{}', '[1]', '[{"outcome": "pass"}]', '[{"test": 7, "outcome": "pass"}]',
+                     '[{"test": "harness.x::y", "outcome": ["pass"]}]',
+                     '[{"test": "harness.x::y", "outcome": "fail", "message": 404}]'):
+            (self.directory / 'probes.json').write_text(text)
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                check_results.load_results(self.directory)
 
 
 class AgentScoring(unittest.TestCase):
@@ -136,11 +163,11 @@ class GatewayScoring(unittest.TestCase):
         self.assertEqual([item.test for item in unlisted], ['a'])
         self.assertEqual(stale, ['a: listed as skip or fail, but it is now xfail'])
 
-    def test_a_test_the_gateway_fixes_or_loses_is_a_difference_too(self):
-        gateway = results(a='pass', b='pass', d='skip')
+    def test_a_test_the_gateway_fixes_loses_or_adds_is_a_difference_too(self):
+        gateway = results(a='pass', b='pass', d='skip', e='pass')
         _, unlisted, _ = check_results.score(False, gateway, self.DIRECT, {})
         self.assertEqual([(item.test, item.direct, item.result.outcome) for item in unlisted],
-                         [('b', 'fail', 'pass'), ('c', 'pass', 'absent')])
+                         [('b', 'fail', 'pass'), ('c', 'pass', 'absent'), ('e', 'absent', 'pass')])
 
 
 class Baselines(unittest.TestCase):
@@ -178,6 +205,19 @@ class Baselines(unittest.TestCase):
             '[[expected]]\ntest = "a"\noutcome = ["fail", "broken"]\nreason = "r"\n',
             '[[expected]]\ntest = "a"\noutcome = []\nreason = "r"\n',
             self.ENTRY + self.ENTRY,
+        ):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self.load(text)
+
+    def test_refuses_a_baseline_of_the_wrong_shape(self):
+        for text in (
+            'expected = "a"\n',
+            'expected = [1]\n',
+            '[expected]\ntest = "a"\noutcome = "fail"\nreason = "r"\n',
+            '[[expected]]\ntest = "a"\noutcome = "fail"\nreason = 5\n',
+            '[[expected]]\ntest = 5\noutcome = "fail"\nreason = "r"\n',
+            '[[expected]]\ntest = "a"\noutcome = 5\nreason = "r"\n',
+            '[[expected]]\ntest = "a"\noutcome = [["fail"]]\nreason = "r"\n',
         ):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 self.load(text)
@@ -266,6 +306,24 @@ class Main(unittest.TestCase):
         self.assertIn('FAIL  access-point', output)
         self.assertIn('not in the baseline: card::test_etag (pass -> fail): no ETag', output)
 
+    def test_a_failing_target_fails_the_run_whatever_the_targets_after_it_do(self):
+        self.suite('direct', testcase('test_etag'))
+        self.suite('access-point', testcase('test_etag', 'fail'))
+        self.suite('transit', testcase('test_etag'))
+        code, output = self.main('direct,access-point,transit')
+        self.assertEqual(code, 1)
+        self.assertIn('FAIL  access-point', output)
+        self.assertIn('PASS  transit', output)
+
+    def test_a_failure_the_agent_has_on_its_own_is_counted_apart_from_the_differences(self):
+        self.baseline('direct', 'passed = 1\n' + self.LISTED)
+        self.suite('direct', testcase('test_etag', 'fail'), testcase('test_get'))
+        self.suite('access-point', testcase('test_etag', 'fail'), testcase('test_get'))
+        code, output = self.main('direct,access-point')
+        self.assertEqual(code, 0)
+        self.assertIn('PASS  access-point: 1 passed, 1 failed, 0 skipped, 0 xfail; '
+                      '0 expected difference(s) from direct; 1 fail without the gateway too', output)
+
     def test_fails_on_a_baseline_entry_that_no_longer_applies(self):
         code, output = self.access_point('pass', self.LISTED)
         self.assertEqual(code, 1)
@@ -303,6 +361,14 @@ class Main(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('0 tests passed where the baseline records passed = 1', output)
 
+    def test_an_agent_target_fails_when_a_passing_test_becomes_an_expected_failure_of_the_suite(self):
+        xfail = ('<testcase classname="tests.compatibility.card" name="test_get">'
+                 '<skipped type="pytest.xfail" message="SHOULD not met"/></testcase>')
+        code, output = self.proxy(1, testcase('test_etag', 'fail'), xfail)
+        self.assertEqual(code, 1)
+        self.assertIn('FAIL  a2a-proxy: 0 passed, 1 failed, 0 skipped, 1 xfail', output)
+        self.assertIn('0 tests passed where the baseline records passed = 1', output)
+
     def test_an_agent_target_fails_when_more_tests_pass_than_its_baseline_records(self):
         code, output = self.proxy(1, testcase('test_etag', 'fail'), testcase('test_get'), testcase('test_list'))
         self.assertEqual(code, 1)
@@ -325,6 +391,27 @@ class Main(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('FAIL  direct: no suite results', output)
         self.assertNotIn('access-point:', output)
+
+    def test_direct_results_that_cannot_be_parsed_fail_the_run_in_both_modes(self):
+        self.suite('access-point', testcase('test_etag'))
+        directory = self.work / 'results' / 'direct'
+        directory.mkdir(parents=True)
+        (directory / 'junitreport.xml').write_text('<testsuite><testcase')
+        (directory / 'probes.json').write_text(NO_PROBES)
+        report = self.work / 'gaps.md'
+        for extra in ((), ('--report', str(report))):
+            with self.subTest(extra=extra):
+                code, output = self.main('direct,access-point', *extra)
+                self.assertEqual(code, 1)
+                self.assertIn('FAIL  direct:', output)
+                self.assertNotIn('access-point:', output)
+                self.assertFalse(report.exists())
+
+    def test_a_baseline_of_the_wrong_shape_is_reported_not_raised(self):
+        code, output = self.access_point('fail', 'expected = "card::test_etag"\n')
+        self.assertEqual(code, 1)
+        self.assertIn('FAIL  access-point:', output)
+        self.assertIn('expected must be a list of [[expected]] entries', output)
 
     def test_the_direct_target_is_required(self):
         code, output = self.main('access-point')

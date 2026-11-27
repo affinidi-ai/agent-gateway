@@ -18,10 +18,24 @@ make a2a-conformance ARGS="--only transit --skip-build"
 ```
 
 Requires git, openssl and Python: 3.15 or later for the 1.0 suite, 3.13 or 3.14
-for the 0.3 suite. Cargo is needed unless `--skip-build` or `--binary` names a
-built gateway. The first run needs GitHub and PyPI; later runs reuse the
-checkouts and virtual environments under `target/a2a-conformance/`. Nothing is
-installed outside that directory.
+for the 0.3 suite. The 1.0 suite also needs a C++ compiler when `uv` has to
+build `grpcio`, as the first run does (see
+[What is pinned](#what-is-pinned)). Cargo is needed unless
+`--skip-build` or `--binary` names a built gateway. The first run needs GitHub
+and PyPI; later runs reuse the checkouts and virtual environments under
+`target/a2a-conformance/`. Nothing is installed outside that directory; pip and
+uv keep their download caches where they usually do.
+
+Some of the caller's variables would change what is tested, so the run sets
+them itself. Every variable whose name starts with `PYTHON` (`PYTHONPATH`,
+`PYTHONHOME`, `PYTHONSAFEPATH` and the rest) is unset; the suite gets only the
+`PYTHONPATH` that holds the harness plugins. `127.0.0.1` and `localhost` are
+added to `NO_PROXY` and `no_proxy`, which both end up with the entries of
+both, so a proxy set in the environment is used for the fetches and never for
+the requests the run makes on loopback; a value of `*` is kept as it is. The
+1.0 suite's packages go into its own environment whatever `UV_PROJECT` or
+`UV_PROJECT_ENVIRONMENT` say. Other `UV_*` and `PIP_*` settings, such as an
+index mirror, still apply.
 
 | Option | Effect |
 | --- | --- |
@@ -54,6 +68,14 @@ be fetched, `129` hung up (SIGHUP, such as a closed terminal), `130` interrupted
 | Test agent | The suite's generated `sut/a2a-python/sut_agent.py` | The suite's bundled `python-sut/tck_core_agent` |
 | Test agent packages | `agent-requirements.txt` (`a2a-sdk` 1.3.1) | `legacy-agent-requirements.txt` (`a2a-sdk` 0.3.26) |
 
+The 1.0 suite is not installed as a package: pytest runs from its checkout,
+so its build backend, which the lock does not pin, never runs. Two of the
+packages its lock installs, `grpcio` and `markupsafe`, are there as source
+archives only, so `uv` builds them from those locked, hashed sources; `grpcio`
+is what needs the C++ compiler. What they build with is not in the lock:
+`uv` takes the newest `setuptools` (both) and `wheel` (`grpcio`) on the index,
+and the `cython` version `grpcio` itself names.
+
 The suite is fetched by commit and verified with `git rev-parse`. The 1.0
 suite runs `tests/compatibility/`, as its `run_tck.py` does. The 0.3 suite runs
 the two categories that decide compliance, `mandatory` and `capabilities`.
@@ -71,8 +93,8 @@ Both run on the JSON-RPC binding only, the one binding the gateway serves.
 2. **Self-tests.** `test_check_results.py` runs first: the scoring has to be
    right before it scores anything.
 3. **Pinned dependencies.** Fetches the suite, restores its checkout to the
-   pinned commit with nothing else in it, and installs it and the test agent
-   into their own virtual environments.
+   pinned commit with nothing else in it, and installs the suite's packages and
+   the test agent's packages into their own virtual environments.
 4. **Direct run.** Starts the test agent on loopback and runs the suite
    against it. This is the reference for the forwarding targets.
 5. **Gateway targets.** Builds the gateway, writes a fresh env with `env.py`,

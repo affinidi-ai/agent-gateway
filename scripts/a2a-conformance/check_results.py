@@ -93,10 +93,14 @@ def junit_results(path: Path) -> dict[str, Result]:
 def probe_results(path: Path) -> dict[str, Result]:
     if not path.exists():
         raise FileNotFoundError(f'no probe results at {path}')
+    entries = json.loads(path.read_text())
+    if not isinstance(entries, list):
+        raise ValueError(f'{path}: the probe results must be a list')
     results = {}
-    for entry in json.loads(path.read_text()):
-        if entry.get('outcome') not in OUTCOMES:
-            raise ValueError(f'{path}: unknown outcome in {entry}')
+    for entry in entries:
+        named = isinstance(entry, dict) and isinstance(entry.get('test'), str)
+        if not named or entry.get('outcome') not in OUTCOMES or not isinstance(entry.get('message', ''), str):
+            raise ValueError(f'{path}: each probe result needs test, outcome ({", ".join(OUTCOMES)}) and a text message: {entry}')
         results[entry['test']] = Result(entry['outcome'], short(entry.get('message')))
     return results
 
@@ -136,13 +140,17 @@ def load_baseline(path: Path, is_agent: bool) -> Baseline:
     if not is_agent and passed is not None:
         raise ValueError(f'{path}: the baseline of a forwarding target must not set passed')
     allowed = ('fail',) if is_agent else OUTCOMES
+    entries = document.get('expected', [])
+    if not (isinstance(entries, list) and all(isinstance(entry, dict) for entry in entries)):
+        raise ValueError(f'{path}: expected must be a list of [[expected]] entries')
     expected: dict[str, Expected] = {}
-    for entry in document.get('expected', []):
+    for entry in entries:
         tests = entry.get('tests', [entry['test']] if 'test' in entry else [])
-        outcome, reason = entry.get('outcome'), entry.get('reason', '').strip()
+        outcome, reason = entry.get('outcome'), entry.get('reason')
         outcomes = tuple(outcome) if isinstance(outcome, list) else (outcome,)
         named = isinstance(tests, list) and bool(tests) and all(isinstance(test, str) for test in tests)
         known = bool(outcomes) and all(item in allowed for item in outcomes)
+        reason = reason.strip() if isinstance(reason, str) else ''
         if not named or ('test' in entry and 'tests' in entry) or not known or not reason:
             raise ValueError(f'{path}: each entry needs test or tests, outcome ({", ".join(allowed)}) and reason: {entry}')
         for test in tests:

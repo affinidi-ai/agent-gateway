@@ -11,6 +11,23 @@
 set -euo pipefail
 unset CDPATH
 
+# The caller's environment must not change what is tested. A proxy would take
+# the loopback traffic of the suite, the probes and the gateway, so loopback is
+# exempt; fetches still use the proxy. Tools differ in which spelling they
+# read, so both carry the entries of both. "*" exempts every host, but for pip
+# and git only as the whole value, so it is kept as it is.
+if [[ "${no_proxy:-}" == "*" || "${NO_PROXY:-}" == "*" ]]; then
+    no_proxy="*"
+else
+    no_proxy="${no_proxy:+${no_proxy},}${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
+fi
+NO_PROXY="${no_proxy}"
+export NO_PROXY no_proxy
+# Python settings of the caller would reach every interpreter the run starts:
+# PYTHONPATH puts other packages in front of the pinned ones, and
+# PYTHONSAFEPATH takes the suite's checkout off the import path.
+unset "${!PYTHON@}"
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "${HERE}/../.." && pwd)"
 WORK="${REPO}/target/a2a-conformance"
@@ -83,7 +100,8 @@ case "${A2A_VERSION}" in
     1.0)
         TCK_SHA="5e6f37c2d38eb3d7684686243c34d365c83df49b"
         TCK_DIR="${WORK}/tck"
-        SUITE_PYTHON="${TCK_DIR}/.venv/bin/python"
+        SUITE_VENV="${TCK_DIR}/.venv"
+        SUITE_PYTHON="${SUITE_VENV}/bin/python"
         PYTHON_MIN="3.15"
         PYTHON_BELOW=""
         PYTHON_OVERRIDE_NAME="A2A_CONFORMANCE_PYTHON"
@@ -371,6 +389,17 @@ find_python() {
     return 1
 }
 
+# What pip and uv print when the network is the cause. A version the index
+# does not have is not one of them: pip reports that as "No matching
+# distribution", and uv reports a build requirement it cannot meet as "Failed
+# to resolve", with and without a network. Nor is a build that fails: its log
+# names source files such as timeout_encoding.cc, so only whole phrases about
+# a timeout count. pip words an index that answers 5xx like a missing version,
+# so that outage is reported as a failure (1), not as a fetch failure.
+FETCH_FAILURE='could not resolve|nodename nor servname|name or service not known|temporary failure|dns error'
+FETCH_FAILURE+='|failed to (fetch|download|establish a new connection)|connection (refused|reset|broken)'
+FETCH_FAILURE+='|network is unreachable|timed out|(read|connect)timeout|HTTP error 5[0-9][0-9]'
+
 # A fetch failure has its own exit code (3), so a caller can tell an outage
 # from a broken harness. The step runs as an `if` condition, where `set -e` is
 # off, so each step function chains its commands with `&&`.
@@ -382,7 +411,7 @@ install_step() {
         return
     fi
     tail -20 "${log}" >&2
-    if grep -Eiq 'could not resolve|connection (refused|reset|timed out)|network is unreachable|temporary failure|failed to (fetch|download)|dns error|timed? ?out|HTTP error 5[0-9][0-9]' "${log}"; then
+    if grep -Eiq "${FETCH_FAILURE}" "${log}"; then
         fail 3 "dependencies: ${name} could not be fetched (log: $(relative "${log}"))"
     fi
     fail 1 "dependencies: ${name} failed (log: $(relative "${log}"))"
@@ -435,7 +464,10 @@ pinned_venv() {
 
 # The 1.0 suite pins its packages in uv.lock, so uv installs them. uv itself is
 # pinned and lives in a virtual environment under ${WORK}; nothing is installed
-# outside it.
+# outside it. The suite project itself is not installed: pytest runs from its
+# checkout, and installing it would run a build backend the lock does not pin.
+# The project and its environment are named here, so a UV_PROJECT or
+# UV_PROJECT_ENVIRONMENT of the caller cannot send the install elsewhere.
 install_uv() {
     if [[ "$("${TOOLS_VENV}/bin/uv" --version 2>/dev/null || true)" == "uv ${UV_VERSION}"* ]]; then return; fi
     rm -rf "${TOOLS_VENV}" &&
@@ -444,7 +476,8 @@ install_uv() {
 }
 
 install_locked_suite() {
-    (cd "${TCK_DIR}" && "${TOOLS_VENV}/bin/uv" sync --frozen --no-dev --python "${PYTHON}")
+    UV_PROJECT_ENVIRONMENT="${SUITE_VENV}" "${TOOLS_VENV}/bin/uv" sync --project "${TCK_DIR}" \
+        --frozen --no-dev --no-install-project --python "${PYTHON}"
 }
 
 install_suite() {
