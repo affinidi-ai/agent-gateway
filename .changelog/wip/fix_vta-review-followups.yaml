@@ -1,0 +1,41 @@
+branch: fix/vta-review-followups
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-26T10:00:00Z'
+      title: Keep Gateway signing when the dashboard settings are reset to defaults
+      description: >-
+        Reset to Defaults (`DELETE /v1/settings`) used to clear `default_signing`, moving every
+        token and credential the gateway issues as itself back to its own key. It now resets the
+        other settings and keeps Gateway signing, so it needs `settings.edit` only.
+  fixed:
+    - timestamp: '2026-11-26T10:00:00Z'
+      title: Keep edits saved meanwhile when a signing key rotation moves the choices
+      description: >-
+        After a trust agent signing key rotation, the surfaces, issuers and Gateway signing that
+        named the old key are moved to the new one. Each is now read again under its write lock
+        and only its key is changed, so an edit saved after the rotation listed them is kept.
+        Issuer updates now take a per-issuer lock for the same reason.
+    - timestamp: '2026-11-26T10:00:00Z'
+      title: Keep publishing a re-enabled trust agent's key after a later switch
+      description: >-
+        A Gateway signing connection that was disabled and enabled again kept the start time it
+        had before, so a later switch of Gateway signing treated it as retired and dropped keys
+        that still signed live tokens. Its start time now moves past that retirement when it
+        signs again.
+    - timestamp: '2026-11-26T10:00:00Z'
+      title: Say which keys stay on the gateway in the Key Management custody line
+      description: >-
+        The Key Management tab said the gateway keeps only the key it signs in to its trust agent
+        with. It now says the tokens and credentials the gateway issues as itself are signed by
+        the trust agent, and that some keys stay on the gateway, such as that key and those of
+        agents onboarded before it was connected.
+  removed: []
+  security:
+    - timestamp: '2026-11-26T10:00:00Z'
+      title: Publish the gateway's own key under `[vta]` only while its tokens may be live
+      description: >-
+        A gateway signing through the `[vta]` block kept its own key in `/oauth2/jwks.json` for
+        as long as it ran. That key is now published only for 21 minutes after it last signed a
+        token, as for a trust agent chosen in the dashboard.
+  breaking: []

@@ -414,6 +414,20 @@ impl SettingsStore {
         Ok(())
     }
 
+    /// Applies `change` to the settings held now, under the write lock, so a
+    /// change made since an earlier read is kept, and saves when `change`
+    /// returns `true`. Returns whether it saved.
+    pub async fn modify(
+        &self,
+        change: impl FnOnce(&mut DashboardSettings) -> bool,
+    ) -> Result<bool> {
+        if !change(&mut self.settings.write().unwrap()) {
+            return Ok(false);
+        }
+        self.save().await?;
+        Ok(true)
+    }
+
     /// Whether `flag` is explicitly on.
     pub fn flag_enabled(
         &self,

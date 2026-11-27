@@ -384,6 +384,7 @@ pub async fn update_issuer<S: IssuerStore>(
         return Err((StatusCode::BAD_REQUEST, "Issuer name cannot be empty".to_string()));
     }
 
+    let _locked = super::lock_issuer(&id).await;
     let mut issuer = store
         .get(&id)
         .await

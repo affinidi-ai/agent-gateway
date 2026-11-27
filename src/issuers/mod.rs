@@ -4,4 +4,4 @@ pub mod store;
 pub mod types;
 
 pub use filesystem::FileSystemIssuerStore;
-pub use store::IssuerStore;
+pub use store::{IssuerStore, lock_issuer};

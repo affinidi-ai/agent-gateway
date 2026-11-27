@@ -355,62 +355,67 @@ pub async fn update_settings(
     Ok(Json(settings))
 }
 
-/// Reset settings to defaults
+/// Reset settings to defaults. Gateway signing is kept: which key signs is
+/// key management, changed only where it is chosen, never as a side effect of
+/// resetting the dashboard's display settings.
 pub async fn reset_settings(
     Extension(user_id): Extension<String>,
     Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
     State(state): State<IdentityApiState>,
-    pat: Option<Extension<crate::auth_manager::pat::PatContext>>,
 ) -> Result<Json<DashboardSettings>, AppError> {
     // RBAC: require settings.edit permission
     require_settings_edit(&user_id, &passkey_storage, &rbac_config).await?;
 
-    // Reset to default settings
-    let default_settings = DashboardSettings::default();
-    if super::signing_choice::signing_changed(
-        state
-            .settings_store
-            .get()
-            .default_signing
-            .as_ref(),
-        default_settings
-            .default_signing
-            .as_ref(),
-    ) {
-        require_permission(
-            &user_id,
-            &passkey_storage,
-            &rbac_config,
-            &Feature::KeyManagementEdit,
-            pat.as_ref()
-                .map(|Extension(pat)| pat),
-        )
-        .await
-        .inspect_err(signing_change_refused)?;
-    }
-
-    // Update and save
     state
         .settings_store
-        .update(default_settings.clone())
-        .map_err(|e| AppError::BadRequest(e.to_string()))?;
-
-    state
-        .settings_store
-        .save()
+        .modify(|current| {
+            reset_keeping_signing(current);
+            true
+        })
         .await
         .map_err(|e| AppError::InternalError(format!("Failed to save settings: {}", e)))?;
     crate::audit::sources::rebuild_sinks().await;
 
     info!("Settings reset to defaults");
 
-    Ok(Json(default_settings))
+    let mut settings = state.settings_store.get();
+    settings.prometheus_auth_password_hash = String::new();
+    Ok(Json(settings))
+}
+
+/// `settings` reset to the defaults, keeping its Gateway signing choice.
+fn reset_keeping_signing(settings: &mut DashboardSettings) {
+    *settings = DashboardSettings {
+        default_signing: settings
+            .default_signing
+            .take(),
+        ..DashboardSettings::default()
+    };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reset_restores_the_defaults_and_keeps_gateway_signing() {
+        let signing = crate::config::agent_surface::SurfaceSigningConfig {
+            backend: Some(crate::config::agent_surface::SigningBackendKind::Vta),
+            connection_id: Some("conn".to_string()),
+            ..Default::default()
+        };
+        let mut settings = DashboardSettings {
+            metrics_retention_minutes: 42,
+            default_signing: Some(signing.clone()),
+            ..DashboardSettings::default()
+        };
+
+        reset_keeping_signing(&mut settings);
+
+        assert_eq!(settings.metrics_retention_minutes, DashboardSettings::default().metrics_retention_minutes);
+        assert_eq!(settings.default_signing, Some(signing));
+    }
 
     #[tokio::test]
     async fn the_audit_event_catalog_lists_every_event_with_its_group() {

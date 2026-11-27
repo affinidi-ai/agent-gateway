@@ -117,7 +117,9 @@ describe('KeyManagementTab custody', () => {
     render(<KeyManagementTab />);
 
     expect(
-      await screen.findByText(/Signing keys are held by a separately-operated trust agent/)
+      await screen.findByText(
+        /signed by a separately-operated trust agent\. Some keys stay on the gateway/
+      )
     ).toBeInTheDocument();
   });
 

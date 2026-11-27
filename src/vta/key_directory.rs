@@ -1749,6 +1749,18 @@ impl ApplianceAuthority {
                 signers.push(other.replaced_at(now));
             }
         }
+        // It signed just now, so a retirement of its connection recorded
+        // since it first signed was undone (enabled or paired again): what it
+        // signs from now on must outlive that retirement.
+        if let Some(connection) = &current.connection_id
+            && self
+                .directory
+                .connection_retirement(connection, current.since)
+                .await
+                == crate::vta::registry::Retirement::Retired
+        {
+            current.since = now;
+        }
         history.signers = unexpired(signers, now);
         history.current = Some(current);
         self.save_history(&mut history)
@@ -3746,6 +3758,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A connection disabled and enabled again, with nothing reading the
+    /// signer history in between, signs from then on as a signer that started
+    /// after that retirement, so a later switch keeps its keys published.
+    #[tokio::test]
+    async fn a_signer_enabled_again_keeps_what_it_signs_after_a_later_switch() {
+        let (store, _tmp) = connected_store(&["vta-a", "vta-b"]).await;
+        let registry = Arc::new(crate::vta::registry::VtaConnectionRegistry::new(
+            Arc::clone(&store),
+            None,
+            None,
+            None,
+            std::time::Duration::from_secs(5),
+            4,
+        ));
+        let authority = ApplianceAuthority::new(Arc::new(directory_with(None).with_connections(registry)));
+        let signer_a = StubAuthority::new("did:key:a", vec!["a-1"]) as Arc<dyn CredentialAuthority>;
+        authority
+            .note_signer(managed_jwt_ref("vta-a"), &signer_a)
+            .await;
+        for enabled in [false, true] {
+            crate::vta::connections::modify(store.as_ref(), "vta-a", |c| c.enabled = enabled)
+                .await
+                .unwrap();
+        }
+        if let Some(current) = authority
+            .history
+            .write()
+            .await
+            .current
+            .as_mut()
+        {
+            current.seen_at -= chrono::Duration::seconds(SIGNER_SEEN_REFRESH_SECS + 1);
+        }
+
+        authority
+            .note_signer(managed_jwt_ref("vta-a"), &signer_a)
+            .await;
+        authority
+            .note_signer(
+                managed_jwt_ref("vta-b"),
+                &(StubAuthority::new("did:key:b", vec!["b-1"]) as Arc<dyn CredentialAuthority>),
+            )
+            .await;
+
+        assert!(
+            authority
+                .earlier_issuer_dids()
+                .await
+                .contains(&"did:key:a".to_string()),
+            "a token it signed after it was enabled again is still this gateway's"
+        );
+        assert!(
+            kids(
+                &authority
+                    .issuer_jwks()
+                    .await
+                    .unwrap()
+            )
+            .contains(&"a-1".to_string())
+        );
     }
 
     async fn switched_off(store: &Arc<dyn crate::vta::connections::VtaConnectionStorage>) -> ApplianceAuthority {

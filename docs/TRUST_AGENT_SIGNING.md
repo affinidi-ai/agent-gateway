@@ -655,7 +655,7 @@ staying scoped to one context, which each such test names.
   the choice and changes the key refreshes the saved current signer at once. Each save re-reads
   the file and keeps what another node sharing the storage wrote to it.
 - **The gateway's own key is published while it is in use.** Once Gateway signing is on a trust
-  agent, `/oauth2/jwks.json` and token exchange self-trust include the gateway's own key and DID
+  agent, whether chosen in the dashboard or by the `[vta]` block, `/oauth2/jwks.json` and token exchange self-trust include the gateway's own key and DID
   only while a token it signed may be outstanding: for 21 minutes after it last signed one (the
   20-minute window plus the minute between saves of its last use). Its last use is saved in the
   signer history when the key set or self-trust is next read (serving the JWKS, verifying a token,
