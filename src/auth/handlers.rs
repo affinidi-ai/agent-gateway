@@ -132,11 +132,11 @@ pub async fn register_start(
         })?;
 
     // Enforce the appliance user limit before starting a new registration.
-    if let Ok(users) = auth_state
+    if let Ok(user_count) = auth_state
         .storage
-        .list_users()
+        .count_toward_user_limit()
         .await
-        && let Err(e) = crate::config::global_limits().check_can_add("users", users.len())
+        && let Err(e) = crate::config::global_limits().check_can_add("users", user_count)
     {
         crate::config::log_limit_reached("users", &e);
         return Err((StatusCode::FORBIDDEN, e.message()));
@@ -279,8 +279,16 @@ pub async fn register_finish(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .len();
+    let seated_user_count = auth_state
+        .storage
+        .count_toward_user_limit()
+        .await
+        .map_err(|e| {
+            error!("Failed to count users: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     if user_count > 0
-        && let Err(e) = crate::config::global_limits().check_can_add("users", user_count)
+        && let Err(e) = crate::config::global_limits().check_can_add("users", seated_user_count)
     {
         drop(user_write_guard);
         crate::config::log_limit_reached("users", &e);
@@ -521,7 +529,7 @@ pub async fn login_finish(
     }
 
     // Load user to get user_id
-    let mut user = auth_state
+    let user = auth_state
         .storage
         .load_user(&username)
         .await
@@ -538,15 +546,19 @@ pub async fn login_finish(
             StatusCode::UNAUTHORIZED
         })?;
 
-    // Update last_logged_in timestamp
-    user.last_logged_in = Some(chrono::Utc::now());
-    if let Err(e) = auth_state
+    let Some(user) = auth_state
         .storage
-        .save_user(&user)
+        .record_login(&user.user_id)
         .await
-    {
-        error!("Failed to update last_logged_in for user_id {}: {}", user.user_id, e);
-    }
+        .map_err(|e| {
+            error!("Failed to record the sign-in of user_id {}: {}", user.user_id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    else {
+        error!("Refused the sign-in of user_id {}: deleted or no longer approved", user.user_id);
+        raise_failed_passkey_sign_in(&auth_state.storage, &username).await;
+        return Err(StatusCode::UNAUTHORIZED.into());
+    };
 
     let finalized_session = SessionManagerFinalizer::new(
         auth_state
@@ -705,6 +717,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             30,
+            crate::auth::session::DEFAULT_SESSION_LIFETIME_MINUTES,
             temp_dir
                 .path()
                 .join("sessions")
@@ -745,6 +758,8 @@ mod tests {
                 updated_at: now,
                 last_logged_in: None,
                 saml_id: None,
+                oidc: None,
+                deleted_at: None,
             })
             .await
             .unwrap();
@@ -895,7 +910,7 @@ mod tests {
         ] {
             let token = state
                 .session_manager
-                .create_session_with_terms_gate("alice".into(), "user-1".into(), gate)
+                .create_session_with_terms_gate("alice".into(), "user-1".into(), gate, None)
                 .await;
             let mut headers = axum::http::HeaderMap::new();
             headers.insert(

@@ -51,9 +51,11 @@ impl From<JwtBearerError> for SourceAuthError {
             JwtBearerError::InvalidToken(msg) => SourceAuthError::InvalidCredential {
                 reason: format!("Invalid token: {msg}"),
             },
-            JwtBearerError::KeyNotFound(kid) => SourceAuthError::InvalidCredential {
-                reason: format!("Key not found for kid: {kid}"),
-            },
+            JwtBearerError::KeyNotFound(kid) | JwtBearerError::KeyNotFoundDuringCooldown(kid) => {
+                SourceAuthError::InvalidCredential {
+                    reason: format!("Key not found for kid: {kid}"),
+                }
+            }
             JwtBearerError::JwksFetchFailed(msg) => SourceAuthError::Internal {
                 reason: format!("JWKS fetch failed: {msg}"),
             },
@@ -393,6 +395,17 @@ mod tests {
         assert!(SourceAuthError::InvalidCredential { reason: "x".into() }.is_caller_attributable());
         assert!(!SourceAuthError::ConfigNotFound { id: "x".into() }.is_caller_attributable());
         assert!(!SourceAuthError::Internal { reason: "x".into() }.is_caller_attributable());
+    }
+
+    #[test]
+    fn a_key_unknown_during_the_refetch_cooldown_is_the_callers_invalid_credential() {
+        let refused = SourceAuthError::from(JwtBearerError::KeyNotFoundDuringCooldown("made-up".into()));
+
+        assert!(refused.is_caller_attributable());
+        assert!(
+            matches!(&refused, SourceAuthError::InvalidCredential { reason } if reason == "Key not found for kid: made-up"),
+            "{refused:?}"
+        );
     }
 
     #[tokio::test]

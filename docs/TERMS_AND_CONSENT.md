@@ -111,7 +111,7 @@ A user who logs in with terms outstanding gets a **consent-pending session**. It
 authenticated, but can reach only:
 
 - `/v1/terms/applicable`, `/v1/terms/status`, and `/v1/terms/acceptances`
-- `/auth/check` and `/auth/logout`, and `/saml/logout`
+- `/auth/check` and `/auth/logout`, `/saml/logout` and `/oidc/logout`
 
 each also under the `/api` prefix. Any other route answers `403` with the code
 `TERMS_ACCEPTANCE_REQUIRED`. Once the required versions are accepted, the same session

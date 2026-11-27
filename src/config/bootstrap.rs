@@ -74,6 +74,12 @@ impl BootstrapConfig {
                     .to_string_lossy()
                     .to_string();
             }
+            if PathBuf::from(&config.config_files.oidc).is_relative() {
+                config.config_files.oidc = config_dir
+                    .join(&config.config_files.oidc)
+                    .to_string_lossy()
+                    .to_string();
+            }
             if PathBuf::from(&config.config_files.x402).is_relative() {
                 config.config_files.x402 = config_dir
                     .join(&config.config_files.x402)
@@ -344,6 +350,8 @@ impl BootstrapConfig {
 
         integration_stores_apart_from_the_deprecated_ones(&self.storage_paths)?;
 
+        validate_session_max_lifetime(self.session_max_lifetime_minutes)?;
+
         // Validate TLS certificate paths
         if !self.tls.cert_path.exists() {
             anyhow::bail!("TLS certificate file not found: {:?}", self.tls.cert_path);
@@ -355,6 +363,14 @@ impl BootstrapConfig {
 
         Ok(())
     }
+}
+
+fn validate_session_max_lifetime(minutes: u64) -> anyhow::Result<()> {
+    let longest = crate::auth::session::MAX_SESSION_LIFETIME_MINUTES;
+    if minutes == 0 || minutes > longest {
+        anyhow::bail!("session_max_lifetime_minutes must be between 1 and {longest}, got {minutes}");
+    }
+    Ok(())
 }
 
 /// Puts each integration storage key the raw config leaves unset beside the deprecated
@@ -642,6 +658,37 @@ mod migration_tests {
                 .contains("Must be 'dynamodb' or 'local'"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn the_session_lifetime_defaults_to_twelve_hours_and_may_be_one_minute_to_a_day() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = bootstrap_with_source(directory.path(), "local");
+        assert_eq!(config.session_max_lifetime_minutes, 720);
+
+        for minutes in [1, 720, 1440] {
+            config.session_max_lifetime_minutes = minutes;
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{minutes} is accepted: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn a_session_lifetime_of_zero_or_more_than_a_day_stops_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = bootstrap_with_source(directory.path(), "local");
+
+        for minutes in [0, 1441] {
+            config.session_max_lifetime_minutes = minutes;
+            let error = config
+                .validate()
+                .expect_err("an out-of-range session lifetime stops startup");
+            assert_eq!(
+                error.to_string(),
+                format!("session_max_lifetime_minutes must be between 1 and 1440, got {minutes}")
+            );
+        }
     }
 
     #[test]

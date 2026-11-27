@@ -3,6 +3,9 @@ use std::path::Path;
 use chrono::Utc;
 use serde_json::json;
 
+use crate::bdd_support::dashboard_op::{
+    BOUND_TENANT, DASHBOARD_CLIENT_ID, DASHBOARD_CLIENT_SECRET, DASHBOARD_PROVIDER_LABEL,
+};
 use crate::bdd_support::sign_in_events::{APPLIANCE_ID, EVENT_TOPIC, RECORD_TEMPLATE, RECORD_TOPIC};
 
 /// The events the stored sign-in integration receives.
@@ -116,6 +119,86 @@ pub fn sign_in_with_saml(
     let config = config
         .replacen("auth_mode = \"passkey\"", "auth_mode = \"saml\"", 1)
         .replacen("[config_files]\n", &format!("[config_files]\nsaml = \"{}\"\n", saml_path.display()), 1);
+    std::fs::write(&config_path, config).expect("write config.toml");
+}
+
+/// Switches the gateway written under `base_dir` to OpenID Connect sign-in at the provider
+/// `issuer`, binding sign-in to [`BOUND_TENANT`], mapping the `roles` claim and returning from the
+/// provider's sign-out to [`post_logout_redirect_uri`], with `settings` written over that
+/// `oidc.json`. The client secret is a `file://` reference to a file with a trailing newline, as an
+/// operator's secret file usually has.
+pub fn sign_in_with_oidc(
+    base_dir: &Path,
+    gateway_port: u16,
+    issuer: &str,
+    settings: &serde_json::Map<String, serde_json::Value>,
+) {
+    let secret_path = base_dir.join("oidc-client-secret");
+    std::fs::write(&secret_path, format!("{DASHBOARD_CLIENT_SECRET}\n")).expect("write the OIDC client secret");
+    let oidc_path = base_dir.join("oidc.json");
+    let mut oidc = json!({
+        "label": DASHBOARD_PROVIDER_LABEL,
+        "issuer": issuer,
+        "client_id": DASHBOARD_CLIENT_ID,
+        "client_secret": format!("file://{}", secret_path.display()),
+        "redirect_uri": format!("http://localhost:{gateway_port}/api/oidc/callback"),
+        "id_token_signing_algs": ["EdDSA"],
+        "required_claims": { "org_id": [BOUND_TENANT] },
+        "role_mapping": {
+            "claim": "roles",
+            "values": { "gw-admins": "administrator", "gw-power": "poweruser", "gw-all": "user" },
+        },
+        "logout": { "post_logout_redirect_uri": post_logout_redirect_uri(gateway_port) },
+    });
+    for (key, value) in settings {
+        oidc[key] = value.clone();
+    }
+    write(&oidc_path, oidc);
+
+    let config_path = base_dir.join("config.toml");
+    let config = std::fs::read_to_string(&config_path).expect("read config.toml");
+    assert!(config.contains("auth_mode = \"passkey\""), "the gateway config must set the auth mode");
+    assert!(config.contains("[config_files]\n"), "the gateway config must list its config files");
+    let config = config
+        .replacen("auth_mode = \"passkey\"", "auth_mode = \"oidc\"", 1)
+        .replacen("[config_files]\n", &format!("[config_files]\noidc = \"{}\"\n", oidc_path.display()), 1);
+    std::fs::write(&config_path, config).expect("write config.toml");
+}
+
+/// Where the OpenID provider sends the browser after signing the person out: the dashboard of the
+/// gateway on `gateway_port`, which says the person has signed out.
+pub fn post_logout_redirect_uri(gateway_port: u16) -> String {
+    format!("http://localhost:{gateway_port}/?signed_out=1")
+}
+
+/// Sets the appliance limit on human users of the gateway written under `base_dir` to `limit`.
+pub fn limit_human_users(
+    base_dir: &Path,
+    limit: u64,
+) {
+    let limits_path = base_dir.join("limits.json");
+    write(
+        &limits_path,
+        json!({ "limits": { "users": { "name": "Users", "description": "Human users", "limit": limit } } }),
+    );
+    let config_path = base_dir.join("config.toml");
+    let config = std::fs::read_to_string(&config_path).expect("read config.toml");
+    assert!(config.contains("[config_files]\n"), "the gateway config must list its config files");
+    let config =
+        config.replacen("[config_files]\n", &format!("[config_files]\nlimits = \"{}\"\n", limits_path.display()), 1);
+    std::fs::write(&config_path, config).expect("write config.toml");
+}
+
+/// Sets `session_max_lifetime_minutes` of the gateway written under `base_dir` to `minutes`.
+pub fn limit_session_lifetime(
+    base_dir: &Path,
+    minutes: u64,
+) {
+    let config_path = base_dir.join("config.toml");
+    let config = std::fs::read_to_string(&config_path).expect("read config.toml");
+    let timeout = "session_timeout_minutes = 20\n";
+    assert!(config.contains(timeout), "the gateway config must set the session timeout");
+    let config = config.replacen(timeout, &format!("{timeout}session_max_lifetime_minutes = {minutes}\n"), 1);
     std::fs::write(&config_path, config).expect("write config.toml");
 }
 

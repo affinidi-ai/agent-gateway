@@ -102,6 +102,37 @@ const LeftPanel: React.FC = () => {
   );
 };
 
+type SsoMode = 'saml' | 'oidc';
+type AuthMode = 'passkey' | SsoMode;
+
+/** Where each identity-provider sign-in starts on the gateway. */
+const SSO_LOGIN_PATHS: Record<SsoMode, string> = {
+  saml: '/api/saml/login',
+  oidc: '/api/oidc/login',
+};
+
+const isSsoMode = (mode: AuthMode | null): mode is SsoMode => mode !== null && mode !== 'passkey';
+
+/**
+ * Whether the identity provider sent the browser back after signing the person out
+ * (`?signed_out=1`, the configured post-logout address). The marker, and the `state` the provider
+ * echoes beside it, are removed from the address first, so a reload does not show the notice
+ * again and a sign-in never returns to it.
+ */
+const takeSignedOutNotice = (): boolean => {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('signed_out') !== '1') return false;
+  params.delete('signed_out');
+  params.delete('state');
+  const query = params.toString();
+  window.history.replaceState(
+    window.history.state,
+    '',
+    `${window.location.pathname}${query ? `?${query}` : ''}${window.location.hash}`
+  );
+  return true;
+};
+
 const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
   const [mode, setMode] = useState<'login' | 'register'>('login');
   const [username, setUsername] = useState('');
@@ -110,12 +141,16 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
   const [success, setSuccess] = useState<string | null>(null);
   const [supported, setSupported] = useState(false);
   const [platformAuthAvailable, setPlatformAuthAvailable] = useState(false);
-  const [authMode, setAuthMode] = useState<'passkey' | 'saml' | null>(null);
+  const [authMode, setAuthMode] = useState<AuthMode | null>(null);
+  const [providerLabel, setProviderLabel] = useState<string | null>(null);
   const [initializing, setInitializing] = useState(true);
   const registrationTerms = useRegistrationTerms(mode === 'register', setError);
 
   useEffect(() => {
-    if (sessionManager.didSessionExpire()) {
+    if (takeSignedOutNotice()) {
+      sessionManager.clearSessionExpiredError();
+      setSuccess('You have signed out.');
+    } else if (sessionManager.didSessionExpire()) {
       sessionManager.clearSessionExpiredError();
       setError('Your session has expired. Please sign in again.');
     }
@@ -145,6 +180,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
         const response = await apiClient.fetch('/api/v1/auth/mode');
         const data = await response.json();
         setAuthMode(data.mode);
+        setProviderLabel(typeof data.label === 'string' && data.label.trim() ? data.label : null);
         if (data.mode === 'passkey') {
           setSupported(isWebAuthnSupported());
           isPlatformAuthenticatorAvailable().then(setPlatformAuthAvailable);
@@ -193,12 +229,11 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
     setSuccess(null);
     setLoading(true);
 
-    if (authMode === 'saml') {
+    if (isSsoMode(authMode)) {
       await new Promise(resolve => setTimeout(resolve, 100));
       const next = loginNextTarget(window.location);
-      window.location.href = next
-        ? `/api/saml/login?next=${encodeURIComponent(next)}`
-        : '/api/saml/login';
+      const loginPath = SSO_LOGIN_PATHS[authMode];
+      window.location.href = next ? `${loginPath}?next=${encodeURIComponent(next)}` : loginPath;
       return;
     }
 
@@ -237,10 +272,15 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
       );
     }
 
-    if (authMode === 'saml') {
+    if (isSsoMode(authMode)) {
       return (
         <>
           {error && <Alert variant="danger">{error}</Alert>}
+          {success && (
+            <Alert variant="success" role="status" data-testid="login-signed-out-notice">
+              {success}
+            </Alert>
+          )}
           <Form onSubmit={handleLogin}>
             <div className="d-grid">
               <Button
@@ -249,6 +289,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
                 style={{ height: '48px' }}
                 disabled={loading}
                 className={`d-flex align-items-center justify-content-center gap-2 ${styles.submitBtn}`}
+                data-testid="login-sso-button"
               >
                 {loading ? (
                   <>
@@ -257,8 +298,8 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
                   </>
                 ) : (
                   <>
-                    <i className="fas fa-sign-in-alt" />
-                    Sign in with SSO
+                    <i className="fas fa-sign-in-alt" aria-hidden="true" />
+                    Sign in with {authMode === 'oidc' && providerLabel ? providerLabel : 'SSO'}
                   </>
                 )}
               </Button>

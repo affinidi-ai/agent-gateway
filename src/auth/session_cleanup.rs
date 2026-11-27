@@ -8,7 +8,7 @@ use tracing::{debug, info};
 /// Runs every 5 minutes to keep disk storage clean and prevent accumulation
 pub async fn periodic_session_cleanup(
     didauth_store: Arc<crate::didauth::DidAuthSessionStore>,
-    saml_session_manager: Option<Arc<crate::auth::SessionManager>>,
+    sso_session_manager: Option<Arc<crate::auth::SessionManager>>,
 ) {
     // Clean up every 5 minutes
     let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 minutes
@@ -26,8 +26,8 @@ pub async fn periodic_session_cleanup(
             .cleanup_expired()
             .await;
 
-        // Clean up SAML/Passkey sessions if available
-        if let Some(ref session_mgr) = saml_session_manager {
+        // Clean up SAML or OIDC sessions if available
+        if let Some(ref session_mgr) = sso_session_manager {
             session_mgr
                 .cleanup_expired()
                 .await;

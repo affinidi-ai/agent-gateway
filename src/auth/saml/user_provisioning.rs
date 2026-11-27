@@ -5,57 +5,9 @@ use tracing::{info, warn};
 use crate::auth::auth_config::SamlConfig;
 use crate::auth::saml::graph_api::GraphApiClient;
 use crate::auth::saml::service::{ROLE_VALUES_KEY, SamlAttributes};
+use crate::auth::sign_in_events::{Provisioned, SignInChange};
 use crate::auth::storage::{PasskeyStorage, UserData};
 use crate::auth::types::{UserRole, UserStatus};
-
-/// What a SAML sign-in did to the stored user.
-#[derive(Debug)]
-pub enum SignInChange {
-    Created,
-    Updated { previous: Box<UserData> },
-}
-
-/// The signed-in user and what the sign-in changed.
-#[derive(Debug)]
-pub struct Provisioned {
-    pub user: UserData,
-    pub change: SignInChange,
-}
-
-/// A user event a sign-in raises, in the order it is raised.
-#[derive(Debug)]
-pub enum SignInEvent<'a> {
-    Created(&'a UserData),
-    Updated { old: &'a UserData, new: &'a UserData },
-    Login(&'a UserData),
-}
-
-/// The user events a sign-in raises: `user.created` for a new user, `user.updated` when the
-/// sign-in changed what user events report, then `user.login`.
-pub fn sign_in_events(provisioned: &Provisioned) -> Vec<SignInEvent<'_>> {
-    let user = &provisioned.user;
-    let mut events = match &provisioned.change {
-        SignInChange::Created => vec![SignInEvent::Created(user)],
-        SignInChange::Updated { previous } if changes_reported_state(previous, user) => {
-            vec![SignInEvent::Updated {
-                old: previous.as_ref(),
-                new: user,
-            }]
-        }
-        SignInChange::Updated { .. } => Vec::new(),
-    };
-    events.push(SignInEvent::Login(user));
-    events
-}
-
-/// Whether the role, status or primary flag changed: the parts of a user that user events
-/// report and that a sign-in can change.
-fn changes_reported_state(
-    old: &UserData,
-    new: &UserData,
-) -> bool {
-    old.role != new.role || old.status != new.status || old.is_primary != new.is_primary
-}
 
 /// Whether `attribute` carries more than one distinct value.
 fn carries_several_values(
@@ -115,7 +67,23 @@ fn profile_value(
         .cloned()
 }
 
-/// Provision or update a user from SAML attributes
+/// The SAML account has a user who is not approved: an administrator disabled or deleted them.
+/// Carries the user as stored, so the ACS refuses the sign-in naming that account and creates
+/// nothing.
+#[derive(Debug, thiserror::Error)]
+#[error("the user is not approved")]
+pub struct UserNotApproved(pub Box<UserData>);
+
+/// The username the identity provider asserted and the SAML user ID are both held by other users,
+/// so nothing is created or updated.
+#[derive(Debug, thiserror::Error)]
+#[error("the username is held by another user")]
+pub struct UsernameTaken;
+
+/// Provision or update a user from SAML attributes. A user that exists and is not approved is
+/// refused with [`UserNotApproved`]. When another user holds the asserted username the SAML user
+/// ID is used instead, and only when that is held too is the sign-in refused with
+/// [`UsernameTaken`].
 pub async fn provision_user_from_saml(
     storage: &PasskeyStorage,
     all_attributes: &SamlAttributes,
@@ -158,6 +126,11 @@ pub async fn provision_user_from_saml(
     let existing_user = storage
         .load_user_by_saml_id(user_id_attr)
         .await?;
+    if let Some(user) = &existing_user
+        && user.status != UserStatus::Approved
+    {
+        return Err(anyhow::Error::new(UserNotApproved(Box::new(user.clone()))));
+    }
     let mapping = &config.attribute_mapping;
     let email = profile_value(
         all_attributes,
@@ -206,7 +179,9 @@ pub async fn provision_user_from_saml(
 
     let (user, change) = if let Some(mut user) = existing_user {
         let previous = user.clone();
-        user.username = username.clone();
+        if user.username != username || username == user.user_id {
+            user.username = resolve_username(storage, &username, user_id_attr, Some(&user.user_id)).await?;
+        }
         user.email = email.clone();
         user.first_name = first_name;
         user.last_name = last_name;
@@ -231,6 +206,7 @@ pub async fn provision_user_from_saml(
 
         (user, SignInChange::Updated { previous: Box::new(previous) })
     } else {
+        let username = resolve_username(storage, &username, user_id_attr, None).await?;
         // Check if this is the first user (should be admin)
         let is_first_user = storage
             .list_users()
@@ -250,9 +226,8 @@ pub async fn provision_user_from_saml(
         // user always bootstraps admin access regardless of the configured cap.
         if !is_first_user {
             let user_count = storage
-                .list_users()
-                .await?
-                .len();
+                .count_toward_user_limit()
+                .await?;
             if let Err(e) = crate::config::global_limits().check_can_add("users", user_count) {
                 crate::config::log_limit_reached("users", &e);
                 return Err(anyhow::Error::new(e));
@@ -263,7 +238,7 @@ pub async fn provision_user_from_saml(
         let now = chrono::Utc::now();
         let user = UserData {
             user_id: uuid::Uuid::new_v4().to_string(),
-            username: username.clone(),
+            username,
             passkeys: Vec::new(),     // SAML users don't have passkeys
             role: final_role.clone(), // Clone so we can use it in logging
             status,
@@ -278,6 +253,8 @@ pub async fn provision_user_from_saml(
             avatar_path: None,
             last_logged_in: Some(now),
             saml_id: Some(user_id_attr.clone()),
+            oidc: None,
+            deleted_at: None,
         };
 
         info!(user_id = %user.user_id, role = %final_role, "Created SAML user");
@@ -303,18 +280,18 @@ pub async fn provision_user_from_saml(
             if let Some(avatar_filename) =
                 fetch_and_save_avatar(&graph_config, &user_email, &user_id, &avatars_storage_path).await
             {
-                // Update user with avatar path (relative path: avatars/filename)
                 let relative_avatar_path = format!("avatars/{}", avatar_filename);
-                if let Ok(Some(mut user)) = storage
-                    .load_user_by_id(&user_id)
+                match storage
+                    .set_avatar_if_approved(&user_id, relative_avatar_path.clone())
                     .await
                 {
-                    user.avatar_path = Some(relative_avatar_path.clone());
-                    if let Err(e) = storage.save_user(&user).await {
-                        warn!("Failed to update user with avatar path: {}", e);
-                    } else {
-                        info!("Successfully updated user {} with avatar: {}", user_id, relative_avatar_path);
+                    Ok(true) => info!("Successfully updated user {} with avatar: {}", user_id, relative_avatar_path),
+                    Ok(false) => {
+                        storage
+                            .remove_uploaded_avatar(&user_id, &relative_avatar_path)
+                            .await
                     }
+                    Err(e) => warn!("Failed to update user with avatar path: {}", e),
                 }
             }
         } else {
@@ -323,6 +300,21 @@ pub async fn provision_user_from_saml(
     }
 
     Ok(Provisioned { user, change })
+}
+
+/// The username a SAML user gets: the asserted one, or the SAML user ID when another user holds
+/// it or it is a user id. A user whose stored username already is the asserted one, and not their
+/// user id, keeps it without this check, so users that already share a username keep signing in.
+async fn resolve_username(
+    storage: &PasskeyStorage,
+    asserted: &str,
+    saml_user_id: &str,
+    own_user_id: Option<&str>,
+) -> Result<String> {
+    storage
+        .free_username(&[asserted, saml_user_id], own_user_id)
+        .await?
+        .ok_or_else(|| anyhow::Error::new(UsernameTaken))
 }
 
 /// The longest identity-provider role value kept for a refusal's log line.
@@ -350,14 +342,6 @@ impl RoleRefused {
     }
 }
 
-fn privilege(role: &UserRole) -> u8 {
-    match role {
-        UserRole::Administrator => 2,
-        UserRole::PowerUser => 1,
-        UserRole::User => 0,
-    }
-}
-
 /// Resolve the gateway role from the identity provider's role values: the highest role an
 /// explicit `role_mapping` entry gives any value, else `default_role`, else refused.
 fn determine_role(
@@ -372,7 +356,7 @@ fn determine_role(
         .iter()
         .filter_map(|value| config.role_mapping.get(value))
         .filter_map(|name| UserRole::from_config_name(name))
-        .max_by_key(privilege);
+        .max_by_key(UserRole::rank);
     let role = mapped.or_else(|| {
         config
             .default_role
@@ -556,28 +540,6 @@ mod tests {
         attributes
     }
 
-    fn user(role: UserRole) -> UserData {
-        let now = chrono::Utc::now();
-        UserData {
-            user_id: "u-1".to_string(),
-            username: "jane".to_string(),
-            passkeys: Vec::new(),
-            role,
-            status: UserStatus::Approved,
-            is_primary: false,
-            first_name: Some("Jane".to_string()),
-            last_name: None,
-            email: Some("jane@example.test".to_string()),
-            department: None,
-            job_title: None,
-            avatar_path: None,
-            created_at: now,
-            updated_at: now,
-            last_logged_in: Some(now),
-            saml_id: Some("saml-1".to_string()),
-        }
-    }
-
     #[tokio::test]
     async fn the_first_sign_in_creates_the_user() {
         let dir = tempdir().unwrap();
@@ -624,56 +586,6 @@ mod tests {
             other => panic!("expected an update, got {other:?}"),
         }
         assert_eq!(second.user.role, UserRole::PowerUser);
-    }
-
-    #[test]
-    fn a_created_user_raises_created_then_login() {
-        let provisioned = Provisioned {
-            user: user(UserRole::User),
-            change: SignInChange::Created,
-        };
-
-        let events = sign_in_events(&provisioned);
-
-        assert!(matches!(events.as_slice(), [SignInEvent::Created(_), SignInEvent::Login(_)]));
-    }
-
-    #[test]
-    fn a_role_change_raises_updated_then_login() {
-        let previous = user(UserRole::User);
-        let mut current = previous.clone();
-        current.role = UserRole::PowerUser;
-        let provisioned = Provisioned {
-            user: current,
-            change: SignInChange::Updated { previous: Box::new(previous) },
-        };
-
-        let events = sign_in_events(&provisioned);
-
-        match events.as_slice() {
-            [SignInEvent::Updated { old, new }, SignInEvent::Login(_)] => {
-                assert_eq!(old.role, UserRole::User);
-                assert_eq!(new.role, UserRole::PowerUser);
-            }
-            other => panic!("expected updated then login, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_sign_in_that_changes_only_profile_details_raises_only_login() {
-        let previous = user(UserRole::User);
-        let mut current = previous.clone();
-        current.first_name = Some("Janet".to_string());
-        current.updated_at = previous.updated_at + chrono::Duration::minutes(5);
-        current.last_logged_in = Some(current.updated_at);
-        let provisioned = Provisioned {
-            user: current,
-            change: SignInChange::Updated { previous: Box::new(previous) },
-        };
-
-        let events = sign_in_events(&provisioned);
-
-        assert!(matches!(events.as_slice(), [SignInEvent::Login(_)]));
     }
 
     #[tokio::test]
@@ -1227,5 +1139,247 @@ mod tests {
             .unwrap();
         assert_eq!(refused.subject.as_deref(), Some("saml-2"));
         assert_eq!(refused.idp_role.as_deref(), Some("contractors"));
+    }
+
+    fn any_role_config() -> SamlConfig {
+        let mut config = test_saml_config();
+        config.default_role = Some("user".to_string());
+        config
+    }
+
+    async fn sign_in(
+        storage: &PasskeyStorage,
+        avatars: &str,
+        saml_user_id: &str,
+        username: &str,
+    ) -> Result<Provisioned> {
+        provision_user_from_saml(storage, &saml_attributes(saml_user_id, username), &any_role_config(), avatars).await
+    }
+
+    async fn alice_and_bob(
+        storage: &PasskeyStorage,
+        avatars: &str,
+    ) -> (UserData, UserData) {
+        let alice = sign_in(storage, avatars, "alice", "alice")
+            .await
+            .unwrap()
+            .user;
+        let bob = sign_in(storage, avatars, "bob", "bob")
+            .await
+            .unwrap()
+            .user;
+        (alice, bob)
+    }
+
+    async fn user_count(storage: &PasskeyStorage) -> usize {
+        storage
+            .list_users()
+            .await
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn a_new_account_asserting_a_username_another_user_holds_gets_its_saml_user_id_as_username() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let (_, bob) = alice_and_bob(&storage, &avatars).await;
+
+        let second_bob = sign_in(&storage, &avatars, "name-id-2", "bob")
+            .await
+            .unwrap()
+            .user;
+
+        assert_eq!(second_bob.username, "name-id-2");
+        assert_ne!(second_bob.user_id, bob.user_id);
+        let holder = storage
+            .load_user_by_id(&bob.user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((holder.username.as_str(), holder.saml_id.as_deref()), ("bob", Some("bob")));
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_whose_asserted_username_and_saml_user_id_are_both_held_is_refused_and_nothing_is_created() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        alice_and_bob(&storage, &avatars).await;
+        sign_in(&storage, &avatars, "someone", "name-id-3")
+            .await
+            .unwrap();
+
+        let refused = sign_in(&storage, &avatars, "name-id-3", "bob")
+            .await
+            .unwrap_err();
+
+        assert!(
+            refused
+                .downcast_ref::<UsernameTaken>()
+                .is_some(),
+            "{refused:?}"
+        );
+        assert_eq!(user_count(&storage).await, 3);
+    }
+
+    #[tokio::test]
+    async fn an_existing_account_whose_asserted_username_another_user_holds_keeps_its_own() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let (alice, _) = alice_and_bob(&storage, &avatars).await;
+
+        let signed_in = sign_in(&storage, &avatars, "alice", "bob")
+            .await
+            .unwrap()
+            .user;
+
+        assert_eq!(signed_in.user_id, alice.user_id);
+        assert_eq!(signed_in.username, "alice", "the SAML user ID, which alice already holds");
+    }
+
+    #[tokio::test]
+    async fn two_existing_users_that_share_a_username_both_keep_signing_in() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let (_, bob) = alice_and_bob(&storage, &avatars).await;
+        let mut duplicate = sign_in(&storage, &avatars, "dup", "dup")
+            .await
+            .unwrap()
+            .user;
+        duplicate.username = "bob".to_string();
+        storage
+            .save_user(&duplicate)
+            .await
+            .unwrap();
+
+        let first = sign_in(&storage, &avatars, "bob", "bob")
+            .await
+            .unwrap()
+            .user;
+        let second = sign_in(&storage, &avatars, "dup", "bob")
+            .await
+            .unwrap()
+            .user;
+
+        assert_eq!((first.user_id.as_str(), first.username.as_str()), (bob.user_id.as_str(), "bob"));
+        assert_eq!((second.user_id.as_str(), second.username.as_str()), (duplicate.user_id.as_str(), "bob"));
+    }
+
+    #[tokio::test]
+    async fn a_user_who_is_not_approved_is_refused_and_left_unchanged() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let (_, bob) = alice_and_bob(&storage, &avatars).await;
+        for status in [UserStatus::Disabled, UserStatus::New] {
+            storage
+                .update_user(&bob.user_id, None, Some(status.clone()), &crate::config::LimitsConfig::default())
+                .await
+                .unwrap();
+
+            let refused = sign_in(&storage, &avatars, "bob", "alice")
+                .await
+                .unwrap_err();
+
+            let UserNotApproved(stored) = refused
+                .downcast_ref::<UserNotApproved>()
+                .unwrap_or_else(|| panic!("{status}: {refused:?}"));
+            assert_eq!(stored.user_id, bob.user_id);
+            let stored = storage
+                .load_user_by_id(&bob.user_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!((stored.status, stored.username.as_str()), (status, "bob"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deleted_user_is_refused_at_the_next_sign_in_and_not_created_again() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let (_, bob) = alice_and_bob(&storage, &avatars).await;
+        storage
+            .delete_user(&bob.user_id)
+            .await
+            .unwrap();
+
+        let refused = sign_in(&storage, &avatars, "bob", "bob")
+            .await
+            .unwrap_err();
+
+        assert!(
+            refused
+                .downcast_ref::<UserNotApproved>()
+                .is_some(),
+            "{refused:?}"
+        );
+        assert_eq!(user_count(&storage).await, 2, "no second user for the SAML account");
+    }
+
+    #[tokio::test]
+    async fn a_deleted_user_signs_in_as_the_same_user_once_approved_again() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let (_, bob) = alice_and_bob(&storage, &avatars).await;
+        storage
+            .delete_user(&bob.user_id)
+            .await
+            .unwrap();
+        storage
+            .update_user(&bob.user_id, None, Some(UserStatus::Approved), &crate::config::LimitsConfig::default())
+            .await
+            .unwrap();
+
+        let again = sign_in(&storage, &avatars, "bob", "bob")
+            .await
+            .unwrap()
+            .user;
+
+        assert_eq!(again.user_id, bob.user_id);
+        assert_eq!(again.username, "bob");
+        assert_eq!(again.status, UserStatus::Approved);
+        assert!(again.deleted_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_asserted_username_equal_to_the_users_own_id_gives_them_their_saml_user_id() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let (_, bob) = alice_and_bob(&storage, &avatars).await;
+
+        let signed_in = sign_in(&storage, &avatars, "bob", &bob.user_id)
+            .await
+            .unwrap()
+            .user;
+        assert_eq!((signed_in.user_id.as_str(), signed_in.username.as_str()), (bob.user_id.as_str(), "bob"));
+
+        storage
+            .delete_user(&bob.user_id)
+            .await
+            .unwrap();
+        storage
+            .update_user(&bob.user_id, None, Some(UserStatus::Approved), &crate::config::LimitsConfig::default())
+            .await
+            .unwrap();
+        let approved_again = sign_in(&storage, &avatars, "bob", &bob.user_id)
+            .await
+            .unwrap()
+            .user;
+        assert_eq!(approved_again.username, "bob", "a kept record approved again never keeps its user id as username");
+    }
+
+    #[tokio::test]
+    async fn an_asserted_username_equal_to_another_users_id_gives_the_saml_user_id() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let (alice, _) = alice_and_bob(&storage, &avatars).await;
+
+        let newcomer = sign_in(&storage, &avatars, "carol", &alice.user_id)
+            .await
+            .unwrap()
+            .user;
+
+        assert_ne!(newcomer.user_id, alice.user_id);
+        assert_eq!(newcomer.username, "carol");
     }
 }

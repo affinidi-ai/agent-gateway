@@ -11,7 +11,7 @@ const MAX_TARGET_LENGTH = 1024;
  * dashboard root, the new access token form with or without its preset query, and the CLI
  * authorize path with a query are allowed, and the path may not hold an encoded slash or
  * backslash. The query may, since the CLI `state` is opaque. The gateway applies the same rule to
- * the SAML return target.
+ * the SAML and OIDC return targets.
  */
 export function safeNextTarget(next: string | null, origin: string): string | null {
   if (

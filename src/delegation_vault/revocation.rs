@@ -1459,7 +1459,7 @@ async fn provider_secret(
 
 /// `Basic` credentials as RFC 6749 section 2.3.1 builds them: the client id
 /// and secret each form-urlencoded, then joined and base64-encoded.
-pub(super) fn basic_authorization(
+pub(crate) fn basic_authorization(
     client_id: &str,
     secret: &str,
 ) -> zeroize::Zeroizing<String> {

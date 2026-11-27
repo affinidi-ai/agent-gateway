@@ -4,6 +4,16 @@ import { apiClient } from '../api';
 import { formatDateTime } from '../utils/stringUtils';
 import { DeleteButton } from '../components/shared/DeleteButton';
 import { useSaveAction } from '../hooks/useSaveAction';
+import {
+  DELETED_USER_NOTICE,
+  DELETE_USER_TITLE,
+  type DeleteOutcome,
+  deleteConfirmNotice,
+  deleteSuccessMessage,
+  isDeletedKeptUser,
+  keptAccountLabel,
+  type SignInMethod,
+} from '../utils/userDelete';
 
 interface User {
   username: string;
@@ -19,6 +29,9 @@ interface User {
   department?: string;
   job_title?: string;
   avatar_path?: string;
+  oidc?: { issuer: string; subject: string };
+  saml_id?: string;
+  sign_in_method?: SignInMethod;
 }
 
 interface UserForm {
@@ -111,8 +124,8 @@ const EditUserPage: React.FC = () => {
   }, [handleSubmit, saving, userId]);
 
   const handleDelete = async () => {
-    await run(() => apiClient.delete(`/users/${userId}`), {
-      successMessage: 'User deleted!',
+    await run(() => apiClient.delete<{ outcome?: DeleteOutcome }>(`/users/${userId}`), {
+      successMessage: response => deleteSuccessMessage(response.data?.outcome, user ?? {}),
       redirectTo: '/users',
       onError: setError,
       errorMessage: 'Failed to delete user',
@@ -163,6 +176,16 @@ const EditUserPage: React.FC = () => {
               This user is an administrator and cannot be deleted or downgraded below power user.
             </div>
           )}
+          {user && isDeletedKeptUser(user) && (
+            <div
+              className="alert alert-secondary"
+              role="alert"
+              data-testid="edit-user-deleted-notice"
+            >
+              <i className="fas fa-user-slash me-2"></i>
+              {DELETED_USER_NOTICE}
+            </div>
+          )}
           {form.status === 'new' && (
             <div className="alert alert-info" role="alert">
               <i className="fas fa-info-circle me-2"></i>
@@ -174,6 +197,11 @@ const EditUserPage: React.FC = () => {
             <div className="mb-3">
               <label className="form-label">Username</label>
               <input type="text" className="form-control" value={user?.username || ''} disabled />
+              {user && keptAccountLabel(user) && (
+                <div className="form-text" data-testid="edit-user-kept-account">
+                  {keptAccountLabel(user)}
+                </div>
+              )}
             </div>
             {created && (
               <div className="row">
@@ -339,7 +367,13 @@ const EditUserPage: React.FC = () => {
                 )}
               </button>
               {form.role !== 'administrator' && !user?.is_primary && (
-                <DeleteButton onDelete={handleDelete} disabled={saving} variant="danger">
+                <DeleteButton
+                  onDelete={handleDelete}
+                  disabled={saving}
+                  variant="danger"
+                  title={DELETE_USER_TITLE}
+                  confirmNotice={user ? deleteConfirmNotice(user) : undefined}
+                >
                   Delete User
                 </DeleteButton>
               )}

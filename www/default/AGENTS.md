@@ -97,6 +97,46 @@ the banner for a refused save is `surface-error-alert`, and the delete button is
 `surface-delete-button`, which opens `surface-delete-confirm` with `surface-delete-confirm-name`,
 `surface-delete-confirm-confirm` and `surface-delete-confirm-cancel` (see _Surface delete_).
 
+## Login page
+
+`pages/LoginPage.tsx` reads `GET /api/v1/auth/mode` (`mode` and `label`) and shows one form per
+mode:
+
+- `passkey`: the username field, sign-in and registration.
+- `saml` and `oidc`: no username field, passkeys or registration, only one primary button that
+  sends the browser to `/api/saml/login` or `/api/oidc/login`, with `?next=` from
+  `loginNextTarget` when there is one. The SAML button reads "Sign in with SSO"; the OIDC
+  button reads "Sign in with {label}", the provider name `oidc.json` sets, and "Sign in with
+  SSO" when the answer has no label. The label is rendered as text, never as markup. The
+  button is `login-sso-button` in both modes, and its icon is `aria-hidden`.
+- Reached with `?signed_out=1` (where an OpenID provider sends the browser after signing the
+  person out), the page shows "You have signed out." as its success message: in the SAML and
+  OIDC form a success `Alert` with `role="status"` and `login-signed-out-notice`, in the passkey
+  form the success `Alert` registration uses. The notice is shown alone: a `session_expired`
+  flag left by the session is cleared, not shown. Before anything reads the location, the page
+  removes the marker, and the `state` the provider echoes beside it, with
+  `history.replaceState`, keeping the router's history state, the other query parameters and the
+  hash, so a reload does not show the notice again and `loginNextTarget` never sees it.
+
+### Signing out
+
+`sessionManager.logout()` (`api.ts`) posts `/api/auth/logout`, drops the session token and
+resolves to the answer's `end_session_url` when it parses as an `http:` or `https:` address (an
+OIDC session, see `docs/CONFIGURATION_REFERENCE.md`), else to nothing. It resolves to the
+parsed `href`, so the address checked is the address followed.
+
+`App.tsx` owns sign-out, and both explicit sign-outs go through its `handleLogout` once: the
+topbar user menu's **Sign Out** (`AuthenticatedApp.tsx` only disconnects the WebSocket and calls
+`onLogout`) and the Terms page's **Sign out**. `handleLogout` first shows the page loader with
+`flushSync`, which unmounts the dashboard, its pollers and any `beforeunload` prompt, then calls
+`sessionManager.signOut()`, the one `POST /api/auth/logout`. `signOut()` sends the browser to the
+provider's address with `window.location.assign` and resolves to `true`, and the loader stays
+while the browser leaves; the sign-in page is shown only when it resolves to `false`. Once the
+browser is leaving, `expireSession()` does nothing (and one already under way does not reload),
+and a page restored from the back-forward cache (`pageshow` with `persisted`) reloads, so it shows
+the sign-in page rather than the loader. `expireSession()` calls `logout()` and never follows the
+address, so a session that timed out does not sign the person out of the provider.
+
 ## CLI consent page
 
 `/cli-consent` (`pages/CliConsentPage/`) asks a signed-in user to approve a `fabric` CLI
@@ -114,7 +154,8 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   loopback callback with `error=access_denied`, built by `loopbackCallbackUrl`, so the CLI
   stops waiting. The not-approved state tells the user to ask an administrator.
 - A signed-out user on `/cli-consent` gets the login page, which returns to the CLI authorize
-  path built from the consent query (`loginNextTarget`), so a SAML sign-in continues the flow.
+  path built from the consent query (`loginNextTarget`), so a SAML or OIDC sign-in continues the
+  flow.
 
 ## Surface Builder
 
@@ -1397,8 +1438,8 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
   Create, and preset scopes they cannot grant render as red unavailable pills. The
   resource-scope card opens when a pattern or header is preset. The link survives sign-in:
   a signed-out visitor sees the login page at that URL, and `loginNextTarget` re-encodes the
-  query and returns to the form after passkey or SAML login (the gateway's SAML return-target
-  allowlist accepts `/access-tokens/new`).
+  query and returns to the form after passkey, SAML or OIDC login (the gateway's return-target
+  allowlist for SAML and OIDC sign-in accepts `/access-tokens/new`).
 - The form footer always has a **Copy creation link** button
   (`access-token-copy-permalink-button`), in create and edit mode, that copies an absolute
   `/access-tokens/new` URL encoding the current name, description, scopes, expiry, resource
@@ -1989,6 +2030,32 @@ Delete is also disabled while a save runs, and Cmd/Ctrl+S does not save while th
 open. A delete succeeds with the toast `Surface "<name>" deleted` and returns to `/surfaces`; a
 failed one closes the popover, returns focus to the delete button and shows the gateway's message
 in `surface-error-alert`. The popover closes if the page moves to another surface.
+
+## User delete
+
+The wording that says what deleting a user does comes from `utils/userDelete.ts`, never inline,
+so every place that deletes a user says the same thing: the delete button title, the confirm
+notice, the success messages, the "Deleted:" and "Provider account:" headings, the label of a
+kept user's provider account and the deleted notice on the Edit User page.
+
+- `DeleteButton` (`components/shared/DeleteButton.tsx`) takes `confirmNotice`, visible text
+  shown during its confirm step, so it also reaches touch devices that never show a title. With
+  a notice the button keeps a `role="status"` region (`delete-confirm-notice`) mounted and fills
+  it only while confirming; without one there is no region.
+- The Users list (Settings → Users, its row and its detail modal) and the Edit User page
+  (`/users/:userId`) pass a notice only for a user whose `sign_in_method` is `oidc` or `saml`,
+  naming the method ("OpenID Connect" or "SAML"); the table row uses the shorter text, on its own
+  line under the row actions. A passkey user gets no notice.
+- The success message follows the `outcome` the `DELETE` answers: "User deleted successfully"
+  for `removed` or no outcome, a kept-record message for `disabled` that names the method for a
+  user whose `sign_in_method` is `oidc` or `saml`. The Notifications page's reject-and-delete
+  message follows the outcome the same way. The Edit User page's toast comes from `useSaveAction` with a
+  `successMessage` built from the answer.
+- A kept record shows its provider account (`oidc` or `saml_id`) under the username in the
+  Users list (`users-kept-account-<user_id>`), in the detail modal
+  (`users-modal-kept-account`, headed "Deleted:" while the record is disabled and "Provider
+  account:" once approved again) and on the Edit User page (`edit-user-kept-account`), and the
+  Edit User page shows `edit-user-deleted-notice` for a disabled user bound to one.
 
 ## Confirm popover
 

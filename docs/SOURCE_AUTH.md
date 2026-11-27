@@ -304,6 +304,23 @@ carries more than one value in the method's `token_scheme` fails, whatever the v
 Access Point, a Transit Point and over Fabric. A value in another scheme, such as an MPP
 `Payment` credential beside the `Bearer` token, does not count.
 
+A remote key set is cached per strategy for its `Cache-Control: max-age` (24 hours without
+one), and never for less than a minute, even with `max-age=0`. A token naming a `kid` the cached
+keys lack fetches the keys again, at most once a minute for each strategy, counted from the last
+such fetch: a rotated key is found by the first token that names it, but tokens with made-up
+`kid` values cannot make every request fetch from the key server, even when they arrive together
+or the fetch fails. A token naming a key published within that minute is refused as an invalid
+credential until the minute has passed. One fetch runs at a time for each strategy, so tokens
+that arrive together while its keys are missing or expired share it. A fetch that fails is not
+tried again for a minute:
+meanwhile every token checked against that strategy gets the same failure at once, except that
+keys that expired and could not be fetched again are still used for that minute, once, so one
+failed fetch when they expire does not refuse every caller. These rules hold for every check
+against a remote key set: JWT bearer callers, token exchange, consent confirmation (where a key
+the keys lack within the minute counts as keys unavailable), and the OIDC dashboard sign-in and
+its back-channel logout, which fetch the provider's keys
+([`oidc.json`](CONFIGURATION_REFERENCE.md#oidcjson)).
+
 An Access Point `jwt_bearer` method must name at least one audience, unless the Access Point
 publishes protected resource metadata; the admin API refuses a save without one with `400`, on
 the surface or in a variant's overrides. For an identity provider whose access tokens carry no

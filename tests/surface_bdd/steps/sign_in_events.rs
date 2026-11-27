@@ -157,6 +157,16 @@ fn saml_json_maps_role(
         .keeps_gateway_log = true;
 }
 
+#[given(expr = "config.toml sets the dashboard session lifetime to {int} minutes")]
+fn config_sets_session_lifetime(
+    world: &mut SurfaceWorld,
+    minutes: u64,
+) {
+    world
+        .surface_config
+        .session_max_lifetime_minutes = Some(minutes);
+}
+
 #[when("the gateway tries to start")]
 async fn gateway_tries_to_start(world: &mut SurfaceWorld) {
     world
@@ -468,6 +478,11 @@ async fn sign_in_with_saml_layout(
     let answer =
         crate::bdd_support::saml_idp::sign_in(infra._temp_dir.path(), infra.gateway_port, &subject, &roles, layout)
             .await;
+    if let Some(session) = crate::bdd_support::http::handed_off_session(&answer.body) {
+        world
+            .dashboard_sessions
+            .insert(subject, session);
+    }
     world.caller_response = Some(crate::bdd_support::admin_client::RecordedResponse {
         status: answer.status,
         headers: if answer.set_cookies.is_empty() {
@@ -670,27 +685,29 @@ fn the_gateway_issues_no_session_cookie(world: &mut SurfaceWorld) {
     );
 }
 
-fn stored_users(world: &SurfaceWorld) -> Vec<Value> {
-    let base = world
+/// The human users the gateway stored, read from its user directory; none before the first is
+/// stored. A missing storage root or a user directory that cannot be read fails the step, so a
+/// moved storage path never reads as no users.
+pub(crate) fn stored_users(world: &SurfaceWorld) -> Vec<Value> {
+    let storage_root = world
         .infra
         .as_ref()
         .expect("the gateway runs")
         ._temp_dir
         .path()
-        .to_path_buf();
-    let users_dir = ["_storage/passkeys"]
-        .iter()
-        .map(|relative| base.join(relative))
-        .find(|dir| dir.is_dir())
-        .unwrap_or_else(|| panic!("no stored users directory under {base:?}"));
-    let stored: Vec<Value> = std::fs::read_dir(&users_dir)
-        .expect("read the users directory")
+        .join("_storage");
+    assert!(storage_root.is_dir(), "the gateway's storage root {} is missing", storage_root.display());
+    let users_dir = storage_root.join("passkeys");
+    let entries = match std::fs::read_dir(&users_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => panic!("the user directory {} cannot be read: {error}", users_dir.display()),
+    };
+    entries
         .filter_map(Result::ok)
         .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
         .filter_map(|text| serde_json::from_str(&text).ok())
-        .collect();
-    assert!(!stored.is_empty(), "the first user's account is stored in {users_dir:?}");
-    stored
+        .collect()
 }
 
 #[then("only the first human user is stored")]

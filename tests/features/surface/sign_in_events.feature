@@ -4,8 +4,10 @@ Feature: Sign-in integration events
   gateway rejects. An integration whose event set holds them receives both. Both name the sign-in
   method; a failed one also names its reason, and names the user only when the account exists,
   as it is stored. Each sign-in raises one event, and completing a sign-in the gateway did not
-  start raises none. The caller's answer to a failed sign-in is the same either way. The events
-  match the reference events under tests/fixtures/integration_events.
+  start raises none. The caller's answer to a failed sign-in is the same either way. Deleting a
+  SAML user keeps a disabled record under their SAML user ID, so their next sign-in is refused as
+  not approved and creates no user. The events match the reference events under
+  tests/fixtures/integration_events.
 
   Background:
     Given an integration whose event set holds the sign-in events
@@ -116,6 +118,25 @@ Feature: Sign-in integration events
     Then the response status is 403
     And the integration receives a "user.login_failed" event with login method "saml" and failure reason "role_not_mapped"
     And human user "mallory" keeps the stored role "administrator"
+
+  Scenario: A deleted SAML user is refused at their next SAML sign-in and not created again
+    Given human users sign in with SAML
+    And "alpha" has signed in with SAML as the first user and that event was received
+    And "mallory" has signed in with SAML carrying the identity provider roles "gw-all" and that event was received
+    And "alpha" has deleted human user "mallory"
+    When "mallory" signs in with SAML carrying the identity provider roles "gw-all"
+    Then the response status is 403
+    And the gateway issues no session cookie
+    And the SAML account "mallory" has one stored human user, who is "disabled"
+    And the integration receives a "user.login_failed" event with login method "saml" and failure reason "not_approved"
+
+  Scenario: Deleting a user who signs in with SAML answers that the record was kept disabled
+    Given human users sign in with SAML
+    And "alpha" has signed in with SAML as the first user and that event was received
+    And "mallory" has signed in with SAML carrying the identity provider roles "gw-all" and that event was received
+    When "alpha" deletes human user "mallory"
+    Then the response status is 200
+    And the delete answers the outcome "disabled"
 
   Scenario: A SAML sign-in with two different user IDs as repeated attributes is refused and creates no user
     Given human users sign in with SAML

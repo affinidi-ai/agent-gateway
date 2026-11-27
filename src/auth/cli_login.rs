@@ -801,7 +801,7 @@ mod tests {
         .into_owned();
 
         assert!(next.contains("&state=a%2Fb%5Cc%2B%3D&"), "{next}");
-        assert!(crate::auth::saml::is_allowed_return_target(&next), "{next}");
+        assert!(crate::auth::sign_in_pages::is_allowed_return_target(&next), "{next}");
         let query = next
             .strip_prefix(&format!("{CLI_AUTHORIZE_PATH}?"))
             .unwrap();
@@ -1060,6 +1060,8 @@ mod tests {
                 updated_at: now,
                 last_logged_in: None,
                 saml_id: None,
+                oidc: None,
+                deleted_at: None,
             })
             .await
             .unwrap();
@@ -1417,6 +1419,7 @@ mod tests {
                 "alice".to_string(),
                 TEST_USER_ID.to_string(),
                 TermsSessionGate::ConsentPending,
+                None,
             )
             .await;
         let store = Arc::new(CliLoginStore::new());

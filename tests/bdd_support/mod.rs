@@ -8,6 +8,7 @@ pub mod caller;
 pub mod collaborators;
 pub mod config;
 pub mod custom_trust_agent;
+pub mod dashboard_op;
 pub mod dashboard_socket;
 pub mod debug;
 pub mod gateway_process;

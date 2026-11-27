@@ -448,7 +448,7 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`auth/`](src/auth/), [`auth_manager/`](src/auth_manager/) | Dashboard login: passkey and SAML, sessions, and `fabric` CLI browser login (in-memory single-use codes, so one gateway instance) | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#samljson), [`ACCESS_TOKENS.md`](docs/ACCESS_TOKENS.md#cli-browser-login), [`TERMS_AND_CONSENT.md`](docs/TERMS_AND_CONSENT.md#gating-the-session) |
+| [`auth/`](src/auth/), [`auth_manager/`](src/auth_manager/) | Dashboard login: passkey, SAML and OpenID Connect, sessions, and `fabric` CLI browser login (in-memory single-use codes, so one gateway instance) | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#samljson), [`oidc.json`](docs/CONFIGURATION_REFERENCE.md#oidcjson), [`ACCESS_TOKENS.md`](docs/ACCESS_TOKENS.md#cli-browser-login), [`TERMS_AND_CONSENT.md`](docs/TERMS_AND_CONSENT.md#gating-the-session) |
 | [`rbac/`](src/rbac/) | Management API role enforcement | [`RBAC.md`](docs/RBAC.md) |
 | [`access_tokens/`](src/access_tokens/) | Management PATs, delegation, resource patterns; the permissions that cover each management route for a PAT with feature scopes live in [`auth_manager/route_scopes.rs`](src/auth_manager/route_scopes.rs) | [`ACCESS_TOKENS.md`](docs/ACCESS_TOKENS.md#feature-scopes) |
 | [`tenancy/`](src/tenancy/) | Tenant context and record ownership | [`ACCESS_TOKENS.md`](docs/ACCESS_TOKENS.md) |

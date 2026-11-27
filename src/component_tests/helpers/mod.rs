@@ -999,6 +999,7 @@ fn build_bootstrap_config(
         metrics_cache_ttl_seconds: 1,
         websocket_require_auth: false,
         session_timeout_minutes: 20,
+        session_max_lifetime_minutes: crate::auth::session::DEFAULT_SESSION_LIFETIME_MINUTES,
         websocket_broadcast_buffer: 500,
         metrics_retention_minutes: 360,
         metrics_cache_ttl_seconds_legacy: 1,
@@ -1072,6 +1073,7 @@ pub fn configure_admin_api(bootstrap: &BootstrapConfig) -> reqwest::Client {
         created_at: now,
         expires_at: now + chrono::Duration::minutes(10),
         terms_gate: Default::default(),
+        oidc: None,
     };
     for (directory, id, record) in [
         (

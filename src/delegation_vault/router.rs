@@ -448,6 +448,8 @@ mod tests {
                 updated_at: now,
                 last_logged_in: None,
                 saml_id: None,
+                oidc: None,
+                deleted_at: None,
             })
             .await
             .unwrap();

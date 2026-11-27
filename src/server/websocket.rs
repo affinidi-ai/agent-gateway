@@ -1219,6 +1219,7 @@ mod tests {
             created_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::minutes(5),
             terms_gate,
+            oidc: None,
         }
     }
 
@@ -2481,6 +2482,8 @@ mod tests {
             updated_at: now,
             last_logged_in: None,
             saml_id: None,
+            oidc: None,
+            deleted_at: None,
         }
     }
 

@@ -59,9 +59,18 @@ impl JwksServer {
 }
 
 pub fn sign_jwt(claims: serde_json::Value) -> String {
+    sign_typed_jwt(claims, "JWT")
+}
+
+/// An EdDSA JWT over `claims` with the shared BDD key, its header `typ` set to `typ`.
+pub fn sign_typed_jwt(
+    claims: serde_json::Value,
+    typ: &str,
+) -> String {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     let mut header = Header::new(Algorithm::EdDSA);
     header.kid = Some(KID.to_string());
+    header.typ = Some(typ.to_string());
     let key = EncodingKey::from_ed_pem(ED25519_PRIVATE_PEM.as_bytes()).unwrap();
     encode(&header, &claims, &key).unwrap()
 }
@@ -115,6 +124,16 @@ mod tests {
         );
 
         let header = jsonwebtoken::decode_header(&token).expect("decode JWT header");
+        assert_eq!(header.kid.as_deref(), Some(super::get_jwks_key_id()));
+        assert_eq!(header.typ.as_deref(), Some("JWT"));
+    }
+
+    #[test]
+    fn sign_typed_jwt_sets_the_header_type() {
+        let token = super::sign_typed_jwt(serde_json::json!({ "sub": "bdd-user" }), "logout+jwt");
+
+        let header = jsonwebtoken::decode_header(&token).expect("decode JWT header");
+        assert_eq!(header.typ.as_deref(), Some("logout+jwt"));
         assert_eq!(header.kid.as_deref(), Some(super::get_jwks_key_id()));
     }
 

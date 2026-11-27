@@ -7,6 +7,18 @@ import { DeleteButton } from '../components/shared/DeleteButton';
 import SearchInput from '../components/shared/SearchInput';
 import { UserAvatar } from '../components/shared/UserAvatar';
 import { usePermissions } from '../context/PermissionsContext';
+import {
+  DELETE_USER_TITLE,
+  type DeleteOutcome,
+  deleteConfirmNotice,
+  deleteSuccessMessage,
+  isDeletedKeptUser,
+  KEPT_ACCOUNT_HEADING,
+  keptAccountDetail,
+  keptAccountLabel,
+  PROVIDER_ACCOUNT_HEADING,
+  type SignInMethod,
+} from '../utils/userDelete';
 
 const ROLE_BADGE: Record<string, string> = {
   administrator: 'text-bg-danger',
@@ -34,6 +46,9 @@ interface User {
   department?: string;
   job_title?: string;
   avatar_path?: string;
+  oidc?: { issuer: string; subject: string };
+  saml_id?: string;
+  sign_in_method?: SignInMethod;
 }
 
 const UsersPage: React.FC = () => {
@@ -96,8 +111,10 @@ const UsersPage: React.FC = () => {
   const handleDelete = useCallback(
     async (user: User) => {
       try {
-        await apiClient.delete(`/users/${user.user_id}`);
-        setSuccess('User deleted successfully');
+        const { data } = await apiClient.delete<{ outcome?: DeleteOutcome }>(
+          `/users/${user.user_id}`
+        );
+        setSuccess(deleteSuccessMessage(data?.outcome, user));
         setTimeout(() => setSuccess(null), 3000);
         fetchUsers();
       } catch (err: any) {
@@ -310,6 +327,14 @@ const UsersPage: React.FC = () => {
                         </td>
                         <td>
                           <strong>{user.username}</strong>
+                          {keptAccountLabel(user) && (
+                            <div
+                              className="small text-muted"
+                              data-testid={`users-kept-account-${user.user_id}`}
+                            >
+                              {keptAccountLabel(user)}
+                            </div>
+                          )}
                           {user.is_primary && (
                             <span
                               className="badge text-bg-primary ms-2"
@@ -366,7 +391,7 @@ const UsersPage: React.FC = () => {
                             )}
                           </small>
                         </td>
-                        <td className="d-flex flex-column flex-lg-row gap-2 align-items-start align-items-lg-center">
+                        <td className="d-flex flex-column flex-lg-row flex-wrap gap-2 align-items-start align-items-lg-center">
                           {hasPermission('users.edit') && (
                             <>
                               <button
@@ -398,7 +423,8 @@ const UsersPage: React.FC = () => {
                                 data-testid={`users-delete-button-${user.user_id}`}
                                 onDelete={() => handleDelete(user)}
                                 className="btn-sm"
-                                title="Delete user permanently"
+                                title={DELETE_USER_TITLE}
+                                confirmNotice={deleteConfirmNotice(user, true)}
                               />
                             )}
                         </td>
@@ -470,6 +496,20 @@ const UsersPage: React.FC = () => {
                         {selectedUser.status.toUpperCase()}
                       </span>
                     </div>
+                    {keptAccountLabel(selectedUser) && (
+                      <div className="mb-2" data-testid="users-modal-kept-account">
+                        <strong>
+                          {isDeletedKeptUser(selectedUser)
+                            ? KEPT_ACCOUNT_HEADING
+                            : PROVIDER_ACCOUNT_HEADING}
+                        </strong>{' '}
+                        <span className="text-muted">
+                          {isDeletedKeptUser(selectedUser)
+                            ? keptAccountDetail(keptAccountLabel(selectedUser) ?? '')
+                            : keptAccountLabel(selectedUser)}
+                        </span>
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -524,6 +564,8 @@ const UsersPage: React.FC = () => {
                       setSelectedUser(null);
                     }}
                     variant="danger"
+                    title={DELETE_USER_TITLE}
+                    confirmNotice={deleteConfirmNotice(selectedUser)}
                   >
                     Delete User
                   </DeleteButton>

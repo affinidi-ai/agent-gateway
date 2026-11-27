@@ -2895,6 +2895,8 @@ mod tests {
             updated_at: chrono::Utc::now(),
             last_logged_in: None,
             saml_id: None,
+            oidc: None,
+            deleted_at: None,
         };
         std::fs::write(users_dir.join(format!("{user_id}.json")), serde_json::to_string(&user).unwrap()).unwrap();
         let storage = PasskeyStorage::new(

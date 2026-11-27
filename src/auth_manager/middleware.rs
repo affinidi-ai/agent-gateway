@@ -30,6 +30,8 @@ const CONSENT_PENDING_PATHS: &[&str] = &[
     "/api/auth/logout",
     "/saml/logout",
     "/api/saml/logout",
+    "/oidc/logout",
+    "/api/oidc/logout",
 ];
 
 /// Paths where a personal access token only inspects itself, so its resource-scope
@@ -39,6 +41,7 @@ const TOKEN_SELF_INSPECTION_PATHS: &[&str] = &["/v1/token-info", "/api/v1/token-
 const PUBLIC_PATH_PREFIXES: &[&str] = &[
     "/auth/",                    // Passkey auth flows
     "/saml/",                    // SAML auth flows
+    "/oidc/",                    // OpenID Connect sign-in flows
     "/internal/test-support/",   // Internal UI-test auth bootstrap
     "/v1/auth/",                 // Auth mode endpoint
     "/v1/alive",                 // Liveness check
@@ -245,14 +248,10 @@ pub async fn require_session_auth(
                     .insert(storage);
             }
             let mut response = next.run(request).await;
-            if let Ok(value) = session_cookie::build_session_cookie(
-                &session_token,
-                state
-                    .session_manager
-                    .timeout_seconds(),
-            )
-            .parse()
-            {
+            let max_age = state
+                .session_manager
+                .cookie_max_age_seconds(&session, chrono::Utc::now());
+            if let Ok(value) = session_cookie::build_session_cookie(&session_token, max_age).parse() {
                 response
                     .headers_mut()
                     .append(SET_COOKIE, value);
@@ -876,6 +875,11 @@ mod tests {
             .route("/saml/login", get(ok_handler))
             .route("/saml/acs", get(ok_handler))
             .route("/saml/metadata", get(ok_handler))
+            .route("/oidc/login", get(ok_handler))
+            .route("/oidc/callback", get(ok_handler))
+            .route("/oidc/initiate", get(ok_handler))
+            .route("/oidc/backchannel-logout", get(ok_handler))
+            .route("/oidc/logout", get(ok_handler))
             .route("/v1/auth/mode", get(ok_handler))
             .route("/v1/terms/provider-health", get(ok_handler))
             .route("/v1/health", get(ok_handler))
@@ -994,6 +998,8 @@ mod tests {
                 updated_at: now,
                 last_logged_in: None,
                 saml_id: None,
+                oidc: None,
+                deleted_at: None,
             })
             .await
             .unwrap();
@@ -1147,6 +1153,11 @@ mod tests {
             "/saml/login",
             "/saml/acs",
             "/saml/metadata",
+            "/oidc/login",
+            "/oidc/callback",
+            "/oidc/initiate",
+            "/oidc/backchannel-logout",
+            "/oidc/logout",
             "/v1/auth/mode",
             "/v1/terms/provider-health",
             "/v1/health",
@@ -1214,6 +1225,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 401, "a cookie without the __Host- prefix is not a session");
+    }
+
+    /// The `Max-Age` of the session cookie the gate sends back on a request carrying `token`.
+    async fn refreshed_cookie_max_age(
+        app: &Router,
+        token: &str,
+    ) -> i64 {
+        let req = axum::http::Request::builder()
+            .uri("/v1/settings")
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        resp.headers()
+            .get(SET_COOKIE)
+            .expect("the gate re-sends the session cookie")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .find_map(|attribute| {
+                attribute
+                    .trim()
+                    .strip_prefix("Max-Age=")
+            })
+            .expect("the session cookie carries a Max-Age")
+            .parse()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn refreshed_session_cookie_never_outlives_the_session_lifetime() {
+        let dir = tempdir().unwrap();
+        let sessions = Arc::new(
+            SessionManager::with_storage(20, 60, dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let now = chrono::Utc::now();
+        sessions
+            .store_for_test(&crate::auth::session::Session {
+                token_hash: crate::storage::filesystem::token_storage_id("near-the-end"),
+                username: "alice".to_string(),
+                user_id: "user-1".to_string(),
+                created_at: now - chrono::Duration::minutes(50),
+                expires_at: now + chrono::Duration::minutes(5),
+                terms_gate: TermsSessionGate::AllowedAtLogin,
+                oidc: None,
+            })
+            .await;
+
+        let max_age = refreshed_cookie_max_age(&test_app(sessions), "near-the-end").await;
+
+        assert!((1..=600).contains(&max_age), "Max-Age {max_age} must end by the lifetime end");
+    }
+
+    #[tokio::test]
+    async fn refreshed_session_cookie_lasts_the_timeout_inside_the_lifetime() {
+        let sessions = Arc::new(SessionManager::new());
+        let token = sessions
+            .create_session("alice".into(), "user-1".into())
+            .await;
+
+        let max_age = refreshed_cookie_max_age(&test_app(sessions), &token).await;
+
+        assert!((1190..=1200).contains(&max_age), "Max-Age {max_age} must be the 20-minute timeout");
     }
 
     // ── Session token via Authorization Bearer header should work ──
@@ -1296,6 +1377,8 @@ mod tests {
             updated_at: now,
             last_logged_in: None,
             saml_id: None,
+            oidc: None,
+            deleted_at: None,
         }
     }
 
@@ -1478,6 +1561,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::auth_manager::pat::PatAuthenticator for ScopedPat {
+        async fn revoke_for_user(
+            &self,
+            _user_id: &str,
+        ) -> std::io::Result<usize> {
+            Ok(0)
+        }
+
         async fn authenticate(
             &self,
             token: &str,
@@ -1552,6 +1642,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::auth_manager::pat::PatAuthenticator for PatternPat {
+        async fn revoke_for_user(
+            &self,
+            _user_id: &str,
+        ) -> std::io::Result<usize> {
+            Ok(0)
+        }
+
         async fn authenticate(
             &self,
             token: &str,
@@ -1664,7 +1761,7 @@ mod tests {
                 require_session_auth,
             ));
         let session = sessions
-            .create_session_with_terms_gate("alice".into(), "user-1".into(), TermsSessionGate::ConsentPending)
+            .create_session_with_terms_gate("alice".into(), "user-1".into(), TermsSessionGate::ConsentPending, None)
             .await;
 
         for (bearer, actor) in [
@@ -1700,6 +1797,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::auth_manager::pat::PatAuthenticator for TermsTestPat {
+        async fn revoke_for_user(
+            &self,
+            _user_id: &str,
+        ) -> std::io::Result<usize> {
+            Ok(0)
+        }
+
         async fn authenticate(
             &self,
             token: &str,
@@ -1735,6 +1839,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::auth_manager::pat::PatAuthenticator for AccessTokenTestPat {
+        async fn revoke_for_user(
+            &self,
+            _user_id: &str,
+        ) -> std::io::Result<usize> {
+            Ok(0)
+        }
+
         async fn authenticate(
             &self,
             token: &str,
@@ -1755,6 +1866,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::auth_manager::pat::PatAuthenticator for SettingsViewPat {
+        async fn revoke_for_user(
+            &self,
+            _user_id: &str,
+        ) -> std::io::Result<usize> {
+            Ok(0)
+        }
+
         async fn authenticate(
             &self,
             token: &str,
@@ -2500,7 +2618,7 @@ mod tests {
             (TermsSessionGate::ConsentPending, 503),
         ] {
             let token = sessions
-                .create_session_with_terms_gate("alice".into(), "user-1".into(), gate)
+                .create_session_with_terms_gate("alice".into(), "user-1".into(), gate, None)
                 .await;
             assert_eq!(get_status_with_bearer(&app, "/v1/settings", &token).await, expected);
             for path in ["/auth/login/start", "/saml/acs", "/v1/terms/status"] {
@@ -2608,7 +2726,12 @@ mod tests {
         );
         let sessions = Arc::new(crate::auth::session::SessionManager::new());
         let token = sessions
-            .create_session_with_terms_gate("alice".to_string(), "user-1".to_string(), TermsSessionGate::ConsentPending)
+            .create_session_with_terms_gate(
+                "alice".to_string(),
+                "user-1".to_string(),
+                TermsSessionGate::ConsentPending,
+                None,
+            )
             .await;
         let app = Router::new()
             .route("/v1/settings", get(ok_handler))
@@ -2616,6 +2739,7 @@ mod tests {
             .route("/auth/login/start", get(ok_handler))
             .route("/auth/check", get(ok_handler))
             .route("/auth/logout", get(ok_handler))
+            .route("/oidc/logout", get(ok_handler))
             .layer(axum::middleware::from_fn_with_state(
                 AuthGuardState::new(sessions, None, manager),
                 require_session_auth,
@@ -2643,6 +2767,7 @@ mod tests {
         assert_eq!(get_status_with_bearer(&app, "/v1/terms/status", &token).await, 200);
         assert_eq!(get_status_with_bearer(&app, "/auth/check", &token).await, 200);
         assert_eq!(get_status_with_bearer(&app, "/auth/logout", &token).await, 200);
+        assert_eq!(get_status_with_bearer(&app, "/oidc/logout", &token).await, 200);
         assert_eq!(get_status_with_bearer(&app, "/auth/login/start", &token).await, 200);
     }
 }

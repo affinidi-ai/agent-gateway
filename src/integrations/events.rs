@@ -362,9 +362,21 @@ const EVENTS: &[EventSpec] = &[
     ),
     spec(GATEWAY, "gateway.accessed", "Gateway Accessed", "A gateway was viewed", &[GATEWAY_VARIABLES]),
     spec(USER, "user.created", "User Registered", "A user completed registration", &[USER_VARIABLES]),
-    spec(USER, "user.approved", "User Approved", "An administrator approved a pending user", &[USER_VARIABLES]),
+    spec(
+        USER,
+        "user.approved",
+        "User Approved",
+        "An administrator approved a pending user, or a deleted user's kept record again",
+        &[USER_VARIABLES],
+    ),
     spec(USER, "user.updated", "User Updated", "A user's role, status or profile was changed", &[USER_VARIABLES]),
-    spec(USER, "user.deleted", "User Deleted", "A user was deleted", &[USER_VARIABLES]),
+    spec(
+        USER,
+        "user.deleted",
+        "User Deleted",
+        "A user was deleted. One who signs in through OpenID Connect or SAML is kept as a disabled record",
+        &[USER_VARIABLES],
+    ),
     spec(USER, "user.login", "User Login", "A user logged in", &[USER_VARIABLES, &["LOGIN_METHOD"]]),
     spec(
         USER,

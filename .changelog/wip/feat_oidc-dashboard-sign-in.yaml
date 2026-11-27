@@ -1,0 +1,154 @@
+branch: feat/oidc-dashboard-sign-in
+changes:
+  added:
+    - timestamp: '2026-11-27T08:00:00Z'
+      title: ⭐ Sign in to the dashboard with any OpenID Connect provider
+      description: >-
+        A new sign-in mode, auth_mode = "oidc", signs human users in to the dashboard at one
+        OpenID provider configured in oidc.json, using the authorization code flow with PKCE, a
+        nonce and a browser-binding cookie. The ID token is fully verified, its signature and nbf
+        included, against the provider's published keys. Users are created at their first
+        sign-in, approved and never the primary administrator, and identified by the provider
+        account (issuer and sub), never by email; the username is the first of the username
+        claim, the email and sub that no other user holds and that is no user's id, and an
+        account for which none is free is refused with a 403 page. role_mapping maps a string or array claim
+        to a gateway role at every sign-in, raising or lowering it and ending the user's other
+        sessions when it changes, and refuses unmapped accounts by default. required_claims
+        binds the deployment to one tenant at the provider and is required unless
+        allow_any_account is set; values may be strings, booleans or regex: patterns. The client
+        secret is a secret reference, never written into the file, and a field oidc.json does
+        not define stops startup. The provider's endpoints are reached under the Configured
+        egress policy, discovery is fetched once and cached, and a provider that cannot be
+        reached neither stops nor delays startup. Sign-in is always throttled per client, with a
+        lockout after repeated refused codes, and /oidc/login answers a request the browser says
+        is not a page it opens (Sec-Fetch-Dest other than document), such as an image another
+        site embeds, with a 400 page before it counts. Sign-ins raise the user.login and user.login_failed
+        events with login method oidc, and the login page shows one "Sign in with {label}"
+        button. A gateway in OIDC mode refuses dashboard sessions that did not come from a
+        sign-in at its provider, such as passkey or SAML sessions from before the switch.
+    - timestamp: '2026-11-27T11:45:00Z'
+      title: Start a dashboard sign-in from the OpenID provider's sign-in link
+      description: >-
+        GET and POST /oidc/initiate (third-party-initiated login) let an OpenID provider's portal
+        link people straight into the dashboard. The link must name the configured issuer
+        exactly as iss, or it gets a readable 400 page; a login_hint of at most 256 characters
+        without control characters is passed on to the provider; and target_link_uri opens a page
+        only when it is on the dashboard's own origin and is a return target a sign-in may send
+        the browser to, otherwise the dashboard root. Every link starts a fresh sign-in under the
+        same per-client throttle as the login page, and the posted form never reads or changes a
+        session. Register https://<gateway>/api/oidc/initiate as the provider's
+        initiate_login_uri.
+    - timestamp: '2026-11-27T11:45:00Z'
+      title: End dashboard sessions when someone signs out at the OpenID provider
+      description: >-
+        POST /oidc/backchannel-logout accepts the provider's signed logout tokens (OpenID Connect
+        Back-Channel Logout 1.0) and ends the dashboard sessions of that provider session, or every
+        session of the account for a token with only sub; a token with sid and sub also ends that
+        account's sessions whose ID token had no sid. Each session now records the provider
+        sign-in it came from. A token is checked like an ID token, must carry exp, be typed
+        logout+jwt when typed, carry the back-channel logout event and no nonce, so an ID token
+        is never accepted in its place, and is accepted once. The route answers 200 also when
+        nothing matched; 400 invalid_request for a token that does not verify; 400 logout_failed
+        when a session could not be ended, which leaves the token usable for a retry; and 503
+        while the provider or its keys cannot be reached (keys that cannot be fetched have the
+        discovery document fetched again at the next logout), while the token names a key published
+        since the keys were last fetched for an unknown key id (within a minute), and on a
+        Standby instance or one that is not yet ready. Sessions are ended even when the provider
+        drops the connection first. It has a 16 KiB body limit, spends no sign-in budget, and is
+        not served when logout.backchannel in oidc.json is false. ID tokens with a sid must carry
+        it as a string of 1 to 255 characters.
+    - timestamp: '2026-11-27T11:45:00Z'
+      title: Sign out of the OpenID provider too when signing out of the dashboard
+      description: >-
+        In OIDC mode POST /auth/logout and POST /oidc/logout end the dashboard session, without
+        extending it first and without a request in flight saving it back, and, for a session
+        from a sign-in at the configured issuer while logout.rp_initiated in oidc.json is on and
+        the provider publishes an end_session_endpoint, answer with the provider's sign-out
+        address (OpenID Connect RP-Initiated Logout 1.0), carrying the session's ID token, which
+        the session keeps until it ends, as id_token_hint, the client id,
+        logout.post_logout_redirect_uri when it is set (on the dashboard's origin) and a random
+        state. The dashboard's Sign Out sends the browser there, while a session that times out
+        never does, and the login page says "You have signed out." when the provider sends the
+        browser back with signed_out=1. oidc.json now reads a logout block (backchannel,
+        rp_initiated, post_logout_redirect_uri) and refuses unknown fields in it.
+  changed:
+    - timestamp: '2026-11-27T08:00:00Z'
+      title: Return the sign-in label from the auth mode endpoint
+      description: >-
+        GET /v1/auth/mode now returns a label field beside mode: the provider name the sign-in
+        button shows in OIDC mode, and null in passkey and SAML modes. Clients that read only
+        mode are unaffected.
+    - timestamp: '2026-11-27T14:00:00Z'
+      title: Report whether deleting a user removed or kept the record
+      description: >-
+        DELETE /v1/users/{user_id} now answers with an outcome of removed or disabled, so a
+        client can tell that an OpenID Connect or SAML user's record was kept; a repeat delete
+        of a kept record answers disabled. The user API returns sign_in_method (passkey, oidc or
+        saml) for every user, and the provider account (oidc or saml_id) on kept records only.
+        In the dashboard the delete confirm step on the Users list and the Edit User page shows
+        a visible notice for an OpenID Connect or SAML user that names the method, also on touch
+        devices, and the success messages, the Notifications reject message included, follow
+        the outcome. A kept record shows its provider account. Approving a kept record again
+        raises user.approved, and user.deleted fires only for the delete that changed the
+        record.
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-27T11:45:00Z'
+      title: Fetch a JWT key set again for an unknown key id at most once a minute
+      description: >-
+        A token naming a kid that the cached keys lack, a key server answering max-age=0, or a
+        key server that keeps failing used to make the gateway fetch the key set again on every
+        request, so unauthenticated callers could make every request reach the key server. Every
+        check against a remote key set (surface JWT bearer callers, token exchange, consent
+        confirmation and the OIDC dashboard sign-in and back-channel logout) now fetches it again
+        for an unknown kid at most once a minute for each key set, counted from the last such
+        fetch, so a rotated key is still found by the first token that names it; caches keys for
+        at least a minute whatever Cache-Control says; and does not try a failed fetch again for
+        a minute, answering the same failure meanwhile. Keys that expired and could not be
+        fetched again are still used for that minute, once, so one failed fetch at expiry does
+        not refuse every caller. A token naming a key published within the minute is refused as
+        an invalid credential, or answered as keys unavailable by consent confirmation and the
+        OIDC sign-in and back-channel logout, until it has passed. The key id of such a token is
+        logged escaped. Requests that find a key set missing or expired at the same time now
+        share one fetch of it.
+    - timestamp: '2026-11-27T14:00:00Z'
+      title: ⭐ Keep a deleted SAML user out and refuse SAML users who are not approved
+      description: >-
+        Deleting a user who signs in with SAML used to remove the record, so their next
+        sign-in created a new approved user with the mapped role, and a SAML user who was not
+        approved was still handed a session. Delete now clears the user's profile and passkeys
+        and keeps a disabled record under their SAML user ID, as it does for an OpenID Connect
+        user under their provider account, so the next sign-in is refused with a 403 page
+        until an administrator approves the record again; that record does not count toward
+        the users limit, and approving it is checked against the limit. A SAML user whose
+        asserted username another user holds, or is a user's id, gets their SAML user ID as
+        username instead.
+        Every delete now also revokes the user's access tokens, including those whose secret
+        they created or rotated for others, ends their sessions and removes their uploaded
+        avatar files. Administrator updates and deletes now write by user id under the same
+        lock as sign-ins, so neither overwrites the other, a passkey sign-in or avatar upload
+        overtaken by a delete no longer brings the user back, and a profile update overtaken by
+        a delete no longer writes profile data onto the kept record. Upgrade note: SAML users
+        deleted before this release were created again, approved, at their next sign-in, and
+        personal access tokens they created were not revoked. Delete such users again and
+        review their access tokens.
+    - timestamp: '2026-11-27T16:00:00Z'
+      title: End dashboard sessions 12 hours after sign-in, however active they stay
+      description: >-
+        Dashboard sessions now end session_max_lifetime_minutes in config.toml after sign-in
+        (default 720, at most 1440), however often they are used, for passkey, SAML and OIDC
+        sign-in alike, so an open dashboard signs in again at least every 12 hours by default.
+        Session checks, the startup sweep and the periodic cleanup all apply the limit; a refresh
+        never extends a session past it, the refreshed session cookie's Max-Age is the time left
+        on the session, and the sign-in cookie lasts the smaller of session_timeout_minutes and the
+        lifetime. Sessions stored before the upgrade are held to it from their sign-in time, so
+        those older than the lifetime end at the first start. A value of 0 or above 1440 stops
+        startup with an error.
+  breaking:
+    - timestamp: '2026-11-27T14:00:00Z'
+      title: Answer a user delete with 200 and its outcome instead of 204
+      description: >-
+        DELETE /v1/users/{user_id} now answers 200 with the JSON body {"outcome": "removed"} or
+        {"outcome": "disabled"} instead of 204 No Content. A client that checks for exactly 204
+        must accept any 2xx status.

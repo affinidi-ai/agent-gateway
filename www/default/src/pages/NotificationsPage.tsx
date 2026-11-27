@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { apiClient } from '../api';
 import { formatDateTime } from '../utils/stringUtils';
 import { DeleteButton } from '../components/shared/DeleteButton';
+import { type DeleteOutcome, rejectSuccessMessage } from '../utils/userDelete';
 import { usePermissions } from '../context/PermissionsContext';
 
 interface Notification {
@@ -122,8 +123,8 @@ const NotificationsPage: React.FC = () => {
 
     try {
       setActionInProgress(true);
-      await apiClient.delete(`/users/${userId}`);
-      setSuccess(`User '${notification.metadata?.username || userId}' rejected and deleted`);
+      const { data } = await apiClient.delete<{ outcome?: DeleteOutcome }>(`/users/${userId}`);
+      setSuccess(rejectSuccessMessage(data?.outcome, notification.metadata?.username || userId));
       setTimeout(() => setSuccess(null), 3000);
       await handleMarkAsRead(notification.id);
     } catch (error: any) {

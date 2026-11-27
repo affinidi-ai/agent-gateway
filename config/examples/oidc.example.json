@@ -1,0 +1,33 @@
+{
+  "label": "Example Directory",
+  "issuer": "https://id.example.com",
+  "client_id": "agent-gateway",
+  "client_secret": "env://AG_OIDC_CLIENT_SECRET",
+  "token_endpoint_auth_method": "client_secret_basic",
+  "redirect_uri": "https://agent-gateway-1.example.com/api/oidc/callback",
+  "scopes": ["openid", "profile", "email"],
+  "id_token_signing_algs": ["ES256"],
+  "claims": {
+    "username": "preferred_username",
+    "email": "email",
+    "first_name": "given_name",
+    "last_name": "family_name"
+  },
+  "required_claims": {
+    "org_id": ["<your-org-id>"]
+  },
+  "role_mapping": {
+    "claim": "roles",
+    "values": {
+      "<op-admin-role>": "administrator",
+      "<op-power-user-role>": "poweruser",
+      "<op-user-role>": "user"
+    },
+    "unmapped": "deny"
+  },
+  "logout": {
+    "backchannel": true,
+    "rp_initiated": true,
+    "post_logout_redirect_uri": "https://agent-gateway-1.example.com/?signed_out=1"
+  }
+}

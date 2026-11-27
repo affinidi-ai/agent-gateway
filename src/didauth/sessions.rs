@@ -680,6 +680,7 @@ mod tests {
             created_at: now,
             expires_at: now + chrono::Duration::minutes(20),
             terms_gate: crate::auth::session::TermsSessionGate::AllowedAtLogin,
+            oidc: None,
         };
         std::fs::write(&dashboard_file, serde_json::to_vec(&dashboard_session).unwrap()).unwrap();
         let logs = FormattedLogs::capture();
@@ -687,9 +688,13 @@ mod tests {
         let store = DidAuthSessionStore::with_storage(sessions_path.to_path_buf())
             .await
             .unwrap();
-        let dashboard_sessions = crate::auth::SessionManager::with_storage(20, sessions_path.to_path_buf())
-            .await
-            .unwrap();
+        let dashboard_sessions = crate::auth::SessionManager::with_storage(
+            20,
+            crate::auth::session::DEFAULT_SESSION_LIFETIME_MINUTES,
+            sessions_path.to_path_buf(),
+        )
+        .await
+        .unwrap();
 
         assert!(
             store

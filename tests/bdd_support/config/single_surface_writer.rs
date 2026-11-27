@@ -735,6 +735,20 @@ fn write_single_surface_config_inner(
     if surface_config.signs_in_with_saml {
         crate::bdd_support::config::sign_in::sign_in_with_saml(base_dir, gateway_port, &surface_config.saml_settings);
     }
+    if let Some(limit) = surface_config.human_user_limit {
+        crate::bdd_support::config::sign_in::limit_human_users(base_dir, limit);
+    }
+    if let Some(minutes) = surface_config.session_max_lifetime_minutes {
+        crate::bdd_support::config::sign_in::limit_session_lifetime(base_dir, minutes);
+    }
+    if let Some(issuer) = &surface_config.signs_in_with_oidc {
+        crate::bdd_support::config::sign_in::sign_in_with_oidc(
+            base_dir,
+            gateway_port,
+            issuer,
+            &surface_config.oidc_settings,
+        );
+    }
     if !surface_config
         .rbac_permissions
         .is_empty()

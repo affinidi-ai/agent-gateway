@@ -223,6 +223,17 @@ with the gateway's own key; the connect wizard's Complete step points to **Setti
 Gateway signing** for changing the default later. See _Key Management tab_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#key-management-tab).
 
+The login page shows, in OIDC mode, one button reading "Sign in with {label}" (the provider name
+from `GET /api/v1/auth/mode`) that starts the sign-in at `/api/oidc/login`, as the SAML button does
+at `/api/saml/login`; see _Login page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#login-page).
+
+An explicit sign-out (the topbar's **Sign Out**, the Terms page's **Sign out**) goes through
+`App` once: it takes the dashboard down first, then follows the `end_session_url` an OIDC
+sign-out answers with, when it is an `http(s)` address, so the person is signed out at the
+provider too; a session that times out never does. The login page shows only "You have signed
+out." when reached with `?signed_out=1` and removes the marker and the provider's `state` from
+the address; see _Login page_ and _Signing out_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#signing-out).
+
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 
 The endpoint editor picks a Kafka endpoint's security protocol (`plaintext`, `ssl`,
@@ -263,6 +274,16 @@ built on the shared `ConfirmPopover` with focus on **Cancel**, and deletes only 
 **Delete**; **Cancel** deletes nothing. The delete button needs `surfaces.delete`, and no page
 shortcut (Cmd/Ctrl+S, the canvas keys) acts while the popover is open. See _Surface delete_ and
 _Confirm popover_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-delete).
+
+Deleting a user keeps an OIDC or SAML user's record disabled under their provider account, and
+`DELETE /v1/users/{user_id}` answers `{"outcome": "removed" | "disabled"}`. The shared
+`DeleteButton` shows a visible `confirmNotice` during its confirm step (a `role="status"` region
+that stays mounted), which the Users list and Edit User page pass only for a user whose
+`sign_in_method` is `oidc` or `saml`, naming that method; success messages follow the outcome
+and name the method too, and all of this wording lives in
+`utils/userDelete.ts`. See _User delete_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#user-delete) and
+[`docs/CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#deleting-an-oidc-or-saml-user).
 
 The credential provider editor shows a **Consent confirmation** switch and its login client
 (ID and secret, both picked from the secrets store), endpoints, strategy (only the provider's

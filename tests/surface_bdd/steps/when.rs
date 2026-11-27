@@ -483,6 +483,12 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     if let Some(files) = &jwks_files {
         egress_allowlist.push(files.issuer.clone());
     }
+    if let Some(issuer) = &world
+        .surface_config
+        .signs_in_with_oidc
+    {
+        egress_allowlist.push(issuer.clone());
+    }
     if !egress_allowlist.is_empty() {
         gateway_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), egress_allowlist.join(","));
     }

@@ -13,6 +13,7 @@ use crate::auth::types::{UserRole, UserStatus};
 pub enum LoginMethod {
     Passkey,
     Saml,
+    Oidc,
 }
 
 impl LoginMethod {
@@ -20,6 +21,7 @@ impl LoginMethod {
         match self {
             Self::Passkey => "passkey",
             Self::Saml => "saml",
+            Self::Oidc => "oidc",
         }
     }
 }
@@ -34,6 +36,8 @@ pub enum LoginFailure<'a> {
     SamlRejected,
     RoleNotMapped,
     AmbiguousAttribute,
+    OidcRejected,
+    ClaimNotAllowed,
 }
 
 impl<'a> LoginFailure<'a> {
@@ -55,13 +59,20 @@ impl<'a> LoginFailure<'a> {
             Self::SamlRejected => "saml_rejected",
             Self::RoleNotMapped => "role_not_mapped",
             Self::AmbiguousAttribute => "ambiguous_attribute",
+            Self::OidcRejected => "oidc_rejected",
+            Self::ClaimNotAllowed => "claim_not_allowed",
         }
     }
 
     fn account(&self) -> Option<&'a UserData> {
         match self {
             Self::InvalidCredential(user) | Self::NotApproved(user) => Some(user),
-            Self::UnknownUser | Self::SamlRejected | Self::RoleNotMapped | Self::AmbiguousAttribute => None,
+            Self::UnknownUser
+            | Self::SamlRejected
+            | Self::RoleNotMapped
+            | Self::AmbiguousAttribute
+            | Self::OidcRejected
+            | Self::ClaimNotAllowed => None,
         }
     }
 }
@@ -214,6 +225,8 @@ mod tests {
             updated_at: now,
             last_logged_in: Some(now),
             saml_id: Some("saml-subject-123".to_string()),
+            oidc: None,
+            deleted_at: None,
         }
     }
 
@@ -341,6 +354,9 @@ mod tests {
         for (method, failure, method_name, reason) in [
             (LoginMethod::Passkey, LoginFailure::UnknownUser, "passkey", "unknown_user"),
             (LoginMethod::Saml, LoginFailure::SamlRejected, "saml", "saml_rejected"),
+            (LoginMethod::Oidc, LoginFailure::OidcRejected, "oidc", "oidc_rejected"),
+            (LoginMethod::Oidc, LoginFailure::ClaimNotAllowed, "oidc", "claim_not_allowed"),
+            (LoginMethod::Oidc, LoginFailure::RoleNotMapped, "oidc", "role_not_mapped"),
         ] {
             let values = login_failed_values(method, failure);
 
