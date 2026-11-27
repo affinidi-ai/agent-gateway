@@ -453,24 +453,13 @@ static CATALOG_PARSES: std::sync::LazyLock<std::sync::Mutex<HashMap<String, usiz
 /// parsed again. The parse runs on a blocking thread, and requests that find the catalogs
 /// unparsed wait for it on the proxy's own slot, so its spec is parsed once between them while
 /// other proxies' lookups go on. A spec or base URL that cannot be parsed, or a parse that
-/// panicked or was cancelled, is an error and leaves the slot empty, so it is not cached.
+/// panicked or was cancelled, is an error and is not cached: the lookup removes its empty slot
+/// ([`EvictUnfilled`]), so a proxy that was never stored leaves nothing behind.
 async fn parsed_catalogs(proxy: &McpProxy) -> Result<RegisteredCatalogs, String> {
-    let inputs = CatalogInputs::of(proxy);
-    let slot = {
-        let mut slots = PARSED_CATALOGS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match slots.get(&proxy.id) {
-            Some(slot) if slot.inputs == inputs => slot.clone(),
-            _ => {
-                let slot = Arc::new(CatalogSlot {
-                    inputs,
-                    catalogs: tokio::sync::OnceCell::new(),
-                });
-                slots.insert(proxy.id.clone(), slot.clone());
-                slot
-            }
-        }
+    let slot = catalog_slot(proxy);
+    let _unfilled = EvictUnfilled {
+        proxy_id: &proxy.id,
+        slot: &slot,
     };
     slot.catalogs
         .get_or_try_init(|| {
@@ -483,6 +472,62 @@ async fn parsed_catalogs(proxy: &McpProxy) -> Result<RegisteredCatalogs, String>
         })
         .await
         .cloned()
+}
+
+/// The slot `proxy`'s catalogs are kept in: the one in [`PARSED_CATALOGS`] while it was made
+/// for the proxy's current [`CatalogInputs`], else a new empty one that replaces it.
+fn catalog_slot(proxy: &McpProxy) -> Arc<CatalogSlot> {
+    let inputs = CatalogInputs::of(proxy);
+    let mut slots = PARSED_CATALOGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match slots.get(&proxy.id) {
+        Some(slot) if slot.inputs == inputs => slot.clone(),
+        _ => {
+            let slot = Arc::new(CatalogSlot {
+                inputs,
+                catalogs: tokio::sync::OnceCell::new(),
+            });
+            slots.insert(proxy.id.clone(), slot.clone());
+            slot
+        }
+    }
+}
+
+/// Removes `proxy_id`'s entry from [`PARSED_CATALOGS`] while it still holds `slot`, so a newer
+/// slot written for the same id meanwhile is kept.
+fn evict_if_current(
+    proxy_id: &str,
+    slot: &Arc<CatalogSlot>,
+) {
+    let mut slots = PARSED_CATALOGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slots
+        .get(proxy_id)
+        .is_some_and(|current| Arc::ptr_eq(current, slot))
+    {
+        slots.remove(proxy_id);
+    }
+}
+
+/// Removes its slot from [`PARSED_CATALOGS`] when dropped while the slot is still empty: the
+/// lookup that held it failed or was cancelled before any parse filled it.
+struct EvictUnfilled<'lookup> {
+    proxy_id: &'lookup str,
+    slot: &'lookup Arc<CatalogSlot>,
+}
+
+impl Drop for EvictUnfilled<'_> {
+    fn drop(&mut self) {
+        if !self
+            .slot
+            .catalogs
+            .initialized()
+        {
+            evict_if_current(self.proxy_id, self.slot);
+        }
+    }
 }
 
 /// Parses `proxy`'s spec into its catalogs: one for both revisions, or, when the spec's schemas
@@ -1401,21 +1446,13 @@ pub async fn create_mcp_proxy<S: McpProxyStore>(
         .into_iter()
         .collect();
 
-    // Store the proxy
-    store
-        .create(&proxy)
-        .await
-        .map_err(|e| {
-            // If storage fails, clean up the server
-            let manager_clone = manager.clone();
-            let proxy_id = proxy.id.clone();
-            tokio::spawn(async move {
-                manager_clone
-                    .remove_server(&proxy_id)
-                    .await;
-            });
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+    // A proxy that cannot be stored keeps no server and no parsed catalogs.
+    if let Err(error) = store.create(&proxy).await {
+        manager
+            .remove_server(&proxy.id)
+            .await;
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
+    }
 
     // Trigger MCP proxy created event
     if let Some(ref notif_store) = notification_store {
@@ -3840,6 +3877,126 @@ mod tests {
                 "lookup {lookup}"
             );
             assert_eq!(parses(), lookup, "a failed parse was cached");
+        }
+    }
+
+    fn holds_catalog_slot(proxy_id: &str) -> bool {
+        super::PARSED_CATALOGS
+            .lock()
+            .unwrap()
+            .contains_key(proxy_id)
+    }
+
+    /// A lookup whose spec cannot be parsed leaves no catalog slot behind for the proxy.
+    #[tokio::test]
+    async fn a_failed_lookup_leaves_no_catalog_slot() {
+        let proxy = McpProxy::new(
+            "Broken".into(),
+            String::new(),
+            "http://127.0.0.1:9".into(),
+            "openapi: [not, a, spec".into(),
+            "/mcp".into(),
+            format!("/broken-slot-{}", uuid::Uuid::new_v4()),
+        );
+        assert!(
+            super::parsed_catalogs(&proxy)
+                .await
+                .is_err()
+        );
+        assert!(!holds_catalog_slot(&proxy.id), "a failed parse left its slot");
+    }
+
+    /// A failed lookup removes only the slot it parsed into: a newer slot written meanwhile
+    /// for the same proxy id stays.
+    #[tokio::test]
+    async fn a_failed_lookup_never_evicts_a_newer_slot() {
+        let mut proxy = McpProxy::new(
+            "Items".into(),
+            String::new(),
+            "http://127.0.0.1:9".into(),
+            "openapi: [not, a, spec".into(),
+            "/mcp".into(),
+            format!("/newer-slot-{}", uuid::Uuid::new_v4()),
+        );
+        let failed = super::catalog_slot(&proxy);
+        proxy.openapi_spec = SPEC.to_string();
+        super::parsed_catalogs(&proxy)
+            .await
+            .expect("the newer spec parses");
+        let newer = super::catalog_slot(&proxy);
+        assert!(!Arc::ptr_eq(&failed, &newer));
+        super::evict_if_current(&proxy.id, &failed);
+        let current = super::PARSED_CATALOGS
+            .lock()
+            .unwrap()
+            .get(&proxy.id)
+            .cloned()
+            .expect("the newer slot stays");
+        assert!(Arc::ptr_eq(&current, &newer), "the failed lookup evicted a newer slot");
+    }
+
+    /// A create the gateway refuses, for a spec that cannot be parsed or because the proxy
+    /// cannot be stored, leaves no catalog slot for the proxy id it was given.
+    #[tokio::test]
+    async fn a_refused_mcp_proxy_create_leaves_no_catalog_slot() {
+        let invalid_id = format!("invalid-{}", uuid::Uuid::new_v4());
+        let mut body = create_body(Some(&invalid_id));
+        body["openapi_spec"] = serde_json::json!("openapi: [not, a, spec");
+        let refused = create(&store_with(Vec::new()), body, None, None)
+            .await
+            .expect_err("an invalid spec is refused");
+        assert_eq!(refused.0, StatusCode::BAD_REQUEST, "{refused:?}");
+        assert!(!holds_catalog_slot(&invalid_id), "a refused create left its slot");
+
+        let unstored_id = format!("unstored-{}", uuid::Uuid::new_v4());
+        let refused = super::create_mcp_proxy(
+            Extension(Arc::new(RefusingStore)),
+            Extension(Arc::new(super::McpServerManager::new())),
+            Extension(None),
+            Extension(no_resource_owners()),
+            None,
+            None,
+            None,
+            Json(serde_json::from_value(create_body(Some(&unstored_id))).unwrap()),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("a proxy that cannot be stored is refused");
+        assert_eq!(refused.0, StatusCode::INTERNAL_SERVER_ERROR, "{refused:?}");
+        assert!(!holds_catalog_slot(&unstored_id), "a create that could not be stored left its slot");
+    }
+
+    /// A store that holds nothing and refuses every create.
+    struct RefusingStore;
+
+    #[async_trait::async_trait]
+    impl crate::mcp_proxies::McpProxyStore for RefusingStore {
+        async fn create(
+            &self,
+            _proxy: &McpProxy,
+        ) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("the store refuses writes"))
+        }
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<Option<McpProxy>> {
+            Ok(None)
+        }
+        async fn list_all(&self) -> anyhow::Result<Vec<McpProxy>> {
+            Ok(Vec::new())
+        }
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update(
+            &self,
+            _proxy: &McpProxy,
+        ) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 
