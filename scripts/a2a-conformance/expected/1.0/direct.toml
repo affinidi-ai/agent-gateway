@@ -1,7 +1,8 @@
 # Failures of the suite's own test agent with no gateway in front of it
 # (target "direct"). They are the agent's, not the gateway's: a gateway target
-# that fails the same test is not scored for it. The run fails on a failure
-# not listed here and on a listed test that no longer fails.
+# that fails the same test with the same message from the suite is not scored
+# for it. The run fails on a failure not listed here and on a listed test that
+# no longer fails.
 #
 # passed is how many tests pass. A different count fails the run: fewer means
 # tests stopped running or started being skipped, which a list of failures

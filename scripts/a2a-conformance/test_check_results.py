@@ -24,6 +24,7 @@ JUNIT = """<testsuites><testsuite>
   <skipped type="pytest.xfail" message="SHOULD not met"/></testcase>
 </testsuite></testsuites>"""
 NO_PROBES = '[]'
+BOTH_WAYS = '(fail both ways, for another reason)'
 SLASH_PROBE = [{'test': 'harness.entry_point::accepts_trailing_slash', 'outcome': 'fail', 'message': 'HTTP 404'}]
 
 
@@ -202,6 +203,68 @@ class GatewayScoring(unittest.TestCase):
         self.assertEqual([(item.test, item.direct, item.result.outcome) for item in unlisted],
                          [('b', 'fail', 'pass'), ('c', 'pass', 'absent'), ('e', 'absent', 'pass')])
 
+    def test_the_same_outcome_for_another_reason_is_a_difference(self):
+        for outcome in ('fail', 'skip', 'xfail'):
+            direct = {'a': Result(outcome, 'the agent accepts an unsupported media type')}
+            gateway = {'a': Result(outcome, 'HTTP 500 from the gateway')}
+            with self.subTest(outcome=outcome):
+                listed, unlisted, stale = check_results.score(False, gateway, direct, {})
+                self.assertEqual([(item.test, item.direct, item.result.outcome, item.direct_message) for item in unlisted],
+                                 [('a', outcome, outcome, 'the agent accepts an unsupported media type')])
+                self.assertEqual((listed, stale), ([], []))
+
+    def test_the_same_outcome_with_the_same_message_is_not_a_difference(self):
+        task = ('Task {} of {} is in terminal state: completed, <function is_success at {}>, '
+                '400 Bad Request for url: {} and "{}", at {}: refused')
+        directly = task.format('daeea35f-f00f-43d2-9109-9a0db0db13f9', 'tck-complete-task-3fa9c1b2', '0x10beb33d0',
+                               'http://127.0.0.1:18860', '127.0.0.1:18860/', 'localhost:18860')
+        forwarded = task.format('4EC59245-93D9-4C19-BBD7-6656797736C7', 'tck-complete-task-9d00aa11', '0x7f3a6c0',
+                                'http://127.0.0.1:18870/conformance/a2a', 'localhost:18871/transit/conformance-a2a/',
+                                'localhost:18870/conformance/a2a')
+        skipped = Result('skip', 'Streaming is not supported')
+        direct = {'a': Result('fail', directly), 'b': skipped, 'c': Result('pass', 'HTTP 200')}
+        gateway = {'a': Result('fail', forwarded), 'b': skipped, 'c': Result('pass', 'HTTP 200 after a redirect')}
+        self.assertEqual(check_results.score(False, gateway, direct, {}), ([], [], []))
+
+    def test_what_is_masked_in_a_message_leaves_the_rest_to_compare(self):
+        for direct, gateway in (('expected -32005, got -32602', 'expected -32005, got -32603'),
+                                ('HTTP 400 for url: http://127.0.0.1:18860', 'HTTP 500 for url: http://127.0.0.1:18870/conformance/a2a'),
+                                ('size 10x20', 'size 10x99'),
+                                ('http://127.0.0.1:1/a?code=400', 'http://127.0.0.1:2/b?code=500'),
+                                ('{url: http://127.0.0.1:1/a}; error 400', '{url: http://127.0.0.1:2/b}; error 500'),
+                                ('notlocalhost:1 refused', 'notlocalhost:2 refused'),
+                                ('Task tck-complete-task-3fa9c1b2 not found', 'Task tck-cancel-task-9d00aa11 was refused'),
+                                ('', 'HTTP 500')):
+            with self.subTest(direct=direct):
+                unlisted = check_results.score(False, {'a': Result('fail', gateway)}, {'a': Result('fail', direct)}, {})[1]
+                self.assertEqual([item.direct_message for item in unlisted], [direct])
+
+    def test_the_direct_message_is_kept_only_for_a_test_with_the_same_outcome(self):
+        unlisted = check_results.score(False, {'a': Result('fail', 'HTTP 500')}, {'a': Result('skip', 'no streaming')}, {})[1]
+        self.assertEqual([(item.direct, item.direct_message) for item in unlisted], [('skip', None)])
+
+    def test_a_message_is_compared_whole_not_as_it_is_shown(self):
+        padding = 'x' * (check_results.MESSAGE_LIMIT - 10)
+        direct = {'a': Result('fail', f'{padding} daeea35f-f00f-43d2-9109-9a0db0db13f9 then the agent refused')}
+        same = {'a': Result('fail', f'{padding} 4ec59245-93d9-4c19-bbd7-6656797736c7 then the agent refused')}
+        other = {'a': Result('fail', f'{padding} 4ec59245-93d9-4c19-bbd7-6656797736c7 then the gateway refused')}
+        self.assertEqual(check_results.score(False, same, direct, {}), ([], [], []))
+        self.assertEqual([item.test for item in check_results.score(False, other, direct, {})[1]], ['a'])
+
+    def test_a_listed_difference_of_reason_passes_until_the_reasons_agree_again(self):
+        direct = {'a': Result('fail', 'the agent accepts an unsupported media type')}
+        entry = {'a': Expected(('fail',), 'the gateway refuses the part first')}
+        listed, unlisted, stale = check_results.score(False, {'a': Result('fail', 'HTTP 415 from the gateway')}, direct, entry)
+        self.assertEqual(([item.reason for item in listed], unlisted, stale), (['the gateway refuses the part first'], [], []))
+        listed, unlisted, stale = check_results.score(False, direct, direct, entry)
+        self.assertEqual((listed, unlisted, stale), ([], [], ['a: listed as fail, but it no longer differs']))
+
+    def test_an_agent_target_is_not_scored_on_the_reason_of_a_listed_failure(self):
+        direct = {'a': Result('fail', 'the agent accepts an unsupported media type')}
+        proxy = {'a': Result('fail', 'got -32602')}
+        listed, unlisted, stale = check_results.score(True, proxy, direct, {'a': Expected(('fail',), 'InvalidParams')})
+        self.assertEqual(([(item.test, item.direct_message) for item in listed], unlisted, stale), ([('a', None)], [], []))
+
 
 class Baselines(unittest.TestCase):
     ENTRY = '[[expected]]\ntest = "a"\noutcome = "fail"\nreason = "r"\n'
@@ -356,6 +419,65 @@ class Main(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn('PASS  access-point: 1 passed, 1 failed, 0 skipped, 0 xfail; '
                       '0 expected difference(s) from direct; 1 fail without the gateway too', output)
+
+    def other_reason(self, direct: str, gateway: str, baseline: str = '', *extra: str) -> tuple[int, str]:
+        failure = '<testcase classname="tests.compatibility.card" name="test_etag"><failure message="{}"/></testcase>'
+        self.baseline('direct', 'passed = 1\n' + self.LISTED)
+        self.suite('direct', failure.format(direct), testcase('test_get'))
+        self.suite('access-point', failure.format(gateway), testcase('test_get'))
+        self.baseline('access-point', baseline)
+        return self.main('direct,access-point', *extra)
+
+    def test_fails_when_a_test_fails_both_ways_for_another_reason(self):
+        limit = check_results.MESSAGE_LIMIT
+        code, output = self.other_reason('no ETag ' + 'y' * limit, 'HTTP 500 ' + 'x' * limit)
+        self.assertEqual(code, 1)
+        self.assertIn('FAIL  access-point: 1 passed, 1 failed, 0 skipped, 0 xfail; '
+                      '0 expected difference(s) from direct; 0 fail without the gateway too', output)
+        gateway = 'HTTP 500 ' + 'x' * (limit - len('HTTP 500 ')) + '...'
+        direct = 'no ETag ' + 'y' * (limit - len('no ETag ')) + '...'
+        self.assertIn(f'not in the baseline: card::test_etag {BOTH_WAYS}: {gateway} (directly: {direct})', output)
+
+    def test_passes_when_the_other_reason_is_listed_and_reports_both_messages(self):
+        limit = check_results.MESSAGE_LIMIT
+        report = self.work / 'gaps.md'
+        direct, gateway = 'no ETag ' + 'y' * limit, 'HTTP 500 ' + 'x' * limit
+        code, output = self.other_reason(direct, gateway, self.LISTED, '--report', str(report))
+        self.assertEqual(code, 0)
+        self.assertIn('PASS  access-point: 1 passed, 1 failed, 0 skipped, 0 xfail; 1 expected difference(s) from direct', output)
+        text = report.read_text()
+        self.assertIn('  - direct run: fail; this target: fail, for another reason\n', text)
+        self.assertIn('  - suite message: HTTP 500 ' + 'x' * (limit - len('HTTP 500 ')) + '...\n', text)
+        self.assertIn('  - suite message of the direct run: no ETag ' + 'y' * (limit - len('no ETag ')) + '...\n', text)
+        self.assertIn('  - cause: the gateway rebuilds the card', text)
+
+    def test_messages_that_part_beyond_what_is_shown_are_shown_from_where_they_part(self):
+        limit, context = check_results.MESSAGE_LIMIT, check_results.PARTING_CONTEXT
+        start = 'x' * limit + ' task daeea35f-f00f-43d2-9109-9a0db0db13f9 ' + 'y' * context
+        code, output = self.other_reason(start + 'the agent refused', start + 'the gateway refused')
+        self.assertEqual(code, 1)
+        lead = '...' + 'y' * (context - len('the '))
+        self.assertIn(f'{BOTH_WAYS}: {lead}the gateway refused (directly: {lead}the agent refused)', output)
+
+    def test_a_message_that_goes_on_where_the_other_ends_is_shown_from_there(self):
+        limit, context = check_results.MESSAGE_LIMIT, check_results.PARTING_CONTEXT
+        start = 'x' * limit + 'y' * context
+        code, output = self.other_reason(start, start + ' and then the gateway refused')
+        self.assertEqual(code, 1)
+        lead = '...' + 'y' * context
+        self.assertIn(f'{BOTH_WAYS}: {lead} and then the gateway refused (directly: {lead})', output)
+
+    def test_messages_are_shown_as_they_are_compared(self):
+        urls = ' '.join(f'http://127.0.0.1:1886{digit}/conformance/a2a/v1/tasks' for digit in range(10))
+        code, output = self.other_reason(f'{urls} got 400', f'{urls.replace("/conformance/a2a", "")} got 500')
+        self.assertEqual(code, 1)
+        stars = ' '.join('*' * 10)
+        self.assertIn(f'{BOTH_WAYS}: {stars} got 500 (directly: {stars} got 400)', output)
+
+    def test_a_direct_failure_with_no_message_is_shown_as_such(self):
+        code, output = self.other_reason('', 'HTTP 500')
+        self.assertEqual(code, 1)
+        self.assertIn(f'card::test_etag {BOTH_WAYS}: HTTP 500 (directly: no message)', output)
 
     def test_fails_on_a_baseline_entry_that_no_longer_applies(self):
         code, output = self.access_point('pass', self.LISTED)

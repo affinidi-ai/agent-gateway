@@ -12,9 +12,14 @@ target that is an agent in its own right is scored on its own results:
                  skipped changes the count and fails the run. A pass lost and
                  a pass gained in the same run cancel out and are not seen.
   other targets  every test whose outcome differs from the direct run must be
-                 listed, with that outcome, in the target's baseline
+                 listed, with that outcome, in the target's baseline. So must
+                 a test with the same outcome both ways, other than a pass,
+                 and another message from the suite, once what changes from
+                 one call or target to the next is masked: it then fails or
+                 is skipped for a reason the direct run does not have
 
-A listed entry that no longer happens fails the run too, so a baseline cannot
+An agent target is not scored on the message of a listed failure. A listed
+entry that no longer happens fails the run too, so a baseline cannot
 keep an entry the gateway has outgrown. Outcomes are pass, fail, skip and
 xfail (a SHOULD-level check the suite reports without failing the run). A
 test that passes directly and is skipped through the gateway is a difference:
@@ -27,6 +32,7 @@ is 0 unless results or a baseline could not be read.
 
 import argparse
 import json
+import re
 import sys
 import tomllib
 import xml.etree.ElementTree as ET
@@ -39,6 +45,14 @@ DIRECT = 'direct'
 TEST_PREFIX = 'tests.compatibility.'
 MESSAGE_LIMIT = 300
 DOCUMENT_TYPE = b'<!DOCTYPE'
+VOLATILE = re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    r'|\btck-[a-z0-9-]+-[0-9a-f]{8}\b'
+    r'|\b0x[0-9a-f]+'
+    r'''|(?:https?://)?\b(?:127\.0\.0\.1|localhost):\d+[^\s'",;?#)\]}>]*''',
+    re.IGNORECASE,
+)
+PARTING_CONTEXT = 60
 
 
 @dataclass(frozen=True)
@@ -68,11 +82,38 @@ class Difference:
     direct: str
     result: Result
     reason: str | None
+    direct_message: str | None = None
 
 
-def short(message: str | None) -> str:
-    text = ' '.join((message or '').split())
-    return text if len(text) <= MESSAGE_LIMIT else f'{text[:MESSAGE_LIMIT]}...'
+def collapse(message: str | None) -> str:
+    return ' '.join((message or '').split())
+
+
+def short(message: str) -> str:
+    return message if len(message) <= MESSAGE_LIMIT else f'{message[:MESSAGE_LIMIT]}...'
+
+
+def cause(message: str) -> str:
+    """The message without what changes from one call or target to the next.
+
+    That is a UUID, an id the 1.0 suite makes for itself, an object address,
+    and a loopback URL with its path: each target is served at its own.
+    """
+    return VOLATILE.sub('*', message)
+
+
+def beside(message: str, other: str) -> str:
+    """What to show of a message that is compared with another: the text that is compared, as `cause` masks it.
+
+    It is shown from its start while the point where the two part falls within
+    what is shown, and from shortly before that point otherwise.
+    """
+    mine, theirs = cause(message), cause(other)
+    parting = next((index for index, pair in enumerate(zip(mine, theirs, strict=False)) if pair[0] != pair[1]),
+                   min(len(mine), len(theirs)))
+    if parting + PARTING_CONTEXT <= MESSAGE_LIMIT:
+        return short(mine)
+    return f'...{short(mine[parting - PARTING_CONTEXT:])}'
 
 
 def junit_root(path: Path) -> ET.Element:
@@ -95,11 +136,11 @@ def junit_results(path: Path) -> dict[str, Result]:
         result = Result('pass')
         for child in case:
             if child.tag in ('failure', 'error'):
-                result = Result('fail', short(child.get('message')))
+                result = Result('fail', collapse(child.get('message')))
                 break
             if child.tag == 'skipped':
                 outcome = 'xfail' if child.get('type') == 'pytest.xfail' else 'skip'
-                result = Result(outcome, short(child.get('message')))
+                result = Result(outcome, collapse(child.get('message')))
         results[test] = result
     return results
 
@@ -115,7 +156,7 @@ def probe_results(path: Path) -> dict[str, Result]:
         named = isinstance(entry, dict) and isinstance(entry.get('test'), str)
         if not named or entry.get('outcome') not in OUTCOMES or not isinstance(entry.get('message', ''), str):
             raise ValueError(f'{path}: each probe result needs test, outcome ({", ".join(OUTCOMES)}) and a text message: {entry}')
-        results[entry['test']] = Result(entry['outcome'], short(entry.get('message')))
+        results[entry['test']] = Result(entry['outcome'], collapse(entry.get('message')))
     return results
 
 
@@ -174,15 +215,20 @@ def load_baseline(path: Path, is_agent: bool) -> Baseline:
     return Baseline(expected, passed)
 
 
-def differences(is_agent: bool, results: dict[str, Result], direct: dict[str, Result]) -> dict[str, tuple[str, Result]]:
-    """Map each test that counts against the target to (direct outcome, result)."""
+def differences(is_agent: bool, results: dict[str, Result], direct: dict[str, Result]) -> dict[str, tuple[Result, Result]]:
+    """Map each test that counts against the target to (direct result, result).
+
+    A forwarding target differs on a test whose outcome differs, and on one
+    with the same outcome, other than a pass, when the suite gives another
+    message for it: the reason is then one the direct run does not have.
+    """
     if is_agent:
-        return {test: ('', result) for test, result in results.items() if result.outcome == 'fail'}
+        return {test: (Result(''), result) for test, result in results.items() if result.outcome == 'fail'}
     found = {}
     for test in sorted(results.keys() | direct.keys()):
-        before = direct[test].outcome if test in direct else 'absent'
+        before = direct.get(test, Result('absent'))
         after = results.get(test, Result('absent'))
-        if before != after.outcome:
+        if before.outcome != after.outcome or (after.outcome != 'pass' and cause(before.message) != cause(after.message)):
             found[test] = (before, after)
     return found
 
@@ -196,10 +242,11 @@ def score(is_agent: bool, results: dict[str, Result], direct: dict[str, Result],
     listed, unlisted, stale = [], [], []
     for test, (before, result) in found.items():
         entry = expected.get(test)
+        direct_message = before.message if before.outcome == result.outcome else None
         if entry is not None and result.outcome in entry.outcomes:
-            listed.append(Difference(test, before, result, entry.reason))
+            listed.append(Difference(test, before.outcome, result, entry.reason, direct_message))
         else:
-            unlisted.append(Difference(test, before, result, None))
+            unlisted.append(Difference(test, before.outcome, result, None, direct_message))
     for test, entry in expected.items():
         if test not in found:
             stale.append(f'{test}: listed as {entry}, but it no longer differs')
@@ -209,9 +256,25 @@ def score(is_agent: bool, results: dict[str, Result], direct: dict[str, Result],
 
 
 def describe(is_agent: bool, difference: Difference) -> str:
-    change = difference.result.outcome if is_agent else f'{difference.direct} -> {difference.result.outcome}'
-    detail = f': {difference.result.message}' if difference.result.message else ''
-    return f'{difference.test} ({change}){detail}'
+    outcome = difference.result.outcome
+    message, direct_message = shown(difference)
+    if is_agent:
+        change = outcome
+    elif direct_message is not None:
+        change = f'{outcome} both ways, for another reason'
+    else:
+        change = f'{difference.direct} -> {outcome}'
+    detail = f': {message}' if message else ''
+    directly = '' if direct_message is None else f' (directly: {direct_message})'
+    return f'{difference.test} ({change}){detail}{directly}'
+
+
+def shown(difference: Difference) -> tuple[str, str | None]:
+    """The target's message and, for a test that has the direct run's outcome, the direct run's, as they are printed."""
+    message, direct_message = difference.result.message, difference.direct_message
+    if direct_message is None:
+        return short(message), None
+    return beside(message, direct_message), beside(direct_message, message) or 'no message'
 
 
 def report_section(
@@ -225,10 +288,14 @@ def report_section(
         lines += [f'### {title}', '']
         for item in items:
             lines.append(f'- `{item.test}`')
+            message, direct_message = shown(item)
             if not is_agent:
-                lines.append(f'  - direct run: {item.direct}; this target: {item.result.outcome}')
-            if item.result.message:
-                lines.append(f'  - suite message: {item.result.message}')
+                same = '' if direct_message is None else ', for another reason'
+                lines.append(f'  - direct run: {item.direct}; this target: {item.result.outcome}{same}')
+            if message:
+                lines.append(f'  - suite message: {message}')
+            if direct_message is not None:
+                lines.append(f'  - suite message of the direct run: {direct_message}')
             if item.reason:
                 lines.append(f'  - cause: {item.reason}')
         lines.append('')
@@ -277,8 +344,8 @@ def main() -> int:
         summary = (f'{totals["pass"]} passed, {totals["fail"]} failed, {totals["skip"]} skipped, {totals["xfail"]} xfail; '
                    f'{len(listed)} expected {noun}')
         if not is_agent:
-            shared = sum(1 for test, result in results.items()
-                         if result.outcome == 'fail' and direct.get(test, Result('absent')).outcome == 'fail')
+            differing = {item.test for item in listed + unlisted}
+            shared = sum(1 for test, result in results.items() if result.outcome == 'fail' and test not in differing)
             summary += f'; {shared} fail without the gateway too'
         ok = not unlisted and not notes
         failed = failed or not ok

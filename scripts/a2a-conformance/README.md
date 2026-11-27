@@ -141,7 +141,7 @@ to `run-0.3/` and `env-0.3/`:
 | Path | Contents |
 | --- | --- |
 | `run/summary.txt` | One line per step and the overall result |
-| `run/gaps.md` | With `--report`: every difference per target, with the suite's message and the baseline's cause |
+| `run/gaps.md` | With `--report`: every difference per target, with the suite's message, the direct run's message where the outcome is the same, and the baseline's cause |
 | `run/logs/` | Build, install, gateway, test agent, suite and scoring logs |
 | `run/results/<target>/` | The suite's JUnit report (and, for 1.0, its compatibility and HTML reports) and `probes.json` |
 | `env/` | The generated gateway env and `targets.json` |
@@ -158,13 +158,26 @@ forwarding target is not scored on what fails. It is scored on what changes:
   same run cancel out and are not seen.
 - **Forwarding targets** (`access-point`, `access-point-full`, `transit`):
   every test whose outcome differs from the direct run must be listed, with
-  that outcome. A test that fails in both is the agent's and does not count.
+  that outcome. So must a test with the same outcome both ways, other than a
+  pass, when the suite gives another message for it: it then fails or is
+  skipped for a reason the direct run does not have. A test that fails in
+  both with the same message is the agent's and does not count.
 
 Outcomes are `pass`, `fail`, `skip` and `xfail` (a SHOULD-level check the suite
 reports without failing its run). A test that passes directly and is skipped
 through the gateway is a difference: the suite skips a test when the call it
 depends on did not work. The run also fails on a listed entry that no longer
 applies, so a baseline cannot keep an entry the gateway has outgrown.
+
+A message is compared as the suite's report gives it, not as it is cut for
+display; the 0.3 suite's pytest shortens a long one itself. UUIDs, the ids the
+1.0 suite makes for itself, object addresses and loopback URLs with their
+paths are masked first, since they change from one call or target to the
+next. The check sees only what the message says: a gateway failure that the
+suite words like the agent's own still counts as the agent's. An agent target
+is not scored on the message of a listed failure: its baseline says in words
+why each test fails, and a failure that changes its cause while the test keeps
+failing is not seen there.
 
 `probes.py` adds two checks the suite does not make, scored the same way:
 
@@ -177,7 +190,9 @@ applies, so a baseline cannot keep an entry the gateway has outgrown.
 
 `expected/<version>/<target>.toml`. Each entry names one `test` or several
 `tests`, the `outcome`, and the `reason`: the cause, not a restatement of the
-failure. An outcome that depends on timing is a list. An agent's baseline lists
+failure. An outcome that depends on timing is a list. A forwarding target's
+entry for a test that has the direct run's outcome for another reason gives
+that outcome. An agent's baseline lists
 failures only and sets `passed`, the number of tests that pass; the run fails
 until it is updated when that number changes in either direction.
 

@@ -852,9 +852,11 @@ maintenance. CI runs both suites on every push to `main`, and on a pull request 
 harness or the A2A code listed in the `a2a` path filter of `.github/workflows/ci.yml`.
 
 The suite's own test agent is measured twice with the same suite: directly, and through the
-gateway. A forwarding target is scored on the tests whose outcome differs from the direct run, so
-a failure of the test agent itself never counts against the gateway. The A2A proxy is an agent in
-its own right and is scored on its own failures.
+gateway. A forwarding target is scored on the tests whose outcome differs from the direct run, and
+on those with the same outcome, other than a pass, and another message from the suite, so a failure of
+the test agent itself never counts against the gateway, and a failure of the gateway on such a test
+is seen when the suite words it differently. The A2A proxy is an agent in its own right and is
+scored on its own failures.
 
 | Target | Endpoint | Scored |
 | --- | --- | --- |

@@ -1,4 +1,4 @@
-# Tests whose outcome through an A2A Transit Point differs from the direct run
+# Tests whose outcome, or the suite's message for it, through an A2A Transit Point differs from the direct run
 # (target "transit"). The run fails on a difference not listed here, on a
 # listed difference with another outcome, and on a listed test that no longer
 # differs.
