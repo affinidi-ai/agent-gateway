@@ -15,6 +15,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { SIMPLE_TEXT } from './fixture.mjs';
+import { listSection, loadResults } from './suite-report.mjs';
 
 const { values } = parseArgs({
   options: {
@@ -42,34 +43,9 @@ function report(ok, name, detail) {
   if (!ok) failures += 1;
 }
 
-// The frozen requirement file is a flat mapping of section name to a list of
-// scenario names; only the `server` list is needed.
-function scoredServerScenarios(file) {
-  const scenarios = [];
-  let inServer = false;
-  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
-    if (/^\S/.test(line) && !line.startsWith('#')) inServer = line.trim() === 'server:';
-    const entry = inServer && line.match(/^\s+-\s+([\w/-]+)\s*$/);
-    if (entry) scenarios.push(entry[1]);
-  }
-  if (scenarios.length === 0) throw new Error(`no server scenarios found in ${file}`);
-  return scenarios;
-}
-
-function loadResults(target) {
-  const dir = path.join(values.results, target);
-  const byScenario = new Map();
-  if (!fs.existsSync(dir)) return byScenario;
-  for (const entry of fs.readdirSync(dir).sort()) {
-    const match = entry.match(/^server-(.+)-\d{4}-\d{2}-\d{2}T[\d-]+Z$/);
-    const file = path.join(dir, entry, 'checks.json');
-    if (match && fs.existsSync(file)) byScenario.set(match[1], JSON.parse(fs.readFileSync(file, 'utf8')));
-  }
-  return byScenario;
-}
-
-const scored = scoredServerScenarios(values.requirements);
-const results = new Map(targets.map((target) => [target, loadResults(target)]));
+const scored = listSection(fs.readFileSync(values.requirements, 'utf8'), 'server');
+if (scored.length === 0) throw new Error(`no server scenarios found in ${values.requirements}`);
+const results = new Map(targets.map((target) => [target, loadResults(path.join(values.results, target), 'server')]));
 
 for (const target of targets) {
   const expected = OWNED.has(target) ? ownedScenarios : scored;
