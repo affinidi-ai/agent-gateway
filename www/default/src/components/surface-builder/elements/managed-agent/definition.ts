@@ -8,17 +8,14 @@ import { a2aProxyIdFromEndpoint, isA2aProxyEndpoint } from '../_shared/a2aProxyE
 import {
   STORED_TARGET_AUTH_KEY,
   providerTargetAuthFromApi,
+  storedHeaderKind,
   storedHeaderValue,
   storedTargetAuth,
 } from '../_shared/providerTargetAuth';
 import { parseFabricEndpoint } from '../_shared/useGatewaySurfaces';
 import { isHttpTarget } from './PartnerGrantReleaseSection';
 import { responseAuthProblems, responseAuthToWire } from './responseAuth';
-import {
-  inferAuthType,
-  managedAgentTargetAuth,
-  managedAgentTargetAuthProblems,
-} from './targetAuth';
+import { managedAgentTargetAuth, managedAgentTargetAuthProblems } from './targetAuth';
 
 export const managedAgentDefinition: NodeDefinition = {
   type: 'target',
@@ -214,7 +211,7 @@ export const managedAgentDefinition: NodeDefinition = {
         if (typeof ta.auth_type === 'string') {
           c.target_auth_type = ta.auth_type;
         } else {
-          c.target_auth_type = inferAuthType(
+          c.target_auth_type = storedHeaderKind(
             c.target_auth_header_name,
             c.target_auth_header_format
           );

@@ -16,6 +16,16 @@ Feature: SAML configuration at startup
     When the gateway tries to start
     Then the gateway refuses to start, naming "idp_slo_url"
 
+  Scenario: A saml.json whose default_role is not a gateway role stops the gateway at startup
+    Given saml.json sets "default_role" to "Administrator"
+    When the gateway tries to start
+    Then the gateway refuses to start, naming "default_role"
+
+  Scenario: A saml.json that maps an identity provider role to a misspelled gateway role stops the gateway at startup
+    Given saml.json maps the identity provider role "gw-admins" to "Administrator"
+    When the gateway tries to start
+    Then the gateway refuses to start, naming "gw-admins"
+
   Scenario: A saml.json key the gateway does not read is named in a startup warning
     Given saml.json sets "idp_sso_urll" to "bdd-unread-setting-value"
     When the gateway starts

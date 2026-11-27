@@ -241,6 +241,22 @@ impl CreationGuard {
         }
     }
 
+    /// For a DID already announced with `creation_started` (a permanent DID a paused
+    /// pairing reserved): reports only `created`, or `creation_failed` when dropped
+    /// first, without announcing the start again.
+    pub fn resume(
+        hook: Option<Arc<EventHook>>,
+        minted: ConnectionPointPayload,
+    ) -> Self {
+        Self { hook, minted, armed: true }
+    }
+
+    /// Hands the announced DID over to the stored record that reserved it, which
+    /// reports its `created` or `creation_failed` later. Nothing is reported now.
+    pub fn hand_over(mut self) {
+        self.armed = false;
+    }
+
     pub fn created(
         mut self,
         saved: ConnectionPointPayload,
@@ -764,6 +780,38 @@ mod tests {
         let mut seen = kinds(&captured);
         seen.sort();
         assert_eq!(seen, vec!["connection_point.created", "connection_point.creation_started"]);
+    }
+
+    #[tokio::test]
+    async fn a_guard_handed_over_to_its_record_reports_nothing_more() {
+        let (url, captured) = serve(204, "").await;
+        let hook = hook(url, None);
+        CreationGuard::start(Some(hook), payload()).hand_over();
+        wait_for(&captured, 1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(kinds(&captured), vec!["connection_point.creation_started"]);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_guard_reports_created_without_a_second_start() {
+        let (url, captured) = serve(204, "").await;
+        let hook = hook(url, None);
+        CreationGuard::resume(Some(hook), payload()).created(payload());
+        wait_for(&captured, 1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(kinds(&captured), vec!["connection_point.created"]);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_guard_dropped_early_reports_only_creation_failed() {
+        let (url, captured) = serve(204, "").await;
+        let hook = hook(url, None);
+        {
+            let _creation = CreationGuard::resume(Some(hook), payload());
+        }
+        wait_for(&captured, 1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(kinds(&captured), vec!["connection_point.creation_failed"]);
     }
 
     #[tokio::test]

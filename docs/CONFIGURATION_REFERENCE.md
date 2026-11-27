@@ -305,11 +305,12 @@ The bootstrap file. Startup only; changes need a restart.
 | `[tls]` | Certificate and key paths, upstream verification |
 | `[mcp]` | Default MCP revision, validation, timeouts, SSE and stdio transports. Gateway-originated `2026-07-28` consent needs `[mcp.continuations]`; see [`MCP_METADATA.md`](MCP_METADATA.md#protected-continuations). |
 | `[reconnect_policy]` | Backoff for DIDComm connection points and for the background retry of a trust registry connection |
-| `[oob_connection]` | How long an out-of-band pairing invitation stays pending |
+| `[oob_connection]` | `pending_expiry_hours` (default 1): how long a pending acceptance whose temporary Connection Point recorded no expiry stays valid. An acceptance records its invitation's expiry (`expires_time`, capped at seven days, or seven days without one), so this applies only to acceptances stored before that |
 | `[a2a]` | Default A2A revision, body size (`max_body_size`, at least 1 byte; `0` fails startup), timeouts, fabric timeouts and envelope lifetime, inbound cache sizing. See [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md). |
 | `[logging]` | Level, JSON output, log directory, and `delegation_events` (default `true`): `false` writes none of the per-call credential delegation events to the log (see [Governance audit forwarding](OBSERVABILITY.md#governance-audit-forwarding)). Log redaction is not read here; see [Log redaction](#log-redaction). |
 | `[audit]` | How the VP Audit Log file is rotated: `vp_audit_log_max_bytes` (default 8388608) and `vp_audit_log_keep` (default 0, keep every rotated file), and the advisory `vp_audit_log_soft_cap_bytes` the Audit page shows the history against (default 1073741824). See [Governance audit forwarding](OBSERVABILITY.md#governance-audit-forwarding). |
 | `[extension_inspection]` | Whether to parse A2A extensions, and which URIs to watch |
+| `[vta]` | Connects the gateway to a trust agent you run, so it signs through it; read at startup. Off by default (`enabled = false`: the gateway signs with its own issuer key, and only the `context_did_*` keys below apply). When enabled, `base_url`, `vta_did`, `context_id` and `signing_key_id` are required, or startup fails; `base_url` must be `https`, or `http` to a loopback address. `signing_key_public` (the key's multibase public key; required for a non-exportable key, and lets the key set be published with no trust agent call) and `[[vta.retiring_keys]]` (`key_id`, `public_key`: keys still published so what they signed keeps verifying, never the active key) set the published keys; `purposes` (default `["jwt"]`) the signing purposes asked of it. `control_did_method = "did_key"` or `"did_webvh"` chooses the DID the gateway authenticates as (absent: `auth_did` if set, then the older `publish_auth_did`, then `did_webvh`); `auth_key_source` (`file://<path>` or `env://<var>`; absent, an ephemeral key) holds its key, and `auth_did` with `auth_verification_method` names a `did:webvh` you host yourself. A `did_key` held in a file (no `auth_did`) can be rotated with `acl/swap-key`, on demand and, when `control_key_rotation_days` is above `0` (default `0`, off; at most `3650`), on a schedule. `connection_key_switch_timeout_secs` (default `330`, `10` to `3600`) is how long a control-key rotation of a connection you added keeps trying a new key the trust agent refuses before it rolls back. `timeout_ms` (default `5000`) bounds each call and `max_concurrent` (default `16`) the calls in flight; `sign_quota_max` (default `600`, `0` off) signatures per `sign_quota_window_secs` (default `60`) fail closed once used up. `auto_provision_contexts` (default `false`) creates a context per surface and variant on first use, at most `max_contexts` (default `256`). `audit_enabled` (default `false`) logs a minimal record of each signature through a bounded queue of `audit_queue_capacity` (default `256`) records. `context_did_method = "did_key"` (default) or `"did_webvh"` chooses the DID the trust agent contexts the gateway creates sign as, on every connection, including dashboard ones and whether or not the block is enabled; it applies to contexts created after it is set. With `did_webvh`, `context_did_hosting = "gateway"` (default; the gateway serves the log at `/vta-issuer/{token}/did.jsonl` and needs its own DID domain) or `"vta_server"` (a webvh server registered on the trust agent, named by `context_did_server_id`, which is then required). `expect_pcr0` is refused at startup: the gateway does not check a trust agent's enclave attestation. Nothing checks that the agent at `base_url` holds `vta_did`, so its identity rests on TLS to `base_url`; a connection added in the dashboard is instead checked against the DID that signs its answers when it is verified. `default_backend` (`auto` or `legacy_local`) signs with the gateway's own key either way. See [`TRUST_AGENT_SIGNING.md`](TRUST_AGENT_SIGNING.md). |
 
 Fields and defaults are defined in [`src/config/bootstrap.rs`](../src/config/bootstrap.rs).
 `config.example.toml` documents each field inline and is the most complete field-level
@@ -619,14 +620,50 @@ Read when `auth_mode = "saml"`. Ignored otherwise.
 | Security | `sign_requests` |
 | Sign-in throttle | `login_throttle`: `enabled` (default `false`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds) per client IP for `/saml/login`. Behind a load balancer, set `client_ip.trusted_proxies` in `gateway.json` first. |
 | Claims | `attribute_mapping` from SAML claim URI to user field |
-| Roles | `role_mapping` from identity-provider role to gateway role |
+| Roles | `role_mapping` from identity-provider role to gateway role (`administrator`, `poweruser` or `user`), and an optional `default_role` for a role with no mapping |
 | Directory | `graph_api` for Microsoft Entra ID group and profile lookup |
 
 `role_mapping` decides what an authenticated user may do. A mapping that sends an
 unexpected identity-provider role to `administrator` grants full management access, so
 treat it as a security-relevant setting rather than a convenience.
 
-Each SAML sign-in sets the user's role from the identity provider, with one exception: the
+A role comes only from an explicit `role_mapping` entry. The identity provider may send several
+role values, in one attribute, in repeated attributes or in several attribute statements; the highest
+role any of them maps to wins, whatever their order, and values with no entry are ignored. When no value has an entry, or the sign-in has no role value, the sign-in gets
+`default_role` when it is set and is otherwise refused: the browser gets a `403` page, no user is
+created or updated and a stored role is left as it was, so an existing session or token keeps its
+rights until it is revoked by hand. A value that merely looks like a gateway role, such as `admin`,
+is not mapped. A refusal is logged with the SAML subject and the role values received (an absent
+claim is shown as none) and raises a `user.login_failed` event with failure reason
+`role_not_mapped` ([`docs/INTEGRATIONS.md`](INTEGRATIONS.md#sign-in-events)).
+
+A `role_mapping` key must equal the identity provider's role value exactly, including its case.
+
+The user ID, username and profile attributes are read from the first attribute statement of the
+assertion only; role values are read from every statement. The user ID and username attributes must
+not carry more than one distinct value there, including across repeated attributes; a value repeated
+unchanged is accepted. Such an assertion is refused before any user is created or updated: the
+browser gets the same generic `403` page, the log names the attribute (never its value) and a
+`user.login_failed` event is raised with failure reason `ambiguous_attribute`. The user ID attribute
+identifies the user when it is present and the `NameID` otherwise. Changing `attribute_mapping.user_id`
+to another attribute gives every user a new identifier, so each user who signs in afterwards is
+created as a new user.
+
+The email, first name, last name, department and job title attributes may carry several values: the
+user keeps the stored value while the identity provider still sends it, and otherwise takes the first
+one sent, and the log warns naming the attribute. When no username attribute is sent, or the username
+is mapped to the email claim, the username is the email the user keeps.
+
+The first user to sign in to an appliance with no users is still the primary administrator, and
+the primary administrator signs in and is updated as usual, keeping that role, even when the role
+is unmapped. A `role_mapping` value or `default_role` that is not `administrator`, `poweruser` or
+`user` (spelled exactly so, in lower case) stops the gateway at startup, naming the entry. `saml.json` is read only at startup, so a change to `role_mapping` or `default_role` takes effect after a restart. At
+startup the gateway warns when `default_role` is `administrator`, since every unmapped sign-in
+then becomes an administrator, and when `role_mapping` is empty and `default_role` is unset, since
+every sign-in but the first user's is then refused, or when every `role_mapping` key is an unedited
+`<...>` placeholder from the example file, since no identity-provider role is then mapped.
+
+Each SAML sign-in sets the user's role from `role_mapping` or `default_role`, with one exception: the
 first user to sign in becomes the primary administrator and keeps that role whatever the
 identity provider sends later, so a missing or changed role claim cannot remove the only
 guaranteed administrator. A sign-in that would have changed it logs a warning instead
@@ -829,7 +866,7 @@ neither lists them nor acts on them.
   when a payment gateway already exists and the flag has not been set either way, so an upgrade
   never hides a payment gateway that is taking payments.
 - `POST /v1/payment-gateways/connect-via-oob` connects to an agent-pay connection point with the
-  same body as `POST /v1/gateways/connect-via-oob` and creates a payment gateway whose exposure is
+  same body as `POST /v1/gateways/connect-via-oob`, except `await_mediator_access`, which it refuses with `400`, and creates a payment gateway whose exposure is
   `none`. agent-pay's administrator approves every connection, so the gateway stays
   `awaiting-approval` until then. A link already connected as a peer is `409`.
 - `GET /v1/payment-gateways/{id}/info` asks agent-pay for its `gateway-info` summary
@@ -1358,6 +1395,20 @@ issuer and the keys, one field decides who a caller is:
 | `principal_claim` | A top-level claim name, case-sensitive, printable ASCII without spaces, up to 128 characters | The claim whose value names a JWT caller, in the identity hash, STS subjects and consent. Absent means `sub`, and naming `sub` is stored as absent. Fixed when the strategy is created: an update naming another claim gets `400`. A claim that names a token, client, tenant, session or lifetime, such as `iss`, `aud` or `tid`, is refused, and a record edited by hand to name one names no caller. A release older than the field names callers by `sub` while it runs and removes the field when it saves the strategy; restore it by editing the record. |
 
 See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#which-claim-names-a-jwt-caller).
+
+## Credential provider records
+
+Credential providers live in `_storage/credential_providers/`, not in a configuration file, and
+are managed through `/v1/credential-providers`. Three fields decide how a provider's client
+authenticates at its token endpoint:
+
+| Field | Values | Behaviour |
+| --- | --- | --- |
+| `client_authentication` | `client_secret_basic`, `client_secret_post`, and on `oauth2_jwt_bearer` also `none` | On `oauth2_client_credentials` and on `oauth2_authorization_code` without an `issuer`: absent sends the client ID and secret in the form body, as `client_secret_post` does, and `client_secret_basic` sends them by HTTP Basic, on the grant, the code exchange and every refresh. On `oauth2_jwt_bearer`: absent sends no client identity. Refused on the other types. A record without the field keeps today's behaviour. |
+| `jwt_signing_algorithm` | `RS256`, `PS256`, `ES256` | `oauth2_jwt_bearer` takes `RS256` (default) or `ES256`; `oauth2_client_credentials_jwt_auth` takes `PS256` (default), `RS256` or `ES256`. |
+| `jwt_audience` | An https URL | The `aud` of the signed JWT; absent means the token endpoint. Servers that follow RFC 7523bis want their issuer identifier here. |
+
+See [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#client-secret-authentication).
 
 ## Related
 

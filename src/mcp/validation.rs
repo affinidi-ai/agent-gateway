@@ -167,6 +167,7 @@ async fn inject_vp_into_mcp(
     target: McpMetaTarget,
     context: McpMetadataContext,
     domain: Option<&str>,
+    scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<(bytes::Bytes, Option<String>)> {
     let mut message_json: JsonValue = serde_json::from_slice(message_bytes)?;
     super::meta::normalize_metadata(&mut message_json, context)?;
@@ -203,6 +204,7 @@ async fn inject_vp_into_mcp(
             None,
             domain,
             inbound_chained_vcs,
+            scope,
         )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create identity presentation: {}", e))?;
@@ -249,6 +251,7 @@ pub async fn inject_vp_into_mcp_response(
     strip_raw_meta: bool,
     context: McpMetadataContext,
     domain: Option<&str>,
+    scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<(bytes::Bytes, Option<String>)> {
     inject_vp_into_mcp(
         response_bytes,
@@ -263,6 +266,7 @@ pub async fn inject_vp_into_mcp_response(
         McpMetaTarget::Result,
         context,
         domain,
+        scope,
     )
     .await
 }
@@ -281,6 +285,7 @@ pub async fn inject_vp_into_mcp_request(
     strip_raw_meta: bool,
     context: McpMetadataContext,
     domain: Option<&str>,
+    scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<(bytes::Bytes, Option<String>)> {
     inject_vp_into_mcp(
         request_bytes,
@@ -295,6 +300,7 @@ pub async fn inject_vp_into_mcp_request(
         McpMetaTarget::TopLevel,
         context,
         domain,
+        scope,
     )
     .await
 }
@@ -320,6 +326,7 @@ mod tests {
             true,
             context,
             None,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -389,6 +396,7 @@ mod tests {
             true,
             modern_context(&request),
             None,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -428,6 +436,7 @@ mod tests {
             false,
             modern_context(&modern_tools_call()),
             None,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -463,6 +472,7 @@ mod tests {
                 false,
                 McpMetadataContext::default(),
                 None,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -500,6 +510,72 @@ mod tests {
         (Arc::new(issuer), tmp, did)
     }
 
+    /// The credential an MCP message carries is issued under the key of the
+    /// surface serving it: a surface whose trust agent cannot issue gets no
+    /// credential, never one from the gateway's key.
+    #[tokio::test]
+    async fn injection_follows_the_signing_of_the_surface_it_serves() {
+        let (issuer, tmp, did) = issuer_with_did().await;
+        crate::identity::test_helpers::map_surface_to_unusable_trust_agent(&issuer, tmp.path(), "surface-mapped").await;
+        let request = bytes::Bytes::from(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "echo"}})
+                .to_string(),
+        );
+        let response =
+            bytes::Bytes::from(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"content": []}}).to_string());
+        let context = McpMetadataContext::legacy(Some(crate::config::McpLegacyMetadataOutput::Canonical));
+        let inject_request = |scope: crate::vta::key_directory::KeyScope| {
+            let (request, issuer, did) = (request.clone(), Arc::clone(&issuer), did.clone());
+            async move {
+                inject_vp_into_mcp_request(
+                    &request,
+                    &did,
+                    &identity_fields(),
+                    None,
+                    &issuer,
+                    "test",
+                    vec![],
+                    "agentIdentity",
+                    true,
+                    context,
+                    None,
+                    &scope,
+                )
+                .await
+            }
+        };
+
+        let err = inject_request(crate::vta::key_directory::KeyScope::surface("surface-mapped"))
+            .await
+            .expect_err("the request's surface cannot issue");
+        assert!(
+            err.to_string()
+                .contains("vta-gone"),
+            "{err}"
+        );
+        let (_, proof) = inject_request(crate::vta::key_directory::KeyScope::surface("surface-unmapped"))
+            .await
+            .expect("an unmapped surface issues as before");
+        assert!(proof.is_some());
+
+        inject_vp_into_mcp_response(
+            &response,
+            &did,
+            &identity_fields(),
+            None,
+            &issuer,
+            "test",
+            vec![],
+            "serverIdentity",
+            false,
+            context,
+            None,
+            &crate::vta::key_directory::KeyScope::surface("surface-mapped"),
+        )
+        .await
+        .expect_err("the response's surface cannot issue");
+    }
+
     #[tokio::test]
     async fn request_injection_binds_the_presentation_to_the_domain() {
         let (issuer, _tmp, did) = issuer_with_did().await;
@@ -518,6 +594,7 @@ mod tests {
             false,
             McpMetadataContext::default(),
             Some("https://target.example"),
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -551,6 +628,7 @@ mod tests {
             false,
             McpMetadataContext::default(),
             None,
+            &Default::default(),
         )
         .await
         .expect("request injection must succeed on a params-only body");
@@ -610,6 +688,7 @@ mod tests {
             false,
             McpMetadataContext::default(),
             None,
+            &Default::default(),
         )
         .await
         .expect_err("response injection must fail without a result object");
@@ -643,6 +722,7 @@ mod tests {
             false,
             McpMetadataContext::default(),
             None,
+            &Default::default(),
         )
         .await
         .expect("response injection must succeed with a result object");

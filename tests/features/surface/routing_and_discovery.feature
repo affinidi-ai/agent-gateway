@@ -176,6 +176,17 @@ Feature: Surface routing, variants, and discovery
     And MCP server "charlie" received the forwarded MCP request
     And MCP server "bravo" was not called
 
+  Scenario: A variant that lowers the target request timeout answers a modern MCP request it gave up on with a JSON-RPC error
+    Given the alternate variant lowers the target request timeout to 1 second
+    And MCP surface "alpha" exists for route "/example" with default MCP server "bravo" and alternate MCP server "charlie"
+    And MCP server "charlie" is slow to respond by 2 seconds
+    When the caller asks the MCP surface at path "/example$alternate" for available tools using protocol version "2026-07-28"
+    Then the response status is 504
+    And the response is a JSON-RPC error with code -32603
+    And the MCP response id matches the request id
+    And the response reason is "target_unreachable"
+    And MCP server "bravo" was not called
+
   Scenario: Variant in complete mode clears base source authentication on the alternate route of a public surface
     Given the surface requires "API Key" source authentication
     And the surface is stored with a public Access Point

@@ -411,6 +411,43 @@ async fn appliance_holds_signing_key(
     create_secret_with_value(world, &secret_id, None, &key.private_pem).await;
 }
 
+#[given(expr = "the appliance holds the EC signing key {string}")]
+async fn appliance_holds_ec_signing_key(
+    world: &mut SurfaceWorld,
+    secret_id: String,
+) {
+    let group = openssl::ec::EcGroup::from_curve_name(openssl::nid::Nid::X9_62_PRIME256V1).unwrap();
+    let key = openssl::pkey::PKey::from_ec_key(openssl::ec::EcKey::generate(&group).unwrap()).unwrap();
+    let private_pem = String::from_utf8(
+        key.private_key_to_pem_pkcs8()
+            .unwrap(),
+    )
+    .unwrap();
+    create_secret_with_value(world, &secret_id, None, &private_pem).await;
+}
+
+#[when(
+    expr = "the operator creates the client credentials JWT provider {string} signing with {string} using the secret {string} and the client ID secret {string}"
+)]
+async fn operator_creates_client_credentials_jwt_provider(
+    world: &mut SurfaceWorld,
+    provider_id: String,
+    algorithm: String,
+    signing_key_secret: String,
+    client_id_secret: String,
+) {
+    let body = json!({
+        "name": provider_id, "provider_id": provider_id, "provider_type": "oauth2_client_credentials_jwt_auth",
+        "token_endpoint": "https://192.0.2.1/token",
+        "client_id_secret_ref": client_id_secret,
+        "jwt_signing_key_secret_ref": signing_key_secret,
+        "jwt_signing_algorithm": algorithm,
+        "jwt_key_id": "bdd-key-id",
+    });
+    let response = send(world, Method::POST, "/v1/credential-providers", Some(&body)).await;
+    world.admin_response = Some(response);
+}
+
 #[given(expr = "tenant {string} holds the secret {string}")]
 async fn tenant_holds_secret(
     world: &mut SurfaceWorld,

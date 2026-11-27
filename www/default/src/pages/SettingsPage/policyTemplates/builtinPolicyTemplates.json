@@ -523,7 +523,7 @@
     "id": "require-verified-credential-subject",
     "name": "Require verified credential subject",
     "summary": "Allow only listed caller DIDs the gateway verified.",
-    "description": "Allows a request only when the gateway verified the caller's DID, from an identity presentation or a bound source credential, and that DID is on the list. Denies unverified and unlisted callers. It decides on the Access Point and Target request policies: a Transit Point or response policy, and the Target request policy of a fabric:// Target, have no input.extension_identity, so it denies every request there.",
+    "description": "Allows a request only when the gateway verified the caller's DID, from an identity presentation or a bound source credential, and that DID is on the list. Denies unverified and unlisted callers. It decides on the Access Point and Target request policies. On a Transit Point, and in its response policy, input.extension_identity is the managed agent, so it decides on the managed agent's DID there. An inbound response policy and the Target request policy of a fabric:// Target have no input.extension_identity, so it denies every request there.",
     "category": "trust_checks",
     "policy_types": ["agent_surface"],
     "rules": "default allow := false\n\nallow if {\n  input.extension_identity.verified == true\n  input.extension_identity.did in {{dids}}\n}",

@@ -156,7 +156,7 @@ async fn access_point_stops_a_stalled_legacy_mcp_body_at_the_idle_deadline() {
     let (status, body, elapsed) = post_sse_shaped(&harness.gateway_url).await;
 
     assert_eq!(status, 504, "{body}");
-    assert!(body.contains("Upstream response timed out"), "{body}");
+    assert!(body.contains("target_unreachable"), "{body}");
     assert!(elapsed < STALL_BUDGET, "stalled body held the caller for {elapsed:?}");
 }
 
@@ -303,7 +303,7 @@ async fn access_point_stops_a_stalled_sse_tools_list_at_the_idle_deadline() {
     let (status, body, elapsed) = post_sse_shaped_with(&harness.gateway_url, tools_list()).await;
 
     assert_eq!(status, 504, "{body}");
-    assert!(body.contains("Upstream response timed out"), "{body}");
+    assert!(body.contains("target_unreachable"), "{body}");
     assert!(elapsed < STALL_BUDGET, "stalled tools/list held the caller for {elapsed:?}");
 }
 

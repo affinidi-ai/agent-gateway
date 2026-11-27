@@ -2,6 +2,9 @@ use std::path::Path;
 
 use crate::bdd_support::config::config_tree::G2G_BDD_GATEWAY_LOG_LEVEL_ENV;
 
+/// How long a test gateway waits for a peer gateway's answer over Fabric.
+pub const FABRIC_GATEWAY_TIMEOUT_MS: u64 = 5000;
+
 pub fn write_config_toml(
     config_dir: &Path,
     storage_dir: &Path,
@@ -21,7 +24,7 @@ metrics_cache_ttl_seconds = 1
 backup_encryption_key = "{backup_key}"
 
 [a2a]
-fabric_gateway_timeout_ms = 5000
+fabric_gateway_timeout_ms = {FABRIC_GATEWAY_TIMEOUT_MS}
 message_expires_seconds = 15
 
 [config_files]

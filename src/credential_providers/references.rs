@@ -817,6 +817,57 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_api_key_provider_is_no_referrer_of_the_client_secrets_an_older_record_kept() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::credential_providers::storage::FileSystemCredentialProviderStore::new(
+                directory.path().to_path_buf(),
+            )
+            .await
+            .unwrap(),
+        );
+        for (id, provider_type) in [("api-key", "api_key"), ("machine", "oauth2_client_credentials")] {
+            store
+                .create(
+                    serde_json::from_value(json!({
+                        "id": id, "name": id, "provider_id": id, "provider_type": provider_type,
+                        "token_endpoint": "https://idp.example/token",
+                        "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+                        "api_key_secret_ref": "API_KEY",
+                        "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let stores = ReferenceStores {
+            credential_providers: Some(store),
+            ..Default::default()
+        };
+        for (secret_id, expected) in [
+            ("CLIENT_ID", vec!["machine"]),
+            ("CLIENT_SECRET", vec!["machine"]),
+            ("API_KEY", vec!["api-key", "machine"]),
+        ] {
+            let referrers = stores
+                .referrers_of_secret(secret_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                sorted(
+                    referrers
+                        .into_iter()
+                        .map(|referrer| referrer.id)
+                        .collect()
+                ),
+                expected,
+                "{secret_id}"
+            );
+        }
+    }
+
     async fn body(response: Response) -> serde_json::Value {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)

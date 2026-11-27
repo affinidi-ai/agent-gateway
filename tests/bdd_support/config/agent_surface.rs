@@ -19,6 +19,7 @@ pub struct AgentSurfaceFixture {
     pub browser_origins: Vec<String>,
     pub a2a_settings: Option<Value>,
     pub tenant_id: Option<String>,
+    pub variants: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +179,7 @@ impl AgentSurfaceFixture {
             browser_origins: Vec::new(),
             a2a_settings: None,
             tenant_id: None,
+            variants: Vec::new(),
         }
     }
 
@@ -588,6 +590,9 @@ impl AgentSurfaceFixture {
         if let Some(tenant_id) = &self.tenant_id {
             surface["tenant_id"] = json!(tenant_id);
         }
+        if !self.variants.is_empty() {
+            surface["variants"] = json!(self.variants);
+        }
         if !self.identity_slots.is_empty() {
             surface["identity_slots"] = Value::Object(
                 self.identity_slots
@@ -695,6 +700,7 @@ impl Default for AgentSurfaceFixture {
             browser_origins: Vec::new(),
             a2a_settings: None,
             tenant_id: None,
+            variants: Vec::new(),
         }
     }
 }

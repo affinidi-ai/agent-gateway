@@ -84,6 +84,7 @@ function serve(port, target) {
         url,
         { method: req.method, headers: { ...req.headers, host: url.host } },
         (upstream) => {
+          upstream.on('error', () => res.destroy());
           const json = (upstream.headers['content-type'] ?? '').startsWith('application/json');
           const id = listenId(body.toString('utf8'));
           if (json && id !== undefined) {

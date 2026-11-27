@@ -16,7 +16,7 @@
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
@@ -64,6 +64,31 @@ const SEGMENT_EXTENSION: &str = "jsonl";
 const LOCK_FILE: &str = "journal.lock";
 pub(crate) const OWNER_ONLY_FILE: u32 = 0o600;
 const OWNER_ONLY_DIR: u32 = 0o700;
+
+/// Writes `bytes` to an owner-only temporary file next to `path`, syncs it, renames it over
+/// `path` and syncs the directory, so a crash leaves either the old or the new content.
+pub(crate) fn write_owner_only_atomically(
+    path: &Path,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let temp = path.with_extension("json.tmp");
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(OWNER_ONLY_FILE)
+            .open(&temp)?;
+        file.set_permissions(fs::Permissions::from_mode(OWNER_ONLY_FILE))?;
+        io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(&temp, path)?;
+    if let Some(dir) = path.parent() {
+        File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
 
 /// Creates `dir` readable by the owner only; missing parents get the usual
 /// mode. An existing directory is left as it is.

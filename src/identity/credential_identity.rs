@@ -20,7 +20,10 @@
 //!   derived from the *stored* credential the slot names, not from what the
 //!   caller presents.
 //!   `FromApiKey` without an `api_key_id` names no stored credential and
-//!   fails with [`CredentialIdentityError::ApiKeyIdMissing`].
+//!   fails with [`CredentialIdentityError::ApiKeyIdMissing`]; the inbound slot
+//!   and a Transit Point derive it from the verified caller instead, through
+//!   [`CredentialIdentityResolver::resolve_verified_caller`], as a Transit
+//!   Point derives `FromJwtClaim`.
 //! - **`Static { did }`** bypasses issuance: the configured DID is used
 //!   verbatim. No identity record is persisted.
 //! - **`Certificate.identity_did = Some(_)`** is honoured as a pre-bound
@@ -64,6 +67,11 @@ use crate::source_auth::ManagedIdentityConfig;
 /// `credential_type` of an mTLS-derived identity, whose identity fields describe the
 /// certificate's value, so a rotation is a change of those fields.
 pub const MTLS_CREDENTIAL_TYPE: &str = "mtls";
+
+/// `credential_type` of the identity of a client certificate a Transit Point's
+/// caller presented. It differs from [`MTLS_CREDENTIAL_TYPE`], so a caller
+/// certificate's hash never equals a stored certificate's.
+pub const MTLS_CALLER_CREDENTIAL_TYPE: &str = "mtls_caller";
 
 // ── Pepper ────────────────────────────────────────────────────────────────
 
@@ -194,6 +202,18 @@ pub enum CredentialIdentityError {
 
     #[error("required JWT claim '{0}' is missing or not a string in the validated token")]
     JwtClaimMissing(String),
+
+    #[error("caller identity requires API key authentication")]
+    ApiKeyCallerMissing,
+
+    #[error("from_mtls identity has no certificate_id")]
+    CertificateIdMissing,
+
+    #[error("caller identity requires mTLS authentication")]
+    MtlsCallerMissing,
+
+    #[error("managed identity does not take its DID from the caller's credential")]
+    NotCallerBound,
 }
 
 /// Classification used by callers to map errors to HTTP status + metric label.
@@ -220,7 +240,11 @@ impl CredentialIdentityError {
             | Self::CertificateParse { .. }
             | Self::InvalidStaticDid(_)
             | Self::JwtClaimsUnavailable
-            | Self::JwtClaimMissing(_) => CredentialIdentityErrorClass::Misconfigured,
+            | Self::JwtClaimMissing(_)
+            | Self::ApiKeyCallerMissing
+            | Self::CertificateIdMissing
+            | Self::MtlsCallerMissing
+            | Self::NotCallerBound => CredentialIdentityErrorClass::Misconfigured,
         }
     }
 
@@ -240,6 +264,10 @@ impl CredentialIdentityError {
             Self::StoreLookup(_) => "store_lookup_failed",
             Self::JwtClaimsUnavailable => "jwt_claims_unavailable",
             Self::JwtClaimMissing(_) => "jwt_claim_missing",
+            Self::ApiKeyCallerMissing => "api_key_unavailable",
+            Self::CertificateIdMissing => "certificate_id_missing",
+            Self::MtlsCallerMissing => "mtls_unavailable",
+            Self::NotCallerBound => "identity_not_caller_bound",
         }
     }
 }
@@ -270,6 +298,15 @@ impl CredentialIdentity {
             Self::Bound { .. } => "bound",
         }
     }
+}
+
+/// What [`CredentialIdentityResolver::resolve_verified_caller`] derives: the
+/// inputs of caller DID issuance and how far policy may trust the DID.
+#[derive(Debug, Clone)]
+pub struct VerifiedCallerIdentity {
+    pub identity_fields: HashMap<String, JsonValue>,
+    pub identity_hash: String,
+    pub verification: crate::surface_context::IdentityVerification,
 }
 
 // ── Cache ─────────────────────────────────────────────────────────────────
@@ -315,10 +352,18 @@ impl CredentialIdentityResolver {
         match managed_identity {
             ManagedIdentityConfig::PayloadExtraction(_) => Ok(None),
 
-            ManagedIdentityConfig::FromMtls { certificate_id } => self
-                .resolve_mtls(certificate_id, certificates_store)
-                .await
-                .map(Some),
+            ManagedIdentityConfig::FromMtls {
+                certificate_id: Some(certificate_id),
+            } if !certificate_id
+                .trim()
+                .is_empty() =>
+            {
+                self.resolve_mtls(certificate_id, certificates_store)
+                    .await
+                    .map(Some)
+            }
+
+            ManagedIdentityConfig::FromMtls { .. } => Err(CredentialIdentityError::CertificateIdMissing),
 
             ManagedIdentityConfig::FromApiKey { api_key_id: Some(api_key_id) } => self
                 .resolve_api_key(api_key_id, secrets_store)
@@ -337,7 +382,7 @@ impl CredentialIdentityResolver {
 
             // Request-bound: the store-based resolver has no token in scope.
             // Callers must special-case `FromJwtClaim` and route through
-            // [`resolve_jwt_claim_identity`] with the validated claim set.
+            // [`Self::resolve_verified_caller`] with the verified caller.
             ManagedIdentityConfig::FromJwtClaim { .. } => Err(CredentialIdentityError::JwtClaimsUnavailable),
         }
     }
@@ -463,6 +508,96 @@ impl CredentialIdentityResolver {
             self.resolve_secret_api_key(key_name, store)
                 .await
                 .map(|(fields, hash, _)| (fields, hash))
+        }
+    }
+
+    /// The identity of a caller from the credential source authentication
+    /// verified on this request, as the Access Point and a Transit Point both
+    /// derive it, so one credential gives one hash, and so one DID, on either.
+    /// `identity` names the credential: `from_jwt_claim` reads its claim and
+    /// namespace claims from the verified JWT, and counts as `source_auth`;
+    /// a caller without a verified JWT is refused as
+    /// [`CredentialIdentityError::JwtClaimsUnavailable`]. `from_mtls` reads the
+    /// verified client certificate: the hash of the CA (or pinned certificate) it
+    /// was verified against, and the `identity_binding` of `verified_by`, the
+    /// mTLS caller authentication that verified it, with the principal that
+    /// binding derived, counting as `source_auth`; a caller without one, or
+    /// verified without mTLS, is refused as
+    /// [`CredentialIdentityError::MtlsCallerMissing`]. `from_api_key` reads
+    /// the presented API key: an API Key Provider key counts as `source_auth`;
+    /// a plain API Key as `unverified`, since every holder of the secret shares
+    /// its DID; a caller without one is refused as
+    /// [`CredentialIdentityError::ApiKeyCallerMissing`]. A mode that names a
+    /// stored credential, a static DID or the payload is refused as
+    /// [`CredentialIdentityError::NotCallerBound`].
+    pub async fn resolve_verified_caller(
+        &self,
+        identity: &ManagedIdentityConfig,
+        caller: &crate::source_auth::AuthenticatedIdentity,
+        verified_by: Option<&crate::source_auth::SourceAuthConfig>,
+        store: Option<&Arc<dyn SecretsStore>>,
+    ) -> Result<VerifiedCallerIdentity, CredentialIdentityError> {
+        use crate::surface_context::IdentityVerification;
+
+        match identity {
+            _ if identity
+                .caller_credential()
+                .is_none() =>
+            {
+                Err(CredentialIdentityError::NotCallerBound)
+            }
+            ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims } => {
+                let claims = caller
+                    .jwt_claims()
+                    .ok_or(CredentialIdentityError::JwtClaimsUnavailable)?;
+                let (identity_fields, identity_hash) = jwt_claim_fields_and_hash(claim, namespace_claims, claims)?;
+                Ok(VerifiedCallerIdentity {
+                    identity_fields,
+                    identity_hash,
+                    verification: IdentityVerification::SourceAuth,
+                })
+            }
+            ManagedIdentityConfig::FromMtls { .. } => {
+                let (
+                    crate::source_auth::AuthenticatedIdentity::Mtls {
+                        principal,
+                        trust_anchor_fingerprint,
+                        ..
+                    },
+                    Some(crate::source_auth::SourceAuthConfig::Mtls(mtls)),
+                ) = (caller, verified_by)
+                else {
+                    return Err(CredentialIdentityError::MtlsCallerMissing);
+                };
+                let (identity_fields, identity_hash) =
+                    mtls_caller_fields_and_hash(trust_anchor_fingerprint, &mtls.identity_binding, principal);
+                Ok(VerifiedCallerIdentity {
+                    identity_fields,
+                    identity_hash,
+                    verification: IdentityVerification::SourceAuth,
+                })
+            }
+            ManagedIdentityConfig::FromApiKey { .. } => {
+                let crate::source_auth::AuthenticatedIdentity::ApiKey { key_name, provider_agent_id } = caller else {
+                    return Err(CredentialIdentityError::ApiKeyCallerMissing);
+                };
+                let from_provider = provider_agent_id.is_some();
+                let (identity_fields, identity_hash) = self
+                    .resolve_presented_api_key(key_name, from_provider, store)
+                    .await?;
+                Ok(VerifiedCallerIdentity {
+                    identity_fields,
+                    identity_hash,
+                    verification: if from_provider {
+                        IdentityVerification::SourceAuth
+                    } else {
+                        IdentityVerification::Unverified
+                    },
+                })
+            }
+            ManagedIdentityConfig::Static { .. } | ManagedIdentityConfig::PayloadExtraction(_) => {
+                Err(CredentialIdentityError::NotCallerBound)
+            }
         }
     }
 
@@ -592,19 +727,16 @@ pub async fn derive_credential_identity(
         .await
 }
 
-/// Resolve a [`CredentialIdentity`] from validated inbound JWT claims.
-///
-/// Request-bound counterpart to [`CredentialIdentityResolver::resolve`]: the
-/// agent DID is derived from the value of `claim` in the caller's verified
-/// token (the Entra Agent ID `oid` by default), namespaced by
-/// `namespace_claims` so the same object id under different tenants / issuers
-/// yields distinct DIDs. The peppered HMAC keeps the derivation stable across
-/// gateways that share `AG_IDENTITY_HASH_PEPPER`.
-pub fn resolve_jwt_claim_identity(
+/// The identity fields and hash of validated inbound JWT claims: the value of
+/// `claim` in the caller's verified token (the Entra Agent ID `oid` by
+/// default), namespaced by `namespace_claims` so the same object id under
+/// different tenants / issuers yields distinct DIDs. The peppered HMAC keeps
+/// the derivation stable across gateways that share `AG_IDENTITY_HASH_PEPPER`.
+fn jwt_claim_fields_and_hash(
     claim: &str,
     namespace_claims: &[String],
     claims: &JsonValue,
-) -> Result<CredentialIdentity, CredentialIdentityError> {
+) -> Result<(HashMap<String, JsonValue>, String), CredentialIdentityError> {
     let value = claims
         .get(claim)
         .and_then(JsonValue::as_str)
@@ -636,11 +768,44 @@ pub fn resolve_jwt_claim_identity(
         .map(|(k, v)| (k.clone(), json!(v)))
         .collect::<HashMap<String, JsonValue>>();
 
-    Ok(CredentialIdentity::Derived {
-        identity_fields,
-        identity_hash,
-        credential_updated_at: None,
-    })
+    Ok((identity_fields, identity_hash))
+}
+
+/// The identity of a verified client certificate: the trust anchor it was
+/// verified against, the identity binding (with its OID for `subject_rdn`) and
+/// the principal that binding derived, so a renewed certificate with the same
+/// principal under the same CA and binding keeps its hash, and one value read
+/// from two certificate fields gives two.
+fn mtls_caller_fields_and_hash(
+    trust_anchor_fingerprint: &str,
+    binding: &crate::source_auth::models::MtlsIdentityBinding,
+    principal: &str,
+) -> (HashMap<String, JsonValue>, String) {
+    use crate::source_auth::models::MtlsIdentityBinding;
+
+    let (binding_type, binding_oid) = match binding {
+        MtlsIdentityBinding::Fingerprint => ("fingerprint", None),
+        MtlsIdentityBinding::SubjectCn => ("subject_cn", None),
+        MtlsIdentityBinding::DnsSan => ("dns_san", None),
+        MtlsIdentityBinding::UriSan => ("uri_san", None),
+        MtlsIdentityBinding::IpSan => ("ip_san", None),
+        MtlsIdentityBinding::SubjectRdn { oid } => ("subject_rdn", Some(oid.as_str())),
+    };
+    let mut pairs = vec![
+        ("credential_type", MTLS_CALLER_CREDENTIAL_TYPE),
+        ("trust_anchor_fingerprint", trust_anchor_fingerprint),
+        ("identity_binding", binding_type),
+    ];
+    if let Some(oid) = binding_oid {
+        pairs.push(("identity_binding_oid", oid));
+    }
+    pairs.push(("principal", principal));
+    let identity_hash = hash_credential(&pairs);
+    let identity_fields = pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), json!(v)))
+        .collect();
+    (identity_fields, identity_hash)
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -790,21 +955,10 @@ mod tests {
     use crate::secrets::Secret;
     use chrono::Duration;
 
-    /// Destructure a `Derived` outcome into `(hash, fields)`; panics otherwise.
-    fn derived_parts(r: &CredentialIdentity) -> (String, HashMap<String, JsonValue>) {
-        match r {
-            CredentialIdentity::Derived {
-                identity_hash, identity_fields, ..
-            } => (identity_hash.clone(), identity_fields.clone()),
-            _ => panic!("expected Derived, got {r:?}"),
-        }
-    }
-
     #[test]
-    fn resolve_jwt_claim_identity_derives_from_oid() {
+    fn jwt_claim_identity_derives_from_oid() {
         let claims = json!({ "oid": "11111111-2222-3333-4444-555555555555", "sub": "app-123" });
-        let resolved = resolve_jwt_claim_identity("oid", &[], &claims).unwrap();
-        let (hash, fields) = derived_parts(&resolved);
+        let (fields, hash) = jwt_claim_fields_and_hash("oid", &[], &claims).unwrap();
         assert_eq!(hash.len(), 64, "identity hash is hex SHA-256");
         assert_eq!(
             fields
@@ -817,29 +971,28 @@ mod tests {
     }
 
     #[test]
-    fn resolve_jwt_claim_identity_is_deterministic() {
+    fn jwt_claim_identity_is_deterministic() {
         let claims = json!({ "oid": "agent-1" });
-        let a = resolve_jwt_claim_identity("oid", &[], &claims).unwrap();
-        let b = resolve_jwt_claim_identity("oid", &[], &claims).unwrap();
-        assert_eq!(derived_parts(&a).0, derived_parts(&b).0, "same claim → same DID hash");
+        let (_, a) = jwt_claim_fields_and_hash("oid", &[], &claims).unwrap();
+        let (_, b) = jwt_claim_fields_and_hash("oid", &[], &claims).unwrap();
+        assert_eq!(a, b, "same claim → same DID hash");
     }
 
     #[test]
-    fn resolve_jwt_claim_identity_namespaces_by_issuer() {
+    fn jwt_claim_identity_namespaces_by_issuer() {
         let tenant_a = json!({ "oid": "shared-oid", "iss": "https://login.microsoftonline.com/aaaa/v2.0" });
         let tenant_b = json!({ "oid": "shared-oid", "iss": "https://login.microsoftonline.com/bbbb/v2.0" });
         let ns = vec!["iss".to_string()];
-        let a = resolve_jwt_claim_identity("oid", &ns, &tenant_a).unwrap();
-        let b = resolve_jwt_claim_identity("oid", &ns, &tenant_b).unwrap();
-        assert_ne!(derived_parts(&a).0, derived_parts(&b).0, "same oid under different issuers must not collide");
-        let (_, fields) = derived_parts(&a);
+        let (fields, a) = jwt_claim_fields_and_hash("oid", &ns, &tenant_a).unwrap();
+        let (_, b) = jwt_claim_fields_and_hash("oid", &ns, &tenant_b).unwrap();
+        assert_ne!(a, b, "same oid under different issuers must not collide");
         assert_eq!(fields.get("ns.iss").unwrap(), &json!("https://login.microsoftonline.com/aaaa/v2.0"));
     }
 
     #[test]
-    fn resolve_jwt_claim_identity_missing_claim_errors() {
+    fn jwt_claim_identity_missing_claim_errors() {
         let claims = json!({ "sub": "app-123" });
-        let err = resolve_jwt_claim_identity("oid", &[], &claims).unwrap_err();
+        let err = jwt_claim_fields_and_hash("oid", &[], &claims).unwrap_err();
         assert_eq!(err.classify(), CredentialIdentityErrorClass::Misconfigured);
         match err {
             CredentialIdentityError::JwtClaimMissing(c) => assert_eq!(c, "oid"),
@@ -848,10 +1001,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_jwt_claim_identity_missing_namespace_claim_errors() {
+    fn jwt_claim_identity_missing_namespace_claim_errors() {
         let claims = json!({ "oid": "agent-1" });
         let ns = vec!["tid".to_string()];
-        let err = resolve_jwt_claim_identity("oid", &ns, &claims).unwrap_err();
+        let err = jwt_claim_fields_and_hash("oid", &ns, &claims).unwrap_err();
         match err {
             CredentialIdentityError::JwtClaimMissing(c) => assert_eq!(c, "tid"),
             other => panic!("expected JwtClaimMissing(tid), got {other:?}"),
@@ -859,9 +1012,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_jwt_claim_identity_non_string_claim_errors() {
+    fn jwt_claim_identity_non_string_claim_errors() {
         let claims = json!({ "oid": 12345 });
-        let err = resolve_jwt_claim_identity("oid", &[], &claims).unwrap_err();
+        let err = jwt_claim_fields_and_hash("oid", &[], &claims).unwrap_err();
         match err {
             CredentialIdentityError::JwtClaimMissing(c) => assert_eq!(c, "oid"),
             other => panic!("expected JwtClaimMissing, got {other:?}"),
@@ -979,7 +1132,7 @@ mod tests {
     #[tokio::test]
     async fn from_mtls_requires_store() {
         let mi = ManagedIdentityConfig::FromMtls {
-            certificate_id: "cert-1".into(),
+            certificate_id: Some("cert-1".into()),
         };
         let err = derive_credential_identity(&mi, None, None)
             .await
@@ -1027,7 +1180,7 @@ mod tests {
         };
 
         let mi = ManagedIdentityConfig::FromMtls {
-            certificate_id: "cert-1".into(),
+            certificate_id: Some("cert-1".into()),
         };
         let r1 = resolver
             .resolve(&mi, Some(&store_a), None)
@@ -1080,7 +1233,7 @@ mod tests {
         let store: Arc<dyn CertificateStore> = Arc::new(InMemoryCertStore::new(make_cert(&pem, false)));
         let resolver = CredentialIdentityResolver::new();
         let mi = ManagedIdentityConfig::FromMtls {
-            certificate_id: "cert-1".into(),
+            certificate_id: Some("cert-1".into()),
         };
         let err = resolver
             .resolve(&mi, Some(&store), None)
@@ -1099,7 +1252,7 @@ mod tests {
         let store: Arc<dyn CertificateStore> = Arc::new(InMemoryCertStore::new(cert));
         let resolver = CredentialIdentityResolver::new();
         let mi = ManagedIdentityConfig::FromMtls {
-            certificate_id: "cert-1".into(),
+            certificate_id: Some("cert-1".into()),
         };
         let err = resolver
             .resolve(&mi, Some(&store), None)
@@ -1116,7 +1269,7 @@ mod tests {
         let store: Arc<dyn CertificateStore> = Arc::new(InMemoryCertStore::new(cert));
         let resolver = CredentialIdentityResolver::new();
         let mi = ManagedIdentityConfig::FromMtls {
-            certificate_id: "cert-1".into(),
+            certificate_id: Some("cert-1".into()),
         };
         let err = resolver
             .resolve(&mi, Some(&store), None)
@@ -1133,7 +1286,7 @@ mod tests {
         let store: Arc<dyn CertificateStore> = Arc::new(InMemoryCertStore::new(cert));
         let resolver = CredentialIdentityResolver::new();
         let mi = ManagedIdentityConfig::FromMtls {
-            certificate_id: "cert-1".into(),
+            certificate_id: Some("cert-1".into()),
         };
         let r = resolver
             .resolve(&mi, Some(&store), None)
@@ -1278,7 +1431,7 @@ mod tests {
         let store: Arc<dyn CertificateStore> = Arc::new(InMemoryCertStore::new(cert.clone()));
         let resolver = CredentialIdentityResolver::new();
         let mi = ManagedIdentityConfig::FromMtls {
-            certificate_id: "cert-1".into(),
+            certificate_id: Some("cert-1".into()),
         };
 
         // First call — miss.
@@ -1591,6 +1744,436 @@ mod tests {
 
         assert_eq!(hash, hash_credential(&[("credential_type", "api_key"), ("api_key_id", "demo-key")]));
         assert_eq!(fields.get("api_key_id"), Some(&json!("demo-key")));
+    }
+
+    fn presented_key() -> ManagedIdentityConfig {
+        ManagedIdentityConfig::FromApiKey { api_key_id: None }
+    }
+
+    fn jwt_claim_identity(namespace_claims: &[&str]) -> ManagedIdentityConfig {
+        ManagedIdentityConfig::FromJwtClaim {
+            claim: "oid".to_string(),
+            namespace_claims: namespace_claims
+                .iter()
+                .map(|claim| (*claim).to_string())
+                .collect(),
+        }
+    }
+
+    fn jwt_caller(claims: JsonValue) -> crate::source_auth::AuthenticatedIdentity {
+        crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "agent".to_string(),
+            principal_claim: "sub".to_string(),
+            claims,
+            verification: Default::default(),
+            strategy_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_verified_jwt_claim_gives_the_access_point_hash_and_counts_as_source_auth() {
+        let claims = json!({ "oid": "agent-oid-1", "tid": "tenant-a", "sub": "app" });
+        let resolver = CredentialIdentityResolver::new();
+        let identity = resolver
+            .resolve_verified_caller(&jwt_claim_identity(&["tid"]), &jwt_caller(claims.clone()), None, None)
+            .await
+            .unwrap();
+        let (access_point_fields, access_point_hash) =
+            jwt_claim_fields_and_hash("oid", &["tid".to_string()], &claims).unwrap();
+        let other = resolver
+            .resolve_verified_caller(
+                &jwt_claim_identity(&["tid"]),
+                &jwt_caller(json!({ "oid": "agent-oid-2", "tid": "tenant-a" })),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(identity.identity_hash, access_point_hash);
+        assert_eq!(identity.identity_fields, access_point_fields);
+        assert_ne!(identity.identity_hash, other.identity_hash, "each claim value has its own hash");
+        assert_eq!(identity.verification, crate::surface_context::IdentityVerification::SourceAuth);
+    }
+
+    #[tokio::test]
+    async fn a_verified_jwt_without_the_claim_has_no_identity() {
+        let err = CredentialIdentityResolver::new()
+            .resolve_verified_caller(&jwt_claim_identity(&[]), &jwt_caller(json!({ "sub": "app" })), None, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, CredentialIdentityError::JwtClaimMissing(ref claim) if claim == "oid"));
+    }
+
+    #[tokio::test]
+    async fn a_caller_verified_without_a_jwt_has_no_jwt_claim_identity() {
+        let err = CredentialIdentityResolver::new()
+            .resolve_verified_caller(
+                &jwt_claim_identity(&[]),
+                &api_key_caller("atgk_shared_1", Some("agents")),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, CredentialIdentityError::JwtClaimsUnavailable));
+        assert_eq!(err.classify(), CredentialIdentityErrorClass::Misconfigured);
+    }
+
+    fn api_key_caller(
+        key_name: &str,
+        provider: Option<&str>,
+    ) -> crate::source_auth::AuthenticatedIdentity {
+        crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: key_name.into(),
+            provider_agent_id: provider.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_verified_provider_key_gives_the_hash_of_its_key_id_and_counts_as_source_auth() {
+        use crate::surface_context::IdentityVerification;
+
+        let resolver = CredentialIdentityResolver::new();
+        let caller = api_key_caller("atgk_shared_1", Some("agents"));
+        let first = resolver
+            .resolve_verified_caller(&presented_key(), &caller, None, None)
+            .await
+            .unwrap();
+        let again = resolver
+            .resolve_verified_caller(&presented_key(), &caller, None, None)
+            .await
+            .unwrap();
+        let (_, presented) = resolver
+            .resolve_presented_api_key("atgk_shared_1", true, None)
+            .await
+            .unwrap();
+        let other = resolver
+            .resolve_verified_caller(&presented_key(), &api_key_caller("atgk_shared_2", Some("agents")), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(first.identity_hash, again.identity_hash);
+        assert_eq!(first.identity_hash, presented);
+        assert_eq!(
+            first.identity_hash,
+            hash_credential(&[("credential_type", "api_key"), ("api_key_id", "atgk_shared_1")])
+        );
+        assert_ne!(first.identity_hash, other.identity_hash);
+        assert_eq!(
+            first
+                .identity_fields
+                .get("api_key_id"),
+            Some(&json!("atgk_shared_1"))
+        );
+        assert_eq!(first.verification, IdentityVerification::SourceAuth);
+    }
+
+    #[tokio::test]
+    async fn a_verified_plain_key_gives_the_hash_of_its_secret_and_counts_as_unverified() {
+        let store: Arc<dyn SecretsStore> = Arc::new(InMemorySecretsStore::new(make_secret("v")));
+        let identity = CredentialIdentityResolver::new()
+            .resolve_verified_caller(&presented_key(), &api_key_caller("demo-key", None), None, Some(&store))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            identity.identity_hash,
+            hash_credential(&[("credential_type", "api_key"), ("api_key_id", "demo-key")])
+        );
+        assert_eq!(identity.verification, crate::surface_context::IdentityVerification::Unverified);
+    }
+
+    fn caller_certificate() -> ManagedIdentityConfig {
+        ManagedIdentityConfig::FromMtls { certificate_id: None }
+    }
+
+    fn mtls_caller(
+        trust_anchor: &str,
+        principal: &str,
+        fingerprint: &str,
+    ) -> crate::source_auth::AuthenticatedIdentity {
+        crate::source_auth::AuthenticatedIdentity::Mtls {
+            principal: principal.to_string(),
+            fingerprint: fingerprint.to_string(),
+            subject_dn: format!("CN={principal}"),
+            issuer_dn: "CN=agents-ca".to_string(),
+            trust_anchor_fingerprint: trust_anchor.to_string(),
+            sans: Default::default(),
+            source: crate::source_auth::models::PeerCertSource::DirectTls,
+        }
+    }
+
+    fn mtls_caller_authentication(
+        binding: crate::source_auth::models::MtlsIdentityBinding
+    ) -> crate::source_auth::SourceAuthConfig {
+        crate::source_auth::SourceAuthConfig::Mtls(crate::source_auth::models::MtlsAuthConfig {
+            trust: crate::source_auth::models::MtlsTrust::Ca {
+                ca_certificate_ids: vec!["agents-ca".to_string()],
+                require_client_auth_eku: true,
+                check_crl: false,
+                require_ocsp: false,
+            },
+            identity_binding: binding,
+            allowed_subjects: Vec::new(),
+            allow_forwarded: true,
+        })
+    }
+
+    async fn caller_certificate_hash_under(
+        binding: crate::source_auth::models::MtlsIdentityBinding,
+        caller: &crate::source_auth::AuthenticatedIdentity,
+    ) -> String {
+        CredentialIdentityResolver::new()
+            .resolve_verified_caller(&caller_certificate(), caller, Some(&mtls_caller_authentication(binding)), None)
+            .await
+            .unwrap()
+            .identity_hash
+    }
+
+    async fn caller_certificate_hash(caller: &crate::source_auth::AuthenticatedIdentity) -> String {
+        caller_certificate_hash_under(crate::source_auth::models::MtlsIdentityBinding::SubjectCn, caller).await
+    }
+
+    #[tokio::test]
+    async fn a_verified_client_certificate_gives_one_hash_per_ca_and_principal() {
+        let identity = CredentialIdentityResolver::new()
+            .resolve_verified_caller(
+                &caller_certificate(),
+                &mtls_caller("ca-a", "agent-1", "leaf-1"),
+                Some(&mtls_caller_authentication(crate::source_auth::models::MtlsIdentityBinding::SubjectCn)),
+                None,
+            )
+            .await
+            .unwrap();
+        let renewed = caller_certificate_hash(&mtls_caller("ca-a", "agent-1", "leaf-2")).await;
+        let other_ca = caller_certificate_hash(&mtls_caller("ca-b", "agent-1", "leaf-1")).await;
+        let other_principal = caller_certificate_hash(&mtls_caller("ca-a", "agent-2", "leaf-1")).await;
+
+        assert_eq!(identity.identity_hash, renewed, "a renewed certificate keeps its hash");
+        assert_ne!(identity.identity_hash, other_ca, "another CA gives another hash");
+        assert_ne!(identity.identity_hash, other_principal, "another principal gives another hash");
+        assert_eq!(
+            identity.identity_hash,
+            hash_credential(&[
+                ("credential_type", MTLS_CALLER_CREDENTIAL_TYPE),
+                ("trust_anchor_fingerprint", "ca-a"),
+                ("identity_binding", "subject_cn"),
+                ("principal", "agent-1"),
+            ])
+        );
+        assert_eq!(
+            identity
+                .identity_fields
+                .get("identity_binding"),
+            Some(&json!("subject_cn"))
+        );
+        assert!(
+            !identity
+                .identity_fields
+                .contains_key("identity_binding_oid")
+        );
+        assert_eq!(
+            identity
+                .identity_fields
+                .get("principal"),
+            Some(&json!("agent-1"))
+        );
+        assert_eq!(
+            identity
+                .identity_fields
+                .get("trust_anchor_fingerprint"),
+            Some(&json!("ca-a"))
+        );
+        assert_eq!(identity.verification, crate::surface_context::IdentityVerification::SourceAuth);
+    }
+
+    #[tokio::test]
+    async fn one_principal_under_one_ca_gives_one_hash_per_identity_binding() {
+        use crate::source_auth::models::MtlsIdentityBinding;
+
+        let caller = mtls_caller("ca-a", "agent-1", "leaf-1");
+        let renewed = mtls_caller("ca-a", "agent-1", "leaf-2");
+        let rdn = |oid: &str| MtlsIdentityBinding::SubjectRdn { oid: oid.to_string() };
+        let mut hashes = Vec::new();
+        for binding in [
+            MtlsIdentityBinding::Fingerprint,
+            MtlsIdentityBinding::SubjectCn,
+            MtlsIdentityBinding::DnsSan,
+            MtlsIdentityBinding::UriSan,
+            MtlsIdentityBinding::IpSan,
+            rdn("0.9.2342.19200300.100.1.1"),
+            rdn("2.5.4.5"),
+        ] {
+            if binding == MtlsIdentityBinding::Fingerprint {
+                let hash =
+                    caller_certificate_hash_under(binding.clone(), &mtls_caller("ca-a", "leaf-1", "leaf-1")).await;
+                assert_ne!(
+                    hash,
+                    caller_certificate_hash_under(binding.clone(), &mtls_caller("ca-a", "leaf-2", "leaf-2")).await,
+                    "under a fingerprint binding the principal is the certificate's hash, so a renewal is a new caller"
+                );
+                assert!(!hashes.contains(&hash), "{binding:?} shares a hash with another binding");
+                hashes.push(hash);
+                continue;
+            }
+            let hash = caller_certificate_hash_under(binding.clone(), &caller).await;
+            assert_eq!(
+                hash,
+                caller_certificate_hash_under(binding.clone(), &renewed).await,
+                "a renewed certificate keeps its hash under {binding:?}"
+            );
+            assert!(!hashes.contains(&hash), "{binding:?} shares a hash with another binding");
+            hashes.push(hash);
+        }
+
+        let fields = CredentialIdentityResolver::new()
+            .resolve_verified_caller(
+                &caller_certificate(),
+                &caller,
+                Some(&mtls_caller_authentication(rdn("2.5.4.5"))),
+                None,
+            )
+            .await
+            .unwrap()
+            .identity_fields;
+        assert_eq!(fields.get("identity_binding"), Some(&json!("subject_rdn")));
+        assert_eq!(fields.get("identity_binding_oid"), Some(&json!("2.5.4.5")));
+    }
+
+    #[tokio::test]
+    async fn a_client_certificate_verified_without_mtls_caller_authentication_has_no_identity() {
+        let caller = mtls_caller("ca-a", "agent-1", "leaf-1");
+        let api_key = serde_json::from_value::<crate::source_auth::SourceAuthConfig>(json!({
+            "type": "api_key", "secret_id": "keys",
+            "extraction": { "source": "http_header", "field": "X-API-Key" }
+        }))
+        .unwrap();
+        for verified_by in [None, Some(&api_key)] {
+            let err = CredentialIdentityResolver::new()
+                .resolve_verified_caller(&caller_certificate(), &caller, verified_by, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, CredentialIdentityError::MtlsCallerMissing), "{verified_by:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_caller_certificate_hash_never_equals_a_stored_certificate_hash() {
+        let caller = caller_certificate_hash(&mtls_caller("cert-1", "cert-1", "leaf-1")).await;
+        let store: Arc<dyn CertificateStore> = Arc::new(InMemoryCertStore::new(make_cert(&self_signed_pem(), true)));
+        let stored = CredentialIdentityResolver::new()
+            .resolve(
+                &ManagedIdentityConfig::FromMtls {
+                    certificate_id: Some("cert-1".into()),
+                },
+                Some(&store),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(caller, unwrap_derived(&stored).0);
+    }
+
+    #[tokio::test]
+    async fn a_caller_verified_without_a_client_certificate_has_no_certificate_identity() {
+        let err = CredentialIdentityResolver::new()
+            .resolve_verified_caller(
+                &caller_certificate(),
+                &api_key_caller("atgk_shared_1", Some("agents")),
+                Some(&mtls_caller_authentication(crate::source_auth::models::MtlsIdentityBinding::SubjectCn)),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, CredentialIdentityError::MtlsCallerMissing));
+        assert_eq!(err.classify(), CredentialIdentityErrorClass::Misconfigured);
+        assert_eq!(err.reason_label(), "mtls_unavailable");
+    }
+
+    #[tokio::test]
+    async fn a_stored_from_mtls_without_certificate_id_is_misconfigured() {
+        for certificate_id in [None, Some(String::new()), Some("  ".to_string())] {
+            let err = CredentialIdentityResolver::new()
+                .resolve(&ManagedIdentityConfig::FromMtls { certificate_id }, None, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, CredentialIdentityError::CertificateIdMissing));
+            assert_eq!(err.classify(), CredentialIdentityErrorClass::Misconfigured);
+            assert_eq!(err.reason_label(), "certificate_id_missing");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_caller_verified_without_an_api_key_has_no_api_key_identity() {
+        let caller = crate::source_auth::AuthenticatedIdentity::DidAuth {
+            did: "did:example:caller".into(),
+        };
+        let err = CredentialIdentityResolver::new()
+            .resolve_verified_caller(&presented_key(), &caller, None, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, CredentialIdentityError::ApiKeyCallerMissing));
+        assert_eq!(err.classify(), CredentialIdentityErrorClass::Misconfigured);
+        assert_eq!(err.reason_label(), "api_key_unavailable");
+    }
+
+    #[tokio::test]
+    async fn an_identity_that_names_no_caller_credential_never_reads_the_presented_key() {
+        let caller = api_key_caller("atgk_shared_1", Some("agents"));
+        let mtls = mtls_caller("ca-a", "agent-1", "leaf-1");
+        let mtls_auth = mtls_caller_authentication(crate::source_auth::models::MtlsIdentityBinding::SubjectCn);
+        let cases = [
+            (
+                ManagedIdentityConfig::FromApiKey {
+                    api_key_id: Some("atgk_stored".into()),
+                },
+                &caller,
+                None,
+            ),
+            (
+                ManagedIdentityConfig::Static {
+                    did: "did:web:static.example".into(),
+                },
+                &caller,
+                None,
+            ),
+            (
+                ManagedIdentityConfig::PayloadExtraction(crate::source_auth::models::PayloadExtractionConfig {
+                    extension_uri: None,
+                    meta_field: "agentIdentity".into(),
+                    fields: Vec::new(),
+                    json_schema: None,
+                    extension_rules: None,
+                    strip_raw_meta: false,
+                }),
+                &caller,
+                None,
+            ),
+            (
+                ManagedIdentityConfig::FromMtls {
+                    certificate_id: Some("cert-1".into()),
+                },
+                &mtls,
+                Some(&mtls_auth),
+            ),
+        ];
+        for (identity, caller, verified_by) in cases {
+            let err = CredentialIdentityResolver::new()
+                .resolve_verified_caller(&identity, caller, verified_by, None)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, CredentialIdentityError::NotCallerBound), "{identity:?}: {err:?}");
+            assert_eq!(err.classify(), CredentialIdentityErrorClass::Misconfigured);
+            assert_eq!(err.reason_label(), "identity_not_caller_bound");
+        }
     }
 
     #[tokio::test]

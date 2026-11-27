@@ -64,6 +64,43 @@ pub fn create_mcp_error_response(
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
+/// The answer to an MCP request the gateway could not carry to its Target: a JSON-RPC `-32603`
+/// error that echoes the request `id` with `data.reason` set to `reason`, under HTTP `status`.
+/// A JSON-RPC notification (an object without an `id`) gets `status` and no body, and a body
+/// whose `id` cannot be read is answered with a `null` one.
+pub fn target_failure_response(
+    status: StatusCode,
+    request_body: &[u8],
+    reason: &str,
+    message: &str,
+) -> Response {
+    let id = match serde_json::from_slice::<JsonValue>(request_body) {
+        Ok(JsonValue::Object(message)) => message.get("id").cloned(),
+        _ => Some(JsonValue::Null),
+    };
+    target_failure_response_with_id(status, id, reason, message)
+}
+
+/// [`target_failure_response`] for a request whose `id` was already read: `None` for a
+/// notification, which gets `status` and no body.
+pub fn target_failure_response_with_id(
+    status: StatusCode,
+    id: Option<JsonValue>,
+    reason: &str,
+    message: &str,
+) -> Response {
+    match id {
+        Some(id) => create_mcp_error_response_with_status(
+            status,
+            Some(id),
+            error_codes::INTERNAL_ERROR,
+            message,
+            Some(json!({"reason": reason})),
+        ),
+        None => status.into_response(),
+    }
+}
+
 /// Standard JSON-RPC error codes
 pub mod error_codes {
     /// Invalid JSON was received by the server
@@ -119,6 +156,50 @@ mod tests {
         let response = create_mcp_error_response(None, error_codes::INVALID_REQUEST, "Invalid request", None);
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response_json(response).await["id"], JsonValue::Null);
+    }
+
+    #[tokio::test]
+    async fn target_failure_echoes_the_request_id_under_the_given_status() {
+        for (body, id) in [
+            (r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#, json!(7)),
+            (r#"{"jsonrpc":"2.0","id":"abc","method":"tools/list"}"#, json!("abc")),
+            (r#"not json"#, JsonValue::Null),
+            (r#"[{"jsonrpc":"2.0","id":1,"method":"x"}]"#, JsonValue::Null),
+        ] {
+            let response = target_failure_response(
+                StatusCode::BAD_GATEWAY,
+                body.as_bytes(),
+                "target_unreachable",
+                "Target unavailable",
+            );
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{body}");
+            assert_eq!(response.headers()["content-type"], "application/json");
+            let json = response_json(response).await;
+            assert_eq!(
+                json,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32603, "message": "Target unavailable", "data": {"reason": "target_unreachable"}},
+                }),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn target_failure_for_a_notification_has_a_status_and_no_body() {
+        let response = target_failure_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            "target_auth_misconfigured",
+            "Target authentication failed",
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(bytes.is_empty());
     }
 
     #[tokio::test]

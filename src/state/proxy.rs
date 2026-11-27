@@ -116,6 +116,18 @@ pub struct ProxyState {
     pub served_surface: Arc<crate::config::agent_surface::AgentSurface>,
 }
 
+impl ProxyState {
+    /// Where the keys this request signs with are resolved: its surface and the
+    /// variant serving it.
+    pub fn key_scope(&self) -> crate::vta::key_directory::KeyScope {
+        crate::vta::key_directory::KeyScope::serving(
+            &self.surface,
+            self.active_variant_id
+                .as_deref(),
+        )
+    }
+}
+
 /// Surface info with routing support (includes rules engines and identity selector)
 #[derive(Clone)]
 pub struct SurfaceInfo {

@@ -63,7 +63,7 @@ Every gateway and surface policy input carries these fields (`PolicyInput` in
 | `input.channel.variant_alias` | The surface variant the request selects: set on Fabric receive and on a Transit Point; absent on a direct request and for the default variant. |
 | `input.gateway.direction` | `inbound` for a request arriving at the Access Point, directly or over Fabric receive: the gateway policy, the Access Point policy and the Target's request policy see it. `outbound` for a request the managed agent sends through a Transit Point: the gateway policy, the shared Transit Point policy and the Transit Point's own policy see it. Also `outbound` for the request a surface with a `fabric://` Target sends to the peer gateway: the Target's request policy sees it there, and so do the MCP tool gating conditions on that leg, without `input.transit`. Test `input.transit` to tell a Transit Point evaluation from that one. |
 | `input.gateway.target_id` | On a Transit Point, its configured `target_endpoint`, such as `https://api.example.com/mcp`, or `fabric://{gateway_id}/{surface_id}` on a Fabric route; never the URL of one request. On the send of a `fabric://` Target, the peer gateway's DID. Absent on `inbound`. |
-| `input.gateway.source_id` | On a Transit Point, the managed agent's DID when it has one. On Fabric receive, the DID that sent the forward request. Absent on the send of a `fabric://` Target. |
+| `input.gateway.source_id` | On a Transit Point, the managed agent's DID when it has one. On a Transit Point whose `managed_identity` is `from_api_key` without `api_key_id`, `from_jwt_claim`, or `from_mtls` without `certificate_id`, the DID of the API key, the JWT claim, or the client certificate its caller presented, never an identity the request body asserts (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-identity-from-its-caller)). On Fabric receive, the DID that sent the forward request. Absent on the send of a `fabric://` Target. |
 
 ### MCP tool policy input
 
@@ -467,7 +467,11 @@ may hold managed-agent elements; any other list refuses them with `400`.
 
 A managed-agent element whose `query.entity_id` is blank asks about the DID the Transit Point
 calls out under: its own managed identity's when it has one, otherwise the surface Managed
-Agent's identity it injects. Templates, authority lists, `authority_source`, query types and
+Agent's identity it injects. On a Transit Point whose identity is taken from its caller's
+credential (see
+[Transit Point identity from its caller](SOURCE_AUTH.md#transit-point-identity-from-its-caller)),
+that is the DID of the API key, JWT claim or client certificate the Transit Point verified on
+the request, never one the body asserts. Templates, authority lists, `authority_source`, query types and
 timeouts work as on any element. When no managed agent DID is resolved for the request, each
 managed-agent element reports `MANAGED_AGENT_IDENTITY_UNAVAILABLE` without asking its trust
 registry; such a Transit Point can still be saved. Managed-agent elements need no destination
@@ -739,14 +743,18 @@ different credential header on each side.
 `input.extension_identity` is the caller identity the gateway resolved on the
 inbound leg (`did`, `identity_hash`), and `normalize_caller_did` promotes its
 `did` into `input.agent.did` when the body asserted none (unless the Trust
-Check flagged an identity mismatch). Both carry how the DID was established:
+Check flagged an identity mismatch). On a Transit Point it is the managed agent instead, with
+the same values and no promotion (see
+[Caller in Transit Point policy input](#caller-in-transit-point-policy-input)). A DID used as
+given, a `static` DID or a certificate with a pinned DID, has no hash, so `identity_hash` is
+absent on both legs; match such a DID by `did`. Both carry how the DID was established:
 
 | Field | Values | Meaning |
 | --- | --- | --- |
 | `input.extension_identity.verification`, `input.agent.did_verification` | `vp` | The caller proved control of the DID with an identity presentation that verified and whose issuer is one of the sending connection's issuers. Only the fabric receive path produces it. |
 | | `vp_unanchored` | The caller proved control of the DID with an identity presentation that verified, but no trust anchor vouches for its issuer: the direct A2A path has no authenticated sender, so a self-issued credential ends here too. Trust its identity fields only after checking `input.agent.identity_issuer_did` or a Trust Check. |
-| | `source_auth` | The DID is bound to the source credential this gateway authenticated on this request: `from_jwt_claim`, or an API Key Provider key on an inbound `from_api_key` slot. |
-| | `unverified` | Nothing in the request proves the DID: `x-identity` payload pseudonyms, surface-configured identities (`static`, `from_mtls`, a stored-key `from_api_key`), and a plain API Key on an inbound `from_api_key` slot, whose DID every holder of the secret shares. |
+| | `source_auth` | The DID is bound to the source credential this gateway authenticated on this request: `from_jwt_claim`, or an API Key Provider key on an inbound `from_api_key` slot; on a Transit Point whose identity is taken from its caller, the API Key Provider key, the JWT claim or the client certificate the Transit Point verified. |
+| | `unverified` | Nothing in the request proves the DID: `x-identity` payload pseudonyms, surface-configured identities (`static`, a stored-certificate `from_mtls`, a stored-key `from_api_key`), and a plain API Key on an inbound `from_api_key` slot, whose DID every holder of the secret shares. |
 | `input.extension_identity.verified`, `input.agent.did_verified` | `true` / `false` | Boolean projection: everything but `unverified` is verified. |
 
 `input.agent.trust_verification` is `true` when every Trust Registry recognition query for
@@ -810,7 +818,9 @@ Every Transit Point evaluation (gateway, surface, per-Transit-Point and response
 and MCP tool gating conditions on a Transit Point) gets `input.transit`. It is never on an
 inbound evaluation, where `input.source_auth` and `input.extension_identity` carry the
 caller, nor on the `outbound` evaluation of the request a `fabric://` Target sends, where
-only `input.source_auth` does. It names two principals, each in its own field, because one call can carry both:
+only `input.source_auth` does. The same Transit Point evaluations also get the Transit
+Point's own caller, the managed agent, in `input.extension_identity` (see below). `input.transit`
+names two principals, each in its own field, because one call can carry both:
 
 - `input.transit.caller` is the end user the transit token names, as the Access Point
   authenticated them. Without a transit token it is `anonymous`.
@@ -825,15 +835,49 @@ caller named only by an unverified DID is reported, and never as verified.
 The policy editor's built-in templates that read the caller (`input.source_auth`,
 `input.agent` or `input.extension_identity`) decide on the Access Point and Target request
 policies. On a Transit Point `input.source_auth` is the client the Transit Point
-authenticated, `input.agent` describes the destination and there is no
-`input.extension_identity`; an inbound response policy gets none of the three. On the send of
+authenticated, `input.agent` describes the destination and `input.extension_identity` is the
+managed agent, so a template that reads `input.extension_identity` decides on the managed
+agent there, and denies while the managed agent has no identity; an inbound response policy
+gets none of the three. On the send of
 a `fabric://` Target, the Target's request policy gets `input.source_auth` but no
 `input.extension_identity`, and its `input.agent` describes this Access Point's own card, not
 the caller, so the templates that read `input.extension_identity` or `input.agent` deny every
 request there.
 
-A Transit Point's response policy gets `input.transit`, and `input.source_auth` when the
-Transit Point authenticated a client, beside its `input.response`, `input.caller` and
+On a Transit Point the managed agent's DID is `input.extension_identity.did`,
+`input.gateway.source_id`, and its response policy's `input.caller.did`. A Transit Point whose `managed_identity` is `from_api_key` without
+`api_key_id` takes it from the API key the Transit Point's `source_auth` verified on this
+request, one whose `managed_identity` is `from_jwt_claim` from the claim of the JWT it
+verified, and one whose `managed_identity` is `from_mtls` without `certificate_id` from the CA and
+principal of the client certificate it verified, replacing any identity the body asserts. How far
+that DID can be trusted follows the credential, as on the Access Point, and
+`input.extension_identity` carries it in the Access Point's shape (`did`, `identity_hash`,
+`verification`, `verified`): a JWT claim, an API Key Provider key and a client certificate give
+each claim value, key or CA and principal its own DID (`source_auth`), while a plain API Key
+gives every holder of the secret the same DID (`unverified`). A managed agent identity read from
+the request payload, a static DID, a stored key or a stored certificate is `unverified`; a
+Transit Point never verifies an identity presentation from its caller, so it never reports
+`vp` or `vp_unanchored`. `input.extension_identity` is absent when the managed agent has no
+identity, such as an API key or client certificate caller without a VC issuer; a JWT caller is
+refused there instead (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-identity-from-its-caller)). A rule that trusts the DID as one caller tests
+`input.extension_identity.verification == "source_auth"`. The DID is never copied into
+`input.agent`, which describes the destination. A Transit Point Trust Check element that asks
+about the destination never reads `input.extension_identity`, so a template that falls back to
+it never resolves to the managed agent. A managed-agent element (see
+[Self recognition check](#self-recognition-check)) asks about the managed agent's resolved DID,
+which for an identity taken from the caller's credential is the DID of that credential.
+
+Gateway and surface policies run on Transit Point calls too, so they also see
+`input.extension_identity` there. A rule such as `input.extension_identity.verified == false`,
+which never matched on a Transit Point before, now matches a managed agent identity read from
+the payload, a static DID or a stored key or certificate (all `unverified`), and can deny
+Transit Point traffic it used to allow. Scope such a rule to the inbound legs by testing that
+`input.transit` is absent.
+
+A Transit Point's response policy gets `input.transit`, `input.extension_identity` while the
+managed agent has an identity, and `input.source_auth` when the Transit Point authenticated a
+client, beside its `input.response`, `input.caller` and
 `input.surface`. Its `input.caller.did` is the managed agent's DID, not the Transit Point's
 caller, so a rule about who receives a response reads `input.transit.caller`.
 
@@ -1006,6 +1050,22 @@ flowchart LR
     R --> P["Per-request client pinned to that<br/>address, redirects disabled"]
     P --> S["Send. An upstream 3xx is<br/>returned, not followed"]
 ```
+
+### Trust agent addresses
+
+A trust agent is a control-plane dependency and never a data-plane destination. The gateway
+reserves the origin (`host:port`, scheme and path ignored) of every trust agent it signs through:
+the `[vta]` block's `base_url` at startup, and each stored connection's endpoint at startup and
+when it is created or its client is built ([`src/vta/isolation.rs`](../src/vta/isolation.rs)).
+Both pinned egress clients, `pinned_forward_client` (the forward step of every surface, MCP proxy
+and A2A proxy Target and Transit Point) and `pinned_strict_client`, refuse a reserved origin
+before resolving it, even where the forward-leg policy allows loopback and RFC 1918, so a caller
+cannot drive the trust agent through the proxy pipeline. Only addresses the gateway was
+configured with are reserved, never request input, so other local services stay reachable.
+Every name of the gateway's own host (`localhost`, a `.localhost` name, a loopback or unspecified
+address) counts as one host, listed as `loopback`, so a trust agent at `127.0.0.1:3000` is also
+refused as `localhost:3000` or `[::1]:3000`. Another host name that resolves to the same address
+is not compared. `GET /v1/vta/status` lists the reserved origins under `reserved_origins`.
 
 ### Other pinned egress sinks
 

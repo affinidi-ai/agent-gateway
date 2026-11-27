@@ -139,6 +139,28 @@ pub async fn a_fabric_with_n_gateways(
         .max(count);
 }
 
+#[given(regex = r"^a fabric with (\d+) gateways that pause for mediator access when they pair$")]
+pub async fn a_fabric_pairing_through_mediator_access(
+    world: &mut G2gWorld,
+    count: usize,
+) {
+    a_fabric_with_n_gateways(world, count).await;
+    world
+        .topology
+        .pause_for_mediator_access = true;
+}
+
+#[given(regex = r"^a fabric with (\d+) gateways that pause for mediator access and restart while paused$")]
+pub async fn a_fabric_restarting_while_paused(
+    world: &mut G2gWorld,
+    count: usize,
+) {
+    a_fabric_pairing_through_mediator_access(world, count).await;
+    world
+        .topology
+        .restart_while_paused = true;
+}
+
 /// The receiving gateway admits Fabric streams as one whose surfaces serve
 /// only that MCP revision does; no product setting does this.
 #[given(expr = "gateway {int} admits only MCP protocol version \"2024-11-05\" over Fabric")]
@@ -492,6 +514,14 @@ pub async fn transit_point_authenticates_callers_with_api_key(
         secret_id: format!("{}-{transit_point}-caller-key", link.from_surface),
         valid_key,
     });
+}
+
+#[given(expr = "Transit Point {string} takes the managed agent's identity from its caller's API key")]
+pub async fn transit_point_takes_identity_from_caller_api_key(
+    world: &mut G2gWorld,
+    transit_point: String,
+) {
+    transit_point_spec_mut(world, &transit_point).identity_from_caller_api_key = true;
 }
 
 /// `error_codes` is a comma-separated list.
@@ -1765,6 +1795,75 @@ pub async fn gateway_has_published_an_oob_invitation_for_gateway(
         .await
         .expect("create OOB invitation");
     world.pending_oob_url = Some(connection_point.oob_url);
+}
+
+#[given(regex = r"^gateway (\d+) has accepted the invitation and gateway (\d+) holds it for approval$")]
+pub async fn gateway_has_accepted_the_invitation(
+    world: &mut G2gWorld,
+    acceptor: usize,
+    inviter: usize,
+) {
+    let inviter_admin = world
+        .harness()
+        .gw(inviter)
+        .admin
+        .clone();
+    let existing = inviter_admin
+        .remote_gateway_ids()
+        .await
+        .expect("list the inviter's remote gateways");
+    crate::steps::when::accept_pending_oob(world, acceptor, None).await;
+    assert_eq!(world.response_status, Some(200), "first acceptance: {:?}", world.response_body);
+    inviter_admin
+        .wait_for_new_remote_gateway_status(
+            &existing,
+            crate::bdd_support::admin_client::GatewayStatus::AwaitingApproval,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .expect("the inviter redeems the invitation and holds the acceptor for approval");
+}
+
+#[given(regex = r"^gateway (\d+) has deleted the gateway it accepted$")]
+pub async fn gateway_has_deleted_the_gateway_it_accepted(
+    world: &mut G2gWorld,
+    acceptor: usize,
+) {
+    let gateway_id = world
+        .accepted_gateway_id
+        .take()
+        .expect("a step must accept an invitation before this one");
+    let deleted = world
+        .harness()
+        .gw(acceptor)
+        .admin
+        .delete_gateway_recorded(&gateway_id)
+        .await
+        .expect("delete request completes at the transport layer");
+    assert!((200..300).contains(&deleted.status), "delete refused: {} {}", deleted.status, deleted.body);
+}
+
+#[given(regex = r"^gateway (\d+) has accepted the invitation again and been refused$")]
+pub async fn gateway_has_been_refused_on_the_invitation_again(
+    world: &mut G2gWorld,
+    acceptor: usize,
+) {
+    super::when::gateway_accepts_the_invitation_again(world, acceptor).await;
+    let gateway_id = world
+        .accepted_gateway_id
+        .clone()
+        .expect("accepting the invitation again records the gateway");
+    world
+        .harness()
+        .gw(acceptor)
+        .admin
+        .wait_for_gateway_status(
+            &gateway_id,
+            crate::bdd_support::admin_client::GatewayStatus::Failed,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("setup failed: gateway {acceptor} never marked {gateway_id} failed: {error:#}"));
 }
 
 #[given(expr = "the mediator has lost every account it held")]

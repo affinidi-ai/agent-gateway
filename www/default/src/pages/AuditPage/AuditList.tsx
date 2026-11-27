@@ -28,7 +28,7 @@ interface AuditListProps {
   /** Reads the log again, for the retry offered with the error. */
   onRetry?: () => void;
   onPageChange: (updater: number | ((p: number) => number)) => void;
-  /** Names the users policy changes were made by. */
+  /** Names the users changes were made by. */
   userName?: UserNameResolver;
 }
 

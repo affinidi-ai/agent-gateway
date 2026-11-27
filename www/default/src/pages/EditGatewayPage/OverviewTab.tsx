@@ -25,6 +25,8 @@ interface OverviewTabProps {
   runtimeStatus?: ConnectionRuntimeStatus | null;
   isEditMode: boolean;
   isSelfGateway: boolean;
+  /** The connection was sent and the other gateway has not accepted it yet. */
+  isPending?: boolean;
   saving: boolean;
   id?: string;
   handleSubmit: (e: React.FormEvent) => void;
@@ -40,6 +42,7 @@ const OverviewTab: React.FC<OverviewTabProps> = ({
   runtimeStatus,
   isEditMode,
   isSelfGateway,
+  isPending = false,
   saving,
   id,
   handleSubmit,
@@ -52,6 +55,12 @@ const OverviewTab: React.FC<OverviewTabProps> = ({
         <div className="alert alert-info" role="alert">
           <i className="fas fa-info-circle me-2"></i>
           This is the self gateway and cannot be deleted. It can be edited to update its details.
+        </div>
+      )}
+      {isPending && (
+        <div className="alert alert-info" role="status" data-testid="gateway-editor-pending-notice">
+          <i className="fas fa-hourglass-half me-2" aria-hidden="true"></i>
+          This connection is pending. It becomes active once the other gateway accepts it.
         </div>
       )}
       {runtimeStatus && runtimeStatus.status !== 'connected' && (
@@ -195,7 +204,7 @@ const OverviewTab: React.FC<OverviewTabProps> = ({
             <div className="mb-4">
               <div className="form-check">
                 <input
-                  disabled={isSelfGateway}
+                  disabled={isSelfGateway || isPending}
                   type="checkbox"
                   className="form-check-input"
                   id="status"

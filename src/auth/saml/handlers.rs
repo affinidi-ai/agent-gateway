@@ -337,6 +337,30 @@ pub async fn saml_acs(
                 error!("SAML sign-in blocked by appliance limit: {}", limit.message());
                 return Ok(saml_error_page(StatusCode::FORBIDDEN, "Sign-in unavailable", &limit.message()));
             }
+            if let Some(refused) = e.downcast_ref::<super::user_provisioning::RoleRefused>() {
+                warn!(saml_subject = ?refused.subject, idp_role = ?refused.idp_role, "SAML sign-in refused: {}", e);
+                crate::integrations::trigger_user_login_failed(
+                    crate::integrations::LoginMethod::Saml,
+                    crate::integrations::LoginFailure::RoleNotMapped,
+                );
+                return Ok(saml_error_page(
+                    StatusCode::FORBIDDEN,
+                    "Sign-in unavailable",
+                    "Your account has no role in this application. Please contact your administrator.",
+                ));
+            }
+            if let Some(ambiguous) = e.downcast_ref::<super::user_provisioning::AmbiguousAttribute>() {
+                warn!(attribute = ambiguous.attribute, "SAML sign-in refused: {}", e);
+                crate::integrations::trigger_user_login_failed(
+                    crate::integrations::LoginMethod::Saml,
+                    crate::integrations::LoginFailure::AmbiguousAttribute,
+                );
+                return Ok(saml_error_page(
+                    StatusCode::FORBIDDEN,
+                    "Sign-in unavailable",
+                    "Your identity provider sent conflicting account details. Please contact your administrator.",
+                ));
+            }
             error!("Failed to provision user from SAML: {}", e);
             return Ok(saml_error_page(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -731,6 +755,7 @@ mod tests {
                 .to_string(),
             attribute_mapping: SamlAttributeMapping::default(),
             role_mapping: HashMap::new(),
+            default_role: None,
             require_encrypted_assertions: false,
             sign_requests: false,
             sp_key_path: None,

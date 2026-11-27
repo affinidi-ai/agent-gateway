@@ -22,7 +22,8 @@ pub async fn prepare_agent_card(
     let identity = super::identity::resolve_synthetic_identity(proxy, surface, vc_issuer).await?;
 
     if let (Some(identity @ ProtectedAgentIdentity::Managed { .. }), Some(vc_issuer)) = (identity.as_ref(), vc_issuer) {
-        crate::a2a::upsert_credential_into_agent_card(&mut card, identity, vc_issuer, channel_name).await?;
+        let scope = crate::vta::key_directory::KeyScope::serving(surface, None);
+        crate::a2a::upsert_credential_into_agent_card(&mut card, identity, vc_issuer, channel_name, &scope).await?;
     }
 
     Ok(PreparedA2aProxyAgentCard { card, identity })

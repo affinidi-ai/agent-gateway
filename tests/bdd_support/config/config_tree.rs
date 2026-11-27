@@ -17,6 +17,7 @@ use crate::bdd_support::config::mcp_proxy::{McpProxyFixture, write_mcp_proxy_fix
 use crate::bdd_support::config::policy_definitions::write_policy_definition_fixture;
 use crate::bdd_support::config::secrets::write_secret_fixture;
 use crate::bdd_support::config::storage::create_storage_dirs;
+use crate::bdd_support::config::toml::FABRIC_GATEWAY_TIMEOUT_MS;
 use crate::bdd_support::config::toml::write_config_toml;
 use chrono::{DateTime, Utc};
 
@@ -399,7 +400,7 @@ metrics_cache_ttl_seconds = 1
 backup_encryption_key = "{backup_key}"
 
 [a2a]
-fabric_gateway_timeout_ms = 5000
+fabric_gateway_timeout_ms = {FABRIC_GATEWAY_TIMEOUT_MS}
 message_expires_seconds = 15
 
 [config_files]

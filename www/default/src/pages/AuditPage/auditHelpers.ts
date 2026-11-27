@@ -3,10 +3,13 @@ import {
   POLICY_CHANGE_EVENTS,
   type AuditEntry,
   type EmbeddedDecision,
+  type PolicyChangeActor,
   type PolicyChangeData,
   type PolicyChangeEvent,
   type PolicyDecisionData,
   type RequestRejectedData,
+  type SecretForceDeleteData,
+  type TargetAuthChangeData,
   type TraceTerminatedData,
   type TrustCheckData,
   type WorkloadIntent,
@@ -25,6 +28,8 @@ export const CATEGORY_OPTIONS = [
   { value: 'consent_limited', label: 'Consent Limited', lowFrequency: true },
   { value: 'token_revoked', label: 'Token Revoked', lowFrequency: true },
   { value: 'user_tokens_revoked', label: 'User Tokens Revoked', lowFrequency: true },
+  { value: 'target_auth_changed', label: 'Target Authentication Changed', lowFrequency: true },
+  { value: 'secret_force_deleted', label: 'Secret Force-Deleted', lowFrequency: true },
   { value: 'policy_created', label: 'Policy Created', lowFrequency: true },
   { value: 'policy_updated', label: 'Policy Updated', lowFrequency: true },
   { value: 'policy_deleted', label: 'Policy Deleted', lowFrequency: true },
@@ -223,6 +228,10 @@ export function categoryLabel(name: string): string {
       return 'Identity Binding Verified';
     case 'identity_binding_failed':
       return 'Identity Binding Failed';
+    case 'target_auth_changed':
+      return 'Target Authentication Changed';
+    case 'secret_force_deleted':
+      return 'Secret Force-Deleted';
     case 'policy_created':
     case 'policy_updated':
     case 'policy_deleted':
@@ -312,6 +321,42 @@ export function requestRejected(entry: AuditEntry): RequestRejectedData | null {
   return null;
 }
 
+/** Extracts the TargetAuthChange payload if present, else null */
+export function targetAuthChange(entry: AuditEntry): TargetAuthChangeData | null {
+  if (
+    typeof entry.event === 'object' &&
+    entry.event !== null &&
+    'target_auth_changed' in entry.event
+  ) {
+    return (entry.event as { target_auth_changed: TargetAuthChangeData }).target_auth_changed;
+  }
+  return null;
+}
+
+/** Extracts the SecretForceDelete payload if present, else null */
+export function secretForceDelete(entry: AuditEntry): SecretForceDeleteData | null {
+  if (
+    typeof entry.event === 'object' &&
+    entry.event !== null &&
+    'secret_force_deleted' in entry.event
+  ) {
+    return (entry.event as { secret_force_deleted: SecretForceDeleteData }).secret_force_deleted;
+  }
+  return null;
+}
+
+const TARGET_AUTH_METHOD_LABEL: Record<string, string> = {
+  none: 'no authentication',
+  static_secret: 'a static secret',
+  credential_provider: 'a credential provider',
+  credential_lookup: 'a credential lookup',
+};
+
+/** A Target authentication method as a phrase, e.g. "a static secret"; unknown kinds as recorded. */
+export function targetAuthMethodLabel(method: string): string {
+  return TARGET_AUTH_METHOD_LABEL[method] ?? method.replace(/_/g, ' ');
+}
+
 /** Extracts a policy change event's name and body if present, else null */
 export function policyChange(
   entry: AuditEntry
@@ -328,6 +373,16 @@ export function policyChange(
     }
   }
   return null;
+}
+
+/** Who made the change an entry records: a policy change, a Target authentication change or a forced secret delete. */
+export function changeActor(entry: AuditEntry): PolicyChangeActor | null {
+  return (
+    policyChange(entry)?.change.actor ??
+    targetAuthChange(entry)?.actor ??
+    secretForceDelete(entry)?.actor ??
+    null
+  );
 }
 
 /** Sentence-case name of a policy change, e.g. "Policy attached". */

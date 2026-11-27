@@ -317,23 +317,24 @@ impl AgentSurface {
 
     /// Whether calls through `point` resolve a managed agent identity, as the
     /// outbound pipeline resolves it: the Transit Point's own
-    /// `managed_identity`, else the surface's when the Transit Point injects a
-    /// VP, in any mode but `from_jwt_claim`, which is inbound only.
+    /// `managed_identity` in any mode, `from_jwt_claim` reading its own caller's
+    /// JWT, else the surface's when the Transit Point injects a VP, in any mode
+    /// but `from_jwt_claim`, which reads the Access Point caller's JWT.
     pub fn transit_point_has_managed_identity(
         &self,
         point: &super::agent_surface::TransitPoint,
     ) -> bool {
         point
             .managed_identity
-            .clone()
-            .or_else(|| {
-                point
-                    .identity_injection
-                    .inject_vp
-                    .then(|| self.managed_identity())
-                    .flatten()
-            })
-            .is_some_and(|identity| !matches!(identity, crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. }))
+            .is_some()
+            || (point
+                .identity_injection
+                .inject_vp
+                && self
+                    .managed_identity()
+                    .is_some_and(|identity| {
+                        !matches!(identity, crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. })
+                    }))
     }
 
     /// Whether the surface issues a managed agent identity: an `a2a-proxy://` target always
@@ -1754,6 +1755,7 @@ mod tests {
             mcp_legacy_metadata_output: None,
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
+            signing: None,
             caller_key: None,
             trust_check_split: false,
             transit_point_source_auth: false,
@@ -1891,7 +1893,7 @@ mod tests {
         assert!(!s.has_managed_identity());
 
         point.managed_identity = Some(crate::source_auth::ManagedIdentityConfig::FromMtls {
-            certificate_id: "cert".to_string(),
+            certificate_id: Some("cert".to_string()),
         });
         s.transit = Some(serde_json::from_value(serde_json::json!({"points": [point]})).unwrap());
         assert!(s.has_managed_identity());

@@ -235,6 +235,29 @@ pub async fn inject_custom_metadata_extension(
     Ok(bytes::Bytes::from(modified_json))
 }
 
+/// Every place the gateway reads an A2A message from in a request or response
+/// body, as JSON pointers: the request's `params.message` and `message`, the
+/// bare body, and a response's `result.status.message`, `result.message` and
+/// `result`.
+pub(crate) const MESSAGE_POINTERS: [&str; 6] =
+    ["/params/message", "/message", "", "/result/status/message", "/result/message", "/result"];
+
+/// Whether an A2A body carries a message: an object at one of the
+/// [`MESSAGE_POINTERS`], where the bare body and `result`, which are objects in
+/// any body, count only when shaped like a message (`parts`, `role` or
+/// `messageId`). Task operations such as `tasks/get` carry a task `id` instead.
+pub fn has_message(body: &JsonValue) -> bool {
+    MESSAGE_POINTERS
+        .iter()
+        .any(|&pointer| match body.pointer(pointer) {
+            Some(JsonValue::Object(message)) if matches!(pointer, "" | "/result") => ["parts", "role", "messageId"]
+                .iter()
+                .any(|field| message.contains_key(*field)),
+            Some(message) => message.is_object(),
+            None => false,
+        })
+}
+
 /// Inject agent identity credential (VP) extension into the A2A request body
 /// This is called when GW1 has computed a DID for an agent and wants to forward it to GW2
 /// The VP contains a VC signed by the agent's DID, proving the identity
@@ -251,10 +274,18 @@ pub async fn inject_identity_credential_extension(
     vc_issuer: &Arc<crate::identity::VCIssuer>,
     channel_name: &str,
     domain: Option<&str>,
+    scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<(bytes::Bytes, String)> {
     // Create VP containing VC signed by agent DID
     let vp_jwt = vc_issuer
-        .create_agent_identity_presentation_with_binding(agent_did, identity_fields, workload_binding, None, domain)
+        .create_agent_identity_presentation_with_binding(
+            agent_did,
+            identity_fields,
+            workload_binding,
+            None,
+            domain,
+            scope,
+        )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create identity presentation: {}", e))?;
 
@@ -351,6 +382,57 @@ pub async fn inject_identity_credential_extension(
     Ok((bytes::Bytes::from(modified_json), vp_jwt))
 }
 
+/// The extensions through which an A2A message asserts an agent identity: the
+/// raw identity, a signed credential and a caller binding.
+const ASSERTED_IDENTITY_EXTENSIONS: [&str; 3] = [
+    crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION,
+    crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION,
+    crate::config::AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION,
+];
+
+/// Removes every agent identity the body asserts, from the `extensions` and the
+/// `metadata` at each of the [`MESSAGE_POINTERS`], so none is forwarded. A JSON
+/// object is always returned re-serialized, so a duplicate key the parser
+/// dropped is not forwarded either; an empty body is returned unchanged, and
+/// `None` for any other body that is not exactly one JSON object, such as a
+/// batch, whose identities could not all be removed.
+pub fn remove_asserted_identity(body_bytes: &bytes::Bytes) -> Option<bytes::Bytes> {
+    if body_bytes.is_empty() {
+        return Some(body_bytes.clone());
+    }
+    let mut body_json = serde_json::from_slice::<JsonValue>(body_bytes)
+        .ok()
+        .filter(JsonValue::is_object)?;
+    for pointer in MESSAGE_POINTERS {
+        let Some(message) = body_json
+            .pointer_mut(pointer)
+            .and_then(JsonValue::as_object_mut)
+        else {
+            continue;
+        };
+        if let Some(extensions) = message
+            .get_mut("extensions")
+            .and_then(JsonValue::as_array_mut)
+        {
+            extensions.retain(|e| {
+                !e.as_str()
+                    .is_some_and(|uri| ASSERTED_IDENTITY_EXTENSIONS.contains(&uri))
+            });
+        }
+        if let Some(metadata) = message
+            .get_mut("metadata")
+            .and_then(JsonValue::as_object_mut)
+        {
+            for uri in ASSERTED_IDENTITY_EXTENSIONS {
+                metadata.remove(uri);
+            }
+        }
+    }
+    serde_json::to_vec(&body_json)
+        .ok()
+        .map(bytes::Bytes::from)
+}
+
 /// A JSON-RPC `result` read as a Task or Message. A v1.0 `SendMessage` result
 /// wraps its payload (`SendMessageResponse`), so an object-valued `result.task`
 /// is read in its place; a `GetTask` or v0.3 result is returned unchanged.
@@ -385,6 +467,7 @@ pub async fn inject_identity_credential_into_response(
     workload_binding: Option<serde_json::Value>,
     vc_issuer: &Arc<crate::identity::VCIssuer>,
     channel_name: &str,
+    scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<Option<(bytes::Bytes, String)>> {
     let mut body_json: JsonValue = serde_json::from_slice(body_bytes)
         .map_err(|e| anyhow::anyhow!("Failed to parse response body as JSON: {}", e))?;
@@ -395,7 +478,14 @@ pub async fn inject_identity_credential_into_response(
     }
 
     let vp_jwt = vc_issuer
-        .create_agent_identity_presentation_with_binding(agent_did, identity_fields, workload_binding, None, None)
+        .create_agent_identity_presentation_with_binding(
+            agent_did,
+            identity_fields,
+            workload_binding,
+            None,
+            None,
+            scope,
+        )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create identity presentation: {}", e))?;
 
@@ -582,6 +672,7 @@ trait AgentIdentityPresenter: Send + Sync {
         &self,
         agent_did: &str,
         identity_fields: &std::collections::HashMap<String, serde_json::Value>,
+        scope: &crate::vta::key_directory::KeyScope,
     ) -> anyhow::Result<String>;
 }
 
@@ -591,20 +682,31 @@ impl AgentIdentityPresenter for crate::identity::VCIssuer {
         &self,
         agent_did: &str,
         identity_fields: &std::collections::HashMap<String, serde_json::Value>,
+        scope: &crate::vta::key_directory::KeyScope,
     ) -> anyhow::Result<String> {
-        self.create_agent_identity_presentation(agent_did, identity_fields, None, None)
+        self.create_agent_identity_presentation_with_binding(agent_did, identity_fields, None, None, None, scope)
             .await
     }
 }
 
+/// `scope` is the surface (and variant) serving the card, which decides the
+/// key that issues the embedded credential, as on every other path.
 pub async fn inject_credential_into_agent_card(
     agent_card: &mut JsonValue,
     resolved_identity: &ProtectedAgentIdentity,
     vc_issuer: &Arc<crate::identity::VCIssuer>,
     channel_name: &str,
+    scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<()> {
-    inject_credential_into_agent_card_inner(agent_card, resolved_identity, vc_issuer.as_ref(), channel_name, false)
-        .await
+    inject_credential_into_agent_card_inner(
+        agent_card,
+        resolved_identity,
+        vc_issuer.as_ref(),
+        channel_name,
+        false,
+        scope,
+    )
+    .await
 }
 
 pub async fn upsert_credential_into_agent_card(
@@ -612,8 +714,17 @@ pub async fn upsert_credential_into_agent_card(
     resolved_identity: &ProtectedAgentIdentity,
     vc_issuer: &Arc<crate::identity::VCIssuer>,
     channel_name: &str,
+    scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<()> {
-    inject_credential_into_agent_card_inner(agent_card, resolved_identity, vc_issuer.as_ref(), channel_name, true).await
+    inject_credential_into_agent_card_inner(
+        agent_card,
+        resolved_identity,
+        vc_issuer.as_ref(),
+        channel_name,
+        true,
+        scope,
+    )
+    .await
 }
 
 /// Remove every `agent-identity-credential/v1` extension the card's sender put
@@ -625,9 +736,10 @@ pub async fn replace_credential_in_agent_card(
     resolved_identity: &ProtectedAgentIdentity,
     vc_issuer: &Arc<crate::identity::VCIssuer>,
     channel_name: &str,
+    scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<()> {
     remove_credential_extensions(agent_card);
-    upsert_credential_into_agent_card(agent_card, resolved_identity, vc_issuer, channel_name).await
+    upsert_credential_into_agent_card(agent_card, resolved_identity, vc_issuer, channel_name, scope).await
 }
 
 fn remove_credential_extensions(agent_card: &mut JsonValue) {
@@ -650,6 +762,7 @@ async fn inject_credential_into_agent_card_inner(
     presenter: &dyn AgentIdentityPresenter,
     channel_name: &str,
     allow_insert: bool,
+    scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<()> {
     let (agent_did, identity_fields) = match resolved_identity {
         ProtectedAgentIdentity::Managed { did, identity_fields } => (did, identity_fields),
@@ -723,7 +836,7 @@ async fn inject_credential_into_agent_card_inner(
     };
 
     let vp_jwt = presenter
-        .create_presentation(agent_did, identity_fields)
+        .create_presentation(agent_did, identity_fields, scope)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create identity presentation for agent card: {}", e))?;
 
@@ -762,6 +875,7 @@ pub async fn inject_vp_into_a2a_response(
     channel_name: &str,
     inbound_chained_vcs: Vec<serde_json::Value>,
     domain: Option<&str>,
+    scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<Option<(bytes::Bytes, String)>> {
     let mut response_json: JsonValue = serde_json::from_slice(response_bytes)
         .map_err(|e| anyhow::anyhow!("Failed to parse response as JSON: {}", e))?;
@@ -786,6 +900,7 @@ pub async fn inject_vp_into_a2a_response(
             None,
             domain,
             inbound_chained_vcs,
+            scope,
         )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create identity presentation: {}", e))?;
@@ -1129,6 +1244,7 @@ mod tests {
             &self,
             _agent_did: &str,
             _identity_fields: &HashMap<String, serde_json::Value>,
+            _scope: &crate::vta::key_directory::KeyScope,
         ) -> anyhow::Result<String> {
             anyhow::bail!("presentation creation failed")
         }
@@ -1144,9 +1260,14 @@ mod tests {
         let mut card = agent_card_with_identity();
         let original = card.clone();
 
-        let result =
-            inject_credential_into_agent_card(&mut card, &ProtectedAgentIdentity::Anonymous, &issuer, "test-channel")
-                .await;
+        let result = inject_credential_into_agent_card(
+            &mut card,
+            &ProtectedAgentIdentity::Anonymous,
+            &issuer,
+            "test-channel",
+            &crate::vta::key_directory::KeyScope::default(),
+        )
+        .await;
 
         assert!(result.is_ok());
         assert_eq!(card, original, "card should be unchanged for Anonymous");
@@ -1160,9 +1281,14 @@ mod tests {
 
         let mut card = json!({ "name": "test-agent" });
 
-        let result =
-            inject_credential_into_agent_card(&mut card, &managed_identity_with_did(&_did), &issuer, "test-channel")
-                .await;
+        let result = inject_credential_into_agent_card(
+            &mut card,
+            &managed_identity_with_did(&_did),
+            &issuer,
+            "test-channel",
+            &crate::vta::key_directory::KeyScope::default(),
+        )
+        .await;
 
         let err = result.unwrap_err();
         assert!(
@@ -1180,9 +1306,14 @@ mod tests {
             "capabilities": { "extensions": "not-an-array" }
         });
 
-        let result =
-            inject_credential_into_agent_card(&mut card, &managed_identity_with_did(&_did), &issuer, "test-channel")
-                .await;
+        let result = inject_credential_into_agent_card(
+            &mut card,
+            &managed_identity_with_did(&_did),
+            &issuer,
+            "test-channel",
+            &crate::vta::key_directory::KeyScope::default(),
+        )
+        .await;
 
         let err = result.unwrap_err();
         assert!(
@@ -1206,9 +1337,14 @@ mod tests {
             }
         });
 
-        let result =
-            inject_credential_into_agent_card(&mut card, &managed_identity_with_did(&_did), &issuer, "test-channel")
-                .await;
+        let result = inject_credential_into_agent_card(
+            &mut card,
+            &managed_identity_with_did(&_did),
+            &issuer,
+            "test-channel",
+            &crate::vta::key_directory::KeyScope::default(),
+        )
+        .await;
 
         let err = result.unwrap_err();
         assert!(
@@ -1247,6 +1383,7 @@ mod tests {
             &managed_identity_with_did(forwarded_did),
             &issuer,
             "test-channel",
+            &crate::vta::key_directory::KeyScope::default(),
         )
         .await;
 
@@ -1263,9 +1400,14 @@ mod tests {
             "capabilities": { "extensions": [] }
         });
 
-        let result =
-            inject_credential_into_agent_card(&mut card, &managed_identity_with_did(&_did), &issuer, "test-channel")
-                .await;
+        let result = inject_credential_into_agent_card(
+            &mut card,
+            &managed_identity_with_did(&_did),
+            &issuer,
+            "test-channel",
+            &crate::vta::key_directory::KeyScope::default(),
+        )
+        .await;
 
         let err = result.unwrap_err();
         assert!(
@@ -1282,9 +1424,15 @@ mod tests {
         let mut card = agent_card_with_identity();
         let identity = managed_identity_with_did("did:key:zTestAgent");
 
-        let result =
-            inject_credential_into_agent_card_inner(&mut card, &identity, &FailingPresenter, "test-channel", false)
-                .await;
+        let result = inject_credential_into_agent_card_inner(
+            &mut card,
+            &identity,
+            &FailingPresenter,
+            "test-channel",
+            false,
+            &crate::vta::key_directory::KeyScope::default(),
+        )
+        .await;
 
         let err = result.unwrap_err();
         assert!(
@@ -1313,9 +1461,15 @@ mod tests {
         extensions.insert(0, self_asserted_credential_extension());
         extensions.push(self_asserted_credential_extension());
 
-        replace_credential_in_agent_card(&mut card, &managed_identity_with_did(&did), &issuer, "test-channel")
-            .await
-            .unwrap();
+        replace_credential_in_agent_card(
+            &mut card,
+            &managed_identity_with_did(&did),
+            &issuer,
+            "test-channel",
+            &crate::vta::key_directory::KeyScope::default(),
+        )
+        .await
+        .unwrap();
 
         let credentials: Vec<&JsonValue> = card["capabilities"]["extensions"]
             .as_array()
@@ -1336,9 +1490,15 @@ mod tests {
             .unwrap()
             .push(self_asserted_credential_extension());
 
-        replace_credential_in_agent_card(&mut card, &ProtectedAgentIdentity::Anonymous, &issuer, "test-channel")
-            .await
-            .unwrap();
+        replace_credential_in_agent_card(
+            &mut card,
+            &ProtectedAgentIdentity::Anonymous,
+            &issuer,
+            "test-channel",
+            &crate::vta::key_directory::KeyScope::default(),
+        )
+        .await
+        .unwrap();
 
         assert!(
             card["capabilities"]["extensions"]
@@ -1355,9 +1515,15 @@ mod tests {
         let (issuer, did, _tmp) = issuer_with_identity().await;
         let mut card = json!({"capabilities": {"extensions": [self_asserted_credential_extension()]}});
 
-        inject_credential_into_agent_card(&mut card, &managed_identity_with_did(&did), &issuer, "test-channel")
-            .await
-            .unwrap();
+        inject_credential_into_agent_card(
+            &mut card,
+            &managed_identity_with_did(&did),
+            &issuer,
+            "test-channel",
+            &crate::vta::key_directory::KeyScope::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(card["capabilities"]["extensions"], json!([self_asserted_credential_extension()]));
     }
@@ -1370,9 +1536,14 @@ mod tests {
 
         let mut card = agent_card_with_identity();
 
-        let result =
-            inject_credential_into_agent_card(&mut card, &managed_identity_with_did(&did), &issuer, "test-channel")
-                .await;
+        let result = inject_credential_into_agent_card(
+            &mut card,
+            &managed_identity_with_did(&did),
+            &issuer,
+            "test-channel",
+            &crate::vta::key_directory::KeyScope::default(),
+        )
+        .await;
 
         assert!(result.is_ok(), "injection should succeed: {:?}", result.err());
 
@@ -1432,9 +1603,14 @@ mod tests {
             }
         });
 
-        let result =
-            inject_credential_into_agent_card(&mut card, &managed_identity_with_did(&did), &issuer, "test-channel")
-                .await;
+        let result = inject_credential_into_agent_card(
+            &mut card,
+            &managed_identity_with_did(&did),
+            &issuer,
+            "test-channel",
+            &crate::vta::key_directory::KeyScope::default(),
+        )
+        .await;
 
         assert!(result.is_ok());
 
@@ -1475,12 +1651,75 @@ mod tests {
     async fn inject_backend_vp(body: &serde_json::Value) -> (Option<(serde_json::Value, String)>, String) {
         let (issuer, did, _tmp) = issuer_with_identity().await;
         let bytes = bytes::Bytes::from(serde_json::to_vec(body).expect("serialize body"));
-        let injected =
-            inject_vp_into_a2a_response(&bytes, &did, &identity_fields(), None, &issuer, "ch", Vec::new(), None)
-                .await
-                .expect("injection should not fail");
+        let injected = inject_vp_into_a2a_response(
+            &bytes,
+            &did,
+            &identity_fields(),
+            None,
+            &issuer,
+            "ch",
+            Vec::new(),
+            None,
+            &Default::default(),
+        )
+        .await
+        .expect("injection should not fail");
         let parsed = injected.map(|(body, vp)| (serde_json::from_slice(&body).expect("injected body is JSON"), vp));
         (parsed, did)
+    }
+
+    fn request_with_identity() -> bytes::Bytes {
+        bytes::Bytes::from(
+            serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {
+                "message": agent_message()
+            } }))
+            .expect("serialize body"),
+        )
+    }
+
+    /// The credential in a presentation the gateway injects is issued under the
+    /// key of the surface serving the request: a surface whose trust agent
+    /// cannot issue gets no credential, never one from the gateway's key.
+    #[tokio::test]
+    async fn injection_follows_the_signing_of_the_surface_it_serves() {
+        let (issuer, did, tmp) = issuer_with_identity().await;
+        crate::identity::test_helpers::map_surface_to_unusable_trust_agent(&issuer, tmp.path(), "surface-mapped").await;
+        let mapped = crate::vta::key_directory::KeyScope::surface("surface-mapped");
+        let unmapped = crate::vta::key_directory::KeyScope::surface("surface-unmapped");
+        let request = request_with_identity();
+        let response = bytes::Bytes::from(
+            serde_json::to_vec(&json!({ "result": {
+                "kind": "task",
+                "id": "t",
+                "status": { "state": "completed", "message": agent_message() }
+            } }))
+            .expect("serialize body"),
+        );
+
+        let err =
+            inject_identity_credential_extension(&request, &did, &identity_fields(), None, &issuer, "ch", None, &mapped)
+                .await
+                .expect_err("the request's surface cannot issue");
+        assert!(
+            err.to_string()
+                .contains("vta-gone"),
+            "{err}"
+        );
+        inject_identity_credential_extension(&request, &did, &identity_fields(), None, &issuer, "ch", None, &unmapped)
+            .await
+            .expect("an unmapped surface issues as before");
+
+        inject_identity_credential_into_response(&response, &did, &identity_fields(), None, &issuer, "ch", &mapped)
+            .await
+            .expect_err("the response's surface cannot issue");
+        inject_identity_credential_into_response(&response, &did, &identity_fields(), None, &issuer, "ch", &unmapped)
+            .await
+            .expect("an unmapped surface issues as before")
+            .expect("the response carries the identity extension");
+
+        inject_vp_into_a2a_response(&response, &did, &identity_fields(), None, &issuer, "ch", Vec::new(), None, &mapped)
+            .await
+            .expect_err("the backend response's surface cannot issue");
     }
 
     fn assert_carries_backend_vp(
@@ -1569,5 +1808,154 @@ mod tests {
         let (injected, _did) = inject_backend_vp(&body).await;
 
         assert!(injected.is_none());
+    }
+
+    #[test]
+    fn asserted_identity_is_removed_from_a_message() {
+        let body = bytes::Bytes::from(
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "message/send", "params": { "message": {
+                "messageId": "m", "role": "user", "parts": [],
+                "extensions": [IDENTITY_URI, CREDENTIAL_URI, "https://example.com/other"],
+                "metadata": { IDENTITY_URI: { "name": "copied" }, CREDENTIAL_URI: "vp", "kept": true }
+            } } })
+            .to_string(),
+        );
+
+        let removed: serde_json::Value =
+            serde_json::from_slice(&remove_asserted_identity(&body).expect("one JSON object")).unwrap();
+
+        assert_eq!(removed["params"]["message"]["extensions"], json!(["https://example.com/other"]));
+        assert_eq!(removed["params"]["message"]["metadata"], json!({ "kept": true }));
+    }
+
+    #[test]
+    fn a_body_without_a_message_is_kept_unchanged() {
+        let request = json!({ "jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": { "id": "t" } });
+        let body = bytes::Bytes::from(request.to_string());
+
+        let removed: serde_json::Value =
+            serde_json::from_slice(&remove_asserted_identity(&body).expect("one JSON object")).unwrap();
+
+        assert_eq!(removed, request);
+        assert!(!has_message(&request));
+        assert_eq!(remove_asserted_identity(&bytes::Bytes::new()), Some(bytes::Bytes::new()));
+    }
+
+    #[test]
+    fn asserted_identity_is_removed_from_every_message_location() {
+        let asserted = || {
+            json!({
+                "extensions": [IDENTITY_URI, CREDENTIAL_URI, "https://example.com/other"],
+                "metadata": { IDENTITY_URI: { "name": "copied" }, CREDENTIAL_URI: "vp", "kept": true }
+            })
+        };
+        let with = |mut base: serde_json::Value, pointer: &str| {
+            let target = if pointer.is_empty() {
+                &mut base
+            } else {
+                base.pointer_mut(pointer)
+                    .unwrap()
+            };
+            for (key, value) in asserted()
+                .as_object()
+                .unwrap()
+            {
+                target[key] = value.clone();
+            }
+            base
+        };
+        for (case, body, pointers) in [
+            (
+                "top-level metadata with no message",
+                with(json!({ "jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": { "id": "t" } }), ""),
+                vec![""],
+            ),
+            (
+                "result.message",
+                with(
+                    json!({ "jsonrpc": "2.0", "id": 1, "result": { "message": { "role": "agent" } } }),
+                    "/result/message",
+                ),
+                vec!["/result/message"],
+            ),
+            (
+                "both params.message and message",
+                with(
+                    with(
+                        json!({ "jsonrpc": "2.0", "id": 1, "method": "message/send",
+                            "params": { "message": { "role": "user" } }, "message": { "role": "user" } }),
+                        "/params/message",
+                    ),
+                    "/message",
+                ),
+                vec!["/params/message", "/message"],
+            ),
+        ] {
+            let removed: serde_json::Value = serde_json::from_slice(
+                &remove_asserted_identity(&bytes::Bytes::from(body.to_string())).expect("one JSON object"),
+            )
+            .unwrap();
+
+            for pointer in pointers {
+                let location = removed
+                    .pointer(pointer)
+                    .unwrap();
+                assert_eq!(location["extensions"], json!(["https://example.com/other"]), "{case}: {removed}");
+                assert_eq!(location["metadata"], json!({ "kept": true }), "{case}: {removed}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_body_with_duplicate_keys_is_forwarded_re_serialized() {
+        let body = bytes::Bytes::from_static(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"copied"},"params":{"id":"t"}}"#,
+        );
+
+        let removed = remove_asserted_identity(&body).expect("one JSON object");
+
+        assert_ne!(removed, body);
+        assert!(!String::from_utf8_lossy(&removed).contains("copied"), "{removed:?}");
+        let parsed: serde_json::Value = serde_json::from_slice(&removed).unwrap();
+        assert_eq!(parsed["params"], json!({ "id": "t" }));
+    }
+
+    #[test]
+    fn only_an_object_message_counts_as_a_message() {
+        for (case, body, expected) in [
+            ("params.message", json!({ "params": { "message": { "role": "user" } } }), true),
+            ("message", json!({ "message": { "parts": [] } }), true),
+            ("bare message", json!({ "messageId": "m", "parts": [] }), true),
+            ("result.status.message", json!({ "result": { "status": { "message": {} } } }), true),
+            ("result.message", json!({ "result": { "message": {} } }), true),
+            (
+                "task request",
+                json!({ "jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": { "id": "t" } }),
+                false,
+            ),
+            ("a message that is not an object", json!({ "params": { "message": "text" } }), false),
+            ("batch", json!([{ "params": { "message": { "role": "user" } } }]), false),
+        ] {
+            assert_eq!(has_message(&body), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn a_body_that_is_not_one_json_object_has_no_identity_removed() {
+        let message = json!({ "jsonrpc": "2.0", "id": 1, "method": "message/send", "params": { "message": {
+            "messageId": "m", "role": "user", "parts": [], "extensions": [IDENTITY_URI] } } });
+        for (case, body) in [
+            (
+                "batch",
+                json!([message])
+                    .to_string()
+                    .into_bytes(),
+            ),
+            ("byte order mark", [b"\xEF\xBB\xBF".as_slice(), message.to_string().as_bytes()].concat()),
+            ("string", br#""text""#.to_vec()),
+            ("not JSON", b"not json".to_vec()),
+        ] {
+            assert_eq!(remove_asserted_identity(&bytes::Bytes::from(body)), None, "{case}");
+        }
     }
 }

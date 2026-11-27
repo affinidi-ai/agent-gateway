@@ -16,7 +16,7 @@ import {
   showSurfaceSaveToast,
   shownSaveWarnings,
 } from '../components/surface-builder/elements/saveWarnings';
-import type { Protocol } from '../components/surface-builder/elements/types';
+import type { Protocol, SurfaceSigning } from '../components/surface-builder/elements/types';
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSurfaceHistory } from '../components/surface-builder/hooks/useSurfaceHistory';
 import { useSaveShortcut } from '../components/surface-builder/hooks/useSaveShortcut';
@@ -91,6 +91,7 @@ interface DirtyInputs {
   terminateTraceId: boolean;
   issuerId: string;
   didwebvh: DidwebvhConfig;
+  signing?: SurfaceSigning;
   jsonOverride: string | null;
 }
 
@@ -194,6 +195,7 @@ const SurfaceDetailPage: React.FC = () => {
   const [terminateTraceId, setTerminateTraceId] = useState(false);
   const [issuerId, setIssuerId] = useState('');
   const [didwebvh, setDidwebvh] = useState<DidwebvhConfig>(DEFAULT_DIDWEBVH_CONFIG);
+  const [signing, setSigning] = useState<SurfaceSigning | undefined>(undefined);
 
   usePageTitle(`Edit Agent Surface - ${name || 'Untitled'}`);
 
@@ -386,6 +388,7 @@ const SurfaceDetailPage: React.FC = () => {
         ...(surfaceMeta.description ? { description: surfaceMeta.description } : {}),
         tags: surfaceMeta.tags || [],
         ...(surfaceMeta.issuer_id ? { issuer_id: surfaceMeta.issuer_id } : {}),
+        ...(surfaceMeta.signing ? { signing: surfaceMeta.signing } : {}),
         status: surfaceMeta.status ?? 'active',
       },
       allNodes: nodes,
@@ -467,6 +470,7 @@ const SurfaceDetailPage: React.FC = () => {
         terminateTraceId,
         issuerId,
         didwebvh,
+        signing,
       },
     });
   }, [
@@ -481,6 +485,7 @@ const SurfaceDetailPage: React.FC = () => {
     terminateTraceId,
     issuerId,
     didwebvh,
+    signing,
     variantSnapshots,
     buildVariantsWireSlice,
   ]);
@@ -518,6 +523,7 @@ const SurfaceDetailPage: React.FC = () => {
       setPublishToDid(meta.publishToDid);
       setTerminateTraceId(meta.terminateTraceId);
       setIssuerId(meta.issuerId);
+      setSigning(meta.signing);
       setDidwebvh(meta.didwebvh ?? DEFAULT_DIDWEBVH_CONFIG);
       // Mark the canvas as already showing the target variant BEFORE
       // we trigger any state change, so the activeVariantId-watcher
@@ -638,6 +644,8 @@ const SurfaceDetailPage: React.FC = () => {
       setPublishToDid(data.access_point?.publish_to_did_document ?? false);
       setTerminateTraceId(data.access_point?.terminate_trace_id ?? false);
       setIssuerId(data.issuer_id || '');
+      // Absent means inherit, so an absent block must stay absent.
+      setSigning(data.signing ?? undefined);
       setDidwebvh(didwebvhFromAccessPoint(data.access_point));
       setJsonOverride(null);
       setJsonError(null);
@@ -1365,6 +1373,9 @@ const SurfaceDetailPage: React.FC = () => {
       payload.status = status;
       payload.issuer_id = issuerId.trim() || undefined;
       payload = withA2aValidationSettled(payload);
+      // Assigned here rather than passed through `buildPayload`, matching
+      // `issuer_id`, so a save keeps the surface's signing choice.
+      payload.signing = signing;
       // A PUT that leaves out a stored discovery setting keeps it, so one the
       // operator removed is sent as null, removed only if the save succeeds.
       payload = withDroppedProtectedResourcesRemoved(surface, payload);
@@ -1548,6 +1559,7 @@ const SurfaceDetailPage: React.FC = () => {
     terminateTraceId,
     issuerId,
     didwebvh,
+    signing,
     jsonOverride,
   });
   // Keep the latest currentSignature in a ref so the deferred
@@ -1813,6 +1825,7 @@ const SurfaceDetailPage: React.FC = () => {
           terminateTraceId,
           issuerId,
           didwebvh,
+          signing,
         }}
         setMeta={{
           setName,
@@ -1823,6 +1836,7 @@ const SurfaceDetailPage: React.FC = () => {
           setPublishToDid,
           setTerminateTraceId,
           setIssuerId,
+          setSigning,
           setDidwebvh,
         }}
         jsonOverride={jsonOverride}

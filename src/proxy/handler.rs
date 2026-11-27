@@ -1018,6 +1018,20 @@ impl TargetAuthFailure {
         crate::a2a::create_error_response_with_reason(self.status(), TARGET_AUTH_FAILED, self.reason())
     }
 
+    /// [`Self::response`], or on an MCP surface a JSON-RPC error that echoes the id of
+    /// `request_body`.
+    pub(crate) fn response_for(
+        self,
+        surface: &crate::config::agent_surface::AgentSurface,
+        request_body: &[u8],
+    ) -> Response {
+        if surface.access_point.protocol == crate::config::agent_surface::SurfaceProtocol::Mcp {
+            crate::mcp::errors::target_failure_response(self.status(), request_body, self.reason(), TARGET_AUTH_FAILED)
+        } else {
+            self.response()
+        }
+    }
+
     /// The failure a peer gateway refused with over Fabric: its problem JSON `body` names one
     /// of these reasons with the matching `status`. Any other answer is `None`.
     pub(crate) fn relayed(
@@ -2025,6 +2039,29 @@ fn is_jsonrpc_message(body: &str) -> bool {
                 .and_then(serde_json::Value::as_str)
                 == Some("2.0")
         })
+}
+
+/// The Legacy SSE message for a request refused with `status` and `body`: a JSON-RPC message,
+/// whatever its HTTP status, and any JSON answered with `200` reach the caller as they are;
+/// anything else becomes a JSON-RPC error with `fallback_message` and the request's id, so the
+/// message stays parseable.
+fn legacy_sse_refusal_message(
+    status: StatusCode,
+    body: &str,
+    request: &serde_json::Value,
+    fallback_message: impl FnOnce() -> String,
+) -> String {
+    let forwardable = is_jsonrpc_message(body)
+        || (status == StatusCode::OK && serde_json::from_str::<serde_json::Value>(body).is_ok());
+    if forwardable {
+        return body.to_string();
+    }
+    serde_json::to_string(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request.get("id"),
+        "error": { "code": -32603, "message": fallback_message() }
+    }))
+    .unwrap_or_default()
 }
 
 fn sse_session_limit_response(
@@ -4087,7 +4124,7 @@ async fn proxy_charged_request(
                             .await;
                     }
                 }
-                Err(err_resp) => {
+                Err(err_resp) if !is_notification => {
                     let err_status = err_resp.status();
                     let (err_parts, err_body) = err_resp.into_parts();
                     let err_body_bytes = axum::body::to_bytes(err_body, 1024 * 1024)
@@ -4104,14 +4141,18 @@ async fn proxy_charged_request(
                         err_body_bytes.len()
                     );
 
-                    let error_json = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": json_request.get("id"),
-                        "error": { "code": -32603, "message": format!("Fabric forwarding failed: {} {}", err_status, err_body_str.chars().take(200).collect::<String>()) }
+                    let to_send = legacy_sse_refusal_message(err_status, &err_body_str, &json_request, || {
+                        format!(
+                            "Fabric forwarding failed: {} {}",
+                            err_status,
+                            err_body_str
+                                .chars()
+                                .take(200)
+                                .collect::<String>()
+                        )
                     });
-                    let error_str = serde_json::to_string(&error_json).unwrap_or_default();
                     CHANNEL_SSE_SESSION_MGR
-                        .send_response(&session_id, &error_str)
+                        .send_response(&session_id, &to_send)
                         .await;
                 }
                 _ => {} // Notification — no response
@@ -4732,33 +4773,15 @@ async fn proxy_charged_request(
                             .await;
                     }
                 }
-                Err(resp) => {
-                    // `handle_mcp_proxy_request` returns Err with HTTP 200 +
-                    // JSON-RPC error envelope for in-protocol failures (e.g.
-                    // disabled proxy, unknown tool). For those, forward the
-                    // body verbatim so the caller sees the actual error
-                    // shape rather than a generic "Internal error". For
-                    // out-of-band HTTP errors (non-200, non-JSON), fall back
-                    // to a synthesized JSON-RPC envelope so the SSE message
-                    // stays parseable.
+                Err(resp) if !is_notification => {
                     let (parts, body) = resp.into_parts();
                     let body_bytes_resp = axum::body::to_bytes(body, 10 * 1024 * 1024)
                         .await
                         .unwrap_or_default();
                     let body_str = String::from_utf8_lossy(&body_bytes_resp);
-                    let forwardable = parts.status == StatusCode::OK
-                        && !body_str.is_empty()
-                        && serde_json::from_str::<serde_json::Value>(&body_str).is_ok();
-                    let to_send = if forwardable {
-                        body_str.into_owned()
-                    } else {
-                        serde_json::to_string(&serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": json_request.get("id"),
-                            "error": { "code": -32603, "message": "Internal error" }
-                        }))
-                        .unwrap_or_default()
-                    };
+                    let to_send = legacy_sse_refusal_message(parts.status, &body_str, &json_request, || {
+                        "Internal error".to_string()
+                    });
                     CHANNEL_SSE_SESSION_MGR
                         .send_response(&session_id, &to_send)
                         .await;
@@ -5344,15 +5367,15 @@ async fn proxy_charged_request(
     if caller_identified
         && !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
         && identity_result.is_none()
-        && let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) = state
+        && let Some(inbound_identity @ crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. }) = state
             .surface
             .inbound_identity()
     {
         let mode_label = "from_jwt_claim";
         let started = std::time::Instant::now();
-        let Some(claims) = authenticated_identity
+        let Some(caller) = authenticated_identity
             .as_ref()
-            .and_then(|i| i.jwt_claims())
+            .filter(|i| i.jwt_claims().is_some())
         else {
             crate::metrics::backends::prometheus::track_managed_identity_resolve(
                 &channel_name,
@@ -5367,11 +5390,14 @@ async fn proxy_charged_request(
                 .await;
             return Err(from_jwt_claim_without_claims());
         };
-        match crate::identity::credential_identity::resolve_jwt_claim_identity(claim, namespace_claims, claims) {
-            Ok(crate::identity::credential_identity::CredentialIdentity::Derived {
+        match crate::identity::credential_identity::global_resolver()
+            .resolve_verified_caller(inbound_identity, caller, None, None)
+            .await
+        {
+            Ok(crate::identity::credential_identity::VerifiedCallerIdentity {
                 identity_fields,
                 identity_hash,
-                ..
+                verification,
             }) => {
                 let vc_issuer_opt = state
                     .identity_selector
@@ -5430,7 +5456,7 @@ async fn proxy_charged_request(
                             "Resolved inbound agent DID from JWT claim"
                         );
                         identity_result = Some(crate::identity::IdentityResult {
-                            verification: crate::surface_context::IdentityVerification::SourceAuth,
+                            verification,
                             hash: identity_hash,
                             did: response.did,
                             is_new: response.is_new,
@@ -5457,7 +5483,6 @@ async fn proxy_charged_request(
                     }
                 }
             }
-            Ok(_) => unreachable!("resolve_jwt_claim_identity only returns Derived"),
             Err(e) => {
                 let result_label = match &e {
                     crate::identity::credential_identity::CredentialIdentityError::JwtClaimMissing(_) => {
@@ -5508,7 +5533,7 @@ async fn proxy_charged_request(
         .map(|result| crate::surface_context::ExtensionIdentityContext {
             verification: result.verification,
             did: Some(result.did.clone()),
-            identity_hash: Some(result.hash.clone()),
+            identity_hash: crate::surface_context::ExtensionIdentityContext::hash_field(&result.hash),
         });
     bind_api_key_caller_did(
         &state.surface,
@@ -6943,7 +6968,7 @@ async fn proxy_charged_request(
             );
             let refusal = TargetAuthFailure::PathRefused;
             record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
-            return Ok(refusal.response());
+            return Ok(refusal.response_for(&state.surface, &body_bytes));
         }
         let caller_assertion = CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed);
         let mcp_proxy_base_url = match state.mcp_proxy_store.as_ref() {
@@ -6978,7 +7003,9 @@ async fn proxy_charged_request(
                 record_target_auth_failure(&audit_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return Ok(e.failure().response());
+                        return Ok(e
+                            .failure()
+                            .response_for(&state.surface, &body_bytes));
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -7257,6 +7284,7 @@ async fn proxy_charged_request(
                             wb,
                             None,
                             Some(crate::identity::vc_issuer::AUDIT_ONLY_VP_DOMAIN),
+                            &state.key_scope(),
                         )
                         .await
                     {
@@ -7526,6 +7554,7 @@ async fn proxy_charged_request(
                 wb,
                 None,
                 vp_domain.as_deref(),
+                &state.key_scope(),
             )
             .await
         {
@@ -7680,7 +7709,7 @@ async fn proxy_charged_request(
         connection_guard
             .decrement()
             .await;
-        return Err(circuit_open_response(retry_after));
+        return Err(circuit_open_response(&state.surface, &body_bytes, retry_after));
     }
     match inbound_payment
         .charge(
@@ -7911,7 +7940,14 @@ async fn proxy_charged_request(
             );
             tokio::time::timeout(deadline, execute)
                 .await
-                .map_err(|_| create_error_response(StatusCode::GATEWAY_TIMEOUT, "MCP proxy execution timed out"))?
+                .map_err(|_| {
+                    target_unreachable_response(
+                        &state.surface,
+                        StatusCode::GATEWAY_TIMEOUT,
+                        &body_bytes,
+                        "MCP proxy execution timed out",
+                    )
+                })?
                 .map_err(|error| (*error).into_response())
         };
         let response = if let Some(breaker) = circuit_breaker.clone() {
@@ -7923,7 +7959,12 @@ async fn proxy_charged_request(
                         gate_receipt
                             .iter()
                             .for_each(|receipt| receipt.revoke());
-                        create_error_response(StatusCode::SERVICE_UNAVAILABLE, "MCP proxy circuit breaker is open")
+                        target_unreachable_response(
+                            &state.surface,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &body_bytes,
+                            "MCP proxy circuit breaker is open",
+                        )
                     }
                     crate::policies::CircuitBreakerError::Inner(response) => response,
                 })?
@@ -7964,7 +8005,15 @@ async fn proxy_charged_request(
     let send_failed =
         |error: reqwest::Error| match crate::proxy::response_auth::handshake_failure(&state.surface, &error) {
             Some(failure) => crate::proxy::response_auth::refuse(failure, &audit_facts, &body_bytes),
-            None => handle_upstream_error(error, &state, &source_addr, &identity_hash, &channel_name, &ucp_operation),
+            None => handle_upstream_error(
+                error,
+                &state,
+                &source_addr,
+                &identity_hash,
+                &channel_name,
+                &ucp_operation,
+                &body_bytes,
+            ),
         };
 
     // Implement retry logic if configured
@@ -8106,7 +8155,7 @@ async fn proxy_charged_request(
                     gate_receipt
                         .iter()
                         .for_each(|receipt| receipt.revoke());
-                    return Err(circuit_open_response(retry_after));
+                    return Err(circuit_open_response(&state.surface, &body_bytes, retry_after));
                 }
                 Err(crate::policies::CircuitBreakerError::Inner(e)) => {
                     if sent_nothing(&e) {
@@ -8145,7 +8194,12 @@ async fn proxy_charged_request(
         tokio::time::timeout(header_timeout, send_response)
             .await
             .map_err(|_| {
-                create_error_response(StatusCode::GATEWAY_TIMEOUT, "Modern MCP upstream response headers timed out")
+                target_unreachable_response(
+                    &state.surface,
+                    StatusCode::GATEWAY_TIMEOUT,
+                    &body_bytes,
+                    "Modern MCP upstream response headers timed out",
+                )
             })??
     } else if let Some(header_timeout) = a2a_stream_header_timeout {
         tokio::time::timeout(header_timeout, send_response)
@@ -8404,15 +8458,17 @@ async fn proxy_charged_request(
                             connection_guard
                                 .decrement()
                                 .await;
-                            let (status, message) = match &e {
+                            return Err(match &e {
                                 crate::mcp::sse_transport::SseConsumeError::Body(body_error) => {
-                                    body_error.status_and_message()
+                                    upstream_body_failure_response(&state.surface, body_error, &body_bytes)
                                 }
-                                crate::mcp::sse_transport::SseConsumeError::NoResponse => {
-                                    (StatusCode::BAD_GATEWAY, "Failed to read MCP tools/list response")
-                                }
-                            };
-                            return Err(create_error_response(status, message));
+                                crate::mcp::sse_transport::SseConsumeError::NoResponse => target_unreachable_response(
+                                    &state.surface,
+                                    StatusCode::BAD_GATEWAY,
+                                    &body_bytes,
+                                    "Failed to read MCP tools/list response",
+                                ),
+                            });
                         }
                     }
                 } else {
@@ -8562,8 +8618,7 @@ async fn proxy_charged_request(
                     });
                 }
 
-                let (status, message) = e.status_and_message();
-                create_error_response(status, message)
+                upstream_body_failure_response(&state.surface, &e, &body_bytes)
             })?;
         (status, response_headers, response_body)
     };
@@ -8800,6 +8855,7 @@ async fn proxy_charged_request(
                     &vc_issuer,
                     &channel_name,
                     identity_response_kind,
+                    &state.key_scope(),
                 )
                 .await
                 .map_err(|e| {
@@ -9193,6 +9249,7 @@ async fn proxy_charged_request(
                         response_wb,
                         &vc_issuer,
                         &channel_name,
+                        &state.key_scope(),
                     )
                     .await
                     {
@@ -10541,6 +10598,7 @@ fn handle_upstream_error(
     identity_hash: &Option<String>,
     channel_name: &str,
     ucp_operation: &Option<String>,
+    request_body: &[u8],
 ) -> Response {
     // Check if this is a placeholder/example domain that's expected to fail
     let is_example_domain = state
@@ -10629,7 +10687,46 @@ fn handle_upstream_error(
     } else {
         StatusCode::BAD_GATEWAY
     };
-    create_error_response(status_code, error_message)
+    target_unreachable_response(&state.surface, status_code, request_body, error_message)
+}
+
+/// The answer to a Target whose response body could not be read: one that stalled, came too
+/// late or broke off did not answer, as [`target_unreachable_response`] says; one too large or
+/// compressed keeps the problem JSON.
+fn upstream_body_failure_response(
+    surface: &crate::config::agent_surface::AgentSurface,
+    error: &crate::proxy::upstream_body::UpstreamBodyError,
+    request_body: &[u8],
+) -> Response {
+    use crate::proxy::upstream_body::UpstreamBodyError;
+
+    let (status, message) = error.status_and_message();
+    match error {
+        UpstreamBodyError::TimedOut | UpstreamBodyError::Read(_) => {
+            target_unreachable_response(surface, status, request_body, message)
+        }
+        UpstreamBodyError::TooLarge(_) | UpstreamBodyError::Compressed => create_error_response(status, message),
+    }
+}
+
+const TARGET_UNREACHABLE: &str = "target_unreachable";
+const TARGET_UNAVAILABLE: &str = "Target unavailable";
+
+/// The answer to a request whose Target, or the peer gateway of a `fabric://` route, could
+/// not be reached or gave no answer in time: on an MCP surface the JSON-RPC
+/// `target_unreachable` error that echoes the id of `request_body`, otherwise the problem
+/// JSON with `detail`.
+pub(crate) fn target_unreachable_response(
+    surface: &crate::config::agent_surface::AgentSurface,
+    status: StatusCode,
+    request_body: &[u8],
+    detail: &str,
+) -> Response {
+    if surface.access_point.protocol == crate::config::agent_surface::SurfaceProtocol::Mcp {
+        crate::mcp::errors::target_failure_response(status, request_body, TARGET_UNREACHABLE, TARGET_UNAVAILABLE)
+    } else {
+        create_error_response(status, detail)
+    }
 }
 
 /// Message returned to the caller when forwarding to the target fails. It names the
@@ -10849,11 +10946,21 @@ async fn resolve_configured_caller_identity(
             }
         }
         Ok(None) => return Ok(None),
-        Err(e @ crate::identity::credential_identity::CredentialIdentityError::ApiKeyIdMissing) => {
+        Err(
+            e @ (crate::identity::credential_identity::CredentialIdentityError::ApiKeyIdMissing
+            | crate::identity::credential_identity::CredentialIdentityError::CertificateIdMissing),
+        ) => {
             warn!(channel = channel_name, leg, error = %e, "Failed to derive inbound credential-based identity");
+            let mode = match e {
+                crate::identity::credential_identity::CredentialIdentityError::CertificateIdMissing => {
+                    crate::source_auth::CallerCredential::Mtls
+                }
+                _ => crate::source_auth::CallerCredential::ApiKey,
+            }
+            .identity_mode();
             crate::metrics::backends::prometheus::track_managed_identity_resolve(
                 channel_name,
-                "from_api_key",
+                mode,
                 e.reason_label(),
                 0.0,
             );
@@ -10870,7 +10977,8 @@ async fn resolve_configured_caller_identity(
     Ok(Some(identity))
 }
 
-const CALLER_IDENTITY_UNRESOLVED: &str = "Caller identity could not be resolved";
+pub(crate) const CALLER_IDENTITY_UNRESOLVED: &str = "Caller identity could not be resolved";
+const CALLER_IDENTITY_NEEDS_API_KEY: &str = "Caller identity requires API key authentication";
 
 /// Whether the configured caller identity runs on this request. It fills in
 /// when the body carried no identity; on an inbound `from_api_key` slot it
@@ -10959,23 +11067,30 @@ async fn resolve_presented_api_key_identity(
                 .as_secs_f64(),
         );
     };
-    let Some(crate::source_auth::AuthenticatedIdentity::ApiKey { key_name, provider_agent_id }) =
-        authenticated_identity
-    else {
-        warn!(channel = channel_name, leg, "Inbound from_api_key identity without API key source auth — refused");
-        track("api_key_unavailable");
-        return Err(create_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Caller identity requires API key authentication",
-        ));
+    let derived = match authenticated_identity {
+        Some(caller) => {
+            crate::identity::credential_identity::global_resolver()
+                .resolve_verified_caller(
+                    &crate::source_auth::ManagedIdentityConfig::FromApiKey { api_key_id: None },
+                    caller,
+                    None,
+                    state.secrets_store.as_ref(),
+                )
+                .await
+        }
+        None => Err(crate::identity::credential_identity::CredentialIdentityError::ApiKeyCallerMissing),
     };
-    let from_provider = provider_agent_id.is_some();
-
-    let (identity_fields, identity_hash) = match crate::identity::credential_identity::global_resolver()
-        .resolve_presented_api_key(key_name, from_provider, state.secrets_store.as_ref())
-        .await
-    {
+    let crate::identity::credential_identity::VerifiedCallerIdentity {
+        identity_fields,
+        identity_hash,
+        verification,
+    } = match derived {
         Ok(derived) => derived,
+        Err(e @ crate::identity::credential_identity::CredentialIdentityError::ApiKeyCallerMissing) => {
+            warn!(channel = channel_name, leg, "Inbound from_api_key identity without API key source auth — refused");
+            track(e.reason_label());
+            return Err(create_error_response(StatusCode::INTERNAL_SERVER_ERROR, CALLER_IDENTITY_NEEDS_API_KEY));
+        }
         Err(e) => {
             warn!(channel = channel_name, leg, error = %e, "Failed to derive caller identity from the presented API key");
             track(e.reason_label());
@@ -11030,11 +11145,7 @@ async fn resolve_presented_api_key_identity(
         debug!(channel = channel_name, leg, did = %response.did, "Resolved caller DID from the presented API key");
     }
     Ok(Some(crate::identity::IdentityResult {
-        verification: if from_provider {
-            crate::surface_context::IdentityVerification::SourceAuth
-        } else {
-            crate::surface_context::IdentityVerification::Unverified
-        },
+        verification,
         hash: identity_hash,
         did: response.did,
         is_new: response.is_new,
@@ -11073,7 +11184,7 @@ fn modern_fabric_failure_response(
         | crate::proxy::fabric_forward::FabricForwardError::ReplyNotReceived(_) => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::BAD_GATEWAY,
     };
-    create_error_response(status, "Modern Fabric transport is unavailable")
+    crate::mcp::errors::target_failure_response_with_id(status, id, TARGET_UNREACHABLE, TARGET_UNAVAILABLE)
 }
 
 /// Policy input for MCP tool gating on the fabric leg. The `tools/list`
@@ -11323,7 +11434,12 @@ async fn handle_fabric_request_inner(
         .await
         .ok_or_else(|| {
             channel_warn!(config_id, "No active listener found for gateway {}", gateway_id);
-            create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Gateway not connected")
+            target_unreachable_response(
+                &state.surface,
+                StatusCode::SERVICE_UNAVAILABLE,
+                &body_bytes,
+                "Gateway not connected",
+            )
         })?;
 
     // Get the remote gateway's DID
@@ -11496,15 +11612,15 @@ async fn handle_fabric_request_inner(
     if caller_identified
         && !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
         && identity_result.is_none()
-        && let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) = state
+        && let Some(inbound_identity @ crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. }) = state
             .surface
             .inbound_identity()
     {
         let mode_label = "from_jwt_claim";
         let started = std::time::Instant::now();
-        let Some(claims) = authenticated_identity
+        let Some(caller) = authenticated_identity
             .as_ref()
-            .and_then(|i| i.jwt_claims())
+            .filter(|i| i.jwt_claims().is_some())
         else {
             crate::metrics::backends::prometheus::track_managed_identity_resolve(
                 channel_name,
@@ -11519,11 +11635,14 @@ async fn handle_fabric_request_inner(
                 .await;
             return Err(from_jwt_claim_without_claims());
         };
-        match crate::identity::credential_identity::resolve_jwt_claim_identity(claim, namespace_claims, claims) {
-            Ok(crate::identity::credential_identity::CredentialIdentity::Derived {
+        match crate::identity::credential_identity::global_resolver()
+            .resolve_verified_caller(inbound_identity, caller, None, None)
+            .await
+        {
+            Ok(crate::identity::credential_identity::VerifiedCallerIdentity {
                 identity_fields,
                 identity_hash,
-                ..
+                verification,
             }) => {
                 let vc_issuer_opt = state
                     .identity_selector
@@ -11582,7 +11701,7 @@ async fn handle_fabric_request_inner(
                             "Resolved inbound agent DID from JWT claim on fabric path"
                         );
                         identity_result = Some(crate::identity::IdentityResult {
-                            verification: crate::surface_context::IdentityVerification::SourceAuth,
+                            verification,
                             hash: identity_hash,
                             did: response.did,
                             is_new: response.is_new,
@@ -11609,7 +11728,6 @@ async fn handle_fabric_request_inner(
                     }
                 }
             }
-            Ok(_) => unreachable!("resolve_jwt_claim_identity only returns Derived"),
             Err(e) => {
                 let result_label = match &e {
                     crate::identity::credential_identity::CredentialIdentityError::JwtClaimMissing(_) => {
@@ -11644,7 +11762,7 @@ async fn handle_fabric_request_inner(
         .map(|result| crate::surface_context::ExtensionIdentityContext {
             verification: result.verification,
             did: Some(result.did.clone()),
-            identity_hash: Some(result.hash.clone()),
+            identity_hash: crate::surface_context::ExtensionIdentityContext::hash_field(&result.hash),
         });
 
     // Access-Point Inbound OPA Policy check (fabric:// path).
@@ -12606,6 +12724,7 @@ async fn handle_fabric_request_inner(
                     None,
                     Some(remote_gateway_did.as_str()),
                     chained_credentials,
+                    &state.key_scope(),
                 )
                 .await
             {
@@ -12847,7 +12966,7 @@ async fn handle_fabric_request_inner(
             connection_guard
                 .decrement()
                 .await;
-            return Err(refusal.response());
+            return Err(refusal.response_for(&state.surface, &body_bytes));
         }
         match inject_target_auth_header(
             target_auth,
@@ -12880,7 +12999,9 @@ async fn handle_fabric_request_inner(
                         connection_guard
                             .decrement()
                             .await;
-                        return Err(e.failure().response());
+                        return Err(e
+                            .failure()
+                            .response_for(&state.surface, &body_bytes));
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -13219,8 +13340,10 @@ async fn handle_fabric_request_inner(
         channel_warn!(config_id, "Consider checking if a cached DID document exists but is expired");
         // The underlying pack/send error stays in the channel log above; the
         // client only gets a generic message so mediator/SDK internals don't leak.
-        create_error_response(
+        target_unreachable_response(
+            &state.surface,
             StatusCode::BAD_GATEWAY,
+            &body_bytes,
             &format!("Failed to send message to remote gateway '{}'. Gateway may be offline if DID resolution failed.", gateway_id)
         )
     })?;
@@ -13465,7 +13588,7 @@ async fn handle_fabric_request_inner(
                     connection_guard
                         .decrement()
                         .await;
-                    return Err(TargetAuthFailure::Rejected.response());
+                    return Err(TargetAuthFailure::Rejected.response_for(&state.surface, &original_body_bytes));
                 }
 
                 let response_headers = response_msg
@@ -13525,7 +13648,12 @@ async fn handle_fabric_request_inner(
                     }
 
                     channel_error!(config_id, "❌ Gateway forwarding error: {}", error);
-                    let relayed_failure = TargetAuthFailure::relayed(status, &response_body);
+                    if let Some(failure) = TargetAuthFailure::relayed(status, &response_body) {
+                        connection_guard
+                            .decrement()
+                            .await;
+                        return Err(failure.response_for(&state.surface, &original_body_bytes));
+                    }
 
                     // For MCP requests, return the error as a properly formatted JSON-RPC error response
                     // instead of converting it to an HTTP error (which causes a 500)
@@ -13543,15 +13671,12 @@ async fn handle_fabric_request_inner(
                             -32603
                         };
                         let jsonrpc_error = || {
-                            let mut jsonrpc_error = serde_json::json!({
+                            let jsonrpc_error = serde_json::json!({
                                 "code": jsonrpc_error_code,
                                 "message": error
                                     .as_str()
                                     .unwrap_or("Gateway forwarding failed")
                             });
-                            if let Some(failure) = relayed_failure {
-                                jsonrpc_error["data"] = serde_json::json!({ "reason": failure.reason() });
-                            }
                             serde_json::json!({ "jsonrpc": "2.0", "id": null, "error": jsonrpc_error }).to_string()
                         };
 
@@ -13610,9 +13735,6 @@ async fn handle_fabric_request_inner(
                     connection_guard
                         .decrement()
                         .await;
-                    if let Some(failure) = relayed_failure {
-                        return Err(failure.response());
-                    }
                     return Err(create_error_response(
                         error_status,
                         error
@@ -13926,6 +14048,7 @@ async fn handle_fabric_request_inner(
                             &vc_issuer,
                             channel_name,
                             identity_response_kind,
+                            &state.key_scope(),
                         )
                         .await
                         {
@@ -14708,7 +14831,12 @@ async fn handle_fabric_request_inner(
                 connection_guard
                     .decrement()
                     .await;
-                Err(create_error_response(StatusCode::GATEWAY_TIMEOUT, "Gateway did not respond in time"))
+                Err(target_unreachable_response(
+                    &state.surface,
+                    StatusCode::GATEWAY_TIMEOUT,
+                    &body_bytes,
+                    "Gateway did not respond in time",
+                ))
             }
             Err(e) => {
                 channel_error!(config_id, "❌ Fabric forward failed: {}", e);
@@ -14768,7 +14896,12 @@ async fn handle_fabric_request_inner(
                 connection_guard
                     .decrement()
                     .await;
-                Err(create_error_response(StatusCode::BAD_GATEWAY, &format!("Fabric forwarding failed: {}", e)))
+                Err(target_unreachable_response(
+                    &state.surface,
+                    StatusCode::BAD_GATEWAY,
+                    &body_bytes,
+                    &format!("Fabric forwarding failed: {}", e),
+                ))
             }
         }
     };
@@ -15130,11 +15263,12 @@ async fn put_identity_credential_into_agent_card(
     vc_issuer: &Arc<crate::identity::VCIssuer>,
     channel_name: &str,
     response_kind: crate::proxy::backend_identity::IdentityResponseKind,
+    scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<()> {
     if response_kind.trusts_upstream_identity_credential() {
-        crate::a2a::inject_credential_into_agent_card(card, resolved_identity, vc_issuer, channel_name).await
+        crate::a2a::inject_credential_into_agent_card(card, resolved_identity, vc_issuer, channel_name, scope).await
     } else {
-        crate::a2a::replace_credential_in_agent_card(card, resolved_identity, vc_issuer, channel_name).await
+        crate::a2a::replace_credential_in_agent_card(card, resolved_identity, vc_issuer, channel_name, scope).await
     }
 }
 
@@ -15957,7 +16091,9 @@ async fn handle_mcp_proxy_request_inner(
                 record_target_auth_failure(&audit_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return Err(e.failure().response());
+                        return Err(e
+                            .failure()
+                            .response_for(&state.surface, body_bytes));
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -15995,14 +16131,7 @@ async fn handle_mcp_proxy_request_inner(
         && let Some(retry_after) = breaker.refusing_for().await
     {
         error!(channel = channel_name, proxy_id = proxy_id, retry_after = ?retry_after, "Circuit breaker is open");
-        return Err(crate::mcp::errors::create_mcp_error_response(
-            json_request
-                .get("id")
-                .cloned(),
-            crate::mcp::errors::error_codes::INTERNAL_ERROR,
-            &format!("MCP proxy error: Circuit breaker open, retry after {:?}", retry_after),
-            None,
-        ));
+        return Err(circuit_open_response(&state.surface, body_bytes, retry_after));
     }
     let executed = match prepared {
         Ok(prepared) => {
@@ -16300,7 +16429,16 @@ async fn handle_mcp_proxy_request_inner(
             if let Some(target_auth) = state.surface.target_auth() {
                 record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
             }
-            Err(refusal.response())
+            Err(refusal.response_for(&state.surface, body_bytes))
+        }
+        Err(error) if crate::mcp_proxies::handlers::is_circuit_open_error(&error) => {
+            error!(channel = channel_name, proxy_id = proxy_id, "Circuit breaker is open");
+            Err(target_unreachable_response(
+                &state.surface,
+                StatusCode::SERVICE_UNAVAILABLE,
+                body_bytes,
+                "MCP proxy circuit breaker is open",
+            ))
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::Failed(e)) => {
             error!(
@@ -16454,10 +16592,17 @@ async fn load_owned_proxy(
         .ok_or_else(crate::protocols::no_mcp_proxy_response)
 }
 
-/// What a request gets when the Target's circuit breaker is open.
-fn circuit_open_response(retry_after: std::time::Duration) -> Response {
-    create_error_response(
+/// What a request gets when the Target's circuit breaker is open: on an MCP surface the
+/// JSON-RPC `target_unreachable` error, otherwise the problem JSON.
+fn circuit_open_response(
+    surface: &crate::config::agent_surface::AgentSurface,
+    request_body: &[u8],
+    retry_after: std::time::Duration,
+) -> Response {
+    target_unreachable_response(
+        surface,
         StatusCode::SERVICE_UNAVAILABLE,
+        request_body,
         &format!("Service temporarily unavailable. Retry after {:?}", retry_after),
     )
 }
@@ -16627,6 +16772,7 @@ async fn inject_backend_agent_vp(
                 protected_strip_raw,
                 mcp_metadata_context,
                 None,
+                &state.key_scope(),
             )
             .await
         }
@@ -16640,6 +16786,7 @@ async fn inject_backend_agent_vp(
                 channel_name,
                 inbound_chained_vcs.clone(),
                 None,
+                &state.key_scope(),
             )
             .await
             .map(|injected| injected.map_or_else(|| (response_body.clone(), None), |(body, proof)| (body, Some(proof))))
@@ -16738,8 +16885,8 @@ const CALLER_IDENTITY_PROOFS: [&str; 2] = [
 
 /// `body_bytes` without the identity proofs its caller put in it, for a caller
 /// that gets no inbound identity, so none of its own reaches the Target: the
-/// MCP `_meta` entries, and the A2A and AP2 message `metadata` entries (in
-/// `params.message`, `message` or a bare message), of a request or of each
+/// MCP `_meta` entries, and the A2A and AP2 message `metadata` entries (at each
+/// of [`crate::a2a::extensions::MESSAGE_POINTERS`]), of a request or of each
 /// request of a JSON-RPC batch. The extension URIs in `extensions` stay: they
 /// also ask for the responding agent's credential. A body with no proof, an
 /// empty one, or one of another protocol is returned byte for byte. A body the
@@ -16780,11 +16927,13 @@ fn remove_mcp_identity_proofs(request: &mut serde_json::Value) -> bool {
         .fold(false, |removed, key| crate::mcp::meta::remove_metadata_key(request, key) | removed)
 }
 
-/// Remove the caller identity proofs from an A2A or AP2 message's `metadata`;
-/// whether any was there.
+/// Remove the caller identity proofs from the `metadata` at every A2A or AP2
+/// message location; whether any was there. Unlike a Transit Point's removal of
+/// asserted identity, this removes only the two proofs and keeps the extension
+/// URIs, by design.
 fn remove_a2a_identity_proofs(request: &mut serde_json::Value) -> bool {
     let mut removed = false;
-    for pointer in ["/params/message", "/message", ""] {
+    for pointer in crate::a2a::extensions::MESSAGE_POINTERS {
         if let Some(metadata) = request
             .pointer_mut(pointer)
             .and_then(|message| message.get_mut("metadata"))
@@ -17453,6 +17602,7 @@ pub(crate) mod target_auth_tests {
             .remove(0);
         let now = chrono::Utc::now();
         stored.created_at = now - chrono::Duration::seconds(3400);
+        stored.consent_granted_at = stored.created_at;
         stored.expires_at = Some(now + chrono::Duration::seconds(200));
         fixture
             .vault
@@ -21561,7 +21711,7 @@ allow if {
                 "{surface_id} runtime={with_runtime}: {status} {body}"
             );
             assert_eq!(
-                body.contains("Modern Fabric transport is unavailable"),
+                body.contains("target_unreachable"),
                 !opted_in,
                 "{surface_id} runtime={with_runtime}: {status} {body}"
             );
@@ -23218,7 +23368,32 @@ allow if {
                     .get(axum::http::header::RETRY_AFTER)
                     .is_none()
             );
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "call-1",
+                    "error": {"code": -32603, "message": "Target unavailable", "data": {"reason": "target_unreachable"}},
+                }),
+                "{status}"
+            );
         }
+
+        let notification = modern_fabric_failure_response(FabricForwardError::NoResponse("gw".into()), None, &facts);
+        assert_eq!(notification.status(), axum::http::StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            axum::body::to_bytes(notification.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a notification gets the status and no body"
+        );
     }
 
     // ── Log and span redaction ─────────────────────────────────────────────────
@@ -23701,6 +23876,32 @@ allow if {
         }
 
         #[tokio::test]
+        async fn protected_mtls_without_certificate_id_is_a_fixed_500() {
+            let (issuer, _dir) = test_vc_issuer().await;
+            let state = state_with(
+                surface_with(
+                    "pak-protected-no-cert",
+                    None,
+                    Some(ManagedIdentityConfig::FromMtls { certificate_id: None }),
+                ),
+                Some(issuer),
+            );
+
+            let response = resolve(&state, Some(&provider_key("atgk_pak_caller")), false)
+                .await
+                .unwrap_err();
+
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = body_text(response).await;
+            assert!(body.contains(super::super::CALLER_IDENTITY_UNRESOLVED), "{body}");
+            assert!(!body.contains("certificate_id"), "{body}");
+            let mtls_count = crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
+                .with_label_values(&["pak-protected-no-cert", "from_mtls", "certificate_id_missing"])
+                .get();
+            assert_eq!(mtls_count, 1);
+        }
+
+        #[tokio::test]
         async fn missing_vc_issuer_resolves_no_identity() {
             let state = state_with(inbound_from_api_key("pak-no-issuer"), None);
 
@@ -23901,7 +24102,7 @@ allow if {
             let mtls = surface_with(
                 "pak-precedence-mtls",
                 Some(ManagedIdentityConfig::FromMtls {
-                    certificate_id: "cert-1".into(),
+                    certificate_id: Some("cert-1".into()),
                 }),
                 None,
             );
@@ -24039,7 +24240,7 @@ allow if {
                 surface_with(
                     "pak-agent-did-mtls",
                     Some(ManagedIdentityConfig::FromMtls {
-                        certificate_id: "cert-1".into(),
+                        certificate_id: Some("cert-1".into()),
                     }),
                     None,
                 ),
@@ -24806,6 +25007,261 @@ allow if {
         assert!(!text.contains("tool-argument-marker"), "a log holds the request body: {text}");
     }
 
+    async fn unreachable_endpoint() -> String {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        format!("http://127.0.0.1:{port}/agent")
+    }
+
+    async fn body_of(response: axum::response::Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_target_on_an_mcp_surface_answers_a_json_rpc_error_with_the_request_id() {
+        let endpoint = unreachable_endpoint().await;
+        let surface = mcp_surface("mcp-down", &endpoint, None);
+        let state = bare_proxy_state(surface.clone(), None);
+        let request = serde_json::json!({"jsonrpc": "2.0", "id": "req-9", "method": "tools/list"});
+
+        let response = send_to_surface(&state, surface, legacy_mcp_request("/mcp-down", &request)).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        let body = body_of(response).await;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "req-9",
+                "error": {"code": -32603, "message": "Target unavailable", "data": {"reason": "target_unreachable"}},
+            })
+        );
+        assert!(!String::from_utf8_lossy(&body).contains("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn an_open_circuit_answers_an_mcp_request_with_a_json_rpc_error_and_others_with_the_problem_document() {
+        let surface = mcp_surface("mcp-open", "http://127.0.0.1:9/agent", None);
+        let request = br#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#;
+        let retry_after = std::time::Duration::from_secs(30);
+
+        let response = super::circuit_open_response(&surface, request, retry_after);
+        assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body_of(response).await).unwrap(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "error": {"code": -32603, "message": "Target unavailable", "data": {"reason": "target_unreachable"}},
+            })
+        );
+
+        let notification = super::circuit_open_response(
+            &surface,
+            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            retry_after,
+        );
+        assert_eq!(notification.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body_of(notification)
+                .await
+                .is_empty()
+        );
+
+        let mut a2a = surface;
+        a2a.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::A2a;
+        let problem =
+            String::from_utf8(body_of(super::circuit_open_response(&a2a, request, retry_after)).await).unwrap();
+        assert!(problem.contains("Service temporarily unavailable"), "{problem}");
+        assert!(!problem.contains("jsonrpc"), "{problem}");
+    }
+
+    /// A Target that sends `head` and the start of a body, then sends nothing more.
+    async fn stalling_endpoint(head: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut connection, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = connection
+                        .read(&mut [0u8; 65536])
+                        .await;
+                    let _ = connection
+                        .write_all(head.as_bytes())
+                        .await;
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                });
+            }
+        });
+        format!("http://{address}/agent")
+    }
+
+    fn surface_with_one_second_timeout(
+        surface_id: &str,
+        endpoint: &str,
+    ) -> crate::config::agent_surface::AgentSurface {
+        let mut surface = mcp_surface(surface_id, endpoint, None);
+        surface.target.networking =
+            Some(serde_json::from_value(serde_json::json!({"timeout": {"request_secs": 1, "idle_secs": 1}})).unwrap());
+        surface
+    }
+
+    #[tokio::test]
+    async fn a_target_that_stalls_its_body_answers_an_mcp_request_with_a_json_rpc_error_with_the_request_id() {
+        for (head, method) in [
+            ("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 200\r\n\r\n{\"jsonrpc\"", "ping"),
+            ("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\nevent: message\r\n", "tools/list"),
+        ] {
+            let endpoint = stalling_endpoint(head).await;
+            let surface = surface_with_one_second_timeout("mcp-stall", &endpoint);
+            let state = bare_proxy_state(surface.clone(), None);
+            let request = serde_json::json!({"jsonrpc": "2.0", "id": "req-stall", "method": method});
+
+            let response = send_to_surface(&state, surface, legacy_mcp_request("/mcp-stall", &request)).await;
+
+            assert_eq!(response.status(), axum::http::StatusCode::GATEWAY_TIMEOUT, "{method}");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body_of(response).await).unwrap(),
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "req-stall",
+                    "error": {"code": -32603, "message": "Target unavailable", "data": {"reason": "target_unreachable"}},
+                }),
+                "{method}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_open_circuit_refuses_a_legacy_mcp_proxy_call_with_503_and_the_json_rpc_error() {
+        use crate::mcp_proxies::filesystem::McpProxyStore;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            crate::mcp_proxies::FileSystemMcpProxyStore::new(directory.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let proxy = crate::mcp_proxies::types::McpProxy::new(
+            "Breaker".into(),
+            String::new(),
+            unreachable_endpoint().await,
+            serde_json::json!({"openapi": "3.0.0", "info": {"title": "Tools", "version": "1.0"}, "paths": {
+                "/alpha": {"get": {"operationId": "alpha", "responses": {"200": {"description": "OK"}}}}
+            }})
+            .to_string(),
+            "/mcp".into(),
+            "/breaker".into(),
+        );
+        store
+            .create(&proxy)
+            .await
+            .unwrap();
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "proxy-breaker", "name": "Proxy breaker",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/proxy-breaker", "protocol": "mcp"},
+            "target": {
+                "endpoint": format!("proxy://{}", proxy.id),
+                "networking": {"circuit_breaker": {"failure_threshold": 1, "success_threshold": 1, "timeout_secs": 60, "window_secs": 60}}
+            }
+        }))
+        .unwrap();
+        let policies = std::sync::Arc::new(crate::policies::SurfacePolicyManager::new());
+        policies
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+        let breaker = policies
+            .get_circuit_breaker("proxy-breaker")
+            .await
+            .expect("the surface configures a circuit breaker");
+        let _ = breaker
+            .call(async { Err::<(), _>("the Target failed") })
+            .await;
+        let state = crate::state::ProxyState {
+            mcp_proxy_store: Some(store),
+            ..bare_proxy_state(surface.clone(), Some(policies))
+        };
+        let request = serde_json::json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "alpha", "arguments": {}}});
+
+        let response = send_to_surface(&state, surface, legacy_mcp_request("/proxy-breaker", &request)).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body_of(response).await).unwrap(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "error": {"code": -32603, "message": "Target unavailable", "data": {"reason": "target_unreachable"}},
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_target_on_an_mcp_surface_answers_a_notification_with_no_body() {
+        let endpoint = unreachable_endpoint().await;
+        let state = bare_proxy_state(mcp_surface("mcp-down-note", &endpoint, None), None);
+        let error = reqwest::Client::new()
+            .get(&endpoint)
+            .send()
+            .await
+            .expect_err("nothing listens on the port");
+
+        let response = super::handle_upstream_error(
+            error,
+            &state,
+            "127.0.0.1:12345",
+            &None,
+            "mcp-down-note",
+            &None,
+            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        );
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+        assert!(
+            body_of(response)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_target_on_an_a2a_surface_keeps_the_problem_document() {
+        let endpoint = unreachable_endpoint().await;
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "a2a-down", "name": "a2a-down",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/a2a-down", "protocol": "a2a"},
+            "target": {"endpoint": endpoint}
+        }))
+        .unwrap();
+        let state = bare_proxy_state(surface.clone(), None);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/a2a-down")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{}}"#))
+            .unwrap();
+
+        let response = send_to_surface(&state, surface, request).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+        assert_eq!(response.headers()["content-type"], "application/problem+json");
+        let problem: serde_json::Value = serde_json::from_slice(&body_of(response).await).unwrap();
+        assert_eq!(problem["type"], "https://a2a-protocol.org/errors/proxy-error");
+        assert_eq!(problem["detail"], "Connection failed to target endpoint");
+    }
+
     #[tokio::test]
     async fn an_unreachable_target_answers_a_generic_error_and_logs_no_target_url() {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -24822,15 +25278,23 @@ allow if {
             .expect_err("nothing listens on the port");
         let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
 
-        let response =
-            super::handle_upstream_error(error, &state, "127.0.0.1:12345", &None, "unreachable-target", &None);
+        let response = super::handle_upstream_error(
+            error,
+            &state,
+            "127.0.0.1:12345",
+            &None,
+            "unreachable-target",
+            &None,
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        );
 
         assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
-        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(problem["detail"], "Connection failed to target endpoint");
+        let rpc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rpc["error"]["message"], "Target unavailable");
+        assert!(!String::from_utf8_lossy(&body).contains("127.0.0.1"), "{rpc}");
         let text = logs.text();
         assert!(text.contains("Failed to forward request to upstream - bad gateway"), "{text}");
         assert!(text.contains(&format!("target=http://127.0.0.1:{port}/agent?api_key=<redacted>")), "{text}");
@@ -25958,6 +26422,89 @@ mod fabric_send_tests {
         super::CHANNEL_SSE_SESSION_MGR
             .remove_session(&session_id)
             .await;
+    }
+
+    /// A gateway whose MCP surface targets a Fabric peer it has no connection to, with an
+    /// open Legacy SSE session past its `endpoint` event, and that session's message URL.
+    async fn unconnected_fabric_mcp_legacy_sse_session() -> (FabricPeer, String, axum::body::Body, String) {
+        let peer = fabric_peer_fronted_by(200, json!({}), |_| {
+            json!({
+                "surface_id": "fabric-unconnected-mcp", "name": "Fabric unconnected MCP",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+                "target": {"endpoint": "fabric://not-connected/remote-surface"}
+            })
+        })
+        .await;
+        let (session_id, stream) = super::CHANNEL_SSE_SESSION_MGR
+            .create_session()
+            .await
+            .unwrap();
+        let mut events =
+            crate::mcp::sse_server::build_legacy_sse_response(session_id.clone(), stream, "/mcp").into_body();
+        let (name, _) = next_event(&mut events).await;
+        assert_eq!(name, "endpoint");
+        let url = format!("https://gateway.example/mcp/messages/?session_id={session_id}");
+        (peer, session_id, events, url)
+    }
+
+    #[test]
+    fn a_legacy_sse_request_over_the_fabric_gets_the_json_rpc_error_with_its_reason() {
+        run_on_large_stack(async {
+            let (peer, session_id, mut events, url) = unconnected_fabric_mcp_legacy_sse_session().await;
+
+            let (status, _, _) = answer(post(&peer.state, &url, &tool_call("any_tool"), None).await).await;
+
+            assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+            let (name, data) = next_event(&mut events).await;
+            assert_eq!(name, "message");
+            let message: serde_json::Value = serde_json::from_str(&data).unwrap();
+            assert_eq!(
+                message,
+                json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32603, "message": "Target unavailable",
+                    "data": {"reason": "target_unreachable"}}})
+            );
+            super::CHANNEL_SSE_SESSION_MGR
+                .remove_session(&session_id)
+                .await;
+        });
+    }
+
+    #[test]
+    fn a_legacy_sse_refusal_that_is_not_json_rpc_becomes_a_json_rpc_error_with_the_request_id() {
+        let request = tool_call("any_tool");
+        let problem = json!({"type": "proxy-error", "detail": "Gateway DID not found"}).to_string();
+
+        let message = super::legacy_sse_refusal_message(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &problem,
+            &request,
+            || "Fabric forwarding failed".to_string(),
+        );
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&message).unwrap(),
+            json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32603, "message": "Fabric forwarding failed"}})
+        );
+    }
+
+    #[test]
+    fn a_legacy_sse_notification_over_the_fabric_that_fails_gets_no_message() {
+        run_on_large_stack(async {
+            let (peer, session_id, mut events, url) = unconnected_fabric_mcp_legacy_sse_session().await;
+            let notification = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+
+            let (status, _, _) = answer(post(&peer.state, &url, &notification, None).await).await;
+            assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+            answer(post(&peer.state, &url, &tool_call("any_tool"), None).await).await;
+
+            let (name, data) = next_event(&mut events).await;
+            assert_eq!(name, "message");
+            let message: serde_json::Value = serde_json::from_str(&data).unwrap();
+            assert_eq!(message["id"], 7, "the first message answers the request, not the notification: {message}");
+            super::CHANNEL_SSE_SESSION_MGR
+                .remove_session(&session_id)
+                .await;
+        });
     }
 
     #[test]

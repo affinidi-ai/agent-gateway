@@ -177,6 +177,20 @@ impl PendingConnectionStore {
             .flatten()
     }
 
+    /// Whether a connection-setup from `their_temporary_did` waits for approval: the
+    /// acceptor that redeemed an invitation, whose repeated setup is not refused.
+    pub async fn awaits_approval_from(
+        &self,
+        their_temporary_did: &str,
+    ) -> bool {
+        self.approval_connections
+            .list_all()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|approval| approval.their_temporary_did == their_temporary_did)
+    }
+
     /// Remove pending approval connection
     pub async fn remove_approval(
         &self,
@@ -511,5 +525,38 @@ mod tests {
         let restored: PendingConnection = serde_json::from_value(serde_json::to_value(&connection).unwrap()).unwrap();
 
         assert_eq!(restored.their_issuer_did, Some("did:web:them.example".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_setup_waiting_for_approval_is_recognised_by_its_sender() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PendingConnectionStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        store
+            .store_approval(&PendingConnection {
+                gateway_id: "gw-1".to_string(),
+                invitation_id: "cp-1".to_string(),
+                our_temporary_did: "did:peer:2.inviter".to_string(),
+                our_secure_did: "did:peer:2.inviter-permanent".to_string(),
+                their_temporary_did: "did:peer:2.acceptor".to_string(),
+                their_secure_did: None,
+                their_issuer_did: None,
+                state: PendingConnectionState::AwaitingApproval,
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .awaits_approval_from("did:peer:2.acceptor")
+                .await
+        );
+        assert!(
+            !store
+                .awaits_approval_from("did:peer:2.someone-else")
+                .await
+        );
     }
 }

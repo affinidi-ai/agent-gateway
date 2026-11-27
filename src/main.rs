@@ -75,6 +75,7 @@ mod trust_registries;
 mod trust_registry_verification; // Trust Registry client and validation
 mod url_validation; // SSRF protection for user-supplied URLs
 mod vault_identity; // Vault identity generation for API keys and certificates
+mod vta; // Verifiable Trust Agent (VTA) signing connector — thin REST/Trust-Task client
 mod x402; // x402 protocol (HTTP Native Payments Protocol)
 
 #[cfg(test)]
@@ -125,6 +126,12 @@ struct Args {
     /// Decrypt a previously exported storage archive
     #[arg(long, value_name = "INPUT_FILE")]
     decrypt_export: Option<PathBuf>,
+
+    /// Print the did:key of the control key stored for the trust agent
+    /// connection configured in `[vta]`, for granting it on the trust agent or
+    /// again after a backup restore. Prints public data only.
+    #[arg(long)]
+    vta_print_control_did: bool,
 
     /// Output path (used with --decrypt-export, defaults to export.zip)
     #[arg(long, value_name = "OUTPUT_FILE", default_value = "export.zip")]
@@ -308,6 +315,19 @@ async fn async_main() -> Result<()> {
     // Initialize global encryption config for all storage operations
     storage::filesystem::init_global_encryption(encryption.clone())
         .context("Failed to initialize storage encryption")?;
+
+    if args.vta_print_control_did {
+        let key_path = vta::rotatable_control_key_path(&bootstrap_config.vta)
+            .ok_or_else(|| anyhow::anyhow!("[vta] holds no did:key control key in a file"))?;
+        match vta::control_rotation::stored_control_did(&key_path)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.log_detail().to_string()))?
+        {
+            Some(did) => println!("{did}"),
+            None => anyhow::bail!("no control key is stored at {}", key_path.display()),
+        }
+        return Ok(());
+    }
 
     // Boot migration: decrypt any residual field-level ENC[...] values left by an
     // earlier build to plaintext, before any store is loaded into a model. Whole-file
@@ -1499,6 +1519,7 @@ fn render_default_bootstrap_toml(
         legacy_backup_encryption_keys: None,
         trust_registry: Default::default(),
         tenancy: Default::default(),
+        vta: Default::default(),
         credential_policy: Default::default(),
         config_dir: None,
         server_mode: crate::server::mode::ServerMode::default(),

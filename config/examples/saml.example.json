@@ -25,9 +25,9 @@
     "job_title": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/title/title"
   },
   "role_mapping": {
-    "administrator": "administrator",
-    "poweruser": "poweruser",
-    "user": "user"
+    "<idp-admin-group>": "administrator",
+    "<idp-power-user-group>": "poweruser",
+    "<idp-user-group>": "user"
   },
   "graph_api": {
     "tenant_id": "$AZURE_TENANT",

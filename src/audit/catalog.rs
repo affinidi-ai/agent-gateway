@@ -3,7 +3,7 @@
 
 use serde::Serialize;
 
-use AuditEventGroup::{Auth, Delegation, Identity, Payments, Policies, Requests, Trace, Trust};
+use AuditEventGroup::{Auth, Delegation, Identity, KeyManagement, Payments, Policies, Requests, Trace, Trust};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -16,6 +16,7 @@ pub enum AuditEventGroup {
     Delegation,
     Payments,
     Requests,
+    KeyManagement,
 }
 
 impl AuditEventGroup {
@@ -29,6 +30,7 @@ impl AuditEventGroup {
             Delegation => "delegation",
             Payments => "payments",
             Requests => "requests",
+            KeyManagement => "key_management",
         }
     }
 
@@ -43,6 +45,7 @@ impl AuditEventGroup {
             Delegation => "Delegation",
             Payments => "Payments",
             Requests => "Requests",
+            KeyManagement => "Key management",
         }
     }
 }
@@ -212,6 +215,72 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         Auth,
     ),
     event(
+        "trust_agent_connection_created",
+        "Trust Agent Connection Created",
+        "A Verifiable Trust Agent connection was added",
+        KeyManagement,
+    ),
+    event(
+        "trust_agent_connection_updated",
+        "Trust Agent Connection Updated",
+        "A Verifiable Trust Agent connection was edited, enabled or disabled",
+        KeyManagement,
+    ),
+    event(
+        "trust_agent_connection_deleted",
+        "Trust Agent Connection Deleted",
+        "A Verifiable Trust Agent connection was deleted",
+        KeyManagement,
+    ),
+    event(
+        "trust_agent_pairing_started",
+        "Trust Agent Pairing Started",
+        "Pairing with a Verifiable Trust Agent began and its grant request was issued",
+        KeyManagement,
+    ),
+    event(
+        "trust_agent_connection_verified",
+        "Trust Agent Connection Verified",
+        "The gateway checked a connection's grant on its trust agent, with the state it found",
+        KeyManagement,
+    ),
+    event(
+        "trust_agent_connection_revoked",
+        "Trust Agent Connection Revoked",
+        "The gateway stopped signing through a Verifiable Trust Agent connection",
+        KeyManagement,
+    ),
+    event(
+        "trust_agent_signing_key_provisioned",
+        "Trust Agent Signing Key Provisioned",
+        "A signing key was minted in a trust agent and made a connection's active key",
+        KeyManagement,
+    ),
+    event(
+        "trust_agent_signing_key_rotated",
+        "Trust Agent Signing Key Rotated",
+        "A connection's active signing key was replaced",
+        KeyManagement,
+    ),
+    event(
+        "trust_agent_control_key_rotated",
+        "Trust Agent Control Key Rotated",
+        "A control key rotation, of a connection or of the [vta] block, finished, rolled back, was cancelled or was left running",
+        KeyManagement,
+    ),
+    event(
+        "trust_agent_change_refused",
+        "Trust Agent Change Refused",
+        "A change to a trust agent connection or key was refused (401, 403, 409, or 404 for a connection the caller may not see)",
+        KeyManagement,
+    ),
+    event(
+        "signing_change_refused",
+        "Signing Change Refused",
+        "A surface, issuer or settings save that changed a signing choice was refused for lack of key_management.edit",
+        KeyManagement,
+    ),
+    event(
         "policy_input_capture_started",
         "Policy Input Capture Started",
         "A dashboard user started watching the live, masked policy input of a surface; also recorded wherever Policy Input Capture Stopped is selected",
@@ -293,7 +362,7 @@ mod tests {
 
     #[test]
     fn a_group_id_is_its_serialized_name() {
-        for group in [Policies, Trust, Identity, Trace, Auth, Delegation, Payments, Requests] {
+        for group in [Policies, Trust, Identity, Trace, Auth, Delegation, Payments, Requests, KeyManagement] {
             assert_eq!(serde_json::to_value(group).expect("serializes"), group.id());
         }
     }
@@ -408,6 +477,21 @@ mod tests {
         assert_eq!(group_of("browser_origins_changed"), Some(AuditEventGroup::Auth));
         assert_eq!(group_of("identity_binding_failed"), Some(AuditEventGroup::Identity));
         assert_eq!(group_of("identity_binding_verified"), Some(AuditEventGroup::Identity));
+        for security in [
+            "trust_agent_connection_created",
+            "trust_agent_connection_updated",
+            "trust_agent_connection_deleted",
+            "trust_agent_pairing_started",
+            "trust_agent_connection_verified",
+            "trust_agent_connection_revoked",
+            "trust_agent_signing_key_provisioned",
+            "trust_agent_signing_key_rotated",
+            "trust_agent_control_key_rotated",
+            "trust_agent_change_refused",
+            "signing_change_refused",
+        ] {
+            assert_eq!(group_of(security), Some(AuditEventGroup::KeyManagement), "{security}");
+        }
         for request in ["request_rejected", "rate_limited"] {
             assert_eq!(group_of(request), Some(AuditEventGroup::Requests), "{request}");
         }
