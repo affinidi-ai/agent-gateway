@@ -83,6 +83,9 @@ replaces it while it does. Its **Keep open** button stops the countdown, removes
 the button, moves focus to the close button and keeps the toast (`#app-toast-kept`) until it is
 closed: a later toast no longer replaces it but is shown below it, moving back to the top when
 the kept toast closes, and keeping a newer warnings toast closes the older kept one.
+`closeKeptToast` closes a kept toast and leaves the replaceable one; the surface page calls it
+when it leaves its surface, for another surface or another page, so kept save warnings stay
+with their surface as the save-warnings banner did.
 `showSuccessCountdownToast` is a success toast that counts down 3 seconds with no other button.
 Both colour the left border with the brand colour (`UI_COLORS`) and the icon with the text-safe
 token (`--warning-text`, `--success-text`), so the icon keeps 3:1 in both themes.

@@ -1,6 +1,7 @@
 import { act } from 'react';
 import {
   ANNOUNCE_DELAY_MS,
+  closeKeptToast,
   removeToast,
   showKeepOpenWarningToast,
   showSuccessCountdownToast,
@@ -358,6 +359,19 @@ describe('showKeepOpenWarningToast', () => {
 
     expect(document.querySelectorAll('#app-toast-kept')).toHaveLength(1);
     expect(kept()?.textContent).toContain('second');
+  });
+
+  it('is closed by closeKeptToast, which leaves the replaceable toast in place', () => {
+    showAndKeep('Saved, with warnings:\nfirst');
+    act(() => {
+      showToast('error', 'Save blocked');
+    });
+
+    act(() => {
+      closeKeptToast();
+    });
+    expect(kept()).toBeNull();
+    expect(getToast().textContent).toContain('Save blocked');
   });
 
   it('is removed by removeToast', () => {

@@ -222,10 +222,15 @@ export const showToast = (
   }
 };
 
+/** Closes the kept toast, if any; the replaceable one stays. */
+export const closeKeptToast = () => {
+  dismissKept?.();
+};
+
 /** Removes every toast on screen, a kept one included. */
 export const removeToast = () => {
   replaceActiveToast();
-  dismissKept?.();
+  closeKeptToast();
 };
 
 export interface UndoToastOptions {

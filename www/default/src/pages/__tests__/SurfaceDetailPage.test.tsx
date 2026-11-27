@@ -6,6 +6,7 @@ import SurfaceDetailPage from '../SurfaceDetailPage';
 import { apiClient } from '../../api';
 import type { AgentSurface } from '../../api';
 import {
+  closeKeptToast,
   showKeepOpenWarningToast,
   showSuccessCountdownToast,
   showToast,
@@ -16,10 +17,12 @@ jest.mock('../../utils/toaster', () => ({
   showToast: jest.fn(),
   showKeepOpenWarningToast: jest.fn(),
   showSuccessCountdownToast: jest.fn(),
+  closeKeptToast: jest.fn(),
 }));
 
 const keepOpenToast = showKeepOpenWarningToast as jest.Mock;
 const successToast = showSuccessCountdownToast as jest.Mock;
+const closeKept = closeKeptToast as jest.Mock;
 jest.mock('../../components/surface-builder/SurfaceCanvas', () => ({
   getIncompleteReason: () => null,
 }));
@@ -129,6 +132,7 @@ beforeEach(() => {
   (showToast as jest.Mock).mockReset();
   keepOpenToast.mockReset();
   successToast.mockReset();
+  closeKept.mockReset();
   jest.spyOn(apiClient, 'getSurface').mockResolvedValue(surface);
 });
 
@@ -158,6 +162,26 @@ describe('SurfaceDetailPage save warnings', () => {
 
     await waitFor(() => expect(apiClient.getSurface).toHaveBeenCalledWith('s2'));
     expect(await screen.findByTestId('meta-warnings')).toBeEmptyDOMElement();
+  });
+
+  it('closes a kept save-warnings toast only when the page moves to another surface', async () => {
+    renderAt(null);
+    await screen.findByTestId('meta-warnings');
+    expect(closeKept).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByText('Open another surface'));
+
+    await waitFor(() => expect(apiClient.getSurface).toHaveBeenCalledWith('s2'));
+    expect(closeKept).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes a kept save-warnings toast when the page is left', async () => {
+    const { unmount } = renderAt(null);
+    await screen.findByTestId('meta-warnings');
+
+    unmount();
+
+    expect(closeKept).toHaveBeenCalledTimes(1);
   });
 
   it('ignores route state that is not a list of warnings', async () => {
