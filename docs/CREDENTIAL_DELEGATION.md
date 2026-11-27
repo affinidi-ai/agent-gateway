@@ -1682,10 +1682,13 @@ request that could never be served. Every leg loads the proxy it checks in one w
 the surface's tenant. Each
 proxy's spec is parsed once and kept while its id, base URL and spec stay the same, so the
 check and the call it guards share one parse; requests that find it unparsed wait for one parse
-of that proxy's spec, while other proxies' lookups go on. On Fabric receive a `2026-07-28` tool
-call to an MCP proxy Target arrives over a Fabric stream, which does not say what its sender
-injected, so it is held as carrying a delegated credential for this check whatever the
-receiving surface's own bindings, as an unreadable `delegated_meta_fields` list is (see
+of that proxy's spec, while other proxies' lookups go on. On Fabric receive a `2026-07-28` MCP request arrives over a Fabric stream, which does not say what
+its sender injected, so every request a stream carries is held as carrying a delegated credential
+for this check whatever the Target and the receiving surface's own bindings, as an unreadable
+`delegated_meta_fields` list is: an HTTP(S) Target's request URL is held to the Target base path,
+and an MCP proxy's tool call to the REST URL its path arguments build, both refused with
+`400 target_path_refused` and recorded before the Target is called. The stream format is unchanged
+(see
 [Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric)). When a legacy MCP
 Target refuses the plain POST and the request falls back to Legacy SSE, on the direct path or
 Fabric receive, the session endpoint the Target advertises is known only after the first

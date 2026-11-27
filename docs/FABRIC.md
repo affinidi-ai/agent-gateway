@@ -714,11 +714,11 @@ header, or lists either in a way the receiving gateway cannot read whole, is hel
 base path whatever path it reads: a card read routed to a configured agent card location outside
 the base path is refused with `400 target_path_refused`, though a card read without them is
 served from that location. A `2026-07-28` MCP call crosses Fabric as a framed stream, whose
-`Open` names neither list, so the receiving gateway cannot see what its sender injected: a tool
-call it carries to an MCP proxy (`proxy://`) Target is held as carrying a delegated credential
-for the base path check, as an unreadable list is, and one whose path arguments build a REST URL
-outside the proxy's base path is refused with `400 target_path_refused` and recorded before the
-Target is called. That rule applies to that check only, not to the traffic mirror, the Legacy
+`Open` names neither list, so the receiving gateway cannot see what its sender injected: every request it carries is held
+as carrying a delegated credential for the base path check, as an unreadable list is. An HTTP(S)
+Target's request URL, or the REST URL a tool call to an MCP proxy (`proxy://`) Target builds from
+its path arguments, outside the base path is refused with `400 target_path_refused` and recorded
+before the Target is called. The stream format is unchanged. That rule applies to that check only, not to the traffic mirror, the Legacy
 SSE fallback or a card read. A sender that does not name them is held only to the receiving
 surface's own bindings.
 

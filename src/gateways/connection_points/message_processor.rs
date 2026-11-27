@@ -5788,9 +5788,9 @@ async fn process_charged_forward_request(
                 card_location: surface.agent_card_location_path(),
             },
         };
-        // A Fabric stream does not say what its sender injected, so a tool call it carries to an
-        // MCP proxy Target is held as carrying a delegated credential for this check.
-        let unnamed_stream_credential = stream_request.is_some() && modern_proxy.is_some();
+        // A Fabric stream does not say what its sender injected, so every request it carries is
+        // held as carrying a delegated credential for this check.
+        let unnamed_stream_credential = stream_request.is_some();
         crate::proxy::credential_destination::verdict(
             surface.target_auth().is_some(),
             carries_delegated_credential || unnamed_stream_credential,
