@@ -9,7 +9,9 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use super::service::{SamlService, TooManyPendingAuthnRequests};
-use super::user_provisioning::provision_user_from_saml;
+use super::user_provisioning::{
+    AmbiguousAttribute, RoleRefused, UserNotApproved, UsernameTaken, provision_user_from_saml,
+};
 use crate::auth::session::SessionManager;
 use crate::auth::session_finalizer::{
     AuthenticatedPrincipal, SessionFinalizationError, SessionFinalizer, SessionManagerFinalizer,
@@ -193,44 +195,7 @@ pub async fn saml_acs(
     .await
     {
         Ok(provisioned) => provisioned,
-        Err(e) => {
-            // A reached appliance user limit is reported to the SSO user as a
-            // readable page rather than a blank 500.
-            if let Some(limit) = e.downcast_ref::<crate::config::LimitExceeded>() {
-                error!("SAML sign-in blocked by appliance limit: {}", limit.message());
-                return Ok(sign_in_error_page(StatusCode::FORBIDDEN, "Sign-in unavailable", &limit.message()));
-            }
-            if let Some(refused) = e.downcast_ref::<super::user_provisioning::RoleRefused>() {
-                warn!(saml_subject = ?refused.subject, idp_role = ?refused.idp_role, "SAML sign-in refused: {}", e);
-                crate::integrations::trigger_user_login_failed(
-                    crate::integrations::LoginMethod::Saml,
-                    crate::integrations::LoginFailure::RoleNotMapped,
-                );
-                return Ok(sign_in_error_page(
-                    StatusCode::FORBIDDEN,
-                    "Sign-in unavailable",
-                    "Your account has no role in this application. Please contact your administrator.",
-                ));
-            }
-            if let Some(ambiguous) = e.downcast_ref::<super::user_provisioning::AmbiguousAttribute>() {
-                warn!(attribute = ambiguous.attribute, "SAML sign-in refused: {}", e);
-                crate::integrations::trigger_user_login_failed(
-                    crate::integrations::LoginMethod::Saml,
-                    crate::integrations::LoginFailure::AmbiguousAttribute,
-                );
-                return Ok(sign_in_error_page(
-                    StatusCode::FORBIDDEN,
-                    "Sign-in unavailable",
-                    "Your identity provider sent conflicting account details. Please contact your administrator.",
-                ));
-            }
-            error!("Failed to provision user from SAML: {}", e);
-            return Ok(sign_in_error_page(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Sign-in failed",
-                "We couldn't complete your sign-in. Please contact your administrator.",
-            ));
-        }
+        Err(e) => return Ok(provisioning_refusal(&e)),
     };
     let user = &provisioned.user;
     let finalized_session = SessionManagerFinalizer::new(
@@ -257,6 +222,60 @@ pub async fn saml_acs(
     let redirect_target = acs_return_target(&saml_state.saml_service, form.relay_state.as_deref());
 
     Ok(sign_in_success_response(finalized_session.headers, &redirect_target, &finalized_session.session_token)?)
+}
+
+/// The readable page that answers a sign-in refused while provisioning, since the browser lands
+/// on the ACS straight from the identity provider. A refusal opens no session.
+fn provisioning_refusal(e: &anyhow::Error) -> Response {
+    const UNAVAILABLE: &str = "Sign-in unavailable";
+    if let Some(limit) = e.downcast_ref::<crate::config::LimitExceeded>() {
+        error!("SAML sign-in blocked by appliance limit: {}", limit.message());
+        return sign_in_error_page(StatusCode::FORBIDDEN, UNAVAILABLE, &limit.message());
+    }
+    if let Some(refused) = e.downcast_ref::<RoleRefused>() {
+        warn!(saml_subject = ?refused.subject, idp_role = ?refused.idp_role, "SAML sign-in refused: {}", e);
+        crate::integrations::trigger_user_login_failed(
+            crate::integrations::LoginMethod::Saml,
+            crate::integrations::LoginFailure::RoleNotMapped,
+        );
+        return sign_in_error_page(
+            StatusCode::FORBIDDEN,
+            UNAVAILABLE,
+            "Your account has no role in this application. Please contact your administrator.",
+        );
+    }
+    if let Some(ambiguous) = e.downcast_ref::<AmbiguousAttribute>() {
+        warn!(attribute = ambiguous.attribute, "SAML sign-in refused: {}", e);
+        crate::integrations::trigger_user_login_failed(
+            crate::integrations::LoginMethod::Saml,
+            crate::integrations::LoginFailure::AmbiguousAttribute,
+        );
+        return sign_in_error_page(
+            StatusCode::FORBIDDEN,
+            UNAVAILABLE,
+            "Your identity provider sent conflicting account details. Please contact your administrator.",
+        );
+    }
+    if let Some(UserNotApproved(user)) = e.downcast_ref::<UserNotApproved>() {
+        warn!(user_id = %user.user_id, "SAML sign-in refused: {}", e);
+        crate::integrations::trigger_user_login_failed(
+            crate::integrations::LoginMethod::Saml,
+            crate::integrations::LoginFailure::NotApproved(user),
+        );
+        return sign_in_error_page(StatusCode::FORBIDDEN, UNAVAILABLE, "This account is not allowed to sign in.");
+    }
+    if e.downcast_ref::<UsernameTaken>()
+        .is_some()
+    {
+        warn!("SAML sign-in refused: the asserted username and the SAML user ID are both held by other users");
+        return sign_in_error_page(StatusCode::FORBIDDEN, UNAVAILABLE, "This account is not allowed to sign in.");
+    }
+    error!("Failed to provision user from SAML: {}", e);
+    sign_in_error_page(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Sign-in failed",
+        "We couldn't complete your sign-in. Please contact your administrator.",
+    )
 }
 
 /// Serve SAML metadata
@@ -885,5 +904,71 @@ mod tests {
         assert!(!text.contains("alice@example.com"), "{text}");
         assert!(!text.contains(&token), "{text}");
         assert!(!text.contains(unknown_token), "{text}");
+    }
+
+    fn stored_user() -> crate::auth::storage::UserData {
+        let now = chrono::Utc::now();
+        crate::auth::storage::UserData {
+            user_id: "kept-1".to_string(),
+            username: "kept-1".to_string(),
+            passkeys: Vec::new(),
+            role: crate::auth::UserRole::User,
+            status: crate::auth::UserStatus::Disabled,
+            is_primary: false,
+            first_name: None,
+            last_name: None,
+            email: None,
+            department: None,
+            job_title: None,
+            avatar_path: None,
+            created_at: now,
+            updated_at: now,
+            last_logged_in: None,
+            saml_id: Some("saml-1".to_string()),
+            oidc: None,
+            deleted_at: Some(now),
+        }
+    }
+
+    async fn page_text(response: Response) -> String {
+        String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_user_who_is_not_approved_or_whose_usernames_are_taken_gets_a_403_page_and_no_session() {
+        for refusal in [anyhow::Error::new(UserNotApproved(Box::new(stored_user()))), anyhow::Error::new(UsernameTaken)]
+        {
+            let response = provisioning_refusal(&refusal);
+
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{refusal}");
+            assert!(
+                response
+                    .headers()
+                    .get(header::SET_COOKIE)
+                    .is_none(),
+                "{refusal}"
+            );
+            let page = page_text(response).await;
+            assert!(page.contains("This account is not allowed to sign in."), "{page}");
+            assert!(!page.contains("kept-1"), "the page does not name the account: {page}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unexpected_provisioning_failure_is_a_server_error_page() {
+        let response = provisioning_refusal(&anyhow::anyhow!("disk full"));
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            !page_text(response)
+                .await
+                .contains("disk full")
+        );
     }
 }

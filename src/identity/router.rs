@@ -646,6 +646,7 @@ pub async fn create_identity_api_router(
                 .route("/v1/users/{user_id}", put(crate::auth_manager::handlers::update_user))
                 .route("/v1/users/{user_id}", delete(crate::auth_manager::handlers::delete_user))
                 .layer(middleware::from_fn(crate::auth_manager::middleware::extract_user_id))
+                .layer(Extension(pat_authenticator.clone()))
                 .layer(Extension(sess_mgr.clone()))
                 .layer(Extension(storage.clone()))
                 .layer(Extension(notification_store.clone()))

@@ -765,6 +765,169 @@ async fn a_user_who_is_not_approved_is_refused_even_with_a_valid_token_and_signe
     }
 }
 
+impl Flow {
+    async fn administrator(&self) -> UserData {
+        let now = chrono::Utc::now();
+        let admin = UserData {
+            user_id: "admin-1".to_string(),
+            username: "admin".to_string(),
+            passkeys: Vec::new(),
+            role: UserRole::Administrator,
+            status: UserStatus::Approved,
+            is_primary: true,
+            first_name: None,
+            last_name: None,
+            email: None,
+            department: None,
+            job_title: None,
+            avatar_path: None,
+            created_at: now,
+            updated_at: now,
+            last_logged_in: None,
+            saml_id: None,
+            oidc: None,
+            deleted_at: None,
+        };
+        self.oidc
+            .storage
+            .save_user(&admin)
+            .await
+            .unwrap();
+        admin
+    }
+
+    /// `request` through the real user management routes, sent by `caller`.
+    async fn as_administrator(
+        &self,
+        caller: &UserData,
+        request: Request<Body>,
+    ) -> (StatusCode, Value) {
+        let response = crate::auth_manager::handlers::user_routes_for_tests(
+            self.oidc.storage.clone(),
+            self.oidc
+                .session_manager
+                .clone(),
+            None,
+            &caller.user_id,
+        )
+        .oneshot(request)
+        .await
+        .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    async fn delete_user(
+        &self,
+        caller: &UserData,
+        user_id: &str,
+    ) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/users/{user_id}"))
+            .body(Body::empty())
+            .unwrap();
+        self.as_administrator(caller, request)
+            .await
+    }
+
+    async fn approve_user(
+        &self,
+        caller: &UserData,
+        user_id: &str,
+    ) -> StatusCode {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/v1/users/{user_id}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "status": "approved" }).to_string()))
+            .unwrap();
+        self.as_administrator(caller, request)
+            .await
+            .0
+    }
+
+    async fn stored_user_count(&self) -> usize {
+        self.oidc
+            .storage
+            .list_users()
+            .await
+            .unwrap()
+            .len()
+    }
+}
+
+#[tokio::test]
+async fn a_deleted_user_is_refused_at_the_next_sign_in_and_not_created_again() {
+    let flow = Flow::new().await;
+    let admin = flow.administrator().await;
+    flow.sign_in(|claims| claims["roles"] = json!(["member"]))
+        .await;
+    let user = flow.user().await.unwrap();
+    let elsewhere = flow
+        .other_session(&user)
+        .await;
+
+    let (deleted, answer) = flow
+        .delete_user(&admin, &user.user_id)
+        .await;
+    let response = flow
+        .sign_in(|claims| claims["roles"] = json!(["member"]))
+        .await;
+
+    assert_eq!((deleted, answer), (StatusCode::OK, json!({ "outcome": "disabled" })));
+    assert!(
+        !flow
+            .session_is_live(&elsewhere)
+            .await,
+        "deleting the user ended their sessions"
+    );
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        set_cookies(&response)
+            .iter()
+            .all(|cookie| !cookie.starts_with("__Host-session_token=")),
+        "the refused sign-in opens no session"
+    );
+    let kept = flow.user().await.unwrap();
+    assert_eq!(kept.user_id, user.user_id, "no second user was created");
+    assert_eq!(kept.status, UserStatus::Disabled);
+    assert!(kept.deleted_at.is_some());
+    assert_eq!(flow.stored_user_count().await, 2);
+}
+
+#[tokio::test]
+async fn a_deleted_user_signs_in_as_the_same_user_once_an_administrator_approves_them_again() {
+    let flow = Flow::new().await;
+    let admin = flow.administrator().await;
+    flow.sign_in(|claims| claims["roles"] = json!(["member"]))
+        .await;
+    let user = flow.user().await.unwrap();
+    flow.delete_user(&admin, &user.user_id)
+        .await;
+
+    let approved = flow
+        .approve_user(&admin, &user.user_id)
+        .await;
+    let response = flow.sign_in(|_| {}).await;
+
+    assert_eq!(approved, StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::OK);
+    let back = flow.user().await.unwrap();
+    assert_eq!(back.user_id, user.user_id);
+    assert_eq!(
+        (back.status, back.role),
+        (UserStatus::Approved, UserRole::Administrator),
+        "the role comes from the ID token"
+    );
+    assert_eq!(back.username, "alice", "the next sign-in gives the record its username again");
+    assert!(back.deleted_at.is_none());
+    assert_eq!(flow.stored_user_count().await, 2);
+}
+
 #[tokio::test]
 async fn an_unreachable_provider_shows_a_readable_page() {
     let flow = Flow::with_config(|config| config.issuer = "http://127.0.0.1:9".to_string()).await;

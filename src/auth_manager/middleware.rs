@@ -998,6 +998,7 @@ mod tests {
                 last_logged_in: None,
                 saml_id: None,
                 oidc: None,
+                deleted_at: None,
             })
             .await
             .unwrap();
@@ -1303,6 +1304,7 @@ mod tests {
             last_logged_in: None,
             saml_id: None,
             oidc: None,
+            deleted_at: None,
         }
     }
 
@@ -1485,6 +1487,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::auth_manager::pat::PatAuthenticator for ScopedPat {
+        async fn revoke_for_user(
+            &self,
+            _user_id: &str,
+        ) -> std::io::Result<usize> {
+            Ok(0)
+        }
+
         async fn authenticate(
             &self,
             token: &str,
@@ -1559,6 +1568,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::auth_manager::pat::PatAuthenticator for PatternPat {
+        async fn revoke_for_user(
+            &self,
+            _user_id: &str,
+        ) -> std::io::Result<usize> {
+            Ok(0)
+        }
+
         async fn authenticate(
             &self,
             token: &str,
@@ -1707,6 +1723,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::auth_manager::pat::PatAuthenticator for TermsTestPat {
+        async fn revoke_for_user(
+            &self,
+            _user_id: &str,
+        ) -> std::io::Result<usize> {
+            Ok(0)
+        }
+
         async fn authenticate(
             &self,
             token: &str,
@@ -1742,6 +1765,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::auth_manager::pat::PatAuthenticator for AccessTokenTestPat {
+        async fn revoke_for_user(
+            &self,
+            _user_id: &str,
+        ) -> std::io::Result<usize> {
+            Ok(0)
+        }
+
         async fn authenticate(
             &self,
             token: &str,
@@ -1762,6 +1792,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::auth_manager::pat::PatAuthenticator for SettingsViewPat {
+        async fn revoke_for_user(
+            &self,
+            _user_id: &str,
+        ) -> std::io::Result<usize> {
+            Ok(0)
+        }
+
         async fn authenticate(
             &self,
             token: &str,

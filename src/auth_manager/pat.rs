@@ -20,6 +20,14 @@ pub trait PatAuthenticator: Send + Sync {
         &self,
         token: &str,
     ) -> Option<PatPrincipal>;
+
+    /// Revoke every active access token bound to `user_id` and every one whose secret that user
+    /// last received (they created it and nobody rotated it, or they rotated it last), with the
+    /// tokens delegated from them, and return how many were revoked.
+    async fn revoke_for_user(
+        &self,
+        user_id: &str,
+    ) -> std::io::Result<usize>;
 }
 
 #[derive(Clone)]

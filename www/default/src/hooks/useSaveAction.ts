@@ -3,9 +3,9 @@ import { To } from 'react-router-dom';
 import { showToast } from '../utils/toaster';
 import { useSafeNavigate } from './useSafeNavigate';
 
-interface RunOptions {
-  /** Toast shown on success. */
-  successMessage: string;
+interface RunOptions<T> {
+  /** Toast shown on success, or built from what the action returned. */
+  successMessage: string | ((result: T) => string);
   /** Where to go on success. Omit to stay on the page. */
   redirectTo?: To;
   /** Page-specific work to run after a successful action (before redirect). */
@@ -34,11 +34,16 @@ export function useSaveAction() {
   const [saving, setSaving] = useState(false);
 
   const run = useCallback(
-    async (action: () => Promise<unknown>, opts: RunOptions): Promise<boolean> => {
+    async <T>(action: () => Promise<T>, opts: RunOptions<T>): Promise<boolean> => {
       setSaving(true);
       try {
-        await action();
-        showToast('success', opts.successMessage);
+        const result = await action();
+        showToast(
+          'success',
+          typeof opts.successMessage === 'function'
+            ? opts.successMessage(result)
+            : opts.successMessage
+        );
         opts.onSuccess?.();
         if (opts.redirectTo !== undefined) navigate(opts.redirectTo);
         return true;

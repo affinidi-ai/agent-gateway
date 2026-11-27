@@ -282,6 +282,7 @@ async fn save_user(
             last_logged_in: None,
             saml_id: None,
             oidc: None,
+            deleted_at: None,
         })
         .await
         .expect("save user");
@@ -1347,6 +1348,7 @@ async fn new_user_storage(
         last_logged_in: None,
         saml_id: None,
         oidc: None,
+        deleted_at: None,
     };
     std::fs::write(users_dir.join(format!("{user_id}.json")), serde_json::to_string(&user).expect("user json"))
         .expect("write user");

@@ -45,8 +45,9 @@ fn claim_string(
 }
 
 /// Create or update the user for `identity`, with `role`, from the ID token's claims. A user that
-/// exists and is not approved is refused and left unchanged, and a new user is created approved,
-/// never primary, within the appliance user limit.
+/// exists and is not approved, a deleted user's kept record among them, is refused and left
+/// unchanged before any username is resolved, and a new user is created approved, never primary,
+/// within the appliance user limit.
 pub async fn provision_user_from_oidc(
     storage: &PasskeyStorage,
     identity: OidcIdentity,
@@ -77,7 +78,8 @@ pub async fn provision_user_from_oidc(
     let own_user_id = existing
         .as_ref()
         .map(|user| user.user_id.as_str());
-    let username = free_username(storage, [&preferred_username, &identity.subject], own_user_id)
+    let username = storage
+        .free_username(&[preferred_username.as_str(), identity.subject.as_str()], own_user_id)
         .await?
         .ok_or(ProvisionRefusal::UsernameTaken)?;
     let now = chrono::Utc::now();
@@ -99,9 +101,8 @@ pub async fn provision_user_from_oidc(
         }
         None => {
             let user_count = storage
-                .list_users()
-                .await?
-                .len();
+                .count_toward_user_limit()
+                .await?;
             crate::config::global_limits()
                 .check_can_add("users", user_count)
                 .map_err(ProvisionRefusal::UserLimit)?;
@@ -126,6 +127,7 @@ pub async fn provision_user_from_oidc(
                     last_logged_in: Some(now),
                     saml_id: None,
                     oidc: Some(identity),
+                    deleted_at: None,
                 },
                 change: SignInChange::Created,
             }
@@ -135,25 +137,6 @@ pub async fn provision_user_from_oidc(
         .save_user(&provisioned.user)
         .await?;
     Ok(provisioned)
-}
-
-/// The first of `candidates` that no other user has as their username. The admin handlers find
-/// users by username, so two users must never share one.
-async fn free_username<const N: usize>(
-    storage: &PasskeyStorage,
-    candidates: [&String; N],
-    own_user_id: Option<&str>,
-) -> anyhow::Result<Option<String>> {
-    for candidate in candidates {
-        match storage
-            .load_user(candidate)
-            .await?
-        {
-            Some(holder) if Some(holder.user_id.as_str()) != own_user_id => continue,
-            _ => return Ok(Some(candidate.clone())),
-        }
-    }
-    Ok(None)
 }
 
 #[cfg(test)]
@@ -375,6 +358,70 @@ mod tests {
             assert_eq!(stored.role, UserRole::User, "{status}: the refused sign-in changed nothing");
             assert_eq!(stored.email.as_deref(), Some("a@example.com"), "{status}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_user_who_is_not_approved_is_refused_as_such_even_when_every_username_is_taken() {
+        let (_dir, storage) = storage().await;
+        let mut user = provision(&storage, "sub-1", json!({}), UserRole::User)
+            .await
+            .unwrap()
+            .user;
+        user.username = "renamed".to_string();
+        user.status = UserStatus::Disabled;
+        storage
+            .save_user(&user)
+            .await
+            .unwrap();
+        provision(&storage, "sub-2", json!({ "preferred_username": "taken-a" }), UserRole::User)
+            .await
+            .unwrap();
+        provision(&storage, "sub-3", json!({ "preferred_username": "sub-1" }), UserRole::User)
+            .await
+            .unwrap();
+
+        let refused = provision(&storage, "sub-1", json!({ "preferred_username": "taken-a" }), UserRole::User)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(refused, ProvisionRefusal::NotApproved(_)), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn a_deleted_user_is_refused_and_no_second_user_is_created_until_approved_again() {
+        let (_dir, storage) = storage().await;
+        let user = provision(&storage, "sub-1", json!({ "preferred_username": "alice" }), UserRole::PowerUser)
+            .await
+            .unwrap()
+            .user;
+        storage
+            .delete_user(&user.user_id)
+            .await
+            .unwrap();
+
+        let refused = provision(&storage, "sub-1", json!({ "preferred_username": "alice" }), UserRole::PowerUser)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(refused, ProvisionRefusal::NotApproved(_)), "{refused:?}");
+        assert_eq!(
+            storage
+                .list_users()
+                .await
+                .unwrap(),
+            vec![user.user_id.clone()]
+        );
+
+        storage
+            .update_user(&user.user_id, None, Some(UserStatus::Approved), &crate::config::LimitsConfig::default())
+            .await
+            .unwrap();
+        let back = provision(&storage, "sub-1", json!({ "preferred_username": "alice" }), UserRole::PowerUser)
+            .await
+            .unwrap()
+            .user;
+        assert_eq!(back.user_id, user.user_id);
+        assert_eq!((back.username.as_str(), back.role), ("alice", UserRole::PowerUser));
     }
 
     #[tokio::test]

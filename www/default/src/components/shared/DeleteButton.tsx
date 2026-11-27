@@ -9,6 +9,8 @@ interface DeleteButtonProps extends Omit<
   size?: 'sm' | 'md' | 'lg';
   variant?: 'danger' | 'warning' | 'icon-only';
   confirmTitle?: string;
+  /** Visible text shown during the confirm step, also on touch devices that show no title. */
+  confirmNotice?: string;
 }
 
 /**
@@ -26,6 +28,7 @@ export const DeleteButton: React.FC<DeleteButtonProps> = ({
   children,
   title,
   confirmTitle = 'Click again to confirm deletion',
+  confirmNotice,
   style: customStyle,
   ...rest
 }) => {
@@ -76,6 +79,15 @@ export const DeleteButton: React.FC<DeleteButtonProps> = ({
           </>
         )}
       </button>
+      {confirmNotice !== undefined && (
+        <div
+          className={`small text-danger${isConfirming ? ' w-100 mt-1' : ''}`}
+          role="status"
+          data-testid="delete-confirm-notice"
+        >
+          {isConfirming ? confirmNotice : ''}
+        </div>
+      )}
       {isConfirming && (
         <style>{`
         @keyframes pulse-warning {

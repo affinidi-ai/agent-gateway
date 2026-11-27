@@ -3079,9 +3079,8 @@ pub async fn run_axum_proxy(
             crate::config::register_counter("users", move || {
                 let s = user_storage.clone();
                 async move {
-                    s.list_users()
+                    s.count_toward_user_limit()
                         .await
-                        .map(|v| v.len())
                         .unwrap_or(0)
                 }
             });

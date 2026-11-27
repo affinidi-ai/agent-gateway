@@ -1977,6 +1977,31 @@ open. A delete succeeds with the toast `Surface "<name>" deleted` and returns to
 failed one closes the popover, returns focus to the delete button and shows the gateway's message
 in `surface-error-alert`. The popover closes if the page moves to another surface.
 
+## User delete
+
+The wording that says what deleting a user does comes from `utils/userDelete.ts`, never inline,
+so every place that deletes a user says the same thing: the delete button title, the confirm
+notice, the success messages, the "Deleted:" and "Provider account:" headings, the label of a
+kept user's provider account and the deleted notice on the Edit User page.
+
+- `DeleteButton` (`components/shared/DeleteButton.tsx`) takes `confirmNotice`, visible text
+  shown during its confirm step, so it also reaches touch devices that never show a title. With
+  a notice the button keeps a `role="status"` region (`delete-confirm-notice`) mounted and fills
+  it only while confirming; without one there is no region.
+- The Users list (Settings → Users, its row and its detail modal) and the Edit User page
+  (`/users/:userId`) pass a notice only for a user with `has_oidc_account`; the table row uses
+  the shorter text, on its own line under the row actions. A SAML user gets no notice.
+- The success message follows the `outcome` the `DELETE` answers: "User deleted successfully"
+  for `removed` or no outcome, a kept-record message for `disabled` (OpenID Connect wording
+  only for a user with `has_oidc_account`). The Notifications page's reject-and-delete message
+  follows the outcome the same way. The Edit User page's toast comes from `useSaveAction` with a
+  `successMessage` built from the answer.
+- A kept record shows its provider account (`oidc` or `saml_id`) under the username in the
+  Users list (`users-kept-account-<user_id>`), in the detail modal
+  (`users-modal-kept-account`, headed "Deleted:" while the record is disabled and "Provider
+  account:" once approved again) and on the Edit User page (`edit-user-kept-account`), and the
+  Edit User page shows `edit-user-deleted-notice` for a disabled user bound to one.
+
 ## Confirm popover
 
 `components/shared/ConfirmPopover.tsx` is the shared inline confirmation: a speech bubble beside

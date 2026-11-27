@@ -121,6 +121,7 @@ mod tests {
             last_logged_in: Some(now),
             saml_id: Some("saml-1".to_string()),
             oidc: None,
+            deleted_at: None,
         }
     }
 

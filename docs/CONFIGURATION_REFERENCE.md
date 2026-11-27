@@ -436,7 +436,11 @@ further. An approved account whose passkeys differ in count or length from what 
 still be told apart. A key file that cannot be read stops the gateway from starting in passkey
 mode. To replace the key, stop every instance, delete both `login_decoy_credential_key.json`
 and `login_decoy_credential_key.json.enc`, and start them again; every username then gets new
-decoys. The `.atgx` export leaves the key file out.
+decoys. The `.atgx` export leaves the key file out. `POST /auth/login/finish` answers `401` when
+the account was deleted, disabled or set back to awaiting approval after its challenge was
+issued, and opens no session; it records the sign-in only on an account that is still approved,
+so a delete that lands during the sign-in is not undone. A failure to store the sign-in answers
+`500`.
 
 Registering a passkey (`POST /auth/register/finish`) for a username that already has an
 account, approved or awaiting approval, checks the passkey and the accepted Terms as for a new
@@ -650,7 +654,21 @@ browser gets the same generic `403` page, the log names the attribute (never its
 `user.login_failed` event is raised with failure reason `ambiguous_attribute`. The user ID attribute
 identifies the user when it is present and the `NameID` otherwise. Changing `attribute_mapping.user_id`
 to another attribute gives every user a new identifier, so each user who signs in afterwards is
-created as a new user.
+created as a new user; the old records stay, and a user whose username an old record holds gets
+their new SAML user ID as username.
+
+A user who is not approved (an administrator disabled or deleted them, or set them back to
+awaiting approval) is refused at the ACS with a `403` page that does not say why, no session
+opens and the record is left as it was; the refusal raises `user.login_failed` with failure
+reason `not_approved`. Deleting a SAML user keeps a disabled record under their SAML user ID,
+as [Deleting an OIDC or SAML user](#deleting-an-oidc-or-saml-user) describes. When the username
+the identity provider asserts is held by another user, the user gets their SAML user ID as
+username instead, and only when that is held too is the sign-in refused with the same page,
+with nothing created or changed. A user whose stored username already is the asserted one signs
+in as before, so users who already share a username keep signing in. To clear such a refusal,
+change the asserted attribute at the identity provider, or delete the other user if they are not
+an administrator. Users created by SAML are approved at once and count toward the `users` limit;
+the kept record of a deleted user does not.
 
 The email, first name, last name, department and job title attributes may carry several values: the
 user keeps the stored value while the identity provider still sends it, and otherwise takes the first
@@ -784,13 +802,17 @@ for it after the person has left the organisation.
   when another user has it, the username is `sub`, and when another user has that too the
   sign-in is refused. Every sign-in sets the username, email, first and last name, and role
   again from the ID token. A user who is not approved is refused even with a valid ID token.
+  Deleting an OIDC user keeps a disabled record under their provider account, so their next
+  sign-in is refused rather than creating a new user; see
+  [Deleting an OIDC or SAML user](#deleting-an-oidc-or-saml-user).
 - **Sessions.** When a sign-in changes the user's role, their other sessions end, so other tabs
   and devices sign in again with the new role. When `required_claims` or `role_mapping`
   refuses an existing user, or the user is not approved, all their sessions end, the CLI's
   among them (the `fabric` CLI holds a browser session), and the record is kept as it was.
   Personal access tokens are not touched: a user the provider no longer admits keeps their
-  tokens, with the role last stored, until an administrator disables the user. The role is set
-  again only at a sign-in, so nothing at the provider reaches the gateway between sign-ins.
+  tokens, with the role last stored, until an administrator disables or deletes the user;
+  deleting the user ends their sessions and revokes their tokens. The role is set again only at
+  a sign-in, so nothing at the provider reaches the gateway between sign-ins.
 - **Throttling.** Always on, per client (an IPv4 address or an IPv6 /64, taken from
   `X-Forwarded-For` only from `client_ip.trusted_proxies`): `/oidc/login` and `/oidc/callback`
   share a budget of 10 requests per minute, and 10 callbacks whose code the provider refused
@@ -834,6 +856,60 @@ sign-in, with `LOGIN_METHOD` `oidc`, and a refused one raises `user.login_failed
   mapping on `email` at a provider where people can set their own address.
 - This release reads no `logout` block: a field `oidc.json` does not define stops startup, so
   remove one copied from another product's runbook.
+- The kept record of a deleted user is matched by its exact issuer and `sub`, or by its SAML
+  user ID. After the `issuer`, the SAML `user_id` mapping or `auth_mode` changes, a deleted
+  person's next sign-in finds no record and creates a new approved user, so disable deleted
+  users by hand before the change. A user deleted before kept records existed has no record
+  left either: disable such a user if they signed in again.
+
+### Deleting an OIDC or SAML user
+
+`DELETE /v1/users/{user_id}` removes a user who signs in with a passkey. A user who signs in
+with an OIDC or SAML account is not removed: with no record, the next sign-in would create a new
+approved user with the mapped role. The record is kept `Disabled` and marked deleted, so that
+sign-in is refused like any disabled user's (`403`, no reason shown; `user_disabled` in the OIDC
+log, and `user.login_failed` with failure reason `not_approved`).
+
+The endpoint answers `200` with `{"outcome": "removed"}` for a user whose record is gone and
+`{"outcome": "disabled"}` for a kept record, a repeat delete of one included. It answers `404`
+for an unknown user, and `403` for the primary administrator and for administrators, who are
+demoted before they can be deleted.
+
+- **Cleared:** first and last name, email, department, job title, avatar link and passkeys.
+  The username becomes the user id, releasing the old one, and the role goes back to `user`.
+- **Kept:** the user id, the created and last sign-in times, the user's notifications and
+  personal settings (both are stored by user id, so a user approved again gets them back), and
+  the provider account the sign-in matches on: the OIDC issuer and `sub`, or the SAML user ID.
+  The user API returns that account as `oidc` or `saml_id` on a kept record only, and keeps
+  returning it after approval until the user's next sign-in gives the record a username again,
+  so an administrator knows whose sign-in approving it allows. It also returns
+  `has_oidc_account: true` for every user with an OIDC account, before and after delete, and
+  leaves the field out for other users; it says how the account signs in and nothing more.
+- **Every delete:** the user's sessions end, their personal access tokens are revoked (see
+  [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#token-contract)), and their uploaded avatar files are
+  removed; the shared default avatar never is, and only files directly in the avatars directory
+  that the record names or that carry the user id are. A file that cannot be removed is logged
+  and does not stop the delete. The delete is logged on the `audit` target as `user.deleted`
+  with the caller, the outcome and the number of tokens revoked. The `user.deleted` integration
+  event fires for the call that changed the record, decided while the user lock is held, so two
+  concurrent deletes fire it once and a repeat delete of a kept record fires nothing.
+- **User limit:** a kept record does not count toward the `users` limit. Approving it gives it
+  a seat back, so that approval answers `403` when the limit is reached.
+- **Signing in again:** an administrator sets the status back to `approved`. Approving revokes
+  any access token still bound to the user and ends their earlier sessions, and raises
+  `user.approved` (without the welcome notification) beside `user.updated`. The next sign-in is
+  the same user, with the role set from the claim or attribute mapping again; a role set in the
+  kept record lasts only until then.
+- Updates, deletes and sign-ins of users take one lock, so an administrator's change and a
+  sign-in cannot write over each other, and a sign-in that a delete overtakes does not bring
+  the record back.
+- No action removes a kept record, because removing it lets the account sign in again as a new
+  user. To answer an erasure request, disable the account at the provider first, then delete the
+  record's file from `_storage/` and restart the gateway or reload its configuration.
+
+The dashboard shows the provider account on a kept record in the Users list, its detail view and
+the Edit User page. For a user with `has_oidc_account` the delete confirm step shows a notice that
+the record is kept, and the success message follows the outcome the delete returns.
 
 ### Registering the gateway at the provider
 

@@ -592,6 +592,44 @@ impl PatAuthenticator for FsAccessTokenStore {
             resource_scope,
         })
     }
+
+    async fn revoke_for_user(
+        &self,
+        user_id: &str,
+    ) -> std::io::Result<usize> {
+        let _delegation_guard = self
+            .delegation_lock
+            .lock()
+            .await;
+        let active = || {
+            self.cache
+                .iter()
+                .filter(|entry| entry.revoked_at.is_none())
+                .count()
+        };
+        let active_before = active();
+        let held_by_user: Vec<String> = self
+            .cache
+            .iter()
+            .filter(|entry| {
+                entry.revoked_at.is_none()
+                    && (entry.user_id == user_id
+                        || entry
+                            .rotated_by
+                            .as_deref()
+                            .unwrap_or(&entry.created_by)
+                            == user_id)
+            })
+            .map(|entry| entry.key().clone())
+            .collect();
+        for root_id in held_by_user {
+            for token_id in self.descendants_including(&root_id) {
+                self.revoke_one(&token_id)
+                    .await?;
+            }
+        }
+        Ok(active_before.saturating_sub(active()))
+    }
 }
 
 #[cfg(test)]
@@ -727,6 +765,119 @@ mod tests {
             .unwrap();
         assert_eq!(principal.user_id, "admin-9");
         assert_eq!(principal.scopes, Some(vec!["surfaces.edit".to_string()]));
+    }
+
+    async fn create_token(
+        store: &FsAccessTokenStore,
+        secret: &str,
+        user_id: &str,
+        created_by: &str,
+        rotated_by: Option<&str>,
+    ) -> String {
+        let mut token = record(&hash_secret(secret), vec![]);
+        token.user_id = user_id.into();
+        token.created_by = created_by.into();
+        token.rotated_by = rotated_by.map(str::to_string);
+        let id = token.id.clone();
+        store
+            .create(token)
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn delegate(
+        store: &FsAccessTokenStore,
+        secret: &str,
+        parent_id: &str,
+        depth: u32,
+        created_by: &str,
+    ) -> String {
+        let mut child = record(&hash_secret(secret), vec![]);
+        child.user_id = "svc".into();
+        child.created_by = created_by.into();
+        child.parent_token_id = Some(parent_id.to_string());
+        child.delegation_depth = depth;
+        let id = child.id.clone();
+        store
+            .create(child)
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn works(
+        store: &FsAccessTokenStore,
+        secret: &str,
+    ) -> bool {
+        store
+            .authenticate(secret)
+            .await
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn revoking_for_a_user_revokes_every_token_bound_to_them_and_no_other() {
+        let store = store().await;
+        for (secret, user) in [("agpat_one", "svc"), ("agpat_two", "svc"), ("agpat_other", "someone-else")] {
+            create_token(&store, secret, user, "admin", None).await;
+        }
+
+        let revoked = store
+            .revoke_for_user("svc")
+            .await
+            .unwrap();
+
+        assert_eq!(revoked, 2);
+        assert!(!works(&store, "agpat_one").await);
+        assert!(!works(&store, "agpat_two").await);
+        assert!(works(&store, "agpat_other").await);
+        assert_eq!(
+            store
+                .revoke_for_user("svc")
+                .await
+                .unwrap(),
+            0,
+            "already revoked tokens are not counted again"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoking_for_a_user_also_revokes_and_counts_the_tokens_delegated_from_theirs() {
+        let store = store().await;
+        let root = create_token(&store, "agpat_root", "svc", "leaver", None).await;
+        let child = delegate(&store, "agpat_child", &root, 1, "delegate").await;
+        delegate(&store, "agpat_grandchild", &child, 2, "delegate").await;
+
+        let revoked = store
+            .revoke_for_user("leaver")
+            .await
+            .unwrap();
+
+        assert_eq!(revoked, 3);
+        for secret in ["agpat_root", "agpat_child", "agpat_grandchild"] {
+            assert!(!works(&store, secret).await, "{secret} is still valid");
+        }
+    }
+
+    #[tokio::test]
+    async fn revoking_for_a_user_follows_whoever_last_received_the_secret() {
+        let store = store().await;
+        create_token(&store, "agpat_minted", "service-account", "leaver", None).await;
+        create_token(&store, "agpat_unrelated", "service-account", "someone-else", None).await;
+        create_token(&store, "agpat_rotated_away", "service-account", "leaver", Some("other-admin")).await;
+        create_token(&store, "agpat_rotated_by_leaver", "service-account", "other-admin", Some("leaver")).await;
+
+        let revoked = store
+            .revoke_for_user("leaver")
+            .await
+            .unwrap();
+
+        assert_eq!(revoked, 2);
+        assert!(!works(&store, "agpat_minted").await, "the leaver created it and holds its secret");
+        assert!(!works(&store, "agpat_rotated_by_leaver").await, "the leaver holds this secret");
+        assert!(works(&store, "agpat_unrelated").await);
+        assert!(works(&store, "agpat_rotated_away").await, "another administrator holds this secret now");
     }
 
     #[tokio::test]

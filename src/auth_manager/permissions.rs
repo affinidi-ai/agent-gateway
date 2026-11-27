@@ -384,6 +384,7 @@ mod tests {
             last_logged_in: None,
             saml_id: None,
             oidc: None,
+            deleted_at: None,
         };
         std::fs::write(users_dir.join(format!("{}.json", user_id)), serde_json::to_string(&user_data).unwrap())
             .unwrap();

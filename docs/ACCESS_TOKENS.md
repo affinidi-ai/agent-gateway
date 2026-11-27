@@ -61,6 +61,17 @@ operators should ship the `audit` target off the appliance
 (see [`OBSERVABILITY.md`](OBSERVABILITY.md#access-token-rotation-events)). `rotated_by`,
 `rotated_at`, and `rotation_generation` are returned to anyone with `access_tokens.view`.
 
+A token authenticates only while its owner is approved. Deleting a user
+(`DELETE /api/v1/users/{id}`) revokes every token bound to them and every token for another
+owner, such as a service account, whose secret they last received, with the tokens delegated
+from those. That is the person who created the token, or who rotated it if it was rotated: a
+token someone else rotated keeps working, and one the deleted person rotated is revoked. A
+service account's token the deleted person holds stops working, so another administrator
+creates or rotates one. When the tokens cannot be revoked the delete answers `500` and changes
+nothing. Approving the kept record of a deleted OIDC or SAML user again revokes any token still
+bound to them and ends their earlier sessions, so none comes back (see
+[Deleting an OIDC or SAML user](CONFIGURATION_REFERENCE.md#deleting-an-oidc-or-saml-user)).
+
 Operator advice:
 
 - Keep `access_tokens.edit` administrator-only. A lower role granted it can rotate its own

@@ -460,3 +460,101 @@ fn no_human_user_is_stored(world: &mut SurfaceWorld) {
     let stored = stored_users(world);
     assert!(stored.is_empty(), "the refused sign-in stored a user: {stored:?}");
 }
+
+/// The stored human users that sign in with `person`'s account at the OpenID provider.
+fn stored_users_of_account(
+    world: &SurfaceWorld,
+    person: &str,
+) -> Vec<Value> {
+    stored_users(world)
+        .into_iter()
+        .filter(|user| user["oidc"]["subject"] == person)
+        .collect()
+}
+
+/// `administrator`, signed in, sends `method` with `body` to the user management route of the one
+/// human user that signs in with `person`'s account, and gets the gateway's answer.
+async fn manage_human_user(
+    world: &SurfaceWorld,
+    administrator: &str,
+    method: reqwest::Method,
+    person: &str,
+    body: Option<Value>,
+) -> RecordedResponse {
+    let users = stored_users_of_account(world, person);
+    assert_eq!(users.len(), 1, "{person} has one stored human user: {users:?}");
+    let user_id = users[0]["user_id"]
+        .as_str()
+        .expect("a stored user id");
+    let mut request = browser()
+        .request(method, gateway_url(world, &format!("/api/v1/users/{user_id}")))
+        .bearer_auth(session_of(world, administrator));
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request
+        .send()
+        .await
+        .expect("the user management route");
+    let status = response.status().as_u16();
+    RecordedResponse {
+        status,
+        headers: Default::default(),
+        body: response
+            .json()
+            .await
+            .unwrap_or(Value::Null),
+    }
+}
+
+#[when(expr = "{string} deletes human user {string}")]
+async fn deletes_human_user(
+    world: &mut SurfaceWorld,
+    administrator: String,
+    person: String,
+) {
+    let answer = manage_human_user(world, &administrator, reqwest::Method::DELETE, &person, None).await;
+    world.caller_response = Some(answer);
+}
+
+#[given(expr = "{string} has deleted human user {string}")]
+async fn has_deleted_human_user(
+    world: &mut SurfaceWorld,
+    administrator: String,
+    person: String,
+) {
+    let answer = manage_human_user(world, &administrator, reqwest::Method::DELETE, &person, None).await;
+    assert_eq!(answer.status, 200, "the delete succeeds: {answer:?}");
+}
+
+#[given(expr = "{string} has approved human user {string} again")]
+async fn has_approved_human_user_again(
+    world: &mut SurfaceWorld,
+    administrator: String,
+    person: String,
+) {
+    let answer =
+        manage_human_user(world, &administrator, reqwest::Method::PUT, &person, Some(json!({ "status": "approved" })))
+            .await;
+    assert_eq!(answer.status, 200, "the approval succeeds: {answer:?}");
+}
+
+#[then(expr = "the delete answers the outcome {string}")]
+fn delete_answers_outcome(
+    world: &mut SurfaceWorld,
+    outcome: String,
+) {
+    let answer = recorded(world);
+    assert_eq!(answer.body, json!({ "outcome": outcome }), "{answer:?}");
+}
+
+#[then(expr = "the OpenID Connect account {string} has one stored human user, who is {string}")]
+fn account_has_one_stored_human_user(
+    world: &mut SurfaceWorld,
+    person: String,
+    status: String,
+) {
+    let users = stored_users_of_account(world, &person);
+    assert_eq!(users.len(), 1, "{person}'s account has one stored human user: {users:?}");
+    assert_eq!(users[0]["status"], status.as_str(), "{:?}", users[0]);
+}

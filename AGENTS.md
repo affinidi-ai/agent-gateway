@@ -266,6 +266,15 @@ built on the shared `ConfirmPopover` with focus on **Cancel**, and deletes only 
 shortcut (Cmd/Ctrl+S, the canvas keys) acts while the popover is open. See _Surface delete_ and
 _Confirm popover_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-delete).
 
+Deleting a user keeps an OIDC or SAML user's record disabled under their provider account, and
+`DELETE /v1/users/{user_id}` answers `{"outcome": "removed" | "disabled"}`. The shared
+`DeleteButton` shows a visible `confirmNotice` during its confirm step (a `role="status"` region
+that stays mounted), which the Users list and Edit User page pass only for a user with
+`has_oidc_account`; success messages follow the outcome, and all of this wording lives in
+`utils/userDelete.ts`. See _User delete_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#user-delete) and
+[`docs/CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#deleting-an-oidc-or-saml-user).
+
 The credential provider editor shows a **Consent confirmation** switch and its login client
 (ID and secret, both picked from the secrets store), endpoints, strategy (only the provider's
 tenant's and appliance-wide ones; appliance-wide only on a new provider), principal claim and a

@@ -130,6 +130,16 @@ creation, so no `user.approved` follows. A later sign-in that changes the user's
 primary flag raises `user.updated`. Every SAML or OIDC sign-in then raises `user.login`, in that
 order ([`sign_in_events.rs`](../src/auth/sign_in_events.rs)).
 
+`user.deleted` is raised once a delete has succeeded, and only by the call that changed the
+record: a user who signs in with a passkey is removed, and one who signs in through OIDC or SAML is
+kept as a disabled record (see
+[Deleting an OIDC or SAML user](CONFIGURATION_REFERENCE.md#deleting-an-oidc-or-saml-user)), so
+deleting a kept record again raises nothing. `OLD_STATE` and the `USER_*` variables describe the
+user as they were before the delete. `user.approved` is also raised, without the welcome
+notification and beside `user.updated`, when an administrator approves a deleted user's kept
+record again, so an integration that offboarded the person on `user.deleted` sees them return;
+`USERNAME` is then the user id and `USER_EMAIL` is empty until the user's next sign-in.
+
 ### Sign-in events
 
 A console sign-in raises `user.login`, with `LOGIN_METHOD` set to `passkey`, `saml` or `oidc`. A
@@ -137,8 +147,8 @@ failed one raises `user.login_failed` ([`user_integration_triggers.rs`](../src/i
 a passkey sign-in whose credential does not verify, and a SAML response the gateway rejects at the
 Assertion Consumer Service (bad or missing signature, untrusted certificate, wrong destination or
 audience, an unknown, used or expired AuthnRequest, expired conditions), and a verified SAML
-sign-in refused because its identity-provider role maps to no gateway role or its user ID or username
-attribute carries conflicting values. An OIDC sign-in raises it when the provider refuses the code
+sign-in refused because its identity-provider role maps to no gateway role, its user ID or username
+attribute carries conflicting values, or its user is not approved. An OIDC sign-in raises it when the provider refuses the code
 or the ID token does not verify, and when a verified sign-in is refused by `required_claims`, by
 `role_mapping` or because the user is not approved. A passkey sign-in whose
 challenge is unknown or expired has nothing to verify and raises nothing, and neither does an OIDC
@@ -161,8 +171,8 @@ the session.
 | `claim_not_allowed` | The OIDC ID token was valid, but it did not meet a `required_claims` entry of `oidc.json`: the account is not in the tenant the gateway is bound to |
 
 `USER_ID`, `USERNAME`, `USER_EMAIL`, `USER_ROLE`, `USER_STATUS` and `NEW_STATE` are set only when the
-account exists, from the account as stored, and an OIDC `not_approved` names the account the
-provider's subject belongs to. For `unknown_user`, `saml_rejected`, `role_not_mapped`,
+account exists, from the account as stored, and an OIDC or SAML `not_approved` names the account
+the provider's subject belongs to, a deleted user's kept record included. For `unknown_user`, `saml_rejected`, `role_not_mapped`,
 `ambiguous_attribute`, `oidc_rejected` and `claim_not_allowed` they are absent:
 a template placeholder for them is empty and `EVENT_DATA` leaves them out, so neither the username a
 caller typed nor anything in a rejected SAML response leaves the appliance. With the default

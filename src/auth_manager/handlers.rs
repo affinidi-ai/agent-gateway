@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
-use super::types::{UpdateProfileRequest, UpdateUserRequest, User};
+use super::types::{DeleteUserResponse, UpdateProfileRequest, UpdateUserRequest, User};
 use crate::auth::storage::{PasskeyStorage, UserData};
 use crate::auth::types::{UserRole, UserStatus};
 use crate::metrics::MetricsStore;
@@ -165,22 +165,7 @@ pub async fn list_users(
             .load_user_by_id(&user_id)
             .await
         {
-            users.push(User {
-                username: user_data.username,
-                user_id: user_data.user_id,
-                role: user_data.role,
-                status: user_data.status,
-                is_primary: user_data.is_primary,
-                created_at: user_data.created_at,
-                updated_at: user_data.updated_at,
-                first_name: user_data.first_name,
-                last_name: user_data.last_name,
-                email: user_data.email,
-                department: user_data.department,
-                job_title: user_data.job_title,
-                avatar_path: user_data.avatar_path,
-                last_logged_in: user_data.last_logged_in,
-            });
+            users.push(User::from(user_data));
         }
     }
 
@@ -242,22 +227,7 @@ pub async fn get_user(
         spawn_record_user_event(metrics_store, "accessed".to_string(), user_data.role.clone());
     }
 
-    Ok(Json(User {
-        username: user_data.username,
-        user_id: user_data.user_id,
-        role: user_data.role,
-        status: user_data.status,
-        is_primary: user_data.is_primary,
-        created_at: user_data.created_at,
-        updated_at: user_data.updated_at,
-        first_name: user_data.first_name,
-        last_name: user_data.last_name,
-        email: user_data.email,
-        department: user_data.department,
-        job_title: user_data.job_title,
-        avatar_path: user_data.avatar_path,
-        last_logged_in: user_data.last_logged_in,
-    }))
+    Ok(Json(User::from(user_data)))
 }
 
 /// Update a user (role and/or status)
@@ -268,6 +238,7 @@ pub async fn update_user(
     Extension(rbac_config): Extension<std::sync::Arc<RbacConfig>>,
     Extension(notification_store): Extension<Option<std::sync::Arc<crate::integrations::FileSystemNotificationStore>>>,
     Extension(session_manager): Extension<std::sync::Arc<crate::auth::session::SessionManager>>,
+    Extension(pat_authenticator): Extension<Option<Arc<dyn crate::auth_manager::pat::PatAuthenticator>>>,
     Path(user_id): Path<String>,
     Json(req): Json<UpdateUserRequest>,
 ) -> Result<Json<User>, (StatusCode, String)> {
@@ -326,11 +297,27 @@ pub async fn update_user(
         }
     }
 
-    // Update the user
+    let reapproved = user_before
+        .deleted_at
+        .is_some()
+        && req.status == Some(UserStatus::Approved);
+    if reapproved {
+        revoke_access_tokens(pat_authenticator.as_deref(), &user_id).await?;
+        session_manager
+            .remove_sessions_for_user(&user_id)
+            .await;
+    }
+
     storage
-        .update_user(&user_before.username, req.role.clone(), req.status.clone())
+        .update_user(&user_id, req.role.clone(), req.status.clone(), crate::config::global_limits())
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update user: {}", e)))?;
+        .map_err(|e| match e.downcast_ref::<crate::config::LimitExceeded>() {
+            Some(limit) => {
+                crate::config::log_limit_reached("users", limit);
+                (StatusCode::FORBIDDEN, limit.message())
+            }
+            None => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update user: {}", e)),
+        })?;
 
     // Update profile fields if provided
     if req.first_name.is_some()
@@ -416,6 +403,9 @@ pub async fn update_user(
         }
         crate::integrations::trigger_user_approved(&user_data);
     }
+    if reapproved {
+        crate::integrations::trigger_user_approved(&user_data);
+    }
 
     crate::integrations::trigger_user_updated(&user_before, &user_data);
     if notification_store.is_some()
@@ -424,33 +414,21 @@ pub async fn update_user(
         spawn_record_user_event(metrics_store, "updated".to_string(), user_data.role.clone());
     }
 
-    Ok(Json(User {
-        username: user_data.username,
-        user_id: user_data.user_id,
-        role: user_data.role,
-        status: user_data.status,
-        is_primary: user_data.is_primary,
-        created_at: user_data.created_at,
-        updated_at: user_data.updated_at,
-        first_name: user_data.first_name,
-        last_name: user_data.last_name,
-        email: user_data.email,
-        department: user_data.department,
-        job_title: user_data.job_title,
-        avatar_path: user_data.avatar_path,
-        last_logged_in: user_data.last_logged_in,
-    }))
+    Ok(Json(User::from(user_data)))
 }
 
-/// Delete a user
+/// Delete a user. Ends their sessions and revokes the access tokens they hold; a user who signs
+/// in through an OpenID provider or SAML is kept as a disabled record (see
+/// [`PasskeyStorage::delete_user`]), and the answer says which happened.
 pub async fn delete_user(
     Extension(metrics_store): Extension<Option<Arc<MetricsStore>>>,
     Extension(caller_user_id): Extension<String>,
     Extension(storage): Extension<std::sync::Arc<PasskeyStorage>>,
     Extension(rbac_config): Extension<std::sync::Arc<RbacConfig>>,
     Extension(session_manager): Extension<std::sync::Arc<crate::auth::session::SessionManager>>,
+    Extension(pat_authenticator): Extension<Option<Arc<dyn crate::auth_manager::pat::PatAuthenticator>>>,
     Path(user_id): Path<String>,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<Json<DeleteUserResponse>, (StatusCode, String)> {
     // Load caller for authorization decisions
     let caller = storage
         .load_user_by_id(&caller_user_id)
@@ -478,13 +456,27 @@ pub async fn delete_user(
         return Err((StatusCode::FORBIDDEN, "Cannot delete administrator users".to_string()));
     }
 
-    crate::integrations::trigger_user_deleted(&user_data);
+    let revoked_tokens = revoke_access_tokens(pat_authenticator.as_deref(), &user_id).await?;
 
-    // Permanently delete the user
-    storage
-        .delete_user(&user_data.username)
+    let deleted = storage
+        .delete_user(&user_data.user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to delete user: {}", e)))?;
+
+    tracing::info!(
+        target: "audit",
+        event = "user.deleted",
+        caller_user_id = %caller_user_id,
+        target_user_id = %user_id,
+        outcome = ?deleted.outcome,
+        already_deleted = !deleted.changed,
+        revoked_tokens,
+        "User deleted"
+    );
+
+    if deleted.changed {
+        crate::integrations::trigger_user_deleted(&user_data);
+    }
 
     // Revoke any active sessions so the deleted account cannot continue
     // operating with previously issued bearer tokens.
@@ -494,11 +486,28 @@ pub async fn delete_user(
     if revoked > 0 {
         tracing::info!("Revoked {} active session(s) for deleted user_id={}", revoked, user_id);
     }
-    if let Some(metrics_store) = metrics_store {
+    if deleted.changed
+        && let Some(metrics_store) = metrics_store
+    {
         spawn_record_user_event(metrics_store, "deleted".to_string(), user_data.role.clone());
     }
 
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(DeleteUserResponse { outcome: deleted.outcome }))
+}
+
+/// Revoke the access tokens `user_id` holds through `authenticator`, when access tokens are on,
+/// and return how many were revoked.
+async fn revoke_access_tokens(
+    authenticator: Option<&dyn crate::auth_manager::pat::PatAuthenticator>,
+    user_id: &str,
+) -> Result<usize, (StatusCode, String)> {
+    let Some(authenticator) = authenticator else {
+        return Ok(0);
+    };
+    authenticator
+        .revoke_for_user(user_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to revoke access tokens: {}", e)))
 }
 
 /// Get current user profile
@@ -512,22 +521,7 @@ pub async fn get_profile(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load user: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "User not found".to_string()))?;
 
-    Ok(Json(User {
-        username: user_data.username,
-        user_id: user_data.user_id,
-        role: user_data.role,
-        status: user_data.status,
-        is_primary: user_data.is_primary,
-        created_at: user_data.created_at,
-        updated_at: user_data.updated_at,
-        first_name: user_data.first_name,
-        last_name: user_data.last_name,
-        email: user_data.email,
-        department: user_data.department,
-        job_title: user_data.job_title,
-        avatar_path: user_data.avatar_path,
-        last_logged_in: user_data.last_logged_in,
-    }))
+    Ok(Json(User::from(user_data)))
 }
 
 /// Update current user profile
@@ -555,22 +549,7 @@ pub async fn update_profile(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load updated user: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "User not found".to_string()))?;
 
-    Ok(Json(User {
-        username: user_data.username,
-        user_id: user_data.user_id,
-        role: user_data.role,
-        status: user_data.status,
-        is_primary: user_data.is_primary,
-        created_at: user_data.created_at,
-        updated_at: user_data.updated_at,
-        first_name: user_data.first_name,
-        last_name: user_data.last_name,
-        email: user_data.email,
-        department: user_data.department,
-        job_title: user_data.job_title,
-        avatar_path: user_data.avatar_path,
-        last_logged_in: user_data.last_logged_in,
-    }))
+    Ok(Json(User::from(user_data)))
 }
 
 /// Upload user avatar
@@ -638,12 +617,17 @@ pub async fn upload_avatar(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write avatar file: {}", e)))?;
 
-    // Update user profile with avatar path
     let relative_avatar_path = format!("avatars/{}", filename);
-    storage
-        .update_profile(&user_id, None, None, None, None, None, Some(relative_avatar_path.clone()))
+    let linked = storage
+        .set_avatar_if_approved(&user_id, relative_avatar_path.clone())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update profile with avatar: {}", e)))?;
+    if !linked {
+        storage
+            .remove_uploaded_avatar(&user_id, &relative_avatar_path)
+            .await;
+        return Err((StatusCode::FORBIDDEN, "User not approved".to_string()));
+    }
 
     let user_data = storage
         .load_user_by_id(&user_id)
@@ -651,22 +635,7 @@ pub async fn upload_avatar(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load updated user: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "User not found".to_string()))?;
 
-    Ok(Json(User {
-        username: user_data.username,
-        user_id: user_data.user_id,
-        role: user_data.role,
-        status: user_data.status,
-        is_primary: user_data.is_primary,
-        created_at: user_data.created_at,
-        updated_at: user_data.updated_at,
-        first_name: user_data.first_name,
-        last_name: user_data.last_name,
-        email: user_data.email,
-        department: user_data.department,
-        job_title: user_data.job_title,
-        avatar_path: user_data.avatar_path,
-        last_logged_in: user_data.last_logged_in,
-    }))
+    Ok(Json(User::from(user_data)))
 }
 
 /// Count users with role `Administrator` and status `Approved`.
@@ -684,6 +653,27 @@ async fn count_approved_administrators(storage: &PasskeyStorage) -> anyhow::Resu
         }
     }
     Ok(count)
+}
+
+/// The user management and avatar routes with the extensions their handlers read, as the gateway
+/// mounts them, for a caller already signed in as `caller_user_id`.
+#[cfg(test)]
+pub(crate) fn user_routes_for_tests(
+    storage: Arc<PasskeyStorage>,
+    sessions: Arc<crate::auth::session::SessionManager>,
+    tokens: Option<Arc<dyn crate::auth_manager::pat::PatAuthenticator>>,
+    caller_user_id: &str,
+) -> axum::Router {
+    axum::Router::new()
+        .route("/v1/users/{user_id}", axum::routing::put(update_user).delete(delete_user))
+        .route("/v1/profile/avatar", axum::routing::post(upload_avatar))
+        .layer(Extension(tokens))
+        .layer(Extension(sessions))
+        .layer(Extension(storage))
+        .layer(Extension(Arc::new(RbacConfig::default())))
+        .layer(Extension(None::<Arc<crate::integrations::FileSystemNotificationStore>>))
+        .layer(Extension(None::<Arc<MetricsStore>>))
+        .layer(Extension(caller_user_id.to_string()))
 }
 
 #[cfg(test)]
@@ -715,6 +705,7 @@ mod tests {
             last_logged_in: None,
             saml_id: None,
             oidc: None,
+            deleted_at: None,
         }
     }
 
@@ -1082,5 +1073,485 @@ mod tests {
 
         let err = authorize_user_update(&attacker, &target, &r, &admin_only_rbac(), 1).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    mod routes {
+        use super::super::user_routes_for_tests;
+        use super::*;
+        use crate::access_tokens::FsAccessTokenStore;
+        use crate::access_tokens::store::hash_secret;
+        use crate::auth::session::SessionManager;
+        use crate::auth::storage::OidcIdentity;
+        use crate::auth_manager::pat::{PatAuthenticator, PatPrincipal};
+        use axum::body::Body;
+        use axum::http::Request;
+        use serde_json::Value;
+        use tower::ServiceExt;
+
+        struct Fixture {
+            storage: Arc<PasskeyStorage>,
+            sessions: Arc<SessionManager>,
+            dir: tempfile::TempDir,
+        }
+
+        const ADMIN: &str = "admin-1";
+
+        async fn fixture() -> Fixture {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = Arc::new(
+                PasskeyStorage::new(
+                    dir.path()
+                        .join("users")
+                        .to_string_lossy()
+                        .into_owned(),
+                    dir.path()
+                        .join("avatars")
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+                .await
+                .unwrap(),
+            );
+            storage
+                .save_user(&mk_user(ADMIN, UserRole::Administrator, UserStatus::Approved, true))
+                .await
+                .unwrap();
+            Fixture {
+                storage,
+                sessions: Arc::new(SessionManager::new()),
+                dir,
+            }
+        }
+
+        impl Fixture {
+            async fn member(
+                &self,
+                user_id: &str,
+                status: UserStatus,
+                signs_in_with_oidc: bool,
+            ) -> UserData {
+                let mut user = mk_user(user_id, UserRole::PowerUser, status, false);
+                user.oidc = signs_in_with_oidc.then(|| OidcIdentity {
+                    issuer: "https://idp.example.com".to_string(),
+                    subject: format!("sub-{user_id}"),
+                });
+                self.storage
+                    .save_user(&user)
+                    .await
+                    .unwrap();
+                user
+            }
+
+            async fn send(
+                &self,
+                tokens: Option<Arc<dyn PatAuthenticator>>,
+                caller: &str,
+                request: Request<Body>,
+            ) -> (StatusCode, Value) {
+                let response = user_routes_for_tests(self.storage.clone(), self.sessions.clone(), tokens, caller)
+                    .oneshot(request)
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+            }
+
+            async fn delete(
+                &self,
+                tokens: Option<Arc<dyn PatAuthenticator>>,
+                user_id: &str,
+            ) -> (StatusCode, Value) {
+                let request = Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/users/{user_id}"))
+                    .body(Body::empty())
+                    .unwrap();
+                self.send(tokens, ADMIN, request)
+                    .await
+            }
+
+            async fn set_status(
+                &self,
+                tokens: Option<Arc<dyn PatAuthenticator>>,
+                user_id: &str,
+                status: &str,
+            ) -> StatusCode {
+                let request = Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/users/{user_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({ "status": status }).to_string()))
+                    .unwrap();
+                self.send(tokens, ADMIN, request)
+                    .await
+                    .0
+            }
+
+            async fn upload_avatar(
+                &self,
+                user_id: &str,
+            ) -> StatusCode {
+                let boundary = "avatar-boundary";
+                let mut body = format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\n"
+                )
+                .into_bytes();
+                body.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+                body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+                let request = Request::builder()
+                    .method("POST")
+                    .uri("/v1/profile/avatar")
+                    .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+                    .body(Body::from(body))
+                    .unwrap();
+                self.send(None, user_id, request)
+                    .await
+                    .0
+            }
+
+            async fn stored(
+                &self,
+                user_id: &str,
+            ) -> Option<UserData> {
+                self.storage
+                    .load_user_by_id(user_id)
+                    .await
+                    .unwrap()
+            }
+
+            fn avatar_file(
+                &self,
+                user_id: &str,
+            ) -> std::path::PathBuf {
+                self.dir
+                    .path()
+                    .join("avatars")
+                    .join(format!("{user_id}.png"))
+            }
+        }
+
+        /// Records the users whose tokens were revoked, and fails the revocation when told to.
+        struct RecordingTokens {
+            revoked_for: std::sync::Mutex<Vec<String>>,
+            fails: bool,
+        }
+
+        impl RecordingTokens {
+            fn new(fails: bool) -> Arc<Self> {
+                Arc::new(Self {
+                    revoked_for: std::sync::Mutex::new(Vec::new()),
+                    fails,
+                })
+            }
+
+            fn revoked_for(&self) -> Vec<String> {
+                self.revoked_for
+                    .lock()
+                    .unwrap()
+                    .clone()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl PatAuthenticator for RecordingTokens {
+            async fn authenticate(
+                &self,
+                _token: &str,
+            ) -> Option<PatPrincipal> {
+                None
+            }
+
+            async fn revoke_for_user(
+                &self,
+                user_id: &str,
+            ) -> std::io::Result<usize> {
+                if self.fails {
+                    return Err(std::io::Error::other("token store unavailable"));
+                }
+                self.revoked_for
+                    .lock()
+                    .unwrap()
+                    .push(user_id.to_string());
+                Ok(1)
+            }
+        }
+
+        #[tokio::test]
+        async fn deleting_a_passkey_user_answers_removed_ends_their_sessions_and_removes_the_record() {
+            let fixture = fixture().await;
+            let member = fixture
+                .member("member-1", UserStatus::Approved, false)
+                .await;
+            let session = fixture
+                .sessions
+                .create_session(member.username.clone(), member.user_id.clone())
+                .await;
+
+            let (status, body) = fixture
+                .delete(None, "member-1")
+                .await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, serde_json::json!({ "outcome": "removed" }));
+            assert!(
+                fixture
+                    .stored("member-1")
+                    .await
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .sessions
+                    .validate_session(&session)
+                    .await
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn deleting_an_oidc_user_answers_disabled_and_again_for_a_repeat() {
+            let fixture = fixture().await;
+            fixture
+                .member("oidc-1", UserStatus::Approved, true)
+                .await;
+
+            let (first, first_body) = fixture
+                .delete(None, "oidc-1")
+                .await;
+            let (repeat, repeat_body) = fixture
+                .delete(None, "oidc-1")
+                .await;
+
+            assert_eq!((first, first_body["outcome"].as_str()), (StatusCode::OK, Some("disabled")));
+            assert_eq!((repeat, repeat_body["outcome"].as_str()), (StatusCode::OK, Some("disabled")));
+            let kept = fixture
+                .stored("oidc-1")
+                .await
+                .unwrap();
+            assert_eq!(kept.status, UserStatus::Disabled);
+            assert!(kept.deleted_at.is_some());
+        }
+
+        #[tokio::test]
+        async fn deleting_a_missing_user_answers_not_found_without_an_outcome() {
+            let fixture = fixture().await;
+
+            let (status, body) = fixture
+                .delete(None, "ghost")
+                .await;
+
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert!(body.get("outcome").is_none());
+        }
+
+        #[tokio::test]
+        async fn deleting_a_user_revokes_the_access_tokens_they_hold_and_no_others() {
+            let fixture = fixture().await;
+            fixture
+                .member("member-1", UserStatus::Approved, true)
+                .await;
+            let tokens = Arc::new(
+                FsAccessTokenStore::new(
+                    fixture
+                        .dir
+                        .path()
+                        .join("tokens"),
+                )
+                .await
+                .unwrap(),
+            );
+            let mut secrets = Vec::new();
+            for bound_to in ["member-1", ADMIN] {
+                let (id, secret) = crate::access_tokens::generate_token();
+                tokens
+                    .create(crate::access_tokens::AccessToken {
+                        id,
+                        name: "service".to_string(),
+                        description: String::new(),
+                        token_hash: hash_secret(&secret),
+                        user_id: bound_to.to_string(),
+                        scopes: Vec::new(),
+                        resource_pattern: None,
+                        required_headers: Vec::new(),
+                        created_by: ADMIN.to_string(),
+                        parent_token_id: None,
+                        delegation_depth: 0,
+                        created_at: chrono::Utc::now(),
+                        last_used_at: None,
+                        expires_at: None,
+                        revoked_at: None,
+                        rotation_generation: 0,
+                        rotated_at: None,
+                        rotated_by: None,
+                    })
+                    .await
+                    .unwrap();
+                secrets.push(secret);
+            }
+
+            let (status, _) = fixture
+                .delete(Some(tokens.clone()), "member-1")
+                .await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                tokens
+                    .authenticate(&secrets[0])
+                    .await
+                    .is_none(),
+                "the deleted user's token is revoked"
+            );
+            assert!(
+                tokens
+                    .authenticate(&secrets[1])
+                    .await
+                    .is_some(),
+                "another user's token still works"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_delete_whose_token_revocation_fails_answers_500_and_leaves_the_user_unchanged() {
+            let fixture = fixture().await;
+            fixture
+                .member("oidc-1", UserStatus::Approved, true)
+                .await;
+
+            let (status, body) = fixture
+                .delete(Some(RecordingTokens::new(true)), "oidc-1")
+                .await;
+
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(body.get("outcome").is_none());
+            let stored = fixture
+                .stored("oidc-1")
+                .await
+                .unwrap();
+            assert_eq!(stored.status, UserStatus::Approved);
+            assert!(stored.deleted_at.is_none());
+        }
+
+        #[tokio::test]
+        async fn approving_a_kept_record_again_revokes_its_tokens_and_earlier_sessions() {
+            let fixture = fixture().await;
+            let member = fixture
+                .member("oidc-1", UserStatus::Approved, true)
+                .await;
+            let earlier_session = fixture
+                .sessions
+                .create_session(member.username.clone(), member.user_id.clone())
+                .await;
+            fixture
+                .storage
+                .delete_user("oidc-1")
+                .await
+                .unwrap();
+            let tokens = RecordingTokens::new(false);
+
+            let status = fixture
+                .set_status(Some(tokens.clone()), "oidc-1", "approved")
+                .await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(tokens.revoked_for(), vec!["oidc-1".to_string()]);
+            assert!(
+                fixture
+                    .sessions
+                    .validate_session(&earlier_session)
+                    .await
+                    .is_none(),
+                "a session from before the delete does not come back"
+            );
+            let approved = fixture
+                .stored("oidc-1")
+                .await
+                .unwrap();
+            assert_eq!(approved.status, UserStatus::Approved);
+            assert!(approved.deleted_at.is_none());
+        }
+
+        #[tokio::test]
+        async fn approving_a_disabled_user_who_was_not_deleted_revokes_nothing() {
+            let fixture = fixture().await;
+            fixture
+                .member("disabled-1", UserStatus::Disabled, true)
+                .await;
+            let tokens = RecordingTokens::new(false);
+
+            let status = fixture
+                .set_status(Some(tokens.clone()), "disabled-1", "approved")
+                .await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                tokens
+                    .revoked_for()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn an_approved_user_can_upload_an_avatar() {
+            let fixture = fixture().await;
+            fixture
+                .member("member-1", UserStatus::Approved, false)
+                .await;
+
+            let status = fixture
+                .upload_avatar("member-1")
+                .await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                fixture
+                    .stored("member-1")
+                    .await
+                    .unwrap()
+                    .avatar_path
+                    .as_deref(),
+                Some("avatars/member-1.png")
+            );
+            assert!(
+                fixture
+                    .avatar_file("member-1")
+                    .exists()
+            );
+        }
+
+        #[tokio::test]
+        async fn an_avatar_uploaded_for_a_deleted_user_is_refused_and_its_file_removed() {
+            let fixture = fixture().await;
+            fixture
+                .member("oidc-1", UserStatus::Approved, true)
+                .await;
+            fixture
+                .storage
+                .delete_user("oidc-1")
+                .await
+                .unwrap();
+
+            let status = fixture
+                .upload_avatar("oidc-1")
+                .await;
+
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(
+                !fixture
+                    .avatar_file("oidc-1")
+                    .exists(),
+                "the uploaded file does not stay"
+            );
+            assert!(
+                fixture
+                    .stored("oidc-1")
+                    .await
+                    .unwrap()
+                    .avatar_path
+                    .is_none()
+            );
+        }
     }
 }
