@@ -43,9 +43,11 @@ pub enum UpstreamMcpResponse {
 const CT_EVENT_STREAM: &str = "text/event-stream";
 const CT_JSON: &str = "application/json";
 
-/// Determines if a content-type header value indicates SSE.
+/// Determines if a content-type header value indicates SSE, in any letter case.
 pub fn is_sse_content_type(content_type: &str) -> bool {
-    content_type.starts_with(CT_EVENT_STREAM)
+    content_type
+        .get(..CT_EVENT_STREAM.len())
+        .is_some_and(|media_type| media_type.eq_ignore_ascii_case(CT_EVENT_STREAM))
 }
 
 /// An upstream SSE event grew past its byte cap before it was complete.
@@ -2219,6 +2221,7 @@ mod tests {
     fn test_is_sse_content_type() {
         assert!(is_sse_content_type("text/event-stream"));
         assert!(is_sse_content_type("text/event-stream; charset=utf-8"));
+        assert!(is_sse_content_type("Text/Event-Stream"));
         assert!(!is_sse_content_type("application/json"));
         assert!(!is_sse_content_type("text/plain"));
     }

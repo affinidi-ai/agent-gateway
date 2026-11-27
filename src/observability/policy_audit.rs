@@ -414,7 +414,9 @@ pub struct PolicyDecisionEvent<'a> {
     pub scope: PolicyScope,
     /// `true` = allowed, `false` = denied.
     pub allow: bool,
-    /// Set when the policy could not decide; the request was denied.
+    /// Set when the policy could not decide; the request was denied, except
+    /// for a response policy's `NoPolicyManager`, whose answer was delivered
+    /// unchecked.
     pub error: Option<PolicyEvaluationError>,
     /// Tools a `tools/list` filter removed (scope `McpToolList`).
     pub removed_tools: Option<&'a [String]>,

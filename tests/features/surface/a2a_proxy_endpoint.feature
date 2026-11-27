@@ -133,6 +133,32 @@ Feature: A2A proxy endpoint targets a non-A2A managed agent
     And the A2A response is a JSON-RPC Target timeout error
     And non-A2A managed agent "bravo" received text "hello worker"
 
+  Scenario: A response policy refuses the A2A proxy's answer before it reaches the caller
+    Given surface "alpha" has a response policy that denies every response
+    And the VP Audit Log keeps every audit event
+    When the caller sends an A2A message/send request to surface "alpha" with text "hello worker"
+    Then the response status is 403
+    And the response body is error "response_policy_denied"
+    And non-A2A managed agent "bravo" received text "hello worker"
+    And the VP Audit Log records a response policy "deny"
+
+  Scenario: A response policy lets the A2A proxy's answer reach the caller
+    Given surface "alpha" has a response policy that allows every response
+    And the VP Audit Log keeps every audit event
+    When the caller sends an A2A message/send request to surface "alpha" with text "hello worker"
+    Then the response status is 200
+    And the A2A response result contains text from non-A2A managed agent "bravo"
+    And the VP Audit Log records a response policy "allow"
+
+  Scenario: A response policy does not check the A2A proxy's own error answer
+    Given non-A2A managed agent "bravo" does not answer before the proxy timeout
+    And surface "alpha" has a response policy that denies every response
+    And the VP Audit Log keeps every audit event
+    When the caller sends an A2A message/send request to surface "alpha" with text "hello worker"
+    Then the response status is 200
+    And the A2A response is a JSON-RPC Target timeout error
+    And the VP Audit Log records no response policy decision
+
   Scenario: Agent card is synthesized from the proxy and exposed through the surface
     When the caller fetches the agent card for surface "alpha"
     Then the response status is 200

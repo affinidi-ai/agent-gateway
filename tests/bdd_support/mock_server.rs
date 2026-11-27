@@ -100,7 +100,8 @@ pub enum MockStream {
     /// caller goes away.
     Quiet,
     /// Each element of the configured JSON array as one SSE `message` event,
-    /// then the end of the body.
+    /// then the end of the body. A string element is written as a raw line of
+    /// the stream, such as a `:` comment.
     Events,
     /// The configured JSON string, base64-decoded, as the raw body: a file,
     /// not JSON.
@@ -875,6 +876,9 @@ async fn handler(
                 .expect("an Events stream is configured with a JSON array")
                 .iter()
                 .flat_map(|event| {
+                    if let Some(line) = event.as_str() {
+                        return bytes::Bytes::from(format!("{line}\n\n"));
+                    }
                     let mut event = event.clone();
                     if let (Some(event), Some(request_id)) = (event.as_object_mut(), body.get("id")) {
                         event.insert("id".to_string(), request_id.clone());

@@ -381,6 +381,9 @@ fn write_single_surface_config_inner(
     if let Some(policy) = &surface_config.request_policy {
         surface_fixture = surface_fixture.with_target_policy_definition_id(&policy.id);
     }
+    if let Some(policy) = &surface_config.response_policy {
+        surface_fixture = surface_fixture.with_target_response_policy_definition_id(&policy.id);
+    }
     if let Some(cm) = &surface_config.custom_metadata {
         let mut payload = serde_json::Map::new();
         payload.insert(cm.key.clone(), serde_json::Value::String(cm.value.clone()));
@@ -1534,6 +1537,9 @@ fn policy_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<PolicyDefinitio
         ));
     }
     if let Some(policy) = &surface_config.request_policy {
+        policies.push(policy.clone());
+    }
+    if let Some(policy) = &surface_config.response_policy {
         policies.push(policy.clone());
     }
     if let Some(policy) = &surface_config.mcp_tool_gating_condition_policy {

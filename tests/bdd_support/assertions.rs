@@ -47,6 +47,56 @@ pub fn assert_json_bodies_equal(
     assert_eq!(actual, expected, "{context} body mismatch. Expected: {expected} Actual: {actual}");
 }
 
+/// Asserts that the Direct Line activity posted to non-A2A managed agent
+/// `agent_name`, among its `requests`, carries `expected_text`. Gherkin strings
+/// are not unescaped, so `\n` in the step text stands for a line break between
+/// text parts.
+pub fn assert_direct_line_activity_text(
+    requests: &[crate::bdd_support::mock_server::ReceivedRequest],
+    agent_name: &str,
+    expected_text: &str,
+) {
+    let expected_text = expected_text.replace("\\n", "\n");
+    let activity_post = requests
+        .iter()
+        .find(|request| request.method == "POST" && request.path_and_query.ends_with("/activities"))
+        .unwrap_or_else(|| {
+            panic!("non-A2A managed agent '{agent_name}' did not receive a Direct Line activity post; observed requests: {requests:?}")
+        });
+    let body = activity_post.json_body();
+    assert_eq!(
+        body.get("text")
+            .and_then(serde_json::Value::as_str),
+        Some(expected_text.as_str()),
+        "non-A2A managed agent '{agent_name}' should receive text {expected_text:?}; activity body was {body}"
+    );
+}
+
+/// Asserts that an A2A 0.3 `message/send` result, the message itself, has a
+/// `kind: "text"` part containing `expected_text` from non-A2A managed agent `agent_name`.
+pub fn assert_a2a_result_text_from_non_a2a_managed_agent(
+    body: &serde_json::Value,
+    agent_name: &str,
+    expected_text: &str,
+) {
+    let parts = body
+        .pointer("/result/parts")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("A2A response result.parts must be an array, got {body}"));
+    assert!(
+        parts.iter().any(|part| {
+            part.get("kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("text")
+                && part
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| text.contains(expected_text))
+        }),
+        "A2A response should contain text {expected_text:?} from non-A2A managed agent '{agent_name}', got {body}"
+    );
+}
+
 pub fn json_body_mentions(
     body: &serde_json::Value,
     expected: &str,

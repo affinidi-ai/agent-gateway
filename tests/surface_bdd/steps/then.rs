@@ -147,16 +147,6 @@ fn is_agent_card_discovery(request: &crate::bdd_support::mock_server::ReceivedRe
                 .contains(".well-known/agent.json"))
 }
 
-fn direct_line_activity_post<'a>(
-    requests: &'a [crate::bdd_support::mock_server::ReceivedRequest],
-    actor_name: &str,
-) -> &'a crate::bdd_support::mock_server::ReceivedRequest {
-    requests
-        .iter()
-        .find(|request| request.method == "POST" && request.path_and_query.ends_with("/activities"))
-        .unwrap_or_else(|| panic!("non-A2A managed agent '{actor_name}' did not receive a Direct Line activity post; observed requests: {requests:?}"))
-}
-
 fn assert_actor_not_called(
     world: &SurfaceWorld,
     actor_name: &str,
@@ -250,19 +240,9 @@ fn named_non_a2a_managed_agent_received_text(
     agent_name: String,
     expected_text: String,
 ) {
-    // Gherkin strings are not unescaped, so `\n` in the step text stands for a
-    // line break between text parts.
-    let expected_text = expected_text.replace("\\n", "\n");
     let target = get_observed_target_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
     let requests = get_observed_target_requests(target, &agent_name);
-    let activity_post = direct_line_activity_post(requests, &agent_name);
-    let body = activity_post.json_body();
-    assert_eq!(
-        body.get("text")
-            .and_then(serde_json::Value::as_str),
-        Some(expected_text.as_str()),
-        "non-A2A managed agent '{agent_name}' should receive text {expected_text:?}; activity body was {body}"
-    );
+    crate::bdd_support::assertions::assert_direct_line_activity_text(requests, &agent_name, &expected_text);
 }
 
 #[then(expr = "non-A2A managed agent {string} did not receive header {string}")]
@@ -378,26 +358,10 @@ fn a2a_response_result_contains_text_from_non_a2a_managed_agent(
     world: &mut SurfaceWorld,
     agent_name: String,
 ) {
-    let response = get_caller_response(world);
-    // The scenarios send `message/send`, so the reply is the A2A 0.3 result: the
-    // message itself, with `kind: "text"` parts.
-    let parts = response
-        .body
-        .pointer("/result/parts")
-        .and_then(serde_json::Value::as_array)
-        .unwrap_or_else(|| panic!("A2A response result.parts must be an array, got {}", response.body));
-    assert!(
-        parts.iter().any(|part| {
-            part.get("kind")
-                .and_then(serde_json::Value::as_str)
-                == Some("text")
-                && part
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|text| text.contains(&agent_name))
-        }),
-        "A2A response should contain text from non-A2A managed agent '{agent_name}', got {}",
-        response.body
+    crate::bdd_support::assertions::assert_a2a_result_text_from_non_a2a_managed_agent(
+        &get_caller_response(world).body,
+        &agent_name,
+        &agent_name,
     );
 }
 
@@ -905,6 +869,55 @@ pub(crate) async fn expect_vp_audit_record(
 ) {
     let (found, events) = vp_audit_events_matching(world, matches).await;
     assert!(found, "expected {what}, got {events:?}");
+}
+
+/// The VP Audit Log once it holds the record of a marker request: a body that is no
+/// JSON-RPC envelope, refused before the Target with `invalid_envelope`. Records reach
+/// the log in the order they are made, so every record of an earlier request is in it.
+pub(crate) async fn vp_audit_events_up_to_a_marker(world: &mut SurfaceWorld) -> Vec<serde_json::Value> {
+    let port = world
+        .infra
+        .as_ref()
+        .expect("the gateway is running")
+        .gateway_port;
+    let route = world
+        .surface_config
+        .route
+        .clone();
+    let marker = crate::bdd_support::caller::post_raw_path(port, &route, "{}", &[])
+        .await
+        .unwrap_or_else(|error| panic!("POST a body that is no JSON-RPC envelope: {error:#}"));
+    assert_eq!(marker.status, 400, "the marker request must be refused before the Target");
+    let (marked, events) =
+        vp_audit_events_matching(world, |event| event["event"]["request_rejected"]["reason"] == "invalid_envelope")
+            .await;
+    assert!(marked, "expected the marker's invalid_envelope record, got {events:?}");
+    events
+}
+
+fn is_response_decision(event: &serde_json::Value) -> bool {
+    event["event"]["policy_decision"]["scope"] == "response"
+}
+
+#[then(regex = r#"^the VP Audit Log records a response policy "(allow|deny)"$"#)]
+async fn vp_audit_log_records_response_decision(
+    world: &mut SurfaceWorld,
+    decision: String,
+) {
+    expect_vp_audit_record(world, &format!("a response policy {decision}"), |event| {
+        is_response_decision(event) && event["event"]["policy_decision"]["decision"] == decision.as_str()
+    })
+    .await;
+}
+
+#[then("the VP Audit Log records no response policy decision")]
+async fn vp_audit_log_records_no_response_decision(world: &mut SurfaceWorld) {
+    let events = vp_audit_events_up_to_a_marker(world).await;
+    let decisions: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| is_response_decision(event))
+        .collect();
+    assert!(decisions.is_empty(), "expected no response policy decision, got {decisions:?}");
 }
 
 /// The audit scheme of a source authentication method, as the step names it.

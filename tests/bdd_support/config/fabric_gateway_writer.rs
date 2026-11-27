@@ -26,6 +26,8 @@ use crate::bdd_support::config::target_auth::{
     TARGET_AUTH_PROVIDER_ID, credential_provider_target_auth_json, static_secret_target_auth_json,
 };
 
+const A2A_PROXY_DIRECT_LINE_SECRET_VALUE: &str = "g2g-bdd-direct-line-secret-value";
+
 /// Write the full config tree for one gateway listening on `gateway_port` and
 /// exposing `surfaces`.
 pub fn write_fabric_gateway_config(
@@ -65,6 +67,11 @@ pub fn write_fabric_gateway_config(
         if let Some(proxy) = &surface.mcp_proxy {
             config_tree
                 .mcp_proxies
+                .insert(proxy.proxy_id.clone(), proxy.clone());
+        }
+        if let Some(proxy) = &surface.a2a_proxy {
+            config_tree
+                .a2a_proxies
                 .insert(proxy.proxy_id.clone(), proxy.clone());
         }
         if let Some(provider) = &surface.target_auth_provider {
@@ -117,6 +124,9 @@ fn secret_fixtures(surface: &SurfaceSpec) -> Vec<SecretFixture> {
     }
     if let Some(provider) = &surface.target_auth_provider {
         secrets.extend(target_auth_provider_secrets(provider));
+    }
+    if let Some(proxy) = &surface.a2a_proxy {
+        secrets.push(SecretFixture::new(&proxy.secret_id, A2A_PROXY_DIRECT_LINE_SECRET_VALUE));
     }
     secrets
 }
@@ -214,6 +224,9 @@ fn build_surface_fixture(
     }
     if let Some(proxy) = &surface.mcp_proxy {
         fixture = fixture.with_mcp_proxy_id(proxy.proxy_id.clone());
+    }
+    if let Some(proxy) = &surface.a2a_proxy {
+        fixture = fixture.with_a2a_proxy_id(proxy.proxy_id.clone());
     }
     if surface.protocol == "mcp" {
         // An MCP endpoint checks Origin, so it accepts the gateway's own

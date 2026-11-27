@@ -32,7 +32,12 @@ use crate::{channel_debug, channel_error, channel_info, channel_warn};
 mod a2a_stream;
 pub(crate) mod agent_card;
 pub(crate) mod agent_pay_gate;
+mod response_policy;
 pub(crate) mod surface_payment;
+
+use response_policy::{
+    DirectRequest, DirectResponsePolicy, DirectToolsListRequest, direct_caller_identity, filter_direct_tools_list,
+};
 
 /// Lazy-initialized SSE session manager for MCP proxy:// channels.
 /// Shared across all channel proxy handlers.
@@ -4066,6 +4071,7 @@ async fn proxy_charged_request(
                     subscription_lifetime: None,
                     mcp_continuations: mcp_continuations.clone(),
                     payment: payment.as_ref(),
+                    agent_context: agent_context.as_ref(),
                 },
             ))
             .await;
@@ -4337,6 +4343,7 @@ async fn proxy_charged_request(
                 subscription_lifetime,
                 mcp_continuations,
                 payment: payment.as_ref(),
+                agent_context: agent_context.as_ref(),
             },
         ))
         .await;
@@ -6486,6 +6493,22 @@ async fn proxy_charged_request(
         start_time,
     };
 
+    let response_policy = DirectResponsePolicy::for_request(
+        &state,
+        DirectRequest {
+            config_id,
+            trace_id: &trace_id,
+            method: method.as_ref(),
+            path: uri.path(),
+            caller_did: agent_context
+                .as_ref()
+                .and_then(|ctx| ctx.did.as_deref()),
+            agent: agent_context.as_ref(),
+            extension_identity: extension_identity.as_ref(),
+            identity: authenticated_identity.as_ref(),
+            actor_did: request_agent_did.as_deref(),
+        },
+    );
     // A2A Proxy target adapter: the surface remains the public A2A/AP2 endpoint,
     // while the target endpoint dispatches to an internal configured adapter.
     // Dispatch happens after the normal gateway/source-auth/body/trust/OPA
@@ -6577,6 +6600,14 @@ async fn proxy_charged_request(
             body_bytes.len() as u64,
         )
         .await;
+        let response = match response_policy.as_ref() {
+            Some(policy) => {
+                policy
+                    .a2a_proxy_answer(response)
+                    .await
+            }
+            None => response,
+        };
         connection_guard
             .decrement()
             .await;
@@ -6761,35 +6792,9 @@ async fn proxy_charged_request(
     // agent which trust level to apply.
     let caller_identity_source: Option<String>;
     {
-        use crate::proxy::caller_identity::{CallerHeaders, CallerIdentity};
+        use crate::proxy::caller_identity::CallerHeaders;
 
-        let caller_did = agent_context
-            .as_ref()
-            .and_then(|ctx| ctx.did.as_deref())
-            .unwrap_or("anonymous")
-            .to_string();
-
-        // Determine identity source from caller-presented metadata, not from the
-        // channel's own DID:webvh identity. The channel DID context represents the
-        // managed agent/gateway identity, while `extension_identity`/`agent_context`
-        // reflect the caller.
-        #[cfg(feature = "didwebvh")]
-        let caller_presented_did = extension_identity
-            .as_ref()
-            .and_then(|ctx| ctx.did.as_ref())
-            .is_some();
-        #[cfg(feature = "didwebvh")]
-        let caller_agent_dna = agent_context
-            .as_ref()
-            .and_then(|ctx| ctx.agent_dna.clone());
-        #[cfg(feature = "didwebvh")]
-        let caller = if caller_presented_did || caller_agent_dna.is_some() {
-            CallerIdentity::from_self_presented(caller_did, None, caller_agent_dna)
-        } else {
-            CallerIdentity::from_gateway_computed(caller_did, std::collections::HashMap::new())
-        };
-        #[cfg(not(feature = "didwebvh"))]
-        let caller = CallerIdentity::from_gateway_computed(caller_did, std::collections::HashMap::new());
+        let caller = direct_caller_identity(agent_context.as_ref(), extension_identity.as_ref());
 
         // Preserve identity_source for transit token enrichment (used after this block).
         caller_identity_source = Some(
@@ -8356,6 +8361,52 @@ async fn proxy_charged_request(
                 connection_guard
                     .decrement()
                     .await;
+                let json_response = if !crate::mcp::is_tools_list_request(&body_bytes) {
+                    json_response
+                } else {
+                    match serde_json::from_str::<serde_json::Value>(&json_response) {
+                        Ok(mut answer) => {
+                            filter_direct_tools_list(
+                                &mut answer,
+                                &DirectToolsListRequest {
+                                    state: &state,
+                                    method: method.as_ref(),
+                                    path: uri.path(),
+                                    headers: &headers,
+                                    source_auth: source_auth_context.as_ref(),
+                                    mcp: mcp_classification
+                                        .as_ref()
+                                        .and_then(crate::mcp::modern_mcp_context),
+                                    agent: agent_context.as_ref(),
+                                    a2a: a2a_context.as_ref(),
+                                    extension_identity: extension_identity.as_ref(),
+                                    payment: payment_context.as_ref(),
+                                    identity_binding: identity_binding.as_ref(),
+                                    trace_id: &trace_id,
+                                    identity: authenticated_identity.as_ref(),
+                                    actor_did: request_agent_did.as_deref(),
+                                },
+                            );
+                            answer.to_string()
+                        }
+                        Err(_) if surface_mcp_tool_gating(&state).is_some() => {
+                            channel_warn!(
+                                config_id,
+                                "MCP tools/list answer from a Legacy SSE session unparsable under gating; failing closed"
+                            );
+                            crate::mcp::fail_closed_tools_list(&body_bytes, mcp_metadata_context)
+                        }
+                        Err(_) => json_response,
+                    }
+                };
+                if !json_response.is_empty()
+                    && let Some(policy) = response_policy.as_ref()
+                    && let Some(refusal) = policy
+                        .refusal(StatusCode::OK.as_u16(), json_response.as_bytes(), Some("application/json"))
+                        .await
+                {
+                    return Err(refusal);
+                }
                 return Ok(axum::response::Response::builder()
                     .status(StatusCode::OK)
                     .header("Content-Type", "application/json")
@@ -8941,167 +8992,27 @@ async fn proxy_charged_request(
                     }
                 }
 
-                // Filter tools/list responses based on OPA policy
-                if let (Some(policy_manager), Some(config_id)) = (&state.policy_manager, state.surface.config_id())
-                    && let Some(result) = json_response.get_mut("result")
-                    && let Some(tools) = result.get_mut("tools")
-                    && let Some(tools_array_mut) = tools.as_array_mut()
-                {
-                    // Extract tool names
-                    let tool_names: Vec<String> = tools_array_mut
-                        .iter()
-                        .filter_map(|t| {
-                            t.get("name")
-                                .and_then(|n| n.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .collect();
-
-                    let original_count = tools_array_mut.len();
-
-                    if !tool_names.is_empty() {
-                        // Build a full PolicyInput template so per-tool decisions
-                        // see the same context as the inbound channel OPA gate
-                        // (source_auth, agent, extension_identity, payment,
-                        // identity_binding, a2a). `filter_mcp_tools` clones the
-                        // template per tool and overrides `mcp` with the
-                        // synthesized tools/call probe.
-                        let mut template = crate::surface_context::PolicyInput::new(
-                            method.as_ref(),
-                            uri.path(),
-                            crate::surface_context::filter_sensitive_headers(&headers),
-                            "inbound",
-                            None,
-                            None,
-                            state
-                                .surface
-                                .config_id()
-                                .map(|s| s.to_string()),
-                            &state.surface.name,
-                        );
-                        template.source_auth = source_auth_context.clone();
-                        template.mcp = mcp_classification
+                filter_direct_tools_list(
+                    &mut json_response,
+                    &DirectToolsListRequest {
+                        state: &state,
+                        method: method.as_ref(),
+                        path: uri.path(),
+                        headers: &headers,
+                        source_auth: source_auth_context.as_ref(),
+                        mcp: mcp_classification
                             .as_ref()
-                            .and_then(crate::mcp::modern_mcp_context);
-                        template.agent = agent_context.clone();
-                        template.a2a = a2a_context.clone();
-                        template.extension_identity = extension_identity.clone();
-                        template.payment = payment_context.clone();
-                        template.identity_binding = identity_binding.clone();
-                        template.normalize_caller_did();
-
-                        // Filter tools based on policy
-                        let listed_names = tool_names.clone();
-                        let filtered_names = policy_manager.filter_mcp_tools_for_variant(
-                            config_id,
-                            state
-                                .active_variant_alias
-                                .as_deref(),
-                            tool_names,
-                            &template,
-                        );
-
-                        // Update tools array to only include filtered tools
-                        tools_array_mut.retain(|t| {
-                            if let Some(name) = t
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                            {
-                                filtered_names.contains(&name.to_string())
-                            } else {
-                                false
-                            }
-                        });
-                        channel_info!(
-                            config_id,
-                            "Filtered tools based on OPA policy original_count={} filtered_count={}",
-                            original_count,
-                            tools_array_mut.len()
-                        );
-
-                        // MCP Tool Gating — apply the surface's condition-gated
-                        // allow/deny firewall on top of the per-tool OPA filter.
-                        // The gate condition sees the request `PolicyInput` (with
-                        // `mcp.method = tools/list`), so a tool hidden here is the
-                        // same one the tools/call gate blocks.
-                        if let Some(gating) = policy_manager
-                            .compiled_mcp_tool_gating(
-                                config_id,
-                                state
-                                    .active_variant_alias
-                                    .as_deref(),
-                            )
-                            .filter(|g| !g.is_empty())
-                        {
-                            let gating_input_value = if gating.has_policy_conditions() {
-                                let mut gating_input = template.clone();
-                                gating_input.mcp = mcp_classification
-                                    .as_ref()
-                                    .and_then(crate::mcp::modern_mcp_context)
-                                    .or_else(|| {
-                                        Some(crate::surface_context::McpContext {
-                                            method: "tools/list".to_string(),
-                                            tool_name: None,
-                                            resource_uri: None,
-                                            prompt_name: None,
-                                            params: None,
-                                            ..Default::default()
-                                        })
-                                    });
-                                serde_json::to_value(&gating_input).unwrap_or_default()
-                            } else {
-                                serde_json::Value::Null
-                            };
-                            let current_names: Vec<String> = tools_array_mut
-                                .iter()
-                                .filter_map(|t| {
-                                    t.get("name")
-                                        .and_then(|n| n.as_str())
-                                        .map(|s| s.to_string())
-                                })
-                                .collect();
-                            let gated_count_before = tools_array_mut.len();
-                            let allowed_names = gating.filter_tools(current_names, &gating_input_value);
-                            tools_array_mut.retain(|t| {
-                                t.get("name")
-                                    .and_then(|n| n.as_str())
-                                    .map(|name| allowed_names.contains(&name.to_string()))
-                                    .unwrap_or(false)
-                            });
-                            if tools_array_mut.len() < gated_count_before {
-                                channel_info!(
-                                    config_id,
-                                    "MCP tool gating filtered tools/list before={} after={}",
-                                    gated_count_before,
-                                    tools_array_mut.len()
-                                );
-                            }
-                        }
-
-                        let kept_names: Vec<String> = tools_array_mut
-                            .iter()
-                            .filter_map(|t| {
-                                t.get("name")
-                                    .and_then(|n| n.as_str())
-                                    .map(str::to_string)
-                            })
-                            .collect();
-                        crate::observability::policy_audit::record_tools_list_filtering(
-                            &listed_names,
-                            &kept_names,
-                            crate::observability::PolicyDecisionEvent {
-                                surface_id: Some(config_id),
-                                surface_name: Some(state.surface.name.as_str()),
-                                trace_id: Some(&trace_id),
-                                http_method: Some(method.as_ref()),
-                                path: Some(uri.path()),
-                                identity: authenticated_identity.as_ref(),
-                                actor_did: request_agent_did.as_deref(),
-                                ..Default::default()
-                            },
-                        );
-                    }
-                }
+                            .and_then(crate::mcp::modern_mcp_context),
+                        agent: agent_context.as_ref(),
+                        a2a: a2a_context.as_ref(),
+                        extension_identity: extension_identity.as_ref(),
+                        payment: payment_context.as_ref(),
+                        identity_binding: identity_binding.as_ref(),
+                        trace_id: &trace_id,
+                        identity: authenticated_identity.as_ref(),
+                        actor_did: request_agent_did.as_deref(),
+                    },
+                );
 
                 if is_modern_response
                     && caller_scoped_mcp_result(
@@ -9411,116 +9322,18 @@ async fn proxy_charged_request(
         // ── Step 23: Response policy evaluation (§4.11 / §6.1) ─────────────────
         // If a response_policy_definition_id is configured, evaluate the OPA policy
         // on the upstream response before returning it to the caller.
-        if let Some(response_policy_id) = state
-            .surface
-            .response_policy_definition_id()
-            && let Some(ref pm) = state.policy_manager
+        let content_type_str = response_headers
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok());
+        if let Some(policy) = response_policy.as_ref()
+            && let Some(refusal) = policy
+                .refusal(status.as_u16(), &response_body, content_type_str)
+                .await
         {
-            use crate::proxy::response_policy::{
-                CallerContext as RpCallerContext, ResponseContext, ResponsePolicyInput, SurfaceContext,
-                evaluate_response_policy,
-            };
-
-            let response_json: Option<serde_json::Value> = serde_json::from_slice(&response_body).ok();
-
-            let content_type_str = response_headers
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-
-            let policy_key = format!("response:{}", response_policy_id);
-            let input = ResponsePolicyInput::new(
-                ResponseContext {
-                    status_code: status.as_u16(),
-                    body: response_json,
-                    content_type: content_type_str,
-                    is_error: status.is_server_error() || status.is_client_error(),
-                    method: None,
-                },
-                RpCallerContext {
-                    did: agent_context
-                        .as_ref()
-                        .and_then(|ctx| ctx.did.clone()),
-                    identity_source: caller_identity_source.clone(),
-                    dna_uai: agent_context
-                        .as_ref()
-                        .and_then(|ctx| ctx.agent_dna.as_ref())
-                        .map(|dna| dna.uai.clone()),
-                },
-                SurfaceContext {
-                    id: state
-                        .surface
-                        .surface_id
-                        .clone(),
-                    name: channel_name.clone(),
-                    protocol: format!(
-                        "{:?}",
-                        state
-                            .surface
-                            .channel_protocol()
-                    )
-                    .to_lowercase(),
-                },
-            );
-
-            let response_policy = pm
-                .resolve_policy_attestation(Some(response_policy_id))
+            connection_guard
+                .decrement()
                 .await;
-            let decision = evaluate_response_policy(pm.as_ref(), &policy_key, input);
-            if !decision.allow {
-                crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
-                    scope: crate::observability::PolicyScope::Response,
-                    allow: false,
-                    reason: decision.reason.as_deref(),
-                    error: decision.error,
-                    policy_id: Some(response_policy_id),
-                    policy_definition_id: Some(response_policy_id),
-                    policy_name: response_policy
-                        .name
-                        .as_deref(),
-                    policy_version: response_policy.version,
-                    policy_content_hash: response_policy
-                        .content_hash
-                        .as_deref(),
-                    surface_id: Some(config_id),
-                    surface_name: Some(state.surface.name.as_str()),
-                    trace_id: Some(&trace_id),
-                    http_method: Some(method.as_ref()),
-                    path: Some(uri.path()),
-                    identity: authenticated_identity.as_ref(),
-                    actor_did: request_agent_did.as_deref(),
-                    ..Default::default()
-                });
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(axum::response::Response::builder()
-                    .status(axum::http::StatusCode::FORBIDDEN)
-                    .header("Content-Type", "application/json")
-                    .body(axum::body::Body::from(r#"{"error":"Response blocked","code":"response_policy_denied"}"#))
-                    .unwrap());
-            }
-            crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
-                scope: crate::observability::PolicyScope::Response,
-                allow: true,
-                policy_id: Some(response_policy_id),
-                policy_definition_id: Some(response_policy_id),
-                policy_name: response_policy
-                    .name
-                    .as_deref(),
-                policy_version: response_policy.version,
-                policy_content_hash: response_policy
-                    .content_hash
-                    .as_deref(),
-                surface_id: Some(config_id),
-                surface_name: Some(state.surface.name.as_str()),
-                trace_id: Some(&trace_id),
-                http_method: Some(method.as_ref()),
-                path: Some(uri.path()),
-                identity: authenticated_identity.as_ref(),
-                actor_did: request_agent_did.as_deref(),
-                ..Default::default()
-            });
+            return Err(refusal);
         }
 
         // Inject VP into response if client supports credential extension and backend agent has DID
@@ -11249,6 +11062,45 @@ fn fabric_send_route(surface: &crate::config::agent_surface::AgentSurface) -> Op
     })
 }
 
+/// Records, from `start_time`, the request of a `fabric://` send whose answer
+/// the sending surface's response policy refused as a failed connection.
+async fn record_refused_fabric_send(
+    state: &ProxyState,
+    source_addr: &str,
+    trace_id: &str,
+    ucp_operation: Option<&str>,
+    start_time: std::time::Instant,
+) {
+    let Some(metrics) = state.metrics_store.as_ref() else {
+        return;
+    };
+    let latency_ms = start_time
+        .elapsed()
+        .as_millis() as u64;
+    metrics
+        .record_connection_with_ucp(
+            state
+                .surface
+                .config_id_string(),
+            source_addr.to_string(),
+            state
+                .surface
+                .target
+                .endpoint
+                .clone(),
+            crate::metrics::ConnectionStatus::Failed,
+            Some(latency_ms),
+            None,
+            crate::metrics::ConnectionDirection::Request,
+            trace_id.to_string(),
+            ucp_operation.map(str::to_string),
+            None,
+            None,
+            latency_ms,
+        )
+        .await;
+}
+
 /// A request for a `fabric://` Target.
 struct FabricSend<'a> {
     channel_name: &'a str,
@@ -11270,6 +11122,7 @@ struct FabricSend<'a> {
     subscription_lifetime: Option<crate::mcp::subscriptions::SubscriptionLifetime>,
     mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
     payment: Option<&'a agent_pay_gate::Intake>,
+    agent_context: Option<&'a crate::surface_context::AgentContext>,
 }
 
 /// Handle requests through the fabric:// protocol by forwarding via gateway
@@ -11319,6 +11172,7 @@ async fn handle_fabric_request_inner(
         mut subscription_lifetime,
         mcp_continuations,
         payment,
+        agent_context,
     } = request;
     let source_auth_failed =
         matches!(source_auth_context, Some(crate::surface_context::SourceAuthContext::Failed { .. }));
@@ -13510,6 +13364,21 @@ async fn handle_fabric_request_inner(
         .cloned()
         .zip(injected_target_header);
     let refusal_trace_id = trace_id.clone();
+    let caller_did = response_policy::fabric_send_caller_did(agent_context, extension_identity.as_ref());
+    let response_policy = DirectResponsePolicy::for_request(
+        &state,
+        DirectRequest {
+            config_id,
+            trace_id: &trace_id,
+            method: method.as_ref(),
+            path: uri.path(),
+            caller_did,
+            agent: agent_context,
+            extension_identity: extension_identity.as_ref(),
+            identity: authenticated_identity.as_ref(),
+            actor_did: caller_did,
+        },
+    );
     let mut process_response = async move |forward_result: Result<
         Option<crate::gateways::connection_points::messages::ReceivedMessage>,
         String,
@@ -13591,7 +13460,7 @@ async fn handle_fabric_request_inner(
                     .cloned()
                     .unwrap_or_default();
 
-                let response_body = response_msg
+                let mut response_body = response_msg
                     .message_body
                     .get("body")
                     .and_then(|v| v.as_str())
@@ -13635,6 +13504,23 @@ async fn handle_fabric_request_inner(
                         connection_guard
                             .decrement()
                             .await;
+                        if let Some(policy) = response_policy.as_ref()
+                            && let Some(refusal) = policy
+                                .refusal_of_peer_answer(status, &mut response_body, &response_headers)
+                                .await
+                        {
+                            if !is_modern_response {
+                                record_refused_fabric_send(
+                                    &state,
+                                    &source_addr,
+                                    &trace_id,
+                                    ucp_operation.as_deref(),
+                                    start_time,
+                                )
+                                .await;
+                            }
+                            return Err(refusal);
+                        }
                         return Err(response_builder
                             .body(axum::body::Body::from(response_body))
                             .unwrap());
@@ -13673,21 +13559,40 @@ async fn handle_fabric_request_inner(
                             serde_json::json!({ "jsonrpc": "2.0", "id": null, "error": jsonrpc_error }).to_string()
                         };
 
-                        // Try to parse the response_body as JSON to see if it's already a JSON-RPC error
-                        let error_response =
-                            if let Ok(json_body) = serde_json::from_str::<serde_json::Value>(&response_body) {
-                                // If it's already a JSON-RPC response, use it as-is
-                                if json_body
+                        // A body that is already a JSON-RPC response is relayed as-is,
+                        // under the sending surface's response policy.
+                        let relays_peer_body =
+                            serde_json::from_str::<serde_json::Value>(&response_body).is_ok_and(|json_body| {
+                                json_body
                                     .get("jsonrpc")
                                     .is_some()
-                                {
-                                    response_body
-                                } else {
-                                    jsonrpc_error()
-                                }
-                            } else {
-                                jsonrpc_error()
-                            };
+                            });
+                        if relays_peer_body
+                            && let Some(policy) = response_policy.as_ref()
+                            && let Some(refusal) = policy
+                                .refusal_of_peer_answer(status, &mut response_body, &response_headers)
+                                .await
+                        {
+                            if !is_modern_response {
+                                record_refused_fabric_send(
+                                    &state,
+                                    &source_addr,
+                                    &trace_id,
+                                    ucp_operation.as_deref(),
+                                    start_time,
+                                )
+                                .await;
+                            }
+                            connection_guard
+                                .decrement()
+                                .await;
+                            return Err(refusal);
+                        }
+                        let error_response = if relays_peer_body {
+                            response_body
+                        } else {
+                            jsonrpc_error()
+                        };
 
                         // Build response with headers from the forward response.
                         // Preserve the MCP JSON-RPC convention (HTTP 200 + error
@@ -13718,9 +13623,29 @@ async fn handle_fabric_request_inner(
                         connection_guard
                             .decrement()
                             .await;
-                        return Ok(response_builder
+                        let error_answer = response_builder
                             .body(axum::body::Body::from(error_response))
-                            .unwrap());
+                            .unwrap();
+                        if !relays_peer_body
+                            && error.as_str().is_some()
+                            && let Some(policy) = response_policy.as_ref()
+                        {
+                            let checked = policy
+                                .checked_peer_error(error_answer)
+                                .await;
+                            if checked.is_err() && !is_modern_response {
+                                record_refused_fabric_send(
+                                    &state,
+                                    &source_addr,
+                                    &trace_id,
+                                    ucp_operation.as_deref(),
+                                    start_time,
+                                )
+                                .await;
+                            }
+                            return checked;
+                        }
+                        return Ok(error_answer);
                     }
 
                     // For non-MCP requests, return HTTP error as before
@@ -13728,12 +13653,38 @@ async fn handle_fabric_request_inner(
                     connection_guard
                         .decrement()
                         .await;
-                    return Err(create_error_response(
+                    let error_answer = create_error_response(
                         error_status,
                         error
                             .as_str()
                             .unwrap_or("Gateway forwarding failed"),
-                    ));
+                    );
+                    if error.as_str().is_some()
+                        && let Some(policy) = response_policy.as_ref()
+                    {
+                        return Err(
+                            match policy
+                                .checked_peer_error(error_answer)
+                                .await
+                            {
+                                Ok(answer) => answer,
+                                Err(refusal) => {
+                                    if !is_modern_response {
+                                        record_refused_fabric_send(
+                                            &state,
+                                            &source_addr,
+                                            &trace_id,
+                                            ucp_operation.as_deref(),
+                                            start_time,
+                                        )
+                                        .await;
+                                    }
+                                    refusal
+                                }
+                            },
+                        );
+                    }
+                    return Err(error_answer);
                 }
 
                 // Check if status is 402 Payment Required (even without error field)
@@ -13762,6 +13713,23 @@ async fn handle_fabric_request_inner(
                     connection_guard
                         .decrement()
                         .await;
+                    if let Some(policy) = response_policy.as_ref()
+                        && let Some(refusal) = policy
+                            .refusal_of_peer_answer(status, &mut response_body, &response_headers)
+                            .await
+                    {
+                        if !is_modern_response {
+                            record_refused_fabric_send(
+                                &state,
+                                &source_addr,
+                                &trace_id,
+                                ucp_operation.as_deref(),
+                                start_time,
+                            )
+                            .await;
+                        }
+                        return Err(refusal);
+                    }
                     return Err(response_builder
                         .body(axum::body::Body::from(response_body))
                         .unwrap());
@@ -14423,6 +14391,32 @@ async fn handle_fabric_request_inner(
                 } else {
                     response_body
                 };
+                let mut response_body = response_body;
+
+                // The sending surface's response policy, before the answer is captured as
+                // delivered. The peer's empty `202` acknowledgement of a notification is
+                // not a Target answer and is not checked.
+                if !(status == StatusCode::ACCEPTED.as_u16() && response_body.is_empty())
+                    && let Some(policy) = response_policy.as_ref()
+                    && let Some(refusal) = policy
+                        .refusal_of_peer_answer(status, &mut response_body, &response_headers)
+                        .await
+                {
+                    if !is_modern_response {
+                        record_refused_fabric_send(
+                            &state,
+                            &source_addr,
+                            &trace_id,
+                            ucp_operation.as_deref(),
+                            start_time,
+                        )
+                        .await;
+                    }
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Err(refusal);
+                }
 
                 // Broadcast payload capture AFTER all transformations (4-stage pipeline)
                 // This ensures Stage 4 shows the actual final response sent to the agent
@@ -14917,11 +14911,8 @@ async fn handle_fabric_request_inner(
             request,
             modern_limits,
             discovery_support,
-            move |mut message| async move {
+            move |message| async move {
                 use crate::mcp::modern_sse::SseReadError;
-                if let Some(receipt) = &stream_receipt {
-                    receipt.inject_into_message(&crate::config::ChannelProtocol::Mcp, &mut message);
-                }
                 let headers = crate::proxy::fabric_stream::wire::encode_headers(&processing_headers)
                     .map_err(|_| SseReadError::ResponseRejected)?;
                 let response_body = serde_json::to_string(&message).map_err(|_| SseReadError::InvalidMessage)?;
@@ -14959,8 +14950,12 @@ async fn handle_fabric_request_inner(
                 )
                 .await
                 .map_err(|_| SseReadError::EventTooLarge)?;
+                let mut message = serde_json::from_slice(&bytes).map_err(|_| SseReadError::InvalidMessage)?;
+                if let Some(receipt) = &stream_receipt {
+                    receipt.inject_into_message(&crate::config::ChannelProtocol::Mcp, &mut message);
+                }
                 Ok(crate::mcp::modern_sse::ProcessedResponse {
-                    message: serde_json::from_slice(&bytes).map_err(|_| SseReadError::InvalidMessage)?,
+                    message,
                     headers: Some(headers),
                 })
             },
@@ -16202,59 +16197,42 @@ async fn handle_mcp_proxy_request_inner(
                 && let Some(ref pm) = state.policy_manager
             {
                 use crate::proxy::response_policy::{
-                    CallerContext as RpCallerContext, ResponseContext, ResponsePolicyInput, SurfaceContext,
-                    evaluate_response_policy,
+                    CallerContext as RpCallerContext, ResponsePolicyInput, SurfaceContext, check_response_policy,
+                    mcp_proxy_refusal,
                 };
 
-                let policy_key = format!("response:{}", response_policy_id);
-                let input = ResponsePolicyInput::new(
-                    ResponseContext {
-                        status_code: 200,
-                        body: Some(response_json.clone()),
-                        content_type: Some("application/json".to_string()),
-                        is_error: false,
-                        method: None,
-                    },
-                    RpCallerContext {
-                        did: None,
-                        identity_source: authenticated_identity.map(|id| format!("{:?}", id)),
-                        dna_uai: None,
-                    },
-                    SurfaceContext {
-                        id: state
-                            .surface
-                            .surface_id
-                            .clone(),
-                        name: channel_name.to_string(),
-                        protocol: format!(
-                            "{:?}",
-                            state
-                                .surface
-                                .channel_protocol()
-                        )
-                        .to_lowercase(),
-                    },
-                );
-
-                let response_policy = pm
-                    .resolve_policy_attestation(Some(response_policy_id))
-                    .await;
-                let decision = evaluate_response_policy(pm.as_ref(), &policy_key, input);
-                if !decision.allow {
-                    crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
-                        scope: crate::observability::PolicyScope::Response,
-                        allow: false,
-                        reason: decision.reason.as_deref(),
-                        error: decision.error,
-                        policy_id: Some(response_policy_id),
-                        policy_definition_id: Some(response_policy_id),
-                        policy_name: response_policy
-                            .name
-                            .as_deref(),
-                        policy_version: response_policy.version,
-                        policy_content_hash: response_policy
-                            .content_hash
-                            .as_deref(),
+                let caller = RpCallerContext {
+                    did: None,
+                    identity_source: authenticated_identity.map(|id| format!("{:?}", id)),
+                    dna_uai: None,
+                };
+                if let Some(denied) = mcp_proxy_refusal(&response_json, json_request.get("id"), |response| {
+                    check_response_policy(
+                        pm.as_ref(),
+                        response_policy_id,
+                        ResponsePolicyInput::new(response, caller, SurfaceContext::of(&state.surface)),
+                        crate::observability::PolicyDecisionEvent {
+                            surface_id: Some(config_id),
+                            surface_name: Some(state.surface.name.as_str()),
+                            trace_id: Some(&trace_id),
+                            http_method: Some("POST"),
+                            path: Some(uri.path()),
+                            identity: authenticated_identity,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .await
+                {
+                    return Err(axum::response::Json(denied).into_response());
+                }
+            } else if let Some(response_policy_id) = state
+                .surface
+                .response_policy_definition_id()
+            {
+                crate::proxy::response_policy::pass_without_policy_manager(
+                    response_policy_id,
+                    crate::observability::PolicyDecisionEvent {
                         surface_id: Some(config_id),
                         surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
@@ -16262,37 +16240,8 @@ async fn handle_mcp_proxy_request_inner(
                         path: Some(uri.path()),
                         identity: authenticated_identity,
                         ..Default::default()
-                    });
-                    let error_response = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": json_request.get("id"),
-                        "error": {
-                            "code": -32000,
-                            "message": decision.reason.unwrap_or_else(|| "Response blocked by policy".to_string())
-                        }
-                    });
-                    return Err(axum::response::Json(error_response).into_response());
-                }
-                crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
-                    scope: crate::observability::PolicyScope::Response,
-                    allow: true,
-                    policy_id: Some(response_policy_id),
-                    policy_definition_id: Some(response_policy_id),
-                    policy_name: response_policy
-                        .name
-                        .as_deref(),
-                    policy_version: response_policy.version,
-                    policy_content_hash: response_policy
-                        .content_hash
-                        .as_deref(),
-                    surface_id: Some(config_id),
-                    surface_name: Some(state.surface.name.as_str()),
-                    trace_id: Some(&trace_id),
-                    http_method: Some("POST"),
-                    path: Some(uri.path()),
-                    identity: authenticated_identity,
-                    ..Default::default()
-                });
+                    },
+                );
             }
 
             // Trust Recorder — writes TrAdmin records to configured TRs on the
@@ -25369,6 +25318,19 @@ mod fabric_send_tests {
         status: u16,
         body: &str,
     ) -> crate::gateways::connection_points::messages::ReceivedMessage {
+        forward_reply(
+            request,
+            responder_did,
+            json!({"status": status, "headers": {"content-type": "application/json"}, "body": body}),
+        )
+    }
+
+    /// The peer's `ForwardResponse` to `request`, with `message_body` as sent.
+    fn forward_reply(
+        request: &affinidi_messaging_didcomm::Message,
+        responder_did: &str,
+        message_body: serde_json::Value,
+    ) -> crate::gateways::connection_points::messages::ReceivedMessage {
         crate::gateways::connection_points::messages::ReceivedMessage::new(
             "cp-1".into(),
             "peer".into(),
@@ -25381,7 +25343,7 @@ mod fabric_send_tests {
             vec!["did:example:connection-point".into()],
             None,
             None,
-            json!({"status": status, "headers": {"content-type": "application/json"}, "body": body}),
+            message_body,
             crate::gateways::connection_points::messages::MessageMetadata {
                 encrypted: true,
                 authenticated: true,
@@ -25621,6 +25583,263 @@ mod fabric_send_tests {
         });
     }
 
+    /// A gateway whose `protocol` surface on a `fabric://` Target has a response
+    /// policy deciding by `rego`, and whose peer answers with `message_body`.
+    async fn fabric_peer_relaying(
+        protocol: &str,
+        message_body: serde_json::Value,
+        rego: &str,
+    ) -> FabricPeer {
+        let route = format!("/{protocol}");
+        let mut peer = fabric_peer_fronted_by(200, json!({}), |peer_id| {
+            json!({
+                "surface_id": "fabric-relay", "name": "Fabric relay",
+                "access_point": {"listen_address": "https://gateway.example", "route": route, "protocol": protocol},
+                "target": {
+                    "endpoint": format!("fabric://{peer_id}/remote-surface"),
+                    "response_policy": {"policy_definition_id": "relay-policy"}
+                }
+            })
+        })
+        .await;
+        let manager = crate::policies::SurfacePolicyManager::new();
+        manager
+            .load_policy_text("response:relay-policy", rego)
+            .unwrap();
+        peer.state.policy_manager = Some(Arc::new(manager));
+        let responder_did = peer.peer_did.clone();
+        crate::comm::didcomm::client::test_send_hook::install(&peer.peer_did, move |request| {
+            let reply = forward_reply(request, &responder_did, message_body.clone());
+            assert!(crate::proxy::fabric_response_waiter::complete_forward_response_waiter(&reply));
+        });
+        peer
+    }
+
+    const DENY_ALL_RESPONSES: &str = "package surface.policy\n\ndefault allow := false\n";
+    const ALLOW_ALL_RESPONSES: &str = "package surface.policy\n\ndefault allow := true\n";
+
+    fn a2a_message() -> serde_json::Value {
+        json!({"jsonrpc": "2.0", "id": "m-1", "method": "message/send", "params": {"message": {
+            "role": "user", "messageId": "msg-1", "parts": [{"kind": "text", "text": "hi"}]}}})
+    }
+
+    #[test]
+    fn a_payment_challenge_relayed_from_a_fabric_peer_meets_the_sending_surfaces_response_policy() {
+        run_on_large_stack(async {
+            let challenge = json!({"accepts": [{"secret": "s"}]}).to_string();
+            for (message_body, rego, expected) in [
+                (
+                    json!({"status": 402, "headers": {"content-type": "application/json"}, "body": challenge}),
+                    DENY_ALL_RESPONSES,
+                    axum::http::StatusCode::FORBIDDEN,
+                ),
+                (
+                    json!({"status": 402, "headers": {"content-type": "application/json"}, "body": challenge,
+                        "error": "payment required"}),
+                    DENY_ALL_RESPONSES,
+                    axum::http::StatusCode::FORBIDDEN,
+                ),
+                (
+                    json!({"status": 402, "headers": {"content-type": "application/json"}, "body": challenge}),
+                    ALLOW_ALL_RESPONSES,
+                    axum::http::StatusCode::PAYMENT_REQUIRED,
+                ),
+                (
+                    json!({"status": 402, "headers": {"content-type": "application/json"}, "body": challenge,
+                        "error": "payment required"}),
+                    ALLOW_ALL_RESPONSES,
+                    axum::http::StatusCode::PAYMENT_REQUIRED,
+                ),
+            ] {
+                let peer = fabric_peer_relaying("a2a", message_body.clone(), rego).await;
+
+                let (status, _, body) =
+                    answer(post(&peer.state, "https://gateway.example/a2a", &a2a_message(), None).await).await;
+
+                assert_eq!(status, expected, "{message_body} {body}");
+                if expected == axum::http::StatusCode::FORBIDDEN {
+                    assert!(
+                        body.to_string()
+                            .contains("response_policy_denied"),
+                        "{body}"
+                    );
+                } else {
+                    assert_eq!(body["accepts"][0]["secret"], "s", "{body}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_jsonrpc_error_relayed_from_a_fabric_peer_meets_the_sending_surfaces_response_policy() {
+        run_on_large_stack(async {
+            let peer_error =
+                json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32000, "message": "secret"}}).to_string();
+            let message_body = json!({"status": 500, "headers": {"content-type": "application/json"},
+                "body": peer_error, "error": "Target failed"});
+            let tools_list = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}});
+
+            let peer = fabric_peer_relaying("mcp", message_body.clone(), DENY_ALL_RESPONSES).await;
+            let (status, _, body) =
+                answer(post(&peer.state, "https://gateway.example/mcp", &tools_list, None).await).await;
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+            assert!(
+                body.to_string()
+                    .contains("response_policy_denied"),
+                "{body}"
+            );
+
+            let peer = fabric_peer_relaying("mcp", message_body, ALLOW_ALL_RESPONSES).await;
+            let (status, _, body) =
+                answer(post(&peer.state, "https://gateway.example/mcp", &tools_list, None).await).await;
+            assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+            assert_eq!(body["error"]["message"], "secret", "{body}");
+        });
+    }
+
+    #[test]
+    fn a_relayed_peer_body_the_response_policy_refuses_is_recorded_as_a_failed_connection() {
+        run_on_large_stack(async {
+            let challenge = json!({"accepts": []}).to_string();
+            let peer_error =
+                json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32000, "message": "secret"}}).to_string();
+            let tools_list = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}});
+            for (protocol, request, message_body) in [
+                (
+                    "a2a",
+                    a2a_message(),
+                    json!({"status": 402, "headers": {"content-type": "application/json"}, "body": challenge}),
+                ),
+                (
+                    "a2a",
+                    a2a_message(),
+                    json!({"status": 402, "headers": {"content-type": "application/json"}, "body": challenge,
+                        "error": "payment required"}),
+                ),
+                (
+                    "mcp",
+                    tools_list.clone(),
+                    json!({"status": 500, "headers": {"content-type": "application/json"}, "body": peer_error,
+                        "error": "Target failed"}),
+                ),
+                (
+                    "mcp",
+                    tools_list.clone(),
+                    json!({"status": 500, "headers": {"content-type": "text/plain"}, "body": "x", "error": "secret"}),
+                ),
+                (
+                    "a2a",
+                    a2a_message(),
+                    json!({"status": 500, "headers": {"content-type": "text/plain"}, "body": "x", "error": "secret"}),
+                ),
+            ] {
+                let mut peer = fabric_peer_relaying(protocol, message_body.clone(), DENY_ALL_RESPONSES).await;
+                let metrics = Arc::new(crate::metrics::MetricsStore::new(10));
+                peer.state.metrics_store = Some(metrics.clone());
+
+                let (status, _, body) =
+                    answer(post(&peer.state, &format!("https://gateway.example/{protocol}"), &request, None).await)
+                        .await;
+
+                assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{message_body} {body}");
+                let connections = metrics
+                    .get_recent_connections(10)
+                    .await;
+                assert!(
+                    connections
+                        .iter()
+                        .any(|connection| matches!(connection.status, crate::metrics::ConnectionStatus::Failed)),
+                    "{message_body}: {connections:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_gateway_written_mcp_error_carrying_the_peers_error_text_meets_the_response_policy() {
+        run_on_large_stack(async {
+            let message_body = json!({"status": 500, "headers": {"content-type": "text/plain"},
+                "body": "upstream exploded", "error": "secret"});
+            let tools_list = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}});
+
+            let peer = fabric_peer_relaying("mcp", message_body.clone(), DENY_ALL_RESPONSES).await;
+            let (status, _, body) =
+                answer(post(&peer.state, "https://gateway.example/mcp", &tools_list, None).await).await;
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+            assert!(
+                !body
+                    .to_string()
+                    .contains("secret"),
+                "{body}"
+            );
+
+            let peer = fabric_peer_relaying("mcp", message_body, ALLOW_ALL_RESPONSES).await;
+            let (status, _, body) =
+                answer(post(&peer.state, "https://gateway.example/mcp", &tools_list, None).await).await;
+            assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+            assert_eq!(body["error"]["code"], -32603, "{body}");
+            assert_eq!(body["error"]["message"], "secret", "{body}");
+            assert!(
+                !body
+                    .to_string()
+                    .contains("upstream exploded"),
+                "{body}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_gateway_written_a2a_error_carrying_the_peers_error_text_meets_the_response_policy() {
+        run_on_large_stack(async {
+            let message_body = json!({"status": 500, "headers": {"content-type": "text/plain"},
+                "body": "upstream exploded", "error": "secret"});
+
+            let peer = fabric_peer_relaying("a2a", message_body.clone(), DENY_ALL_RESPONSES).await;
+            let (status, _, body) =
+                answer(post(&peer.state, "https://gateway.example/a2a", &a2a_message(), None).await).await;
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+            assert!(
+                !body
+                    .to_string()
+                    .contains("secret"),
+                "{body}"
+            );
+
+            let peer = fabric_peer_relaying("a2a", message_body, ALLOW_ALL_RESPONSES).await;
+            let (status, _, body) =
+                answer(post(&peer.state, "https://gateway.example/a2a", &a2a_message(), None).await).await;
+            assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+            assert!(
+                body.to_string()
+                    .contains("secret"),
+                "{body}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_jsonrpc_error_body_labelled_as_an_event_stream_is_refused() {
+        run_on_large_stack(async {
+            let peer_error =
+                json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32000, "message": "secret"}}).to_string();
+            let message_body = json!({"status": 500, "headers": {"content-type": "text/event-stream"},
+                "body": peer_error, "error": "Target failed"});
+            let tools_list = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}});
+            let peer = fabric_peer_relaying("mcp", message_body, ALLOW_ALL_RESPONSES).await;
+
+            let (status, _, body) =
+                answer(post(&peer.state, "https://gateway.example/mcp", &tools_list, None).await).await;
+
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+            assert!(
+                !body
+                    .to_string()
+                    .contains("secret"),
+                "{body}"
+            );
+        });
+    }
+
     #[tokio::test]
     async fn fabric_send_forwards_no_identity_proof_of_a_caller_that_gets_no_inbound_identity() {
         let peer = fabric_peer_fronted_by(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}}), |peer_id| {
@@ -25677,6 +25896,7 @@ mod fabric_send_tests {
                 subscription_lifetime: None,
                 mcp_continuations: None,
                 payment: None,
+                agent_context: None,
             },
         ))
         .await;
@@ -25766,6 +25986,7 @@ mod fabric_send_tests {
                 subscription_lifetime: None,
                 mcp_continuations: None,
                 payment: None,
+                agent_context: None,
             },
         )))
         .await;
@@ -25834,6 +26055,7 @@ mod fabric_send_tests {
                 subscription_lifetime: None,
                 mcp_continuations: None,
                 payment: None,
+                agent_context: None,
             },
         ))
         .await;
@@ -25908,6 +26130,7 @@ mod fabric_send_tests {
                 subscription_lifetime: None,
                 mcp_continuations: None,
                 payment: None,
+                agent_context: None,
             },
         )
         .await;
@@ -26018,6 +26241,7 @@ mod fabric_send_tests {
                 subscription_lifetime: None,
                 mcp_continuations: None,
                 payment: None,
+                agent_context: None,
             },
         )))
         .await;
@@ -26952,6 +27176,7 @@ mod fabric_send_tests {
                 subscription_lifetime: None,
                 mcp_continuations: None,
                 payment: None,
+                agent_context: None,
             },
         ))
         .await;
@@ -27137,6 +27362,7 @@ mod fabric_send_tests {
                     subscription_lifetime: None,
                     mcp_continuations: None,
                     payment: None,
+                    agent_context: None,
                 },
             ))
             .await;

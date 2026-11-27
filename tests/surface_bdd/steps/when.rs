@@ -1050,10 +1050,11 @@ async fn caller_fetches_agent_card_for_surface(
     let content_type = headers
         .get("content-type")
         .cloned();
-    let body = response
-        .json()
+    let text = response
+        .text()
         .await
-        .expect("agent card response should be JSON");
+        .expect("read agent card response");
+    let body = serde_json::from_str(&text).expect("agent card response should be JSON");
     record_caller_response(
         world,
         RecordedHttpResponse {
@@ -1061,6 +1062,7 @@ async fn caller_fetches_agent_card_for_surface(
             headers,
             body,
             content_type,
+            text,
         },
     );
     record_mock_observation(world).await;

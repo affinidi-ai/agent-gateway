@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::bdd_support::actors::TargetActorKind;
 use crate::bdd_support::admin_client::ExternalMediatorBlob;
 use crate::bdd_support::config::fabric_surface_fixture::{
-    McpProxySpec, McpToolPolicySpec, SourceAuthSpec, SurfaceSpec, TargetAuthSpec,
+    A2aProxySpec, McpProxySpec, McpToolPolicySpec, SourceAuthSpec, SurfaceSpec, TargetAuthSpec,
     TransitPointHeaderMetadataMappingRowSpec, TransitPointSpec,
 };
 use crate::bdd_support::config::modern_consent::ModernConsentFixture;
@@ -351,6 +351,67 @@ pub async fn gateway_has_surface_backed_by_mcp_proxy(
         .topology
         .actors
         .bind_target_to_surface(&target_name, gw_index, &surface_id);
+}
+
+#[given(
+    expr = "gateway {int} exposes A2A surface {string} backed by non-A2A managed agent {string} through an A2A proxy endpoint"
+)]
+pub async fn gateway_has_surface_backed_by_a2a_proxy(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    surface_name: String,
+    agent_name: String,
+) {
+    let surface_id = surface_name.clone();
+    let route = format!("/{surface_id}");
+    let proxy_id = format!("{surface_id}-a2a-proxy");
+    world
+        .topology
+        .actors
+        .register_target_with_key(&agent_name, TargetActorKind::ManagedAgent, &surface_id);
+    world
+        .topology
+        .actors
+        .register_surface_with_target(&surface_name, "a2a", Some(&route), Some(&agent_name));
+
+    let mut spec = SurfaceSpec::new(&surface_id, &route, "a2a", &format!("a2a-proxy://{proxy_id}"));
+    spec.a2a_proxy = Some(A2aProxySpec::new(
+        &proxy_id,
+        &proxy_id,
+        format!("{proxy_id}-direct-line-secret"),
+        "http://placeholder.invalid",
+    ));
+    world
+        .topology
+        .plan_mut(gw_index)
+        .surfaces
+        .push(spec);
+
+    world
+        .topology
+        .surface_names
+        .insert(surface_name, (gw_index, surface_id.clone()));
+    world
+        .topology
+        .actors
+        .bind_target_to_surface(&agent_name, gw_index, &surface_id);
+}
+
+#[given(expr = "the MCP proxy of surface {string} offers the weather tools")]
+pub fn mcp_proxy_offers_the_weather_tools(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    let (gw_index, surface_id) = world.surface(&surface_name);
+    let spec = world
+        .topology
+        .plan_mut(gw_index)
+        .surfaces
+        .iter_mut()
+        .find(|spec| spec.surface_id == surface_id)
+        .and_then(|spec| spec.mcp_proxy.as_mut())
+        .unwrap_or_else(|| panic!("surface '{surface_id}' has no MCP proxy"));
+    spec.openapi_spec = Some(crate::bdd_support::config::mcp_proxy::WEATHER_OPENAPI_SPEC.to_string());
 }
 
 /// The reference server the MCP conformance harness serves; `run.sh` passes
@@ -1175,6 +1236,59 @@ pub fn managed_agent_compresses_its_replies(
         .insert(surface_id, stream);
 }
 
+#[given(expr = "managed agent {string} answers with an event stream whose last event names a secret")]
+pub fn managed_agent_answers_with_an_event_stream_naming_a_secret(
+    world: &mut G2gWorld,
+    agent_name: String,
+) {
+    let (gw_index, surface_id) = world.target(&agent_name);
+    let plan = world
+        .topology
+        .plan_mut(gw_index);
+    plan.mock_responses.insert(
+        surface_id.clone(),
+        serde_json::json!([
+            {"jsonrpc": "2.0", "result": {"kind": "status-update", "status": {"state": "working"}}},
+            {"jsonrpc": "2.0", "result": {"kind": "message", "secret": "s3cr3t"}}
+        ]),
+    );
+    plan.mock_gzip
+        .insert(surface_id, crate::bdd_support::mock_server::MockStream::Events);
+}
+
+#[given(expr = "managed agent {string} answers with an event stream carrying the comment {string}")]
+pub fn managed_agent_answers_with_an_event_stream_carrying_a_comment(
+    world: &mut G2gWorld,
+    agent_name: String,
+    comment: String,
+) {
+    let (gw_index, surface_id) = world.target(&agent_name);
+    let plan = world
+        .topology
+        .plan_mut(gw_index);
+    plan.mock_responses.insert(
+        surface_id.clone(),
+        serde_json::json!([
+            format!(": {comment}"),
+            {"jsonrpc": "2.0", "result": {"kind": "message", "note": "delivered"}}
+        ]),
+    );
+    plan.mock_gzip
+        .insert(surface_id, crate::bdd_support::mock_server::MockStream::Events);
+}
+
+#[given(expr = "managed agent {string} answers naming a secret")]
+pub fn managed_agent_answers_naming_a_secret(
+    world: &mut G2gWorld,
+    agent_name: String,
+) {
+    set_target_response(
+        world,
+        &agent_name,
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message", "secret": "s3cr3t"}}),
+    );
+}
+
 #[given(expr = "managed agent {string} serves an agent card")]
 pub fn managed_agent_serves_an_agent_card(
     world: &mut G2gWorld,
@@ -1299,9 +1413,82 @@ async fn surface_has_allow_all_request_policy(
     attach_request_policy(world, &surface_name, "allow-all", "default allow := true").await;
 }
 
+#[given(regex = r#"^surface "([^"]+)" has a response policy that (allows|denies) every response$"#)]
+async fn surface_has_every_response_policy(
+    world: &mut G2gWorld,
+    surface_name: String,
+    decision: String,
+) {
+    let (label, rule) = match decision.as_str() {
+        "allows" => ("allow-every-response", "default allow := true"),
+        _ => ("deny-every-response", "default allow := false"),
+    };
+    attach_surface_policy(world, &surface_name, "response_policy", label, rule).await;
+}
+
+#[given(regex = r#"^surface "([^"]+)" has a response policy that denies a tool list naming tool "([^"]+)"$"#)]
+async fn surface_has_tool_list_response_policy(
+    world: &mut G2gWorld,
+    surface_name: String,
+    tool: String,
+) {
+    let tool_literal = serde_json::to_string(&tool).expect("tool name should serialize");
+    let rule = format!(
+        "default allow := true\n\nallow := false if {{\n    input.response.body.result.tools[_].name == {tool_literal}\n}}"
+    );
+    attach_surface_policy(world, &surface_name, "response_policy", "deny-tool-list", &rule).await;
+}
+
+#[given(expr = "surface {string} has a response policy that denies an answer naming a secret")]
+async fn surface_has_secret_response_policy(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    let rule = "default allow := true\n\nallow := false if {\n    input.response.body.result.secret\n}";
+    attach_surface_policy(world, &surface_name, "response_policy", "deny-secret", rule).await;
+}
+
+#[given(regex = r#"^surface "([^"]+)" lists only MCP tool "([^"]+)"$"#)]
+async fn surface_lists_only_mcp_tool(
+    world: &mut G2gWorld,
+    surface_name: String,
+    tool: String,
+) {
+    world.start().await;
+    let (gw_index, surface_id) = world.surface(&surface_name);
+    world
+        .harness()
+        .gw(gw_index)
+        .admin
+        .patch_surface(
+            &surface_id,
+            &serde_json::json!({ "target": { "mcp_tool_gating": {
+                "default_effect": "deny",
+                "gates": [{
+                    "id": "g2g-gate-allow",
+                    "action": { "effect": "allow", "patterns": [format!("^{tool}$")] }
+                }]
+            } } }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("set the MCP tool gating of surface '{surface_id}': {error:#}"));
+}
+
 async fn attach_request_policy(
     world: &mut G2gWorld,
     surface_name: &str,
+    label: &str,
+    rule: &str,
+) {
+    attach_surface_policy(world, surface_name, "policy", label, rule).await;
+}
+
+/// Creates a surface policy definition with `rule` and attaches it to the
+/// Target's `slot` (`policy` or `response_policy`) of `surface_name`.
+async fn attach_surface_policy(
+    world: &mut G2gWorld,
+    surface_name: &str,
+    slot: &str,
     label: &str,
     rule: &str,
 ) {
@@ -1323,7 +1510,7 @@ async fn attach_request_policy(
     admin
         .patch_surface(
             &surface_id,
-            &serde_json::json!({ "target": { "policy": { "policy_definition_id": policy_definition_id } } }),
+            &serde_json::json!({ "target": { slot: { "policy_definition_id": policy_definition_id } } }),
         )
         .await
         .unwrap_or_else(|error| panic!("attach {label} policy to surface '{surface_id}': {error:#}"));
@@ -1526,6 +1713,7 @@ pub async fn managed_agent_has_obtained_identity_presentation(
     world.sent_body = None;
     world.response_status = None;
     world.response_body = None;
+    world.response_text = None;
 }
 
 /// The mediator is both disabled and unregistered (no gateway identity on it),

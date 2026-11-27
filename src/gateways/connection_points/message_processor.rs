@@ -21,6 +21,10 @@ use crate::{channel_debug, channel_error, channel_info, channel_warn};
 
 mod forward_refusal;
 use forward_refusal::ForwardRefusal;
+mod response_policy;
+use response_policy::{
+    FabricResponsePolicy, FabricResponseRequest, FabricToolsListGate, RefusedExchange, answers_with_public_agent_card,
+};
 
 /// Global metrics store for GW2 - set during initialization
 static GLOBAL_METRICS_STORE: OnceCell<Arc<crate::metrics::MetricsStore>> = OnceCell::const_new();
@@ -5852,6 +5856,31 @@ async fn process_charged_forward_request(
     }
     let active_variant_alias = variant_alias.map(|s| s.to_string());
     let resolved_surface = surface.clone();
+    let response_policy = FabricResponsePolicy::for_request(
+        &surface,
+        FabricResponseRequest {
+            config_id,
+            trace_id: (!trace_id_field.is_empty()).then_some(trace_id_field),
+            method,
+            path,
+            identity: authenticated_identity.as_ref(),
+            caller_identity: caller_identity.as_deref(),
+            verification: caller_identity_verification,
+        },
+    );
+    let tools_list_gate = FabricToolsListGate {
+        surface: &surface,
+        config_id,
+        variant_alias,
+        request_body: body_bytes.clone(),
+        headers: headers.as_ref(),
+        method,
+        path,
+        from_did: message.from_did.as_deref(),
+        source_auth_context: source_auth_context.as_ref(),
+        modern_mcp_context: modern_mcp_context.as_ref(),
+        metadata: mcp_metadata_context,
+    };
     let deadline_ms: Option<u64> = message
         .message_body
         .get("deadline_ms")
@@ -5974,6 +6003,7 @@ async fn process_charged_forward_request(
             a2a_proxy_receive_caller(&surface, method, path, source_auth_failed),
             fabric_payment,
             gate_receipt,
+            response_policy.as_ref(),
         )
         .await;
     }
@@ -5991,12 +6021,14 @@ async fn process_charged_forward_request(
             proxy_id,
             method,
             path,
-            headers,
-            body_bytes,
+            headers.clone(),
+            body_bytes.clone(),
             caller_identity,
             source_auth_failed,
             fabric_payment,
             gate_receipt,
+            response_policy.as_ref(),
+            &tools_list_gate,
         )
         .await;
     }
@@ -6015,7 +6047,9 @@ async fn process_charged_forward_request(
 
     // An agent card request at a configured card location goes to that path on the
     // Target's origin, dropping any sub-path of the Target endpoint.
-    let target_url = if (is_agent_card_request || credentialed_card_fetch) && surface.agent_card_location_path().is_some() {
+    let sent_to_card_url =
+        (is_agent_card_request || credentialed_card_fetch) && surface.agent_card_location_path().is_some();
+    let target_url = if sent_to_card_url {
         let url = crate::proxy::handler::agent_card::card_target_url(&surface);
         channel_info!(config_id, "Agent card location override applied: {}", loggable::url(&url));
         url
@@ -6719,6 +6753,13 @@ async fn process_charged_forward_request(
             {
                 Ok(json_response) if !json_response.is_empty() => {
                     channel_info!(config_id, "GW2: Persistent SSE session succeeded (reuse)");
+                    let mut json_response = tools_list_gate.apply(json_response);
+                    if let Some(policy) = response_policy.as_ref()
+                        && let Some(refusal) =
+                            policy.refusal_of_buffered(200, &mut json_response, Some("application/json")).await
+                    {
+                        return refusal;
+                    }
                     let response_time_ms = response_start.elapsed().as_millis() as u64;
                     let response_bytes = json_response.len() as u64;
 
@@ -6867,6 +6908,13 @@ async fn process_charged_forward_request(
                 {
                     Ok(json_response) if !json_response.is_empty() => {
                         channel_info!(config_id, "GW2: Persistent SSE session succeeded");
+                        let mut json_response = tools_list_gate.apply(json_response);
+                        if let Some(policy) = response_policy.as_ref()
+                            && let Some(refusal) =
+                                policy.refusal_of_buffered(200, &mut json_response, Some("application/json")).await
+                        {
+                            return refusal;
+                        }
                         let response_time_ms = response_start.elapsed().as_millis() as u64;
                         let response_bytes = json_response.len() as u64;
 
@@ -7063,13 +7111,26 @@ async fn process_charged_forward_request(
                     Err(error) => return axum_response_to_forward_result(error.into_response(response_body.as_bytes(), axum::http::StatusCode::BAD_GATEWAY)).await,
                 };
             }
-            if let Some((receipt, protocol)) = stream_receipt.as_ref()
-                && let Some(injected) = receipt
-                    .inject_into_json(protocol, response_body.as_bytes())
-                    .and_then(|body| String::from_utf8(body).ok())
-            {
-                response_body = injected;
-                body_modified = true;
+            // MCP Tool Gating — G2G `tools/list` filter. Hides denied tools
+            // from the list GW1 receives (parity with the direct-path filter),
+            // before the response policy sees the list, as on the direct path.
+            // `response_body` is already de-SSE'd above, so this covers MCP
+            // targets that answer over SSE too.
+            if let Some(filtered) = filter_mcp_tools_list_for_fabric(
+                &resolved_surface,
+                config_id,
+                active_variant_alias.as_deref(),
+                &body_bytes,
+                &response_body,
+                headers.as_ref(),
+                method,
+                path,
+                message.from_did.clone(),
+                source_auth_context.as_ref(),
+                modern_mcp_context.as_ref(),
+                mcp_metadata_context,
+            ) {
+                response_body = filtered;
             }
 
             // GW2: Inject trust registry extension into agent card responses for fabric requests
@@ -7249,6 +7310,51 @@ async fn process_charged_forward_request(
                         }
                     }
                 }
+            }
+
+            // The surface's response policy sees the answer as the caller will, after the
+            // response custom metadata, as on the direct path; the payment receipt the
+            // gateway adds comes after it.
+            let content_type = response_headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                .and_then(|(_, values)| values.first())
+                .map(String::as_str);
+            if !answers_with_public_agent_card(
+                method,
+                path,
+                crate::proxy::handler::is_fabric_card_fetch(&resolved_surface, method, path),
+                sent_to_card_url,
+            ) && let Some(policy) = response_policy.as_ref()
+                && let Some(refusal) = policy.refusal_of_buffered(status, &mut response_body, content_type).await
+            {
+                if !is_modern_response {
+                    let request_payload = serde_json::from_slice(&body_bytes).unwrap_or_else(|_| {
+                        serde_json::json!({"_raw_body": String::from_utf8_lossy(&body_bytes), "method": method.to_uppercase()})
+                    });
+                    let surface_id = surface.config_id().unwrap_or(channel_id);
+                    RefusedExchange {
+                        surface_id,
+                        capture_channel: channel_id,
+                        source: message.from_did.as_deref().unwrap_or("unknown"),
+                        destination: &target_url,
+                        caller_identity: caller_identity.as_deref(),
+                        request: &request_payload,
+                        request_bytes,
+                        latency_ms: start_time.elapsed().as_millis() as u64,
+                    }
+                    .record(&crate::proxy::response_policy::denied_body())
+                    .await;
+                }
+                return refusal;
+            }
+            if let Some((receipt, protocol)) = stream_receipt.as_ref()
+                && let Some(injected) = receipt
+                    .inject_into_json(protocol, response_body.as_bytes())
+                    .and_then(|body| String::from_utf8(body).ok())
+            {
+                response_body = injected;
+                body_modified = true;
             }
 
             // Inject responding gateway DID for fabric-to-fabric connections
@@ -7960,27 +8066,6 @@ async fn process_charged_forward_request(
                 );
             }
 
-            // MCP Tool Gating — G2G `tools/list` filter. Hides denied tools
-            // from the list GW1 receives (parity with the direct-path filter).
-            // `response_body` is already de-SSE'd above, so this covers MCP
-            // targets that answer over SSE too.
-            if let Some(filtered) = filter_mcp_tools_list_for_fabric(
-                &resolved_surface,
-                config_id,
-                active_variant_alias.as_deref(),
-                &body_bytes,
-                &response_body,
-                headers.as_ref(),
-                method,
-                path,
-                message.from_did.clone(),
-                source_auth_context.as_ref(),
-                modern_mcp_context.as_ref(),
-                mcp_metadata_context,
-            ) {
-                response_body = filtered;
-            }
-
             if surface_protocol == crate::config::ChannelProtocol::Mcp {
                 response_body = match crate::mcp::meta::normalize_text(&response_body, mcp_metadata_context) {
                     Ok(body) => body,
@@ -8571,6 +8656,7 @@ fn filter_mcp_tools_list_for_fabric(
             &filtered.listed,
             &filtered.kept,
             crate::observability::PolicyDecisionEvent {
+                flow: crate::observability::PolicyFlow::Fabric,
                 surface_id: Some(config_id),
                 surface_name: Some(surface.name.as_str()),
                 http_method: Some(method),
@@ -8726,6 +8812,7 @@ async fn handle_a2a_proxy_forward(
     caller: crate::proxy::handler::CallerAssertion,
     payment: FabricPayment<'_>,
     gate_receipt: &mut Option<(crate::proxy::handler::agent_pay_gate::Receipt, crate::config::ChannelProtocol)>,
+    response_policy: Option<&FabricResponsePolicy>,
 ) -> ProcessingResult {
     let config_id = surface
         .config_id()
@@ -8823,6 +8910,28 @@ async fn handle_a2a_proxy_forward(
 
     let request_body_bytes = body_bytes;
     let (parts, body) = response.into_parts();
+    let dispatched_body = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            channel_warn!(config_id, "GW2: Could not read the A2A proxy's answer: {}", error);
+            return axum_response_to_forward_result(crate::a2a::create_error_response(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "The A2A proxy's answer could not be read",
+            ))
+            .await;
+        }
+    };
+    let connection_status = crate::proxy::handler::a2a_proxy_connection_status(parts.status, &dispatched_body);
+    let response = axum::response::Response::from_parts(parts, axum::body::Body::from(dispatched_body));
+    let response = match response_policy {
+        Some(policy) => {
+            policy
+                .a2a_proxy_answer(response)
+                .await
+        }
+        None => response,
+    };
+    let (parts, body) = response.into_parts();
     let response_body_bytes = axum::body::to_bytes(body, usize::MAX)
         .await
         .unwrap_or_default();
@@ -8841,7 +8950,6 @@ async fn handle_a2a_proxy_forward(
                 .map(|v| (k.as_str().to_string(), v.to_string()))
         })
         .collect();
-    let connection_status = crate::proxy::handler::a2a_proxy_connection_status(status, &response_body_bytes);
 
     if let Some(metrics_store) = GLOBAL_METRICS_STORE.get() {
         let source = message
@@ -8900,10 +9008,12 @@ async fn handle_a2a_proxy_forward(
             })
         });
         let response_payload = serde_json::from_str(&response_body).ok();
-        let validation_status = if connection_status == crate::metrics::ConnectionStatus::Success {
+        let validation_status = if connection_status != crate::metrics::ConnectionStatus::Success {
+            "a2a_proxy_error"
+        } else if status.is_success() {
             "success"
         } else {
-            "a2a_proxy_error"
+            "client_error"
         };
         crate::observability::payload_capture::broadcast_payload_capture_async(
             &Some(ws_state.clone()),
@@ -9009,7 +9119,7 @@ async fn spawn_mcp_proxy_trust_recorder(
 }
 
 /// Handle MCP proxy forwarding for fabric gateway requests
-#[instrument(name = "fabric.mcp_proxy_forward", skip(message, surface, body_bytes, payment, gate_receipt), fields(channel_id, proxy_id, msg.id = %message.didcomm_message_id))]
+#[instrument(name = "fabric.mcp_proxy_forward", skip(message, surface, body_bytes, payment, gate_receipt, response_policy, tools_list_gate), fields(channel_id, proxy_id, msg.id = %message.didcomm_message_id))]
 async fn handle_mcp_proxy_forward(
     message: &ReceivedMessage,
     surface: &crate::config::agent_surface::AgentSurface,
@@ -9023,6 +9133,8 @@ async fn handle_mcp_proxy_forward(
     source_auth_failed: bool,
     payment: FabricPayment<'_>,
     gate_receipt: &mut Option<(crate::proxy::handler::agent_pay_gate::Receipt, crate::config::ChannelProtocol)>,
+    response_policy: Option<&FabricResponsePolicy>,
+    tools_list_gate: &FabricToolsListGate<'_>,
 ) -> ProcessingResult {
     // Record fields in the span
     tracing::Span::current().record("channel_id", channel_id);
@@ -9298,6 +9410,43 @@ async fn handle_mcp_proxy_forward(
     };
     match executed {
         Ok(mcp_response) => {
+            let mcp_response = tools_list_gate.apply_value(mcp_response);
+            if let Some(policy) = response_policy
+                && let Some(denied) =
+                    crate::proxy::response_policy::mcp_proxy_refusal(&mcp_response, mcp_request.get("id"), |response| {
+                        policy.check(response)
+                    })
+                    .await
+            {
+                RefusedExchange {
+                    surface_id: surface
+                        .config_id()
+                        .unwrap_or(channel_id),
+                    capture_channel: &surface.name,
+                    source: message
+                        .from_did
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    destination: &format!("proxy://{proxy_id}"),
+                    caller_identity: caller_identity.as_deref(),
+                    request: &mcp_request,
+                    request_bytes,
+                    latency_ms: start_time
+                        .elapsed()
+                        .as_millis() as u64,
+                }
+                .record(&denied)
+                .await;
+                return ProcessingResult::RequiresResponse {
+                    response_type: MessageType::ForwardResponse.to_string(),
+                    response_body: serde_json::json!({
+                        "status": 200,
+                        "headers": {"Content-Type": "application/json"},
+                        "body": denied.to_string(),
+                    }),
+                };
+            }
+
             // Broadcast payload capture for successful MCP proxy request
             if let (Some(ws_state), Some(metrics_store)) = (GLOBAL_WS_STATE.get(), GLOBAL_METRICS_STORE.get()) {
                 let config_id = surface

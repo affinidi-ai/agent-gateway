@@ -484,38 +484,9 @@ async fn vp_audit_log_records_transit_point_refusal(
     expect_target_credential_refusal(world, &outcome, None, Some(&transit_point)).await;
 }
 
-fn is_invalid_envelope_marker(event: &Value) -> bool {
-    event["event"]["request_rejected"]["reason"] == "invalid_envelope"
-}
-
-/// Sends the surface a body that is no JSON-RPC envelope, which is refused before any Target
-/// credential is resolved, and waits for its `invalid_envelope` record. Records reach the VP
-/// Audit Log in the order they are made, so a refusal made by an earlier request is in the log
-/// by the time this marker is.
 #[then("the VP Audit Log records no Target credential that was not sent")]
 async fn vp_audit_log_records_no_refusal(world: &mut SurfaceWorld) {
-    let port = world
-        .infra
-        .as_ref()
-        .expect("the gateway is running")
-        .gateway_port;
-    let route = world
-        .surface_config
-        .route
-        .clone();
-    let marker = post_raw_path(port, &route, "{}", &[])
-        .await
-        .unwrap_or_else(|error| panic!("POST a body that is no JSON-RPC envelope: {error:#}"));
-    assert_eq!(marker.status, 400, "the marker request must be refused before the Target");
-    ensure_admin_session(world).await;
-    let (marked, events) = world
-        .admin_client
-        .as_ref()
-        .expect("admin client must exist")
-        .wait_for_audit_event(is_invalid_envelope_marker)
-        .await
-        .unwrap_or_else(|error| panic!("the VP Audit Log must be readable: {error:#}"));
-    assert!(marked, "expected the marker's invalid_envelope record, got {events:?}");
+    let events = crate::steps::then::vp_audit_events_up_to_a_marker(world).await;
     let refusals: Vec<&Value> = events
         .iter()
         .filter(|event| is_target_credential_refusal(event))

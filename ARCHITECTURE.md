@@ -129,12 +129,15 @@ flowchart TB
         F1[Forward] --> F2["Resolve protected<br/>identity"] --> F3["Response processing,<br/>tools/list filter"] --> F4[Metrics]
     end
     E --> G --> P --> C --> S --> Y --> O --> Z --> F
-    B4 -. fabric:// Target .-> FP["Surface OPA, MCP tool<br/>gating, target auth,<br/>agent_pay payment"] --> FB([Fabric dispatch])
+    B4 -. fabric:// Target .-> FP["Surface OPA, MCP tool<br/>gating, target auth,<br/>agent_pay payment"] --> FB([Fabric dispatch]) --> FR["Peer answer: tools/list<br/>filter, response policy"]
 ```
 
 A `fabric://` Target leaves after request validation. It then runs its own surface policy
 and, for MCP, the MCP tool policies and gating, target authentication and credential delegation,
-and only then the delegated payment, just before fabric dispatch. Payment is the last step on every
+and only then the delegated payment, just before fabric dispatch. It runs its own response
+policy on every body the peer sends back that it relays: a `402`, an `error`-marked JSON-RPC
+body, or the error it writes with the peer's `error` text, as it arrives, and the answer after
+MCP tool gating on a `tools/list`, before the answer is captured as delivered. Payment is the last step on every
 path, so a request is never charged and then refused for a reason that does not depend on payment.
 Version negotiation and request validation run on the sending gateway, before
 that; the fabric receive pipeline does not run them again.
@@ -176,7 +179,7 @@ logic.
 | Upstream response bounds | Buffering the upstream response within `[a2a] max_body_size`, the target's `networking.timeout.idle_secs` and its request timeout; `502` over the size or for a compressed body where none was accepted, `504` on a stall. An MCP event-stream passthrough is not buffered. | [`src/proxy/upstream_body.rs`](src/proxy/upstream_body.rs) |
 | A2A event streams | Forwarding a direct Target's `text/event-stream` one event at a time, each event given the response checks below; a refused event ends the stream with a JSON-RPC error event | [`src/a2a/streaming.rs`](src/a2a/streaming.rs), [`src/proxy/handler/a2a_stream.rs`](src/proxy/handler/a2a_stream.rs) |
 | Protected identity resolution | Deriving the managed agent's DID from its response | [`src/proxy/backend_identity.rs`](src/proxy/backend_identity.rs) |
-| Response processing | Rewrites, tool-list filtering, agent cards | [`src/proxy/response_policy.rs`](src/proxy/response_policy.rs) |
+| Response processing | Rewrites, tool-list filtering, agent cards; the surface response policy on direct answers and on answers sent back over Fabric | [`src/proxy/response_policy.rs`](src/proxy/response_policy.rs), [`src/proxy/handler/response_policy.rs`](src/proxy/handler/response_policy.rs), [`src/gateways/connection_points/message_processor/response_policy.rs`](src/gateways/connection_points/message_processor/response_policy.rs) |
 | Metrics | Recording the outcome | [`src/metrics/`](src/metrics/) |
 
 ## Outbound path
@@ -231,7 +234,8 @@ wire validation and context → agent
 context → appliance-wide gateway policy → gateway OPA → AP2 gate → A2A version negotiation
 and request validation (A2A and AP2) (a `fabric://` Target leaves here: its own policy,
 MCP tool policies and gating for MCP, target authentication and credential delegation, delegated
-payment, then fabric dispatch) →
+payment, fabric dispatch, then on the peer's answer the `tools/list` filter and its own response
+policy) →
 forward-target egress check → body-size re-check (a body the gateway grew, and an
 MCP Access Point's body over `max_body_size`) → MCP tool
 policies → extension inspection → caller identity → custom metadata → Trust Check (caller

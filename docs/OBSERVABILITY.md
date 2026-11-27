@@ -1339,7 +1339,9 @@ caller the record holds), `EVENT_DATA` (the same as `AUDIT_RECORD`), `APPLIANCE_
 default), `AUDIT_PROTOCOL`, `AUDIT_AGENT_DID`, `AUDIT_VIA_FABRIC`, `AUDIT_PRINCIPAL`,
 `AUDIT_PRINCIPAL_EMAIL`, `AUDIT_PRINCIPAL_NAME`, `AUDIT_AUTH_METHOD`, `AUDIT_DECISION`,
 `AUDIT_DENY_REASON`, `AUDIT_POLICY_NAME`, `AUDIT_POLICY_VERSION`, `AUDIT_POLICY_CONTENT_HASH`,
-`AUDIT_VP_JWT` and `AUDIT_VP_FINGERPRINT`. `AUDIT_RECORD` is the full record in the
+`AUDIT_VP_JWT` and `AUDIT_VP_FINGERPRINT`. `AUDIT_VIA_FABRIC` is `true` on a record of a
+request received over Fabric, every `policy_decision` record among them, including the
+`tools/list` filtering record, which then says flow `fabric`. `AUDIT_RECORD` is the full record in the
 `/v1/audit` row shape. A `payment` record never carries its signed credential out of the appliance:
 `AUDIT_VP_JWT` is empty and `AUDIT_RECORD` has no `vp_jwt` for it, so integrations get only
 `AUDIT_VP_FINGERPRINT`; the full credential stays in the local VP Audit Log as dispute evidence
