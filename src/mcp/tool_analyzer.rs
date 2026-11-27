@@ -283,6 +283,13 @@ pub fn single_object_refusal(body: &[u8]) -> Option<BodyRefusal> {
     None
 }
 
+/// Whether `body` holds an object, at any depth, with two keys that are equal
+/// or differ only in case, which parsers read differently (see
+/// [`single_object_refusal`]). `body` must already be known to be JSON.
+pub fn has_ambiguous_keys(body: &[u8]) -> bool {
+    serde_json::from_slice::<UniqueKeys>(body).is_err()
+}
+
 /// JSON-RPC envelope fields the gateway reads.
 const ENVELOPE_FIELDS: &[&str] = &["jsonrpc", "id", "method", "params"];
 

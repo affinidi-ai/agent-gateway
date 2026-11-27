@@ -916,6 +916,15 @@ async fn send_raw_string_request_and_record(
     raw_body: &str,
     content_type: &str,
 ) {
+    send_raw_string_request_with_headers_and_record(world, raw_body, content_type, vec![]).await;
+}
+
+async fn send_raw_string_request_with_headers_and_record(
+    world: &mut SurfaceWorld,
+    raw_body: &str,
+    content_type: &str,
+    headers: Vec<(String, String)>,
+) {
     ensure_gateway_running(world).await;
 
     let infra = world.infra.as_ref().unwrap();
@@ -923,10 +932,14 @@ async fn send_raw_string_request_and_record(
 
     world.sent_body = None;
 
-    let resp = reqwest::Client::new()
+    let mut request = reqwest::Client::new()
         .post(&url)
         .header("content-type", content_type)
-        .body(raw_body.to_string())
+        .body(raw_body.to_string());
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let resp = request
         .send()
         .await
         .expect("send raw request to gateway");
@@ -2821,6 +2834,60 @@ async fn request_with_valid_api_key_and_own_identity_proof_nested_too_deeply(wor
         nested = serde_json::json!([nested]);
     }
     body["params"]["message"]["metadata"]["nested"] = nested;
+    send_json_request_and_record(world, body, vec![header]).await;
+}
+
+#[when(
+    "the caller sends a request to the surface with a valid API key and an identity proof of its own beside a duplicate metadata member"
+)]
+async fn request_with_valid_api_key_and_own_identity_proof_beside_duplicate_metadata(world: &mut SurfaceWorld) {
+    let header = build_valid_api_key_source_auth_header(world);
+    let body = with_caller_identity_proof(build_request_body(&world.surface_config.protocol));
+    let proofs = body["params"]["message"]["metadata"].to_string();
+    let mut placeholder = body;
+    placeholder["params"]["message"]["metadata"] = serde_json::json!("duplicated-below");
+    let raw_body = placeholder
+        .to_string()
+        .replacen("\"metadata\":\"duplicated-below\"", &format!("\"metadata\":{proofs},\"metadata\":{{}}"), 1);
+    assert!(raw_body.contains(&proofs), "the raw body must carry the proofs in its first metadata member");
+    send_raw_string_request_with_headers_and_record(world, &raw_body, "application/json", vec![header]).await;
+}
+
+#[when(
+    expr = "the caller invokes MCP tool {string} using protocol version {string} with a valid API key and an identity proof of its own"
+)]
+async fn caller_invokes_mcp_tool_using_protocol_version_with_valid_api_key_and_own_identity_proof(
+    world: &mut SurfaceWorld,
+    tool_name: String,
+    protocol_version: String,
+) {
+    let protocol_version = McpVersion::from(protocol_version.as_str());
+    let mut body = crate::bdd_support::json_rpc::build_modern_mcp_tool_call_body(
+        serde_json::json!("bdd-modern-call"),
+        &tool_name,
+        &protocol_version,
+    );
+    body["params"]["_meta"][AGENT_IDENTITY_BINDING_URI] =
+        serde_json::json!({"verifiablePresentation": "caller-made-presentation"});
+    body["params"]["_meta"][TRUST_REGISTRY_EXTENSION_URI] =
+        serde_json::json!({"agent_did": "did:web:asserted.example"});
+    let mut headers = modern_mcp_request_headers(&protocol_version, "tools/call");
+    headers.push(("Mcp-Name".to_string(), tool_name));
+    headers.push(build_valid_api_key_source_auth_header(world));
+    send_json_request_and_record(world, body, headers).await;
+}
+
+#[when(expr = "the caller invokes MCP tool {string} with a valid API key and an identity proof of its own")]
+async fn caller_invokes_mcp_tool_with_valid_api_key_and_own_identity_proof(
+    world: &mut SurfaceWorld,
+    tool_name: String,
+) {
+    let header = build_valid_api_key_source_auth_header(world);
+    let mut body = build_mcp_tool_call_body(&tool_name, serde_json::json!({}));
+    body["params"]["_meta"] = serde_json::json!({
+        AGENT_IDENTITY_BINDING_URI: {"verifiablePresentation": "caller-made-presentation"},
+        TRUST_REGISTRY_EXTENSION_URI: {"agent_did": "did:web:asserted.example"}
+    });
     send_json_request_and_record(world, body, vec![header]).await;
 }
 

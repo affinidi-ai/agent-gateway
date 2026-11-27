@@ -2972,6 +2972,18 @@ fn mcp_surface_enforces_wildcard_allow_policy(world: &mut SurfaceWorld) {
     });
 }
 
+#[given(
+    "the MCP surface enforces a wildcard default tool policy that denies a call carrying an identity proof or trust-registry claim"
+)]
+fn mcp_surface_enforces_wildcard_policy_denying_caller_claims(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .mcp_wildcard_tool_policy = Some(McpWildcardToolPolicyFixture {
+        policy_definition_id: "bdd-mcp-wildcard-no-caller-claims-policy".to_string(),
+        rego: caller_claims_denying_policy("input.mcp.params._meta"),
+    });
+}
+
 #[given(expr = "the MCP surface enforces a wildcard default tool policy that denies all tools")]
 fn mcp_surface_enforces_wildcard_deny_policy(world: &mut SurfaceWorld) {
     world
@@ -3079,6 +3091,58 @@ fn surface_has_allow_all_request_policy(world: &mut SurfaceWorld) {
     world
         .surface_config
         .request_policy = Some(RequestPolicyFixture::new("bdd-allow-all", "BDD allow-all surface policy", rego));
+}
+
+fn caller_claims_denying_policy(input_path: &str) -> String {
+    format!(
+        r#"package surface.policy
+
+claims := {{
+    "https://fabric.affinidi.io/extensions/agent-identity-binding/v1",
+    "https://fabric.affinidi.io/extensions/agent-identity-credential/v1",
+    "https://fabric.affinidi.io/extensions/trust-registry",
+    "io.affinidi.fabric/agent-identity-binding",
+    "io.affinidi.fabric/agent-identity-credential",
+    "io.affinidi.fabric/trust-registry",
+}}
+
+present if {{
+    some key
+    {input_path}[key]
+    claims[key]
+}}
+
+default allow := false
+
+allow if not present
+
+deny_reason := "policy input carries an identity proof or trust-registry claim of the caller" if present
+"#
+    )
+}
+
+#[given("the surface has a request policy that denies a message carrying an identity proof or trust-registry claim")]
+fn surface_denies_message_with_caller_claims(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .request_policy = Some(RequestPolicyFixture::new(
+        format!("bdd-no-caller-claims-{}", uuid::Uuid::new_v4()),
+        "BDD policy denying caller claims in the message metadata",
+        caller_claims_denying_policy("input.a2a.message.metadata"),
+    ));
+}
+
+#[given(
+    "the MCP surface has a request policy that denies a request carrying an identity proof or trust-registry claim"
+)]
+fn mcp_surface_denies_request_with_caller_claims(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .request_policy = Some(RequestPolicyFixture::new(
+        format!("bdd-mcp-no-caller-claims-{}", uuid::Uuid::new_v4()),
+        "BDD policy denying caller claims in the MCP params metadata",
+        caller_claims_denying_policy("input.mcp.params._meta"),
+    ));
 }
 
 #[given(expr = "the MCP surface has a request policy that allows all requests")]

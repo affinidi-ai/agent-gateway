@@ -786,7 +786,9 @@ On a surface whose inbound identity is `from_api_key` or `from_jwt_claim`, a cal
 a method that identity does not read (any method but an API key for `from_api_key`, any but
 JWT Bearer for `from_jwt_claim`), or whose credential failed on a public Access Point, gets no
 caller identity, on direct requests and Fabric send: `input.extension_identity` and
-`input.agent.did` are absent, and so are the trust-registry claims its body makes. Tell it apart
+`input.agent.did` are absent, and so are the trust-registry claims its body makes, including
+those in `input.a2a.message.metadata` and `input.mcp.params._meta` (the Target still receives the
+unsigned trust-registry metadata). Tell it apart
 by `input.source_auth.method`; see
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#several-methods-on-one-access-point).
 

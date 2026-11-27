@@ -207,12 +207,16 @@ Both identity rules follow from the caller: `from_jwt_claim` needs a verified JW
 `from_api_key` identity those of an API key method. A caller authenticated by any other method,
 or whose credential failed on a public Access Point, is served with no inbound identity, on direct
 requests and Fabric send: none is derived from its credential or taken from its request body,
-`input.agent.did` and the trust-registry claims its body makes are absent from policy input, and
+`input.agent.did` and the trust-registry claims its body makes are absent from policy input,
+the identity proofs and trust-registry claims in the message `metadata` (`input.a2a.message.metadata`)
+or MCP `_meta` (`input.mcp.params._meta`) are absent too, and
 the identity binding VP and identity credential it puts in its request, or that Header Metadata
 Mapping copies from its headers, are removed before the Target, in a single request, each request
 of a batch, or a bare message. A body the gateway cannot read to remove them (not JSON, or nested
 deeper than it parses) is refused with `400` and a JSON-RPC parse error (`-32700`), even with A2A
-validation `off`. The extension URIs that name them stay, since they also ask for the responding
+validation `off`. So is one with duplicate or case-variant keys at any depth, with `400` and an
+invalid request error (`-32600`): a parser that keeps the first of two `metadata` members would
+read a proof the gateway removed from the last. The extension URIs that name them stay, since they also ask for the responding
 agent's credential, and other metadata the caller sends, such as a trust-registry `agent_did`, is
 forwarded unsigned as it came. On a direct request, a body that carries no proof is forwarded byte
 for byte; Fabric send carries every caller's body as a JSON value, as it always has. Policy tells
