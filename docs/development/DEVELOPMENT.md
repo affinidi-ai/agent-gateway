@@ -336,9 +336,10 @@ make ci
 
 `make ci-happy-quick` runs the quick part of CI side by side, usually in a minute or two once
 the builds are warm: rustfmt, Clippy, cargo audit and deny, the docs, Gherkin, changelog and
-toolchain checks, and the frontend's `npm ci`, format check and lint. It runs no test, no
-coverage and no frontend build, so it does not need `make config-test`, Docker or Node beyond
-what the frontend lint uses.
+toolchain checks, the local tooling tests, and the frontend's `npm ci`, format check and lint.
+It runs no gateway or frontend test, no coverage and no frontend build, so it does not need
+`make config-test`, Docker or Node beyond what the frontend lint uses, and of the cargo tools
+`make install-rust-deps` installs it checks only for `cargo-audit` and `cargo-deny`.
 
 `make ci-happy-full` (or `make ci-happy`) runs the blocking jobs of `.github/workflows/ci.yml`, `checks.yml` and
 `release-guards.yml` with each job's own commands and no autofix, one `ci-<job>` target per job
@@ -349,9 +350,11 @@ unit and component tests; and the gateway-to-gateway suite runs its scenarios 8 
 (`G2G_BDD_PARALLELISM`), where CI runs them one by one.
 
 The jobs run side by side, with each group's log in `tmp/local/latest/`; `PARALLEL=0` runs them
-one at a time on a machine short of memory. Each group is reported as it ends, and every 30
-seconds (`PROGRESS_SECS`, `0` for never) each group still running is named with its time so far
-and its log's last line; `make local` reports the same way. Clippy builds in `target/ci-clippy`
+one at a time on a machine short of memory. Each group is reported as it ends, and, in parallel
+mode only, every 30 seconds (`PROGRESS_SECS`, `0` for never) each group still running is named
+with its time so far and its log's last line; `make local` reports the same way.
+`scripts/local/test-parallel.sh` tests that runner with a stand-in `make` (CI job
+`local-tooling`, `make ci-local-tooling`). Clippy builds in `target/ci-clippy`
 and coverage in `target/llvm-cov-target`, beside `ci-suites`, which builds the `surface_bdd` and
 `g2g_bdd` test binaries in one cargo call, runs them side by side, and then runs the MCP
 conformance harness, whose own build replaces the gateway binary the suites start. Coverage runs

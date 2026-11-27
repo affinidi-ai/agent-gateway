@@ -19,7 +19,7 @@ SHELL := /bin/bash
         config-certs config-debug config-debug-dev config-debug-x config-test config-release install-deps install-rust-deps verify-rust-deps install-python-deps install-git-hooks setup-vscode \
         docker-build-local docker-build-local-dev docker-rebuild-local docker-rebuild-local-dev docker-run docker-run-dev docker-shell docker-network \
         config-docker \
-	test test-unit test-bins test-policies test-coverage test-junit test-rust-ci npm-test npm-test-ci npm-build npm-build-ci npm-install npm-install-ci clippy clippy-ci fmt fmt-www-all fmt-check lint lint-changelog npm-lint shellcheck npm-lint-www-all npm-lint-ci check cargo-build-ci node-ci rust-ci ci-happy ci-happy-full ci-happy-quick ci-fmt ci-clippy ci-audit ci-deny ci-frontend ci-frontend-lint ci-docs ci-gherkin ci-changelog ci-toolchain ci-test ci-coverage ci-surface-bdd ci-g2g-bdd ci-mcp-conformance ci-suites g2g-bdd-run node-local rust-local local audit-www-all audit-fix-www-all browserslist-update license-check \
+	test test-unit test-bins test-policies test-coverage test-junit test-rust-ci npm-test npm-test-ci npm-build npm-build-ci npm-install npm-install-ci clippy clippy-ci fmt fmt-www-all fmt-check lint lint-changelog npm-lint shellcheck npm-lint-www-all npm-lint-ci check cargo-build-ci node-ci rust-ci ci-happy ci-happy-full ci-happy-quick ci-fmt ci-clippy ci-audit ci-deny ci-frontend ci-frontend-lint ci-local-tooling ci-docs ci-gherkin ci-changelog ci-toolchain ci-test ci-coverage ci-surface-bdd ci-g2g-bdd ci-mcp-conformance ci-suites g2g-bdd-run node-local rust-local local audit-www-all audit-fix-www-all browserslist-update license-check \
         www www-dev \
         clean clean-all clear-storage clear-storage-local \
 		demo-multi-tenancy \
@@ -74,6 +74,10 @@ export CMAKE_PREFIX_PATH := $(BREW_OPENSSL_PREFIX)$(if $(CMAKE_PREFIX_PATH),:$(C
 endif
 endif
 CARGO_TOOLS := cargo-llvm-cov cargo-nextest cargo-audit cargo-deny cargo-watch
+# What verify-rust-deps checks besides the Homebrew formulae; ci-happy-quick
+# narrows it to the cargo tools its checks run.
+VERIFY_CARGO_TOOLS ?= $(CARGO_TOOLS)
+VERIFY_LLVM_TOOLS ?= 1
 DEPS := jq mdbook plantuml pre-commit gitleaks
 # Python packages the changelog tooling imports. Homebrew's python3 is
 # externally managed (PEP 668), so a plain `pip install` into it fails; these go
@@ -140,10 +144,10 @@ verify-rust-deps: ## Verify Rust build toolchain dependencies (sccache, lld, etc
 	@if command -v brew >/dev/null 2>&1; then \
 		brew ls --version $(RUST_DEPS) >/dev/null 2>&1 || { echo "$(RED)❌ Rust dependencies are not installed. Please run 'make install-rust-deps' to install them.$(NC)"; exit 1; }; \
 	fi
-	@for tool in $(CARGO_TOOLS); do \
+	@for tool in $(VERIFY_CARGO_TOOLS); do \
 		command -v $$tool >/dev/null 2>&1 || (echo "$(RED)❌ $$tool not found. Please run 'make install-rust-deps' to install it.$(NC)" && exit 1); \
 	done
-	@rustup component list --installed 2>/dev/null | grep -q llvm-tools || (echo "$(RED)❌ llvm-tools-preview not installed. Please run 'make install-rust-deps'.$(NC)" && exit 1)
+	@[ "$(VERIFY_LLVM_TOOLS)" = 0 ] || rustup component list --installed 2>/dev/null | grep -q llvm-tools || (echo "$(RED)❌ llvm-tools-preview not installed. Please run 'make install-rust-deps'.$(NC)" && exit 1)
 	@echo "$(GREEN)✅ Rust dependencies verified!$(NC)"
 
 install-python-deps: ## Install the Python packages the changelog tooling needs, into .venv
@@ -774,7 +778,8 @@ CI_BASE ?= origin/main
 # Clippy builds into a target directory of its own, so it runs beside the tests
 # instead of waiting on the lock of theirs.
 CI_CLIPPY_TARGET_DIR ?= target/ci-clippy
-CHANGELOG_PY = $(if $(wildcard $(VENV)/bin/python3),$(VENV)/bin/python3,python3)
+# The venv's python3 only when it can import PyYAML, as lint-changelog chooses.
+CHANGELOG_PY = $(if $(shell [ -x "$(VENV)/bin/python3" ] && "$(VENV)/bin/python3" -c 'import yaml' >/dev/null 2>&1 && echo yes),$(VENV)/bin/python3,python3)
 # The command that runs the surface suite; ci-suites points it at the test binary it built.
 SURFACE_BDD_RUN ?= cargo test --test surface_bdd
 
@@ -816,6 +821,7 @@ ci-gherkin: ## CI job gherkin: the linter's self-test, then the feature files an
 
 ci-changelog: ## CI job changelog: validator tests, fragment check, and a committed fragment for this branch against CI_BASE
 	@$(CHANGELOG_PY) -m unittest discover -s .github/scripts -p 'test_*.py'
+	@$(CHANGELOG_PY) .github/scripts/changelog.py check
 	@$(MAKE) --no-print-directory lint-changelog
 	@branch="$$(git rev-parse --abbrev-ref HEAD)"; \
 	if [ "$$branch" != "main" ] && [ "$$branch" != "HEAD" ]; then \
@@ -831,6 +837,9 @@ ci-changelog: ## CI job changelog: validator tests, fragment check, and a commit
 
 ci-toolchain: ## CI job release guards: workflow toolchain pins match the MSRV
 	@bash scripts/check-toolchain-sync.sh
+
+ci-local-tooling: ## CI job local-tooling: tests of scripts/local/parallel.sh, the runner behind make local and ci-happy-*
+	@bash scripts/local/test-parallel.sh
 
 ci-test: ## CI job test: unit and component tests of the gateway binary (needs make config-test)
 	@cargo test --bin agent-gateway --all-features --no-run
@@ -883,7 +892,8 @@ ci-suites: ## Build the BDD suites once, run surface-bdd and g2g-bdd side by sid
 # runs after the frontend checks (-k: whatever they find; -j1: even under make -j), because its ts-rs
 # tests rewrite www/default/src/generated/, which those checks read.
 CI_CHECK_GROUPS := "fmt=ci-fmt" "toolchain=ci-toolchain" "docs=ci-docs" "gherkin=ci-gherkin" \
-	"changelog=ci-changelog" "audit=ci-audit" "deny=ci-deny" "clippy=ci-clippy"
+	"changelog=ci-changelog" "audit=ci-audit" "deny=ci-deny" "clippy=ci-clippy" \
+	"local-tooling=ci-local-tooling"
 CI_HAPPY_GROUPS := $(CI_CHECK_GROUPS) \
 	"frontend-coverage=-k -j1 ci-frontend ci-coverage" "suites=ci-suites"
 CI_HAPPY_QUICK_GROUPS := $(CI_CHECK_GROUPS) "frontend-lint=ci-frontend-lint"
@@ -898,7 +908,7 @@ ci-happy-full: ## Run the blocking CI jobs locally as CI runs them, side by side
 ci-happy: ci-happy-full ## Alias of ci-happy-full
 
 ci-happy-quick: ## Run the CI format, lint and dependency checks side by side, no tests or frontend build (PARALLEL=0: one at a time)
-	@$(MAKE) --no-print-directory verify-rust-deps
+	@$(MAKE) --no-print-directory verify-rust-deps VERIFY_CARGO_TOOLS="cargo-audit cargo-deny" VERIFY_LLVM_TOOLS=0
 	@MAKE="$(MAKE)" PARALLEL=$(PARALLEL) bash scripts/local/parallel.sh "CI checks" $(CI_HAPPY_QUICK_GROUPS)
 	@secs=$$(( $$(date +%s) - $(LOCAL_STARTED) )); \
 	  echo "$(GREEN)✅ CI checks are happy, in $$((secs / 60))m $$((secs % 60))s; the tests are left to make ci-happy-full.$(NC)"
