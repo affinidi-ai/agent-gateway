@@ -1681,7 +1681,12 @@ call on the direct path or Fabric receive gets no consent prompt and no grant re
 request that could never be served. Every leg loads the proxy it checks in one way, scoped to
 the surface's tenant. Each
 proxy's spec is parsed once and kept while its id, base URL and spec stay the same, so the
-check and the call it guards share one parse. When a legacy MCP
+check and the call it guards share one parse; requests that find it unparsed wait for one parse
+of that proxy's spec, while other proxies' lookups go on. On Fabric receive a `2026-07-28` tool
+call to an MCP proxy Target arrives over a Fabric stream, which does not say what its sender
+injected, so it is held as carrying a delegated credential for this check whatever the
+receiving surface's own bindings, as an unreadable `delegated_meta_fields` list is (see
+[Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric)). When a legacy MCP
 Target refuses the plain POST and the request falls back to Legacy SSE, on the direct path or
 Fabric receive, the session endpoint the Target advertises is known only after the first
 attempt, so it is checked as soon as it is advertised, before the session is initialized and

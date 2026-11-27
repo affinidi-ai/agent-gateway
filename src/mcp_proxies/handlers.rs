@@ -431,35 +431,69 @@ impl CatalogInputs {
     }
 }
 
-/// Every proxy's last parsed catalogs, by proxy id, with the [`CatalogInputs`] they were parsed
-/// from. The parsed servers are never changed after they are built, so every request shares them.
-static PARSED_CATALOGS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (CatalogInputs, RegisteredCatalogs)>>> =
+/// One proxy's catalogs for one set of [`CatalogInputs`]: empty until the first request parses
+/// them, which holds this slot's lock, and only this one, while it parses.
+struct CatalogSlot {
+    inputs: CatalogInputs,
+    catalogs: std::sync::Mutex<Option<RegisteredCatalogs>>,
+}
+
+/// Every proxy's catalog slot, by proxy id. The parsed servers are never changed after they are
+/// built, so every request shares them.
+static PARSED_CATALOGS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Arc<CatalogSlot>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// How many times each proxy's spec was parsed, by proxy id.
+#[cfg(test)]
+static CATALOG_PARSES: std::sync::LazyLock<std::sync::Mutex<HashMap<String, usize>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// The catalogs of `proxy`, parsed from its spec once and served from [`PARSED_CATALOGS`]
 /// while its id, base URL and spec stay the same; a proxy whose base URL or spec changed is
-/// parsed again. A spec or base URL that cannot be parsed is an error and is not cached.
+/// parsed again. Requests that find the catalogs unparsed wait on the proxy's own slot, so its
+/// spec is parsed once between them while other proxies' lookups go on. A spec or base URL that
+/// cannot be parsed is an error and is not cached.
 fn parsed_catalogs(proxy: &McpProxy) -> Result<RegisteredCatalogs, String> {
     let inputs = CatalogInputs::of(proxy);
-    if let Some((parsed_from, catalogs)) = PARSED_CATALOGS
+    let slot = {
+        let mut slots = PARSED_CATALOGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match slots.get(&proxy.id) {
+            Some(slot) if slot.inputs == inputs => slot.clone(),
+            _ => {
+                let slot = Arc::new(CatalogSlot {
+                    inputs,
+                    catalogs: std::sync::Mutex::new(None),
+                });
+                slots.insert(proxy.id.clone(), slot.clone());
+                slot
+            }
+        }
+    };
+    let mut catalogs = slot
+        .catalogs
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&proxy.id)
-        && *parsed_from == inputs
-    {
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(catalogs) = catalogs.as_ref() {
         return Ok(catalogs.clone());
     }
-    let catalogs = parse_catalogs(proxy)?;
-    PARSED_CATALOGS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(proxy.id.clone(), (inputs, catalogs.clone()));
-    Ok(catalogs)
+    let parsed = parse_catalogs(proxy)?;
+    *catalogs = Some(parsed.clone());
+    Ok(parsed)
 }
 
 /// Parses `proxy`'s spec into its catalogs: one for both revisions, or, when the spec's schemas
 /// cannot serve the legacy catalog, the modern catalog alone with a warning.
 fn parse_catalogs(proxy: &McpProxy) -> Result<RegisteredCatalogs, String> {
+    #[cfg(test)]
+    {
+        *CATALOG_PARSES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(proxy.id.clone())
+            .or_default() += 1;
+    }
     let openapi_json: serde_json::Value =
         serde_yaml::from_str(&proxy.openapi_spec).map_err(|e| format!("Failed to parse OpenAPI spec: {}", e))?;
     let base_url = Url::parse(&proxy.base_url).map_err(|e| format!("Invalid base URL: {}", e))?;
@@ -3711,6 +3745,61 @@ mod tests {
     use crate::auth_manager::pat::PatResourceScope;
     use crate::mcp_proxies::types::McpProxy;
     use crate::tenancy::PatTenantContext;
+
+    /// Many requests that find a proxy's catalogs not yet parsed at once parse its unchanged
+    /// spec once between them; a changed spec is parsed again, once.
+    #[test]
+    fn a_burst_of_first_lookups_parses_an_unchanged_spec_once() {
+        let paths: serde_json::Map<String, serde_json::Value> = (0..200)
+            .map(|index| {
+                (
+                    format!("/items{index}/{{id}}"),
+                    serde_json::json!({"get": {"operationId": format!("getItem{index}"),
+                        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                        "responses": {"200": {"description": "OK"}}}}),
+                )
+            })
+            .collect();
+        let spec =
+            serde_json::json!({"openapi": "3.0.0", "info": {"title": "Items", "version": "1.0"}, "paths": paths});
+        let mut proxy = McpProxy::new(
+            "Burst".into(),
+            String::new(),
+            "http://127.0.0.1:9".into(),
+            spec.to_string(),
+            "/mcp".into(),
+            format!("/burst-{}", uuid::Uuid::new_v4()),
+        );
+        let parses = |proxy: &McpProxy| {
+            super::CATALOG_PARSES
+                .lock()
+                .unwrap()
+                .get(&proxy.id)
+                .copied()
+                .unwrap_or_default()
+        };
+        let burst = |proxy: &McpProxy| {
+            let start = Arc::new(std::sync::Barrier::new(8));
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    let start = start.clone();
+                    scope.spawn(move || {
+                        start.wait();
+                        super::parsed_catalogs(proxy).expect("the spec parses");
+                    });
+                }
+            });
+        };
+
+        burst(&proxy);
+        assert_eq!(parses(&proxy), 1, "the unchanged spec was parsed more than once");
+        burst(&proxy);
+        assert_eq!(parses(&proxy), 1, "a cached spec was parsed again");
+
+        proxy.base_url = "http://127.0.0.1:10".into();
+        burst(&proxy);
+        assert_eq!(parses(&proxy), 2, "a changed proxy is parsed again, once");
+    }
 
     /// `request` prepared and, when it can be served, executed, as a surface's
     /// MCP proxy Target runs it.
