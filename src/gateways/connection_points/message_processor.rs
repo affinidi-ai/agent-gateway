@@ -1839,6 +1839,7 @@ async fn extract_caller_identity_inbound(
     mcp_binding: Option<&crate::surface_context::IdentityBindingContext>,
     peer_issuers: &crate::gateways::types::PeerIssuers,
     vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
+    recipient_did: Option<&str>,
 ) -> (Option<String>, Option<String>, crate::surface_context::IdentityVerification) {
     use crate::surface_context::IdentityVerification;
     if surface.channel_protocol() == crate::config::ChannelProtocol::Mcp {
@@ -1914,7 +1915,7 @@ async fn extract_caller_identity_inbound(
                         && let Some(vc_issuer) = vc_issuer
                     {
                         match vc_issuer
-                            .verify_agent_presentation_full(vp_jwt)
+                            .verify_agent_presentation_for(vp_jwt, recipient_did, Some(peer_issuers))
                             .await
                             .and_then(|verified| require_peer_issuer(verified, peer_issuers))
                         {
@@ -2004,7 +2005,7 @@ async fn extract_caller_identity_inbound(
                         && let Some(vc_issuer) = vc_issuer
                     {
                         match vc_issuer
-                            .verify_agent_presentation_full(vp_jwt)
+                            .verify_agent_presentation_for(vp_jwt, recipient_did, Some(peer_issuers))
                             .await
                             .and_then(|verified| require_peer_issuer(verified, peer_issuers))
                         {
@@ -2194,7 +2195,7 @@ async fn extract_caller_identity_inbound(
                     && let Some(vc_issuer) = vc_issuer
                 {
                     match vc_issuer
-                        .verify_agent_presentation_full(vp_jwt)
+                        .verify_agent_presentation_for(vp_jwt, recipient_did, Some(peer_issuers))
                         .await
                         .and_then(|verified| require_peer_issuer(verified, peer_issuers))
                     {
@@ -2520,6 +2521,7 @@ async fn enrich_and_evaluate_surface_policies(
     mcp_binding: Option<&crate::surface_context::IdentityBindingContext>,
     peer_issuers: &crate::gateways::types::PeerIssuers,
     mcp_context: Option<&crate::surface_context::McpContext>,
+    recipient_did: Option<&str>,
 ) -> Result<bytes::Bytes, ForwardRefusal> {
     // Caller-leg Trust Check stage runs further down (post-identity);
     // gateway OPA on GW2 already ran in `evaluate_gateway_policy_for_fabric`
@@ -2884,6 +2886,7 @@ async fn enrich_and_evaluate_surface_policies(
                 &binding_selector,
                 config_id,
                 Some(peer_issuers),
+                recipient_did,
             )
             .await;
             let binding_trace_id = crate::observability::policy_audit::current_span_trace_id();
@@ -4941,6 +4944,15 @@ async fn process_charged_forward_request(
             };
         }
     };
+    // Identity presentations over Fabric must name the Connection Point they
+    // arrived on, so without it the recipient check cannot run: refuse.
+    let Some(receiving_did) = receiving_connection_point_did(message) else {
+        warn!("Rejecting forward-request from {:?}: receiving Connection Point DID unknown", message.from_did);
+        return ProcessingResult::RequiresResponse {
+            response_type: MessageType::ForwardResponse.to_string(),
+            response_body: forbidden_forward_response("Receiving Connection Point DID unknown"),
+        };
+    };
 
     // Extract config_id for channel-specific logging
     let config_id = surface.config_id().unwrap_or("unknown");
@@ -5398,7 +5410,7 @@ async fn process_charged_forward_request(
         };
         body_bytes = http_policy.cap_legacy_initialize(body_bytes, &classification, config_id, None);
         mcp_verified_binding = match crate::protocols::extensions::verify_mcp_metadata_identity(
-            &body_bytes, GLOBAL_VC_ISSUER.get(), &audit_facts, Some(&peer_issuers),
+            &body_bytes, GLOBAL_VC_ISSUER.get(), &audit_facts, Some(&peer_issuers), Some(receiving_did),
         ).await {
             Ok(binding) => binding,
             Err(error) => {
@@ -5675,6 +5687,7 @@ async fn process_charged_forward_request(
             mcp_verified_binding.as_ref(),
             &peer_issuers,
             GLOBAL_VC_ISSUER.get(),
+            Some(receiving_did),
         ))
         .await;
 
@@ -5721,6 +5734,7 @@ async fn process_charged_forward_request(
         mcp_verified_binding.as_ref(),
         &peer_issuers,
         policy_mcp_context.as_ref(),
+        Some(receiving_did),
     ))
     .await
     {
@@ -7849,6 +7863,7 @@ async fn process_charged_forward_request(
                                         &gw2_meta_field,
                                         gw2_strip_raw,
                                         mcp_metadata_context,
+                                        message.from_did.as_deref(),
                                         &key_scope,
                                     )
                                     .await
@@ -7862,6 +7877,7 @@ async fn process_charged_forward_request(
                                         vc_issuer,
                                         channel_id,
                                         Vec::new(),
+                                        message.from_did.as_deref(),
                                         &key_scope,
                                     )
                                     .await
@@ -10048,6 +10064,7 @@ mod tests {
         let peer_issuers = crate::gateways::types::PeerIssuers {
             attested: None,
             trusted: Vec::new(),
+            require_addressed_presentations: false,
         };
         let (result, events) = crate::audit::producer::capture(Box::pin(enrich_and_evaluate_surface_policies(
             appliance_policy,
@@ -10070,6 +10087,7 @@ mod tests {
             None,
             None,
             &peer_issuers,
+            None,
             None,
         )))
         .await;
@@ -10625,6 +10643,7 @@ mod tests {
                 .iter()
                 .map(|did| did.to_string())
                 .collect(),
+            require_addressed_presentations: false,
         }
     }
 
@@ -10644,6 +10663,7 @@ mod tests {
 
     const CREDENTIAL_EXT: &str = crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION;
     const RAW_IDENTITY_EXT: &str = crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION;
+    const RECEIVING_CONNECTION_POINT_DID: &str = "did:example:receiving-cp";
 
     async fn inbound_caller_identity(
         extensions: &[&str],
@@ -10666,6 +10686,7 @@ mod tests {
             None,
             peer_issuers,
             vc_issuer,
+            Some(RECEIVING_CONNECTION_POINT_DID),
         )
         .await
     }
@@ -10735,6 +10756,7 @@ mod tests {
         let connection = crate::gateways::types::PeerIssuers {
             attested: Some(signed.issuer_did.clone()),
             trusted: Vec::new(),
+            require_addressed_presentations: false,
         };
         let (identity, issuer_did, verification) = inbound_caller_identity(
             &[CREDENTIAL_EXT],
@@ -10753,6 +10775,50 @@ mod tests {
                 .await
                 .verified
         );
+    }
+
+    #[tokio::test]
+    async fn presentation_bound_to_the_receiving_connection_point_is_attributed_as_verified() {
+        let signed =
+            crate::identity::test_helpers::signed_agent_presentation_bound_to(RECEIVING_CONNECTION_POINT_DID).await;
+        let connection = crate::gateways::types::PeerIssuers {
+            attested: Some(signed.issuer_did.clone()),
+            trusted: Vec::new(),
+            require_addressed_presentations: false,
+        };
+        let (identity, _, verification) = inbound_caller_identity(
+            &[CREDENTIAL_EXT],
+            serde_json::json!({
+                CREDENTIAL_EXT: { "did": signed.holder_did, "verifiablePresentation": signed.presentation.to_string() },
+            }),
+            &connection,
+            Some(&signed.issuer),
+        )
+        .await;
+        assert_eq!(identity.as_deref(), Some(signed.holder_did.as_str()));
+        assert_eq!(verification, IdentityVerification::Vp);
+    }
+
+    #[tokio::test]
+    async fn presentation_bound_to_another_recipient_yields_no_identity() {
+        let signed = crate::identity::test_helpers::signed_agent_presentation_bound_to("https://target.example").await;
+        let connection = crate::gateways::types::PeerIssuers {
+            attested: Some(signed.issuer_did.clone()),
+            trusted: Vec::new(),
+            require_addressed_presentations: false,
+        };
+        let (identity, issuer_did, verification) = inbound_caller_identity(
+            &[CREDENTIAL_EXT],
+            serde_json::json!({
+                CREDENTIAL_EXT: { "did": signed.holder_did, "verifiablePresentation": signed.presentation.to_string() },
+            }),
+            &connection,
+            Some(&signed.issuer),
+        )
+        .await;
+        assert_eq!(identity, None, "a presentation minted for a Target must not identify a fabric caller");
+        assert_eq!(issuer_did, None);
+        assert_eq!(verification, IdentityVerification::Unverified);
     }
 
     #[tokio::test]
@@ -10863,6 +10929,7 @@ mod tests {
         let issuers = crate::gateways::types::PeerIssuers {
             attested: None,
             trusted: vec!["did:web:legacy.example".to_string()],
+            require_addressed_presentations: false,
         };
 
         assert!(issuer_matches_peer(Some("did:web:legacy.example"), &issuers));

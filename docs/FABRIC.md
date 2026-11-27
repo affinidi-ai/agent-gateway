@@ -207,6 +207,31 @@ through its own trust agent issues credentials under that trust agent context's 
 receiver accepts only once its operator adds that DID to the connection's `trusted_issuer_dids`
 (see [`TRUST_AGENT_SIGNING.md`](TRUST_AGENT_SIGNING.md#issuer-dids)).
 
+A presentation sent over Fabric names its recipient in its proof's `domain`, and the receiving
+gateway refuses one that names another (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#who-an-identity-presentation-is-for)). A presentation from a
+`trusted_issuer_dids` issuer that the peer relays names another recipient, and is accepted
+anyway while the record's `require_addressed_presentations` is `false` (the default). Set it to
+`true` with `PUT /v1/gateways/{id}` (`gateways.edit`, Remote gateways only; the self gateway
+answers `400`) to refuse such relays on this connection, including relayed presentations that
+name no recipient. Turn it on only after the gateways of every `trusted_issuer_dids` issuer run a
+release that addresses its presentations, since older gateways mint them with no `domain`.
+Without an attested peer issuer, no issuer counts as relayed, so every presentation must be
+addressed to this gateway when it names a recipient: on a connection whose record holds
+hand-trusted issuers but no `issuer_did`, a relayed presentation addressed elsewhere is refused.
+The answer path does not run the issuer exchange for a hand-trusted issuer, so attest the peer
+with `POST /v1/gateways/{id}/issuer`, or restart the listener, which runs the exchange at start; a
+request this gateway receives from the peer also runs it. A peer too old to answer the exchange
+needs an upgrade first; until then, relayed presentations addressed elsewhere stay refused on
+that connection. The setting is API-only: the Edit Gateway page does not show it, and a
+dashboard save keeps the stored value.
+
+Accepted risk: a presentation with no `domain` is still accepted, and the gateway mints such
+presentations on public agent cards and direct answers; with `require_addressed_presentations`
+off, a trusted issuer's presentation addressed to another gateway is admitted; and with no replay
+cache, any presentation can be presented again to its own recipient until it expires. See
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#who-an-identity-presentation-is-for).
+
 Earlier builds had a per-surface allowlist, `AgentSurface.trusted_binding_issuers`, which accepted
 a presentation from any peer that forwarded it. The field no longer exists. A stored surface that
 still carries it has the field removed at load, with a WARN naming the surface
@@ -283,9 +308,19 @@ outcome `invalid`. One whose issuer is not one of the connection's issuers, incl
 cannot be established, also refuses the answer with `502`: the answering agent's DID is not
 stored, and the VP Audit Log records `identity_binding_failed` with outcome `untrusted`. A verified
 one records `identity_binding_verified` and the received presentation (`vp_injected`, detail
-`response_path_fabric_received`), both with `via_fabric: true` and the request's trace id. Answers
-to a Transit Point over Fabric, to MCP requests over Fabric, and agent cards fetched over Fabric
-are not checked.
+`response_path_fabric_received`), both with `via_fabric: true` and the request's trace id. On an
+A2A answer the calling gateway reads the presentation from the status message; on an MCP answer,
+from the credential in `result._meta`, the top-level `_meta` or `params._meta` (where canonical
+metadata output moves a top-level `_meta` when the answer has `params`)
+(`io.affinidi.fabric/agent-identity-credential`, or its historical extension URI key); a `did`
+beside that presentation must name its verified holder, or the answer is refused as `invalid`. An answer to
+a modern MCP request, which travels on a framed Fabric stream, is checked the same way, message by
+message, for each `complete` result; an interim result (`input_required` or `task`) is passed on
+unchecked and supplies no identity, since the paired gateway adds a presentation only to a
+`complete` one. A modern answer sent as `text/event-stream` has its `200` and headers on the
+wire before the check runs, so a refused one is not answered with `502`: its stream ends early,
+and only the VP Audit Log record shows the refusal. Answers to a Transit Point over Fabric and
+agent cards fetched over Fabric are not checked.
 
 Accepted risk: an answer that carries no presentation is not checked. A paired gateway signs one
 only when its surface has a managed identity and it has a VC issuer, so an answer from any other

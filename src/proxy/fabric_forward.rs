@@ -679,6 +679,28 @@ fn parse_fabric_target(fabric_target: &str) -> Result<(&str, &str), FabricForwar
     Ok((gateway_id, channel_id))
 }
 
+/// The `domain` an identity presentation sent to `target_endpoint` is bound
+/// to: for a `fabric://` Target the peer gateway's DID, which the receiving
+/// gateway checks against the Connection Point it received the message on;
+/// otherwise the endpoint's `http` or `https` origin. `None` (unbound) when
+/// neither is known; a `fabric://` forward to an unknown peer fails anyway.
+pub(crate) async fn vp_domain_for_target(
+    listener_manager: &Arc<RwLock<Option<Arc<ConnectionPointListenerManager>>>>,
+    target_endpoint: &str,
+) -> Option<String> {
+    if !target_endpoint.starts_with("fabric://") {
+        return crate::identity::vc_issuer::vp_domain_for_endpoint(target_endpoint);
+    }
+    let (gateway_id, _) = parse_fabric_target(target_endpoint).ok()?;
+    let manager = listener_manager
+        .read()
+        .await
+        .clone()?;
+    manager
+        .get_gateway_did(gateway_id)
+        .await
+}
+
 /// Splits the part of a `fabric://` Target after the gateway id into the peer
 /// surface it names and the variant alias it pins (`orders$v`: `orders`, `v`).
 /// The pinned alias is the only one a request sends the peer: a caller's own
@@ -2338,6 +2360,47 @@ mod tests {
     fn test_parse_fabric_target_empty_parts() {
         assert!(matches!(parse_fabric_target("fabric:///chan"), Err(FabricForwardError::InvalidUrl(_))));
         assert!(matches!(parse_fabric_target("fabric://gw/"), Err(FabricForwardError::InvalidUrl(_))));
+    }
+
+    #[tokio::test]
+    async fn vp_domain_for_target_names_the_peer_gateway_did_of_a_fabric_target() {
+        let root = tempfile::tempdir().unwrap();
+        let peer = crate::gateways::types::Gateway::new(
+            "Peer".into(),
+            String::new(),
+            "did:example:peer".into(),
+            crate::gateways::types::GatewayType::Remote,
+        );
+        let gateways = Arc::new(
+            crate::gateways::FileSystemGatewayStore::new(
+                root.path().join("gateways"),
+                Some("did:web:gateway.example".into()),
+            )
+            .await
+            .unwrap(),
+        );
+        crate::gateways::GatewayStore::create(gateways.as_ref(), &peer)
+            .await
+            .unwrap();
+        let (manager, _issuer_dir) = crate::gateways::test_helpers::test_listener_manager(root.path()).await;
+        let listener_manager = Arc::new(RwLock::new(Some(Arc::new(manager.with_gateway_store(gateways)))));
+
+        let domain = vp_domain_for_target(&listener_manager, &format!("fabric://{}/orders", peer.id)).await;
+
+        assert_eq!(domain.as_deref(), Some("did:example:peer"));
+    }
+
+    #[tokio::test]
+    async fn vp_domain_for_target_is_unbound_for_an_unknown_fabric_peer() {
+        let no_manager = Arc::new(RwLock::new(None));
+        assert_eq!(vp_domain_for_target(&no_manager, "fabric://gw-1/orders").await, None);
+        assert_eq!(vp_domain_for_target(&no_manager, "fabric://gw-1").await, None);
+        assert_eq!(
+            vp_domain_for_target(&no_manager, "https://Target.example:443/a2a")
+                .await
+                .as_deref(),
+            Some("https://target.example")
+        );
     }
 
     #[test]

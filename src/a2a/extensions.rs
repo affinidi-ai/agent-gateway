@@ -264,7 +264,8 @@ pub fn has_message(body: &JsonValue) -> bool {
 ///
 /// When `workload_binding` is supplied (Transit Point Workload Binding), the VC
 /// carries the structured `workloadBinding` credential subject; otherwise it
-/// falls back to the flat `identityFields` shape.
+/// falls back to the flat `identityFields` shape. The presentation is bound to
+/// `domain` (see [`crate::identity::vc_issuer::vp_domain_for_endpoint`]).
 pub async fn inject_identity_credential_extension(
     body_bytes: &bytes::Bytes,
     agent_did: &str,
@@ -272,6 +273,7 @@ pub async fn inject_identity_credential_extension(
     workload_binding: Option<serde_json::Value>,
     vc_issuer: &Arc<crate::identity::VCIssuer>,
     channel_name: &str,
+    domain: Option<&str>,
     scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<(bytes::Bytes, String)> {
     // Create VP containing VC signed by agent DID
@@ -281,7 +283,7 @@ pub async fn inject_identity_credential_extension(
             identity_fields,
             workload_binding,
             None,
-            None,
+            domain,
             scope,
         )
         .await
@@ -860,7 +862,10 @@ async fn inject_credential_into_agent_card_inner(
 /// Inject VP into A2A response
 /// Replaces raw identity extension with credential extension containing VP.
 /// Returns `None`, without signing, when no location carries the identity
-/// extension (see [`visit_credential_locations`]).
+/// extension (see [`visit_credential_locations`]). The presentation is bound
+/// to `domain`: the calling gateway's Connection Point DID on a fabric answer,
+/// `None` on a direct one.
+#[allow(clippy::too_many_arguments)]
 pub async fn inject_vp_into_a2a_response(
     response_bytes: &bytes::Bytes,
     agent_did: &str,
@@ -869,6 +874,7 @@ pub async fn inject_vp_into_a2a_response(
     vc_issuer: &Arc<crate::identity::VCIssuer>,
     channel_name: &str,
     inbound_chained_vcs: Vec<serde_json::Value>,
+    domain: Option<&str>,
     scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<Option<(bytes::Bytes, String)>> {
     let mut response_json: JsonValue = serde_json::from_slice(response_bytes)
@@ -892,7 +898,7 @@ pub async fn inject_vp_into_a2a_response(
             identity_fields,
             workload_binding,
             None,
-            None,
+            domain,
             inbound_chained_vcs,
             scope,
         )
@@ -1653,6 +1659,7 @@ mod tests {
             &issuer,
             "ch",
             Vec::new(),
+            None,
             &Default::default(),
         )
         .await
@@ -1689,16 +1696,24 @@ mod tests {
             .expect("serialize body"),
         );
 
-        let err =
-            inject_identity_credential_extension(&request, &did, &identity_fields(), None, &issuer, "ch", &mapped)
-                .await
-                .expect_err("the request's surface cannot issue");
+        let err = inject_identity_credential_extension(
+            &request,
+            &did,
+            &identity_fields(),
+            None,
+            &issuer,
+            "ch",
+            None,
+            &mapped,
+        )
+        .await
+        .expect_err("the request's surface cannot issue");
         assert!(
             err.to_string()
                 .contains("vta-gone"),
             "{err}"
         );
-        inject_identity_credential_extension(&request, &did, &identity_fields(), None, &issuer, "ch", &unmapped)
+        inject_identity_credential_extension(&request, &did, &identity_fields(), None, &issuer, "ch", None, &unmapped)
             .await
             .expect("an unmapped surface issues as before");
 
@@ -1710,9 +1725,19 @@ mod tests {
             .expect("an unmapped surface issues as before")
             .expect("the response carries the identity extension");
 
-        inject_vp_into_a2a_response(&response, &did, &identity_fields(), None, &issuer, "ch", Vec::new(), &mapped)
-            .await
-            .expect_err("the backend response's surface cannot issue");
+        inject_vp_into_a2a_response(
+            &response,
+            &did,
+            &identity_fields(),
+            None,
+            &issuer,
+            "ch",
+            Vec::new(),
+            None,
+            &mapped,
+        )
+        .await
+        .expect_err("the backend response's surface cannot issue");
     }
 
     fn assert_carries_backend_vp(

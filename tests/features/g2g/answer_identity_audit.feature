@@ -18,6 +18,32 @@ Feature: The identity on a Fabric answer is audited by the calling gateway
     And the VP Audit Log of gateway 1 records the identity presentation received on the answer
     And the VP Audit Log of gateway 1 records the answer's identity under the trace id of the request
 
+  Scenario: An answer's identity presentation is addressed to the calling gateway
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And gateway 2 surface "alpha" has managed identity enabled
+    And managed agent "bravo" response contains the agent-identity extension
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And gateway 1 surface "charlie" has managed identity enabled
+    And the VP Audit Log of gateway 1 keeps every audit event
+    When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
+    Then the response status is 200
+    And the VP Audit Log of gateway 1 records the identity presentation received on the answer addressed to gateway 1
+
+  Scenario: An answer whose identity presentation is addressed to another Connection Point is refused
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And managed agent "bravo" response contains an identity presentation addressed to another Connection Point
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And gateway 1 surface "charlie" has managed identity enabled
+    And gateway 1 trusts the issuer of the identity presentation of managed agent "bravo" on its connection with gateway 2
+    And gateway 1 requires presentations addressed to it on its connection with gateway 2
+    And the VP Audit Log of gateway 1 keeps every audit event
+    When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
+    Then the response status is 502
+    And the response does not say "agent output"
+    And the VP Audit Log of gateway 1 records a failed identity binding because "its identity presentation is addressed to another Connection Point"
+
   Scenario: A legacy pairing obtains the answering gateway's issuer DID on the first answer
     Given a fabric with 2 gateways
     And gateway 1 has an A2A surface "alpha" targeting managed agent "bravo"
@@ -84,3 +110,30 @@ Feature: The identity on a Fabric answer is audited by the calling gateway
     Then the response status is 200
     And the VP Audit Log of gateway 1 records no identity binding for the answer
     And the VP Audit Log of gateway 1 records no identity presentation received on the answer
+
+  Scenario: An MCP answer's identity presentation is addressed to the calling gateway
+    Given a fabric with 2 gateways
+    And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
+    And gateway 2 surface "alpha" has managed identity enabled
+    And MCP server "bravo" response contains the agent-identity extension
+    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And gateway 1 surface "charlie" has managed identity enabled
+    And the VP Audit Log of gateway 1 keeps every audit event
+    When the caller invokes MCP tool "get_news" through gateway 1 surface "charlie"
+    Then the response status is 200
+    And the VP Audit Log of gateway 1 records a verified identity binding issued by gateway 2
+    And the VP Audit Log of gateway 1 records the identity presentation received on the answer addressed to gateway 1
+
+  Scenario: An MCP answer whose identity presentation is addressed to another Connection Point is refused
+    Given a fabric with 2 gateways
+    And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
+    And MCP server "bravo" response contains an identity presentation addressed to another Connection Point
+    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And gateway 1 surface "charlie" has managed identity enabled
+    And gateway 1 trusts the issuer of the identity presentation of MCP server "bravo" on its connection with gateway 2
+    And gateway 1 requires presentations addressed to it on its connection with gateway 2
+    And the VP Audit Log of gateway 1 keeps every audit event
+    When the caller invokes MCP tool "get_news" through gateway 1 surface "charlie"
+    Then the response status is 502
+    And the response does not say "tool output"
+    And the VP Audit Log of gateway 1 records a failed identity binding because "its identity presentation is addressed to another Connection Point"

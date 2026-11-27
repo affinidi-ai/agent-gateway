@@ -1186,6 +1186,7 @@ pub async fn extract_identity_binding_vp(
     identity_selector: &Option<Arc<crate::identity::IdentitySelector>>,
     channel_name: &str,
     issuer_anchor: Option<&crate::gateways::types::PeerIssuers>,
+    recipient_did: Option<&str>,
 ) -> Result<Option<crate::surface_context::IdentityBindingContext>, String> {
     if *protocol == crate::config::ChannelProtocol::Mcp {
         let Ok(body) = serde_json::from_slice::<JsonValue>(body_bytes) else { return Ok(None) };
@@ -1214,6 +1215,7 @@ pub async fn extract_identity_binding_vp(
                 identity_selector,
                 channel_name,
                 issuer_anchor,
+                recipient_did,
             )
             .await?;
             if primary.is_none() {
@@ -1225,16 +1227,20 @@ pub async fn extract_identity_binding_vp(
     let Some(vp_jwt) = extract_identity_binding_vp_jwt(body_bytes, protocol) else {
         return Ok(None);
     };
-    verify_identity_binding_presentation(&vp_jwt, None, identity_selector, channel_name, issuer_anchor).await
+    verify_identity_binding_presentation(&vp_jwt, None, identity_selector, channel_name, issuer_anchor, recipient_did)
+        .await
 }
 
 /// Verifies the identity binding VP in an MCP request's metadata and records
-/// the outcome against `facts`, which names the surface.
+/// the outcome against `facts`, which names the surface. `recipient_did` is
+/// the Connection Point DID a fabric request was received on, `None` on a
+/// direct request.
 pub async fn verify_mcp_metadata_identity(
     body: &[u8],
     issuer: Option<&Arc<crate::identity::VCIssuer>>,
     facts: &crate::audit::request_events::RequestFacts<'_>,
     issuer_anchor: Option<&crate::gateways::types::PeerIssuers>,
+    recipient_did: Option<&str>,
 ) -> Result<Option<crate::surface_context::IdentityBindingContext>, String> {
     let selector = issuer
         .map(|issuer| crate::identity::IdentitySelector::new(&serde_json::json!({}), issuer.clone()).map(Arc::new))
@@ -1246,6 +1252,7 @@ pub async fn verify_mcp_metadata_identity(
         &selector,
         facts.surface_id,
         issuer_anchor,
+        recipient_did,
     )
     .await;
     crate::observability::identity_binding_audit::audit_extraction(
@@ -1262,6 +1269,7 @@ async fn verify_identity_binding_presentation(
     identity_selector: &Option<Arc<crate::identity::IdentitySelector>>,
     channel_name: &str,
     issuer_anchor: Option<&crate::gateways::types::PeerIssuers>,
+    recipient_did: Option<&str>,
 ) -> Result<Option<crate::surface_context::IdentityBindingContext>, String> {
     info!(channel = channel_name, "Found identity binding VP in inbound request, verifying...");
 
@@ -1276,7 +1284,7 @@ async fn verify_identity_binding_presentation(
 
     let vc_issuer = selector.get_vc_issuer();
     match vc_issuer
-        .verify_agent_presentation_full(vp_jwt)
+        .verify_agent_presentation_for(vp_jwt, recipient_did, issuer_anchor)
         .await
     {
         Ok(verified) => {
@@ -1286,6 +1294,7 @@ async fn verify_identity_binding_presentation(
                 issuer_did,
                 identity_fields,
                 raw_credentials: inbound_credentials,
+                ..
             } = verified;
 
             if claimed_did.is_some_and(|did| did != agent_did) {
@@ -1758,6 +1767,7 @@ mod tests {
                 Some(&issuer),
                 &test_facts(),
                 Some(&peer_issuers(&issuer_did)),
+                None,
             )
             .await
             .unwrap()
@@ -1778,6 +1788,7 @@ mod tests {
                     Some(&issuer),
                     &test_facts(),
                     Some(&peer_issuers("did:example:untrusted")),
+                    None,
                 )
                 .await
                 .is_err()
@@ -1789,6 +1800,7 @@ mod tests {
                     Some(&issuer),
                     &test_facts(),
                     Some(&peer_issuers(&issuer_did)),
+                    None,
                 )
                 .await
                 .is_err()
@@ -1817,6 +1829,69 @@ mod tests {
         );
     }
 
+    fn mcp_body_with_presentation(
+        presentation: &serde_json::Value,
+        holder_did: &str,
+    ) -> String {
+        let key = crate::config::MCP_AGENT_IDENTITY_BINDING_KEY;
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"_meta": {
+            key: {"verifiablePresentation": presentation.to_string(), "did": holder_did}
+        }}})
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn direct_mcp_accepts_a_presentation_forwarded_by_an_upstream_gateway() {
+        let SignedAgentPresentation {
+            issuer_did,
+            holder_did,
+            presentation,
+            issuer,
+            _temporary,
+        } = crate::identity::test_helpers::signed_agent_presentation_bound_to("https://gw2.example:8443").await;
+
+        let binding = super::verify_mcp_metadata_identity(
+            mcp_body_with_presentation(&presentation, &holder_did).as_bytes(),
+            Some(&issuer),
+            &test_facts(),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(binding.agent_did, holder_did);
+        assert_eq!(binding.gateway_did, issuer_did);
+        assert!(!binding.verified);
+    }
+
+    #[tokio::test]
+    async fn direct_mcp_refuses_a_forwarded_audit_only_presentation() {
+        let SignedAgentPresentation {
+            holder_did,
+            presentation,
+            issuer,
+            _temporary,
+            ..
+        } = crate::identity::test_helpers::signed_agent_presentation_bound_to(
+            crate::identity::vc_issuer::AUDIT_ONLY_VP_DOMAIN,
+        )
+        .await;
+
+        assert!(
+            super::verify_mcp_metadata_identity(
+                mcp_body_with_presentation(&presentation, &holder_did).as_bytes(),
+                Some(&issuer),
+                &test_facts(),
+                None,
+                None,
+            )
+            .await
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn mcp_binding_aliases_do_not_bypass_validation() {
         use crate::config::{ChannelProtocol, MCP_AGENT_IDENTITY_BINDING_KEY, MCP_AGENT_IDENTITY_CREDENTIAL_KEY};
@@ -1834,6 +1909,7 @@ mod tests {
                 &None,
                 "test",
                 None,
+                None,
             )
             .await
             .unwrap_err();
@@ -1849,6 +1925,7 @@ mod tests {
                     &ChannelProtocol::Mcp,
                     &None,
                     "test",
+                    None,
                     None
                 )
                 .await
@@ -1862,6 +1939,7 @@ mod tests {
         crate::gateways::types::PeerIssuers {
             attested: Some(attested.to_string()),
             trusted: Vec::new(),
+            require_addressed_presentations: false,
         }
     }
 
@@ -2035,6 +2113,7 @@ mod tests {
         let anchor = crate::gateways::types::PeerIssuers {
             attested: None,
             trusted: vec!["did:web:relay".to_string(), "did:web:gw1".to_string()],
+            require_addressed_presentations: false,
         };
         assert_eq!(evaluate_binding_issuer_trust("did:web:gw1", Some(&anchor)), BindingIssuerDecision::Trusted);
     }
@@ -2044,6 +2123,7 @@ mod tests {
         let anchor = crate::gateways::types::PeerIssuers {
             attested: Some("did:web:gw1".to_string()),
             trusted: vec!["did:web:relay".to_string()],
+            require_addressed_presentations: false,
         };
         assert_eq!(evaluate_binding_issuer_trust("did:web:attacker", Some(&anchor)), BindingIssuerDecision::Reject);
     }
@@ -2053,6 +2133,7 @@ mod tests {
         let anchor = crate::gateways::types::PeerIssuers {
             attested: None,
             trusted: Vec::new(),
+            require_addressed_presentations: false,
         };
         assert_eq!(evaluate_binding_issuer_trust("did:web:gw1", Some(&anchor)), BindingIssuerDecision::Reject);
     }
@@ -2095,7 +2176,7 @@ mod tests {
         let body = body.as_bytes();
         let protocol = ChannelProtocol::A2a;
 
-        let unanchored = extract_identity_binding_vp(body, &protocol, &selector, "test", None)
+        let unanchored = extract_identity_binding_vp(body, &protocol, &selector, "test", None, None)
             .await
             .unwrap()
             .expect("binding is surfaced to OPA");
@@ -2106,8 +2187,9 @@ mod tests {
         let attested = crate::gateways::types::PeerIssuers {
             attested: Some(issuer_did.clone()),
             trusted: Vec::new(),
+            require_addressed_presentations: false,
         };
-        let anchored = extract_identity_binding_vp(body, &protocol, &selector, "test", Some(&attested))
+        let anchored = extract_identity_binding_vp(body, &protocol, &selector, "test", Some(&attested), None)
             .await
             .unwrap()
             .unwrap();
@@ -2116,8 +2198,9 @@ mod tests {
         let allowed = crate::gateways::types::PeerIssuers {
             attested: None,
             trusted: vec![issuer_did.clone()],
+            require_addressed_presentations: false,
         };
-        let allowlisted = extract_identity_binding_vp(body, &protocol, &selector, "test", Some(&allowed))
+        let allowlisted = extract_identity_binding_vp(body, &protocol, &selector, "test", Some(&allowed), None)
             .await
             .unwrap()
             .unwrap();
@@ -2126,9 +2209,10 @@ mod tests {
         let other = crate::gateways::types::PeerIssuers {
             attested: Some("did:example:other".to_string()),
             trusted: Vec::new(),
+            require_addressed_presentations: false,
         };
         assert!(
-            extract_identity_binding_vp(body, &protocol, &selector, "test", Some(&other))
+            extract_identity_binding_vp(body, &protocol, &selector, "test", Some(&other), None)
                 .await
                 .is_err()
         );

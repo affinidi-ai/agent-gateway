@@ -39,6 +39,10 @@ const FABRIC_ROUTE_READY_TIMEOUT_ENV: &str = "G2G_BDD_FABRIC_ROUTE_READY_TIMEOUT
 const FABRIC_ROUTE_READY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const CHANNEL_RELOAD_SETTLE: Duration = Duration::from_millis(300);
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
+/// The `target_endpoint` of a Transit Point that reaches the managed agent
+/// behind surface `<id>` of the same gateway directly, until boot replaces it
+/// with that agent's URL.
+pub const DIRECT_TRANSIT_TARGET_PREFIX: &str = "managed-agent-of-surface://";
 
 /// Prometheus counter each gateway exposes for received fabric (gateway-to-gateway)
 /// forward requests. Scraped to observe receipt without parsing gateway logs.
@@ -1163,6 +1167,28 @@ async fn spawn_node(
                 None => surface.target_endpoint = mock.url(),
             }
             mocks.insert(surface.surface_id.clone(), mock);
+        }
+    }
+    // A Transit Point that reaches a managed agent of this gateway directly
+    // names the agent's surface until its mock is listening.
+    for transit_point in surfaces
+        .iter_mut()
+        .flat_map(|surface| {
+            surface
+                .transit_points
+                .iter_mut()
+        })
+    {
+        if let Some(target_surface) = transit_point
+            .target_endpoint
+            .strip_prefix(DIRECT_TRANSIT_TARGET_PREFIX)
+        {
+            let url = mocks
+                .get(target_surface)
+                .with_context(|| format!("no managed agent behind surface '{target_surface}' on gateway {index}"))?
+                .url();
+            egress_allowlist.push(url.clone());
+            transit_point.target_endpoint = url;
         }
     }
     let mut oauth_endpoints = Vec::new();

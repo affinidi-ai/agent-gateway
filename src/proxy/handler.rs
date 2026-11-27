@@ -3010,6 +3010,7 @@ async fn proxy_charged_request(
                 state.vc_issuer.as_ref(),
                 &audit_facts,
                 None,
+                None,
             )
             .await
             .map_err(|error| {
@@ -5577,6 +5578,7 @@ async fn proxy_charged_request(
             &state.identity_selector,
             &channel_name,
             None,
+            None,
         )
         .await;
         crate::observability::identity_binding_audit::audit_extraction(&audit_facts, None, &result);
@@ -7281,7 +7283,7 @@ async fn proxy_charged_request(
                             &result.identity_fields,
                             wb,
                             None,
-                            None,
+                            Some(crate::identity::vc_issuer::AUDIT_ONLY_VP_DOMAIN),
                             &state.key_scope(),
                         )
                         .await
@@ -7532,29 +7534,33 @@ async fn proxy_charged_request(
             delegation_actions_for_vp.clone(),
             authenticated_identity.as_ref(),
         );
+        // Decided before minting: a presentation that is not injected is only
+        // the audit copy, so it is bound to `AUDIT_ONLY_VP_DOMAIN`, which no
+        // verifier accepts, rather than to the Target.
+        let inject_vp = (state
+            .surface
+            .inject_identity_vp()
+            || state
+                .surface
+                .target_workload_binding()
+                .is_some())
+            && method == "POST"
+            && !body_bytes.is_empty();
+        let vp_domain = crate::identity::vc_issuer::request_vp_domain(inject_vp, &state.surface.target.endpoint);
         match vc_issuer
             .create_agent_identity_presentation_with_binding(
                 &result.did,
                 &result.identity_fields,
                 wb,
                 None,
-                None,
+                vp_domain.as_deref(),
                 &state.key_scope(),
             )
             .await
         {
             Ok(final_vp_jwt) => {
                 // 1. inject into outbound body (replaces the slot if any existed)
-                if (state
-                    .surface
-                    .inject_identity_vp()
-                    || state
-                        .surface
-                        .target_workload_binding()
-                        .is_some())
-                    && method == "POST"
-                    && !body_bytes.is_empty()
-                {
+                if inject_vp {
                     let inbound_meta_field_to_strip: Option<String> = state
                         .surface
                         .inbound_identity()
@@ -11475,6 +11481,7 @@ async fn handle_fabric_request_inner(
             &state.identity_selector,
             channel_name,
             None,
+            None,
         )
         .await;
         crate::observability::identity_binding_audit::audit_extraction(
@@ -12715,7 +12722,7 @@ async fn handle_fabric_request_inner(
                     &result.identity_fields,
                     fabric_workload_binding,
                     None,
-                    None,
+                    Some(remote_gateway_did.as_str()),
                     chained_credentials,
                     &state.key_scope(),
                 )
@@ -13832,6 +13839,11 @@ async fn handle_fabric_request_inner(
                             vc_issuer: state.vc_issuer.as_ref(),
                             listener_manager,
                             gateway_id,
+                            recipient_did: Some(
+                                gateway_listener
+                                    .gateway_did
+                                    .as_str(),
+                            ),
                             facts: &response_audit_facts,
                             caller: authenticated_identity
                                 .as_ref()
@@ -16759,6 +16771,7 @@ async fn inject_backend_agent_vp(
                 &protected_meta_field,
                 protected_strip_raw,
                 mcp_metadata_context,
+                None,
                 &state.key_scope(),
             )
             .await
@@ -16772,6 +16785,7 @@ async fn inject_backend_agent_vp(
                 &vc_issuer,
                 channel_name,
                 inbound_chained_vcs.clone(),
+                None,
                 &state.key_scope(),
             )
             .await
