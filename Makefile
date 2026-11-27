@@ -534,7 +534,7 @@ test-junit: config-test ## Run tests with nextest and emit JUnit XML (test-resul
 	$(call rust_test,cargo nextest run --no-fail-fast --all-features --profile ci)
 	@echo "$(GREEN)✅ JUnit report written to test-results.xml$(NC)"
 
-test-rust-ci: config-test ## Run the CI test flow locally (coverage + surface_bdd)
+test-rust-ci: config-test ## Coverage plus surface_bdd, against the coverage threshold
 	@echo "$(BLUE)🧪 Running CI test flow...$(NC)"
 	@rm -f coverage.xml $(COVERAGE_PROFILE_ARTIFACTS)
 	@set +e; $(LLVM_COV_ENV) cargo llvm-cov nextest --no-clean --no-fail-fast --all-features -P ci --cobertura --output-path coverage.xml --fail-under-lines $(COVERAGE_THRESHOLD) 2>&1 | tee test.log; STATUS=$${PIPESTATUS[0]}; \
@@ -765,6 +765,9 @@ ci: ## Run full local preflight mirroring CI
 # with that job's own commands. Keep them in step with the workflows. Not mirrored:
 # the smoke job (non-blocking in CI, and it takes port 8443 and rewrites envs/local),
 # rust-scan (needs repository secrets), CodeQL, Docker and the PR title check.
+# Unlike CI, the tools are the ones installed locally, not CI's pinned versions,
+# and the g2g suite runs its scenarios 8 at a time (G2G_BDD_PARALLELISM) where CI
+# runs them one by one.
 
 # The commit the changelog job diffs the branch against, as CI diffs the PR base.
 CI_BASE ?= origin/main
@@ -772,11 +775,6 @@ CI_BASE ?= origin/main
 # instead of waiting on the lock of theirs.
 CI_CLIPPY_TARGET_DIR ?= target/ci-clippy
 CHANGELOG_PY = $(if $(wildcard $(VENV)/bin/python3),$(VENV)/bin/python3,python3)
-# Debug info of every ci-* build: line tables only compile and link faster and
-# change no test result. It replaces the full-debug build in target/ (make
-# run-debug rebuilds after); CI_DEBUG=true keeps the full one and shares it.
-CI_DEBUG ?= line-tables-only
-ci-%: export CARGO_PROFILE_DEV_DEBUG := $(CI_DEBUG)
 # The command that runs the surface suite; ci-suites points it at the test binary it built.
 SURFACE_BDD_RUN ?= cargo test --test surface_bdd
 
@@ -842,36 +840,45 @@ ci-surface-bdd: ## CI job surface-bdd: the surface BDD suite
 ci-g2g-bdd: ## CI job g2g-bdd: the gateway-to-gateway BDD suite (needs Docker)
 	@$(MAKE) --no-print-directory gw-e2e
 
-ci-mcp-conformance: ## CI job mcp-conformance: the MCP conformance harness (needs Node >= 22)
+ci-mcp-conformance: ## CI job mcp-conformance: the MCP conformance harness (needs Node 22 or later)
 	@$(MAKE) --no-print-directory mcp-conformance
 
-# The BDD and conformance suites, side by side: one cargo call builds both BDD
-# test binaries and the gateway binary they start (the one the harness builds
-# too), then each suite runs its binary directly, so none waits on the lock
-# cargo holds on target/ while a `cargo test` runs.
-ci-suites: ## Build the BDD suites once, then run surface-bdd, g2g-bdd and mcp-conformance side by side
+# One cargo call builds both BDD test binaries, then each suite runs its binary
+# directly, side by side, so neither waits on the lock cargo holds on target/
+# while a `cargo test` runs. The conformance harness runs after them: its own
+# `cargo build --bin` leaves out the dev-dependencies' features, so it relinks
+# the gateway binary the suites start. Their make arguments carry the binaries'
+# paths, which parallel.sh splits on spaces.
+ci-suites: ## Build the BDD suites once, run surface-bdd and g2g-bdd side by side, then mcp-conformance
 	@echo "$(BLUE)🔨 Building the BDD test binaries...$(NC)"
 	@exes="$$(cargo test --no-run --test surface_bdd --test g2g_bdd --message-format=json-render-diagnostics \
 		| jq -r 'select(.reason == "compiler-artifact" and .executable != null and .profile.test) | "\(.target.name)=\(.executable)"')"; \
 	surface="$$(sed -n 's/^surface_bdd=//p' <<<"$$exes")"; \
 	g2g="$$(sed -n 's/^g2g_bdd=//p' <<<"$$exes")"; \
 	[ -n "$$surface" ] && [ -n "$$g2g" ] || { echo "$(RED)❌ No BDD test binary was built$(NC)"; exit 1; }; \
+	case "$$surface$$g2g" in *[[:space:]]*) \
+		echo "$(RED)❌ ci-suites needs a checkout path without spaces: $$surface$(NC)"; exit 1;; \
+	esac; \
+	status=0; \
 	MAKE="$(MAKE)" PARALLEL=$(PARALLEL) bash scripts/local/parallel.sh "Suites" \
 		"surface-bdd=ci-surface-bdd SURFACE_BDD_RUN=$$surface" \
-		"g2g-bdd=g2g-bdd-run G2G_BDD_RUN=$$g2g" \
-		"mcp-conformance=ci-mcp-conformance"
+		"g2g-bdd=g2g-bdd-run G2G_BDD_RUN=$$g2g" || status=1; \
+	MAKE="$(MAKE)" PARALLEL=$(PARALLEL) bash scripts/local/parallel.sh "Conformance" \
+		"mcp-conformance=ci-mcp-conformance" || status=1; \
+	exit $$status
 
 # The groups run side by side (scripts/local/parallel.sh; logs in tmp/local/latest/).
 # Coverage runs the same tests as ci-test (CI runs both), so ci-test is left out.
 # Coverage builds in target/llvm-cov-target, Clippy in CI_CLIPPY_TARGET_DIR and
-# the suites in target/, so the three builds run beside each other.
+# the suites in target/, so the three builds run beside each other. Coverage
+# runs after the frontend checks (-k: whatever they find; -j1: even under make -j), because its ts-rs
+# tests rewrite www/default/src/generated/, which those checks read.
 CI_HAPPY_GROUPS := "fmt=ci-fmt" "toolchain=ci-toolchain" "docs=ci-docs" "gherkin=ci-gherkin" \
-	"changelog=ci-changelog" "audit=ci-audit" "deny=ci-deny" "frontend=ci-frontend" \
-	"clippy=ci-clippy" "coverage=ci-coverage" "suites=ci-suites"
-ci-happy: ## Run every blocking CI job locally, 1:1 with the workflows and side by side, no autofix (PARALLEL=0: one at a time; CI_BASE=origin/main; CI_DEBUG=true: full debug info)
+	"changelog=ci-changelog" "audit=ci-audit" "deny=ci-deny" \
+	"frontend-coverage=-k -j1 ci-frontend ci-coverage" "clippy=ci-clippy" "suites=ci-suites"
+ci-happy: ## Run the blocking CI jobs locally as CI runs them, side by side, no autofix (PARALLEL=0: one at a time; CI_BASE=origin/main)
 	@$(MAKE) --no-print-directory verify-rust-deps
 	@$(MAKE) --no-print-directory config-test
-	@$(MAKE) --no-print-directory clean-e2e
 	@MAKE="$(MAKE)" PARALLEL=$(PARALLEL) bash scripts/local/parallel.sh "CI" $(CI_HAPPY_GROUPS)
 	@secs=$$(( $$(date +%s) - $(LOCAL_STARTED) )); \
 	  echo "$(GREEN)✅ CI is happy, in $$((secs / 60))m $$((secs % 60))s.$(NC)"
@@ -1005,8 +1012,8 @@ G2G_BDD_RUN ?= cargo test --test g2g_bdd $(CARGO_TEST_ARGS)
 gw-e2e: clean-e2e ## Run the gateway-to-gateway BDD E2E suite (federation)
 	@$(MAKE) --no-print-directory g2g-bdd-run
 
-# The suite without the clean-up first, which would remove the mediators of a
-# conformance run beside it.
+# The suite without gw-e2e's clean-up, which removes the BDD mediators of every
+# checkout on the Docker daemon.
 g2g-bdd-run:
 	@echo "$(BLUE)🧪 Running g2g_bdd...$(NC)"
 	@parallelism="$${G2G_BDD_PARALLELISM:-8}"; \

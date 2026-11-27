@@ -102,16 +102,17 @@ report() {
     fi
 }
 
-# A group still running: its time so far and its log's last line, uncoloured
-# and cut to fit a line.
+# A group still running: its time so far and its log's last line, without
+# colours or any other control character, and cut to fit a line.
 beat() {
     local name=$1 since=$2 line
-    line=$(tail -n 1 "$dir/$name.log" 2>/dev/null | tr -d '\r' | sed $'s/\033\\[[0-9;]*m//g')
+    line=$(tail -n 1 "$dir/$name.log" 2>/dev/null | sed $'s/\033\\[[0-9;]*m//g' | tr -d '\000-\010\013-\037\177')
     say "${pad}${dim}… $name ($(took $((SECONDS - since)))): ${line:0:100}${off}"
 }
 
 names=()
 starts=()
+pids=()
 started=$SECONDS
 say "${pad}${blue}▶ $title${off}"
 n=0
@@ -129,6 +130,7 @@ for group in "$@"; do
         report "$name"
     else
         run "$name" $args &
+        pids+=("$!")
     fi
 done
 if [ "${PARALLEL:-1}" != 0 ]; then
@@ -139,7 +141,9 @@ if [ "${PARALLEL:-1}" != 0 ]; then
         running=0
         for i in "${!names[@]}"; do
             [ "${reported[i]:-0}" = 1 ] && continue
-            if [ -f "$dir/${names[i]}.status" ]; then
+            # A group whose process is gone without a status ended too: it is
+            # reported failed rather than waited for.
+            if [ -f "$dir/${names[i]}.status" ] || ! kill -0 "${pids[i]}" 2>/dev/null; then
                 report "${names[i]}"
                 reported[i]=1
             else

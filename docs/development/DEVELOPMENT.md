@@ -269,26 +269,7 @@ This documents the dependency, fails fast with a clear message if the helper con
 ```bash
 make shellcheck   # lint every tracked *.sh
 make lint         # fmt-check + clippy + eslint + shellcheck + changelog
-make ci-happy     # every blocking CI job, 1:1 with the workflows, side by side
 ```
-
-`make ci-happy` runs each blocking job of `.github/workflows/ci.yml`, `checks.yml` and
-`release-guards.yml` with that job's own commands, one `ci-<job>` target per job (`make help`
-lists them), so a single failing job can be rerun alone. The jobs run side by side, with each
-group's log in `tmp/local/latest/`; `PARALLEL=0` runs them one at a time on a machine short of
-memory. Each group is reported as it ends, and every 30 seconds (`PROGRESS_SECS`, `0` for never)
-each group still running is named with its time so far and its log's last line; `make local`
-reports the same way. Coverage runs the same unit and component tests as the `test` job, so `ci-happy` leaves
-`ci-test` out. `ci-suites` builds the `surface_bdd` and `g2g_bdd` test binaries in one cargo call,
-then runs them and the MCP conformance harness side by side, while Clippy (`target/ci-clippy`) and
-coverage (`target/llvm-cov-target`) build beside it. Every `ci-*` build keeps line tables only as
-debug info (`CI_DEBUG`, default `line-tables-only`), which compiles and links faster and changes
-no test result; it replaces the full-debug build in `target/`, so `make run-debug` rebuilds after
-it, and `CI_DEBUG=true` keeps and shares the full one. The gateway-to-gateway suite needs Docker,
-the conformance harness Node 22, and `ci-suites` jq.
-The changelog job, as in CI, looks for the branch's fragment in the commits since `CI_BASE`
-(`origin/main`), so commit it first. Not run: the non-blocking smoke job, `rust-scan`, CodeQL,
-the Docker build and the PR title check.
 
 ## Tests And Quality Checks
 
@@ -348,11 +329,35 @@ needs PyYAML, either in the repository-local `.venv` that `make install-python-d
 ### Full Local Preflight
 
 ```bash
+make ci-happy
 make ci
 ```
 
-This is the repository's broad local preflight and can take substantially longer than focused
-checks. [`CONTRIBUTING.md`](../../CONTRIBUTING.md) defines the minimum checks expected before a pull
+`make ci-happy` runs the blocking jobs of `.github/workflows/ci.yml`, `checks.yml` and
+`release-guards.yml` with each job's own commands and no autofix, one `ci-<job>` target per job
+(`make help` lists them), so a single failing job can be rerun alone. It differs from CI in three
+ways: it uses the tools installed locally rather than CI's pinned versions (see the
+`toolchain:`, `--version` and action pins in `.github/workflows/`); it leaves `ci-test` out, since coverage runs the same
+unit and component tests; and the gateway-to-gateway suite runs its scenarios 8 at a time
+(`G2G_BDD_PARALLELISM`), where CI runs them one by one.
+
+The jobs run side by side, with each group's log in `tmp/local/latest/`; `PARALLEL=0` runs them
+one at a time on a machine short of memory. Each group is reported as it ends, and every 30
+seconds (`PROGRESS_SECS`, `0` for never) each group still running is named with its time so far
+and its log's last line; `make local` reports the same way. Clippy builds in `target/ci-clippy`
+and coverage in `target/llvm-cov-target`, beside `ci-suites`, which builds the `surface_bdd` and
+`g2g_bdd` test binaries in one cargo call, runs them side by side, and then runs the MCP
+conformance harness, whose own build replaces the gateway binary the suites start. Coverage runs
+after the frontend checks, because its tests rewrite `www/default/src/generated/`, which those
+checks read. The gateway-to-gateway suite needs Docker, the conformance harness Node 22 or later,
+and `ci-suites` jq and a checkout path without spaces. The changelog job, as in CI, looks for the
+branch's fragment in the commits since `CI_BASE` (`origin/main`), so commit it first. It does not
+clear BDD mediator containers left by a crashed run, which hold the port the conformance fabric
+suite needs: run `make clean-e2e` first after such a crash. Not run:
+the non-blocking smoke job, `rust-scan`, CodeQL, the Docker build and the PR title check.
+
+`make ci` is the older preflight: it runs the frontend and Rust checks one after another, with a
+full build and the whole test suite, and can take substantially longer than focused checks. [`CONTRIBUTING.md`](../../CONTRIBUTING.md) defines the minimum checks expected before a pull
 request.
 
 ## Running An Agent In Docker
