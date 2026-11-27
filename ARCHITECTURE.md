@@ -129,12 +129,15 @@ flowchart TB
         F1[Forward] --> F2["Resolve protected<br/>identity"] --> F3["Response processing,<br/>tools/list filter"] --> F4[Metrics]
     end
     E --> G --> P --> C --> S --> Y --> O --> Z --> F
-    B4 -. fabric:// Target .-> FP["Surface OPA, MCP tool<br/>gating, target auth,<br/>agent_pay payment"] --> FB([Fabric dispatch])
+    B4 -. fabric:// Target .-> FP["Surface OPA, MCP tool<br/>gating, target auth,<br/>agent_pay payment"] --> FB([Fabric dispatch]) --> FR["Peer answer: tools/list<br/>filter, response policy"]
 ```
 
 A `fabric://` Target leaves after request validation. It then runs its own surface policy
 and, for MCP, the MCP tool policies and gating, target authentication and credential delegation,
-and only then the delegated payment, just before fabric dispatch. Payment is the last step on every
+and only then the delegated payment, just before fabric dispatch. It runs its own response
+policy on every body the peer sends back that it relays: a `402` or an `error`-marked JSON-RPC
+body as it arrives, and the answer after MCP tool gating on a `tools/list`, before the answer is
+captured as delivered. Payment is the last step on every
 path, so a request is never charged and then refused for a reason that does not depend on payment.
 Version negotiation and request validation run on the sending gateway, before
 that; the fabric receive pipeline does not run them again.
@@ -231,7 +234,8 @@ wire validation and context → agent
 context → appliance-wide gateway policy → gateway OPA → AP2 gate → A2A version negotiation
 and request validation (A2A and AP2) (a `fabric://` Target leaves here: its own policy,
 MCP tool policies and gating for MCP, target authentication and credential delegation, delegated
-payment, then fabric dispatch) →
+payment, fabric dispatch, then on the peer's answer the `tools/list` filter and its own response
+policy) →
 forward-target egress check → body-size re-check (a body the gateway grew, and an
 MCP Access Point's body over `max_body_size`) → MCP tool
 policies → extension inspection → caller identity → custom metadata → Trust Check (caller

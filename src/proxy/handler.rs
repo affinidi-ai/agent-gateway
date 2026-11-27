@@ -13421,7 +13421,7 @@ async fn handle_fabric_request_inner(
                     .cloned()
                     .unwrap_or_default();
 
-                let response_body = response_msg
+                let mut response_body = response_msg
                     .message_body
                     .get("body")
                     .and_then(|v| v.as_str())
@@ -13465,6 +13465,13 @@ async fn handle_fabric_request_inner(
                         connection_guard
                             .decrement()
                             .await;
+                        if let Some(policy) = response_policy.as_ref()
+                            && let Some(refusal) = policy
+                                .refusal_of_peer_answer(status, &mut response_body, &response_headers)
+                                .await
+                        {
+                            return Err(refusal);
+                        }
                         return Err(response_builder
                             .body(axum::body::Body::from(response_body))
                             .unwrap());
@@ -13503,21 +13510,30 @@ async fn handle_fabric_request_inner(
                             serde_json::json!({ "jsonrpc": "2.0", "id": null, "error": jsonrpc_error }).to_string()
                         };
 
-                        // Try to parse the response_body as JSON to see if it's already a JSON-RPC error
-                        let error_response =
-                            if let Ok(json_body) = serde_json::from_str::<serde_json::Value>(&response_body) {
-                                // If it's already a JSON-RPC response, use it as-is
-                                if json_body
+                        // A body that is already a JSON-RPC response is relayed as-is,
+                        // under the sending surface's response policy.
+                        let relays_peer_body =
+                            serde_json::from_str::<serde_json::Value>(&response_body).is_ok_and(|json_body| {
+                                json_body
                                     .get("jsonrpc")
                                     .is_some()
-                                {
-                                    response_body
-                                } else {
-                                    jsonrpc_error()
-                                }
-                            } else {
-                                jsonrpc_error()
-                            };
+                            });
+                        if relays_peer_body
+                            && let Some(policy) = response_policy.as_ref()
+                            && let Some(refusal) = policy
+                                .refusal_of_peer_answer(status, &mut response_body, &response_headers)
+                                .await
+                        {
+                            connection_guard
+                                .decrement()
+                                .await;
+                            return Err(refusal);
+                        }
+                        let error_response = if relays_peer_body && !response_body.is_empty() {
+                            response_body
+                        } else {
+                            jsonrpc_error()
+                        };
 
                         // Build response with headers from the forward response.
                         // Preserve the MCP JSON-RPC convention (HTTP 200 + error
@@ -13592,6 +13608,13 @@ async fn handle_fabric_request_inner(
                     connection_guard
                         .decrement()
                         .await;
+                    if let Some(policy) = response_policy.as_ref()
+                        && let Some(refusal) = policy
+                            .refusal_of_peer_answer(status, &mut response_body, &response_headers)
+                            .await
+                    {
+                        return Err(refusal);
+                    }
                     return Err(response_builder
                         .body(axum::body::Body::from(response_body))
                         .unwrap());
@@ -14253,26 +14276,15 @@ async fn handle_fabric_request_inner(
                 } else {
                     response_body
                 };
+                let mut response_body = response_body;
 
                 // The sending surface's response policy, before the answer is captured as
                 // delivered. The peer's empty `202` acknowledgement of a notification is
                 // not a Target answer and is not checked.
-                let content_type = response_headers
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-                    .and_then(|(_, value)| {
-                        value.as_str().or_else(|| {
-                            value
-                                .as_array()?
-                                .first()?
-                                .as_str()
-                        })
-                    });
-                if !crate::proxy::paths::is_public_agent_card_read(method.as_str(), uri.path())
-                    && !(status == StatusCode::ACCEPTED.as_u16() && response_body.is_empty())
+                if !(status == StatusCode::ACCEPTED.as_u16() && response_body.is_empty())
                     && let Some(policy) = response_policy.as_ref()
                     && let Some(refusal) = policy
-                        .refusal_of_fabric_answer(status, response_body.as_bytes(), content_type)
+                        .refusal_of_peer_answer(status, &mut response_body, &response_headers)
                         .await
                 {
                     if !is_modern_response && let Some(ref metrics) = state.metrics_store {
@@ -25208,6 +25220,19 @@ mod fabric_send_tests {
         status: u16,
         body: &str,
     ) -> crate::gateways::connection_points::messages::ReceivedMessage {
+        forward_reply(
+            request,
+            responder_did,
+            json!({"status": status, "headers": {"content-type": "application/json"}, "body": body}),
+        )
+    }
+
+    /// The peer's `ForwardResponse` to `request`, with `message_body` as sent.
+    fn forward_reply(
+        request: &affinidi_messaging_didcomm::Message,
+        responder_did: &str,
+        message_body: serde_json::Value,
+    ) -> crate::gateways::connection_points::messages::ReceivedMessage {
         crate::gateways::connection_points::messages::ReceivedMessage::new(
             "cp-1".into(),
             "peer".into(),
@@ -25220,7 +25245,7 @@ mod fabric_send_tests {
             vec!["did:example:connection-point".into()],
             None,
             None,
-            json!({"status": status, "headers": {"content-type": "application/json"}, "body": body}),
+            message_body,
             crate::gateways::connection_points::messages::MessageMetadata {
                 encrypted: true,
                 authenticated: true,
@@ -25457,6 +25482,166 @@ mod fabric_send_tests {
                 .as_str()
                 .unwrap_or_default();
             assert!(url.starts_with("https://gateway.example"), "{body}");
+        });
+    }
+
+    /// A gateway whose `protocol` surface on a `fabric://` Target has a response
+    /// policy deciding by `rego`, and whose peer answers with `message_body`.
+    async fn fabric_peer_relaying(
+        protocol: &str,
+        message_body: serde_json::Value,
+        rego: &str,
+    ) -> FabricPeer {
+        let route = format!("/{protocol}");
+        let mut peer = fabric_peer_fronted_by(200, json!({}), |peer_id| {
+            json!({
+                "surface_id": "fabric-relay", "name": "Fabric relay",
+                "access_point": {"listen_address": "https://gateway.example", "route": route, "protocol": protocol},
+                "target": {
+                    "endpoint": format!("fabric://{peer_id}/remote-surface"),
+                    "response_policy": {"policy_definition_id": "relay-policy"}
+                }
+            })
+        })
+        .await;
+        let manager = crate::policies::SurfacePolicyManager::new();
+        manager
+            .load_policy_text("response:relay-policy", rego)
+            .unwrap();
+        peer.state.policy_manager = Some(Arc::new(manager));
+        let responder_did = peer.peer_did.clone();
+        crate::comm::didcomm::client::test_send_hook::install(&peer.peer_did, move |request| {
+            let reply = forward_reply(request, &responder_did, message_body.clone());
+            assert!(crate::proxy::fabric_response_waiter::complete_forward_response_waiter(&reply));
+        });
+        peer
+    }
+
+    const DENY_ALL_RESPONSES: &str = "package surface.policy\n\ndefault allow := false\n";
+    const ALLOW_ALL_RESPONSES: &str = "package surface.policy\n\ndefault allow := true\n";
+
+    fn a2a_message() -> serde_json::Value {
+        json!({"jsonrpc": "2.0", "id": "m-1", "method": "message/send", "params": {"message": {
+            "role": "user", "messageId": "msg-1", "parts": [{"kind": "text", "text": "hi"}]}}})
+    }
+
+    #[test]
+    fn a_payment_challenge_relayed_from_a_fabric_peer_meets_the_sending_surfaces_response_policy() {
+        run_on_large_stack(async {
+            let challenge = json!({"accepts": [{"secret": "s"}]}).to_string();
+            for (message_body, rego, expected) in [
+                (
+                    json!({"status": 402, "headers": {"content-type": "application/json"}, "body": challenge}),
+                    DENY_ALL_RESPONSES,
+                    axum::http::StatusCode::FORBIDDEN,
+                ),
+                (
+                    json!({"status": 402, "headers": {"content-type": "application/json"}, "body": challenge,
+                        "error": "payment required"}),
+                    DENY_ALL_RESPONSES,
+                    axum::http::StatusCode::FORBIDDEN,
+                ),
+                (
+                    json!({"status": 402, "headers": {"content-type": "application/json"}, "body": challenge}),
+                    ALLOW_ALL_RESPONSES,
+                    axum::http::StatusCode::PAYMENT_REQUIRED,
+                ),
+                (
+                    json!({"status": 402, "headers": {"content-type": "application/json"}, "body": challenge,
+                        "error": "payment required"}),
+                    ALLOW_ALL_RESPONSES,
+                    axum::http::StatusCode::PAYMENT_REQUIRED,
+                ),
+            ] {
+                let peer = fabric_peer_relaying("a2a", message_body.clone(), rego).await;
+
+                let (status, _, body) =
+                    answer(post(&peer.state, "https://gateway.example/a2a", &a2a_message(), None).await).await;
+
+                assert_eq!(status, expected, "{message_body} {body}");
+                if expected == axum::http::StatusCode::FORBIDDEN {
+                    assert!(
+                        body.to_string()
+                            .contains("response_policy_denied"),
+                        "{body}"
+                    );
+                } else {
+                    assert_eq!(body["accepts"][0]["secret"], "s", "{body}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_jsonrpc_error_relayed_from_a_fabric_peer_meets_the_sending_surfaces_response_policy() {
+        run_on_large_stack(async {
+            let peer_error =
+                json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32000, "message": "secret"}}).to_string();
+            let message_body = json!({"status": 500, "headers": {"content-type": "application/json"},
+                "body": peer_error, "error": "Target failed"});
+            let tools_list = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}});
+
+            let peer = fabric_peer_relaying("mcp", message_body.clone(), DENY_ALL_RESPONSES).await;
+            let (status, _, body) =
+                answer(post(&peer.state, "https://gateway.example/mcp", &tools_list, None).await).await;
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+            assert!(
+                body.to_string()
+                    .contains("response_policy_denied"),
+                "{body}"
+            );
+
+            let peer = fabric_peer_relaying("mcp", message_body, ALLOW_ALL_RESPONSES).await;
+            let (status, _, body) =
+                answer(post(&peer.state, "https://gateway.example/mcp", &tools_list, None).await).await;
+            assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+            assert_eq!(body["error"]["message"], "secret", "{body}");
+        });
+    }
+
+    #[test]
+    fn a_gateway_written_error_for_a_failed_fabric_answer_is_not_checked() {
+        run_on_large_stack(async {
+            let message_body = json!({"status": 500, "headers": {"content-type": "text/plain"},
+                "body": "upstream exploded", "error": "Target failed"});
+            let tools_list = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}});
+            let peer = fabric_peer_relaying("mcp", message_body, DENY_ALL_RESPONSES).await;
+
+            let (status, _, body) =
+                answer(post(&peer.state, "https://gateway.example/mcp", &tools_list, None).await).await;
+
+            assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+            assert_eq!(body["error"]["code"], -32603, "{body}");
+            assert!(
+                !body
+                    .to_string()
+                    .contains("upstream exploded"),
+                "{body}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_jsonrpc_error_body_labelled_as_an_event_stream_becomes_a_gateway_error() {
+        run_on_large_stack(async {
+            let peer_error =
+                json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32000, "message": "secret"}}).to_string();
+            let message_body = json!({"status": 500, "headers": {"content-type": "text/event-stream"},
+                "body": peer_error, "error": "Target failed"});
+            let tools_list = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}});
+            let peer = fabric_peer_relaying("mcp", message_body, ALLOW_ALL_RESPONSES).await;
+
+            let (status, _, body) =
+                answer(post(&peer.state, "https://gateway.example/mcp", &tools_list, None).await).await;
+
+            assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+            assert_eq!(body["error"]["code"], -32603, "{body}");
+            assert!(
+                !body
+                    .to_string()
+                    .contains("secret"),
+                "{body}"
+            );
         });
     }
 

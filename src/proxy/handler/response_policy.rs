@@ -239,6 +239,22 @@ pub(super) fn fabric_send_caller_did<'a>(
         })
 }
 
+/// The `Content-Type` among the `headers` a peer gateway forwarded with its
+/// answer, a string or the first of a list.
+fn forwarded_content_type(headers: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .and_then(|(_, value)| {
+            value.as_str().or_else(|| {
+                value
+                    .as_array()?
+                    .first()?
+                    .as_str()
+            })
+        })
+}
+
 /// The direct request a [`DirectResponsePolicy`] decides for.
 pub(super) struct DirectRequest<'a> {
     pub(super) config_id: &'a str,
@@ -352,7 +368,7 @@ impl DirectResponsePolicy {
             return pass_without_policy_manager(&self.policy_id, context);
         };
         let Some(responses) = responses else {
-            return refuse_unreadable_answer(&self.policy_id, context);
+            return refuse_unreadable_answer(policy_manager, &self.policy_id, context).await;
         };
         let inputs = responses
             .into_iter()
@@ -374,18 +390,23 @@ impl DirectResponsePolicy {
         (!decision.allow).then(denied_response)
     }
 
-    /// The `403` the caller gets when the policy refuses the answer a peer
-    /// gateway sent back for a `fabric://` Target, or `None` when it may go
-    /// back. An answer still framed as an event stream is checked event by
-    /// event, as on Fabric receive.
-    pub(super) async fn refusal_of_fabric_answer(
+    /// The `403` the caller gets when the policy refuses a body the peer
+    /// gateway sent back for a `fabric://` Target with `status` and the
+    /// forwarded `headers`, or `None` when it may go back. A `GET` or `HEAD` of
+    /// the public agent card is not checked. An answer still framed as an event
+    /// stream is first reduced in `body` to the lines the caller receives, then
+    /// checked event by event, as on Fabric receive.
+    pub(super) async fn refusal_of_peer_answer(
         &self,
         status: u16,
-        body: &[u8],
-        content_type: Option<&str>,
+        body: &mut String,
+        headers: &serde_json::Map<String, serde_json::Value>,
     ) -> Option<Response> {
+        if crate::proxy::paths::is_public_agent_card_read(&self.method, &self.path) {
+            return None;
+        }
         let decision = self
-            .check_each(answer_contexts(status, body, content_type))
+            .check_each(answer_contexts(status, body, forwarded_content_type(headers)))
             .await;
         (!decision.allow).then(denied_response)
     }
@@ -453,72 +474,6 @@ mod tests {
         }
     }
 
-    /// A Target that refuses the plain POST with `405`, so the direct MCP forward
-    /// falls back to Legacy SSE, and answers over its Legacy SSE session: a
-    /// `tools/list` with the tools `get_news` and `summarize`, any other request
-    /// with a result naming a secret.
-    async fn legacy_sse_only_target() -> String {
-        use axum::response::IntoResponse;
-        use axum::response::sse::{Event, Sse};
-        use futures::StreamExt;
-
-        let (events, receiver) = tokio::sync::mpsc::channel::<Event>(16);
-        let receiver = Arc::new(tokio::sync::Mutex::new(Some(receiver)));
-        let app = axum::Router::new()
-            .route(
-                "/sse",
-                axum::routing::get(move || {
-                    let receiver = receiver.clone();
-                    async move {
-                        let Some(receiver) = receiver.lock().await.take() else {
-                            return axum::http::StatusCode::CONFLICT.into_response();
-                        };
-                        let endpoint = futures::stream::once(async {
-                            Event::default()
-                                .event("endpoint")
-                                .data("/messages")
-                        });
-                        Sse::new(
-                            endpoint
-                                .chain(tokio_stream::wrappers::ReceiverStream::new(receiver))
-                                .map(Ok::<_, std::convert::Infallible>),
-                        )
-                        .into_response()
-                    }
-                }),
-            )
-            .route(
-                "/messages",
-                axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
-                    let events = events.clone();
-                    async move {
-                        if request.get("id").is_some() {
-                            let result = if request["method"] == "tools/list" {
-                                serde_json::json!({"tools": [
-                                    {"name": "get_news", "inputSchema": {"type": "object"}},
-                                    {"name": "summarize", "inputSchema": {"type": "object"}}
-                                ]})
-                            } else {
-                                serde_json::json!({"secret": "s"})
-                            };
-                            let answer = serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
-                            let _ = events
-                                .send(Event::default().data(answer.to_string()))
-                                .await;
-                        }
-                        axum::http::StatusCode::ACCEPTED
-                    }
-                }),
-            )
-            .fallback(|| async { axum::http::StatusCode::METHOD_NOT_ALLOWED });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await });
-        url
-    }
-
     /// An MCP surface on `target` with `target_extra` merged into its Target.
     fn mcp_surface(
         target: &str,
@@ -543,6 +498,21 @@ mod tests {
         policy_manager: Arc<crate::policies::SurfacePolicyManager>,
         method: &str,
     ) -> (axum::http::StatusCode, String) {
+        send_mcp_message(
+            surface,
+            policy_manager,
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": {}}),
+        )
+        .await
+    }
+
+    /// Sends the JSON-RPC `message` to the MCP Access Point of `surface` under
+    /// `policy_manager`, and returns the status and body.
+    async fn send_mcp_message(
+        surface: crate::config::agent_surface::AgentSurface,
+        policy_manager: Arc<crate::policies::SurfacePolicyManager>,
+        message: serde_json::Value,
+    ) -> (axum::http::StatusCode, String) {
         let mut router = super::super::variant_routing_tests::router(surface);
         router.policy_manager = Some(policy_manager);
         let request = axum::http::Request::builder()
@@ -551,9 +521,7 @@ mod tests {
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
             .header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION)
-            .body(axum::body::Body::from(
-                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": {}}).to_string(),
-            ))
+            .body(axum::body::Body::from(message.to_string()))
             .unwrap();
         let response = Box::pin(super::super::multi_channel_proxy_handler_with_mcp_runtime(
             "127.0.0.1:12345"
@@ -574,7 +542,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_response_policy_refuses_an_answer_from_a_legacy_sse_session() {
-        let target = legacy_sse_only_target().await;
+        let target = crate::proxy::response_policy::test_targets::legacy_sse_only_target().await;
         let surface =
             mcp_surface(&target, serde_json::json!({"response_policy": {"policy_definition_id": "deny-responses"}}));
 
@@ -587,7 +555,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_tool_gating_hides_a_tool_from_a_legacy_sse_tools_list() {
-        let target = legacy_sse_only_target().await;
+        let target = crate::proxy::response_policy::test_targets::legacy_sse_only_target().await;
         let surface = mcp_surface(
             &target,
             serde_json::json!({"mcp_tool_gating": {"default_effect": "deny", "gates": [
@@ -605,6 +573,32 @@ mod tests {
         assert_eq!(status, axum::http::StatusCode::OK, "{body}");
         assert!(body.contains("get_news"), "{body}");
         assert!(!body.contains("summarize"), "a gated tool reached the caller: {body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tools_list_notification_to_a_legacy_sse_only_target_gets_no_tool_list_under_gating() {
+        let target = crate::proxy::response_policy::test_targets::legacy_sse_only_target().await;
+        let surface = mcp_surface(
+            &target,
+            serde_json::json!({"mcp_tool_gating": {"default_effect": "deny", "gates": [
+                {"id": "allow-news", "action": {"effect": "allow", "patterns": ["^get_news$"]}}
+            ]}}),
+        );
+        let manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+        manager
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+
+        let (status, body) = send_mcp_message(
+            surface,
+            manager,
+            serde_json::json!({"jsonrpc": "2.0", "method": "tools/list", "params": {}}),
+        )
+        .await;
+
+        assert_eq!(status, axum::http::StatusCode::NO_CONTENT, "{body}");
+        assert_eq!(body, "", "a notification is answered with nothing");
     }
 
     #[test]
@@ -653,6 +647,105 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_mcp_proxy_answer_without_a_policy_manager_is_delivered_and_recorded_as_unchecked() {
+        use crate::delegation_vault::audit::DelegationAuditAction;
+        use crate::mcp_proxies::filesystem::McpProxyStore;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::mcp_proxies::FileSystemMcpProxyStore::new(directory.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let spec = serde_json::json!({"openapi": "3.0.0", "info": {"title": "Tools", "version": "1.0"}, "paths": {
+            "/alpha": {"get": {"operationId": "alpha", "summary": "Alpha tool", "responses": {"200": {"description": "OK"}}}}
+        }});
+        let proxy = crate::mcp_proxies::types::McpProxy::new(
+            "Owned tools".into(),
+            String::new(),
+            "https://example.com".into(),
+            spec.to_string(),
+            "/mcp".into(),
+            "/owned-tools".into(),
+        );
+        store
+            .create(&proxy)
+            .await
+            .unwrap();
+        let surface = mcp_surface(
+            &format!("proxy://{}", proxy.id),
+            serde_json::json!({"response_policy": {"policy_definition_id": "deny-responses"}}),
+        );
+        let mut router = super::super::variant_routing_tests::router(surface);
+        router.mcp_proxy_store = Some(store);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION)
+            .body(axum::body::Body::from(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).to_string(),
+            ))
+            .unwrap();
+
+        let (response, events) =
+            crate::audit::producer::capture(Box::pin(super::super::multi_channel_proxy_handler_with_mcp_runtime(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                router,
+                request,
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                None,
+            )))
+            .await;
+
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert!(body.contains("alpha"), "{body}");
+        let decisions: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                DelegationAuditAction::PolicyDecision {
+                    scope, decision, deny_reason, ..
+                } if scope == "response" => Some((decision.clone(), deny_reason.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(decisions, vec![("error".to_string(), Some("no_policy_manager".to_string()))]);
+    }
+
+    #[tokio::test]
+    async fn a_peer_event_stream_of_only_keep_alives_goes_back_with_no_decision() {
+        let state = state(surface(Some("deny-responses")), Some(deny_all_manager())).await;
+        let policy = DirectResponsePolicy::for_request(&state, request()).unwrap();
+        let headers = serde_json::json!({"content-type": "text/event-stream"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let mut body = ": keep-alive\n\nid: 3\n\n".to_string();
+        let collector = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let refusal = crate::observability::policy_audit::POLICY_DECISION_COLLECTOR
+            .scope(collector.clone(), policy.refusal_of_peer_answer(200, &mut body, &headers))
+            .await;
+
+        assert!(refusal.is_none());
+        assert!(
+            collector
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(body, "\n\n");
+    }
+
     #[tokio::test]
     async fn a_direct_answer_framed_as_an_event_stream_is_checked_whole() {
         let manager = crate::policies::SurfacePolicyManager::new();
@@ -661,17 +754,24 @@ mod tests {
             .unwrap();
         let state = state(surface(Some("deny-responses")), Some(Arc::new(manager))).await;
         let policy = DirectResponsePolicy::for_request(&state, request()).unwrap();
-        let body = b"data: not json\n\n";
+        let body = "data: not json\n\n";
 
         assert!(
             policy
-                .refusal(200, body, Some("text/event-stream"))
+                .refusal(200, body.as_bytes(), Some("text/event-stream"))
                 .await
                 .is_none()
         );
         assert!(
             policy
-                .refusal_of_fabric_answer(200, body, Some("text/event-stream"))
+                .refusal_of_peer_answer(
+                    200,
+                    &mut body.to_string(),
+                    &serde_json::json!({"Content-Type": ["text/event-stream"]})
+                        .as_object()
+                        .unwrap()
+                        .clone()
+                )
                 .await
                 .is_some()
         );

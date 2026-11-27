@@ -130,7 +130,7 @@ impl FabricResponsePolicy {
             return pass_without_policy_manager(&self.policy_id, context);
         };
         let Some(responses) = responses else {
-            return refuse_unreadable_answer(&self.policy_id, context);
+            return refuse_unreadable_answer(policy_manager, &self.policy_id, context).await;
         };
         let inputs = responses
             .into_iter()
@@ -140,16 +140,17 @@ impl FabricResponsePolicy {
 
     /// The `403` the peer gets when the policy refuses a whole Target answer
     /// with `status`, `body` and `content_type`, or `None` when it may go back.
-    /// An answer still framed as an event stream (an A2A one) is checked event
-    /// by event, as a direct caller's is.
+    /// An answer still framed as an event stream (an A2A one) is first reduced
+    /// in `body` to the lines the peer receives, then checked event by event,
+    /// as a direct caller's is.
     pub(super) async fn refusal_of_buffered(
         &self,
         status: u16,
-        body: &str,
+        body: &mut String,
         content_type: Option<&str>,
     ) -> Option<ProcessingResult> {
         if self
-            .check_each(answer_contexts(status, body.as_bytes(), content_type))
+            .check_each(answer_contexts(status, body, content_type))
             .await
             .allow
         {
@@ -427,6 +428,197 @@ mod tests {
         assert_eq!(settled, vec![SettleAction::Void]);
     }
 
+    /// `surface` with `target_extra` merged into its Target.
+    fn with_target(
+        surface: crate::config::agent_surface::AgentSurface,
+        target_extra: serde_json::Value,
+    ) -> crate::config::agent_surface::AgentSurface {
+        let mut surface = serde_json::to_value(surface).unwrap();
+        if let (Some(target), Some(extra)) = (surface["target"].as_object_mut(), target_extra.as_object()) {
+            target.extend(extra.clone());
+        }
+        serde_json::from_value(surface).unwrap()
+    }
+
+    type Received = (serde_json::Value, Vec<crate::observability::policy_audit::PolicyDecisionSummary>);
+
+    /// `sends` Fabric receives of the JSON-RPC `method` call to `surface`, one
+    /// after another under `policies`, each with the policy decisions it
+    /// recorded. Against a Legacy SSE-only Target the first opens the session
+    /// and the next ones reuse it.
+    async fn receive_mcp(
+        surface: &crate::config::agent_surface::AgentSurface,
+        policies: crate::policies::SurfacePolicyManager,
+        method: &str,
+        sends: usize,
+    ) -> Vec<Received> {
+        use super::super::fabric_transit_tests::{CALLER_KEY, forward_request, forward_response, receiver};
+
+        super::super::init_policy_manager(std::sync::Arc::new(policies)).await;
+        let root = tempfile::tempdir().unwrap();
+        let _receiver = receiver(root.path(), surface).await;
+        let mut received = Vec::new();
+        for _ in 0..sends {
+            let message = forward_request(
+                root.path(),
+                serde_json::json!({ "x-api-key": CALLER_KEY, "content-type": "application/json",
+                    "accept": "application/json, text/event-stream" }),
+                serde_json::json!({ "jsonrpc": "2.0", "id": 7, "method": method, "params": {} }),
+            );
+            let collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let response = crate::observability::policy_audit::POLICY_DECISION_COLLECTOR
+                .scope(collector.clone(), forward_response(&message))
+                .await;
+            let decisions = collector
+                .lock()
+                .unwrap()
+                .clone();
+            received.push((response, decisions));
+        }
+        received
+    }
+
+    /// The `(decision, flow)` of each response policy record in `decisions`.
+    fn response_decisions(
+        decisions: &[crate::observability::policy_audit::PolicyDecisionSummary]
+    ) -> Vec<(&'static str, &'static str)> {
+        decisions
+            .iter()
+            .filter(|decision| decision.scope == "response")
+            .map(|decision| (decision.decision, decision.flow))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_response_policy_refuses_a_legacy_sse_answer_to_a_fabric_caller() {
+        use super::super::fabric_transit_tests::{ran_in_child, surface};
+
+        if ran_in_child("ATG_FABRIC_LEGACY_SSE_RESPONSE_POLICY_CHILD").await {
+            return;
+        }
+        let target = crate::proxy::response_policy::test_targets::legacy_sse_only_target().await;
+        let served = with_target(
+            surface("mcp", &target, &[]),
+            serde_json::json!({"response_policy": {"policy_definition_id": "deny-every-response"}}),
+        );
+        let policies = crate::policies::SurfacePolicyManager::new();
+        policies
+            .load_policy_text("response:deny-every-response", "package surface.policy\n\ndefault allow := false\n")
+            .unwrap();
+
+        for (response, decisions) in receive_mcp(&served, policies, "tools/call", 2).await {
+            assert_eq!(response["status"], 403, "{response}");
+            assert!(
+                response
+                    .to_string()
+                    .contains("response_policy_denied"),
+                "{response}"
+            );
+            assert_eq!(response_decisions(&decisions), vec![("deny", "fabric")]);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_tool_gating_hides_a_tool_from_a_legacy_sse_tools_list_sent_over_fabric() {
+        use super::super::fabric_transit_tests::{ran_in_child, surface};
+
+        if ran_in_child("ATG_FABRIC_LEGACY_SSE_GATING_CHILD").await {
+            return;
+        }
+        let target = crate::proxy::response_policy::test_targets::legacy_sse_only_target().await;
+        let served = with_target(
+            surface("mcp", &target, &[]),
+            serde_json::json!({"mcp_tool_gating": {"default_effect": "deny", "gates": [
+                {"id": "allow-news", "action": {"effect": "allow", "patterns": ["^get_news$"]}}
+            ]}}),
+        );
+        let policies = crate::policies::SurfacePolicyManager::new();
+        policies
+            .update_channel_policy(&served)
+            .await
+            .unwrap();
+
+        for (response, decisions) in receive_mcp(&served, policies, "tools/list", 2).await {
+            assert_eq!(response["status"], 200, "{response}");
+            let body = response["body"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(body.contains("get_news"), "{response}");
+            assert!(!body.contains("summarize"), "a gated tool reached the peer: {response}");
+            let filtering = decisions
+                .iter()
+                .find(|decision| decision.scope == "mcp_tool_list")
+                .unwrap_or_else(|| panic!("no tools/list filtering record: {decisions:?}"));
+            assert_eq!(filtering.flow, "fabric");
+        }
+    }
+
+    /// The Fabric receive of a `tools/call` to an MCP surface whose response
+    /// policy denies an answer carrying `stamped-by-gateway`, with that stamp
+    /// added as response custom metadata when `stamped`.
+    async fn receive_under_a_policy_denying_the_stamp(stamped: bool) -> Received {
+        use super::super::fabric_transit_tests::surface;
+
+        let app = axum::Router::new().fallback(|| async {
+            axum::Json(serde_json::json!({"jsonrpc": "2.0", "id": 7, "result": {"content": []}}))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let target = format!("http://{}", listener.local_addr().unwrap());
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .ok();
+        });
+        let mut target_extra = serde_json::json!({"response_policy": {"policy_definition_id": "deny-stamped"}});
+        if stamped {
+            target_extra["response_custom_metadata"] = serde_json::json!({"enabled": true,
+                "payload": {"stamp": "stamped-by-gateway"}, "injection_target": "meta"});
+        }
+        let served = with_target(surface("mcp", &target, &[]), target_extra);
+        let policies = crate::policies::SurfacePolicyManager::new();
+        policies
+            .load_policy_text(
+                "response:deny-stamped",
+                "package surface.policy\n\ndefault allow := true\n\nallow := false if {\n    contains(json.marshal(input.response.body), \"stamped-by-gateway\")\n}\n",
+            )
+            .unwrap();
+        receive_mcp(&served, policies, "tools/call", 1)
+            .await
+            .remove(0)
+    }
+
+    #[tokio::test]
+    async fn a_response_policy_over_fabric_sees_the_response_custom_metadata() {
+        if super::super::fabric_transit_tests::ran_in_child("ATG_FABRIC_RESPONSE_METADATA_POLICY_CHILD").await {
+            return;
+        }
+
+        let (response, decisions) = receive_under_a_policy_denying_the_stamp(true).await;
+
+        assert_eq!(response["status"], 403, "{response}");
+        assert!(
+            response
+                .to_string()
+                .contains("response_policy_denied"),
+            "{response}"
+        );
+        assert_eq!(response_decisions(&decisions), vec![("deny", "fabric")]);
+    }
+
+    #[tokio::test]
+    async fn an_answer_without_the_metadata_a_fabric_response_policy_denies_goes_back() {
+        if super::super::fabric_transit_tests::ran_in_child("ATG_FABRIC_RESPONSE_UNSTAMPED_POLICY_CHILD").await {
+            return;
+        }
+
+        let (response, decisions) = receive_under_a_policy_denying_the_stamp(false).await;
+
+        assert_eq!(response["status"], 200, "{response}");
+        assert_eq!(response_decisions(&decisions), vec![("allow", "fabric")]);
+    }
+
     #[test]
     fn only_the_public_agent_card_skips_the_response_policy_over_fabric() {
         assert!(answers_with_public_agent_card("GET", "/a2a/.well-known/agent-card.json", false, false));
@@ -552,6 +744,36 @@ mod tests {
                 .as_deref(),
             Some("no_policy_manager")
         );
+    }
+
+    #[tokio::test]
+    async fn a_fabric_event_stream_answer_of_only_keep_alives_goes_back_with_no_decision() {
+        let manager = crate::policies::SurfacePolicyManager::new();
+        manager
+            .load_policy_text("response:base-response", "package surface.policy\n\ndefault allow := false\n")
+            .unwrap();
+        let policy = FabricResponsePolicy::for_request(&served(None), fabric_response_request()).unwrap();
+        let mut body = ": keep-alive\n\nretry: 100\n\n".to_string();
+        let collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let decision = crate::observability::policy_audit::POLICY_DECISION_COLLECTOR
+            .scope(
+                collector.clone(),
+                policy.check_each_with(
+                    Some(&manager),
+                    crate::proxy::response_policy::answer_contexts(200, &mut body, Some("text/event-stream")),
+                ),
+            )
+            .await;
+
+        assert!(decision.allow);
+        assert!(
+            collector
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(body, "\n\n");
     }
 
     async fn fabric_response_checked(

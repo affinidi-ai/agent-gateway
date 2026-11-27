@@ -1417,6 +1417,17 @@ pub async fn actor_received_one_forwarded_message(
     );
 }
 
+#[then(expr = "non-A2A managed agent {string} received text {string}")]
+pub async fn non_a2a_managed_agent_received_text(
+    world: &mut G2gWorld,
+    agent_name: String,
+    expected_text: String,
+) {
+    let (_, _, mock) = mock_for(world, &agent_name);
+    let requests = mock.requests().await;
+    crate::bdd_support::assertions::assert_direct_line_activity_text(&requests, &agent_name, &expected_text);
+}
+
 #[then(regex = r#"^managed agent "([^"]+)" did not receive a forwarded message$"#)]
 pub async fn actor_did_not_receive_forwarded_message(
     world: &mut G2gWorld,

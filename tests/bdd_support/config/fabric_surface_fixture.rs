@@ -1,3 +1,4 @@
+use crate::bdd_support::config::a2a_proxy::A2aProxyFixture;
 use crate::bdd_support::config::mcp_proxy::McpProxyFixture;
 use crate::bdd_support::config::single_surface_fixture::{
     McpToolPolicyFixture, ResponseAuthFixture, SurfaceTargetAuthConfig, SurfaceTargetAuthProviderConfig,
@@ -13,6 +14,8 @@ pub type TargetAuthSpec = SurfaceTargetAuthConfig;
 pub type McpToolPolicySpec = McpToolPolicyFixture;
 
 pub type McpProxySpec = McpProxyFixture;
+
+pub type A2aProxySpec = A2aProxyFixture;
 
 #[derive(Debug, Clone)]
 pub struct SurfaceSpec {
@@ -44,6 +47,9 @@ pub struct SurfaceSpec {
     pub inbound_identity_from_api_key: bool,
     pub mcp_tool_policy: Option<McpToolPolicySpec>,
     pub mcp_proxy: Option<McpProxySpec>,
+    /// The `a2a-proxy://` Target's proxy, whose Direct Line backend the harness serves and
+    /// sets as `base_url` before the gateway starts.
+    pub a2a_proxy: Option<A2aProxySpec>,
     /// The target is a real upstream serving one path, not a harness mock.
     pub external_target: bool,
     pub transit_points: Vec<TransitPointSpec>,
@@ -138,6 +144,7 @@ impl SurfaceSpec {
             inbound_identity_from_api_key: false,
             mcp_tool_policy: None,
             mcp_proxy: None,
+            a2a_proxy: None,
             external_target: false,
             transit_points: Vec::new(),
             delegated_credentials: None,

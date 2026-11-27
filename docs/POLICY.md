@@ -890,10 +890,15 @@ event, each event's JSON as `input.response.body`, directly and over Fabric, and
 any event is denied or an event's data is not a JSON object. A direct stream records decisions
 as described under [Policy decision audit logging](#policy-decision-audit-logging). Over Fabric,
 and on the answer a surface with a `fabric://` Target gets back, any whole answer framed as an
-event stream is checked event by event and gets one decision: the first deny,
-`unreadable_event_stream` for an event that is not a JSON object or a line that is not an
-event-stream field, or one allow; a stream of only comments and fields with no data event
-(keep-alive comments) has nothing to check and gets none. A direct answer that reaches the
+event stream is first cut down to the lines the caller receives (its `data` and `event` fields
+and the blank lines between events; comments, `id`, `retry` and any other line are dropped, as a
+direct A2A stream drops them), then checked event by event, and gets one decision: the first deny, `unreadable_event_stream`
+(naming the policy, its version and hash) for an event that is not a JSON object, or one allow.
+A stream with no data event left (keep-alive comments only, or a JSON body labelled as an event
+stream) has nothing to check, gets no decision and reaches the caller with no content. The answer
+is cut down only on a surface with a response policy; without one it is relayed as received. In
+practice this reaches A2A answers: Fabric receive turns an MCP event stream into JSON before the
+policy sees it. A direct answer that reaches the
 response policy whole is checked whole. On an HTTP Target, directly, over Fabric and on the
 `fabric://` send side, the policy sees the answer after MCP tool gating and after the surface's
 response custom metadata is added, and before the gateway adds a payment receipt. On a `tools/list` answer the
@@ -907,9 +912,11 @@ card path (the path without its query), or a `GET` of the surface's configured c
 that is sent to the card URL, skips the policy. Any other method to a card path, and a
 configured card location sent to an ordinary Target route, are checked. Other discovery
 documents and an extended agent card are checked. A surface with a `fabric://` Target checks
-what the peer gateway
-sends back, except an answer the peer marks with an `error` field and a `402`, which it relays
-as they come. The peer gateway's own refusals (a `403` from its request policy, a `401`, a `429`
+every body the peer gateway sends back that it relays to the caller: the answer, a `402`
+payment challenge, and, on an MCP surface, a JSON-RPC body the peer marks with an `error` field.
+An error the sending gateway writes itself for an answer marked with an `error` field is not
+checked; it carries the peer's `error` text as its message, and on an A2A surface the peer's
+status. The peer gateway's own refusals (a `403` from its request policy, a `401`, a `429`
 or a `503`) carry no such mark, so the sending surface's response policy checks them as error
 answers (`input.response.is_error`); a policy that denies by default refuses them with its own
 `403`. A refusal by the sending surface does not void a payment the receiving surface already
@@ -917,8 +924,9 @@ captured for the answer. A denied answer is refused with `403 response_policy_de
 or, on an MCP Proxy Target, with a JSON-RPC `-32000` error that carries the deny reason. A
 denied modern MCP result ends its stream when the Target answered with an event stream, and is
 refused with `502` when it answered with a single JSON response. Without a policy manager to
-evaluate it with, the answer goes back unchecked, logged at error level and recorded as an
-`error` decision (`no_policy_manager`). On a request received over Fabric `input.caller.did` is
+evaluate it with, a buffered answer goes back unchecked, logged at error level and recorded as an
+`error` decision (`no_policy_manager`); unlike every other `error` decision, this one means the
+answer was delivered. On a request received over Fabric `input.caller.did` is
 set only when a presentation from one of the peer's connection issuers carried it, and
 `input.caller.identity_source` is `fabric-presentation` or `fabric-asserted`, so a policy
 written for direct callers may refuse Fabric callers. The decision is recorded with flow
@@ -1562,7 +1570,9 @@ Every OPA evaluation emits a structured `tracing` event via
 `policy_content_hash`. See `src/observability/policy_audit.rs`.
 
 `policy_decision` is `allow`, `deny`, or `error`. `error` means the policy could not decide
-and the request was denied (fail closed); `deny_reason` is then `evaluation_error` (the Rego
+and the request was denied (fail closed), except a response policy's `no_policy_manager` on a
+buffered answer, which was delivered unchecked (see the response policy paragraph under
+[Caller in Transit Point policy input](#caller-in-transit-point-policy-input)); `deny_reason` is then `evaluation_error` (the Rego
 raised an error), `no_policy_manager` (no policy engine is available) or
 `policy_not_compiled` (OPA is enabled for the surface but no compiled policy is loaded). These
 are recorded on the gateway, access-point inbound, surface and MCP tool policies on the direct,
@@ -1571,9 +1581,11 @@ and on response policies, and logged at `WARN`. The engine's error text stays in
 it is not put in the audit record or the response to the caller.
 
 Response policies record every outcome: `allow` when the response is passed on, `deny` when it is
-blocked, and `error` when the policy could not decide. On an A2A event stream the policy is
+blocked, and `error` when the policy could not decide. On a direct A2A event stream the policy is
 evaluated on every event, and the stream records one `allow` (on its first event) plus the `deny`
-or `error` that ends it; see [Event streams](PROTOCOLS.md#event-streams).
+or `error` that ends it; see [Event streams](PROTOCOLS.md#event-streams). A buffered event-stream
+answer, over Fabric or on a `fabric://` Target, records one decision, or none when it carries no
+data event.
 
 MCP tool gating that takes tools out of a `tools/list` response is recorded as one decision with
 scope `mcp_tool_list` and decision `allow` (the list itself was served). `removed_tools` lists the

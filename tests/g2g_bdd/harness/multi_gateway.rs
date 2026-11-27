@@ -1125,8 +1125,18 @@ async fn spawn_node(
         })
         .unwrap_or_default();
     let mut surfaces = plan.surfaces.clone();
+    let mut extra_env: HashMap<String, String> = HashMap::new();
     for surface in surfaces.iter_mut() {
-        if let Some(response) = plan
+        if let Some(proxy) = &mut surface.a2a_proxy {
+            let mock =
+                MockServer::start_direct_line(serde_json::json!({ "agent": surface.surface_id.clone() }).to_string())
+                    .await;
+            proxy.base_url = format!("{}/v3/directline", mock.url());
+            // The A2A proxy dial refuses loopback backends unless the gateway's
+            // dev/test hatch is on.
+            extra_env.insert("AG_ALLOW_LOCAL_A2A_PROXY".to_string(), "true".to_string());
+            mocks.insert(surface.surface_id.clone(), mock);
+        } else if let Some(response) = plan
             .mock_responses
             .get(&surface.surface_id)
         {
@@ -1217,7 +1227,6 @@ async fn spawn_node(
     if let Some(reservation) = &mut outbound_port_reservation {
         reservation.release_listener();
     }
-    let mut extra_env: HashMap<String, String> = HashMap::new();
     if !egress_allowlist.is_empty() {
         extra_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), egress_allowlist.join(","));
     }

@@ -25,26 +25,38 @@ changes:
         recorded. Review response policies for Fabric callers before
         upgrading: their input.caller differs from a direct caller's (see docs/POLICY.md), so a
         policy that allows by caller DID or identity source may start refusing peers. Those
-        refusals show in the Audit Log with via_fabric true. When a surface has a response policy
-        but the gateway has no policy manager to evaluate it with, the answer still goes back, now
-        logged at error level and recorded as a no_policy_manager error decision on every path,
-        including direct HTTP and MCP Proxy Targets, which skipped it silently before.
+        refusals show in the Audit Log with via_fabric true.
+    - timestamp: '2026-11-25T18:00:00Z'
+      title: Record a response policy that could not run for want of a policy manager
+      description: >-
+        When a surface has a response policy but the gateway has no policy manager to evaluate it
+        with, a buffered answer still goes back unchecked, now logged at error level and recorded
+        as a no_policy_manager error decision on direct HTTP, Legacy SSE and MCP Proxy Targets,
+        over Fabric and on the answer a surface with a fabric:// Target gets back, where it was
+        skipped silently before. Unlike other error decisions, this one means the
+        answer was delivered.
     - timestamp: '2026-11-25T18:00:00Z'
       title: Apply the response policy of a surface with a fabric:// Target
       description: >-
-        A surface whose Target is fabric:// now runs its own response policy on the answer the peer
-        gateway sends back, refusing it with 403 response_policy_denied when the policy denies it.
-        Before, the sending surface's own response policy never ran on that answer. The peer's
-        empty 202 acknowledgement of a notification is not checked. A response
-        policy already set on such a surface starts running on upgrade, including on the peer
-        gateway's own refusals, so review it first.
+        A surface whose Target is fabric:// now runs its own response policy on every body the peer
+        gateway sends back that it relays to the caller (the answer, a 402 payment challenge, and
+        on MCP a JSON-RPC error body), refusing it with 403 response_policy_denied when the policy
+        denies it. Before, the sending surface's own response policy never ran on these. Errors
+        the sending gateway writes itself, which carry the peer's error text, and the peer's empty
+        202 acknowledgement of a notification are not checked. A response policy already set on such a surface starts
+        running on upgrade, including on the peer gateway's own refusals, so review it first.
     - timestamp: '2026-11-25T18:00:00Z'
       title: Check each event of a streamed A2A answer sent back over Fabric
       description: >-
         An A2A answer framed as an event stream that the gateway returns over Fabric, or that a
-        surface with a fabric:// Target gets back, reaches the response policy event by event, each
-        event's JSON as input.response.body, as a direct caller's stream does. The answer is refused
-        when an event is denied or its data is not a JSON object.
+        surface with a fabric:// Target gets back, is first cut down to the lines a caller receives
+        (data and event fields and the blank lines between events), then reaches the response
+        policy event by event, each event's JSON as input.response.body, as a direct caller's
+        stream does. The answer is refused when an event is denied or its data is not a JSON
+        object. Comments, id, retry and any other line are dropped rather than relayed unchecked,
+        as a direct A2A stream drops them, and a stream with no data event left, such as keep-alive
+        comments only, gets no decision. A surface without a response policy relays the stream as
+        received.
     - timestamp: '2026-11-25T18:00:00Z'
       title: Apply a surface's response policy to a2a-proxy Target answers
       description: >-
@@ -66,7 +78,7 @@ changes:
         A tools/list answer now has the tools MCP tool gating hides from the caller removed when it
         comes from an MCP Proxy Target over Fabric, or from an MCP Target through a Legacy SSE
         session, directly or over Fabric; a direct Legacy SSE answer also gets the surface's
-        per-tool policies, as a plain POST answer does. A tools/list answer that cannot be read
-        while gating is configured is replaced with an empty tool list. Before, those answers listed
+        per-tool policies, as a plain POST answer does. A Legacy SSE tools/list answer that cannot
+        be read while gating is configured is replaced with an empty tool list. Before, those answers listed
         every tool, including ones the gating meant to hide.
   breaking: []

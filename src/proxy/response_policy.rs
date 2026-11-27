@@ -232,39 +232,44 @@ pub fn response_context(
     }
 }
 
-/// What a response policy sees of each event of a buffered `text/event-stream`
-/// answer with `status`: one context per event that carries data, with that
-/// event's JSON object as the body, as a direct caller's event stream is
-/// checked. Empty when `body` is only comments and fields with no data event,
-/// and `None` when it holds a line that is not an event-stream field or when an
-/// event's data is not a JSON object, which a direct caller's stream refuses too.
-pub fn event_stream_contexts(
-    status: u16,
-    body: &[u8],
-) -> Option<Vec<ResponseContext>> {
-    let text = String::from_utf8_lossy(body)
+/// The lines of a buffered `text/event-stream` answer a caller receives: its
+/// `data` and `event` fields and the blank lines that end its events. Comments,
+/// `id`, `retry`, unknown fields and anything else are dropped, as they are from
+/// a direct A2A caller's stream, which is rebuilt from its parsed events.
+fn relayed_event_stream(body: &str) -> String {
+    let text = body
         .replace("\r\n", "\n")
         .replace('\r', "\n");
     let text = text
         .strip_prefix('\u{feff}')
         .unwrap_or(&text);
-    let is_event_stream_line = |line: &str| {
+    let is_relayed = |line: &str| {
         line.is_empty()
-            || line.starts_with(':')
-            || ["data", "event", "id", "retry"]
+            || ["data", "event"]
                 .iter()
                 .any(|field| {
                     line.strip_prefix(field)
                         .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
                 })
     };
-    if !text
-        .lines()
-        .all(is_event_stream_line)
-    {
-        return None;
-    }
-    text.split("\n\n")
+    text.lines()
+        .filter(|line| is_relayed(line))
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+/// What a response policy sees of each event of `relayed`, a buffered
+/// `text/event-stream` answer with `status` already reduced by
+/// [`relayed_event_stream`]: one context per event that carries data, with that
+/// event's JSON object as the body, as a direct caller's event stream is
+/// checked. Empty when no event carries data, and `None` when an event's data
+/// is not a JSON object, which a direct caller's stream refuses too.
+fn event_stream_contexts(
+    status: u16,
+    relayed: &str,
+) -> Option<Vec<ResponseContext>> {
+    relayed
+        .split("\n\n")
         .filter_map(|event| {
             let data: Vec<&str> = event
                 .lines()
@@ -295,21 +300,23 @@ pub fn event_stream_contexts(
         .collect()
 }
 
-/// What a response policy sees of a whole Target answer with `status`, `body`
-/// and `content_type`: one context per event when it is still framed as an
-/// event stream (see [`event_stream_contexts`]), none when that stream carries
-/// no data event (nothing reaches the caller to check), otherwise one for the
-/// answer. `None` when an event of the stream is not a JSON object.
+/// Prepares a whole Target answer with `status` and `content_type` for its
+/// response policy. An answer still framed as an event stream is first reduced
+/// to the lines a caller receives ([`relayed_event_stream`]), in `body`, and
+/// gives one context per event ([`event_stream_contexts`]), none when no data
+/// event is left (nothing reaches the caller to check); any other answer gives
+/// one context. `None` when an event of the stream is not a JSON object.
 pub fn answer_contexts(
     status: u16,
-    body: &[u8],
+    body: &mut String,
     content_type: Option<&str>,
 ) -> Option<Vec<ResponseContext>> {
     match content_type {
         Some(content_type) if crate::mcp::sse_transport::is_sse_content_type(content_type) => {
+            *body = relayed_event_stream(body);
             event_stream_contexts(status, body)
         }
-        _ => Some(vec![response_context(status, body, content_type)]),
+        _ => Some(vec![response_context(status, body.as_bytes(), content_type)]),
     }
 }
 
@@ -345,19 +352,29 @@ pub fn pass_without_policy_manager(
 /// its events is not JSON.
 pub const UNREADABLE_EVENT_REASON: &str = "unreadable_event_stream";
 
-/// Records the refusal of an event-stream answer one of whose events is not
-/// JSON, under response policy `policy_id` with the request fields `context`
-/// carries, and returns that refusal.
-pub fn refuse_unreadable_answer(
+/// Records the refusal of an event-stream answer one of whose events is not a
+/// JSON object, under response policy `policy_id` (named, versioned and hashed
+/// as every response decision is) with the request fields `context` carries,
+/// and returns that refusal.
+pub async fn refuse_unreadable_answer(
+    policy_manager: &crate::policies::surface_manager::SurfacePolicyManager,
     policy_id: &str,
     context: crate::observability::PolicyDecisionEvent<'_>,
 ) -> ResponsePolicyDecision {
+    let attestation = policy_manager
+        .resolve_policy_attestation(Some(policy_id))
+        .await;
     crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
         scope: crate::observability::PolicyScope::Response,
         allow: false,
         reason: Some(UNREADABLE_EVENT_REASON),
         policy_id: Some(policy_id),
         policy_definition_id: Some(policy_id),
+        policy_name: attestation.name.as_deref(),
+        policy_version: attestation.version,
+        policy_content_hash: attestation
+            .content_hash
+            .as_deref(),
         ..context
     });
     ResponsePolicyDecision {
@@ -861,11 +878,16 @@ mod tests {
         assert_eq!(denied, None);
     }
 
+    /// The contexts a response policy gets for `body` answered as an event stream.
+    fn stream_contexts(body: &[u8]) -> Option<Vec<ResponseContext>> {
+        answer_contexts(200, &mut String::from_utf8_lossy(body).into_owned(), Some("text/event-stream"))
+    }
+
     #[test]
     fn each_data_event_of_an_event_stream_is_its_own_context() {
         let body = b"event: message\r\ndata: {\"id\":1,\"result\":{\"kind\":\"task\"}}\r\n\r\n: keep-alive\n\ndata: {\"id\":1,\"error\":{\"code\":-1}}\n\n";
 
-        let contexts = event_stream_contexts(200, body).unwrap();
+        let contexts = stream_contexts(body).unwrap();
 
         assert_eq!(contexts.len(), 2);
         assert_eq!(contexts[0].body, Some(serde_json::json!({"id": 1, "result": {"kind": "task"}})));
@@ -880,20 +902,45 @@ mod tests {
     }
 
     #[test]
-    fn only_comments_and_fields_give_no_contexts_and_anything_else_is_unreadable() {
-        assert!(
-            event_stream_contexts(200, b": keep-alive\n\nretry: 100\n\n").is_some_and(|contexts| contexts.is_empty())
+    fn only_data_and_event_lines_reach_the_caller() {
+        assert_eq!(
+            relayed_event_stream(
+                "\u{feff}: keep-alive\r\nid: 7\r\nretry: 100\r\nevent: message\r\ndata: {\"a\":1}\r\n\r\nsecret line\ndatum: x\ndata\n\n"
+            ),
+            "event: message\ndata: {\"a\":1}\n\ndata\n\n"
         );
-        assert!(event_stream_contexts(200, b"{\"result\":{\"secret\":\"s\"}}").is_none());
-        assert!(answer_contexts(200, b"{\"result\":{\"secret\":\"s\"}}", Some("text/event-stream")).is_none());
-        assert!(event_stream_contexts(200, b"data: {\"a\":1}\n\nsecret line\n\n").is_none());
+    }
+
+    #[test]
+    fn a_line_that_is_not_relayed_is_neither_checked_nor_sent() {
+        let mut body = "data: {\"a\":1}\n\nsecret line\n\n".to_string();
+
+        let contexts = answer_contexts(200, &mut body, Some("text/event-stream")).unwrap();
+
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(body, "data: {\"a\":1}\n\n\n");
+    }
+
+    #[test]
+    fn a_json_body_labelled_as_an_event_stream_sends_nothing() {
+        let mut body = "{\"result\":{\"secret\":\"s\"}}".to_string();
+
+        let contexts = answer_contexts(200, &mut body, Some("text/event-stream")).unwrap();
+
+        assert!(contexts.is_empty());
+        assert_eq!(body, "");
+    }
+
+    #[test]
+    fn only_comments_and_fields_give_no_contexts() {
+        assert!(stream_contexts(b": keep-alive\n\nretry: 100\n\n").is_some_and(|contexts| contexts.is_empty()));
     }
 
     #[test]
     fn a_leading_byte_order_mark_does_not_hide_the_first_event() {
         let body = "\u{feff}data: {\"result\":{\"secret\":\"s\"}}\n\n".as_bytes();
 
-        let contexts = event_stream_contexts(200, body).unwrap();
+        let contexts = stream_contexts(body).unwrap();
 
         assert_eq!(contexts.len(), 1);
         assert_eq!(contexts[0].body, Some(serde_json::json!({"result": {"secret": "s"}})));
@@ -903,15 +950,17 @@ mod tests {
     fn an_event_that_is_not_json_makes_the_stream_unreadable() {
         let body = b"data: {\"result\":{}}\n\ndata: not json\n\n";
 
-        assert!(event_stream_contexts(200, body).is_none());
-        assert!(answer_contexts(200, body, Some("text/event-stream")).is_none());
+        assert!(stream_contexts(body).is_none());
+        assert!(
+            answer_contexts(200, &mut String::from_utf8_lossy(body).into_owned(), Some("text/event-stream")).is_none()
+        );
     }
 
     #[test]
     fn an_event_stream_is_recognised_in_any_letter_case() {
-        let body = b"data: {\"result\":{\"a\":1}}\n\ndata: {\"result\":{\"b\":2}}\n\n";
+        let mut body = "data: {\"result\":{\"a\":1}}\n\ndata: {\"result\":{\"b\":2}}\n\n".to_string();
 
-        let contexts = answer_contexts(200, body, Some("Text/Event-Stream")).unwrap();
+        let contexts = answer_contexts(200, &mut body, Some("Text/Event-Stream")).unwrap();
 
         assert_eq!(contexts.len(), 2);
     }
@@ -940,7 +989,7 @@ mod tests {
             ("string event", b"data: \"s\"\n\n", None),
         ];
         for (name, body, expected) in cases {
-            let bodies = event_stream_contexts(200, body).map(|contexts| {
+            let bodies = stream_contexts(body).map(|contexts| {
                 contexts
                     .into_iter()
                     .map(|context| context.body.unwrap())
@@ -952,11 +1001,12 @@ mod tests {
 
     #[test]
     fn only_an_event_stream_answer_is_split_and_one_without_events_has_nothing_to_check() {
-        let lengths = |body: &[u8], content_type| answer_contexts(200, body, Some(content_type)).map(|c| c.len());
+        let lengths =
+            |body: &str, content_type| answer_contexts(200, &mut body.to_string(), Some(content_type)).map(|c| c.len());
 
-        assert_eq!(lengths(b": keep-alive\n\n", "text/event-stream"), Some(0));
-        assert_eq!(lengths(b"data: x\n\n", "application/json"), Some(1));
-        assert_eq!(lengths(b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\n", "text/event-stream"), Some(2));
+        assert_eq!(lengths(": keep-alive\n\n", "text/event-stream"), Some(0));
+        assert_eq!(lengths("data: x\n\n", "application/json"), Some(1));
+        assert_eq!(lengths("data: {\"a\":1}\n\ndata: {\"b\":2}\n\n", "text/event-stream"), Some(2));
     }
 
     #[tokio::test]
@@ -1019,14 +1069,51 @@ mod tests {
         assert_eq!(recorded[0].decision, "error");
     }
 
-    #[test]
-    fn refusing_an_unreadable_answer_records_a_deny() {
+    #[tokio::test]
+    async fn refusing_an_unreadable_answer_records_a_deny_naming_the_policy() {
         use crate::observability::policy_audit::POLICY_DECISION_COLLECTOR;
+        use crate::policies::policy_definitions::{PolicyDefinition, PolicyType};
+        let manager = manager_with(ALLOW_ALL);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            crate::policies::FileSystemPolicyDefinitionStore::new(
+                tmp.path()
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        store
+            .save(PolicyDefinition {
+                id: "pol-1".into(),
+                name: "No secrets".into(),
+                description: String::new(),
+                policy_type: PolicyType::AgentSurface,
+                policy: ALLOW_ALL.into(),
+                enabled: true,
+                created_at: "t".into(),
+                updated_at: None,
+                version: Some(3),
+                content_hash: Some("sha256:abc".into()),
+                sample_input: None,
+                tenant_id: None,
+            })
+            .await
+            .unwrap();
+        let stored = store
+            .get("pol-1")
+            .await
+            .unwrap();
+        manager.set_policy_definition_store(store);
         let collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        let decision = POLICY_DECISION_COLLECTOR.sync_scope(collector.clone(), || {
-            refuse_unreadable_answer("pol-1", crate::observability::PolicyDecisionEvent::default())
-        });
+        let decision = POLICY_DECISION_COLLECTOR
+            .scope(
+                collector.clone(),
+                refuse_unreadable_answer(&manager, "pol-1", crate::observability::PolicyDecisionEvent::default()),
+            )
+            .await;
 
         assert!(!decision.allow);
         let recorded = collector
@@ -1041,6 +1128,11 @@ mod tests {
                 .as_deref(),
             Some(UNREADABLE_EVENT_REASON)
         );
+        assert_eq!(recorded[0].policy_name, "No secrets");
+        assert!(stored.version.is_some());
+        assert_eq!(recorded[0].policy_version, stored.version);
+        assert!(stored.content_hash.is_some());
+        assert_eq!(recorded[0].policy_content_hash, stored.content_hash);
     }
 
     fn input_with_body(body: Value) -> ResponsePolicyInput {
@@ -1123,5 +1215,75 @@ mod tests {
     fn test_response_policy_key() {
         assert_eq!(response_policy_key("surf-001"), "response:surf-001");
         assert_eq!(response_policy_key("abc-123-def"), "response:abc-123-def");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_targets {
+    use std::sync::Arc;
+
+    /// A Target that refuses the plain POST with `405`, so an MCP forward falls
+    /// back to Legacy SSE, and answers over its Legacy SSE session (a `GET` of
+    /// any path ending in `/sse`): a `tools/list` with the tools `get_news` and
+    /// `summarize`, any other request with a result naming a secret.
+    pub(crate) async fn legacy_sse_only_target() -> String {
+        use axum::response::IntoResponse;
+        use axum::response::sse::{Event, Sse};
+        use futures::StreamExt;
+
+        let (events, receiver) = tokio::sync::mpsc::channel::<Event>(16);
+        let receiver = Arc::new(tokio::sync::Mutex::new(Some(receiver)));
+        let app = axum::Router::new()
+            .route(
+                "/messages",
+                axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                    let events = events.clone();
+                    async move {
+                        if request.get("id").is_some() {
+                            let result = if request["method"] == "tools/list" {
+                                serde_json::json!({"tools": [
+                                    {"name": "get_news", "inputSchema": {"type": "object"}},
+                                    {"name": "summarize", "inputSchema": {"type": "object"}}
+                                ]})
+                            } else {
+                                serde_json::json!({"secret": "s"})
+                            };
+                            let answer = serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
+                            let _ = events
+                                .send(Event::default().data(answer.to_string()))
+                                .await;
+                        }
+                        axum::http::StatusCode::ACCEPTED
+                    }
+                }),
+            )
+            .fallback(move |method: axum::http::Method, uri: axum::http::Uri| {
+                let receiver = receiver.clone();
+                async move {
+                    if method != axum::http::Method::GET || !uri.path().ends_with("/sse") {
+                        return axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response();
+                    }
+                    let Some(receiver) = receiver.lock().await.take() else {
+                        return axum::http::StatusCode::CONFLICT.into_response();
+                    };
+                    let endpoint = futures::stream::once(async {
+                        Event::default()
+                            .event("endpoint")
+                            .data("/messages")
+                    });
+                    Sse::new(
+                        endpoint
+                            .chain(tokio_stream::wrappers::ReceiverStream::new(receiver))
+                            .map(Ok::<_, std::convert::Infallible>),
+                    )
+                    .into_response()
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        url
     }
 }

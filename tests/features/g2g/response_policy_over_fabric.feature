@@ -40,12 +40,47 @@ Feature: Surface response policies over Fabric
     And the response says "response_policy_denied"
     And the VP Audit Log of gateway 2 records a response policy "deny" on the Fabric request
 
+  Scenario: A comment in a streamed A2A answer does not reach a Fabric caller past the response policy
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And managed agent "bravo" answers with an event stream carrying the comment "unchecked-note"
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And surface "alpha" has a response policy that allows every response
+    When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
+    Then the response status is 200
+    And the response says "delivered"
+    And the response does not say "unchecked-note"
+
   Scenario: The response policy of a surface with a fabric:// Target refuses the answer it gets back
     Given a fabric with 2 gateways
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     And the VP Audit Log of gateway 1 keeps every audit event
     And surface "charlie" has a response policy that denies every response
+    When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
+    Then the response status is 403
+    And the response says "response_policy_denied"
+    And managed agent "bravo" received one forwarded message
+    And the VP Audit Log of gateway 1 records a response policy "deny" on surface "charlie"
+
+  Scenario: The response policy of a surface with a fabric:// Target lets a plain answer through
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And the VP Audit Log of gateway 1 keeps every audit event
+    And surface "charlie" has a response policy that denies an answer naming a secret
+    When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
+    Then the response status is 200
+    And the A2A response result matches managed agent "bravo" response result
+    And the VP Audit Log of gateway 1 records a response policy "allow" on surface "charlie"
+
+  Scenario: The response policy of a surface with a fabric:// Target refuses an answer naming a secret
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And managed agent "bravo" answers naming a secret
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And the VP Audit Log of gateway 1 keeps every audit event
+    And surface "charlie" has a response policy that denies an answer naming a secret
     When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
     Then the response status is 403
     And the response says "response_policy_denied"
@@ -73,6 +108,29 @@ Feature: Surface response policies over Fabric
     When the caller sends a GET request to gateway 1 surface "charlie" path "/.well-known/ucp"
     Then the response status is 403
     And the response says "response_policy_denied"
+    And the VP Audit Log of gateway 2 records a response policy "deny" on the Fabric request
+
+  Scenario: A response policy refuses an answer to a path that only names the agent card in its query, fetched over Fabric
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And the VP Audit Log of gateway 2 keeps every audit event
+    And surface "alpha" has a response policy that denies every response
+    When the caller sends a GET request to gateway 1 surface "charlie" path "/x?y=/.well-known/agent.json"
+    Then the response status is 403
+    And the response says "response_policy_denied"
+    And the VP Audit Log of gateway 2 records a response policy "deny" on the Fabric request
+
+  Scenario: A response policy refuses an A2A proxy answer to a Fabric caller
+    Given a fabric with 2 gateways
+    And gateway 2 exposes A2A surface "alpha" backed by non-A2A managed agent "bravo" through an A2A proxy endpoint
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And the VP Audit Log of gateway 2 keeps every audit event
+    And surface "alpha" has a response policy that denies every response
+    When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
+    Then the response status is 403
+    And the response says "response_policy_denied"
+    And non-A2A managed agent "bravo" received text "g2g-bdd"
     And the VP Audit Log of gateway 2 records a response policy "deny" on the Fabric request
 
   Scenario: A response policy refuses a legacy MCP answer to a Fabric caller

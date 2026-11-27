@@ -147,16 +147,6 @@ fn is_agent_card_discovery(request: &crate::bdd_support::mock_server::ReceivedRe
                 .contains(".well-known/agent.json"))
 }
 
-fn direct_line_activity_post<'a>(
-    requests: &'a [crate::bdd_support::mock_server::ReceivedRequest],
-    actor_name: &str,
-) -> &'a crate::bdd_support::mock_server::ReceivedRequest {
-    requests
-        .iter()
-        .find(|request| request.method == "POST" && request.path_and_query.ends_with("/activities"))
-        .unwrap_or_else(|| panic!("non-A2A managed agent '{actor_name}' did not receive a Direct Line activity post; observed requests: {requests:?}"))
-}
-
 fn assert_actor_not_called(
     world: &SurfaceWorld,
     actor_name: &str,
@@ -250,19 +240,9 @@ fn named_non_a2a_managed_agent_received_text(
     agent_name: String,
     expected_text: String,
 ) {
-    // Gherkin strings are not unescaped, so `\n` in the step text stands for a
-    // line break between text parts.
-    let expected_text = expected_text.replace("\\n", "\n");
     let target = get_observed_target_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
     let requests = get_observed_target_requests(target, &agent_name);
-    let activity_post = direct_line_activity_post(requests, &agent_name);
-    let body = activity_post.json_body();
-    assert_eq!(
-        body.get("text")
-            .and_then(serde_json::Value::as_str),
-        Some(expected_text.as_str()),
-        "non-A2A managed agent '{agent_name}' should receive text {expected_text:?}; activity body was {body}"
-    );
+    crate::bdd_support::assertions::assert_direct_line_activity_text(requests, &agent_name, &expected_text);
 }
 
 #[then(expr = "non-A2A managed agent {string} did not receive header {string}")]

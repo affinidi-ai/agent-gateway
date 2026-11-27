@@ -6753,10 +6753,10 @@ async fn process_charged_forward_request(
             {
                 Ok(json_response) if !json_response.is_empty() => {
                     channel_info!(config_id, "GW2: Persistent SSE session succeeded (reuse)");
-                    let json_response = tools_list_gate.apply(json_response);
+                    let mut json_response = tools_list_gate.apply(json_response);
                     if let Some(policy) = response_policy.as_ref()
                         && let Some(refusal) =
-                            policy.refusal_of_buffered(200, &json_response, Some("application/json")).await
+                            policy.refusal_of_buffered(200, &mut json_response, Some("application/json")).await
                     {
                         return refusal;
                     }
@@ -6908,10 +6908,10 @@ async fn process_charged_forward_request(
                 {
                     Ok(json_response) if !json_response.is_empty() => {
                         channel_info!(config_id, "GW2: Persistent SSE session succeeded");
-                        let json_response = tools_list_gate.apply(json_response);
+                        let mut json_response = tools_list_gate.apply(json_response);
                         if let Some(policy) = response_policy.as_ref()
                             && let Some(refusal) =
-                                policy.refusal_of_buffered(200, &json_response, Some("application/json")).await
+                                policy.refusal_of_buffered(200, &mut json_response, Some("application/json")).await
                         {
                             return refusal;
                         }
@@ -7326,7 +7326,7 @@ async fn process_charged_forward_request(
                 crate::proxy::handler::is_fabric_card_fetch(&resolved_surface, method, path),
                 sent_to_card_url,
             ) && let Some(policy) = response_policy.as_ref()
-                && let Some(refusal) = policy.refusal_of_buffered(status, &response_body, content_type).await
+                && let Some(refusal) = policy.refusal_of_buffered(status, &mut response_body, content_type).await
             {
                 if !is_modern_response {
                     let request_payload = serde_json::from_slice(&body_bytes).unwrap_or_else(|_| {
