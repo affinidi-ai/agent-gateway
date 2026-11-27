@@ -19,7 +19,7 @@ SHELL := /bin/bash
         config-certs config-debug config-debug-dev config-debug-x config-test config-release install-deps install-rust-deps verify-rust-deps install-python-deps install-git-hooks setup-vscode \
         docker-build-local docker-build-local-dev docker-rebuild-local docker-rebuild-local-dev docker-run docker-run-dev docker-shell docker-network \
         config-docker \
-	test test-unit test-bins test-policies test-coverage test-junit test-rust-ci npm-test npm-test-ci npm-build npm-build-ci npm-install npm-install-ci clippy clippy-ci fmt fmt-www-all fmt-check lint lint-changelog npm-lint shellcheck npm-lint-www-all npm-lint-ci check cargo-build-ci node-ci rust-ci node-local rust-local local audit-www-all audit-fix-www-all browserslist-update license-check \
+	test test-unit test-bins test-policies test-coverage test-junit test-rust-ci npm-test npm-test-ci npm-build npm-build-ci npm-install npm-install-ci clippy clippy-ci fmt fmt-www-all fmt-check lint lint-changelog npm-lint shellcheck npm-lint-www-all npm-lint-ci check cargo-build-ci node-ci rust-ci ci-happy ci-fmt ci-clippy ci-audit ci-deny ci-frontend ci-docs ci-gherkin ci-changelog ci-toolchain ci-test ci-coverage ci-surface-bdd ci-g2g-bdd ci-mcp-conformance ci-suites g2g-bdd-run node-local rust-local local audit-www-all audit-fix-www-all browserslist-update license-check \
         www www-dev \
         clean clean-all clear-storage clear-storage-local \
 		demo-multi-tenancy \
@@ -761,6 +761,121 @@ ci: ## Run full local preflight mirroring CI
 	@$(MAKE) rust-ci
 	@echo "$(GREEN)✅ Local CI preflight passed!$(NC)"
 
+# --- ci-happy: each target runs one job of .github/workflows/{ci,checks,release-guards}.yml
+# with that job's own commands. Keep them in step with the workflows. Not mirrored:
+# the smoke job (non-blocking in CI, and it takes port 8443 and rewrites envs/local),
+# rust-scan (needs repository secrets), CodeQL, Docker and the PR title check.
+
+# The commit the changelog job diffs the branch against, as CI diffs the PR base.
+CI_BASE ?= origin/main
+# Clippy builds into a target directory of its own, so it runs beside the tests
+# instead of waiting on the lock of theirs.
+CI_CLIPPY_TARGET_DIR ?= target/ci-clippy
+CHANGELOG_PY = $(if $(wildcard $(VENV)/bin/python3),$(VENV)/bin/python3,python3)
+# Debug info of every ci-* build: line tables only compile and link faster and
+# change no test result. It replaces the full-debug build in target/ (make
+# run-debug rebuilds after); CI_DEBUG=true keeps the full one and shares it.
+CI_DEBUG ?= line-tables-only
+ci-%: export CARGO_PROFILE_DEV_DEBUG := $(CI_DEBUG)
+# The command that runs the surface suite; ci-suites points it at the test binary it built.
+SURFACE_BDD_RUN ?= cargo test --test surface_bdd
+
+ci-fmt: ## CI job fmt: rustfmt check
+	@cargo fmt --all -- --check
+
+ci-clippy: ## CI job clippy-all-targets: Clippy on the binary and the four BDD targets, warnings fail
+	@for target in "--bin agent-gateway" "--test g2g_bdd" "--test g2g_bdd_support" "--test surface_bdd" "--test surface_bdd_support"; do \
+		echo "$(BLUE)📎 cargo clippy $$target$(NC)"; \
+		CARGO_TARGET_DIR=$(CI_CLIPPY_TARGET_DIR) cargo clippy $$target --all-features -- -D warnings; \
+	done
+
+ci-audit: ## CI job audit: cargo audit of the Rust dependencies
+	@cargo audit
+
+ci-deny: ## CI job cargo-deny: bans, licenses and sources
+	@cargo deny check bans licenses sources
+
+ci-frontend: ## CI job frontend: npm ci, audit (non-blocking), format check, lint, test, build
+	@cd $(WWW_DIR) && npm ci
+	@cd $(WWW_DIR) && npm audit --omit=dev --audit-level=high || echo "$(YELLOW)⚠️  npm audit found advisories (non-blocking, as in CI)$(NC)"
+	@cd $(WWW_DIR) && npm run format:check
+	@cd $(WWW_DIR) && npm run lint
+	@cd $(WWW_DIR) && CI=true npm test -- --watch=false
+	@cd $(WWW_DIR) && npm run build
+
+ci-docs: ## CI job docs: local links and documented Make targets
+	@python3 .github/scripts/check_docs.py
+
+ci-gherkin: ## CI job gherkin: the linter's self-test, then the feature files and step bindings
+	@python3 -m py_compile scripts/bdd-gherkin.py
+	@python3 scripts/bdd-gherkin.py --self-test
+	@python3 scripts/bdd-gherkin.py --lint
+
+ci-changelog: ## CI job changelog: validator tests, fragment check, and a committed fragment for this branch against CI_BASE
+	@$(CHANGELOG_PY) -m unittest discover -s .github/scripts -p 'test_*.py'
+	@$(MAKE) --no-print-directory lint-changelog
+	@branch="$$(git rev-parse --abbrev-ref HEAD)"; \
+	if [ "$$branch" != "main" ] && [ "$$branch" != "HEAD" ]; then \
+		if git diff --name-only "$(CI_BASE)...HEAD" | grep -Fxq "CHANGELOG.md"; then \
+			echo "$(RED)❌ Update changelog fragments, not CHANGELOG.md directly$(NC)"; exit 1; \
+		fi; \
+		fragment=".changelog/wip/$${branch//\//_}.yaml"; \
+		git diff --name-status --find-renames --diff-filter=AMR "$(CI_BASE)...HEAD" | awk -F '\t' -v expected="$$fragment" ' \
+			($$1 == "A" || $$1 == "M") && $$2 == expected { found = 1 } \
+			$$1 ~ /^R[0-9]+$$/ && $$3 == expected { found = 1 } \
+			END { exit !found }' || { echo "$(RED)❌ Commit a change to $$fragment (CI compares $(CI_BASE)...HEAD)$(NC)"; exit 1; }; \
+	fi
+
+ci-toolchain: ## CI job release guards: workflow toolchain pins match the MSRV
+	@bash scripts/check-toolchain-sync.sh
+
+ci-test: ## CI job test: unit and component tests of the gateway binary (needs make config-test)
+	@cargo test --bin agent-gateway --all-features --no-run
+	@cargo test --bin agent-gateway --all-features --no-fail-fast
+
+ci-coverage: ## CI job coverage: line coverage of the gateway binary against COVERAGE_THRESHOLD (needs make config-test)
+	@$(LLVM_COV_ENV) cargo llvm-cov --bin agent-gateway --all-features --summary-only --fail-under-lines $(COVERAGE_THRESHOLD)
+
+ci-surface-bdd: ## CI job surface-bdd: the surface BDD suite
+	@$(SURFACE_BDD_RUN)
+
+ci-g2g-bdd: ## CI job g2g-bdd: the gateway-to-gateway BDD suite (needs Docker)
+	@$(MAKE) --no-print-directory gw-e2e
+
+ci-mcp-conformance: ## CI job mcp-conformance: the MCP conformance harness (needs Node >= 22)
+	@$(MAKE) --no-print-directory mcp-conformance
+
+# The BDD and conformance suites, side by side: one cargo call builds both BDD
+# test binaries and the gateway binary they start (the one the harness builds
+# too), then each suite runs its binary directly, so none waits on the lock
+# cargo holds on target/ while a `cargo test` runs.
+ci-suites: ## Build the BDD suites once, then run surface-bdd, g2g-bdd and mcp-conformance side by side
+	@echo "$(BLUE)🔨 Building the BDD test binaries...$(NC)"
+	@exes="$$(cargo test --no-run --test surface_bdd --test g2g_bdd --message-format=json-render-diagnostics \
+		| jq -r 'select(.reason == "compiler-artifact" and .executable != null and .profile.test) | "\(.target.name)=\(.executable)"')"; \
+	surface="$$(sed -n 's/^surface_bdd=//p' <<<"$$exes")"; \
+	g2g="$$(sed -n 's/^g2g_bdd=//p' <<<"$$exes")"; \
+	[ -n "$$surface" ] && [ -n "$$g2g" ] || { echo "$(RED)❌ No BDD test binary was built$(NC)"; exit 1; }; \
+	MAKE="$(MAKE)" PARALLEL=$(PARALLEL) bash scripts/local/parallel.sh "Suites" \
+		"surface-bdd=ci-surface-bdd SURFACE_BDD_RUN=$$surface" \
+		"g2g-bdd=g2g-bdd-run G2G_BDD_RUN=$$g2g" \
+		"mcp-conformance=ci-mcp-conformance"
+
+# The groups run side by side (scripts/local/parallel.sh; logs in tmp/local/latest/).
+# Coverage runs the same tests as ci-test (CI runs both), so ci-test is left out.
+# Coverage builds in target/llvm-cov-target, Clippy in CI_CLIPPY_TARGET_DIR and
+# the suites in target/, so the three builds run beside each other.
+CI_HAPPY_GROUPS := "fmt=ci-fmt" "toolchain=ci-toolchain" "docs=ci-docs" "gherkin=ci-gherkin" \
+	"changelog=ci-changelog" "audit=ci-audit" "deny=ci-deny" "frontend=ci-frontend" \
+	"clippy=ci-clippy" "coverage=ci-coverage" "suites=ci-suites"
+ci-happy: ## Run every blocking CI job locally, 1:1 with the workflows and side by side, no autofix (PARALLEL=0: one at a time; CI_BASE=origin/main; CI_DEBUG=true: full debug info)
+	@$(MAKE) --no-print-directory verify-rust-deps
+	@$(MAKE) --no-print-directory config-test
+	@$(MAKE) --no-print-directory clean-e2e
+	@MAKE="$(MAKE)" PARALLEL=$(PARALLEL) bash scripts/local/parallel.sh "CI" $(CI_HAPPY_GROUPS)
+	@secs=$$(( $$(date +%s) - $(LOCAL_STARTED) )); \
+	  echo "$(GREEN)✅ CI is happy, in $$((secs / 60))m $$((secs % 60))s.$(NC)"
+
 # --- Local targets: autofix, for development workflow ---
 
 node-local: ## Run frontend checks locally with autofix (fmt + lint --fix + build + test)
@@ -884,7 +999,15 @@ mediator-down: ## Tear down DIDComm mediator server
 # ==============================================================================
 G2G_MEDIATOR_PORT ?= 7037
 
+# The command that runs the suite; ci-suites points it at the test binary it built.
+G2G_BDD_RUN ?= cargo test --test g2g_bdd $(CARGO_TEST_ARGS)
+
 gw-e2e: clean-e2e ## Run the gateway-to-gateway BDD E2E suite (federation)
+	@$(MAKE) --no-print-directory g2g-bdd-run
+
+# The suite without the clean-up first, which would remove the mediators of a
+# conformance run beside it.
+g2g-bdd-run:
 	@echo "$(BLUE)🧪 Running g2g_bdd...$(NC)"
 	@parallelism="$${G2G_BDD_PARALLELISM:-8}"; \
 	if [ "$$parallelism" = "1" ]; then \
@@ -893,13 +1016,13 @@ gw-e2e: clean-e2e ## Run the gateway-to-gateway BDD E2E suite (federation)
 		FABRIC_BDD_MEDIATOR_PORT="$(G2G_MEDIATOR_PORT)" \
 		FABRIC_BDD_DID_METHOD="peer" \
 		RUST_LOG="$(if $(RUST_LOG),$(RUST_LOG),info)" \
-			cargo test --test g2g_bdd $(CARGO_TEST_ARGS); \
+			$(G2G_BDD_RUN); \
 	else \
 		G2G_BDD_PARALLELISM="$$parallelism" \
 		FABRIC_BDD_MANAGED_MEDIATOR="1" \
 		FABRIC_BDD_DID_METHOD="peer" \
 		RUST_LOG="$(if $(RUST_LOG),$(RUST_LOG),info)" \
-			cargo test --test g2g_bdd $(CARGO_TEST_ARGS); \
+			$(G2G_BDD_RUN); \
 	fi
 
 # Prune any leftover BDD mediator containers + networks + temp dirs from a

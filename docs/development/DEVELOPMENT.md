@@ -269,7 +269,26 @@ This documents the dependency, fails fast with a clear message if the helper con
 ```bash
 make shellcheck   # lint every tracked *.sh
 make lint         # fmt-check + clippy + eslint + shellcheck + changelog
+make ci-happy     # every blocking CI job, 1:1 with the workflows, side by side
 ```
+
+`make ci-happy` runs each blocking job of `.github/workflows/ci.yml`, `checks.yml` and
+`release-guards.yml` with that job's own commands, one `ci-<job>` target per job (`make help`
+lists them), so a single failing job can be rerun alone. The jobs run side by side, with each
+group's log in `tmp/local/latest/`; `PARALLEL=0` runs them one at a time on a machine short of
+memory. Each group is reported as it ends, and every 30 seconds (`PROGRESS_SECS`, `0` for never)
+each group still running is named with its time so far and its log's last line; `make local`
+reports the same way. Coverage runs the same unit and component tests as the `test` job, so `ci-happy` leaves
+`ci-test` out. `ci-suites` builds the `surface_bdd` and `g2g_bdd` test binaries in one cargo call,
+then runs them and the MCP conformance harness side by side, while Clippy (`target/ci-clippy`) and
+coverage (`target/llvm-cov-target`) build beside it. Every `ci-*` build keeps line tables only as
+debug info (`CI_DEBUG`, default `line-tables-only`), which compiles and links faster and changes
+no test result; it replaces the full-debug build in `target/`, so `make run-debug` rebuilds after
+it, and `CI_DEBUG=true` keeps and shares the full one. The gateway-to-gateway suite needs Docker,
+the conformance harness Node 22, and `ci-suites` jq.
+The changelog job, as in CI, looks for the branch's fragment in the commits since `CI_BASE`
+(`origin/main`), so commit it first. Not run: the non-blocking smoke job, `rust-scan`, CodeQL,
+the Docker build and the PR title check.
 
 ## Tests And Quality Checks
 
