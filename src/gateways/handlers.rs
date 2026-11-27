@@ -78,6 +78,8 @@ pub struct UpdateGatewayRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub status: Option<GatewayStatus>,
+    /// A remote gateway's `require_addressed_presentations`.
+    pub require_addressed_presentations: Option<bool>,
 }
 
 /// Request body for trusting an issuer DID on a remote gateway connection.
@@ -463,6 +465,15 @@ pub async fn update_gateway<S: GatewayStore>(
             refuse_removal_in_use(surface_store.as_ref(), &gateway).await?;
         }
         gateway.status = status;
+    }
+    if let Some(require) = req.require_addressed_presentations {
+        if gateway.gateway_type != GatewayType::Remote {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "require_addressed_presentations applies to remote gateways only".to_string(),
+            ));
+        }
+        gateway.require_addressed_presentations = require;
     }
 
     gateway.updated_at = chrono::Utc::now();
@@ -1849,6 +1860,38 @@ mod tests {
 
         assert_eq!(updated.name, "renamed");
         assert_eq!(updated.issuer_did, Some("did:web:peer.example".to_string()));
+    }
+
+    #[tokio::test]
+    async fn update_sets_require_addressed_presentations_on_a_remote_gateway() {
+        let remote = remote_gateway();
+        let (store, _dir) = gateway_store_with(&remote).await;
+
+        let updated =
+            update(&store, &remote.id, update_request(serde_json::json!({ "require_addressed_presentations": true })))
+                .await
+                .expect("update succeeds");
+
+        assert!(updated.require_addressed_presentations);
+        let stored = store
+            .get(&remote.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.require_addressed_presentations);
+    }
+
+    #[tokio::test]
+    async fn update_refuses_require_addressed_presentations_on_the_self_gateway() {
+        let (store, _dir) = gateway_store_with(&remote_gateway()).await;
+        let self_id = self_gateway_id(&store).await;
+
+        let err =
+            update(&store, &self_id, update_request(serde_json::json!({ "require_addressed_presentations": true })))
+                .await
+                .expect_err("the self gateway has no connection to configure");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

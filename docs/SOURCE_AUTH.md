@@ -1587,6 +1587,67 @@ identity presentation reports `vp` or `vp_unanchored` regardless of the configur
 on a direct request to an inbound `from_api_key` surface, where the key's DID replaces it; see
 [`POLICY.md`](POLICY.md#caller-identity-verification-in-policy-input).
 
+### Who an identity presentation is for
+
+An identity presentation the gateway signs for a known recipient names it in the proof's
+`domain`, so a copy taken from a peer or the audit log cannot be presented over Fabric to another
+gateway:
+
+| Presentation | `domain` |
+| ------------ | -------- |
+| Sent over Fabric to a paired gateway, by an Access Point or a `fabric://` Transit Point | The peer's DID, as its Remote gateway record holds it |
+| On an answer sent back over Fabric | The calling gateway's Connection Point DID the request came from |
+| Sent to an `http` or `https` Target, by an Access Point or a Transit Point | The Target's origin (`scheme://host[:port]`) |
+| Minted only for the audit log (`consent_required`, `consent_granted`, and a direct request's presentation the surface does not inject) | `urn:affinidi:audit-only`, which no gateway accepts |
+| On a public agent card, in a direct answer, or to any other Target | None |
+
+Every verifier refuses a presentation whose `domain` is `urn:affinidi:audit-only`. Over Fabric,
+where the gateway knows the recipient, a presentation's `domain` must name the Connection Point
+DID the request was received on (for an answer, the one the request was sent from). On a direct
+request, at the STS token endpoint, and on a fetched agent card the gateway has no recipient DID
+to compare, so it accepts any other `domain`. A presentation with no `domain`, from a gateway or
+client that sets none, is still accepted. A refused presentation is refused with the fixed error
+`VP is not addressed to this gateway` and logged with up to four of its domains (128 characters
+each) and the recipient DID; the request is then treated as one whose presentation failed, and
+an answer to an Access Point with a managed identity whose Target is `fabric://` is refused with
+`502` and recorded as an `invalid` identity binding (answers to a Transit Point over Fabric, and
+to an Access Point without a managed identity, are not checked). A refused answer to a modern MCP
+request sent as `text/event-stream` has already sent its `200`, so its stream ends early instead
+and only the VP Audit Log records the refusal.
+
+A presentation's proof may expire at most 5 minutes after it is verified, plus 2 minutes of
+clock skew. A proof with both `created` and `expires` may span at most 5 minutes plus 2 minutes
+of clock skew between them. No proof may be created more than 2 minutes ahead of the gateway's
+clock. A proof with `expires` but no `created` is bounded only by its `expires`, so it is accepted
+in the last 7 minutes before it expires. The gateway mints its own presentations with `created`
+and a 5 minute lifetime.
+
+A paired gateway may relay a presentation another gateway issued, which names that other
+gateway's recipient. Over Fabric such a presentation is accepted when its issuer is one the
+operator trusts for the connection (`trusted_issuer_dids`) and not the peer's own issuer, unless
+the connection's `require_addressed_presentations` is `true`; see
+[`FABRIC.md`](FABRIC.md#peer-issuer-dids). With `require_addressed_presentations` on, such a
+relayed presentation must name this gateway and one with no `domain` is refused. A presentation
+the peer itself issued must name this gateway when it names anyone, and
+`urn:affinidi:audit-only` is never accepted. Without an attested peer issuer, no issuer counts as
+relayed, so every presentation must be addressed to this gateway when it names a recipient; with
+`require_addressed_presentations` on, one from a `trusted_issuer_dids` issuer with no `domain` is
+still refused.
+
+Accepted risk: binding is partial. A presentation with no `domain` is accepted everywhere, and
+the gateway itself mints such presentations on public agent cards and direct answers, so a copy
+of one can be presented to any gateway within its lifetime. Direct paths and the STS token
+endpoint accept any `domain` but the audit-only one, so a copy a Target received can be
+presented to them, and so can the copy the audit log keeps of a presentation injected into a
+request to an `http` or `https` Target, which is bound to that Target. The audit log keeps that
+Target-bound copy even when a surface that injects finds no place for it in the request, such as
+an A2A `tasks/get` with no message. A request to a Target that is not `http` or `https` (for
+example `proxy://`) carries a presentation with no `domain`. With
+`require_addressed_presentations` off, the default, a Fabric connection
+admits a presentation from an issuer trusted for it that is addressed to another gateway. There
+is no replay cache: any presentation can be presented again to its own audience until it
+expires.
+
 ### A missing identity on the public agent card
 
 On the protected slot, `payload_extraction` refuses a response that carries no identity with

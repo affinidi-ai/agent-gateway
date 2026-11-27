@@ -871,6 +871,21 @@ impl GatewayAdminClient {
         .await
     }
 
+    /// Set whether a Remote gateway's connection requires identity
+    /// presentations addressed to this gateway (`PUT /v1/gateways/{id}`).
+    pub async fn require_addressed_presentations(
+        &self,
+        gateway_id: &str,
+        require: bool,
+    ) -> Result<GatewayRecord> {
+        self.send_json(
+            Method::PUT,
+            &format!("/v1/gateways/{gateway_id}"),
+            Some(&serde_json::json!({ "require_addressed_presentations": require })),
+        )
+        .await
+    }
+
     /// Ask the gateway to run the issuer exchange with a paired Remote gateway
     /// and return the verified issuer DID (`POST /v1/gateways/{id}/issuer`).
     pub async fn request_gateway_issuer(
@@ -1566,6 +1581,9 @@ pub struct GatewayRecord {
     /// Issuer DIDs an operator trusts for presentations arriving over this connection.
     #[serde(default)]
     pub trusted_issuer_dids: Vec<String>,
+    /// Whether this connection refuses relayed presentations addressed to another recipient.
+    #[serde(default)]
+    pub require_addressed_presentations: bool,
     /// Surfaces exposed to a Remote record in `list` mode.
     #[serde(default, rename = "exposed_channels")]
     pub exposed_surfaces: Vec<String>,

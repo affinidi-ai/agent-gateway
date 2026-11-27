@@ -1,0 +1,89 @@
+branch: fix/vp-replay
+changes:
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-24T00:00:00Z'
+      title: Refuse agent presentations whose proof outlives the 5 minute VP lifetime
+      description: >-
+        Before, the gateway accepted any `expires` the holder signed, so a presentation minted
+        with a far-future expiry could be replayed for as long as its credential lasted. Proofs
+        are now held to the 5 minute VP lifetime; the limits and the migration for clients that
+        sign their own presentations are under `breaking`.
+    - timestamp: '2026-11-24T00:00:00Z'
+      title: Bind identity presentations to their recipient to limit replay
+      description: >-
+        Identity presentations now name their audience in the proof's `domain`: the peer's DID
+        over Fabric, the Target's origin on direct calls, and `urn:affinidi:audit-only` for
+        presentations kept only in the audit log, including a direct request's presentation
+        that the surface does not inject. Every verifier refuses an audit-only copy, and
+        a Fabric verifier refuses a presentation addressed to another gateway, so an addressed
+        copy taken from a peer or an audit integration can no longer be presented as the agent
+        there. Direct paths, the STS token endpoint and fetched agent cards accept any other
+        `domain`. Presentations
+        without a `domain` are still accepted, so older gateways and clients keep working.
+    - timestamp: '2026-11-24T00:00:00Z'
+      title: Address Fabric answers' identity presentations to the calling gateway
+      description: >-
+        The identity presentation on an answer sent back over Fabric now names the calling
+        gateway's Connection Point. On an Access Point with a managed identity whose Target is
+        `fabric://`, the calling
+        gateway refuses an answer whose presentation names another recipient with `502`,
+        recorded as an `invalid` identity binding. Answers to a Transit Point over Fabric are
+        not checked.
+    - timestamp: '2026-11-24T00:00:00Z'
+      title: Check the identity presentation on MCP answers over Fabric
+      description: >-
+        On an Access Point with a managed identity whose Target is `fabric://`, the calling
+        gateway now checks the presentation in an MCP answer's `result._meta`, top-level `_meta`
+        or `params._meta`, which it did not check before, as it does on A2A answers: an MCP
+        answer whose presentation fails verification, is addressed to another recipient, or comes
+        from an issuer the connection does not trust is refused with `502`. So is an MCP answer
+        whose credential carries a `did` other than the presentation's holder. This includes a Managed Agent's own credential
+        passed through when the paired gateway adds none (its surface has no managed identity,
+        or the result is not complete). A refused answer to a modern MCP request sent as
+        `text/event-stream` has already sent its `200`, so its stream ends early instead and
+        only the VP Audit Log records the refusal.
+    - timestamp: '2026-11-24T00:00:00Z'
+      title: Take an MCP surface's payload identity from a verified Fabric answer
+      description: >-
+        On an MCP surface that takes the agent's identity from the payload, a verified
+        presentation on an answer over Fabric now supplies that identity.
+  added:
+    - timestamp: '2026-11-24T00:00:00Z'
+      title: Let a Remote gateway connection refuse relayed identity presentations
+      description: >-
+        A Remote gateway record has `require_addressed_presentations`, set with
+        `PUT /v1/gateways/{id}`. Off by default, so a peer may keep relaying presentations from
+        an issuer the operator trusts for the connection; on, such a presentation must be
+        addressed to this gateway, and one with no `domain` is refused. On a connection without
+        an attested peer issuer, a relayed presentation that names another recipient is refused
+        whatever the setting. Turn it on only after the gateways
+        of every `trusted_issuer_dids` issuer run this release, since older gateways mint
+        presentations with no `domain`.
+  breaking:
+    - timestamp: '2026-11-25T00:00:00Z'
+      title: Refuse presentations whose proof lives longer than 7 minutes
+      description: >-
+        The gateway now refuses an identity presentation whose proof `expires` is more than 5
+        minutes plus 2 minutes of clock skew after verification, whose `created` and `expires`
+        span more than 7 minutes, or whose `created` is more than 2 minutes ahead of the
+        gateway's clock. A proof with `expires` but no `created` is bounded only by its
+        `expires`, so it is accepted in the last 7 minutes before it expires. This applies to
+        agents that send their own presentation and to STS clients presenting one at the token
+        endpoint, which answers `invalid_grant`. Migration: sign each presentation just
+        before sending it with a proof `expires` of 5 minutes or less after `created`, and keep
+        the signer's clock in sync; presentations the gateway signs already meet this.
+    - timestamp: '2026-11-25T00:00:00Z'
+      title: Refuse relayed presentations addressed elsewhere on unattested connections
+      description: >-
+        On a Remote gateway connection whose record holds hand-trusted `trusted_issuer_dids`
+        but no attested `issuer_did`, a relayed presentation that names a recipient other than
+        this gateway was accepted and is now refused: `403` under an identity policy on a
+        request, `502` with an `invalid` identity binding on an answer. Relayed presentations
+        with no `domain` still pass while `require_addressed_presentations` is off. Migration:
+        attest the peer's issuer with `POST /v1/gateways/{id}/issuer`, or restart the listener,
+        which runs the issuer exchange at start; the answer path does not run it. A peer too
+        old to answer the exchange needs an upgrade first; until then, relayed presentations
+        addressed elsewhere stay refused on that connection.

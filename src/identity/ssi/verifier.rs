@@ -37,8 +37,9 @@ pub struct VpVerificationResult {
     /// downstream gateways can flatten this hop's VCs into a chained-provenance
     /// VP they re-issue. Order matches the inbound VP.
     pub raw_credentials: Vec<Value>,
-    #[allow(unused)]
-    pub domain: Option<String>,
+    /// The audiences the presentation's proof names in `domain` (a string or an
+    /// array of strings), empty when it names none.
+    pub domains: Vec<String>,
     pub challenge: Option<String>,
 }
 
@@ -249,8 +250,28 @@ fn verify_vc_lifetime(vc: &Value) -> Result<()> {
     Ok(())
 }
 
+const VP_CLOCK_SKEW_SECONDS: i64 = 120;
+
+fn proof_domains(proof: &Value) -> Result<Vec<String>> {
+    match proof.get("domain") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(domain)) => Ok(vec![domain.clone()]),
+        Some(Value::Array(domains)) => domains
+            .iter()
+            .map(|domain| {
+                domain
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow::anyhow!("VP proof domain entries must be strings"))
+            })
+            .collect(),
+        Some(_) => anyhow::bail!("VP proof domain must be a string or an array of strings"),
+    }
+}
+
 fn verify_vp_proof_lifetime(proof: &Value) -> Result<()> {
     let now = Utc::now();
+    let skew = Duration::seconds(VP_CLOCK_SKEW_SECONDS);
 
     if let Some(expires) = proof
         .get("expires")
@@ -261,6 +282,34 @@ fn verify_vp_proof_lifetime(proof: &Value) -> Result<()> {
             .context("Invalid proof expires date format")?;
         if now > expires_dt {
             anyhow::bail!("VP proof has expired (expires: {})", expires);
+        }
+        if expires_dt > now + Duration::minutes(VP_LIFETIME_MINUTES) + skew {
+            anyhow::bail!(
+                "VP proof expires too far ahead (expires: {}, at most {} minutes allowed)",
+                expires,
+                VP_LIFETIME_MINUTES
+            );
+        }
+        // A signed created bounds the whole window, so a long-lived proof
+        // does not become acceptable once enough of it has elapsed.
+        if let Some(created) = proof
+            .get("created")
+            .and_then(|v| v.as_str())
+        {
+            let created_dt: DateTime<Utc> = created
+                .parse()
+                .context("Invalid proof created date format")?;
+            if created_dt > now + skew {
+                anyhow::bail!("VP proof is created in the future (created: {})", created);
+            }
+            if expires_dt - created_dt > Duration::minutes(VP_LIFETIME_MINUTES) + skew {
+                anyhow::bail!(
+                    "VP proof lifetime is too long (created: {}, expires: {}, at most {} minutes allowed)",
+                    created,
+                    expires,
+                    VP_LIFETIME_MINUTES
+                );
+            }
         }
         return Ok(());
     }
@@ -273,6 +322,9 @@ fn verify_vp_proof_lifetime(proof: &Value) -> Result<()> {
     let created_dt: DateTime<Utc> = created
         .parse()
         .context("Invalid proof created date format")?;
+    if created_dt > now + skew {
+        anyhow::bail!("VP proof is created in the future (created: {})", created);
+    }
     if now > created_dt + Duration::minutes(VP_LIFETIME_MINUTES) {
         anyhow::bail!("VP proof has expired (created: {}, no expires)", created);
     }
@@ -865,10 +917,7 @@ impl LocalVerifier {
         // it challenged with, so a presentation whose binding does not match is
         // refused there.
         let proof = &proofs[0];
-        let domain = proof
-            .get("domain")
-            .and_then(|d| d.as_str())
-            .map(String::from);
+        let domains = proof_domains(proof)?;
         let challenge = proof
             .get("challenge")
             .and_then(|c| c.as_str())
@@ -881,7 +930,7 @@ impl LocalVerifier {
                 .iter()
                 .map(|v| (*v).clone())
                 .collect(),
-            domain,
+            domains,
             challenge,
         })
     }
@@ -1287,12 +1336,92 @@ mod tests {
     }
 
     #[test]
-    fn proof_lifetime_accepts_future_expires() {
-        verify_vp_proof_lifetime(&json!({
+    fn proof_lifetime_accepts_expires_within_lifetime() {
+        let expires = (Utc::now() + Duration::minutes(VP_LIFETIME_MINUTES)).to_rfc3339();
+        verify_vp_proof_lifetime(&json!({ "expires": expires })).unwrap();
+    }
+
+    #[test]
+    fn proof_lifetime_accepts_expires_within_clock_skew() {
+        let expires =
+            (Utc::now() + Duration::minutes(VP_LIFETIME_MINUTES) + Duration::seconds(VP_CLOCK_SKEW_SECONDS - 5))
+                .to_rfc3339();
+        verify_vp_proof_lifetime(&json!({ "expires": expires })).unwrap();
+    }
+
+    #[test]
+    fn proof_lifetime_rejects_expires_beyond_lifetime() {
+        let expires =
+            (Utc::now() + Duration::minutes(VP_LIFETIME_MINUTES) + Duration::seconds(VP_CLOCK_SKEW_SECONDS + 5))
+                .to_rfc3339();
+        let err = verify_vp_proof_lifetime(&json!({ "expires": expires })).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("too far ahead"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn proof_lifetime_rejects_far_future_expires() {
+        let err = verify_vp_proof_lifetime(&json!({
             "created": "2000-01-01T00:00:00Z",
             "expires": "2999-01-01T00:00:00Z"
         }))
-        .unwrap();
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("too far ahead"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn proof_lifetime_rejects_long_window_once_mostly_elapsed() {
+        let created = (Utc::now() - Duration::minutes(25)).to_rfc3339();
+        let expires = (Utc::now() + Duration::minutes(5)).to_rfc3339();
+        let err = verify_vp_proof_lifetime(&json!({ "created": created, "expires": expires })).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("lifetime is too long"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn proof_lifetime_accepts_created_and_expires_within_lifetime() {
+        let created = Utc::now().to_rfc3339();
+        let expires = (Utc::now() + Duration::minutes(VP_LIFETIME_MINUTES)).to_rfc3339();
+        verify_vp_proof_lifetime(&json!({ "created": created, "expires": expires })).unwrap();
+    }
+
+    #[test]
+    fn proof_lifetime_rejects_created_in_the_future_with_expires() {
+        let created = (Utc::now() + Duration::minutes(10)).to_rfc3339();
+        let expires = (Utc::now() + Duration::minutes(VP_LIFETIME_MINUTES)).to_rfc3339();
+        let err = verify_vp_proof_lifetime(&json!({ "created": created, "expires": expires })).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("in the future"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn proof_lifetime_rejects_created_in_the_future() {
+        let created = (Utc::now() + Duration::seconds(VP_CLOCK_SKEW_SECONDS + 5)).to_rfc3339();
+        let err = verify_vp_proof_lifetime(&json!({ "created": created })).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("in the future"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn proof_lifetime_accepts_created_within_clock_skew() {
+        let created = (Utc::now() + Duration::seconds(VP_CLOCK_SKEW_SECONDS - 5)).to_rfc3339();
+        verify_vp_proof_lifetime(&json!({ "created": created })).unwrap();
     }
 
     #[test]
@@ -1312,6 +1441,22 @@ mod tests {
                 .contains("expired"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn proof_domains_reads_a_string_an_array_or_nothing() {
+        assert_eq!(proof_domains(&json!({})).unwrap(), Vec::<String>::new());
+        assert_eq!(proof_domains(&json!({ "domain": "did:example:gw2" })).unwrap(), vec!["did:example:gw2"]);
+        assert_eq!(
+            proof_domains(&json!({ "domain": ["did:example:a", "https://b.example"] })).unwrap(),
+            vec!["did:example:a", "https://b.example"]
+        );
+    }
+
+    #[test]
+    fn proof_domains_rejects_a_domain_that_is_not_text() {
+        assert!(proof_domains(&json!({ "domain": 7 })).is_err());
+        assert!(proof_domains(&json!({ "domain": ["did:example:a", 7] })).is_err());
     }
 
     #[test]

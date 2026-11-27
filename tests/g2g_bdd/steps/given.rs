@@ -27,7 +27,7 @@ use crate::bdd_support::policies::{
     build_surface_deny_target_trust_check_errors_policy, build_surface_identity_binding_issuer_policy,
     build_surface_require_agent_did_policy, build_transit_point_partner_policy,
 };
-use crate::world::{FabricLink, G2gWorld, McpCaller, TransitPointFabricLink};
+use crate::world::{FabricLink, G2gWorld, McpCaller, TransitPointLink, trust_issuer_on_connection};
 
 fn set_target_response(
     world: &mut G2gWorld,
@@ -450,12 +450,45 @@ pub async fn surface_has_a2a_transit_point_over_fabric(
     world
         .topology
         .transit_point_fabric_links
-        .push(TransitPointFabricLink {
+        .push(TransitPointLink {
             from_gw,
             from_surface: from_surface_id,
             transit_point,
             to_gw: peer_gw,
             to_surface: peer_surface_id,
+        });
+}
+
+#[given(expr = "surface {string} has A2A Transit Point {string} to managed agent {string}")]
+pub async fn surface_has_a2a_transit_point_to_managed_agent(
+    world: &mut G2gWorld,
+    surface_name: String,
+    transit_point: String,
+    agent_name: String,
+) {
+    world
+        .topology
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let (from_gw, from_surface_id) = world.surface(&surface_name);
+    let (agent_gw, agent_surface_id) = world.target(&agent_name);
+    assert_eq!(
+        agent_gw, from_gw,
+        "managed agent '{agent_name}' must be behind gateway {from_gw}, the gateway of surface '{surface_name}'"
+    );
+    let target_endpoint = format!("{}{agent_surface_id}", crate::harness::multi_gateway::DIRECT_TRANSIT_TARGET_PREFIX);
+    surface_spec_mut(world, &surface_name)
+        .transit_points
+        .push(TransitPointSpec::new(&transit_point, "a2a", target_endpoint));
+    world
+        .topology
+        .transit_point_direct_links
+        .push(TransitPointLink {
+            from_gw,
+            from_surface: from_surface_id,
+            transit_point,
+            to_gw: from_gw,
+            to_surface: agent_surface_id,
         });
 }
 
@@ -994,22 +1027,81 @@ pub async fn gateway_trusts_issuer_on_connection(
         .self_gateway_did(issuer_gw)
         .await
         .unwrap_or_else(|error| panic!("{error:#}"));
+    trust_issuer_on_connection(world.harness(), gw_index, &issuer_did, connection_gw).await;
+}
+
+#[given(
+    expr = "gateway {int} trusts the issuer of the identity presentation of MCP server {string} on its connection with gateway {int}"
+)]
+pub async fn gateway_trusts_mcp_server_presentation_issuer_on_connection(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    server_name: String,
+    connection_gw: usize,
+) {
+    trust_target_presentation_issuer_on_connection(world, gw_index, &server_name, connection_gw).await;
+}
+
+#[given(
+    expr = "gateway {int} trusts the issuer of the identity presentation of managed agent {string} on its connection with gateway {int}"
+)]
+pub async fn gateway_trusts_managed_agent_presentation_issuer_on_connection(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    agent_name: String,
+    connection_gw: usize,
+) {
+    trust_target_presentation_issuer_on_connection(world, gw_index, &agent_name, connection_gw).await;
+}
+
+/// Trusts the DID that signed the identity presentation the Target
+/// `target_name` answers with on `gw_index`'s connection with `connection_gw`.
+/// Before the gateways start, the trust is applied by
+/// [`G2gWorld::start`] ahead of the fabric route probes, which the Target
+/// answers with that presentation.
+async fn trust_target_presentation_issuer_on_connection(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    target_name: &str,
+    connection_gw: usize,
+) {
+    let issuer_did = world
+        .target_presentation_signers
+        .get(target_name)
+        .unwrap_or_else(|| panic!("Target '{target_name}' answers with no identity presentation"))
+        .did()
+        .to_string();
+    match world.harness.as_ref() {
+        Some(harness) => trust_issuer_on_connection(harness, gw_index, &issuer_did, connection_gw).await,
+        None => world
+            .topology
+            .connection_trusted_issuers
+            .push((gw_index, issuer_did, connection_gw)),
+    }
+}
+
+#[given(expr = "gateway {int} requires presentations addressed to it on its connection with gateway {int}")]
+pub async fn gateway_requires_addressed_presentations_on_connection(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    connection_gw: usize,
+) {
+    world.start().await;
     let remote_id = remote_record_id(world, gw_index, connection_gw);
     let updated = world
         .harness()
         .gw(gw_index)
         .admin
-        .add_trusted_issuer_did(&remote_id, &issuer_did)
+        .require_addressed_presentations(&remote_id, true)
         .await
         .unwrap_or_else(|error| {
-            panic!("trust gateway {issuer_gw}'s DID on gateway {gw_index}'s connection with gateway {connection_gw}: {error:#}")
+            panic!(
+                "require addressed presentations on gateway {gw_index}'s connection with gateway {connection_gw}: {error:#}"
+            )
         });
     assert!(
-        updated
-            .trusted_issuer_dids
-            .contains(&issuer_did),
-        "gateway {gw_index}'s record for gateway {connection_gw} should list {issuer_did} as a trusted issuer, got {:?}",
-        updated.trusted_issuer_dids
+        updated.require_addressed_presentations,
+        "gateway {gw_index}'s record for gateway {connection_gw} should require addressed presentations, got {updated:?}"
     );
 }
 
@@ -1142,6 +1234,114 @@ pub fn managed_agent_response_contains_agent_identity_extension(
             }
         }),
     );
+}
+
+/// The MCP server's tool result carries its `agent-identity/v1` payload in
+/// `result.metadata`, where the answering gateway reads a Target's identity on
+/// any answer.
+#[given(expr = "MCP server {string} response contains the agent-identity extension")]
+pub fn mcp_server_response_contains_agent_identity_extension(
+    world: &mut G2gWorld,
+    server_name: String,
+) {
+    use crate::bdd_support::json_rpc::AGENT_IDENTITY_EXTENSION_URI as AGENT_IDENTITY_URI;
+    world
+        .topology
+        .actors
+        .expect_target_kind(&server_name, TargetActorKind::McpServer);
+    let mut response = build_mcp_tools_call_response();
+    response["result"]["metadata"] = serde_json::json!({
+        AGENT_IDENTITY_URI: {
+            "softwareInfo": { "name": "mcp-server", "version": "2.0" },
+            "cloudProvider": "local"
+        }
+    });
+    set_target_response(world, &server_name, response);
+}
+
+/// The canonical MCP `_meta` key of an agent identity credential.
+const MCP_AGENT_IDENTITY_CREDENTIAL_KEY: &str = "io.affinidi.fabric/agent-identity-credential";
+
+/// A Connection Point DID no gateway of the scenario holds.
+const ANOTHER_CONNECTION_POINT_DID: &str = "did:example:another-connection-point";
+
+/// The MCP server answers with a presentation of a credential it issued
+/// itself, signed with a DID the harness publishes and addressed to
+/// [`ANOTHER_CONNECTION_POINT_DID`]. No gateway signs it, so the surface in
+/// front of the server must not have managed identity, which would replace it.
+#[given(expr = "MCP server {string} response contains an identity presentation addressed to another Connection Point")]
+pub async fn mcp_server_response_contains_presentation_addressed_elsewhere(
+    world: &mut G2gWorld,
+    server_name: String,
+) {
+    world
+        .topology
+        .actors
+        .expect_target_kind(&server_name, TargetActorKind::McpServer);
+    let (signer, credential) = own_credential_addressed_to_another_connection_point().await;
+    let mut response = build_mcp_tools_call_response();
+    response["result"]["_meta"] = serde_json::json!({ MCP_AGENT_IDENTITY_CREDENTIAL_KEY: credential });
+    set_target_response(world, &server_name, response);
+    world
+        .target_presentation_signers
+        .insert(server_name, signer);
+}
+
+/// The A2A counterpart of
+/// [`mcp_server_response_contains_presentation_addressed_elsewhere`]: the
+/// managed agent's message carries the credential extension, where the calling
+/// gateway reads an A2A answer's identity. The surface in front of the agent
+/// must not have managed identity, which would replace it.
+#[given(
+    expr = "managed agent {string} response contains an identity presentation addressed to another Connection Point"
+)]
+pub async fn managed_agent_response_contains_presentation_addressed_elsewhere(
+    world: &mut G2gWorld,
+    agent_name: String,
+) {
+    use crate::bdd_support::json_rpc::AGENT_IDENTITY_CREDENTIAL_EXTENSION_URI as CREDENTIAL_URI;
+    world
+        .topology
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let (signer, credential) = own_credential_addressed_to_another_connection_point().await;
+    set_target_response(
+        world,
+        &agent_name,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "kind": "message",
+                "messageId": "msg-001",
+                "role": "agent",
+                "parts": [{ "kind": "text", "text": "agent output" }],
+                "extensions": [CREDENTIAL_URI],
+                "metadata": { CREDENTIAL_URI: credential }
+            }
+        }),
+    );
+    world
+        .target_presentation_signers
+        .insert(agent_name, signer);
+}
+
+/// A signer the harness publishes, and the identity credential (`did` and
+/// `verifiablePresentation`) of a credential it issued itself, presented to
+/// [`ANOTHER_CONNECTION_POINT_DID`].
+async fn own_credential_addressed_to_another_connection_point()
+-> (crate::bdd_support::presentation_signer::PresentationSigner, Value) {
+    let signer =
+        crate::bdd_support::presentation_signer::PresentationSigner::publish(&["authentication", "assertionMethod"])
+            .await;
+    let presentation = signer
+        .present_own_credential_addressed_to(ANOTHER_CONNECTION_POINT_DID)
+        .await;
+    let credential = serde_json::json!({
+        "did": signer.did(),
+        "verifiablePresentation": presentation.to_string(),
+    });
+    (signer, credential)
 }
 
 fn remote_record_id(

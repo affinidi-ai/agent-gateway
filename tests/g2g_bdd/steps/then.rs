@@ -493,6 +493,75 @@ fn first_credential_issuer_from_identity_proof(proof: &Value) -> String {
     issuer.to_string()
 }
 
+/// The audiences an identity presentation names in its proof's `domain`.
+fn presentation_domains(presentation: &Value) -> Vec<String> {
+    match decode_json_or_jwt(presentation).pointer("/proof/domain") {
+        Some(Value::String(domain)) => vec![domain.clone()],
+        Some(Value::Array(domains)) => domains
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Assert that `domains` names gateway `gw`: the DID another gateway of the
+/// fabric holds for it and sends to.
+fn assert_addressed_to_gateway(
+    world: &G2gWorld,
+    what: &str,
+    domains: &[String],
+    gw: usize,
+) {
+    let addresses: Vec<String> = (1..=world.topology.gateway_count)
+        .filter(|index| *index != gw)
+        .filter_map(|index| {
+            world
+                .harness()
+                .remote_peer_did(index, gw)
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(
+        domains
+            .iter()
+            .any(|domain| addresses.contains(domain)),
+        "{what} should be addressed to gateway {gw} (one of {addresses:?}), got domain {domains:?}"
+    );
+}
+
+#[then(
+    expr = "managed agent {string} received the forwarded request carrying an identity presentation addressed to gateway {int}"
+)]
+pub async fn managed_agent_received_forwarded_request_with_presentation_addressed_to_gateway(
+    world: &mut G2gWorld,
+    target_name: String,
+    gw: usize,
+) {
+    world
+        .topology
+        .actors
+        .expect_target_kind(&target_name, TargetActorKind::ManagedAgent);
+    let messages = forwarded_messages_for(world, &target_name).await;
+    let body = messages
+        .last()
+        .unwrap_or_else(|| panic!("managed agent '{target_name}' should receive a forwarded message, got none"))
+        .json_body();
+    let proof = crate::bdd_support::json_rpc::IdentityBindingProof::from_forwarded_a2a_body(&body)
+        .unwrap_or_else(|| panic!("managed agent '{target_name}' should receive an identity proof, got body: {body}"));
+    let presentation = proof
+        .proof
+        .get("verifiablePresentation")
+        .unwrap_or_else(|| panic!("identity proof should contain verifiablePresentation, got: {}", proof.proof));
+    assert_addressed_to_gateway(
+        world,
+        &format!("the identity presentation managed agent '{target_name}' received"),
+        &presentation_domains(presentation),
+        gw,
+    );
+}
+
 fn identity_field_value_from_subject<'a>(
     subject: &'a Value,
     field: &str,
@@ -659,6 +728,41 @@ async fn vp_audit_log_records_presentation_received_on_answer(
     );
 }
 
+#[then(
+    expr = "the VP Audit Log of gateway {int} records the identity presentation received on the answer addressed to gateway {int}"
+)]
+async fn vp_audit_log_records_presentation_received_on_answer_addressed_to_gateway(
+    world: &mut G2gWorld,
+    gateway: usize,
+    addressed_gw: usize,
+) {
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(is_presentation_received_on_answer)
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
+    let event = events
+        .iter()
+        .find(|event| is_presentation_received_on_answer(event))
+        .filter(|_| found)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected gateway {gateway} to record the identity presentation received on the answer, got {events:?}"
+            )
+        });
+    let presentation = event
+        .get("vp_jwt")
+        .unwrap_or_else(|| panic!("the received presentation record should carry the presentation, got {event}"));
+    assert_addressed_to_gateway(
+        world,
+        &format!("the identity presentation gateway {gateway} received on the answer"),
+        &presentation_domains(presentation),
+        addressed_gw,
+    );
+}
+
 #[then(expr = "the VP Audit Log of gateway {int} records no identity presentation received on the answer")]
 async fn vp_audit_log_records_no_presentation_received_on_answer(
     world: &mut G2gWorld,
@@ -775,12 +879,17 @@ async fn vp_audit_log_records_fabric_policy_decision_under_request_trace_id(
     );
 }
 
-/// The audit outcome for a failed identity binding, as the step names it.
-fn audited_identity_binding_failure(reason: &str) -> &'static str {
+/// The audit outcome for a failed identity binding, as the step names it, and
+/// the text its `error_detail` must contain when the outcome alone does not
+/// say which check refused it.
+fn audited_identity_binding_failure(reason: &str) -> (&'static str, Option<&'static str>) {
     match reason {
-        "no identity presentation was sent" => "absent",
-        "its identity presentation failed verification" => "invalid",
-        "its issuer is not trusted on that connection" => "untrusted",
+        "no identity presentation was sent" => ("absent", None),
+        "its identity presentation failed verification" => ("invalid", None),
+        "its identity presentation is addressed to another Connection Point" => {
+            ("invalid", Some("VP is not addressed to this gateway"))
+        }
+        "its issuer is not trusted on that connection" => ("untrusted", None),
         other => panic!("no audited outcome for the identity binding failure '{other}'"),
     }
 }
@@ -791,12 +900,20 @@ async fn vp_audit_log_of_gateway_records_failed_identity_binding(
     gateway: usize,
     reason: String,
 ) {
-    let outcome = audited_identity_binding_failure(&reason);
+    let (outcome, detail) = audited_identity_binding_failure(&reason);
     let (found, events) = world
         .harness()
         .gw(gateway)
         .admin
-        .wait_for_audit_event(|event| event["event"]["identity_binding_failed"]["outcome"] == outcome)
+        .wait_for_audit_event(|event| {
+            let failed = &event["event"]["identity_binding_failed"];
+            failed["outcome"] == outcome
+                && detail.is_none_or(|detail| {
+                    failed["error_detail"]
+                        .as_str()
+                        .is_some_and(|recorded| recorded.contains(detail))
+                })
+        })
         .await
         .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
     assert!(found, "expected gateway {gateway} to record a failed identity binding because {reason}, got {events:?}");

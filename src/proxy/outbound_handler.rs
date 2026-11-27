@@ -2681,6 +2681,7 @@ async fn step_extract_protocol_context_with_versions(
             state.vc_issuer.as_ref(),
             &transit_audit_facts(ctx),
             None,
+            None,
         )
         .await
         .map_err(|error| {
@@ -5197,6 +5198,12 @@ async fn step_inject_trusted_identity(
         wb
     };
 
+    let target_domain = crate::proxy::fabric_forward::vp_domain_for_target(
+        &state.listener_manager,
+        &ctx.virtual_channel
+            .target_endpoint,
+    )
+    .await;
     let key_scope = crate::vta::key_directory::KeyScope::serving(
         &ctx.surface,
         ctx.active_variant_id
@@ -5230,6 +5237,7 @@ async fn step_inject_trusted_identity(
                 workload_binding,
                 vc_issuer,
                 channel_name,
+                target_domain.as_deref(),
                 &key_scope,
             )
             .await
@@ -5268,6 +5276,7 @@ async fn step_inject_trusted_identity(
                 &protected_meta_field,
                 protected_strip_raw,
                 ctx.mcp_metadata_context,
+                target_domain.as_deref(),
                 &key_scope,
             )
             .await

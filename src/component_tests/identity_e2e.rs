@@ -2554,6 +2554,7 @@ fn write_self_gateway_denying_asserted_did(gateways_dir: &str) {
         issuer_did: None,
         issuer_did_source: None,
         trusted_issuer_dids: Vec::new(),
+        require_addressed_presentations: false,
         gateway_type: GatewayType::SelfGateway,
         status: GatewayStatus::Active,
         creation_type: GatewayCreationType::User,
