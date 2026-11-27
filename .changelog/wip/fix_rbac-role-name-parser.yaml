@@ -1,0 +1,16 @@
+branch: fix/rbac-role-name-parser
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-27T09:00:00Z'
+      title: Read role names in rbac.json exactly as saml.json does
+      description: >-
+        rbac.json accepted role names in any letter case while saml.json refused anything but
+        lower case. Both files now take only administrator, poweruser or user in lower case.
+        An rbac.json that names another role, such as Administrator, no longer parses, the
+        error names the permission, and the gateway runs on the built-in defaults as it does
+        for any unparseable rbac.json.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
