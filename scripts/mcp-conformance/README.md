@@ -45,7 +45,8 @@ Exit codes: `0` pass, `1` failure, `2` invalid options or precondition not met
 (another run in progress, missing tool, `RUSTFLAGS` or `CARGO_ENCODED_RUSTFLAGS`
 set when Cargo runs, a binary path that is not an executable file, port in use,
 binary that does not admit `2026-07-28`), `3` the pinned suite or reference server could
-not be fetched, `130` interrupted (SIGINT), `143` terminated (SIGTERM).
+not be fetched, `129` hung up (SIGHUP, such as a closed terminal), `130` interrupted (SIGINT),
+`143` terminated (SIGTERM).
 
 ## What a run does
 

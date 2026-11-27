@@ -2186,7 +2186,7 @@ runs the full binary test suite, and `make mcp-conformance-legacy` runs only
 the legacy-phase compatibility checks.
 Run outputs stay under the ignored `target/mcp-conformance/`. Exit codes are `0`
 pass, `1` failure, `2` invalid options or precondition not met, `3` dependency
-fetch failure, `130` interrupted (SIGINT) and `143` terminated (SIGTERM).
+fetch failure, `129` hung up (SIGHUP), `130` interrupted (SIGINT) and `143` terminated (SIGTERM).
 
 **CI.** The `test:mcp-conformance` job runs only when the pipeline variable
 `MCP_CONFORMANCE` is `"true"` (default `"false"`). It runs the harness with

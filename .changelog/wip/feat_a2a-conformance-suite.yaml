@@ -15,7 +15,14 @@ changes:
         instead. The suite and its packages are pinned and installed under target/, and the
         gateway itself is unchanged.
   changed: []
-  fixed: []
+  fixed:
+    - timestamp: '2026-11-27T12:54:26Z'
+      title: Record an MCP conformance run ended by a hangup as failed
+      description: >-
+        A run of make mcp-conformance whose terminal closed could write RESULT PASS and exit 0
+        to its summary, although the run had stopped part way. A hangup now ends the run with exit 129
+        and a FAIL summary, as an interrupt already did, and a second signal during the cleanup
+        no longer leaves the processes the run started behind.
   removed: []
   security: []
   breaking: []
