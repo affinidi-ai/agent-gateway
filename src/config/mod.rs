@@ -20,6 +20,7 @@ pub mod response_auth;
 pub mod route_claims;
 pub mod target_auth_rules;
 pub mod types;
+pub mod vta;
 
 // Re-export all public types
 pub use credential_policy::init_credential_policy;

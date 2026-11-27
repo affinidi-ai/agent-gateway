@@ -342,8 +342,35 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   Managed Agent response identity (`response:identity-protected`), since the key picker lists
   API keys issued to callers, and none of them identifies the Managed Agent; the inbound and
   external slots still offer it. A protected
-  identity already set to From API Key keeps showing its key selector. Transit Point
-  identities offer only From Payload.
+  identity already set to From API Key keeps showing its key selector. A Transit Point
+  identity offers From Payload, and **From API Key** only while that Transit Point's caller
+  authentication (`source_auth`) is `api_key` or `api_key_provider`; otherwise the option is
+  disabled and one line says why (`identity-panel-transit-api-key-unavailable`). On a Transit
+  Point, From API Key shows no key picker, only the line "Each caller is identified by the API
+  key it presents to this Transit Point." (`identity-panel-transit-api-key-note`), and writes
+  `{type: "from_api_key"}` without `api_key_id`. A stored one with an `api_key_id` (set through
+  the API) keeps its key picker and its key. Save is blocked while a Transit Point From API
+  Key without `api_key_id` sits behind caller authentication that is not an API key
+  (`TRANSIT_POINT_API_KEY_NEEDS_API_KEY_CALLER` in `identity/definition.ts`). The caller
+  methods each identity type needs live in `TRANSIT_POINT_CALLER_METHODS`
+  (`identity/placement.ts`). A Transit Point identity offers **From JWT Claims**, with its JWT
+  Claim (written as `oid` when empty) and Namespace Claims, only while that Transit Point's
+  caller authentication is `jwt_bearer`, and **From mTLS certificate** only while it is `mtls`
+  (set through the API); each disabled option gets its own line saying why
+  (`identity-panel-transit-jwt-claim-unavailable`, `identity-panel-transit-mtls-unavailable`).
+  From mTLS certificate stays disabled in every other slot. On a Transit Point it shows no
+  certificate picker, only the line "Each caller is identified by the client certificate it
+  presents to this Transit Point." (`identity-panel-transit-mtls-note`), and writes
+  `{type: "from_mtls"}` without `certificate_id`; a stored one with a `certificate_id` keeps
+  its picker and its certificate. On a Transit Point the help under the type select
+  (`identity-panel-transit-type-help`) says what each option needs there, and that a From
+  Payload DID can be copied by any caller and is unverified to policy while the other options
+  bind it to the caller's credential. Save is blocked
+  while a Transit Point From JWT Claims sits behind caller authentication that is not JWT
+  Bearer (`TRANSIT_POINT_JWT_CLAIM_NEEDS_JWT_CALLER`), or a Transit Point From mTLS
+  certificate without `certificate_id` behind caller authentication that is not mTLS
+  (`TRANSIT_POINT_MTLS_NEEDS_MTLS_CALLER`); the rule that From JWT Claims needs an all-JWT
+  Bearer Caller Context applies to the other slots only.
 - **Listen Path** is the shared routing editor of Access Points and Transit Points
   (`_shared/RouteListenerSection.tsx`): a required **Surface Prefix** select and a required
   **Custom Path** input, which compose the node's route, helped by
@@ -586,8 +613,12 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   "This surface is refusing requests" (`surface-refusing-requests`, `alert-warning`,
   `role="status"`); `serving` and `not_judged` show nothing. The gateway gives no reason, so the
   notice names none. An error-level dependency blocks
-  Save unless every Caller Context method is API Key or API Key Provider, with the gateway's
-  own message. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
+  Save unless a Caller Context method is API Key or API Key Provider, with the gateway's own
+  message (`INBOUND_API_KEY_NEEDS_API_KEY_CALLER`). An inbound From JWT Claims blocks Save unless
+  a Caller Context method is JWT Bearer, with the dashboard's own message
+  (`INBOUND_JWT_CLAIM_NEEDS_JWT_CALLER`); on the protected or external Identity every method
+  must be JWT Bearer, and on a Transit Point that Transit Point's own caller authentication
+  (`TRANSIT_POINT_JWT_CLAIM_NEEDS_JWT_CALLER`). Callers of the other methods get no identity. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
   apart. Rules only the gateway enforces (an MCP `proxy://` target, `mcp_http.authorization`)
   and rules on inactive variants show as the save-error banner.
 - **Caller Context methods**: the caller-auth element's config holds `methods`, saved as
@@ -694,6 +725,16 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   - **Scopes.** The credential provider method has an optional space-separated **Scopes** input
     (`managed-agent-target-auth-scopes`, `transit-point-target-auth-provider-scopes`) wired to the
     wire `scopes`; empty uses the provider's default scopes.
+  - **One reading of a stored header.** Both editors pick the type a stored header opens as with
+    `storedHeaderKind` (`_shared/providerTargetAuth.ts`), which reads it as the gateway does:
+    **Bearer Token** or **Basic Auth** for an `Authorization` header whose format starts with
+    `Bearer ` or `Basic ` in any letter case, **API Key** for an `X-API-Key` header, **Custom** for
+    any other. Names are compared with `sameHeaderName` and the stored values are not trimmed. The
+    Managed Agent uses it for a static secret or a provider with no stored `auth_type` hint (a
+    stored hint is shown as it is); the Transit Point uses it for a static secret
+    (`staticSecretAuthType`) and, having no Basic Auth type, shows Basic as **Custom Header**. The
+    Transit Point's Bearer Token type saves a stored spelling of `Authorization`, such as
+    `authorization`, unchanged, so opening and saving a Transit Point changes no header.
   - **Rules that block Save**, which the gateway refuses in every mode: a header name that is not
     an HTTP token or is reserved (Host, Content-Length, Transfer-Encoding, Connection, Keep-Alive,
     Proxy-Connection, TE, Upgrade, Trailer, and the gateway's own transit, caller, identity, trace and
@@ -754,9 +795,14 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
     (`mergeTargetAuth`), so a field the editor does not show survives. That holds while the edit
     keeps the stored credential: another method kind, secret or provider replaces the stored
     setting, so nothing unseen follows a credential it was not set for. A Transit Point whose
-    auth form was never opened sends the stored `target_auth` unchanged, and so does a Managed
+    auth form was never edited sends the stored `target_auth` unchanged, and so does a Managed
     Agent or Transit Point whose stored method the editor cannot show, until the operator
     chooses a secret or a provider.
+  - **Opening a Transit Point writes nothing.** The Transit Point panel shows a stored static
+    secret or credential provider from the stored `target_auth` while it renders
+    (`storedTransitPointAuthForm`), and writes those form fields only with the operator's first
+    edit of the section. A mount-time write would be lost to a later write made from the config
+    as loaded, such as the listener's first seed, and the panel would show **None**.
   - **Never in the canvas data.** The Target authentication form fields, the stored copy and a
     Transit Point's `target_auth` are left out of the canvas blob on save and ignored when one
     is read (`withoutTargetAuth` in `elements/registry.ts`; the key lists are
@@ -1169,9 +1215,13 @@ held row shows its case id. The Surface cell says `via <payment surface> on <pay
 gateway>` (`payments-gateway-<id>`, the id as its tooltip) and the details show the
 **Payment gateway** by name (`payments-detail-gateway`). `usePaymentGatewayNames` reads
 `GET /payment-gateways` once per page and falls back to the id for an unlisted gateway or a
-failed read; the ledger is never filtered by it. `usePaymentLedger` only lets the latest request write rows,
-the error and the Refresh state, so a slow answer to an earlier filter never overwrites a
-later one. When a refresh fails, the rows of the same filter stay under
+failed read; the ledger is never filtered by it. The page requests at most 500 newest payments, so
+when more than 500 match the filters, an alert notice says "Showing only the newest 500 matching
+payments. Older payments were not searched." (`payments-capped-list-note`). Its text filter runs
+only on those 500 rows, so if the user searches and finds no match, another notice appears saying
+the same, with a different test id (`payments-capped-search-note`). `usePaymentLedger` only lets
+the latest request write rows, the error and the Refresh state, so a slow answer to an earlier
+filter never overwrites a later one. When a refresh fails, the rows of the same filter stay under
 `payments-stale-note` ("may be out of date"), and the rows of an earlier filter are dropped.
 An outcome or surface filter with no rows shows "No payments match this filter" rather than
 "No payments yet". The outcomes are `paid`, `challenge`, `held`, `rejected`, `unavailable`, `unconfirmed` (the
@@ -1212,6 +1262,7 @@ by the token's decimals and shown in dollars. `/payments` is left free for gatew
 `payments-detail-caller-principal`, `payments-reason-<id>`,
 `payments-legacy-panel`, `payments-legacy-row-<key>`,
 `payments-error-alert`, `payments-error-dismiss-button`, `payments-stale-note`,
+`payments-capped-list-note`, `payments-capped-search-note`,
 `payments-surface-filter`, `payments-gateway-<id>`, `payments-detail-gateway`.
 
 ## Agent Cards tab
@@ -1655,6 +1706,16 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   `credential-provider-jwt-section`): Key ID sits under Certificate, a warning
   (`credential-provider-jwt-key-unidentified-warning`, from `jwtKeyUnidentified`) shows when
   neither names the key, and the algorithm select lists the type's algorithms, default first.
+  The Audience `FieldHelp` (`field-help-jwt-audience`) says an empty Audience means the token
+  endpoint, and that a server following RFC 7523bis wants its issuer identifier there instead.
+- **Client Credentials** and **Authorization Code** (without an `issuer`) show the same
+  **Client authentication** select (`ClientAuthenticationSelect.tsx`, its own `FieldHelp` text)
+  with two options: "Form body (default)", which sends an empty `client_authentication`, and
+  "HTTP Basic" (`client_secret_basic`). A stored `client_secret_post` shows as the default and is
+  sent unchanged unless the operator picks another option; a `none` left from JWT Bearer is
+  sent empty. `clientAuthenticationsOf` in `credentialProviderForm.ts` lists the methods each
+  type takes, and decides what Save sends and whether the list shows a badge. A provider with an
+  `issuer` shows no select.
 - Key material is never typed into this form. Signing key and certificate are secret pickers
   (`SecretSelect.tsx`, `credential-provider-<field>-select`); the operator creates the secret on
   the Secrets page and pastes the PEM, or a whole Google service account JSON key file (16 KiB
@@ -1664,7 +1725,9 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   switching a provider to Client Credentials JWT drops its client secret. The exceptions are the
   client ID reference, which is omitted for every type but JWT Bearer while its picker is hidden
   (JWT Bearer sends it empty then, so a stored one is cleared and no longer blocks deleting its
-  secret), and `client_authentication`, which is always sent, empty for every type but JWT Bearer.
+  secret), and `client_authentication`, which is always sent: the chosen method on JWT Bearer, HTTP
+  Basic or the form body on Client Credentials and Authorization Code, and empty on the other
+  types.
 - `resource` has no input (it is set through the API or YAML) and is never sent on save. When
   `entraRejectsResource` finds the provider's token requests send it to a Microsoft identity
   platform v2.0 token endpoint, which rejects it (AADSTS901002), the form warns
@@ -1813,9 +1876,9 @@ strategy picker: on a new provider, appliance-wide ones only. The labels say "Lo
   (`delegated-access-provider-deactivated-<id>`), also right after a Deactivate on the same
   page, since the tab tells the page (`onProvidersChange`). Success and failure are toasts.
 - The Credential Providers tab labels the types from `PROVIDER_TYPE_LABELS` in the same module, and
-  shows a secondary badge after the type of a JWT Bearer provider that has a
-  `client_authentication` (`credential-provider-client-authentication-badge`: Client ID only,
-  HTTP Basic or Form body, from `CLIENT_AUTHENTICATION_LABELS`); no badge without one. A
+  shows a secondary badge after the type of a provider whose `client_authentication` its type
+  takes (`credential-provider-client-authentication-badge`: Client ID only, HTTP Basic or Form
+  body, from `CLIENT_AUTHENTICATION_LABELS`; `clientAuthenticationsOf`); no badge without one. A
   refused delete shows the API's reason and, for a `409`, the surface that binds the provider
   (`providerDeleteError`).
 - Credential provider pages follow their own permissions, not `settings.*`.
@@ -1899,6 +1962,28 @@ toast that stays until dismissed: "Revoke failed: <gateway message>".
 When the key's surface was deleted (`surface_deleted: true` on `GET /api-keys/{agent_id}/{key_id}`),
 the detail page shows the info alert "This API key is no longer in use because the associated
 surface has been deleted." (`api-key-surface-deleted-info`) at the top of Key Information.
+
+## Key Management tab
+
+The Secrets page's **Key Management** tab (`?tab=key-management`,
+`key-management-tab-trigger`, `pages/SecretsPage/KeyManagementTab.tsx`) is shown only with
+`key_management.view` and reads `GET /v1/key-management/inventory`. It opens with a status alert
+naming the deployment tier and, from `custody_claim`, either "Signing keys are held by a
+separately-operated trust agent; the gateway keeps only the key it signs in to that agent with."
+or, while anything still signs with the gateway's own key, "Some tokens are still signed with the
+gateway's own key, so not every signing key is held by a separate party.", then one card
+per trust agent connection the caller may see (its keys with `kid`, status, public key and
+retirement, `KeyManagementTables.tsx`), a **Surface mapping** card (which backend, context and key
+each surface and variant signs with, "inherit" when it sets nothing, and a "via issuer" badge,
+`key-mapping-via-issuer-<surface id>`, when its issuer decides), and a warning listing contexts no
+surface claims any more. With no connection it shows the empty state "No agent keys", pointing to
+Connections → Verifiable Trust Agent. A payload it cannot read becomes the tab's error with a
+Retry, never an exception that unmounts the other tabs. With `key_management.edit`, a connection
+without a key offers **Provision a signing key** (`POST /v1/vta/connections/{id}/keys`, no
+confirmation) and one with keys offers **New key id** and **Rotate**
+(`POST /v1/vta/connections/{id}/rotate`), which needs a second click, prompted by a toast, before
+it sends. Each card keeps its own key id, and the second click counts only for the same card and
+the same key id: changing the field after the first click asks again.
 
 ## Surface delete
 
@@ -2501,8 +2586,9 @@ in components. It fills `surface_variant` from `variant` on records written befo
   changes are red, deletions and detachments amber, the rest neutral.
 - The footnote shows the actor instead of the caller. Records hold ids only; `useUserNames`
   resolves user ids to usernames from `/users` and keeps the id when the list is not readable.
-  It is called once, in `AuditPage`, and asks for the list only when the page shows a policy
-  change and the viewer has `users.view`; the resolver is passed down as the `userName` prop.
+  It is called once, in `AuditPage`, and asks for the list only when the page shows a record
+  `changeActor` names an actor for (a policy change, a Target authentication change or a forced
+  secret delete) and the viewer has `users.view`; the resolver is passed down as the `userName` prop.
   Don't call it per row. The names are cached per session token, so signing out and in (as
   anyone) loads them again and never shows the previous session's. Within a session a 403 is
   kept until the page reloads; any other failure is retried on the next visit. The status comes
@@ -2512,6 +2598,27 @@ in components. It fills `surface_variant` from `variant` on records written befo
 - The evidence pane shows only **Details** for a change (no request journey or signed
   presentation), grouped as Change, Policy, Where and Refusal. The policy links to the Policies
   tab of its type, the target to its surface or gateway page.
+- Every value is rendered as React text; record fields come from the gateway and are untrusted.
+
+## Audit page: Target authentication changes and forced secret deletes
+
+`target_auth_changed` and `secret_force_deleted` records are read with `targetAuthChange` and
+`secretForceDelete` (`pages/AuditPage/auditHelpers.ts`), never by indexing `entry.event`, and
+both are offered as filters in the Category menu (low frequency).
+
+- `target_auth_changed` is titled **Target authentication changed** in the neutral tone. The
+  summary names the leg (the Target, or Transit Point `<alias>`), the surface by name (its id
+  when no name is recorded), the variant when it is not the base surface, and what changed:
+  added (with the method and provider id), removed, replaced method, or the changed parts by
+  name. The Details list shows Change, Where (surface link, Variant, Leg, Transit point) and
+  Authentication (Method, Provider linking to its page, Changed). The record holds no secret id,
+  header name, format or value, so none is shown; a provider is shown by id.
+- `secret_force_deleted` is titled **Secret force-deleted** in the warn tone. The summary names
+  the secret id and how many records still used it; Details shows Change (with Secret) and a
+  **Records still using it** group, one row per referrer by kind and id. A record with no
+  referrers has no such rows.
+- Both show the actor (`actorLabel`, resolved through `userName`, which loads the users list for
+  them as for a policy change) in the footnote and the detail line, and the evidence pane shows only **Details**, as for a policy change.
 - Every value is rendered as React text; record fields come from the gateway and are untrusted.
 
 ## Audit page: surface variants and refusals
@@ -2608,8 +2715,10 @@ parts `IdentityNameCell`, `IdentitySurfaceCell`, `IdentityOriginBadge`,
   (`agent_identity.credential_type`) or `slot`, so the Managed Agent's response and Transit
   Point DIDs share it. The row shows the most recently used DID, a summed usage count, and the
   latest last use; its actions (Trust Score, Configure Policy, Copy link) belong to that DID.
-  `from_jwt_claim` DIDs (one per claim value), external callers and identities without a
-  surface keep one row per DID.
+  `from_jwt_claim` DIDs (one per claim value), caller-bound Transit Point DIDs (`slot`
+  `caller_bound: true`, and every `credential_type` `mtls_caller`; one per caller credential,
+  still managed for their surface), external callers and identities without a surface keep one
+  row per DID.
 - The expanded row's **Version History** section lists the entry's DIDs and the credential
   rotations inside them as one timeline, newest first, numbered from the oldest. Each version
   shows its time ("Time unknown" for a rotation found when tracking began), its DID, a
@@ -2734,19 +2843,196 @@ parts `IdentityNameCell`, `IdentitySurfaceCell`, `IdentityOriginBadge`,
 | Tooltip last attempt, reason   | `identities-recorder-last-attempt`, `identities-recorder-reason`         |
 | Tooltip registry entry         | `identities-recorder-entry-<registry id>`                                |
 
+## Verifiable Trust Agent tab and Gateway signing
+
+There is no Trust Agent page and no `/trust-agent` address: the sidebar has no entry for it, and
+Verifiable Trust Agents are **connections**, so they live on the Connections page as the
+**Verifiable Trust Agent** tab (`connections-tab-trust-agents`, `?tab=trust-agents`), shown only
+with `vta_connections.view`. The gateway-wide signing default is set in **Settings → Security →
+Gateway signing**, not on Connections.
+
+### Verifiable Trust Agent tab
+
+`pages/TrustAgentsPage.tsx` (`data-testid="page-trust-agents"`) lists the connections the way the
+other tabs list theirs and reports its counts (`onCountChange`). It follows the Registries and
+Gateways tabs: no text above the card and no button in the tab banner (it takes no
+`actionsContainer`). The card header holds the title, the count and **Add VTA**
+(`trust-agents-connect-button`, primary, `size="md"`, shown only with `vta_connections.edit`),
+which opens the wizard; it has no Refresh. **Add VTA** is the tab's only call to action. With no
+connection the card shows the shared `EmptyState` titled "Add your first Verifiable Trust Agent",
+a sentence on what a trust agent is for and **View Docs** (`DOCS_URL.connections`), with no button
+of its own. A failed read shows an error with **Retry**. The Connections filter box is not shown on
+this tab.
+
+The tab never claims a compromised gateway cannot sign: it still holds the control key and can
+ask the trust agent to sign within its grant until that access is revoked. Which DID new contexts
+sign as (`[vta] context_did_method`) is not shown on the tab; `GET /v1/vta/status` and the key
+inventory report it.
+
+The tab shows no signing tier banner. Above the card, while `control_key` of `GET /v1/vta/status`
+is present (the gateway holds a rotatable `did:key` control key for a `[vta]` connection), the
+**Control key** card (`ControlKeyCard`, `data-testid="vta-control-key"`) shows the key this
+gateway signs in to its trust agent with (shortened, full value in the `title`, with a copy
+button: `vta-control-key-did`), when it was last rotated or "Never rotated"
+(`vta-control-key-rotated-at`), and when it is next due or "Automatic rotation is off" when
+`rotation_days` is 0 (`vta-control-key-next`). The card is not rendered while `control_key` is
+absent. **Rotate control key** (`vta-control-key-rotate`) is shown only with
+`key_management.edit`. It asks first (an inline confirmation, `vta-control-key-confirm` /
+`-cancel`) and then posts to `POST /v1/vta/control-key/rotate`; a `429` reads "Try again in N
+minutes" from `Retry-After`, any other refusal shows the gateway's message, and a success toasts
+the new DID and reloads. The card says rotation changes no signing key; keep that true.
+
+The table reads `GET /v1/vta/connections`:
+
+- A connection the operator added whose control identity is a `did:webvh` shows, under its
+  agent DID, `Control key key-N · Rotated <date>` or `Never rotated`
+  (`vta-row-control-key`, `vta-row-control-key-rotated-at`) and an action **Rotate control key**
+  (`vta-row-rotate-control-key`, `canRotateControlKey`: not the `[vta]` block's record, enabled,
+  connected, no rotation under way; only with `key_management.edit`). It asks first, in a row
+  under the connection (`vta-row-rotate-confirm-row`, `-confirm-text`, `-confirm`, `-confirm-cancel`),
+  and posts to `POST /v1/vta/connections/{id}/control-key/rotate`: `200` toasts that the key
+  rotated and the DID did not change, `202` that it is under way, any other status shows the
+  gateway's message. While `control_key_state.rotation` is present the row shows "Rotating control
+  key…" (`vta-row-rotation-status`), the last error (`vta-row-rotation-error`, also shown after
+  a rollback) and **Cancel rotation** (`vta-row-rotate-cancel`, until the phase is `switched`),
+  and the tab reads the connections again every 10 seconds. A `did:key` connection shows
+  none of this: its key cannot change without a new grant.
+- The `vta-bootstrap` record is the `[vta]` configuration block's; the backend reports its
+  pairing state, and the tab offers no Revoke on it (`canRevoke`) or Verify (`canVerify`), since
+  the server refuses both. It has no row rotate button either: its control key is rotated from
+  the Control key card.
+- A row opens the connect wizard at its grant step, or at the last step when it is connected.
+- **Revoke** (outline danger, shown only with `vta_connections.delete` and `canRevoke`) takes
+  three clicks at most. The first only arms that row, with the error toast "Click Revoke again to
+  stop <name> signing."; the button itself does not change, and the armed row stays armed until
+  another row is armed or the revoke is sent. The second posts
+  `POST /v1/vta/connections/{id}/revoke`. When the gateway answers `409` (agents or signing
+  choices that would stop signing), the toast shows its message with "Click Revoke again to
+  proceed.", and only the next click sends the revoke again with
+  `acknowledge_stranded_agents=true&acknowledge_signing_users=true`. Arming any row drops that
+  acknowledgement. A success toasts that the connection is revoked and can no longer sign.
+
+### Add a Verifiable Trust Agent wizard
+
+`/connections/trust-agents/connect` (`pages/ConnectTrustAgentWizardPage.tsx`,
+`vta_connections.edit`, root `wizard-add-trust-agent`) is a full page with the shared step bar
+(`components/shared/WizardProgress.tsx`), like the other connect wizards: nothing opens in a
+pop-up. It sits under `/connections` so it needs no reserved top-level path of its own. Steps,
+with the shared navigation test ids (`wizard-next`, `wizard-back`, `wizard-cancel`,
+`wizard-submit`):
+
+1. **Enter Details** (`wizard-step-details`, fields `wizard-trust-agent-name-input`,
+   `-endpoint-input`, `-did-input`, `-context-input`, all required: the grant is scoped to the one
+   context, so it is asked for up front). **Create and pair** posts the connection (always over
+   HTTPS) and puts no key material in the form; a refusal shows in `wizard-trust-agent-error`.
+2. **Grant Access** (`wizard-step-grant`) shows the `vta acl create` command to run on your own
+   agent. It grants the `initiator` role in that one context with four capabilities, never
+   administration, and the copy names them: `context-create`, `key-mint`, `sign-jws` and
+   `sign-document`. No copy calls the grant "sign-only": Verify says it checks the grant covers
+   one context without administration, and an over-privileged grant is told to re-grant the
+   `initiator` role in exactly one context. An expired command offers a new one; **Finish later**
+   leaves with the connection saved.
+3. **Verify** (`wizard-step-verify`) checks the grant; a refusal shows its reason and a retry. A
+   `409` or `502` whose body is the connection records it and shows its `pairing.last_error`,
+   never the status text.
+4. **Complete** (`wizard-step-complete`) mints the connection's signing key and offers **Use this
+   agent for all signing**, shown only with both `settings.edit` and `key_management.edit` (what
+   the server needs to change Gateway signing) and pre-checked only when `GET /v1/settings` was
+   read and holds no `default_signing` at all: connecting a second agent must never silently
+   repoint signing away from one, a stored choice of the gateway's own key counts as a default,
+   and a failed read leaves it unchecked. Its hint says it can be changed later in
+   **Settings → Security → Gateway signing**, or per surface in the surface editor. **Done**
+   returns to the tab; it is disabled while the signing key is still being minted
+   (`onMintingChange`), so the default is never applied to a connection without a key.
+
+`?id=` resumes a created connection at the grant step, or at the last step when it is connected.
+A revoked or degraded one opens at the grant step showing its state and reason
+(`wizard-out-of-use`) and pairs only after **Pair again** (`wizard-pair-again`), since pairing
+replaces its state and the agent DID it pinned.
+
+### Gateway signing
+
+**Settings → Security** opens with **Gateway signing** (`pages/SettingsPage/GatewaySigningSection.tsx`,
+`data-testid="gateway-signing-settings"`), with no scope label beside the title. It sets what signs tokens, ID-JAGs, credentials, payment evidence and
+the issuer attestation for every surface and issuer that sets no source of its own. It holds only
+the **Signing key source** choice (`SurfaceSigningSection` with `subject="gateway"`) and **Save**.
+While **Verifiable Trust Agent** is the source shown, a primary **Connect VTA** button sits at the
+right of the card header (`gateway-signing-connect-button`, `vta_connections.edit`, opens the
+wizard), like the add buttons on other pages; with **Gateway secret** it is not shown.
+**Save** (`gateway-signing-save-button`, disabled
+until something changed and while Verifiable Trust Agent is chosen without an agent;
+`gateway-signing-saved` after a save). Editing needs both `settings.edit` and
+`key_management.edit`; without either the choice is read-only and there is no Save. **Save** sends
+nothing: it opens the confirmation dialog `gateway-signing-confirm-dialog` (the shared
+`WarningDialog`, titled "Change gateway signing"), which lists the effects: what is issued from
+now on carries the new source's issuer DID, Fabric peers and verifiers must trust that DID, and
+tokens and credentials already issued keep the key that signed them and verify only while it is
+still published. **Change gateway signing** (`gateway-signing-confirm-dialog-confirm`) posts
+`default_signing` to `POST /v1/settings`: `{ "backend": "local" }` for Gateway secret, or the
+chosen agent with its context and key. **Cancel** and the close button save nothing. No text sits
+above the choice. While the `[vta]` configuration block is enabled (`enabled` in
+`GET /v1/vta/status`) and Gateway signing sets nothing, it follows that block: the note
+(`surface-signing-inherited`) says "Following the `[vta]` configuration block.", no agent list or
+"No Verifiable Trust Agent is connected yet." is shown, and once another source is chosen
+**Use the `[vta]` configuration block** (`surface-signing-reset`) takes it back (Save then sends
+`default_signing: {}`). Without the block there is no inherited note and no way back: the
+gateway default then inherits from nothing.
+
+### Signing key source
+
+Wherever a signing key is chosen, the field is **Signing key source** (`SurfaceSigningSection`,
+`surface-signing-type-select`) with two options, **Gateway secret** (this gateway's own key) and
+**Verifiable Trust Agent** (`SIGNING_TYPE_LABELS`). Verifiable Trust Agent shows an **Agent**
+select (`surface-signing-agent-select`) of the connections, only once there is one to list; until
+then it shows "No Verifiable Trust Agent is connected yet." (`surface-signing-no-agents`, which on
+Gateway signing points to **Connect VTA**) and no select. For a surface or issuer it also shows
+**Add VTA**, which opens the wizard in a new tab (`surface-signing-connect-link`), and a Refresh
+(`surface-signing-refresh`). Only a connected, enabled connection with an active key can be chosen;
+a paired one without a key is listed disabled with the reason. The `[vta]` block's own record
+(`vta-bootstrap`) is offered once it is connected; while it is not, it is left out unless the
+surface already saved it, so the select is never blank. Verifiable Trust Agent with no agent yet
+stores nothing and says what applies meanwhile (`surface-signing-pick-agent`).
+
+On a surface or an issuer the field is read-only without `key_management.edit` (the gateway
+refuses a changed choice without it), as Gateway signing is without both `settings.edit` and
+`key_management.edit`. A read-only field shows the stored choice, names a stored agent by its id
+when the connections cannot be listed, and does not show the "could not be listed" note
+(`surface-signing-load-error`), which an editor sees.
+
+- **Surface Builder → Surface**: a surface that sets nothing follows its issuer's source, then
+  the gateway-wide default; the source shown is the one it follows, with a note
+  (`surface-signing-inherited`) saying which. The gateway-wide default is read from
+  `default_resolution` in `GET /v1/vta/status`, which reports the dashboard's Gateway signing
+  when one is set; when it cannot be read (no `vta_connections.view`) the note says "Following the
+  gateway-wide default, which could not be read." and names no source. While the default is loading
+  or unreadable, the source select of a surface or issuer that sets nothing shows **Gateway
+  secret**, as the approved design has it; the note beside it is what tells the operator, and
+  nothing is saved until a source is picked. **Use the gateway-wide default**
+  (`surface-signing-reset`) takes an own choice back.
+- **Identity → Issuers**: the list has a **Signing key source** column (`issuers-signing-<id>`:
+  Default, Gateway secret, or `VTA · <agent name>`), and the issuer editor
+  (`data-testid="issuer-signing"`) uses the same field, worded for an issuer: the choice applies
+  to every surface the issuer owns that sets none of its own. Saving an issuer sends its
+  `signing`; an empty block clears it.
+
 ## Connections page
 
 `/connections` (`pages/ConnectionsPage.tsx`) has the tabs **Gateways**, **Payment Gateways**,
-**Mediators** and **Registries**, kept in `?tab=` (`gateways`, `payment-gateways`,
-`mediators`, `trust-registries`). The active tab follows the URL, so a link to another tab of
+**Mediators**, **Registries** and **Verifiable Trust Agent**, kept in `?tab=`
+(`gateways`, `payment-gateways`, `mediators`, `trust-registries`, `trust-agents`). The active tab follows the URL, so a link to another tab of
 the page switches it; an unknown or hidden value opens the first tab shown. The page (route and
-sidebar entry) opens with `gateways.view`, or also with `payment_gateways.view` while
-`agent_pay_delegation` is on (`ProtectedRoute` accepts a list, any one of which is enough; the
-route waits for the settings before deciding). **Gateways** shows only with `gateways.view` and
-**Payment Gateways** (`connections-tab-payment-gateways`) only with `payment_gateways.view` and
-`agent_pay_delegation` on (see _Feature flags_). One filter box serves every tab; each tab reports its
+sidebar entry) opens with `gateways.view`, `vta_connections.view`, or also with
+`payment_gateways.view` while `agent_pay_delegation` is on (`ProtectedRoute` accepts a list, any
+one of which is enough; the route waits for the settings before deciding). Each tab shows only
+with its own view permission: **Gateways** `gateways.view`, **Payment Gateways**
+(`connections-tab-payment-gateways`) `payment_gateways.view` and `agent_pay_delegation` on (see
+_Feature flags_), **Mediators** `mediators.view`, **Registries** `trust_registries.view`,
+**Verifiable Trust Agent** (`connections-tab-trust-agents`) `vta_connections.view`; see
+_Verifiable Trust Agent tab and Gateway signing_. One filter box serves every tab but the
+Verifiable Trust Agent one, which shows none; each tab reports its
 filtered and total counts (`onCountChange`) for the badge, and a tab given `actionsContainer`
-portals its add button into the tab banner.
+portals its add button into the tab banner; the Verifiable Trust Agent tab is given none and keeps
+**Add VTA** in its card header.
 
 ### Payment Gateways tab
 
@@ -2770,8 +3056,8 @@ name, description, id and DID.
   (`payment_gateways.edit`, `POST /payment-gateways/{id}/ping`, not for a pending row); Delete
   (`payment_gateways.delete`, the two-step `DeleteButton`). A refused delete (409 while surfaces
   take payments through it or it holds unsettled payments) shows the gateway's message.
-- **Connect Payment Gateway** (`payment_gateways.edit`) opens the wizard. With no payment
-  gateway an `EmptyState` explains agent-pay and has the same action.
+- **Connect Payment Gateway** (`payment_gateways.edit`) in the tab header opens the wizard. With no
+  payment gateway an `EmptyState` explains agent-pay with a docs link; the header button is the only action.
 
 ### Connect Payment Gateway wizard
 
@@ -2829,7 +3115,7 @@ to it over `fabric://`) shows the gateway's message.
 | Tab, list, rows                          | `connections-tab-payment-gateways`, `page-payment-gateways`, `payment-gateways-table`, `payment-gateways-row-<id>`, `gateway-status-<id>`                       |
 | List actions                             | `payment-gateways-connect-button`, `-open-button-<id>`, `-verify-button-<id>`, `-ping-button-<id>`, `-delete-button-<id>` (all `payment-gateways-`)              |
 | List offer                               | `payment-gateways-offer-<id>` (and `-payable-count`), `-offer-loading-<id>`, `-offer-error-<id>`, `-offer-empty-<id>`                                           |
-| List states                              | `payment-gateways-empty-state`, `payment-gateways-empty-connect-button`, `payment-gateways-no-match`, `payment-gateways-error-alert`, `payment-gateways-success-alert`, each alert with `-dismiss-button` |
+| List states                              | `payment-gateways-empty-state`, `payment-gateways-no-match`, `payment-gateways-error-alert`, `payment-gateways-success-alert`, each alert with `-dismiss-button` |
 | Wizard steps                             | `wizard-progress`, `wizard-progress-step-<key>`, `wizard-step-details`, `wizard-step-link`, `wizard-step-connect`, `wizard-step-approval`, `wizard-step-verify`, `wizard-step-complete` |
 | Wizard navigation (both OOB wizards)     | `wizard-next`, `wizard-back`, `wizard-cancel`, `wizard-submit`, `wizard-oob-view-button`, `wizard-oob-connect-retry-button`                                     |
 | Wizard fields (both OOB wizards)         | `wizard-oob-name-input`, `wizard-oob-description-input`, `wizard-oob-did-method-select`, `wizard-oob-link-input`, `wizard-oob-secret-input`, `wizard-oob-details-error`, `wizard-oob-link-error`, `wizard-oob-connect-error` |
@@ -2838,6 +3124,80 @@ to it over `fabric://`) shows the gateway's message.
 | Detail overview                          | `payment-gateway-name-input`, `-description-input`, `-did`, `-status`, `-offer`, `-offer-error`, `-save-button`, `-toggle-status-button`, `-pending-note`, `-verify-button` |
 | Detail surfaces, used by, health         | `payment-gateway-surfaces-refresh-button`, `-surfaces-error`, `-surfaces-empty`, `-surface-<id>`, `payment-gateway-surface-manifest-<id>-*`, `-used-by-<id>`, `-used-by-link-<id>`, `-used-by-empty`, `-used-by-error`, `-ping-button`, `-ping-result` |
 | Use as payment gateway                   | `gateways-use-as-payment-button-<id>` (Gateways tab), `gateway-use-as-payment-button` (edit page)                                                             |
+
+### Mediator access step
+
+A mediator in `explicit_allow` mode refuses DIDs its administrator has not added, so both peer
+pairing wizards pause after the gateway mints its DIDs, and show one shared step
+(`components/shared/MediatorAccessStep.tsx`, helpers in `utils/mediatorAccess.ts`) only on a
+refusal or a resume. The gateway cannot tell the mediator's mode, so each wizard tries to continue
+at once and shows the step only when the mediator refuses a DID. On a mediator that admits them, **mediator-access** is left out
+of the step bar too.
+
+| Wizard | Steps | DIDs shown |
+| --- | --- | --- |
+| Create Connection Point (`/gateways/publish`) | select-mediator, enter-details, **mediator-access**, complete | Connection Point DID, Permanent DID for the paired gateway |
+| Add Gateway (`/gateways/connect`) | enter-details, enter-link, **mediator-access**, connect, complete | Temporary DID for the handshake, Permanent DID for this pairing |
+
+- Leaving enter-details (Create Connection Point) or enter-link (Add Gateway) posts with
+  `await_mediator_access: true`; the response's `mediator_access` fills the step. Create
+  Connection Point then calls `POST /connection-points/{id}/continue` behind its saving
+  spinner; Add Gateway moves to the connect step, which calls `POST /gateways/{id}/continue`.
+  Success goes on as before; a `409 mediator_access_refused` opens the step without a
+  refusal message. Any other failure of that first try in Create Connection Point shows
+  "Connection Point Saved, Not Connected Yet" with the error, **Continue Later** and
+  **Try Again** (`first-try-retry-button`), not the step: nothing says the DIDs were refused.
+- The card header is "Add These DIDs to the DIDComm Mediator's Allow List" (`fa-user-shield`).
+  The text opens with "This {name} Mediator most probably uses Explicit Allow, …" ("Mediator"
+  is left out when the name already ends in it), then says what to do when the mediator is
+  hosted by Affinidi or self-hosted. **Copy All DIDs as a Bundle** copies every DID, one per
+  line; below it, one row per DID with its label, `topAndTail(did, 16, 16)` and a
+  `CopyButton`, and a note to use one or the other. Both wizards show the step the same way,
+  with no warning banner: the dashboard cannot tell whose mediator it is, since both gateways
+  may use the same one. When the DIDs sit on two mediators (an acceptance with mediator
+  federation keeps its permanent DID on its own; each DID's `mediator_did` and
+  `mediator_name` come with the access), the step lists them per mediator
+  (`mediator-access-group-<n>`), each with its own bundle (`mediator-access-copy-all-<n>`), and a
+  refusal names the refused DID's mediator.
+- **Continue Later** (left) returns to Connections and changes nothing. **Test Connection**
+  (right) calls the same Continue again. A `409 mediator_access_refused` then keeps the step
+  and shows "DIDComm Mediator {name} still refuses the {label} ({short DID}). Make sure it is
+  allowed, then select Test Connection again."
+- `?resume=<id>` opens either wizard at the step with the same DIDs, from
+  `GET /connection-points/{id}/mediator-access` or `GET /gateways/{id}/mediator-access`
+  (the id `encodeURIComponent`-ed), without calling Continue first. When that load fails (the
+  record is gone or already continued) or its invitation has expired, the wizard shows
+  `ResumeUnavailableCard` ("This Pairing Can't Continue", the reason, **Back to Connections**)
+  instead of a step.
+- On Connections, a gateway with status `awaiting-mediator-access` and a Connection Point with
+  `awaiting_mediator_access` show the warning badge "Waiting for mediator access" and a
+  **Continue** button that opens its wizard with `?resume=`. A paused Connection Point whose
+  expiry has passed shows `EXPIRED` and no **Continue** (the list has no expiry for a paused
+  gateway, so its wizard says so on resume). Both **Continue** buttons are
+  `outline-primary`, `sm`, like the per-row **Edit** button. Such a Connection Point has no
+  copy-link or copy-secret button until it has an invitation; such a gateway is treated as
+  pending (`isGatewayPending`): no ping, edit or row link.
+- A `pending` gateway (the connection-setup was sent, the inviter has not accepted it) has no
+  ping or edit button, but its row opens `/gateways/{id}`, the page the Add Gateway wizard's
+  **View Connection** opens (`opensGatewayDetails` in `utils/gateways.ts`; rows waiting for
+  approval or mediator access do not open it). There the Overview shows an info notice
+  (`gateway-editor-pending-notice`), **Gateway Enabled** is disabled and Save leaves the status
+  alone, and the Remote tab says the issuer DIDs and surfaces appear once the inviter accepts
+  (`gateway-editor-remote-pending`). An inviter that refuses the setup turns it `failed`, with
+  its reason in the description; see
+  [`docs/FABRIC.md`](../../docs/FABRIC.md#connection-establishment-invariants).
+- The payment gateway wizard does not pause.
+
+| Element | Test id |
+| --- | --- |
+| Step and DIDs | `wizard-step-mediator-access`, `mediator-access-did-<role>` (`connection_point`, `temporary`, `permanent`), `mediator-access-copy-button-<role>` |
+| Actions | `mediator-access-copy-all`, `mediator-access-later-button`, `mediator-access-continue-button` |
+| Errors | `mediator-access-refused`, `mediator-access-error` |
+| Two mediators | `mediator-access-group-<n>`, `mediator-access-copy-all-<n>` |
+| First try failed | `wizard-step-first-try-failed`, `first-try-error`, `first-try-retry-button`, `first-try-later-button` |
+| Resume can't continue | `wizard-resume-unavailable`, `wizard-resume-unavailable-message`, `wizard-resume-back-button` |
+| Connections | `gateways-continue-button-<id>`, `connection-points-continue-button-<id>`, `connection-points-status-<id>`, `gateway-status-<id>` |
+| Pending gateway page | `gateway-editor-pending-notice`, `gateway-editor-remote-pending` |
 
 ## Agents page
 
@@ -2871,11 +3231,16 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
   agent never replaces it.
 - The list filters client-side by text only: the display name (**Unnamed agent** included), every
   surface name in the record, and the route label (`agentMatchesFilter`).
-- With no agents and no load error, the list shows the "No managed agents yet" `EmptyState`. For a
-  user with `surfaces.edit` it has a **Create a surface** in-app link (`agents-add-surface-link`,
-  `ctaTo`) that opens `/surfaces/new`, followed by a **What’s a surface?** docs link
-  (`DOCS_URL.surfaces`, `docsPlacement="actions"`); without `surfaces.edit` only the docs link
-  shows, since the page needs only `surfaces.view` and `/surfaces/new` needs `surfaces.edit`.
+- With no agents and no load error, the list shows an `EmptyState` with title **Get started with
+  Agents**, body "Agents show up here once they're connected through a surface. Create a surface
+  to start routing, securing, and monitoring your agents.", and a docs link
+  (`DOCS_URL.createFirstSurface`) pointing to the first-surface creation guide. The header holds an
+  **Add Surface** button (`agents-add-surface-button`) for users with `surfaces.edit` and the
+  surface limit not reached. Without `surfaces.edit` only the docs link in the empty state shows,
+  since the page needs only `surfaces.view` and `/surfaces/new` needs `surfaces.edit`. The button
+  uses the same `useLimitGuard` as the Surfaces page to show a balloon when at capacity before
+  opening the builder, preventing operators from spending time configuring a surface the server
+  will refuse to create.
 - Columns: Agent, Route, Protocol, Identities, Used by surfaces, Trust registry, Last activity.
   The protocol badge (`agents-protocol-badge`) is the shared `ProtocolBadge`
   (`components/shared/ProtocolBadge.tsx`), the one the Surfaces page uses: A2A
@@ -3034,9 +3399,9 @@ disable or rotate action: the API has no write endpoints for agents. Styles are 
 | ------------------------------- | ----------------------------------------------------------------------------------------------- |
 | Pages                           | `page-agents`, `page-agent-details`                                                             |
 | List row, chevron               | `agents-row-<id>`, `agents-row-chevron`                                                         |
-| List filter, count, retry       | `agents-filter-input`, `agents-count`, `agents-retry-button`                                    |
+| List filter, retry              | `agents-filter-input`, `agents-retry-button`                                                    |
 | List load error, no match       | `agents-load-error`, `agents-no-match`                                                          |
-| Empty state add surface         | `agents-add-surface-link`                                                                       |
+| Header button, empty state docs | `agents-add-surface-button`, `agents-empty-docs-link`                                           |
 | Name, unnamed, endpoint host    | `agents-name`, `agents-unnamed`, `agents-endpoint-host`                                         |
 | Runtime, protocol, activity     | `agents-runtime`, `agents-protocol-badge`, `agents-last-activity`                               |
 | Surfaces, count, names          | `agents-surfaces`, `agents-surfaces-count`, `agents-surface-names`                              |
@@ -3422,9 +3787,13 @@ room for its text.
   card shows the UAI. The table fits its box from the 1280px viewport that
   `laptop-layout.spec.ts` checks up to the 1512px and 1728px laptop viewports, with every row
   action inside it; the DID keeps its title and copy button.
-- **Connection Points actions**: the row actions sit in a 6rem wide wrapping block (two
-  buttons per line) with no left margins, so the Actions column stays near 120px and the
-  Name and Mediator columns keep their room. Add a new row action inside that block.
+- **Button labels** (whole dashboard): `.app-button` sets `white-space: nowrap`, so no
+  `AppButton` label wraps. Where a row or card is too narrow, lay its buttons out to fit (or let
+  the container scroll) rather than letting a label break.
+- **Connections row actions** (Agent Gateways and Connection Points): the row actions stay on
+  one line in a `d-flex flex-nowrap gap-2 align-items-center` block, with no left margins. A
+  window too narrow for the row scrolls the table sideways (`table-responsive`) instead of
+  stacking the buttons. Add a new row action inside that block.
 
 ## Validation
 

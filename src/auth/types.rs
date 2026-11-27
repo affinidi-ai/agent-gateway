@@ -23,6 +23,18 @@ impl std::fmt::Display for UserRole {
     }
 }
 
+impl UserRole {
+    /// The role a configuration file names: exactly `administrator`, `poweruser` or `user`.
+    pub fn from_config_name(name: &str) -> Option<Self> {
+        match name {
+            "administrator" => Some(UserRole::Administrator),
+            "poweruser" => Some(UserRole::PowerUser),
+            "user" => Some(UserRole::User),
+            _ => None,
+        }
+    }
+}
+
 /// User status enum
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]

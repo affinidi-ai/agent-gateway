@@ -119,7 +119,9 @@ Feature: Source authentication and target authentication over fabric
     And the VP Audit Log of gateway 1 keeps every audit event
     When the caller asks gateway 1 MCP surface "charlie" for available tools
     Then the response status is 500
-    And the response says "target_auth_rejected"
+    And the MCP response is a JSON-RPC error with code -32603
+    And the MCP response id matches the request id
+    And the response reason is "target_auth_rejected"
     And MCP server "bravo" was not called
     And the VP Audit Log of gateway 1 records the Target credential as refused by the target
 
@@ -142,7 +144,22 @@ Feature: Source authentication and target authentication over fabric
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     When the caller asks gateway 1 MCP surface "charlie" for available tools
     Then the response status is 500
+    And the MCP response is a JSON-RPC error with code -32603
+    And the MCP response id matches the request id
     And the response says "Target authentication failed"
+    And the response reason is "target_auth_misconfigured"
+    And MCP server "bravo" was not called
+
+  Scenario: gateway 1 refuses forwarding over fabric when its credential provider refuses a token
+    Given a fabric with 2 gateways
+    And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
+    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And surface "charlie" authenticates to its managed agent with a client credentials provider
+    And the credential provider of surface "charlie" is refusing token requests
+    When the caller asks gateway 1 MCP surface "charlie" for available tools
+    Then the response status is 500
+    And the MCP response is a JSON-RPC error with code -32603
+    And the MCP response id matches the request id
     And the response reason is "target_auth_misconfigured"
     And MCP server "bravo" was not called
 
@@ -157,3 +174,14 @@ Feature: Source authentication and target authentication over fabric
     And MCP server "bravo" did not receive header "x-target-api-key"
     And the MCP response id matches MCP server "bravo" forwarded request id
     And the MCP response result matches MCP server "bravo" response result
+
+  Scenario: gateway 1 sends no identity proof of a caller whose API key failed on a public Access Point deriving the inbound identity from it
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And surface "charlie" requires "API Key" source authentication
+    And surface "charlie" derives the inbound identity from the API key the caller presents
+    And surface "charlie" is stored with a public Access Point
+    When the caller sends a Fabric A2A request with an invalid API key and an identity proof of its own through gateway 1 surface "charlie"
+    Then the response status is 200
+    And managed agent "bravo" received the forwarded message with no caller identity

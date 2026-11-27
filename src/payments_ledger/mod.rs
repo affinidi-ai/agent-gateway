@@ -597,7 +597,10 @@ pub(crate) mod tests {
         assert!(!admits_cancelled(&store));
 
         store
-            .update(&last.id, |row| row.outcome = LedgerOutcome::Rejected)
+            .update(&last.id, |row| {
+                row.outcome = LedgerOutcome::Rejected;
+                true
+            })
             .await
             .unwrap();
         assert!(admits_cancelled(&store), "a closed row makes room");

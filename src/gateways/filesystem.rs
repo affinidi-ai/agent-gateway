@@ -2,7 +2,6 @@ pub use super::GatewayStore;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use super::types::{ExposureMode, Gateway, GatewayRole, GatewayType};
 use crate::storage::filesystem::{StorageBackend, cached_storage};
@@ -299,20 +298,6 @@ impl GatewayStore for FileSystemGatewayStore {
     }
 }
 
-/// Get the ID of the local (self) gateway
-pub async fn get_local_gateway_id(store: &Arc<dyn GatewayStore>) -> Option<String> {
-    match store.list_all().await {
-        Ok(gateways) => gateways
-            .into_iter()
-            .find(|g| g.gateway_type == GatewayType::SelfGateway)
-            .map(|g| g.id),
-        Err(e) => {
-            tracing::error!("Failed to list gateways to find local gateway ID: {}", e);
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,7 +494,7 @@ mod tests {
         use crate::audit::producer::{capture, capture_spawned};
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(
+        let store = std::sync::Arc::new(
             FileSystemGatewayStore::new(dir.path().to_path_buf(), None)
                 .await
                 .expect("store"),

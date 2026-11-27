@@ -18,6 +18,7 @@ pub(crate) mod file_lock;
 pub mod filesystem;
 pub mod id_locks;
 pub mod settings_store;
+pub mod single_use;
 
 // Re-export main types for convenience
 pub use config_cache::ConfigCache;

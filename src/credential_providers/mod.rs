@@ -93,9 +93,10 @@ impl CredentialProviderType {
     ) -> bool {
         match self {
             Self::OAuth2JwtBearer => matches!(algorithm, JwtSigningAlgorithm::RS256 | JwtSigningAlgorithm::ES256),
-            Self::OAuth2ClientCredentialsJwtAuth => {
-                matches!(algorithm, JwtSigningAlgorithm::PS256 | JwtSigningAlgorithm::RS256)
-            }
+            Self::OAuth2ClientCredentialsJwtAuth => matches!(
+                algorithm,
+                JwtSigningAlgorithm::PS256 | JwtSigningAlgorithm::RS256 | JwtSigningAlgorithm::ES256
+            ),
             Self::OAuth2AuthorizationCode | Self::OAuth2ClientCredentials | Self::ApiKey => false,
         }
     }
@@ -109,10 +110,13 @@ pub enum JwtSigningAlgorithm {
     ES256,
 }
 
-/// How the client of an `oauth2_jwt_bearer` grant identifies itself to the token endpoint
-/// (RFC 6749 section 2.3). A provider that sets no client authentication sends no client
-/// identity with its grant, as a Google service account does. `Unset` is what an empty string
-/// in a request means: it clears the stored setting and is never stored. It is separate from
+/// How a provider's client identifies itself to the token endpoint (RFC 6749 section 2.3). A JWT
+/// Bearer provider that sets none sends no client identity with its grant, as a Google service
+/// account does. An `oauth2_client_credentials` provider, or an `oauth2_authorization_code`
+/// provider without an `issuer`, takes only the two methods that send its client secret, and one
+/// that sets none sends the client ID and secret in the form body, as `ClientSecretPost` does.
+/// `Unset` is what an empty string in a request means: it clears the stored setting and is never
+/// stored. It is separate from
 /// [`TokenEndpointAuthMethod`], which an external consent provider's metadata names and which
 /// includes `private_key_jwt`: a JWT Bearer grant's client never signs a second JWT, and this
 /// setting needs the empty string that clears it.
@@ -175,9 +179,10 @@ pub struct JwtAssertionSettings {
     /// `sub` claim of a JWT Bearer grant: required for a JWT Bearer provider (domain-wide delegation)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_subject: Option<String>,
-    /// How the client of a JWT Bearer grant identifies itself; unset sends no client identity
-    /// and leaves the client references unread. `oauth2_jwt_bearer` only, cleared by an empty
-    /// string in an update.
+    /// How the provider's client identifies itself at the token endpoint. On a JWT Bearer grant,
+    /// unset sends no client identity and leaves the client references unread; on a client
+    /// credentials or authorization code provider without an `issuer`, unset sends the client ID
+    /// and secret in the form body. Cleared by an empty string in an update.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_authentication: Option<GrantClientAuthentication>,
 }
@@ -671,10 +676,15 @@ impl StorableEntity for CredentialProvider {
 
 impl CredentialProvider {
     /// The secret ids this provider reads: client, API key, signing key, certificate and
-    /// consent confirmation client ID and secret.
+    /// consent confirmation client ID and secret. An API key provider reads no client ID or
+    /// secret, so one an older record still holds is not among them.
     pub fn secret_refs(&self) -> Vec<&str> {
-        self.secret_ref_fields()
+        let [client_id, client_secret, others @ ..] = self.secret_ref_fields();
+        let reads_client = self.provider_type != CredentialProviderType::ApiKey;
+        [client_id, client_secret]
             .into_iter()
+            .filter(|_| reads_client)
+            .chain(others)
             .chain(self.consent_confirmation_secret_refs())
             .flatten()
             .collect()
@@ -1732,6 +1742,21 @@ mod tests {
     }
 
     #[test]
+    fn an_api_key_provider_names_no_client_reference_it_keeps_from_an_older_record() {
+        let provider = |provider_type: &str| -> CredentialProvider {
+            serde_json::from_value(serde_json::json!({
+                "id": "p", "name": "p", "provider_id": "p", "provider_type": provider_type,
+                "token_endpoint": "https://idp.example/token",
+                "client_id_secret_ref": "ID", "client_secret_secret_ref": "SECRET", "api_key_secret_ref": "KEY",
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        assert_eq!(provider("api_key").secret_refs(), ["KEY"]);
+        assert_eq!(provider("oauth2_client_credentials").secret_refs(), ["ID", "SECRET", "KEY"]);
+    }
+
+    #[test]
     fn a_service_token_reads_only_the_secrets_its_provider_type_uses() {
         let provider = |provider_type: &str, certificate: Option<&str>| -> CredentialProvider {
             serde_json::from_value(serde_json::json!({
@@ -1752,7 +1777,16 @@ mod tests {
         ] {
             let provider = provider(provider_type, certificate);
             assert_eq!(provider.service_token_secret_refs(), expected, "{provider_type}");
-            assert_eq!(provider.secret_refs().len(), 4 + usize::from(certificate.is_some()), "{provider_type}");
+            let client_refs = if provider_type == "api_key" {
+                0
+            } else {
+                2
+            };
+            assert_eq!(
+                provider.secret_refs().len(),
+                client_refs + 2 + usize::from(certificate.is_some()),
+                "{provider_type}"
+            );
         }
     }
 
@@ -2431,7 +2465,7 @@ mod tests {
         assert!(!OAuth2JwtBearer.allows_jwt_algorithm(PS256));
         assert!(OAuth2ClientCredentialsJwtAuth.allows_jwt_algorithm(PS256));
         assert!(OAuth2ClientCredentialsJwtAuth.allows_jwt_algorithm(RS256));
-        assert!(!OAuth2ClientCredentialsJwtAuth.allows_jwt_algorithm(ES256));
+        assert!(OAuth2ClientCredentialsJwtAuth.allows_jwt_algorithm(ES256));
         assert!(!ApiKey.allows_jwt_algorithm(RS256));
     }
 

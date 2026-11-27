@@ -27,8 +27,18 @@ Feature: HTTP MCP surface forwarding
     Given the gateway authenticates to the managed agent with missing secret "bdd-missing-target-secret" in header "x-target-api-key", falling back to "reject"
     When the caller asks the MCP surface for available tools
     Then the response status is 500
+    And the response is a JSON-RPC error with code -32603
+    And the MCP response id matches the request id
     And the response reason is "target_auth_misconfigured"
     And MCP server "bravo" was not called
+
+  Scenario: An unreachable MCP Target answers a JSON-RPC error that echoes the request id
+    Given MCP server "bravo" is unreachable
+    When the caller asks the MCP surface for available tools
+    Then the response status is 502
+    And the response is a JSON-RPC error with code -32603
+    And the MCP response id matches the request id
+    And the response reason is "target_unreachable"
 
   Scenario: Missing MCP target authentication secret passes through when fallback is passthrough
     Given the gateway authenticates to the managed agent with missing secret "bdd-missing-target-secret" in header "x-target-api-key", falling back to "passthrough"

@@ -202,6 +202,19 @@ fn transit_point_json(
             "inject_vp": true,
         });
     }
+    if transit_point.identity_from_caller_api_key {
+        transit_point_json["managed_identity"] = serde_json::json!({ "type": "from_api_key" });
+        transit_point_json["identity_injection"] = serde_json::json!({ "inject_vp": true });
+    }
+    if let Some(claim) = &transit_point.identity_from_jwt_claim {
+        transit_point_json["managed_identity"] =
+            serde_json::json!({ "type": "from_jwt_claim", "claim": claim, "namespace_claims": [] });
+        transit_point_json["identity_injection"] = serde_json::json!({ "inject_vp": true });
+    }
+    if transit_point.identity_from_caller_certificate {
+        transit_point_json["managed_identity"] = serde_json::json!({ "type": "from_mtls" });
+        transit_point_json["identity_injection"] = serde_json::json!({ "inject_vp": true });
+    }
     if !transit_point
         .trust_check_list
         .is_empty()
@@ -425,8 +438,16 @@ fn write_single_surface_config_inner(
                 transit_point_json(transit_point, target_endpoint, delegation_binding.as_ref())
             })
             .collect::<Vec<_>>();
+        let outbound_scheme = if surface_config
+            .outbound_client_certificates
+            .is_some()
+        {
+            "https"
+        } else {
+            "http"
+        };
         let mut transit_json = serde_json::json!({
-            "outbound_listen_address": format!("http://localhost:{outbound_port}"),
+            "outbound_listen_address": format!("{outbound_scheme}://localhost:{outbound_port}"),
             "points": points
         });
         if let Some(policy) = &surface_config.transit_shared_policy {
@@ -441,6 +462,21 @@ fn write_single_surface_config_inner(
         }
         if let Some(secs) = surface_config.transit_token_lifetime_secs {
             transit_json["transit_token_lifetime_secs"] = serde_json::json!(secs);
+        }
+        if let Some((variant, alias)) = &surface_config.variant_caller_key_transit_point {
+            let mut variant_points = points.clone();
+            let point = variant_points
+                .iter_mut()
+                .find(|point| point["alias"] == alias.as_str())
+                .unwrap_or_else(|| panic!("variant '{variant}' overrides unknown Transit Point '{alias}'"));
+            point["managed_identity"] = serde_json::json!({ "type": "from_api_key" });
+            point["identity_injection"] = serde_json::json!({ "inject_vp": true });
+            surface_fixture
+                .variants
+                .push(serde_json::json!({
+                    "id": format!("{variant}-id"), "alias": variant, "name": variant, "description": "",
+                    "enabled": true, "overrides": { "transit": { "points": variant_points } }
+                }));
         }
         surface_fixture = surface_fixture.with_transit(transit_json);
     }
@@ -518,6 +554,12 @@ fn write_single_surface_config_inner(
         );
     }
 
+    if surface_config.api_key_inbound_identity {
+        surface_fixture = surface_fixture
+            .with_identity_slot("inbound", serde_json::json!({ "type": "from_api_key" }))
+            .with_target_identity_injection(serde_json::json!({ "inject_vp": true }));
+    }
+
     if surface_config.mcp_inbound_identity {
         let mut inbound_slot = serde_json::json!({
             "type": "payload_extraction",
@@ -529,6 +571,14 @@ fn write_single_surface_config_inner(
             inbound_slot["strip_raw_meta"] = serde_json::json!(true);
         }
         surface_fixture = surface_fixture.with_identity_slot("inbound", inbound_slot);
+    }
+
+    if let Some(slot) = &surface_config.unnamed_certificate_identity_slot {
+        surface_fixture = surface_fixture.with_identity_slot(slot.as_str(), serde_json::json!({ "type": "from_mtls" }));
+    }
+    if let Some(did) = &surface_config.inbound_static_did {
+        surface_fixture =
+            surface_fixture.with_identity_slot("inbound", serde_json::json!({ "type": "static", "did": did }));
     }
 
     if let Some(key_id) = &surface_config.protected_identity_api_key_id {
@@ -722,8 +772,16 @@ fn write_single_surface_config_inner(
     if surface_config.outbound_public_origin {
         add_public_origin(base_dir, 1, PROTECTED_RESOURCE_PUBLIC_ORIGIN);
     }
+    if let Some(certificates) = &surface_config.outbound_client_certificates {
+        serve_outbound_with_client_certificates(base_dir, certificates);
+    }
     if let Some(max_secs) = surface_config.transit_token_max_lifetime_secs {
         set_transit_token_max_lifetime(base_dir, max_secs);
+    }
+    if let Some(max_secs) = surface_config.sts_id_jag_max_lifetime_secs {
+        edit_gateway_json(base_dir, |gateway| {
+            gateway["sts"]["id_jag_max_lifetime_secs"] = serde_json::json!(max_secs);
+        });
     }
     write_credential_policy(
         base_dir,
@@ -743,6 +801,24 @@ fn write_single_surface_config_inner(
                     .as_deref()
             }),
     );
+    if let Some(setup) = &surface_config.control_key_trust_agent {
+        write_trust_agent_block(base_dir, setup, surface_config.control_key_rotation_days);
+    }
+    if let Some(secs) = surface_config.connection_key_switch_timeout_secs {
+        let path = base_dir.join("config.toml");
+        let mut config = std::fs::read_to_string(&path).unwrap();
+        config.push_str(&format!("\n[vta]\nconnection_key_switch_timeout_secs = {secs}\n"));
+        std::fs::write(&path, config).unwrap();
+    }
+    if let Some(hosting) = surface_config.context_did_webvh_hosting {
+        let path = base_dir.join("config.toml");
+        let mut config = std::fs::read_to_string(&path).unwrap();
+        config.push_str(&format!(
+            "\n[vta]\ncontext_did_method = \"did_webvh\"\ncontext_did_hosting = \"{hosting}\"\n\
+             context_did_server_id = \"host-1\"\n"
+        ));
+        std::fs::write(&path, config).unwrap();
+    }
     if surface_config.logs_at_info {
         log_info(base_dir);
     } else if surface_config.keeps_gateway_log {
@@ -834,6 +910,29 @@ fn edit_gateway_json(
     let mut gateway: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     edit(&mut gateway);
     std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
+}
+
+/// Appends the `[vta]` table of a gateway configured against `setup.base_url`, with its
+/// control key in a file.
+fn write_trust_agent_block(
+    base_dir: &Path,
+    setup: &super::single_surface_fixture::ControlKeyTrustAgentSetup,
+    rotation_days: Option<u32>,
+) {
+    let path = base_dir.join("config.toml");
+    let mut config = std::fs::read_to_string(&path).unwrap();
+    config.push_str(&format!(
+        "\n[vta]\nenabled = true\nbase_url = \"{}\"\nvta_did = \"{}\"\ncontext_id = \"gateway\"\n\
+         signing_key_id = \"gateway-jwt-1\"\ncontrol_did_method = \"{}\"\nauth_key_source = \"file://{}\"\n",
+        setup.base_url,
+        crate::bdd_support::trust_agent::TRUST_AGENT_DID,
+        setup.control_did_method,
+        setup.key_path.display(),
+    ));
+    if let Some(days) = rotation_days {
+        config.push_str(&format!("control_key_rotation_days = {days}\n"));
+    }
+    std::fs::write(&path, config).unwrap();
 }
 
 /// Lowers the gateway's log level from the harness default `error` to `info`.
@@ -1019,6 +1118,72 @@ fn set_transit_token_max_lifetime(
     std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
 }
 
+/// Serves the outbound listener (the second) over https with the scenario's server certificate,
+/// asks each caller for a client certificate during the handshake (`[tls.client_auth] direct`),
+/// and stores the CA those certificates are checked against.
+fn serve_outbound_with_client_certificates(
+    base_dir: &Path,
+    certificates: &crate::bdd_support::config::single_surface_fixture::OutboundClientCertificatesFixture,
+) {
+    let path = base_dir.join("gateway.json");
+    let mut gateway: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let listener = &mut gateway["listeners"][1];
+    assert_eq!(listener["listener_type"], "outbound", "the second listener must be the outbound one");
+    listener["protocol"] = serde_json::json!("https");
+    let port = listener["port"]
+        .as_u64()
+        .expect("outbound listener port");
+    listener["external_urls"] = serde_json::json!([format!("https://localhost:{port}")]);
+    std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
+
+    let tls_dir = base_dir.join("tls");
+    std::fs::create_dir_all(&tls_dir).unwrap();
+    let cert_path = tls_dir.join("cert.pem");
+    let key_path = tls_dir.join("key.pem");
+    std::fs::write(&cert_path, &certificates.server_certificate_pem).unwrap();
+    std::fs::write(&key_path, &certificates.server_private_key_pem).unwrap();
+    let config_path = base_dir.join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    assert!(config.contains("\n[tls]\ncert_path = "), "the gateway config must have a tls table");
+    let mut lines: Vec<String> = config
+        .lines()
+        .map(|line| {
+            if line.starts_with("cert_path = ") {
+                format!("cert_path = \"{}\"", cert_path.display())
+            } else if line.starts_with("key_path = ") {
+                format!("key_path = \"{}\"", key_path.display())
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    lines.extend(["".to_string(), "[tls.client_auth]".to_string(), "direct = \"optional\"".to_string()]);
+    std::fs::write(&config_path, lines.join("\n") + "\n").unwrap();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let ca = serde_json::json!({
+        "id": certificates.ca_id,
+        "name": certificates.ca_id,
+        "certificate_id": certificates.ca_id,
+        "description": "BDD client certificate CA",
+        "tags": ["bdd"],
+        "kind": "ca",
+        "certificate_pem": certificates.ca_certificate_pem,
+        "private_key_pem": null,
+        "expires_at": null,
+        "created_at": now,
+        "updated_at": now,
+        "active": true,
+    });
+    let certificates_dir = base_dir.join("_storage/certificates");
+    std::fs::create_dir_all(&certificates_dir).unwrap();
+    std::fs::write(
+        certificates_dir.join(format!("{}.json", certificates.ca_id)),
+        serde_json::to_string_pretty(&ca).unwrap(),
+    )
+    .unwrap();
+}
+
 /// Adds a public origin to the listener at `listener` (the inbound listener is first, the
 /// outbound one second), the origin an MCP resource must be published under.
 fn add_public_origin(
@@ -1161,6 +1326,12 @@ fn credential_provider_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<Cr
         .map(target_auth_provider_fixture)
         .collect();
     providers.extend(delegation_provider_fixture(surface_config));
+    providers.extend(
+        surface_config
+            .stored_credential_providers
+            .iter()
+            .cloned(),
+    );
     providers
 }
 
@@ -1224,8 +1395,8 @@ pub fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) 
         api_key_secret_ref: None,
         authorization_response_issuer: None,
         max_consent_age_secs: None,
-        jwt_settings: (provider.grant == TargetAuthProviderGrant::JwtBearer).then(|| {
-            serde_json::json!({
+        jwt_settings: match provider.grant {
+            TargetAuthProviderGrant::JwtBearer => Some(serde_json::json!({
                 "jwt_issuer": TARGET_AUTH_JWT_ISSUER,
                 "jwt_signing_key_secret_ref": TARGET_AUTH_SIGNING_KEY_SECRET,
                 "jwt_key_id": (!provider.signing_key_is_service_account_file).then_some("bdd-target-key-id"),
@@ -1233,8 +1404,11 @@ pub fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) 
                 "client_authentication": provider
                     .client_authentication
                     .map(|method| method.api_value()),
-            })
-        }),
+            })),
+            TargetAuthProviderGrant::ClientCredentials | TargetAuthProviderGrant::AuthorizationCode => provider
+                .client_authentication
+                .map(|method| serde_json::json!({ "client_authentication": method.api_value() })),
+        },
         consent_confirmation: None,
         created_at: now,
         updated_at: now,
@@ -1334,7 +1508,10 @@ fn oauth_provider_fixture(
         api_key_secret_ref: None,
         authorization_response_issuer,
         max_consent_age_secs,
-        jwt_settings: None,
+        jwt_settings: surface_config
+            .oauth_client_authentication
+            .filter(|_| own)
+            .map(|method| serde_json::json!({ "client_authentication": method.api_value() })),
         consent_confirmation: (own && surface_config.consent_confirmation)
             .then(|| consent_confirmation_json(surface_config)),
         created_at: now,

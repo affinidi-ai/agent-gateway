@@ -39,6 +39,10 @@ pub struct ResponsePolicyInput {
     /// policies see it. Set only for a Transit Point's response policy.
     #[serde(skip_serializing_if = "Option::is_none")]
     source_auth: Option<crate::surface_context::SourceAuthContext>,
+    /// The Transit Point's caller, the managed agent, as its request policies
+    /// see it. Set only for a Transit Point's response policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extension_identity: Option<crate::surface_context::ExtensionIdentityContext>,
 }
 
 impl ResponsePolicyInput {
@@ -56,18 +60,21 @@ impl ResponsePolicyInput {
             metadata: None,
             transit: None,
             source_auth: None,
+            extension_identity: None,
         }
     }
 
-    /// Adds what a Transit Point's request policies see as `input.transit`
-    /// and `input.source_auth`.
+    /// Adds what a Transit Point's request policies see as `input.transit`,
+    /// `input.source_auth` and `input.extension_identity`.
     pub fn for_transit_point(
         mut self,
         transit: crate::surface_context::TransitContext,
         source_auth: Option<crate::surface_context::SourceAuthContext>,
+        extension_identity: Option<crate::surface_context::ExtensionIdentityContext>,
     ) -> Self {
         self.transit = Some(transit);
         self.source_auth = source_auth;
+        self.extension_identity = extension_identity;
         self
     }
 }
@@ -233,6 +240,10 @@ mod tests {
             json.get("source_auth")
                 .is_none()
         );
+        assert!(
+            json.get("extension_identity")
+                .is_none()
+        );
     }
 
     fn minimal_input() -> ResponsePolicyInput {
@@ -282,10 +293,24 @@ mod tests {
                 client: None,
             },
             None,
+            Some(crate::surface_context::ExtensionIdentityContext {
+                did: Some("did:web:managed.example".to_string()),
+                identity_hash: Some("hash".to_string()),
+                verification: crate::surface_context::IdentityVerification::SourceAuth,
+            }),
         );
 
         let json = serde_json::to_value(&input).unwrap();
         assert_eq!(json["transit"]["caller"]["verified"], false);
+        assert_eq!(
+            json["extension_identity"],
+            serde_json::json!({
+                "did": "did:web:managed.example",
+                "identity_hash": "hash",
+                "verified": true,
+                "verification": "source_auth"
+            })
+        );
     }
 
     #[test]

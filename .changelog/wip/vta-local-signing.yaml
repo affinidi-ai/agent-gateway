@@ -1,0 +1,343 @@
+branch: vta-local-signing
+changes:
+  added:
+    - timestamp: '2026-10-23T07:00:00.000Z'
+      title: ⭐ Let the gateway sign tokens and credentials through a Verifiable Trust Agent
+      description: >-
+        The gateway can be connected to a Verifiable Trust Agent (VTA) and sign
+        through it, so the keys its tokens and credentials are signed with stay
+        in the trust agent. The gateway still holds the control key it signs in
+        to the trust agent with, its own key for local signing, and the keys of
+        agents onboarded before connecting. Once one is chosen, the gateway's STS access tokens, ID-JAGs, MCP
+        access tokens, payment receipts, agent identity credentials and the
+        issuer attestation a peer gateway receives are signed by the trust
+        agent, and agents onboarded from then on get their key inside it, so
+        their presentations and JWTs are signed there too. A token names the
+        did:key of the trust agent key that signed it as its issuer; a
+        credential, presentation or attestation names the DID of the trust agent
+        context it was signed in, never the gateway DID. Tokens are signed with
+        the keys/sign-jws task and credentials and presentations with
+        keys/sign-document, every request carries a proof from the gateway's
+        control key, and the gateway checks each answer against what it asked
+        for (key, algorithm, signer, purpose, challenge, domain and document)
+        before using it; a returned token, an agent JWT included, must carry the
+        requested header and claims and verify under the signing key, and a
+        returned credential or presentation must carry a proof that verifies
+        under the context's own key. Revoking or
+        disabling a connection stops its agents signing on their next use. A credential or presentation proof the trust agent made
+        is held to the same proof purpose rules as any other. The signer is
+        resolved on every call, the published key
+        set and the gateway's own token checks follow it, and a choice that
+        cannot sign refuses to sign rather than falling back to another key.
+        Calls are bounded by a timeout, a concurrency limit, a circuit breaker
+        and a signing quota. Connecting is optional and forward-only: an
+        installation that connects nothing signs exactly as before, and agents
+        onboarded before connecting keep their keys, since moving them would
+        change their DIDs. A signing choice that names no connection signs
+        tokens and issues credentials through the [vta] block.
+        The gateway does not check trust agent attestation, so a [vta] block
+        that sets expect_pcr0 is refused when the configuration loads, naming
+        the setting, rather than accepted with no check made.
+        A tenant's surface or issuer that signs through the appliance's own
+        trust agent cannot name a context; the gateway creates one named for the
+        tenant and surface, read from the stored surface, so a surface created
+        under another tenant with a deleted surface's id never signs in that
+        surface's context. For a tenant token, GET /v1/vta/status lists only the
+        trust agent addresses of the connections it may see, without the
+        appliance control DID or control key. A newly onboarded agent's key is
+        created in the trust agent that signs for the gateway at that moment,
+        the one Gateway signing names or else the [vta] block's, and onboarding
+        fails with the reason when that agent cannot create it, instead of
+        leaving the agent with a key on the gateway. A gateway that signs with
+        its own key onboards agents as before. A tenant's connection may name only a
+        public https address, checked when it is saved and each time a client is
+        built for it, which then connects only to the addresses checked, and no
+        connection endpoint carries a query or a fragment. A token limited to
+        some connections sees only their addresses in the status. A surface save
+        naming an issuer the caller may not reference is refused as one that does
+        not exist, whatever that issuer signs with. A tenant's surface may follow
+        an appliance-wide issuer that signs in a trust agent context, and its
+        credentials then name that context's DID.
+        A tenant's surface or issuer cannot name a context on any appliance-wide
+        connection, so it never issues credentials under the appliance's or another
+        tenant's context DID. A trust agent reserved at one name of this host
+        (localhost, a loopback or unspecified address) is reserved at all of them. A
+        trust agent answer larger than 512 KiB is refused, and a refusal's body is
+        cut to 2 KiB before it is kept or logged. A tenant connection at an IPv6
+        address is dialled at that address, and a pinned tenant client never goes
+        through a proxy. Concurrent calls on one connection share one client and
+        sign in once, a session the agent superseded is dropped and signed in again
+        once, and a context's did:webvh is created at most once.
+    - timestamp: '2026-11-10T10:00:00Z'
+      title: Rotate the gateway's trust agent control key on demand or on a schedule
+      description: >-
+        When the [vta] block authenticates as a did:key held in a file, the
+        gateway can move its access entry on the trust agent to a new control
+        key with acl/swap-key while it runs, keeping the signing keys and the
+        issuer. It rotates on demand, from the Control key card on the
+        Verifiable Trust Agent tab or POST /v1/vta/control-key/rotate (key
+        management rights; 429 with a Retry-After within ten minutes of the last
+        rotation), and, when [vta] control_key_rotation_days is above 0, on a
+        schedule on the active gateway. A failure keeps the current key. The
+        swap is sent once, and the new key is dropped only when the trust agent
+        refuses it outright; an interrupted rotation, or one made by another
+        process, is settled by asking the trust agent which key is live. GET /v1/vta/status reports when the
+        key last rotated and is next due, and --vta-print-control-did prints the
+        stored key's DID for granting it again after a backup restore.
+    - timestamp: '2026-11-10T15:00:00Z'
+      title: ⭐ Rotate a trust agent connection's control key, keeping its DID
+      description: >-
+        A connection added with a did:webvh identity can replace its control key
+        without a new grant: the new key joins its published document beside
+        the old one, the gateway signs in with it, and the old key is removed.
+        Use Rotate control key on its row (it asks first) or
+        POST /v1/vta/connections/{id}/control-key/rotate, which answers 200 when
+        done, 202 while it carries on and 502 when the trust agent refused the
+        new key and the old one was put back after [vta]
+        connection_key_switch_timeout_secs. POST .../rotate/cancel stops a
+        rotation that has not switched, also while it waits to retry; a rotation
+        waiting to retry keeps going when a Rotate or Cancel is answered as it
+        wakes, a restart resumes one, and the row shows
+        when the key was last rotated and a rotation under way.
+        A Standby node promoted to Active resumes a rotation left under way, and
+        Rotate on a connection whose rotation is under way drives it again. An agent
+        asking for a retry delay too large to represent no longer stops the
+        rotation.
+    - timestamp: '2026-11-16T12:05:00Z'
+      title: Add Verifiable Trust Agents on Connections with a full-page connect wizard
+      description: >-
+        Connections has a Verifiable Trust Agent tab laid out like Registries:
+        it lists the connections, and Add VTA in its card header, its only call
+        to action, opens a full-page wizard that creates the connection, prints the grant to run on the
+        trust agent (the initiator role in one context with context-create,
+        key-mint, sign-jws and sign-document, never admin), verifies it and
+        provisions a signing key. Each connection authenticates with its own
+        control key, as a did:webvh the gateway publishes at
+        /vta-auth/{connection_id}/did.jsonl, or as a did:key. The [vta] block in
+        config.toml connects one without the dashboard. Verifying a connection
+        checks the trust agent's signed answer and pins the DID that signed it.
+        A connection's endpoint, and the [vta] block's base_url, must be https,
+        or http to a loopback address.
+        Revoking, deleting or disabling a connection that Gateway signing, a
+        surface or an issuer signs through, or that agents keep their key in,
+        is refused with a 409 naming them, unless the request acknowledges it.
+        Connections are tenant-owned records, managed with the new
+        vta_connections permissions; a tenant token can read but not change an
+        appliance-wide one. An access token with explicit scopes reaches the
+        connection and key management routes with the permission each one
+        checks. The gateway refuses to forward any surface or proxy
+        request to a verified trust agent's address.
+        An edit (PUT) changes only the fields it sends, and a field sent as null
+        is cleared, so a renamed connection stays paired and its keys stay
+        published. Pointing a connection at another endpoint, agent DID or
+        transport resets its pairing, and while it is connected that is refused
+        with 409, like a revoke, while Gateway signing, a surface or an issuer
+        signs through it, unless acknowledged. A control key rotation, Verify,
+        revoke, an edit and the key routes each re-read the connection under one
+        lock and save only the fields they change, so concurrent changes do not
+        overwrite each other; an edit made while the connection was disabled,
+        repointed or rekeyed elsewhere is refused with 409. Verify keeps the stored state while the agent
+        answers 408, 429 or a 5xx, or its DID or a tenant endpoint's name cannot
+        be resolved for now, degrades the connection only on a definite refusal,
+        and is not saved when the connection was repointed, disabled or revoked
+        while it ran. Verify accepts only the agent's signed answer to the
+        sign-in it sent, for the connection's control DID. A revoked connection
+        stays revoked until it is paired
+        again: Verify refuses it, and a revoke made during a Verify is kept. The
+        [vta] block's own connection cannot be revoked, since it keeps signing
+        through the block. A Standby node leaves a pending [vta] control key to
+        the Active node.
+        A revoked or degraded connection opens in the connect wizard showing its
+        state and reason, and pairs only after Pair again. When Verify fails,
+        the wizard shows the reason the gateway recorded. Editors that follow
+        the gateway-wide signing default name the default the dashboard set, or
+        say it could not be read.
+        The connect wizard offers "Use this agent for all signing" only to users
+        who may change Gateway signing, and pre-checks it only when no default
+        is stored; Key Management rotates with the key id typed on that
+        connection's own card; and a revoke's acknowledgement of stranded agents
+        applies only to the click right after the warning.
+        The grant step names the four capabilities the grant gives, and Done waits
+        until the signing key is created, so the pre-checked default is applied.
+    - timestamp: '2026-11-16T12:10:00Z'
+      title: Choose the signing key source per surface, issuer or whole gateway
+      description: >-
+        A Signing key source field, Gateway secret or Verifiable Trust Agent,
+        sets what signs for a surface in the Surface Builder,
+        for every surface an issuer owns in the issuer editor, and for the whole
+        gateway in Settings, Security, Gateway signing. A surface that sets
+        nothing follows its issuer, then the gateway-wide choice, then the [vta]
+        block, then the gateway's own key, and the dashboard shows which it
+        follows. A surface or issuer can name only a trust agent connection of
+        its own tenant or an appliance-wide one, and Gateway signing only an
+        appliance-wide one. Changing any of these choices needs key management
+        rights as well as the editor's own rights, including moving a surface
+        onto an issuer that signs differently, and for Gateway signing the dashboard asks
+        for confirmation first, listing that the issuer of what is issued from
+        then on changes, that peers and verifiers must trust it, and that tokens
+        already issued keep the key that signed them. With Verifiable Trust Agent
+        chosen, Gateway signing offers a Connect VTA button in its header, and
+        the agent list appears only once an agent is connected. A surface or
+        issuer with its own trust agent issues credentials under that context's
+        DID, which a Fabric peer accepts once its operator adds it to the
+        connection's trusted issuers. Deleting an issuer that signs needs key
+        management rights too, since the surfaces that follow it move to the
+        gateway-wide signer. A Standby node promoted to Active re-reads the
+        connections and Gateway signing before it signs.
+        When Gateway signing moves off a signer, its public keys stay in the
+        JWKS and token exchange accepts a token claiming its issuer DID for 20
+        minutes, the longest access token lifetime plus clock leeway, across a
+        restart (appliance_signer_history.json in the storage directory). It is
+        dropped at once, and for good, when its trust agent connection is
+        deleted, disabled, revoked or pointed at another agent, even if that is
+        undone before anything reads the history, and one whose connection
+        record cannot be read is left out without being forgotten. A key
+        rotation refreshes the recorded signer at once. The current signer is recorded the first time it resolves, so
+        a change made while the gateway was down, or before the new signer
+        signed, still keeps the one it replaced, and a current signer that
+        cannot be resolved stays published for 21 minutes after it last signed.
+        Before a token a trust agent signed is returned, the gateway
+        verifies it against the public key recorded for its key id and refuses
+        one that does not verify. A signing choice through the [vta] block is
+        refused while the block is off.
+        Once Gateway signing is on a trust agent, the gateway's own key stays in
+        /oauth2/jwks.json, and token exchange accepts tokens it signed, only
+        while a token it signed may be outstanding: 21 minutes after it last
+        signed one, across a restart. A surface or issuer that chooses Gateway
+        secret keeps it in use, and a gateway that signs with its own key is
+        unchanged. custody_claim is true only while nothing signs with the
+        gateway's own key, and the Key Management tab says so. Credentials,
+        presentations and receipts it signed verify by resolving their DID, so
+        they are not affected.
+        Signing key source on a surface or issuer is read-only without
+        key_management.edit. Gateway signing on a gateway that signs through a [vta]
+        block says it follows the block, and offers to return to it once another
+        source is chosen.
+    - timestamp: '2026-11-16T12:15:00Z'
+      title: Show which keys sign what on the Secrets page's Key Management tab
+      description: >-
+        Secrets has a Key Management tab, and GET /v1/key-management/inventory
+        the same data, listing each trust agent connection's keys, which backend,
+        context and key each surface the user may see signs with, contexts no
+        surface claims any more, and which kinds of key stay on the gateway's disk and why. Users
+        with key management rights can provision a connection's signing key and
+        rotate to a new one, keeping the old one published. A retired key no
+        longer signs: every choice that named it signs with the active key, and
+        the saved surface, issuer and Gateway signing choices that named it are
+        moved to the new key, so the dashboard shows the key that signs. A
+        rotation that supplies a public key is recorded only once the trust
+        agent signs a fresh nonce with that key, and a rotation or provisioning
+        that finds the connection repointed, disabled or revoked meanwhile is
+        refused with 409.
+    - timestamp: '2026-11-16T12:20:00Z'
+      title: Count trust agent calls, circuit trips and quota refusals in metrics
+      description: >-
+        agent_gateway_vta_call_total and agent_gateway_vta_call_duration_seconds
+        count each call to a trust agent by operation and result,
+        agent_gateway_vta_circuit_open_total the times a client's circuit breaker
+        opened, and agent_gateway_vta_quota_exceeded_total the signatures the
+        signing quota refused, so failing trust agent signing can be alerted on.
+    - timestamp: '2026-11-17T16:00:00Z'
+      title: ⭐ Let trust agent contexts sign as a did:webvh that survives key rotation
+      description: >-
+        A new [vta] context_did_method setting chooses the DID the trust agent
+        contexts the gateway creates sign as, on every connection: did_key
+        (the default) or did_webvh. With did_webvh the trust agent creates a
+        did:webvh in each new context (the issuer context, a surface's, an
+        agent's) and keeps its keys; the gateway signs as it and hosts its log
+        at /vta-issuer/{token}/did.jsonl, or a webvh server registered on the
+        trust agent publishes it (context_did_hosting). The trust agent's
+        operator can then rotate a context's key without changing its DID, so
+        Fabric peers and verifiers keep working; the gateway re-reads the log
+        when it grows and republishes it. Existing contexts and agents keep
+        their DID. The gateway works with trust agent releases that serve either
+        the newer or the older context tasks. GET /v1/vta/status and the key
+        inventory say which method is in use.
+        A context signs credentials, presentations and JWTs only as a DID one of
+        its own active Ed25519 keys backs: a did:key that is that key, or a
+        did:webvh whose assertionMethod names it. A context with no DID, or one
+        whose DID none of its keys backs, refuses to sign rather than sign under
+        another identity.
+    - timestamp: '2026-11-19T16:30:00Z'
+      title: Record trust agent changes and refusals as tamper-evident security records
+      description: >-
+        Creating, updating, pairing, verifying, revoking or deleting a trust
+        agent connection, provisioning or rotating its signing key, and rotating
+        or cancelling a control key each emit a governance audit event in a new
+        Key management group. Refusals of those routes (401, 403, 409, and 404
+        for a connection the caller may not see) emit trust_agent_change_refused,
+        and a signing change refused for lack of key_management.edit emits
+        signing_change_refused. Each record names its actor, is appended to a
+        SHA-256 hash chain under the audit directory before the response is
+        sent, is logged on the security_audit target and reaches the VP Audit
+        Log and integrations that select it, so an edited, removed or reordered
+        record is detectable.
+  changed:
+    - timestamp: '2026-11-11T18:00:00Z'
+      title: ⭐ Sign with the gateway's own keys through the VTA library
+      description: >-
+        With no trust agent connected, the gateway now signs its tokens, agent
+        credentials, presentations and did:webvh log entries through
+        the VTA's signing library, `vta-signing`, instead of with its own
+        signing code. Keys, DIDs, key ids and the published JWKS are unchanged,
+        credential proofs stay eddsa-rdfc-2022 so peers that verify them keep
+        accepting them, and a signing fix now lands in one place for local and
+        remote signing. The gateway keeps no key store and links no VTA server code.
+  fixed:
+    - timestamp: '2026-11-09T15:15:00Z'
+      title: Stop the dashboard reloading forever on a session the gateway forgot
+      description: >-
+        A browser holding a session token the gateway no longer knows (after the
+        gateway's storage was wiped or replaced) made the dashboard reload without
+        end. The sign-in page redirected to the dashboard whenever the session
+        check answered 200, though the answer said "authenticated: false", and the
+        app sent the browser straight back. The page now redirects only for a real
+        session, and otherwise forgets the stale token and shows the sign-in form.
+  removed: []
+  security:
+    - timestamp: '2026-10-27T06:00:00Z'
+      title: Stop a did:webvh log that contains a number from aborting the gateway
+      description: >-
+        Reading a did:webvh log published by somebody else, and creating and
+        updating this gateway's own logs, used a JSON canonicaliser that, in the
+        way this product is built, stops the whole process the moment the
+        document contains a number. Reading mattered most, because the log comes
+        from outside and a single number in it was enough to stop the gateway
+        rather than fail the check. Both now use the canonicaliser the rest of
+        the product uses. Identities are
+        unaffected: both produce the same canonical form, and a test pins the
+        identifier a fixed log entry produces.
+    - timestamp: '2026-11-17T09:00:00Z'
+      title: Keep agent private keys out of the dashboard's live identity updates
+      description: >-
+        An agent whose key the gateway holds had that key sent, with the rest of
+        its record, to every open dashboard session on each identity create or
+        update, whatever the session's role. The updates now carry the record
+        without the key, and the WebSocket drops a private key from any identity
+        update before sending it. The stored key is unchanged.
+    - timestamp: '2026-11-17T09:05:00Z'
+      title: Refuse to resolve a did:webvh log that fails verification
+      description: >-
+        The DID resolution endpoint's deactivation-aware path checked a stored
+        did:webvh log but ignored the result, so a tampered or corrupt log
+        resolved as the current document. It now verifies the log with the same
+        library as every other resolution path and answers invalidDid when
+        verification fails.
+    - timestamp: '2026-11-25T12:05:00Z'
+      title: Check every proof on a credential or presentation, eddsa-jcs-2022 too
+      description: >-
+        A credential or presentation with no proof, or an empty proof list, is
+        refused. Every proof on it must be made by a key of the DID the
+        document names, whichever cryptosuite made it, and eddsa-jcs-2022
+        proofs, which a trust agent makes, are verified as well as
+        eddsa-rdfc-2022 ones.
+    - timestamp: '2026-11-25T12:10:00Z'
+      title: Refuse to exchange a token this gateway signed under any key it publishes
+      description: >-
+        Token exchange refused a subject or actor token this gateway issued only
+        when it named the gateway DID or the MCP issuer. It now also refuses one
+        signed under any key the gateway publishes, a trust agent key's did:key
+        included, so a token the gateway issued cannot be exchanged as an
+        outside assertion. The legacy endpoint still exchanges the gateway's own
+        access tokens.
+  breaking: []

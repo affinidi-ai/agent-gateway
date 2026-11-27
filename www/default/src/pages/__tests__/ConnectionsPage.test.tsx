@@ -22,6 +22,17 @@ jest.mock('../GatewaysPage', () => () => <div data-testid="stub-gateways" />);
 jest.mock('../MediatorsPage', () => () => <div data-testid="stub-mediators" />);
 jest.mock('../TrustRegistriesPage', () => () => <div data-testid="stub-registries" />);
 jest.mock(
+  '../TrustAgentsPage',
+  () =>
+    ({ actionsContainer }: { actionsContainer?: HTMLElement | null }) => (
+      <div
+        data-testid="stub-trust-agents"
+        data-has-actions={String(actionsContainer !== undefined)}
+      />
+    )
+);
+
+jest.mock(
   '../PaymentGatewaysPage',
   () =>
     ({ actionsContainer }: { actionsContainer?: HTMLElement | null }) => (
@@ -118,5 +129,71 @@ describe('ConnectionsPage', () => {
 
     expect(screen.getByTestId('where')).toHaveTextContent('?tab=payment-gateways');
     expect(activeTab()).toContain('Payment Gateways');
+  });
+
+  describe('Verifiable Trust Agent', () => {
+    it('shows the tab to a user with vta_connections.view, and no Key Management tab', () => {
+      mockPermissions = { 'gateways.view': true, 'vta_connections.view': true };
+      renderPage();
+
+      expect(screen.getByTestId('connections-tab-trust-agents')).toHaveTextContent(
+        'Verifiable Trust Agent'
+      );
+      expect(screen.queryByTestId('connections-tab-key-management')).not.toBeInTheDocument();
+    });
+
+    it('hides the tab without vta_connections.view', () => {
+      renderPage();
+
+      expect(screen.queryByTestId('connections-tab-trust-agents')).not.toBeInTheDocument();
+    });
+
+    it('opens from ?tab= and gives the tab no actions banner, so its Add VTA sits in its card', () => {
+      mockPermissions = { 'vta_connections.view': true };
+      renderPage('/connections?tab=trust-agents');
+
+      expect(activeTab()).toContain('Verifiable Trust Agent');
+      expect(screen.getByTestId('stub-trust-agents')).toHaveAttribute('data-has-actions', 'false');
+    });
+
+    it('shows no filter box on the Verifiable Trust Agent tab, and the box on the others', () => {
+      mockPermissions = { 'gateways.view': true, 'vta_connections.view': true };
+      renderPage('/connections?tab=trust-agents');
+      expect(screen.queryByTestId('connections-search-input')).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByTestId('connections-gateways-tab-trigger'));
+      expect(screen.getByTestId('connections-search-input')).toBeInTheDocument();
+    });
+
+    it('opens on the Verifiable Trust Agent tab for a user who may see only trust agents', () => {
+      mockPermissions = { 'vta_connections.view': true };
+      renderPage();
+
+      expect(activeTab()).toContain('Verifiable Trust Agent');
+      expect(screen.queryByTestId('stub-gateways')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('stub-mediators')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('stub-registries')).not.toBeInTheDocument();
+    });
+
+    it('shows Mediators and Registries only with their own view permissions', () => {
+      mockPermissions = {
+        'gateways.view': true,
+        'mediators.view': true,
+        'trust_registries.view': true,
+      };
+      renderPage();
+
+      expect(screen.getByTestId('connections-mediators-tab-trigger')).toBeInTheDocument();
+      expect(screen.getByTestId('connections-trust-registries-tab-trigger')).toBeInTheDocument();
+    });
+
+    it('keeps the selected tab in the URL', () => {
+      mockPermissions = { 'gateways.view': true, 'vta_connections.view': true };
+      renderPage();
+
+      fireEvent.click(screen.getByTestId('connections-tab-trust-agents'));
+
+      expect(screen.getByTestId('where')).toHaveTextContent('?tab=trust-agents');
+    });
   });
 });

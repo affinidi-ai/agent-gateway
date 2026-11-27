@@ -738,4 +738,123 @@ describe('eventNarrative', () => {
     expect(n.summary).toContain('GitHub');
     expect(n.summary).toContain('as header');
   });
+
+  describe('Target authentication changes', () => {
+    const user = { kind: 'user' as const, id: 'u-1' };
+    const change = (body: Record<string, unknown>, extra: Partial<AuditEntry> = {}) =>
+      at(
+        {
+          target_auth_changed: {
+            actor: user,
+            surface_variant: '_base_',
+            leg: 'target',
+            previous_method: 'none',
+            method: 'none',
+            ...body,
+          },
+        } as AuditEntry['event'],
+        { channel_name: 'Orders', surface_id: 's-1', ...extra }
+      );
+
+    it('says a credential provider was added to the Target, naming the provider and actor', () => {
+      const n = describeEntry(change({ method: 'credential_provider', provider_id: 'prov-1' }));
+      expect(n.title).toBe('Target authentication changed');
+      expect(n.tone).toBe('neutral');
+      expect(n.summary).toBe(
+        'Target authentication was added to the Target of Orders: it now uses a credential provider (provider prov-1).'
+      );
+      expect(n.detail).toBe('By user u-1.');
+    });
+
+    it('says the credential was removed from a Transit Point on a variant', () => {
+      const n = describeEntry(
+        change({
+          leg: 'transit_point',
+          transit_point: 'billing',
+          transit_point_id: 'tp-1',
+          surface_variant: 'beta',
+          previous_method: 'static_secret',
+          method: 'none',
+        })
+      );
+      expect(n.summary).toBe(
+        'Target authentication was removed from Transit Point billing of Orders, on variant beta: it no longer sends a credential.'
+      );
+    });
+
+    it('says which method replaced which', () => {
+      const n = describeEntry(
+        change({ previous_method: 'static_secret', method: 'credential_lookup' })
+      );
+      expect(n.summary).toBe(
+        'Target authentication of the Target of Orders changed from a static secret to a credential lookup.'
+      );
+    });
+
+    it('lists the changed parts when the method stayed, and copes with none recorded', () => {
+      const same = { previous_method: 'static_secret', method: 'static_secret' };
+      expect(describeEntry(change({ ...same, changed: ['header_name', 'scopes'] })).summary).toBe(
+        'Target authentication of the Target of Orders changed: header name, scopes.'
+      );
+      expect(describeEntry(change(same)).summary).toBe(
+        'Target authentication of the Target of Orders changed.'
+      );
+    });
+
+    it('falls back to the surface id, and to no surface at all, when no name is recorded', () => {
+      const body = { method: 'static_secret' };
+      expect(describeEntry(change(body, { channel_name: null })).summary).toContain('of s-1');
+      const bare = describeEntry(change(body, { channel_name: null, surface_id: null }));
+      expect(bare.summary).toBe(
+        'Target authentication was added to the Target: it now uses a static secret.'
+      );
+    });
+
+    it('never shows a secret id', () => {
+      const n = describeEntry(
+        change({
+          previous_method: 'static_secret',
+          method: 'static_secret',
+          changed: ['secret_id'],
+        })
+      );
+      expect(JSON.stringify(n)).not.toContain('sec-');
+    });
+  });
+
+  describe('secret force deletes', () => {
+    const forced = (body: Record<string, unknown>) =>
+      at({
+        secret_force_deleted: {
+          actor: { kind: 'pat', id: 'tok-1', user_id: 'u-2' },
+          secret_id: 'sec-9',
+          force: true,
+          ...body,
+        },
+      } as AuditEntry['event']);
+
+    it('warns, naming the secret, the referrer count and the actor', () => {
+      const entry = forced({
+        referrers: [
+          { kind: 'surface', id: 's-1' },
+          { kind: 'credential_provider', id: 'p-1' },
+        ],
+      });
+      const n = describeEntry(entry);
+      expect(eventTone(entry)).toBe('warn');
+      expect(n.title).toBe('Secret force-deleted');
+      expect(n.summary).toBe('Secret sec-9 was deleted while 2 records still used it.');
+      expect(n.detail).toBe('By access token tok-1 of user u-2.');
+    });
+
+    it('reads a single referrer in the singular and none as a plain forced delete', () => {
+      expect(describeEntry(forced({ referrers: [{ kind: 'surface', id: 's-1' }] })).summary).toBe(
+        'Secret sec-9 was deleted while 1 record still used it.'
+      );
+      expect(describeEntry(forced({ referrers: [] })).summary).toBe(
+        'Secret sec-9 was deleted with force.'
+      );
+      expect(describeEntry(forced({})).summary).toBe('Secret sec-9 was deleted with force.');
+    });
+  });
 });

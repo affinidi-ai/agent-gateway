@@ -321,7 +321,7 @@ pub fn validate(provider: &CredentialProvider) -> Result<(), ExternalProviderErr
 
 /// The signed-JWT settings of an external consent provider: only a client
 /// that authenticates with `private_key_jwt` has them, and then it needs a
-/// signing key, signs with RS256 or PS256, names no audience, since its
+/// signing key, signs with PS256, RS256 or ES256, names no audience, since its
 /// assertion is always addressed to its issuer, and is itself the issuer and
 /// subject of its assertion.
 fn validate_client_assertion(
@@ -358,7 +358,7 @@ fn validate_client_assertion(
             !CredentialProviderType::OAuth2ClientCredentialsJwtAuth.allows_jwt_algorithm(algorithm)
         })
     {
-        return Err(Invalid("private_key_jwt signs with RS256 or PS256"));
+        return Err(Invalid("private_key_jwt signs with PS256, RS256 or ES256"));
     }
     if jwt.jwt_audience.is_some() {
         return Err(Invalid(
@@ -2358,6 +2358,11 @@ pub(crate) mod tests {
             .jwt
             .jwt_signing_algorithm = Some(JwtSigningAlgorithm::RS256);
         assert_eq!(validate(&signing), Ok(()));
+        let mut ec_signing = signing.clone();
+        ec_signing
+            .jwt
+            .jwt_signing_algorithm = Some(JwtSigningAlgorithm::ES256);
+        assert_eq!(validate(&ec_signing), Ok(()));
 
         type Change = fn(&mut CredentialProvider);
         let cases: Vec<(&str, Change)> = vec![
@@ -2366,7 +2371,6 @@ pub(crate) mod tests {
                     .jwt_signing_key_secret_ref = None
             }),
             ("a client secret", |p| p.client_secret_secret_ref = Some("secret".into())),
-            ("an ES256 key", |p| p.jwt.jwt_signing_algorithm = Some(JwtSigningAlgorithm::ES256)),
             ("another issuer", |p| p.jwt.jwt_issuer = Some("someone@example.com".into())),
             ("another subject", |p| p.jwt.jwt_subject = Some("someone".into())),
             ("an http audience", |p| p.jwt.jwt_audience = Some("http://203.0.113.10/token".into())),

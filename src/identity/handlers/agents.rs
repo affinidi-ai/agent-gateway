@@ -23,8 +23,9 @@ use tracing::{debug, error, warn};
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::auth_manager::pat::PatResourceScope;
 use crate::config::agent_surface::{AgentSurface, SurfaceProtocol, SurfaceStatus};
+use crate::identity::credential_identity::MTLS_CALLER_CREDENTIAL_TYPE;
 use crate::identity::display_name::{DisplayName, managed_surfaces_by_did};
-use crate::identity::filesystem::AgentIdentityRecord;
+use crate::identity::filesystem::{AgentIdentityRecord, ManagedSlot};
 use crate::identity::handlers::surfaces::{CARD_FETCH_LIMITED, surface_card_preview};
 use crate::identity::state::IdentityApiState;
 use crate::identity::target_card_names::{CardLocation, TARGET_CARD_NAME_TTL, TargetCardNameService};
@@ -596,9 +597,10 @@ impl RegistryData<'_> {
         surfaces
     }
 
-    /// A JWT-claim DID is one parallel agent per claim value, not a version of the
-    /// surface's managed agent.
-    fn is_jwt_claim(
+    /// A DID that is its own agent rather than a version of the surface's managed agent: one
+    /// per JWT claim value, per mTLS caller certificate, or per caller credential a caller-bound
+    /// Transit Point took it from.
+    fn is_separate_agent(
         &self,
         did: &str,
     ) -> bool {
@@ -606,11 +608,16 @@ impl RegistryData<'_> {
             .iter()
             .any(|record| {
                 record.did == did
-                    && record
-                        .identity_fields
-                        .get("credential_type")
-                        .and_then(Value::as_str)
-                        == Some(JWT_CLAIM_CREDENTIAL_TYPE)
+                    && (matches!(
+                        record
+                            .identity_fields
+                            .get("credential_type")
+                            .and_then(Value::as_str),
+                        Some(JWT_CLAIM_CREDENTIAL_TYPE | MTLS_CALLER_CREDENTIAL_TYPE)
+                    ) || record
+                        .slot
+                        .as_ref()
+                        .is_some_and(ManagedSlot::is_caller_bound))
             })
     }
 
@@ -646,8 +653,9 @@ impl RegistryData<'_> {
 
     /// Each surface's own agent DID plus the current managed identity of each of the group's
     /// surfaces, once per DID. A surface's managed DIDs are versions of one managed agent, so
-    /// only the most recently used one is current; JWT-claim DIDs are each their own agent and
-    /// all count. Caller identities are never managed, so never included.
+    /// only the most recently used one is current; JWT-claim, mTLS-caller and caller-bound
+    /// Transit Point DIDs are each their own agent and all count. Caller identities are never
+    /// managed, so never included.
     fn identities(
         &self,
         group: &AgentGroup<'_>,
@@ -677,7 +685,7 @@ impl RegistryData<'_> {
             if ids.is_empty() {
                 continue;
             }
-            if self.is_jwt_claim(did) {
+            if self.is_separate_agent(did) {
                 sources
                     .entry(did.as_str())
                     .or_insert(IdentitySource::Managed);
@@ -2022,6 +2030,49 @@ mod tests {
             .only(&[surface("s-oxygen")], None)
             .await;
         assert_eq!(dids(&agent), vec!["did:claim-a", "did:claim-b", "did:current"]);
+    }
+
+    fn transit_point_slot(
+        record: AgentIdentityRecord,
+        caller_bound: bool,
+    ) -> AgentIdentityRecord {
+        let mut record = record;
+        record.slot = Some(ManagedSlot::TransitPoint {
+            alias: "tr1".to_string(),
+            caller_bound,
+        });
+        record
+    }
+
+    #[tokio::test]
+    async fn test_every_caller_bound_transit_point_did_of_a_surface_is_an_identity() {
+        let mut certificate = managed_used("did:cert", "s-oxygen", 20);
+        certificate
+            .identity_fields
+            .insert("credential_type".to_string(), serde_json::json!(MTLS_CALLER_CREDENTIAL_TYPE));
+        let mut fixture = Fixture::new();
+        fixture.records = vec![
+            transit_point_slot(managed_used("did:key-a", "s-oxygen", 30), true),
+            transit_point_slot(managed_used("did:key-b", "s-oxygen", 5), true),
+            certificate,
+        ];
+        let agent = fixture
+            .only(&[surface("s-oxygen")], None)
+            .await;
+        assert_eq!(dids(&agent), vec!["did:cert", "did:key-a", "did:key-b"]);
+    }
+
+    #[tokio::test]
+    async fn test_only_the_most_recently_used_transit_point_did_that_is_not_caller_bound_is_an_identity() {
+        let mut fixture = Fixture::new();
+        fixture.records = vec![
+            transit_point_slot(managed_used("did:old", "s-oxygen", 30), false),
+            transit_point_slot(managed_used("did:current", "s-oxygen", 5), false),
+        ];
+        let agent = fixture
+            .only(&[surface("s-oxygen")], None)
+            .await;
+        assert_eq!(dids(&agent), vec!["did:current"]);
     }
 
     #[tokio::test]

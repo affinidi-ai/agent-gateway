@@ -470,9 +470,10 @@ pub async fn inspect_message_extensions(
                                 Some(error_msg.clone()),
                             )
                             .await;
+                            let (status, code) = identity_failure(&e);
                             return Err(crate::a2a::create_identity_error_response(
-                                StatusCode::UNPROCESSABLE_ENTITY,
-                                crate::a2a::errors::ERR_IDENTITY_VALIDATION_FAILED,
+                                status,
+                                code,
                                 "inbound_identity",
                                 ctx.channel_name,
                                 &error_msg,
@@ -942,9 +943,10 @@ pub async fn inspect_message_extensions(
                                 Some(error_msg.clone()),
                             )
                             .await;
+                            let (status, code) = identity_failure(&e);
                             return Err(crate::a2a::create_identity_error_response(
-                                StatusCode::UNPROCESSABLE_ENTITY,
-                                crate::a2a::errors::ERR_IDENTITY_VALIDATION_FAILED,
+                                status,
+                                code,
                                 "inbound_identity",
                                 ctx.channel_name,
                                 &error_msg,
@@ -1587,9 +1589,39 @@ pub fn should_forward_request_header(name: &str) -> bool {
         && lower != crate::proxy::fabric_hops::FABRIC_HOPS_HEADER
 }
 
+/// The status and code a failed caller identity is answered with: `503` when
+/// the trust agent that issues its credential could not be used, which is not
+/// the caller's fault and is worth retrying, and `422` for everything else, as
+/// before, a payload the identity schema refuses among them.
+fn identity_failure(error: &anyhow::Error) -> (StatusCode, &'static str) {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::vta::VtaError>()
+            .is_some()
+    }) {
+        return (StatusCode::SERVICE_UNAVAILABLE, crate::a2a::errors::ERR_IDENTITY_DID_FAILED);
+    }
+    (StatusCode::UNPROCESSABLE_ENTITY, crate::a2a::errors::ERR_IDENTITY_VALIDATION_FAILED)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::identity::test_helpers::{SignedAgentPresentation, signed_agent_presentation};
+
+    #[test]
+    fn a_trust_agent_failure_is_503_and_anything_else_stays_422() {
+        let unreachable = anyhow::Error::new(crate::vta::VtaError::Transport("connection refused".to_string()))
+            .context("Failed to issue or retrieve DID for identity");
+        assert_eq!(
+            super::identity_failure(&unreachable),
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, crate::a2a::errors::ERR_IDENTITY_DID_FAILED)
+        );
+        let schema = anyhow::anyhow!("field `model` is required");
+        assert_eq!(
+            super::identity_failure(&schema),
+            (axum::http::StatusCode::UNPROCESSABLE_ENTITY, crate::a2a::errors::ERR_IDENTITY_VALIDATION_FAILED)
+        );
+    }
 
     /// The status inspection refuses `body` with, if any, on a surface whose
     /// rules require `cloudProvider` to be `local`, watching both agent

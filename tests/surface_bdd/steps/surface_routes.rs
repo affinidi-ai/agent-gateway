@@ -107,6 +107,33 @@ async fn save_surface(
     world.admin_response = Some(saved);
 }
 
+/// Reloads the configuration while the stored surfaces' directory cannot be read, so the
+/// reload cannot load a configuration, then makes the directory readable again.
+#[given("the operator has reloaded the configuration while the stored surfaces could not be read")]
+async fn operator_has_reloaded_while_surfaces_unreadable(world: &mut SurfaceWorld) {
+    use std::os::unix::fs::PermissionsExt as _;
+    ensure_admin_session(world).await;
+    let surfaces_dir = world
+        .infra
+        .as_ref()
+        .expect("the gateway must be running")
+        ._temp_dir
+        .path()
+        .join("_storage/agent_surfaces");
+    let readable = std::fs::metadata(&surfaces_dir)
+        .expect("the stored surfaces' directory")
+        .permissions();
+    std::fs::set_permissions(&surfaces_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let reload = world
+        .admin_client
+        .as_ref()
+        .expect("the operator must be signed in")
+        .send_recorded_json::<()>(reqwest::Method::POST, "/v1/config/reload", None)
+        .await;
+    std::fs::set_permissions(&surfaces_dir, readable).unwrap();
+    world.admin_response = Some(reload.expect("reload the configuration"));
+}
+
 #[when(expr = "the operator changes the description of surface {string}")]
 async fn operator_changes_description(
     world: &mut SurfaceWorld,
@@ -140,6 +167,17 @@ async fn operator_enables_surface(
 ) {
     let mut surface = stored_surface(world, &id).await;
     surface["status"] = serde_json::json!("active");
+    save_surface(world, &id, surface).await;
+}
+
+#[when(expr = "the operator saves surface {string} with status {string}")]
+async fn operator_saves_surface_with_status(
+    world: &mut SurfaceWorld,
+    id: String,
+    status: String,
+) {
+    let mut surface = stored_surface(world, &id).await;
+    surface["status"] = serde_json::json!(status);
     save_surface(world, &id, surface).await;
 }
 

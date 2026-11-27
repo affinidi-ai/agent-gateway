@@ -11,6 +11,7 @@ import {
   noTargetAuthProblems,
   parseScopes,
   providerTargetAuthToApi,
+  storedHeaderKind,
   trimSpaces,
 } from '../_shared/providerTargetAuth';
 
@@ -47,12 +48,6 @@ export const MANAGED_AGENT_TARGET_AUTH_FORM_KEYS: ReadonlyArray<keyof ManagedAge
 
 function text(value: unknown): string {
   return typeof value === 'string' ? value : '';
-}
-
-export function inferAuthType(headerName: string, headerFormat: string): string {
-  if (headerFormat.startsWith('Bearer ')) return 'bearer';
-  if (headerFormat.startsWith('Basic ')) return 'basic';
-  return headerName === 'X-API-Key' ? 'api_key' : 'custom';
 }
 
 function editedTargetAuth(c: ManagedAgentTargetAuthForm): Record<string, unknown> | undefined {
@@ -101,7 +96,7 @@ export function managedAgentTargetAuth(c: Form): Record<string, unknown> | undef
   const type = text(c.target_auth_type) || 'bearer';
   const method = edited.method as Record<string, Record<string, string>>;
   const inner = method.static_secret ?? method.credential_provider;
-  const unchanged = inferAuthType(inner.header_name, inner.header_format) === type;
+  const unchanged = storedHeaderKind(inner.header_name, inner.header_format) === type;
   if (stored?.auth?.auth_type === undefined && stored?.auth && unchanged) {
     return mergedTargetAuth(stored, edited);
   }

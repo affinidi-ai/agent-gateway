@@ -723,6 +723,49 @@ describe('AuditPage policy changes', () => {
     }
   );
 
+  it.each([
+    [
+      'a Target authentication change',
+      {
+        target_auth_changed: {
+          actor: { kind: 'user', id: 'u-1' },
+          surface_variant: '_base_',
+          leg: 'target',
+          previous_method: 'none',
+          method: 'static_secret',
+        },
+      },
+      'user alice',
+    ],
+    [
+      'a forced secret delete',
+      {
+        secret_force_deleted: {
+          actor: { kind: 'pat', id: 'tok-1', user_id: 'u-1' },
+          secret_id: 'sec-9',
+          force: true,
+        },
+      },
+      'access token tok-1 of alice',
+    ],
+  ])('names the user who made %s', async (_kind, event, actor) => {
+    const response = {
+      ...CHANGE_RESPONSE,
+      events: [{ ...CHANGE_RESPONSE.events[0], event }],
+      category_counts: {},
+    };
+    mockGet.mockImplementation((url: string) =>
+      Promise.resolve({
+        data: url === '/users' ? [{ user_id: 'u-1', username: 'alice' }] : response,
+      })
+    );
+    renderPage();
+
+    const item = await screen.findByTestId('audit-item-0');
+    await waitFor(() => expect(within(item).getByText(actor)).toBeInTheDocument());
+    expect(usersRequests()).toHaveLength(1);
+  });
+
   it('does not ask for the users list when the page shows no policy change', async () => {
     mockGet.mockImplementation((url: string) =>
       Promise.resolve({ data: url === '/users' ? [] : AUDIT_RESPONSE })

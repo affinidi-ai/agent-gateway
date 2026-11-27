@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 /// Extract the domain segment from an issuer DID, decoding encoded localhost ports.
-fn extract_domain_from_did(issuer_did: &str) -> String {
+pub(crate) fn extract_domain_from_did(issuer_did: &str) -> String {
     crate::identity::utils::extract_domain_from_did(issuer_did)
 }
 
@@ -65,17 +65,12 @@ pub async fn generate_did_webvh_identity(
         pub_jwk
     };
 
-    // --- 3. Convert Ed25519 key to library Secret for multibase public key ---
-    let temp_key_id = "did:key:temp#temp".to_string();
-    let raw_secret = didwebvh_rs::prelude::Secret::from_jwk_value(&temp_key_id, &ed25519_jwk_value)
-        .map_err(|e| anyhow::anyhow!("Failed to convert Ed25519 key to Secret: {}", e))?;
-    let multibase_pubkey = raw_secret
-        .get_public_keymultibase()
-        .map_err(|e| anyhow::anyhow!("Failed to get multibase public key: {}", e))?;
-    let did_key_id = format!("did:key:{0}#{0}", multibase_pubkey);
-    let mut auth_secret = didwebvh_rs::prelude::Secret::from_jwk_value(&did_key_id, &ed25519_jwk_value)
-        .map_err(|e| anyhow::anyhow!("Failed to build auth secret: {}", e))?;
-    auth_secret.id = did_key_id;
+    // --- 3. The signer the log is created with, and its multibase public key ---
+    let auth_signer = crate::vta::local::VtaDiSigner::from_jwk(&ed25519_jwk_value)
+        .map_err(|e| anyhow::anyhow!("Failed to build the signing key: {}", e.log_detail()))?;
+    let multibase_pubkey = auth_signer
+        .public_multibase()
+        .to_string();
 
     // --- 4. Build DID document JSON with {SCID} placeholder ---
     // Publish the Ed25519 key in BOTH formats: `#key-1` as JsonWebKey2020
@@ -123,9 +118,9 @@ pub async fn generate_did_webvh_identity(
     // --- 6. Call create_did() — library handles SCID, hash, signing ---
     let base_url = crate::identity::didwebvh::base_url_for_domain(&domain);
     let create_result = create_did(
-        CreateDIDConfig::builder()
+        CreateDIDConfig::<crate::vta::local::VtaDiSigner, crate::vta::local::VtaDiSigner>::builder_generic()
             .address(base_url)
-            .authorization_key(auth_secret)
+            .authorization_key(auth_signer)
             .did_document(did_document_json)
             .parameters(parameters)
             .build()
@@ -177,6 +172,8 @@ pub async fn generate_did_webvh_identity(
         last_used_at: None,
         channel_usage: vec![],
         private_key: private_key_jwk,
+        vta_context_id: None,
+        vta_connection_id: None,
         channel_config_id: None,
         is_local: true,
         verified: true,

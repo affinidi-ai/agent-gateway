@@ -18,7 +18,7 @@ const TENANT_HEADER: &str = "x-external-account";
 const ALL_SURFACES: &str = ".*";
 
 /// Who calls a management route in a scenario.
-enum Caller<'a> {
+pub(crate) enum Caller<'a> {
     Operator(&'a str),
     PersonalAccessToken,
 }
@@ -34,7 +34,7 @@ fn operator_client<'a>(
         .unwrap_or_else(|| panic!("operator '{operator}' must have a role before calling {path}"))
 }
 
-async fn send(
+pub(crate) async fn send(
     world: &SurfaceWorld,
     caller: Caller<'_>,
     method: Method,
@@ -194,10 +194,19 @@ async fn hold_tenant_token(
     tenant: &str,
     surfaces: &str,
 ) {
+    hold_scoped_tenant_token(world, tenant, surfaces, &[]).await;
+}
+
+async fn hold_scoped_tenant_token(
+    world: &mut SurfaceWorld,
+    tenant: &str,
+    surfaces: &str,
+    scopes: &[&str],
+) {
     ensure_admin_session(world).await;
     let request = json!({
         "name": "agents token",
-        "scopes": [],
+        "scopes": scopes,
         "resource_pattern": format!("TENANT:${{x-external-account}}:surfaces:{surfaces}"),
         "required_headers": [{"name": TENANT_HEADER, "pattern": tenant}],
     });
@@ -323,6 +332,19 @@ async fn tenant_personal_access_token(
     tenant: String,
 ) {
     hold_tenant_token(world, &tenant, ALL_SURFACES).await;
+}
+
+#[given(expr = "a personal access token of tenant {string} with scopes {string}")]
+async fn scoped_tenant_personal_access_token(
+    world: &mut SurfaceWorld,
+    tenant: String,
+    scopes: String,
+) {
+    let scopes: Vec<&str> = scopes
+        .split(',')
+        .map(str::trim)
+        .collect();
+    hold_scoped_tenant_token(world, &tenant, ALL_SURFACES, &scopes).await;
 }
 
 #[given(expr = "a personal access token of tenant {string} limited to surface {string}")]
@@ -470,6 +492,19 @@ async fn operator_validates_credential_provider(
 #[when("the personal access token lists the agents")]
 async fn personal_access_token_lists_agents(world: &mut SurfaceWorld) {
     record(world, Caller::PersonalAccessToken, Method::GET, AGENTS_PATH, None).await;
+}
+
+#[when("the operator lists the agents")]
+async fn operator_lists_agents(world: &mut SurfaceWorld) {
+    ensure_admin_session(world).await;
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("the operator session must exist")
+        .send_recorded_json::<Value>(Method::GET, AGENTS_PATH, None)
+        .await
+        .expect("listing the agents as the operator");
+    world.admin_response = Some(response);
 }
 
 #[when("the personal access token reads the surface's agent")]

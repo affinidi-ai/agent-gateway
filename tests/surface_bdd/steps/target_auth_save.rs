@@ -27,7 +27,7 @@ pub(crate) fn draft(world: &mut SurfaceWorld) -> &mut Value {
         .expect("a surface draft must be prepared first")
 }
 
-fn draft_transit_point<'a>(
+pub(crate) fn draft_transit_point<'a>(
     world: &'a mut SurfaceWorld,
     alias: &str,
 ) -> &'a mut Value {
@@ -190,7 +190,7 @@ async fn draft_injects_delegated_credential(
 }
 
 /// Creates the JWT verification strategy a draft's caller check names, through the admin API.
-async fn create_caller_jwt_strategy(world: &mut SurfaceWorld) -> Value {
+pub(crate) async fn create_caller_jwt_strategy(world: &mut SurfaceWorld) -> Value {
     let strategy = json!({
         "name": "BDD caller IdP",
         "expected_issuer": "https://issuer.bdd.example",

@@ -247,13 +247,16 @@ describe('PaymentGatewaysPage', () => {
 
   it('explains agent-pay and links to the wizard when there is no payment gateway', async () => {
     mocked.listPaymentGateways.mockResolvedValue([]);
-    renderPage();
+    const banner = document.createElement('div');
+    document.body.appendChild(banner);
+    renderPage({ externalSearchTerm: '', actionsContainer: banner });
 
     const empty = await screen.findByTestId('payment-gateways-empty-state');
     expect(empty).toHaveTextContent('agent-pay');
-    fireEvent.click(screen.getByTestId('payment-gateways-empty-connect-button'));
+    fireEvent.click(within(banner).getByTestId('payment-gateways-connect-button'));
 
     expect(screen.getByTestId('where')).toHaveTextContent('/payment-gateways/connect');
+    banner.remove();
   });
 
   it('renders the Connect button in the tab banner when given one', async () => {

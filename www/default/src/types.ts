@@ -1,3 +1,4 @@
+import type { SurfaceSigning } from './components/surface-builder/elements/types';
 import React from 'react';
 import type { ChannelProtocol } from './generated/ChannelProtocol';
 
@@ -222,8 +223,13 @@ export interface ManagedSurfaceRef {
   surface_name: string;
 }
 
-/** The surface slot whose identity setting created a managed identity. */
-export type ManagedSlot = { kind: 'protected' } | { kind: 'transit_point'; alias: string };
+/**
+ * The surface slot whose identity setting created a managed identity. `caller_bound` is
+ * `true` when a Transit Point took the DID from the credential its caller presented.
+ */
+export type ManagedSlot =
+  | { kind: 'protected' }
+  | { kind: 'transit_point'; alias: string; caller_bound?: boolean };
 
 /** A change of the stored certificate or API key behind an identity that kept its DID. */
 export interface CredentialRotation {
@@ -960,6 +966,8 @@ export interface Issuer {
   trust_registry_did?: string;
   authority_did?: string;
   tr_registered?: boolean;
+  /** Which backend signs for the surfaces this issuer owns; absent follows the appliance default. */
+  signing?: SurfaceSigning;
   created_at: string;
   updated_at: string;
 }

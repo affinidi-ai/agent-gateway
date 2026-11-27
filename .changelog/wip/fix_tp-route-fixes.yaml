@@ -2,13 +2,6 @@ branch: fix/tp-route-fixes
 changes:
   added: []
   changed:
-    - timestamp: '2026-11-25T09:00:00Z'
-      title: Split the dashboard's shared code bundle into chunks of 500 KB or less
-      description: >-
-        The production build put all code shared between dashboard pages into one common chunk,
-        which had grown to the 1 MB asset budget and failed the build. That code is now split into
-        several common chunks of at most 500 KB each, so the budget keeps flagging real growth and
-        the browser can cache and load the parts separately.
     - timestamp: '2026-11-25T10:20:00Z'
       title: Warn on save about a stored listen_path on another Transit Point's route
       description: >-

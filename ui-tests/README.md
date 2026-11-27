@@ -18,6 +18,18 @@ make ui-test
 make ui-test-report
 ```
 
+## Against a real trust agent
+
+`specs/trust-agent-connection-live.spec.ts` pairs a custom VTA connection, then clicks **Rotate
+control key** on its row and checks that the DID, the grant and the connection state hold. It is
+skipped unless `VTA_LIVE_URL`, `VTA_LIVE_DID` and `VTA_LIVE_STATE_FILE` are set (and
+`VTA_LIVE_CONTEXT`, default `gwlive`). Run it in two passes, because the trust agent's access
+list is written offline between them: `VTA_LIVE_PHASE=add` saves the grant command the gateway
+prints, you run it on the trust agent, then `VTA_LIVE_PHASE=rotate`. The trust agent must reach
+the gateway's `/vta-auth/<id>/did.jsonl`; locally that means a gateway whose DID names its plain
+HTTP port (a `localhost` DID is fetched over `http`) and a trust agent started with
+`VTA_ALLOW_PRIVATE_ENDPOINTS=1`.
+
 ## Setup
 
 ```bash

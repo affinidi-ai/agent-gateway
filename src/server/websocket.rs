@@ -113,8 +113,13 @@ impl WsState {
     /// Broadcast an update to all connected WebSocket clients
     pub fn broadcast(
         &self,
-        update: WsUpdate,
+        mut update: WsUpdate,
     ) {
+        // Identity frames reach every dashboard session whatever its role, so no producer may put
+        // a private key in one, now or later.
+        if let WsUpdate::IdentityCreated { identity } | WsUpdate::IdentityUpdated { identity } = &mut update {
+            strip_private_keys(identity);
+        }
         let _ = self.tx.send(update);
     }
 
@@ -615,6 +620,23 @@ where
             debug!("WebSocket client stopped reading; closing the connection");
             false
         }
+    }
+}
+
+/// Remove every private-key member from `value`, at any depth.
+fn strip_private_keys(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.remove("private_key");
+            object.remove("private_key_jwk");
+            object
+                .values_mut()
+                .for_each(strip_private_keys);
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .for_each(strip_private_keys),
+        _ => {}
     }
 }
 
@@ -1139,6 +1161,47 @@ mod tests {
         SessionTokenSource, build_allowed_websocket_origins, extract_session_token, normalize_origin,
         validate_websocket_origin, verify_websocket_terms,
     };
+
+    #[test]
+    fn an_identity_frame_never_carries_a_private_key_whoever_produced_it() {
+        let ws = super::WsState::new(4);
+        let mut updates = ws.subscribe();
+
+        ws.broadcast(super::WsUpdate::IdentityUpdated {
+            identity: serde_json::json!({
+                "did": "did:example:agent",
+                "private_key": { "kty": "OKP", "d": "secret" },
+                "nested": [{ "private_key_jwk": { "d": "secret" }, "kept": 1 }],
+                "identity_fields": { "d": "a caller field that happens to be named d" },
+            }),
+        });
+
+        let super::WsUpdate::IdentityUpdated { identity } = updates.try_recv().unwrap() else {
+            panic!("expected an identity update");
+        };
+        assert_eq!(
+            identity,
+            serde_json::json!({
+                "did": "did:example:agent",
+                "nested": [{ "kept": 1 }],
+                "identity_fields": { "d": "a caller field that happens to be named d" },
+            })
+        );
+    }
+
+    #[test]
+    fn frames_that_are_not_identities_are_passed_on_as_they_are() {
+        let ws = super::WsState::new(4);
+        let mut updates = ws.subscribe();
+        let metrics = serde_json::json!({ "private_key": "not an identity frame" });
+
+        ws.broadcast(super::WsUpdate::MetricsUpdated { metrics: metrics.clone() });
+
+        let super::WsUpdate::MetricsUpdated { metrics: received } = updates.try_recv().unwrap() else {
+            panic!("expected a metrics update");
+        };
+        assert_eq!(received, metrics);
+    }
     use axum::body::to_bytes;
     use axum::http::{
         HeaderMap, HeaderValue,

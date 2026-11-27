@@ -459,6 +459,7 @@ mod tests {
                         "same-grant",
                         100,
                         11,
+                        900,
                     )
                     .await
                     .unwrap();
@@ -608,14 +609,22 @@ mod tests {
                         "https://issuer.example",
                         "same-grant",
                         100,
-                        12
+                        12,
+                        900,
                     )
                     .await
                     .unwrap()
             );
             assert!(
                 replay
-                    .record_unique("https://other.example/oauth2/mcp", "https://issuer.example", "same-grant", 100, 12)
+                    .record_unique(
+                        "https://other.example/oauth2/mcp",
+                        "https://issuer.example",
+                        "same-grant",
+                        100,
+                        12,
+                        900
+                    )
                     .await
                     .unwrap()
             );
@@ -626,7 +635,8 @@ mod tests {
                         "https://other-issuer.example",
                         "same-grant",
                         100,
-                        12
+                        12,
+                        900,
                     )
                     .await
                     .unwrap()
@@ -638,7 +648,8 @@ mod tests {
                         "https://issuer.example",
                         "same-grant",
                         200,
-                        100
+                        100,
+                        900,
                     )
                     .await
                     .unwrap()
@@ -650,7 +661,8 @@ mod tests {
                         "https://issuer.example",
                         "bad-expiry",
                         100,
-                        100
+                        100,
+                        900,
                     )
                     .await
                     .is_err()
@@ -727,7 +739,14 @@ mod tests {
                 .unwrap();
         assert!(
             replay
-                .record_unique("https://gateway.example/oauth2/mcp", "https://issuer.example", "unavailable", 100, 12)
+                .record_unique(
+                    "https://gateway.example/oauth2/mcp",
+                    "https://issuer.example",
+                    "unavailable",
+                    100,
+                    12,
+                    900
+                )
                 .await
                 .is_err()
         );

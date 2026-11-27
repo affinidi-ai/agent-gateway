@@ -20,6 +20,7 @@ import {
   entraRejectsResource,
   entraResourceMessage,
   clientAuthenticationOf,
+  clientAuthenticationsOf,
   jwtFieldsOf,
   jwtKeyUnidentified,
   missingProviderField,
@@ -203,18 +204,55 @@ describe('credential provider form', () => {
     );
   });
 
-  it('sends an empty client authentication for every other provider type', () => {
+  it('sends HTTP Basic or the form body on a type that always sends its client secret', () => {
+    for (const provider_type of [
+      'oauth2_client_credentials',
+      'oauth2_authorization_code',
+    ] as const) {
+      for (const method of ['client_secret_basic', 'client_secret_post'] as const) {
+        expect(
+          providerCredentialFields(form({ provider_type, client_authentication: method }))
+        ).toMatchObject({
+          client_authentication: method,
+          client_id_secret_ref: 'CLIENT_ID',
+          client_secret_secret_ref: 'CLIENT_SECRET',
+        });
+      }
+      expect(
+        providerCredentialFields(form({ provider_type, client_authentication: 'none' }))
+          .client_authentication
+      ).toBe('');
+      expect(providerCredentialFields(form({ provider_type })).client_authentication).toBe('');
+    }
+  });
+
+  it('sends an empty client authentication for the types that take none', () => {
     expect(
-      providerCredentialFields(form({ client_authentication: 'client_secret_basic' }))
-    ).toMatchObject({
-      client_authentication: '',
-      client_id_secret_ref: 'CLIENT_ID',
-      client_secret_secret_ref: 'CLIENT_SECRET',
-    });
-    expect(providerCredentialFields(form({ provider_type: 'api_key' }))).toMatchObject({
-      client_authentication: '',
-    });
-    expect(providerCredentialFields(jwtAuth)).toMatchObject({ client_authentication: '' });
+      providerCredentialFields(
+        form({ provider_type: 'api_key', client_authentication: 'client_secret_basic' })
+      )
+    ).toMatchObject({ client_authentication: '' });
+    expect(
+      providerCredentialFields({ ...jwtAuth, client_authentication: 'client_secret_basic' })
+    ).toMatchObject({ client_authentication: '' });
+  });
+
+  it('lists the client authentications each type takes', () => {
+    expect(clientAuthenticationsOf('oauth2_jwt_bearer')).toEqual([
+      'none',
+      'client_secret_basic',
+      'client_secret_post',
+    ]);
+    expect(clientAuthenticationsOf('oauth2_client_credentials')).toEqual([
+      'client_secret_basic',
+      'client_secret_post',
+    ]);
+    expect(clientAuthenticationsOf('oauth2_authorization_code')).toEqual([
+      'client_secret_basic',
+      'client_secret_post',
+    ]);
+    expect(clientAuthenticationsOf('oauth2_client_credentials_jwt_auth')).toEqual([]);
+    expect(clientAuthenticationsOf('api_key')).toEqual([]);
   });
 
   it('clears the client secret and issuer of a Client Credentials JWT provider', () => {
@@ -278,11 +316,18 @@ describe('credential provider form', () => {
 
   it('drops a signing algorithm the selected type does not support', () => {
     expect(
-      providerCredentialFields({ ...jwtAuth, jwt_signing_algorithm: 'ES256' }).jwt_signing_algorithm
+      providerCredentialFields({ ...jwtBearer, jwt_signing_algorithm: 'PS256' })
+        .jwt_signing_algorithm
     ).toBeUndefined();
     expect(
       providerCredentialFields({ ...jwtAuth, jwt_signing_algorithm: 'RS256' }).jwt_signing_algorithm
     ).toBe('RS256');
+  });
+
+  it('keeps ES256 on a Client Credentials JWT provider', () => {
+    expect(
+      providerCredentialFields({ ...jwtAuth, jwt_signing_algorithm: 'ES256' }).jwt_signing_algorithm
+    ).toBe('ES256');
   });
 
   it('clears the JWT settings of a client-secret provider', () => {

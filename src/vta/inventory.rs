@@ -1,0 +1,693 @@
+//! Key inventory — what this appliance signs with, and what it still publishes.
+//!
+//! An operator cannot currently answer basic questions without reading logs and
+//! config: *which key signed this token? which surface uses which context? what
+//! happens if I rotate?* This module answers them in one place.
+//!
+//! Everything here is **derived**, never a second source of truth: connections
+//! come from the connection store, mappings from each surface's `signing`
+//! block, and contexts from the same derived-name function the provisioner
+//! uses. A separate inventory store would be one more thing to drift.
+
+use serde::Serialize;
+
+use crate::config::agent_surface::{AgentSurface, derived_context_name};
+use crate::config::vta::VtaConfig;
+use crate::vta::connections::VtaConnection;
+
+/// A key as the operator sees it.
+#[derive(Debug, Clone, Serialize)]
+pub struct KeyEntry {
+    /// Also the published `kid` — the thing that correlates a token to its key.
+    pub key_id: String,
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<String>,
+}
+
+/// A connection and everything it signs with.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectionInventory {
+    pub connection_id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub transport: String,
+    pub vta_did: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_context_id: Option<String>,
+    pub pairing_state: String,
+    /// Whether this connection may sign right now — the backend's own rule, so
+    /// the UI cannot disagree with what will actually happen.
+    pub usable: bool,
+    pub keys: Vec<KeyEntry>,
+}
+
+/// Which key a surface (or one of its variants) signs with.
+#[derive(Debug, Clone, Serialize)]
+pub struct SurfaceMapping {
+    pub surface_id: String,
+    pub surface_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant_alias: Option<String>,
+    /// `local`, `vta` or `hsm` — or `inherit` when nothing is mapped, which is
+    /// the default and is shown as such rather than silently resolved.
+    pub backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    /// Whether this level declares nothing and therefore inherits.
+    pub inherits: bool,
+    /// The name of the issuer whose `signing` this surface follows, when it sets none of its own
+    /// and the issuer that owns it does. The backend and key fields above are then the issuer's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via_issuer: Option<String>,
+    /// The context name this surface/variant would use if one were
+    /// provisioned, derived from its stable ids.
+    pub derived_context: String,
+}
+
+/// The whole picture.
+#[derive(Debug, Clone, Serialize)]
+pub struct KeyInventory {
+    pub tier: String,
+    /// False for local signing. Computed here so no
+    /// client can imply custody the deployment does not have.
+    pub custody_claim: bool,
+    /// The DID method of the contexts this gateway creates: `did_key` or
+    /// `did_webvh`.
+    pub context_did_method: String,
+    pub connections: Vec<ConnectionInventory>,
+    pub mappings: Vec<SurfaceMapping>,
+    /// Contexts named by no live surface or variant.
+    ///
+    /// Reported, never reclaimed: deleting a surface deliberately does not
+    /// delete its keys, because artifacts they signed must stay verifiable.
+    pub orphaned_contexts: Vec<String>,
+    /// Every private-key surface the gateway has and what was decided about
+    /// it.
+    pub key_surfaces: Vec<crate::vta::key_surfaces::KeySurface>,
+    /// The surfaces that should be in the trust agent and are not.
+    ///
+    /// The honest form of "the gateway holds no signing key": it is empty, or
+    /// it is this list.
+    pub residual_exceptions: Vec<&'static str>,
+    /// Whether the gateway holds no key that forges something others trust.
+    ///
+    /// Computed from the surfaces above, never configured, so it cannot be
+    /// asserted by a deployment that has not earned it.
+    pub holds_no_forging_key: bool,
+}
+
+fn key_entries(connection: &VtaConnection) -> Vec<KeyEntry> {
+    connection
+        .keys
+        .published()
+        .into_iter()
+        .map(|key| KeyEntry {
+            key_id: key.key_id.clone(),
+            status: if key.retired_at.is_some() {
+                "retiring"
+            } else {
+                "active"
+            },
+            public_key: key.public_key.clone(),
+            label: key.label.clone(),
+            retired_at: key
+                .retired_at
+                .map(|at| at.to_rfc3339()),
+        })
+        .collect()
+}
+
+fn mapping_for(
+    surface: &AgentSurface,
+    variant_id: Option<&str>,
+    variant_alias: Option<&str>,
+    signing: Option<&crate::config::agent_surface::SurfaceSigningConfig>,
+    issuer: Option<&crate::issuers::types::Issuer>,
+) -> SurfaceMapping {
+    let own = signing.filter(|s| !s.is_empty());
+    let followed = match own {
+        Some(_) => None,
+        None => issuer.filter(|issuer| {
+            issuer
+                .signing
+                .as_ref()
+                .is_some_and(|s| !s.is_empty())
+        }),
+    };
+    let declared = own.or(followed.and_then(|issuer| issuer.signing.as_ref()));
+    SurfaceMapping {
+        surface_id: surface.surface_id.clone(),
+        surface_name: surface.name.clone(),
+        variant_id: variant_id.map(str::to_string),
+        variant_alias: variant_alias.map(str::to_string),
+        backend: declared
+            .and_then(|s| s.backend)
+            .map(|b| {
+                match b {
+                    crate::config::agent_surface::SigningBackendKind::Local => "local",
+                    crate::config::agent_surface::SigningBackendKind::Vta => "vta",
+                }
+                .to_string()
+            })
+            .unwrap_or_else(|| "inherit".to_string()),
+        connection_id: declared.and_then(|s| s.connection_id.clone()),
+        context_id: declared.and_then(|s| s.context_id.clone()),
+        key_id: declared.and_then(|s| s.key_id.clone()),
+        inherits: own.is_none(),
+        via_issuer: followed.map(|issuer| issuer.name.clone()),
+        derived_context: derived_context_name(surface.tenant_id.as_deref(), &surface.surface_id, variant_id),
+    }
+}
+
+/// The operator-facing deployment tier for whether the appliance signs through a trust agent.
+pub fn tier(through_trust_agent: bool) -> &'static str {
+    if through_trust_agent {
+        "self-hosted"
+    } else {
+        "local"
+    }
+}
+
+/// Whether the appliance signs through a trust agent: the gateway-wide default
+/// when it names a usable backend, else the `[vta]` block, as the key directory
+/// resolves it.
+pub fn signs_through_trust_agent(
+    config: &VtaConfig,
+    default_signing: Option<&crate::config::agent_surface::SurfaceSigningConfig>,
+) -> bool {
+    match default_signing
+        .filter(|signing| !signing.is_empty())
+        .and_then(|signing| {
+            crate::vta::key_directory::signing_key_ref(signing, crate::config::vta::KeyPurpose::Jwt).ok()
+        }) {
+        Some(key_ref) => matches!(key_ref.backend, crate::vta::key_directory::KeyBackend::Vta { .. }),
+        None => config.enabled,
+    }
+}
+
+/// Whether a surface signs with the gateway's own key by choice: its own
+/// signing block, or else its issuer's, names the gateway secret.
+pub fn chooses_gateway_key(
+    surfaces: &[AgentSurface],
+    issuers: &[crate::issuers::types::Issuer],
+) -> bool {
+    let local = |signing: Option<&crate::config::agent_surface::SurfaceSigningConfig>| {
+        signing.is_some_and(|signing| signing.backend == Some(crate::config::agent_surface::SigningBackendKind::Local))
+    };
+    surfaces
+        .iter()
+        .any(|surface| {
+            match surface
+                .signing
+                .as_ref()
+                .filter(|signing| !signing.is_empty())
+            {
+                Some(own) => local(Some(own)),
+                None => local(
+                    surface
+                        .issuer_id
+                        .as_deref()
+                        .and_then(|id| {
+                            issuers
+                                .iter()
+                                .find(|issuer| issuer.id == id)
+                        })
+                        .and_then(|issuer| issuer.signing.as_ref()),
+                ),
+            }
+        })
+}
+
+/// Whether the gateway may claim that a separately operated trust agent holds
+/// its signing keys: it signs through one, no surface chooses the gateway's
+/// own key, and no token that key signed may still be outstanding
+/// (`local_key_in_use`, see [`crate::vta::key_directory::local_key_in_use`]).
+pub fn custody_claim(
+    through_trust_agent: bool,
+    surfaces: &[AgentSurface],
+    issuers: &[crate::issuers::types::Issuer],
+    local_key_in_use: bool,
+) -> bool {
+    through_trust_agent && !chooses_gateway_key(surfaces, issuers) && !local_key_in_use
+}
+
+/// Build the inventory from the live records. Its `custody_claim` reads the
+/// signing choices only; a caller that knows the gateway's own key is in use
+/// sets it from [`custody_claim`].
+///
+/// `default_signing` is the gateway-wide default from Settings. `known_contexts`
+/// are the context names the provisioner has created or adopted; anything in
+/// there that no surface claims is reported as orphaned.
+pub fn build(
+    config: &VtaConfig,
+    default_signing: Option<&crate::config::agent_surface::SurfaceSigningConfig>,
+    connections: &[VtaConnection],
+    surfaces: &[AgentSurface],
+    issuers: &[crate::issuers::types::Issuer],
+    known_contexts: &[String],
+) -> KeyInventory {
+    let mappings: Vec<SurfaceMapping> = surfaces
+        .iter()
+        .flat_map(|surface| {
+            let owner = surface
+                .issuer_id
+                .as_deref()
+                .and_then(|id| {
+                    issuers
+                        .iter()
+                        .find(|issuer| issuer.id == id)
+                });
+            let base = mapping_for(surface, None, None, surface.signing.as_ref(), owner);
+            let variants = surface
+                .variants
+                .iter()
+                .map(|variant| {
+                    mapping_for(
+                        surface,
+                        Some(&variant.id),
+                        Some(&variant.alias),
+                        variant
+                            .overrides
+                            .signing
+                            .as_ref(),
+                        if surface
+                            .signing
+                            .as_ref()
+                            .is_some_and(|signing| !signing.is_empty())
+                        {
+                            None
+                        } else {
+                            owner
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            std::iter::once(base).chain(variants)
+        })
+        .collect();
+
+    let live: std::collections::HashSet<&str> = mappings
+        .iter()
+        .map(|m| m.derived_context.as_str())
+        .collect();
+    let mut orphaned_contexts: Vec<String> = known_contexts
+        .iter()
+        .filter(|name| !live.contains(name.as_str()))
+        .cloned()
+        .collect();
+    orphaned_contexts.sort();
+
+    let through_trust_agent = signs_through_trust_agent(config, default_signing);
+    KeyInventory {
+        tier: tier(through_trust_agent).to_string(),
+        custody_claim: custody_claim(through_trust_agent, surfaces, issuers, false),
+        context_did_method: config
+            .context_did_method
+            .as_str()
+            .to_string(),
+        connections: connections
+            .iter()
+            .map(|connection| ConnectionInventory {
+                connection_id: connection.id.clone(),
+                name: connection.name.clone(),
+                enabled: connection.enabled,
+                transport: serde_json::to_value(connection.transport)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "https".to_string()),
+                vta_did: connection.vta_did.clone(),
+                default_context_id: connection
+                    .default_context_id
+                    .clone(),
+                pairing_state: connection
+                    .pairing
+                    .state
+                    .as_str()
+                    .to_string(),
+                usable: crate::vta::pairing::assert_usable(connection, &connection.pairing).is_ok(),
+                keys: key_entries(connection),
+            })
+            .collect(),
+        mappings,
+        orphaned_contexts,
+        key_surfaces: crate::vta::key_surfaces::surfaces(through_trust_agent),
+        residual_exceptions: crate::vta::key_surfaces::residual_exceptions(through_trust_agent),
+        holds_no_forging_key: crate::vta::key_surfaces::holds_no_forging_key(through_trust_agent),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::agent_surface::{SigningBackendKind, SurfaceSigningConfig};
+    use crate::vta::connections::{SigningKey, VtaConnectionStatus, VtaConnectionTransport};
+    use chrono::Utc;
+
+    fn connection(id: &str) -> VtaConnection {
+        let now = Utc::now();
+        VtaConnection {
+            id: id.to_string(),
+            tenant_id: None,
+            name: format!("VTA {id}"),
+            description: None,
+            enabled: true,
+            transport: VtaConnectionTransport::Https,
+            endpoint: format!("https://{id}.example"),
+            vta_did: format!("did:webvh:{id}.example"),
+            default_context_id: Some("ctx".to_string()),
+            control_key_ref: Some("secret".to_string()),
+            control_did: None,
+            control_key_state: Default::default(),
+            status: VtaConnectionStatus::Connected,
+            pairing: crate::vta::pairing::PairingRecord {
+                state: crate::vta::pairing::PairingState::Connected,
+                ..Default::default()
+            },
+            keys: Default::default(),
+            created_at: now,
+            updated_at: now,
+            retired_at: None,
+        }
+    }
+
+    fn surface(
+        id: &str,
+        signing: Option<SurfaceSigningConfig>,
+    ) -> AgentSurface {
+        AgentSurface {
+            surface_id: id.to_string(),
+            name: format!("surface-{id}"),
+            signing,
+            ..Default::default()
+        }
+    }
+
+    fn vta_config() -> VtaConfig {
+        VtaConfig {
+            enabled: true,
+            base_url: Some("https://vta.example".to_string()),
+            vta_did: Some("did:webvh:vta.example".to_string()),
+            context_id: Some("ctx".to_string()),
+            signing_key_id: Some("k1".to_string()),
+            ..VtaConfig::default()
+        }
+    }
+
+    #[test]
+    fn an_unmapped_surface_is_reported_as_inheriting_rather_than_resolved() {
+        let inventory = build(&vta_config(), None, &[], &[surface("s1", None)], &[], &[]);
+        let mapping = &inventory.mappings[0];
+        // Showing the resolved value would hide that nothing is configured,
+        // which is exactly what an operator is trying to find out.
+        assert!(mapping.inherits);
+        assert_eq!(mapping.backend, "inherit");
+        assert!(mapping.context_id.is_none());
+        assert_eq!(mapping.derived_context, "ctx:_global/s1");
+    }
+
+    #[test]
+    fn an_empty_signing_block_still_counts_as_inheriting() {
+        let inventory =
+            build(&vta_config(), None, &[], &[surface("s1", Some(SurfaceSigningConfig::default()))], &[], &[]);
+        assert!(inventory.mappings[0].inherits);
+    }
+
+    #[test]
+    fn a_mapped_surface_reports_its_backend_context_and_key() {
+        let signing = SurfaceSigningConfig {
+            backend: Some(SigningBackendKind::Vta),
+            connection_id: Some("c1".to_string()),
+            context_id: Some("ctx-sales".to_string()),
+            key_id: Some("k-sales".to_string()),
+        };
+        let inventory = build(&vta_config(), None, &[], &[surface("s1", Some(signing))], &[], &[]);
+        let mapping = &inventory.mappings[0];
+        assert!(!mapping.inherits);
+        assert_eq!(mapping.backend, "vta");
+        assert_eq!(
+            mapping
+                .connection_id
+                .as_deref(),
+            Some("c1")
+        );
+        assert_eq!(mapping.context_id.as_deref(), Some("ctx-sales"));
+        assert_eq!(mapping.key_id.as_deref(), Some("k-sales"));
+    }
+
+    #[test]
+    fn the_inventory_publishes_active_and_retiring_keys_with_their_kid() {
+        let now = Utc::now();
+        let mut connection = connection("c1");
+        connection
+            .keys
+            .rotate_to(
+                SigningKey {
+                    key_id: "k1".to_string(),
+                    public_key: Some("z6Mk1".to_string()),
+                    label: None,
+                    added_at: now,
+                    retired_at: None,
+                },
+                now,
+            )
+            .unwrap();
+        connection
+            .keys
+            .rotate_to(
+                SigningKey {
+                    key_id: "k2".to_string(),
+                    public_key: Some("z6Mk2".to_string()),
+                    label: None,
+                    added_at: now,
+                    retired_at: None,
+                },
+                now,
+            )
+            .unwrap();
+
+        let inventory = build(&vta_config(), None, &[connection], &[], &[], &[]);
+        let keys = &inventory.connections[0].keys;
+        assert_eq!(keys.len(), 2, "the retired key is still published");
+        assert_eq!(keys[0].key_id, "k2");
+        assert_eq!(keys[0].status, "active");
+        assert_eq!(keys[1].key_id, "k1");
+        assert_eq!(keys[1].status, "retiring");
+        assert!(keys[1].retired_at.is_some());
+    }
+
+    #[test]
+    fn a_context_no_surface_claims_is_reported_as_orphaned() {
+        let known = vec!["ctx:_global/s1".to_string(), "ctx:_global/deleted".to_string()];
+        let inventory = build(&vta_config(), None, &[], &[surface("s1", None)], &[], &known);
+        // Reported, not reclaimed: artifacts the orphan's key signed must stay
+        // verifiable.
+        assert_eq!(inventory.orphaned_contexts, vec!["ctx:_global/deleted".to_string()]);
+    }
+
+    #[test]
+    fn the_custody_claim_is_computed_here_and_follows_the_tier() {
+        let config = vta_config();
+        assert!(build(&config, None, &[], &[], &[], &[]).custody_claim, "a separately-operated VTA supports the claim");
+
+        let local = build(&VtaConfig::default(), None, &[], &[], &[], &[]);
+        assert_eq!(local.tier, "local");
+        assert!(!local.custody_claim);
+    }
+
+    /// The gateway-wide default from Settings decides where the appliance
+    /// signs, before the `[vta]` block, so the custody claim follows it.
+    #[test]
+    fn the_custody_claim_follows_the_gateway_wide_default() {
+        let dashboard_agent = SurfaceSigningConfig {
+            backend: Some(SigningBackendKind::Vta),
+            connection_id: Some("c1".to_string()),
+            context_id: Some("ctx".to_string()),
+            key_id: Some("k1".to_string()),
+        };
+        let through_dashboard = build(&VtaConfig::default(), Some(&dashboard_agent), &[], &[], &[], &[]);
+        assert_eq!(through_dashboard.tier, "self-hosted");
+        assert!(through_dashboard.custody_claim);
+        assert!(
+            through_dashboard
+                .key_surfaces
+                .iter()
+                .any(|surface| surface.id == "gateway_issuer" && surface.migrated == Some(true))
+        );
+
+        let gateway_secret = SurfaceSigningConfig {
+            backend: Some(SigningBackendKind::Local),
+            ..Default::default()
+        };
+        let local = build(&vta_config(), Some(&gateway_secret), &[], &[], &[], &[]);
+        assert_eq!(local.tier, "local");
+        assert!(!local.custody_claim);
+        assert!(!local.holds_no_forging_key);
+
+        let malformed = SurfaceSigningConfig {
+            backend: Some(SigningBackendKind::Vta),
+            connection_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            build(&vta_config(), Some(&malformed), &[], &[], &[], &[]).custody_claim,
+            "a default the directory ignores leaves the `[vta]` block in charge"
+        );
+    }
+
+    #[test]
+    fn the_inventory_reports_which_did_new_contexts_sign_as() {
+        assert_eq!(build(&VtaConfig::default(), None, &[], &[], &[], &[]).context_did_method, "did_key");
+        let webvh = VtaConfig {
+            context_did_method: crate::config::vta::ContextDidMethod::DidWebvh,
+            ..VtaConfig::default()
+        };
+        assert_eq!(build(&webvh, None, &[], &[], &[], &[]).context_did_method, "did_webvh");
+    }
+
+    #[test]
+    fn usability_mirrors_the_backend_rule_rather_than_guessing() {
+        let mut disabled = connection("c1");
+        disabled.enabled = false;
+        let unpaired = VtaConnection {
+            pairing: Default::default(),
+            ..connection("c2")
+        };
+        let inventory = build(&vta_config(), None, &[connection("c0"), disabled, unpaired], &[], &[], &[]);
+        assert!(inventory.connections[0].usable);
+        assert!(!inventory.connections[1].usable, "disabled cannot sign");
+        assert!(!inventory.connections[2].usable, "unpaired cannot sign");
+    }
+
+    fn issuer_with(signing: Option<SurfaceSigningConfig>) -> crate::issuers::types::Issuer {
+        let mut issuer = crate::issuers::types::Issuer::new(
+            "issuer-a".into(),
+            "Research".into(),
+            "did:example:issuer".into(),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        );
+        issuer.signing = signing;
+        issuer
+    }
+
+    fn remote(connection: &str) -> SurfaceSigningConfig {
+        SurfaceSigningConfig {
+            backend: Some(SigningBackendKind::Vta),
+            connection_id: Some(connection.to_string()),
+            context_id: Some("ctx-issuer".to_string()),
+            key_id: Some("key-issuer".to_string()),
+        }
+    }
+
+    fn owned_by_issuer(signing: Option<SurfaceSigningConfig>) -> AgentSurface {
+        let mut surface = surface("s1", signing);
+        surface.issuer_id = Some("issuer-a".to_string());
+        surface
+    }
+
+    #[test]
+    fn a_surface_that_sets_nothing_reports_the_signing_of_its_issuer_and_says_so() {
+        let inventory =
+            build(&vta_config(), None, &[], &[owned_by_issuer(None)], &[issuer_with(Some(remote("c1")))], &[]);
+
+        let mapping = &inventory.mappings[0];
+        assert_eq!(mapping.backend, "vta");
+        assert_eq!(
+            mapping
+                .connection_id
+                .as_deref(),
+            Some("c1")
+        );
+        assert_eq!(mapping.context_id.as_deref(), Some("ctx-issuer"));
+        assert_eq!(mapping.key_id.as_deref(), Some("key-issuer"));
+        assert_eq!(mapping.via_issuer.as_deref(), Some("Research"));
+        assert!(mapping.inherits, "the surface itself still declares nothing");
+    }
+
+    #[test]
+    fn a_surface_with_its_own_signing_ignores_its_issuer() {
+        let own = SurfaceSigningConfig {
+            backend: Some(SigningBackendKind::Local),
+            ..Default::default()
+        };
+        let inventory =
+            build(&vta_config(), None, &[], &[owned_by_issuer(Some(own))], &[issuer_with(Some(remote("c1")))], &[]);
+
+        let mapping = &inventory.mappings[0];
+        assert_eq!(mapping.backend, "local");
+        assert_eq!(mapping.via_issuer, None);
+        assert!(!mapping.inherits);
+    }
+
+    /// A surface or issuer that chooses the gateway secret still signs with the
+    /// gateway's own key, so no custody is claimed while one does.
+    #[test]
+    fn no_custody_is_claimed_while_a_surface_or_its_issuer_chooses_the_gateway_secret() {
+        let gateway_secret = || SurfaceSigningConfig {
+            backend: Some(SigningBackendKind::Local),
+            ..Default::default()
+        };
+
+        let own = build(&vta_config(), None, &[], &[surface("s1", Some(gateway_secret()))], &[], &[]);
+        let via_issuer =
+            build(&vta_config(), None, &[], &[owned_by_issuer(None)], &[issuer_with(Some(gateway_secret()))], &[]);
+        let through_the_agent =
+            build(&vta_config(), None, &[], &[owned_by_issuer(None)], &[issuer_with(Some(remote("c1")))], &[]);
+
+        assert!(!own.custody_claim);
+        assert!(!via_issuer.custody_claim);
+        assert!(through_the_agent.custody_claim);
+        assert!(
+            !custody_claim(true, &[], &[], true),
+            "nor while a token the gateway's own key signed may be outstanding"
+        );
+    }
+
+    /// A variant signs with its surface's choice, so when the surface follows
+    /// its issuer the variant's row names that issuer too.
+    #[test]
+    fn a_variant_of_a_surface_that_follows_its_issuer_names_that_issuer() {
+        let mut owned = owned_by_issuer(None);
+        owned
+            .variants
+            .push(crate::config::agent_surface_variants::SurfaceVariant {
+                id: "v1".to_string(),
+                alias: "beta".to_string(),
+                name: "Beta".to_string(),
+                description: String::new(),
+                enabled: true,
+                overrides: Default::default(),
+            });
+
+        let inventory = build(&vta_config(), None, &[], &[owned], &[issuer_with(Some(remote("c1")))], &[]);
+
+        let variant = inventory
+            .mappings
+            .iter()
+            .find(|mapping| mapping.variant_id.as_deref() == Some("v1"))
+            .expect("the variant's row");
+        assert_eq!(variant.via_issuer.as_deref(), Some("Research"));
+        assert_eq!(variant.context_id.as_deref(), Some("ctx-issuer"));
+    }
+
+    #[test]
+    fn an_issuer_without_signing_leaves_its_surface_inheriting_the_appliance_default() {
+        let inventory = build(&vta_config(), None, &[], &[owned_by_issuer(None)], &[issuer_with(None)], &[]);
+
+        let mapping = &inventory.mappings[0];
+        assert_eq!(mapping.backend, "inherit");
+        assert_eq!(mapping.via_issuer, None);
+        assert!(mapping.inherits);
+    }
+}

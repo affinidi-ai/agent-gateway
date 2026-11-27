@@ -118,6 +118,10 @@ use crate::observability::loggable;
 use crate::proxy::backend_identity::ProtectedAgentIdentity;
 use crate::state::OutboundProxyState;
 
+mod caller_bound_identity;
+
+use caller_bound_identity::{identity_carrier, outbound_extension_identity, resolve_caller_bound_agent_identity};
+
 // ── Domain error type ───────────────────────────────────────────────────────
 
 /// Sub-error for identity resolution failures, distinguishing client vs server causes.
@@ -202,6 +206,11 @@ pub(crate) enum OutboundPipelineError {
 
     #[error("{}", crate::a2a::EXTENDED_AGENT_CARD_BATCH_REFUSAL)]
     ExtendedAgentCardBatch,
+
+    /// A caller-bound Transit Point read a body that is not exactly one JSON
+    /// object, so the identities it asserts cannot all be removed.
+    #[error("Invalid Request: the body must be one JSON-RPC request object")]
+    AssertedIdentityUnremovable,
 
     #[error("{}", crate::a2a::url_rewriter::EXTENDED_AGENT_CARD_REFUSAL)]
     UnrewritableExtendedAgentCardResponse { rpc_request_id: Option<serde_json::Value> },
@@ -393,9 +402,10 @@ impl OutboundPipelineError {
                 StatusCode::NOT_FOUND
             }
 
-            Self::BodyReadFailed(_) | Self::HeaderMetadataMappingFailed(_) | Self::ExtendedAgentCardBatch => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::BodyReadFailed(_)
+            | Self::HeaderMetadataMappingFailed(_)
+            | Self::ExtendedAgentCardBatch
+            | Self::AssertedIdentityUnremovable => StatusCode::BAD_REQUEST,
 
             Self::BodyTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
 
@@ -463,7 +473,7 @@ impl IntoResponse for OutboundPipelineError {
         if let Self::UnrewritableExtendedAgentCardResponse { rpc_request_id } = self {
             return crate::a2a::url_rewriter::extended_agent_card_refusal(rpc_request_id.as_ref());
         }
-        if let Self::ExtendedAgentCardBatch = self {
+        if let Self::ExtendedAgentCardBatch | Self::AssertedIdentityUnremovable = self {
             return crate::a2a::create_jsonrpc_error_response(StatusCode::BAD_REQUEST, -32600, &self.to_string());
         }
         if let Self::UpstreamCapacityReached(id) = self {
@@ -638,6 +648,12 @@ pub struct OutboundPipelineContext {
     pub request_path: String,
     /// Protected agent identity resolved by `step_resolve_agent_identity`.
     pub resolved_identity: ProtectedAgentIdentity,
+    /// The hash `resolved_identity`'s DID was issued from; `None` for a DID
+    /// bound without one.
+    pub resolved_identity_hash: Option<String>,
+    /// How `resolved_identity`'s DID was established, reported as
+    /// `input.extension_identity.verification`.
+    pub resolved_identity_verification: crate::surface_context::IdentityVerification,
     /// Detected protocol (A2A, MCP, HTTP).
     pub protocol: Option<ChannelProtocol>,
     pub mcp_metadata_context: crate::mcp::meta::McpMetadataContext,
@@ -929,6 +945,8 @@ impl OutboundPipelineContext {
             proxy_backend_status: None,
             request_path,
             resolved_identity: ProtectedAgentIdentity::Anonymous,
+            resolved_identity_hash: None,
+            resolved_identity_verification: crate::surface_context::IdentityVerification::Unverified,
             protocol: None,
             mcp_metadata_context: crate::mcp::meta::McpMetadataContext::legacy(surface.mcp_legacy_metadata_output),
             mcp_classification: None,
@@ -1889,6 +1907,13 @@ fn mcp_id_before_body(ctx: &OutboundPipelineContext) -> Option<serde_json::Value
 /// - Extraction failure (extension not found) → `Err(IdentityResolutionFailed(ExtensionMissing))` → 422
 /// - Validation failure → `Err(IdentityResolutionFailed(ExtensionMissing))` → 422
 /// - Credential issuance failure → `Err(IdentityResolutionFailed(ServiceUnavailable))` → 502
+///
+/// A Transit Point whose own `managed_identity` takes the DID from its caller's
+/// credential resolves through [`resolve_caller_bound_agent_identity`]: a
+/// caller its `source_auth` refused got `401` before this step; then `422` for
+/// a JWT without the claim, `500` when misconfigured, with no identity carrier or
+/// a JWT caller with no VC issuer, `502` when a JWT caller's issuance fails and
+/// `503` when a store is unavailable.
 async fn step_resolve_agent_identity(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
@@ -1964,13 +1989,17 @@ async fn step_resolve_agent_identity(
         return Ok(());
     }
 
-    // `FromJwtClaim` is request-bound to the *inbound* caller's validated JWT,
-    // so it has no meaning on the outbound (protected → external) path. Skip it
-    // here; the inbound path (proxy/backend_identity.rs) owns this mode.
+    if per_tp_identity_configured && let Some(credential) = managed_identity.caller_credential() {
+        let identity = managed_identity.clone();
+        return resolve_caller_bound_agent_identity(state, ctx, &identity, credential).await;
+    }
+
+    // A `FromJwtClaim` the Transit Point inherits from the surface reads the
+    // Access Point caller's JWT, which this path does not have, so it is skipped.
     if matches!(managed_identity, crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. }) {
         debug!(
             request_id = %ctx.request_id,
-            "Outbound: from_jwt_claim managed identity is inbound-only — skipping"
+            "Outbound: inherited from_jwt_claim managed identity is inbound-only — skipping"
         );
         return Ok(());
     }
@@ -2057,8 +2086,14 @@ async fn step_resolve_agent_identity(
                             .elapsed()
                             .as_secs_f64(),
                     );
+                    warn!(
+                        request_id = %ctx.request_id,
+                        mode = mode_label,
+                        error = %e,
+                        "Failed to issue the DID of the outbound credential-based identity"
+                    );
                     OutboundPipelineError::IdentityResolutionFailed(IdentityResolutionFailure::ServiceUnavailable(
-                        format!("DID creation/lookup failed for credential identity: {}", e),
+                        crate::proxy::handler::CALLER_IDENTITY_UNRESOLVED.to_string(),
                     ))
                 })?;
             if response.is_new {
@@ -2094,6 +2129,7 @@ async fn step_resolve_agent_identity(
                 did: response.did,
                 identity_fields,
             };
+            ctx.resolved_identity_hash = Some(identity_hash);
             return Ok(());
         }
         Ok(None) => {
@@ -2110,7 +2146,13 @@ async fn step_resolve_agent_identity(
                     .elapsed()
                     .as_secs_f64(),
             );
-            let msg = format!("Credential-based identity resolution failed: {}", e);
+            warn!(
+                request_id = %ctx.request_id,
+                mode = mode_label,
+                error = %e,
+                "Failed to derive the outbound credential-based identity"
+            );
+            let msg = crate::proxy::handler::CALLER_IDENTITY_UNRESOLVED.to_string();
             let failure = match e.classify() {
                 CredentialIdentityErrorClass::Misconfigured => IdentityResolutionFailure::Misconfigured(msg),
                 CredentialIdentityErrorClass::BackendUnavailable => IdentityResolutionFailure::BackendUnavailable(msg),
@@ -2301,6 +2343,7 @@ async fn step_resolve_agent_identity(
             did: response.did,
             identity_fields,
         };
+        ctx.resolved_identity_hash = Some(hash);
 
         return Ok(());
     }
@@ -2360,6 +2403,7 @@ async fn step_resolve_agent_identity(
         did: response.did,
         identity_fields,
     };
+    ctx.resolved_identity_hash = Some(hash);
 
     Ok(())
 }
@@ -2664,7 +2708,7 @@ async fn step_extract_protocol_context_with_versions(
         Some(crate::mcp::request_validation::McpRequestClassification::Modern(message)) => {
             (ChannelProtocol::Mcp, Some(message.method.clone()))
         }
-        _ => detect_protocol_and_operation(body, &ctx.surface.channel_protocol()),
+        _ => detect_protocol_and_operation(body, &transit_message_protocol(ctx)),
     };
     ctx.protocol = Some(protocol);
     ctx.operation = operation;
@@ -2717,6 +2761,18 @@ async fn step_extract_protocol_context_with_versions(
         "Outbound: protocol context extracted"
     );
     Ok(None)
+}
+
+/// The protocol the Transit Point's messages are written in. An `http`
+/// Transit Point has no message format of its own and takes the surface's.
+fn transit_message_protocol(ctx: &OutboundPipelineContext) -> ChannelProtocol {
+    use crate::config::agent_surface::TransitProtocol;
+    match ctx.virtual_channel.protocol {
+        TransitProtocol::A2a => ChannelProtocol::A2a,
+        TransitProtocol::Ap2 => ChannelProtocol::Ap2,
+        TransitProtocol::Mcp => ChannelProtocol::Mcp,
+        TransitProtocol::Http => ctx.surface.channel_protocol(),
+    }
 }
 
 /// Map a transit point's configured protocol to the wire "family" the gateway
@@ -3830,7 +3886,13 @@ async fn step_trust_check(
         return Ok(());
     }
 
-    let probe_input = serde_json::to_value(build_outbound_policy_input(ctx)).unwrap_or_default();
+    // The Trust Check subject is the destination, so a template falling back
+    // to `input.extension_identity.did` must not resolve to the managed agent.
+    let probe_input = serde_json::to_value(crate::surface_context::PolicyInput {
+        extension_identity: None,
+        ..build_outbound_policy_input(ctx)
+    })
+    .unwrap_or_default();
 
     let Some(manager) = state
         .trust_registry_listener_manager
@@ -4799,6 +4861,7 @@ fn step_transit_point_response_policy(
         ctx.authenticated_identity
             .as_ref()
             .map(crate::surface_context::SourceAuthContext::from),
+        outbound_extension_identity(ctx),
     );
 
     let decision = evaluate_response_policy(pm.as_ref(), &policy_key, input);
@@ -4911,14 +4974,17 @@ fn build_outbound_policy_input(ctx: &OutboundPipelineContext) -> crate::surface_
         .mcp_classification
         .as_ref()
         .and_then(crate::mcp::modern_mcp_context);
+    let message_protocol = ctx
+        .protocol
+        .clone()
+        .unwrap_or_else(|| ctx.surface.channel_protocol());
     // Parse the A2A/AP2 message payload so transit-point (outbound) policies can
     // inspect the agent content (`input.a2a`), mirroring the inbound surface OPA
     // seam in `proxy::handler`. Without this `input.a2a` was absent on the
     // MA→TP (outbound) leg, so a policy reading e.g. `input.a2a.method` always
     // saw an empty object — even though the identical policy worked on the
     // AP→MA (inbound) leg.
-    let a2a = if modern_mcp_context.is_none()
-        && matches!(ctx.surface.channel_protocol(), ChannelProtocol::A2a | ChannelProtocol::Ap2)
+    let a2a = if modern_mcp_context.is_none() && matches!(message_protocol, ChannelProtocol::A2a | ChannelProtocol::Ap2)
     {
         ctx.body_bytes
             .as_ref()
@@ -4943,7 +5009,7 @@ fn build_outbound_policy_input(ctx: &OutboundPipelineContext) -> crate::surface_
     // (method + tool_name + params) so outbound policies can gate on the MCP
     // payload, matching the inbound MCP seam. Parallel to the A2A gap above.
     let mcp = modern_mcp_context.or_else(|| {
-        if ctx.surface.channel_protocol() == ChannelProtocol::Mcp {
+        if message_protocol == ChannelProtocol::Mcp {
             ctx.body_bytes
                 .as_ref()
                 .and_then(|body| crate::mcp::build_mcp_context(body))
@@ -4992,6 +5058,7 @@ fn build_outbound_policy_input(ctx: &OutboundPipelineContext) -> crate::surface_
             .trust_check_results
             .clone(),
         transit: Some(outbound_transit_context(ctx)),
+        extension_identity: outbound_extension_identity(ctx),
         ..Default::default()
     }
 }
@@ -5056,26 +5123,13 @@ async fn step_inject_trusted_identity(
     };
 
     // Plain-HTTP targets (no extension carrier) → error if we have an identity to inject.
-    let surface_protocol = ctx.surface.channel_protocol();
-    let protocol = ctx
-        .protocol
-        .as_ref()
-        .unwrap_or(&surface_protocol);
-    match protocol {
-        ChannelProtocol::A2a | ChannelProtocol::Ap2 | ChannelProtocol::Mcp => {}
-        _ => {
-            error!(
-                request_id = %ctx.request_id,
-                protocol = ?protocol,
-                "Identity injection not implemented for protocol {:?}",
-                protocol
-            );
-            return Err(OutboundPipelineError::IdentityInjectionFailed(format!(
-                "Identity injection not supported for protocol {:?}",
-                protocol
-            )));
-        }
-    }
+    let protocol = identity_carrier(ctx).inspect_err(|error| {
+        error!(
+            request_id = %ctx.request_id,
+            error = %error,
+            "Identity injection not implemented for this protocol"
+        );
+    })?;
 
     let Some(ref vc_issuer) = state.vc_issuer else {
         error!(
@@ -5143,13 +5197,31 @@ async fn step_inject_trusted_identity(
         wb
     };
 
-    let surface_protocol = ctx.surface.channel_protocol();
-    let protocol = ctx
-        .protocol
-        .as_ref()
-        .unwrap_or(&surface_protocol);
-
+    let key_scope = crate::vta::key_directory::KeyScope::serving(
+        &ctx.surface,
+        ctx.active_variant_id
+            .as_deref(),
+    );
+    let parsed_a2a = matches!(protocol, ChannelProtocol::A2a | ChannelProtocol::Ap2)
+        .then(|| serde_json::from_slice::<serde_json::Value>(body).ok())
+        .flatten();
     let injected_vp_jwt: Option<String> = match protocol {
+        ChannelProtocol::A2a | ChannelProtocol::Ap2
+            if parsed_a2a
+                .as_ref()
+                .is_some_and(|json| !json.is_object()) =>
+        {
+            warn!(request_id = %ctx.request_id, "A2A request body is not one JSON object; refused");
+            return Err(OutboundPipelineError::AssertedIdentityUnremovable);
+        }
+        ChannelProtocol::A2a | ChannelProtocol::Ap2
+            if parsed_a2a
+                .as_ref()
+                .is_some_and(|json| !crate::a2a::extensions::has_message(json)) =>
+        {
+            debug!(request_id = %ctx.request_id, "A2A request carries no message; no identity credential injected");
+            None
+        }
         ChannelProtocol::A2a | ChannelProtocol::Ap2 => {
             let (signed, vp_jwt) = crate::a2a::extensions::inject_identity_credential_extension(
                 body,
@@ -5158,6 +5230,7 @@ async fn step_inject_trusted_identity(
                 workload_binding,
                 vc_issuer,
                 channel_name,
+                &key_scope,
             )
             .await
             .map_err(|e| {
@@ -5195,6 +5268,7 @@ async fn step_inject_trusted_identity(
                 &protected_meta_field,
                 protected_strip_raw,
                 ctx.mcp_metadata_context,
+                &key_scope,
             )
             .await
             .map_err(|e| {
@@ -8557,7 +8631,7 @@ mod tests {
         .expect("outbound_handler test_surface: AgentSurface JSON")
     }
 
-    fn test_pipeline_context() -> OutboundPipelineContext {
+    pub(super) fn test_pipeline_context() -> OutboundPipelineContext {
         let surface = Arc::new(test_surface());
         OutboundPipelineContext {
             request: None,
@@ -8575,6 +8649,8 @@ mod tests {
             proxy_backend_status: None,
             request_path: "/outbound/surfaces/order/partner-a/message/send".to_string(),
             resolved_identity: ProtectedAgentIdentity::Anonymous,
+            resolved_identity_hash: None,
+            resolved_identity_verification: crate::surface_context::IdentityVerification::Unverified,
             protocol: None,
             mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
             mcp_classification: None,
@@ -8605,7 +8681,7 @@ mod tests {
         }
     }
 
-    fn test_outbound_state() -> OutboundProxyState {
+    pub(super) fn test_outbound_state() -> OutboundProxyState {
         let network_config: crate::config::NetworkConfig = serde_json::from_value(json!({
             "did": { "domain": "test.example.com" },
             "webauthn": { "rp_id": "test", "external_origin": "https://test.example.com" },
@@ -13725,11 +13801,16 @@ mod tests {
             ProtectedAgentIdentity::Managed { did, identity_fields } => {
                 assert!(did.starts_with("did:"), "DID should start with 'did:', got: {did}");
                 assert!(!identity_fields.is_empty(), "identity_fields should not be empty");
+                assert_eq!(extension_identity_json(&ctx)["did"], json!(did));
             }
             ProtectedAgentIdentity::Anonymous => {
                 panic!("expected Managed identity, got Anonymous");
             }
         }
+        let identity = extension_identity_json(&ctx);
+        assert_eq!(identity["verification"], "unverified", "a payload identity proves nothing");
+        assert_eq!(identity["verified"], false);
+        assert!(identity["identity_hash"].is_string());
     }
 
     #[tokio::test]
@@ -14416,14 +14497,14 @@ mod tests {
     /// A TRQP client whose listed trust registries recognise every agent and
     /// whose others answer `recognized: false`. Records the entity each query
     /// asks about.
-    struct RecognisedIn(&'static [&'static str], std::sync::Mutex<Vec<String>>);
+    pub(super) struct RecognisedIn(&'static [&'static str], std::sync::Mutex<Vec<String>>);
 
     impl RecognisedIn {
-        fn new(registries: &'static [&'static str]) -> Self {
+        pub(super) fn new(registries: &'static [&'static str]) -> Self {
             Self(registries, std::sync::Mutex::new(Vec::new()))
         }
 
-        fn asked_about(&self) -> Vec<String> {
+        pub(super) fn asked_about(&self) -> Vec<String> {
             self.1.lock().unwrap().clone()
         }
     }
@@ -14456,7 +14537,7 @@ mod tests {
 
     /// A managed-agent element on trust registry `registry` with a blank
     /// entity, so it asks about the agent calling out.
-    fn managed_agent_element(
+    pub(super) fn managed_agent_element(
         id: &str,
         registry: &str,
     ) -> crate::trust_registry_verification::TrustCheckElement {
@@ -14496,7 +14577,7 @@ mod tests {
             .collect()
     }
 
-    fn managed_agent_results(ctx: &OutboundPipelineContext) -> Vec<(String, bool, Option<String>)> {
+    pub(super) fn managed_agent_results(ctx: &OutboundPipelineContext) -> Vec<(String, bool, Option<String>)> {
         ctx.trust_check_results
             .as_ref()
             .map(|results| {
@@ -15206,6 +15287,10 @@ mod tests {
                 .as_deref(),
             Some("test-channel")
         );
+    }
+
+    pub(super) fn extension_identity_json(ctx: &OutboundPipelineContext) -> serde_json::Value {
+        serde_json::to_value(build_outbound_policy_input(ctx)).unwrap()["extension_identity"].clone()
     }
 
     fn caller_claims(
@@ -17101,7 +17186,7 @@ mod tests {
         (format!("http://{}", addr), TrustCheckTestServer(handle))
     }
 
-    fn attach_transit_point_trust_check_list(
+    pub(super) fn attach_transit_point_trust_check_list(
         ctx: &mut OutboundPipelineContext,
         elements: Vec<crate::trust_registry_verification::TrustCheckElement>,
     ) {
@@ -17588,7 +17673,9 @@ mod tests {
     /// `input.agent.provider_did` — the per-element predicate
     /// [`element_needs_missing_tr_metadata`] only fires when the
     /// template names a missing TR-metadata field.
-    fn make_test_element_referencing_provider_did(id: &str) -> crate::trust_registry_verification::TrustCheckElement {
+    pub(super) fn make_test_element_referencing_provider_did(
+        id: &str
+    ) -> crate::trust_registry_verification::TrustCheckElement {
         use crate::trust_registry_verification::trust_check_element::{
             TrqpQueryParams, TrqpQueryType, TrustCheckElement,
         };

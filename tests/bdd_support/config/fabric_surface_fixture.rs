@@ -40,6 +40,8 @@ pub struct SurfaceSpec {
     /// Managed identity fixed to this DID, in the surface's protected
     /// identity slot.
     pub fixed_managed_identity: Option<String>,
+    /// The inbound identity is derived from the API key the caller presents.
+    pub inbound_identity_from_api_key: bool,
     pub mcp_tool_policy: Option<McpToolPolicySpec>,
     pub mcp_proxy: Option<McpProxySpec>,
     /// The target is a real upstream serving one path, not a harness mock.
@@ -63,6 +65,8 @@ pub struct TransitPointSpec {
     pub target_endpoint: String,
     pub header_metadata_mapping: TransitPointHeaderMetadataMappingSpec,
     pub managed_identity_fields: Option<Vec<String>>,
+    /// The Transit Point takes the managed agent's DID from the API key its caller presented.
+    pub identity_from_caller_api_key: bool,
     /// The Transit Point requires the transit token its gateway gave the managed
     /// agent; otherwise it is open to any caller unless it has `source_auth`.
     pub require_transit_token: bool,
@@ -82,6 +86,7 @@ impl TransitPointSpec {
             target_endpoint: target_endpoint.into(),
             header_metadata_mapping: Default::default(),
             managed_identity_fields: None,
+            identity_from_caller_api_key: false,
             require_transit_token: false,
             source_auth: None,
         }
@@ -130,6 +135,7 @@ impl SurfaceSpec {
             transit_policy_rego: None,
             managed_identity: false,
             fixed_managed_identity: None,
+            inbound_identity_from_api_key: false,
             mcp_tool_policy: None,
             mcp_proxy: None,
             external_target: false,

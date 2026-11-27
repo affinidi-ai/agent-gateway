@@ -3,7 +3,7 @@
 use axum::{Extension, Json, extract::Path, http::StatusCode};
 use serde::Deserialize;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::auth_manager::pat::PatResourceScope;
 use crate::gateways::connection_points::{ConnectionPointListenerManager, ConnectionPointStore};
@@ -197,8 +197,10 @@ pub async fn approve_gateway<
 
         info!("  Using mediator from OOB connection point: {}", gw_mediator_did);
 
-        // Create gateway connection point (for receiving from acceptor)
-        let gateway_cp_id = uuid::Uuid::new_v4().to_string();
+        // The gateway connection point (for receiving from acceptor) is the one the
+        // connection point reserved, else a new one
+        let (gateway_cp_id, reserved_did) = permanent_connection_point(&connection_point);
+        let announced_at_pause = reserved_did.is_some();
         if !scope_allows_resource(resource_scope, tenant_context, ResourceKind::ConnectionPoints, &gateway_cp_id) {
             return Err((
                 StatusCode::FORBIDDEN,
@@ -206,29 +208,37 @@ pub async fn approve_gateway<
             ));
         }
 
-        let (gateway_cp_did, _gateway_cp_secrets, _gateway_cp_doc) =
-            crate::gateways::connection_points::handlers::generate_connection_point_identity(
-                &gateway_cp_id,
-                &network_config.did.domain,
-                std::path::Path::new(
-                    &bootstrap_config
-                        .storage_paths
-                        .connection_points,
-                ),
-                &gw_mediator_url,
-                &connection_point.did_method,
-                #[cfg(feature = "didwebvh")]
-                log_storage.clone(),
-                #[cfg(feature = "didwebvh")]
-                identity_store.clone(),
-            )
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to generate gateway connection point identity: {}", e),
+        let gateway_cp_did = match reserved_did {
+            Some(did) => {
+                info!("  Using the permanent DID reserved with the connection point: {}", did);
+                did
+            }
+            None => {
+                crate::gateways::connection_points::handlers::generate_connection_point_identity(
+                    &gateway_cp_id,
+                    &network_config.did.domain,
+                    std::path::Path::new(
+                        &bootstrap_config
+                            .storage_paths
+                            .connection_points,
+                    ),
+                    &gw_mediator_url,
+                    &connection_point.did_method,
+                    #[cfg(feature = "didwebvh")]
+                    log_storage.clone(),
+                    #[cfg(feature = "didwebvh")]
+                    identity_store.clone(),
                 )
-            })?;
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to generate gateway connection point identity: {}", e),
+                    )
+                })?
+                .0
+            }
+        };
 
         // Store acceptor's secure DID in oob_message for ACL setup when listener starts
         let acceptor_secure_did = pending_conn
@@ -259,27 +269,58 @@ pub async fn approve_gateway<
             .clone();
         gateway_connection_point.mediator_did = Some(gw_mediator_did.clone());
 
-        let announcement = crate::event_hook::CreationGuard::start(
-            listener_manager
-                .as_ref()
-                .and_then(|manager| manager.event_hook().cloned()),
-            crate::event_hook::ConnectionPointPayload::from_record(&gateway_connection_point, None),
-        );
+        let hook = listener_manager
+            .as_ref()
+            .and_then(|manager| manager.event_hook().cloned());
+        let minted = crate::event_hook::ConnectionPointPayload::from_record(&gateway_connection_point, None);
+        // A retry after a failed approval finds the reserved record already stored, and its
+        // `created` already sent; it is stored again without announcing anything.
+        let already_stored = announced_at_pause
+            && cp_store
+                .get(&gateway_cp_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
         let record = gateway_connection_point.clone();
         let point_store = cp_store.clone();
-        announcement
-            .complete(
-                async move {
-                    point_store
-                        .create(&record)
-                        .await
-                },
-                crate::event_hook::ConnectionPointPayload::from_record(&gateway_connection_point, None),
-            )
-            .await
-            .map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create gateway connection point: {}", e))
-            })?;
+        let reserving_id = connection_point.id.clone();
+        let store_permanent = async move {
+            if announced_at_pause {
+                // Fails if the reserving connection point was deleted meanwhile, with the
+                // keys of its reservation.
+                point_store
+                    .create_reserved(&record, &reserving_id)
+                    .await?;
+                crate::gateways::mediator_access::mark_reservation_consumed(point_store.as_ref(), &reserving_id).await;
+            } else {
+                point_store
+                    .create(&record)
+                    .await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let stored = if already_stored {
+            store_permanent.await
+        } else if announced_at_pause {
+            // A reserved DID was announced when the connection point paused.
+            crate::event_hook::CreationGuard::resume(hook, minted)
+                .complete(
+                    store_permanent,
+                    crate::event_hook::ConnectionPointPayload::from_record(&gateway_connection_point, None),
+                )
+                .await
+        } else {
+            crate::event_hook::CreationGuard::start(hook, minted)
+                .complete(
+                    store_permanent,
+                    crate::event_hook::ConnectionPointPayload::from_record(&gateway_connection_point, None),
+                )
+                .await
+        };
+        stored.map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create gateway connection point: {}", e))
+        })?;
 
         info!("  ✓ Gateway connection point {} created", gateway_cp_id);
 
@@ -303,8 +344,16 @@ pub async fn approve_gateway<
                 // Wait for the listener to actually start (event-driven, no polling)
                 info!("  ⏳ Waiting for listener to start...");
                 match completion_rx.await {
-                    Ok(Ok(())) => {
-                        info!("  ✓ Listener started successfully");
+                    Ok(Ok(crate::gateways::connection_points::ListenerStart::Connected)) => {
+                        info!("✓ Gateway connection point listener started and authenticated with mediator");
+                    }
+                    Ok(Ok(crate::gateways::connection_points::ListenerStart::Pending)) => {
+                        warn!(
+                            "Gateway connection point listener is still connecting to its mediator; the peer's messages wait at the mediator until it connects"
+                        );
+                    }
+                    Ok(Ok(crate::gateways::connection_points::ListenerStart::Paused)) => {
+                        info!("Gateway connection point listener not started: the connection point waits for mediator access");
                     }
                     Ok(Err(e)) => {
                         // Listener failed to start - this is a critical error
@@ -328,8 +377,6 @@ pub async fn approve_gateway<
                 ));
             }
         }
-
-        info!("✓ Gateway connection point listener started and authenticated with mediator");
 
         // Step 5: NOW send connection-accepted with the gateway CP DID (not the OOB secure DID!)
         // The thread id doubles as the attestation nonce so the acceptor can bind
@@ -377,6 +424,18 @@ pub async fn approve_gateway<
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     Ok(Json(gateway))
+}
+
+/// The id of the inviter's permanent connection point and, when the connection
+/// point reserved it at creation, its DID. Without a reservation the id is new
+/// and the DID still has to be minted.
+fn permanent_connection_point(
+    connection_point: &crate::gateways::connection_points::types::GatewayConnectionPoint
+) -> (String, Option<String>) {
+    match &connection_point.reserved_permanent {
+        Some(reserved) => (reserved.cp_id.clone(), Some(reserved.did.clone())),
+        None => (uuid::Uuid::new_v4().to_string(), None),
+    }
 }
 
 /// Saves the approved gateway, then runs the rest of the approval. When that
@@ -581,5 +640,49 @@ mod tests {
         .await;
         let (status, body) = result.expect_err("a tenant must not approve an appliance-wide gateway");
         assert_eq!(status, StatusCode::FORBIDDEN, "passed the tenant guard and reached: {body}");
+    }
+
+    fn invitation(
+        reserved: Option<crate::gateways::connection_points::types::ReservedPermanent>
+    ) -> crate::gateways::connection_points::types::GatewayConnectionPoint {
+        let mut point = crate::gateways::connection_points::types::GatewayConnectionPoint::new(
+            "gw-self".into(),
+            "med".into(),
+            "did:peer:2.invitation".into(),
+            "Partner".into(),
+            String::new(),
+            String::new(),
+            String::new(),
+            serde_json::json!({}),
+            None,
+            crate::gateways::connection_points::types::ConnectionPointType::User,
+            "s3cret".into(),
+        );
+        point.reserved_permanent = reserved;
+        point
+    }
+
+    #[test]
+    fn approval_uses_the_permanent_did_the_connection_point_reserved() {
+        let reserved = crate::gateways::connection_points::types::ReservedPermanent {
+            cp_id: "cp-permanent".into(),
+            did: "did:peer:2.permanent".into(),
+            mediator_id: "med".into(),
+            mediator_did: "did:web:mediator.example".into(),
+            consumed: false,
+        };
+
+        assert_eq!(
+            permanent_connection_point(&invitation(Some(reserved))),
+            ("cp-permanent".to_string(), Some("did:peer:2.permanent".to_string()))
+        );
+    }
+
+    #[test]
+    fn approval_without_a_reservation_mints_a_new_permanent_did() {
+        let (id, did) = permanent_connection_point(&invitation(None));
+
+        assert_eq!(did, None);
+        assert!(uuid::Uuid::parse_str(&id).is_ok(), "{id}");
     }
 }

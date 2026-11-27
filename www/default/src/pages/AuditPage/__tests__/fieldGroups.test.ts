@@ -434,4 +434,114 @@ describe('fieldGroups', () => {
       expect(result?.value).toBe('Failed');
     });
   });
+
+  describe('Target authentication changes', () => {
+    const entry = (body: Record<string, unknown>) =>
+      baseEntry({
+        event: {
+          target_auth_changed: {
+            actor: { kind: 'user', id: 'u-1' },
+            surface_variant: 'beta',
+            leg: 'transit_point',
+            transit_point: 'billing',
+            previous_method: 'static_secret',
+            method: 'credential_provider',
+            previous_provider_id: null,
+            provider_id: 'prov-1',
+            changed: ['method', 'secret_id', 'provider_id'],
+            ...body,
+          },
+        } as AuditEntry['event'],
+        channel_name: 'Orders',
+        surface_id: 's-1',
+      });
+
+    it('names the surface, Transit Point, methods and provider, linking surface and provider', () => {
+      const groups = groupByLabel(entry({}), null, null);
+      expect(Object.keys(groups)).toEqual(['Change', 'Where', 'Authentication']);
+      expect(groups['Change']).toEqual([
+        { term: 'Action', value: 'Target authentication changed' },
+        { term: 'Actor', value: 'user u-1' },
+      ]);
+      expect(groups['Where']).toEqual([
+        { term: 'Agent surface', value: 'Orders', href: '/surfaces/s-1' },
+        { term: 'Variant', value: 'beta' },
+        { term: 'Leg', value: 'Transit Point' },
+        { term: 'Transit point', value: 'billing', mono: true },
+      ]);
+      expect(groups['Authentication']).toEqual([
+        { term: 'Method', value: 'a static secret → a credential provider' },
+        { term: 'Provider', value: 'prov-1', mono: true, href: '/credential-providers/prov-1' },
+        { term: 'Changed', value: 'method, secret, provider' },
+      ]);
+    });
+
+    it('leaves out rows for fields the record omits and shows a removed provider', () => {
+      const groups = groupByLabel(
+        entry({
+          leg: 'target',
+          transit_point: undefined,
+          surface_variant: undefined,
+          previous_method: 'credential_provider',
+          method: 'none',
+          previous_provider_id: 'prov-1',
+          provider_id: undefined,
+          changed: undefined,
+        }),
+        null,
+        null
+      );
+      expect(groups['Where']).toEqual([
+        { term: 'Agent surface', value: 'Orders', href: '/surfaces/s-1' },
+        { term: 'Leg', value: 'Target' },
+      ]);
+      expect(groups['Authentication']).toEqual([
+        { term: 'Method', value: 'a credential provider → no authentication' },
+        {
+          term: 'Provider',
+          value: 'prov-1 → none',
+          mono: true,
+          href: '/credential-providers/prov-1',
+        },
+      ]);
+    });
+  });
+
+  describe('secret force deletes', () => {
+    const entry = (referrers?: { kind: string; id: string }[]) =>
+      baseEntry({
+        event: {
+          secret_force_deleted: {
+            actor: { kind: 'user', id: 'u-1' },
+            secret_id: 'sec-9',
+            force: true,
+            referrers,
+          },
+        } as AuditEntry['event'],
+      });
+
+    it('lists the secret by id and each record that still used it by kind', () => {
+      const groups = groupByLabel(
+        entry([
+          { kind: 'surface', id: 's-1' },
+          { kind: 'credential_provider', id: 'p-1' },
+        ]),
+        null,
+        null
+      );
+      expect(groups['Change']).toEqual([
+        { term: 'Action', value: 'Secret force-deleted' },
+        { term: 'Actor', value: 'user u-1' },
+        { term: 'Secret', value: 'sec-9', mono: true },
+      ]);
+      expect(groups['Records still using it']).toEqual([
+        { term: 'surface', value: 's-1', mono: true },
+        { term: 'credential provider', value: 'p-1', mono: true },
+      ]);
+    });
+
+    it('has no referrer rows when none are recorded', () => {
+      expect(groupByLabel(entry(), null, null)['Records still using it']).toEqual([]);
+    });
+  });
 });
