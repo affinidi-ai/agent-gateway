@@ -259,7 +259,7 @@ tikv-jemallocator = "0.6"
 # Storage export with PII redaction and public-key encryption
 zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
-curve25519-dalek = "4.1"
+curve25519-dalek = "5.0"
 pem = "3.0"
 hkdf = "0.12"
 
