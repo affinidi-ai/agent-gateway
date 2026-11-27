@@ -30,6 +30,8 @@ const CONSENT_PENDING_PATHS: &[&str] = &[
     "/api/auth/logout",
     "/saml/logout",
     "/api/saml/logout",
+    "/oidc/logout",
+    "/api/oidc/logout",
 ];
 
 /// Paths where a personal access token only inspects itself, so its resource-scope
@@ -879,6 +881,9 @@ mod tests {
             .route("/saml/metadata", get(ok_handler))
             .route("/oidc/login", get(ok_handler))
             .route("/oidc/callback", get(ok_handler))
+            .route("/oidc/initiate", get(ok_handler))
+            .route("/oidc/backchannel-logout", get(ok_handler))
+            .route("/oidc/logout", get(ok_handler))
             .route("/v1/auth/mode", get(ok_handler))
             .route("/v1/terms/provider-health", get(ok_handler))
             .route("/v1/health", get(ok_handler))
@@ -1154,6 +1159,9 @@ mod tests {
             "/saml/metadata",
             "/oidc/login",
             "/oidc/callback",
+            "/oidc/initiate",
+            "/oidc/backchannel-logout",
+            "/oidc/logout",
             "/v1/auth/mode",
             "/v1/terms/provider-health",
             "/v1/health",
@@ -1687,7 +1695,7 @@ mod tests {
                 require_session_auth,
             ));
         let session = sessions
-            .create_session_with_terms_gate("alice".into(), "user-1".into(), TermsSessionGate::ConsentPending)
+            .create_session_with_terms_gate("alice".into(), "user-1".into(), TermsSessionGate::ConsentPending, None)
             .await;
 
         for (bearer, actor) in [
@@ -2544,7 +2552,7 @@ mod tests {
             (TermsSessionGate::ConsentPending, 503),
         ] {
             let token = sessions
-                .create_session_with_terms_gate("alice".into(), "user-1".into(), gate)
+                .create_session_with_terms_gate("alice".into(), "user-1".into(), gate, None)
                 .await;
             assert_eq!(get_status_with_bearer(&app, "/v1/settings", &token).await, expected);
             for path in ["/auth/login/start", "/saml/acs", "/v1/terms/status"] {
@@ -2652,7 +2660,12 @@ mod tests {
         );
         let sessions = Arc::new(crate::auth::session::SessionManager::new());
         let token = sessions
-            .create_session_with_terms_gate("alice".to_string(), "user-1".to_string(), TermsSessionGate::ConsentPending)
+            .create_session_with_terms_gate(
+                "alice".to_string(),
+                "user-1".to_string(),
+                TermsSessionGate::ConsentPending,
+                None,
+            )
             .await;
         let app = Router::new()
             .route("/v1/settings", get(ok_handler))
@@ -2660,6 +2673,7 @@ mod tests {
             .route("/auth/login/start", get(ok_handler))
             .route("/auth/check", get(ok_handler))
             .route("/auth/logout", get(ok_handler))
+            .route("/oidc/logout", get(ok_handler))
             .layer(axum::middleware::from_fn_with_state(
                 AuthGuardState::new(sessions, None, manager),
                 require_session_auth,
@@ -2687,6 +2701,7 @@ mod tests {
         assert_eq!(get_status_with_bearer(&app, "/v1/terms/status", &token).await, 200);
         assert_eq!(get_status_with_bearer(&app, "/auth/check", &token).await, 200);
         assert_eq!(get_status_with_bearer(&app, "/auth/logout", &token).await, 200);
+        assert_eq!(get_status_with_bearer(&app, "/oidc/logout", &token).await, 200);
         assert_eq!(get_status_with_bearer(&app, "/auth/login/start", &token).await, 200);
     }
 }

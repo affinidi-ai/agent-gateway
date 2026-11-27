@@ -1072,6 +1072,7 @@ pub fn configure_admin_api(bootstrap: &BootstrapConfig) -> reqwest::Client {
         created_at: now,
         expires_at: now + chrono::Duration::minutes(10),
         terms_gate: Default::default(),
+        oidc: None,
     };
     for (directory, id, record) in [
         (

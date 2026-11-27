@@ -1,5 +1,6 @@
-//! The per-client limits on OIDC sign-in, always on: a request budget that `/oidc/login` and
-//! `/oidc/callback` share, and a lockout after repeated callbacks whose code the provider refused.
+//! The per-client limits on OIDC sign-in, always on: a request budget that `/oidc/login`,
+//! `/oidc/initiate` and `/oidc/callback` share, and a lockout after repeated callbacks whose code
+//! the provider refused. Sign-out and back-channel logout are not limited.
 //! A client is its address (an IPv6 address by its /64), resolved by
 //! [`crate::source_auth::client_ip`], which trusts forwarded headers only from
 //! `client_ip.trusted_proxies`.
@@ -9,7 +10,7 @@ use std::net::IpAddr;
 use crate::config::types::{LoginThrottleConfig, RateLimitConfig, TokenEndpointThrottleConfig};
 use crate::sts::throttle::TokenEndpointThrottle;
 
-/// Sign-in requests (login and callback together) one client may send per window.
+/// Sign-in requests (login, initiate and callback together) one client may send per window.
 pub const SIGN_IN_REQUESTS_PER_WINDOW: u32 = 10;
 /// How long one request budget lasts.
 const WINDOW_SECS: u64 = 60;

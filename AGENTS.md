@@ -227,6 +227,13 @@ The login page shows, in OIDC mode, one button reading "Sign in with {label}" (t
 from `GET /api/v1/auth/mode`) that starts the sign-in at `/api/oidc/login`, as the SAML button does
 at `/api/saml/login`; see _Login page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#login-page).
 
+An explicit sign-out (the topbar's **Sign Out**, the Terms page's **Sign out**) goes through
+`App` once: it takes the dashboard down first, then follows the `end_session_url` an OIDC
+sign-out answers with, when it is an `http(s)` address, so the person is signed out at the
+provider too; a session that times out never does. The login page shows only "You have signed
+out." when reached with `?signed_out=1` and removes the marker and the provider's `state` from
+the address; see _Login page_ and _Signing out_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#signing-out).
+
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 
 The endpoint editor picks a Kafka endpoint's security protocol (`plaintext`, `ssl`,

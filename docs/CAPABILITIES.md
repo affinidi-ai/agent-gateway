@@ -445,7 +445,11 @@ authorization code flow with PKCE, verifies the ID token's signature against the
 admits only accounts that meet the tenant binding `oidc.json` sets (unless it sets
 `allow_any_account`), is always throttled per client, and creates each human user at their
 first sign-in with the role their role claim maps to, set again at every sign-in
-([`oidc.json`](CONFIGURATION_REFERENCE.md#oidcjson)). A SAML sign-in must return from the identity provider within
+([`oidc.json`](CONFIGURATION_REFERENCE.md#oidcjson)). The provider's portal can link people
+straight in (third-party-initiated login), signing out at the provider ends their dashboard
+sessions (back-channel logout), and signing out of the dashboard signs them out at the provider
+too (RP-initiated logout) ([Signing out of OIDC](CONFIGURATION_REFERENCE.md#signing-out-of-oidc)).
+A SAML sign-in must return from the identity provider within
 five minutes and is accepted once. The gateway holds at most 100,000 unfinished SAML sign-ins;
 past that, `/api/saml/login` answers 503 until older ones expire. An optional per-client-IP
 limit on `/api/saml/login` is off by default: set `login_throttle.enabled` to `true` in

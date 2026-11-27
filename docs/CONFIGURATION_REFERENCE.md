@@ -720,8 +720,8 @@ form-action 'none'; frame-ancestors 'none'`.
 Read only when `auth_mode = "oidc"` ([`OidcConfig`](../src/auth/oidc/config.rs)); see
 [`oidc.example.json`](../config/examples/oidc.example.json) for an example. Human users then sign
 in to the dashboard at one OpenID provider, with no passkeys and no registration. A field the file
-does not define, at the top level or inside `claims` or `role_mapping`, stops startup, so a
-misspelt `required_claims` cannot pass unnoticed.
+does not define, at the top level or inside `claims`, `role_mapping` or `logout`, stops startup, so
+a misspelt `required_claims` cannot pass unnoticed.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -730,7 +730,7 @@ misspelt `required_claims` cannot pass unnoticed.
 | `client_id` | Required | The client registered at the provider. It is not secret, so it may be written as is, or given as a secret reference (`env://`, `file://`, `aws_secrets://`, `aws_parameter_store://`) to keep it beside the client secret; a reference is resolved and trimmed, never sent as written. |
 | `client_secret` | Required | A [secret reference](#secret-references): `env://`, `file://`, `aws_secrets://` or `aws_parameter_store://`. A `string://` or unprefixed value stops startup, so the file never holds the secret. The resolved value is trimmed (a secret file's trailing newline is dropped) and must not be empty. |
 | `token_endpoint_auth_method` | `"client_secret_basic"` | `client_secret_basic` or `client_secret_post`. |
-| `redirect_uri` | Required | The callback URL registered at the provider, verbatim: the dashboard's public origin and the API prefix, for example `https://gateway.example.com/api/oidc/callback`. `https`, and never derived from a request. |
+| `redirect_uri` | Required | The callback URL registered at the provider, verbatim: the dashboard's public origin and the API prefix, for example `https://gateway.example.com/api/oidc/callback`. `https`, and never derived from a request. Its origin is the dashboard's, which a sign-in link's `target_link_uri` and `logout.post_logout_redirect_uri` must share. |
 | `scopes` | `["openid", "profile", "email"]` | Must include `openid`. Add any scope the provider needs before it puts the role and tenant claims in the ID token. |
 | `id_token_signing_algs` | `["ES256"]` | The algorithms an ID token may be signed with: any of `ES256`, `ES384`, `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512` and `EdDSA`. `none` and `HS*` are refused. |
 | `claims` | `preferred_username`, `email`, `given_name`, `family_name` | Which claim fills `username`, `email`, `first_name` and `last_name`. Display data only. |
@@ -739,6 +739,9 @@ misspelt `required_claims` cannot pass unnoticed.
 | `role_mapping.claim` | Required | The top-level claim carrying the role values (a string or an array of strings), matched by its exact name. Nested claims are not read. |
 | `role_mapping.values` | Required, at least one | Claim value, or `regex:` pattern, to `administrator`, `poweruser` or `user`; any other role name, `Administrator` included, stops startup. A value matches exactly, case included; one named like a gateway role, such as `admin`, is not mapped by its name. An exact entry for a value wins over every pattern it matches, so it can raise or lower one person; otherwise the highest role among the matching patterns applies. |
 | `role_mapping.unmapped` | `"deny"` | What an account with no mapped value gets: `deny`, or a role name. Startup stops if a role is set while no `required_claims` entry (other than `iss`, `aud` and `azp`) lists only exact values, because a boolean or a pattern matches accounts of every tenant; at sign-in a string is compared exactly, so `"True"` never matches a boolean `true`. |
+| `logout.backchannel` | `true` | Serve `POST /oidc/backchannel-logout`, where the provider ends dashboard sessions when someone signs out there (back-channel logout). With `false` the route answers `404`. |
+| `logout.rp_initiated` | `true` | Signing out of the dashboard also signs the person out at the provider (RP-initiated logout), when its discovery document publishes an `end_session_endpoint`. With `false` the sign-out ends the dashboard session only. |
+| `logout.post_logout_redirect_uri` | None | Where the provider sends the browser after that sign-out: an absolute URL on the origin of `redirect_uri`, registered at the provider and sent as written, for example `https://gateway.example.com/?signed_out=1`, where the login page says "You have signed out.". `https` (plain `http` only as for `issuer`), with no fragment or user information; another origin stops startup. Without it the provider shows its own signed-out page. |
 
 Each OIDC sign-in sets the user's role again from the ID token, in both directions, and there is
 no primary administrator: a mapping that sends an unexpected value to `administrator` grants full
@@ -761,8 +764,11 @@ for it after the person has left the organisation.
 | Route | Purpose |
 | --- | --- |
 | `GET /oidc/login?next=` | Public. Sends the browser to the provider to sign in. `next` is kept only when it is a return target a sign-in may send the browser to (the dashboard root, the CLI authorize path or the new access token form; see [`CAPABILITIES.md`](CAPABILITIES.md#managing-the-gateway)); otherwise the browser lands on `/` |
+| `GET`, `POST /oidc/initiate` | Public. The provider's sign-in link (third-party-initiated login): starts a sign-in as `/oidc/login` does |
 | `GET /oidc/callback` | Public. The `redirect_uri`: verifies the sign-in and opens a session |
-| `GET /auth/check`, `POST /auth/logout` | As in SAML mode. Signing out ends the dashboard session only, not the session at the provider |
+| `POST /oidc/backchannel-logout` | Public, carrying a logout token the provider signed. Ends the sessions of a sign-out at the provider. Served unless `logout.backchannel` is `false` |
+| `POST /oidc/logout`, `POST /auth/logout` | Ends the dashboard session, clears its cookie, and answers with the provider's sign-out address when there is one |
+| `GET /auth/check` | As in SAML mode |
 
 - **Discovery.** The provider's discovery document, `{issuer}/.well-known/openid-configuration`
   (one trailing `/` of the issuer dropped), is fetched when sign-in first needs it and kept for
@@ -773,9 +779,11 @@ for it after the person has left the organisation.
   fetched, a refresh that fails keeps the cached one and is retried after a minute. A token
   endpoint or key set that cannot be reached, or a token endpoint that answers `404` or fails
   with a `5xx`, has the document fetched again at the next sign-in. The document must name the configured
-  `issuer` exactly and every endpoint in it must be `https`; when it lists
-  `code_challenge_methods_supported` the list must include `S256`, and when it lists
+  `issuer` exactly and every endpoint in it, `end_session_endpoint` included, must be `https`; when
+  it lists `code_challenge_methods_supported` the list must include `S256`, and when it lists
   `token_endpoint_auth_methods_supported` the list must include `token_endpoint_auth_method`.
+  While `logout.backchannel` is on and the document does not set `backchannel_logout_supported`
+  to `true`, the gateway logs a warning: a sign-out at the provider may not reach it.
 - **Egress.** The discovery document, the token endpoint and the JWKS are fetched under the
   Configured egress policy: cloud metadata, loopback and unspecified addresses are refused and
   private networks allowed, on a client pinned to the addresses the host resolved to, with
@@ -790,11 +798,16 @@ for it after the person has left the organisation.
   that the one closest to expiry is dropped.
 - **The ID token.** The callback exchanges the code at the token endpoint and verifies the ID
   token's signature against the provider's JWKS with an algorithm in `id_token_signing_algs`
-  (a key the token names by `kid` and the cached keys lack makes one fresh fetch, so key
-  rotation works; a token without `kid` matches only a key published without one), then `iss`
-  equals the issuer, `aud` includes `client_id` (`azp` must equal it when there are several
-  audiences), `exp` has not passed and `iat` is not more than 60 seconds ahead (60 seconds of
-  leeway each), `nonce` is this sign-in's, and `sub` is 1 to 255 characters.
+  (a key the token names by `kid` and the cached keys lack makes one fresh fetch, at most once a
+  minute, so key rotation works; keys are cached for at least a minute, and a failed fetch is
+  not tried again for a minute, as for JWT bearer callers in
+  [`SOURCE_AUTH.md`](SOURCE_AUTH.md); a token without `kid` matches only a key published without
+  one), then `iss` equals the issuer, `aud` includes `client_id` (`azp` must equal it when there
+  are several audiences), `exp` has not passed and `iat` is not more than 60 seconds ahead (60
+  seconds of leeway each), `nonce` is this sign-in's, `sub` is 1 to 255 characters, and `sid`,
+  when present, is 1 to 255 characters. The session remembers the provider sign-in it came
+  from: the issuer, `sub`, `sid` and the ID token, which is used only as the hint of a sign-out at
+  the provider and never appears in the log.
 - **Users.** A user is identified by the provider account, the issuer and `sub` together,
   never by email or username. The first sign-in creates the user, approved at once and never
   the primary administrator, within the appliance user limit. The username is the
@@ -812,19 +825,32 @@ for it after the person has left the organisation.
   Personal access tokens are not touched: a user the provider no longer admits keeps their
   tokens, with the role last stored, until an administrator disables or deletes the user;
   deleting the user ends their sessions and revokes their tokens. The role is set again only at
-  a sign-in, so nothing at the provider reaches the gateway between sign-ins.
+  a sign-in, so a role change at the provider reaches the gateway at the user's next sign-in; a
+  sign-out at the provider ends their sessions at once through back-channel logout.
+- **Sign-in links.** `/oidc/initiate` takes `iss`, `login_hint` and `target_link_uri` from the
+  query (`GET`) or a form (`POST`, which the provider's page may submit from another site, so it
+  passes no same-origin check and never reads or changes a session), as OpenID Connect Core 1.0
+  section 4 describes. `iss` must equal `issuer` exactly, or the link gets a readable `400` page
+  (`issuer_mismatch`); it is never used to choose or fetch anything. `login_hint` is passed on to
+  the provider when it has at most 256 characters and no control character, and dropped
+  otherwise. `target_link_uri` opens a page only when it is an absolute URL on the origin of
+  `redirect_uri` with no user information, no backslash or control character, and whose path and
+  query, as parsed, start with a single `/`, hold no encoded slash or backslash in the path, fit in
+  1,024 characters and are a return target a sign-in may send the browser to (as for `next`); a
+  relative `target_link_uri` or any other value opens `/`. Every link starts a fresh sign-in, even
+  in a browser with a session.
 - **Throttling.** Always on, per client (an IPv4 address or an IPv6 /64, taken from
-  `X-Forwarded-For` only from `client_ip.trusted_proxies`): `/oidc/login` and `/oidc/callback`
-  share a budget of 10 requests per minute, and 10 callbacks whose code the provider refused
-  (`401`) lock the client out of both for 15 minutes; a completed sign-in clears the count. An
-  unknown `state`, a missing binding cookie or a refused account does not count. A client over
-  either limit gets a `429` page with `Retry-After`. Behind a load balancer, set
-  `client_ip.trusted_proxies` in `gateway.json`, or every caller shares the balancer's budget;
-  startup warns while it is empty.
+  `X-Forwarded-For` only from `client_ip.trusted_proxies`): `/oidc/login`, `/oidc/initiate` and
+  `/oidc/callback` share a budget of 10 requests per minute, and 10 callbacks whose code the
+  provider refused (`401`) lock the client out of all three for 15 minutes; a completed sign-in
+  clears the count. An unknown `state`, a missing binding cookie or a refused account does not
+  count. A client over either limit gets a `429` page with `Retry-After`. Back-channel logout and
+  sign-out are not throttled. Behind a load balancer, set `client_ip.trusted_proxies` in
+  `gateway.json`, or every caller shares the balancer's budget; startup warns while it is empty.
 - **The answer.** On success the callback sets the session cookie and returns the same hand-off
   page as SAML sign-in, with `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. A
   refused sign-in shows a page that does not say why, and the log records a reason code:
-  `state_unknown`, `binding_mismatch`, `code_missing`, `access_denied`, `exchange_failed`,
+  `issuer_mismatch`, `state_unknown`, `binding_mismatch`, `code_missing`, `access_denied`, `exchange_failed`,
   `id_token_invalid`, `claim_not_allowed`, `role_unmapped`, `user_disabled`, `user_limit`,
   `op_unavailable`, `server_error` or `throttled`. No token, code, secret or claim value is
   logged, and the provider's `error_description` is never shown.
@@ -842,20 +868,60 @@ A sign-in raises the same `user.created`, `user.updated` and `user.login` events
 sign-in, with `LOGIN_METHOD` `oidc`, and a refused one raises `user.login_failed`
 ([`docs/INTEGRATIONS.md`](INTEGRATIONS.md#sign-in-events)).
 
+### Signing out of OIDC
+
+- **Signing out of the dashboard (RP-initiated logout).** `POST /auth/logout` and
+  `POST /oidc/logout` read the session without extending it, end it and clear its cookie, and
+  answer `200` with `Cache-Control: no-store`. A session record keeps the ID token of its
+  sign-in, used only as this `id_token_hint`, until the session ends. When the session came from
+  a sign-in at the configured `issuer`, `logout.rp_initiated` is on and the discovery document
+  publishes an `end_session_endpoint`, the answer is
+  `{"end_session_url": "..."}`: that endpoint with `id_token_hint` (the session's ID token,
+  which providers accept even after it has expired), `client_id`, `post_logout_redirect_uri`
+  when it is set, and a random `state` that is not checked. The dashboard sends the browser
+  there when the person signs out, and never when a session times out, so a timed-out tab does
+  not sign the person out of the provider. Otherwise, and for a session that is missing or has
+  expired, or when the provider cannot be reached, the answer is `{}` and the sign-out is local.
+- **Signing out at the provider (back-channel logout).** The provider posts a form with a
+  `logout_token` (OpenID Connect Back-Channel Logout 1.0), server to server and without
+  cookies, to `/oidc/backchannel-logout`. The body is capped at 16 KiB. The token is checked
+  like an ID token (an algorithm in `id_token_signing_algs`, its `kid`, the signature, `iss`,
+  `aud`, `azp` and `exp`, which must be present), then: a `typ` header, when present, is
+  `logout+jwt` with or without `application/` in any case; `iat` is present and not more than 60
+  seconds ahead; `events` holds the member
+  `http://schemas.openid.net/event/backchannel-logout` as an object; there is no `nonce`, so an
+  ID token is never accepted as a logout token; `sub` or `sid` is present (each 1 to 255
+  characters); and the `jti` has not been used before. The `jti` is recorded only once every
+  other check has passed, until the token would no longer be accepted, at most 10,000 at once,
+  and the sessions the token names are then ended even if the provider drops the connection.
+  A token with `sid` ends the sessions of that provider session (with `sub` too, only that
+  account's, including its sessions whose ID token had no `sid`); a token with only `sub` ends
+  every session of the account. The answer is `200` with `{}`, also when no session matched,
+  since a logout may be sent again; `400` with `{"error":"invalid_request"}` for a request that
+  does not verify, with the failed check in the log; `400` with `{"error":"logout_failed"}`
+  when a session could not be deleted, which leaves the token usable again; and `503` with
+  `{"error":"temporarily_unavailable"}` when the discovery document or the keys cannot be
+  fetched, when the token names a key published since the keys were last fetched for an unknown
+  `kid` (within a minute), or on an instance that is not the ready Active one. Every answer is
+  `Cache-Control: no-store`. It ends dashboard sessions, the CLI's included, and no personal
+  access token. Sessions live in one gateway instance, so the provider must reach the Active
+  one.
+
 ### Switching a gateway to OIDC
 
 - Passkey and SAML users stay stored when `auth_mode` becomes `oidc`, the primary administrator
   included. They cannot sign in to the dashboard, and an account at the provider is never linked
   to them, even with the same username or email: its first sign-in creates a new user. Their
   personal access tokens keep working, so disable the users who should no longer have access.
+- A gateway in OIDC mode accepts only dashboard sessions from a sign-in at the configured
+  `issuer`. A passkey or SAML session from before the switch, or one from an earlier provider, is
+  refused, since this provider's role mapping never set its role, and its user signs in again.
 - OIDC mode has no primary administrator. When no account at the provider maps to
   `administrator`, nobody can administer the dashboard until the mapping or the provider's
   claims change.
 - An exact email in `required_claims` admits those accounts only; it names no tenant unless the
   provider is authoritative for the domain. Add `"email_verified": [true]` beside any entry or
   mapping on `email` at a provider where people can set their own address.
-- This release reads no `logout` block: a field `oidc.json` does not define stops startup, so
-  remove one copied from another product's runbook.
 - The kept record of a deleted user is matched by its exact issuer and `sub`, or by its SAML
   user ID. After the `issuer`, the SAML `user_id` mapping or `auth_mode` changes, a deleted
   person's next sign-in finds no record and creates a new approved user, so disable deleted
@@ -920,7 +986,11 @@ the record is kept, and the success message follows the outcome the delete retur
 | Grant | Authorization code, with PKCE `S256` |
 | Client authentication | `client_secret_basic` (the default) or `client_secret_post`, as `token_endpoint_auth_method` says |
 | ID token signing | An algorithm in `id_token_signing_algs` (`ES256` by default) |
-| Claims in the ID token | The role claim, every claim in `required_claims`, and the profile claims. The gateway reads the ID token only, never userinfo |
+| Claims in the ID token | The role claim, every claim in `required_claims`, and the profile claims, with `sid` for a sign-out at the provider to end only that provider session. The gateway reads the ID token only, never userinfo |
+| Initiate login URI (`initiate_login_uri`) | `https://<gateway>/api/oidc/initiate`, for a provider portal that links people into the dashboard |
+| Back-channel logout URI (`backchannel_logout_uri`) | `https://<gateway>/api/oidc/backchannel-logout`, reachable from the provider's servers through any firewall in front of the gateway. Leave it out when `logout.backchannel` is `false` |
+| Back-channel logout session required (`backchannel_logout_session_required`) | `true` when the provider puts `sid` in its ID tokens and logout tokens; without `sid`, a sign-out at the provider ends every session of the account |
+| Post-logout redirect URIs (`post_logout_redirect_uris`) | `logout.post_logout_redirect_uri`, exactly as written, when it is set |
 
 A debug build also accepts plain `http` for `issuer`, `redirect_uri` and the provider's endpoints
 when the host is `localhost` or a loopback address, for a provider running on the same machine. A

@@ -9,13 +9,14 @@ use axum::{
 use std::sync::Arc;
 use tracing::error;
 
-use super::{SessionManager, session_cookie};
+use super::{SessionManager, session::OidcSessionBinding, session_cookie};
 use crate::observability::loggable;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AuthenticatedPrincipal {
     pub(crate) username: String,
     pub(crate) user_id: String,
+    pub(crate) oidc: Option<OidcSessionBinding>,
 }
 
 impl AuthenticatedPrincipal {
@@ -23,7 +24,16 @@ impl AuthenticatedPrincipal {
         username: String,
         user_id: String,
     ) -> Self {
-        Self { username, user_id }
+        Self { username, user_id, oidc: None }
+    }
+
+    /// The same principal, signed in through the OpenID provider sign-in `binding` names, so the
+    /// session is created bound to it.
+    pub(crate) fn with_oidc(
+        self,
+        binding: OidcSessionBinding,
+    ) -> Self {
+        Self { oidc: Some(binding), ..self }
     }
 }
 
@@ -128,7 +138,7 @@ impl SessionFinalizer for SessionManagerFinalizer {
         };
         let session_token = self
             .session_manager
-            .create_session_with_terms_gate(principal.username, principal.user_id, terms_gate)
+            .create_session_with_terms_gate(principal.username, principal.user_id, terms_gate, principal.oidc)
             .await;
 
         let mut headers = HeaderMap::new();
@@ -229,6 +239,50 @@ mod tests {
             .finalize_session(AuthenticatedPrincipal::new("alice".into(), "user-1".into()))
             .await;
         assert!(matches!(result, Err(SessionFinalizationError::Terms(crate::terms::TermsError::Operational(_)))));
+    }
+
+    #[tokio::test]
+    async fn a_principal_signed_in_through_a_provider_gets_a_session_bound_to_that_sign_in() {
+        let sessions = Arc::new(SessionManager::new());
+        let finalizer =
+            SessionManagerFinalizer::new(sessions.clone(), Arc::new(crate::terms::TermsManager::disabled()));
+        let binding = OidcSessionBinding {
+            issuer: "https://idp.example.com".to_string(),
+            subject: "user-1".to_string(),
+            sid: Some("op-1".to_string()),
+            id_token: None,
+        };
+
+        let bound = finalizer
+            .finalize_session(AuthenticatedPrincipal::new("alice".into(), "user-1".into()).with_oidc(binding.clone()))
+            .await
+            .unwrap();
+        let unbound = finalizer
+            .finalize_session(AuthenticatedPrincipal::new("bob".into(), "user-2".into()))
+            .await
+            .unwrap();
+
+        let record = |token: String| {
+            let sessions = sessions.clone();
+            async move {
+                sessions
+                    .validate_session_record(&token)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            record(bound.session_token)
+                .await
+                .oidc,
+            Some(binding)
+        );
+        assert_eq!(
+            record(unbound.session_token)
+                .await
+                .oidc,
+            None
+        );
     }
 
     #[tokio::test]

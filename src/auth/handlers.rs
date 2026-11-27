@@ -909,7 +909,7 @@ mod tests {
         ] {
             let token = state
                 .session_manager
-                .create_session_with_terms_gate("alice".into(), "user-1".into(), gate)
+                .create_session_with_terms_gate("alice".into(), "user-1".into(), gate, None)
                 .await;
             let mut headers = axum::http::HeaderMap::new();
             headers.insert(

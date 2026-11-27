@@ -22,9 +22,9 @@ use super::egress::ProviderEgress;
 use super::pending::{PENDING_SIGN_IN_TTL, PendingSignIns, random_token};
 use super::roles::{mapped_role, unmet_required_claim};
 use super::throttle::SignInThrottle;
-use super::tokens::{IdTokenFailure, verify_id_token};
+use super::tokens::{SeenLogoutTokens, TokenFailure, verify_id_token};
 use super::user_provisioning::{ProvisionRefusal, provision_user_from_oidc};
-use crate::auth::session::SessionManager;
+use crate::auth::session::{OidcSessionBinding, SessionManager};
 use crate::auth::session_cookie::{
     OIDC_STATE_COOKIE_NAME, build_oidc_state_cookie, clear_oidc_state_cookie, request_cookie,
 };
@@ -45,11 +45,12 @@ const MAX_TOKEN_RESPONSE_BYTES: usize = 256 * 1024;
 /// Everything OIDC sign-in needs.
 pub struct OidcState {
     pub config: Arc<OidcConfig>,
-    discovery: Discovery,
-    jwks: JwksClient,
+    pub(super) discovery: Discovery,
+    pub(super) jwks: JwksClient,
     egress: ProviderEgress,
     pending: PendingSignIns,
     throttle: SignInThrottle,
+    pub(super) seen_logout_tokens: SeenLogoutTokens,
     pub storage: Arc<PasskeyStorage>,
     pub session_manager: Arc<SessionManager>,
     terms_manager: Arc<crate::terms::TermsManager>,
@@ -79,6 +80,7 @@ impl OidcState {
             egress,
             pending: PendingSignIns::default(),
             throttle: SignInThrottle::default(),
+            seen_logout_tokens: SeenLogoutTokens::default(),
             storage,
             session_manager,
             terms_manager,
@@ -105,7 +107,8 @@ impl OidcState {
 
 /// Why a sign-in was refused. The reason code goes to the log; the browser gets a generic page.
 #[derive(Debug)]
-enum Refusal {
+pub(super) enum Refusal {
+    IssuerMismatch,
     StateUnknown,
     BindingMismatch,
     CodeMissing,
@@ -123,6 +126,7 @@ enum Refusal {
 impl Refusal {
     fn code(&self) -> &'static str {
         match self {
+            Self::IssuerMismatch => "issuer_mismatch",
             Self::StateUnknown => "state_unknown",
             Self::BindingMismatch => "binding_mismatch",
             Self::CodeMissing => "code_missing",
@@ -139,12 +143,15 @@ impl Refusal {
     }
 
     /// `401` for a code the provider refused (`invalid_grant`): the code is the one thing a
-    /// caller sends that could be a guess. `400` for an unknown or unbound `state` or a callback
-    /// without a code; `502` for an ID token that did not verify, which comes from the provider and
-    /// never from the caller; `403` for an account the settings refuse.
+    /// caller sends that could be a guess. `400` for a sign-in link naming another provider, an
+    /// unknown or unbound `state` or a callback without a code; `502` for an ID token that did not
+    /// verify, which comes from the provider and never from the caller; `403` for an account the
+    /// settings refuse.
     fn status(&self) -> StatusCode {
         match self {
-            Self::StateUnknown | Self::BindingMismatch | Self::CodeMissing => StatusCode::BAD_REQUEST,
+            Self::IssuerMismatch | Self::StateUnknown | Self::BindingMismatch | Self::CodeMissing => {
+                StatusCode::BAD_REQUEST
+            }
             Self::ExchangeFailed => StatusCode::UNAUTHORIZED,
             Self::IdTokenInvalid => StatusCode::BAD_GATEWAY,
             Self::AccessDenied
@@ -170,6 +177,7 @@ impl Refusal {
 
     fn message(&self) -> String {
         match self {
+            Self::IssuerMismatch => "This sign-in link is not for this dashboard.".to_string(),
             Self::StateUnknown | Self::BindingMismatch => {
                 "This sign-in has expired or was started in another browser. Start again from the sign-in page."
                     .to_string()
@@ -204,7 +212,7 @@ impl IntoResponse for Refusal {
 }
 
 /// Log a refusal with its reason code and what caused it, and return it.
-fn refused(
+pub(super) fn refused(
     refusal: Refusal,
     user_id: Option<&str>,
     detail: impl std::fmt::Display,
@@ -218,9 +226,8 @@ pub struct OidcLoginQuery {
     pub next: Option<String>,
 }
 
-/// Start an OIDC sign-in: send the browser to the provider with PKCE, a `state` and a `nonce`,
-/// bound to this browser by a cookie. `next` is kept as the return target only when the
-/// return-target allowlist admits it; otherwise the browser lands on `/`.
+/// Start an OIDC sign-in. `next` is kept as the return target only when the return-target
+/// allowlist admits it; otherwise the browser lands on `/`.
 /// GET /oidc/login
 pub async fn oidc_login(
     State(oidc): State<Arc<OidcState>>,
@@ -234,7 +241,17 @@ pub async fn oidc_login(
         .next
         .filter(|next| is_allowed_return_target(next))
         .unwrap_or_else(|| "/".to_string());
+    start_sign_in(&oidc, None, return_target).await
+}
 
+/// Send the browser to the provider with PKCE, a `state` and a `nonce`, bound to this browser by
+/// a cookie, remembering `return_target`, which the caller has checked, for the callback.
+/// `login_hint` is passed on to the provider.
+pub(super) async fn start_sign_in(
+    oidc: &OidcState,
+    login_hint: Option<&str>,
+    return_target: String,
+) -> Response {
     let metadata = match oidc
         .discovery
         .metadata(&oidc.config)
@@ -264,7 +281,8 @@ pub async fn oidc_login(
         .append_pair("state", &state)
         .append_pair("nonce", &nonce)
         .append_pair("code_challenge", &generate_pkce_challenge(&code_verifier))
-        .append_pair("code_challenge_method", "S256");
+        .append_pair("code_challenge_method", "S256")
+        .extend_pairs(login_hint.map(|hint| ("login_hint", hint)));
 
     let Ok(cookie) = HeaderValue::from_str(&build_oidc_state_cookie(&state, PENDING_SIGN_IN_TTL.as_secs())) else {
         return refused(Refusal::ServerError, None, "the state cookie could not be built").into_response();
@@ -279,7 +297,7 @@ pub async fn oidc_login(
 }
 
 /// The `429` page for a client over its sign-in budget or locked out, if it is.
-fn throttled(
+pub(super) fn throttled(
     oidc: &OidcState,
     client: Option<std::net::IpAddr>,
 ) -> Option<Response> {
@@ -379,18 +397,24 @@ async fn complete_sign_in(
     let verified = match verify_id_token(&id_token, &oidc.config, &oidc.jwks, &metadata.jwks_uri, &pending.nonce).await
     {
         Ok(verified) => verified,
-        Err(IdTokenFailure::KeysUnavailable(detail)) => {
+        Err(TokenFailure::KeysUnavailable(detail) | TokenFailure::KeyNotFoundDuringCooldown(detail)) => {
             oidc.discovery
                 .mark_stale()
                 .await;
             return Err(refused(Refusal::OpUnavailable, None, detail));
         }
-        Err(IdTokenFailure::Invalid(detail)) => {
+        Err(TokenFailure::Invalid(detail)) => {
             login_failed(LoginFailure::OidcRejected);
             return Err(refused(Refusal::IdTokenInvalid, None, detail));
         }
     };
 
+    let binding = OidcSessionBinding {
+        issuer: oidc.config.issuer.clone(),
+        subject: verified.subject.clone(),
+        sid: verified.sid.clone(),
+        id_token: Some(id_token.to_string()),
+    };
     let identity = OidcIdentity {
         issuer: oidc.config.issuer.clone(),
         subject: verified.subject,
@@ -441,7 +465,7 @@ async fn complete_sign_in(
     }
 
     let finalized = SessionManagerFinalizer::new(oidc.session_manager.clone(), oidc.terms_manager.clone())
-        .finalize_session(AuthenticatedPrincipal::new(user.username.clone(), user.user_id.clone()))
+        .finalize_session(AuthenticatedPrincipal::new(user.username.clone(), user.user_id.clone()).with_oidc(binding))
         .await
         .map_err(|e| refused(Refusal::ServerError, Some(&user.user_id), format!("{e:?}")))?;
 
@@ -608,7 +632,8 @@ mod tests {
     #[test]
     fn only_a_refused_code_counts_as_a_failed_sign_in() {
         assert_eq!(Refusal::ExchangeFailed.status(), StatusCode::UNAUTHORIZED);
-        for refusal in [Refusal::StateUnknown, Refusal::BindingMismatch, Refusal::CodeMissing] {
+        for refusal in [Refusal::IssuerMismatch, Refusal::StateUnknown, Refusal::BindingMismatch, Refusal::CodeMissing]
+        {
             assert_eq!(refusal.status(), StatusCode::BAD_REQUEST, "{}", refusal.code());
         }
         assert_eq!(Refusal::IdTokenInvalid.status(), StatusCode::BAD_GATEWAY);

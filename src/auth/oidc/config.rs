@@ -55,6 +55,34 @@ struct OidcFile {
     #[serde(default)]
     allow_any_account: bool,
     role_mapping: RoleMappingFile,
+    #[serde(default)]
+    logout: LogoutSettings,
+}
+
+/// How a sign-out at either end reaches the other.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LogoutSettings {
+    /// Serve `POST /oidc/backchannel-logout`, so the provider can end dashboard sessions when
+    /// someone signs out there.
+    pub backchannel: bool,
+    /// Signing out of the dashboard also sends the browser to the provider's
+    /// `end_session_endpoint`, signing the person out there too.
+    pub rp_initiated: bool,
+    /// Where the provider sends the browser after that sign-out: a URL on the dashboard's origin,
+    /// registered at the provider and sent as written, since providers compare it exactly.
+    /// Without it the provider shows its own page.
+    pub post_logout_redirect_uri: Option<String>,
+}
+
+impl Default for LogoutSettings {
+    fn default() -> Self {
+        Self {
+            backchannel: true,
+            rp_initiated: true,
+            post_logout_redirect_uri: None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -253,6 +281,7 @@ pub struct OidcConfig {
     pub claims: ClaimNames,
     pub required_claims: BTreeMap<String, Vec<ValueMatcher>>,
     pub role_mapping: RoleMapping,
+    pub logout: LogoutSettings,
 }
 
 impl OidcConfig {
@@ -280,6 +309,7 @@ impl OidcConfig {
             claims: checked.claims,
             required_claims: checked.required_claims,
             role_mapping: checked.role_mapping,
+            logout: checked.logout,
         })
     }
 
@@ -308,6 +338,7 @@ struct CheckedFile {
     claims: ClaimNames,
     required_claims: BTreeMap<String, Vec<ValueMatcher>>,
     role_mapping: RoleMapping,
+    logout: LogoutSettings,
 }
 
 fn check(file: OidcFile) -> Result<CheckedFile, String> {
@@ -351,6 +382,7 @@ fn check(file: OidcFile) -> Result<CheckedFile, String> {
     let required_claims = required_claims(file.required_claims)?;
     let role_mapping = role_mapping(file.role_mapping)?;
     check_tenant_binding(&file.issuer, &required_claims, &role_mapping, file.allow_any_account)?;
+    let logout = logout(file.logout, &redirect_uri)?;
     Ok(CheckedFile {
         label,
         issuer: file.issuer,
@@ -363,7 +395,22 @@ fn check(file: OidcFile) -> Result<CheckedFile, String> {
         claims: file.claims,
         required_claims,
         role_mapping,
+        logout,
     })
+}
+
+/// The `logout` block, with a `post_logout_redirect_uri` only on the dashboard's own origin (that
+/// of `redirect_uri`), so the provider can send the browser nowhere else.
+fn logout(
+    settings: LogoutSettings,
+    redirect_uri: &Url,
+) -> Result<LogoutSettings, String> {
+    if let Some(uri) = &settings.post_logout_redirect_uri
+        && provider_url("logout.post_logout_redirect_uri", uri)?.origin() != redirect_uri.origin()
+    {
+        return Err("logout.post_logout_redirect_uri must be on the same origin as redirect_uri".to_string());
+    }
+    Ok(settings)
 }
 
 /// Refuse a file that does not tie sign-in to one tenant at the provider, unless it opts out
@@ -748,6 +795,13 @@ mod tests {
 
         assert_eq!(checked.client_secret_reference, "env://AG_OIDC_CLIENT_SECRET");
         assert_eq!(checked.role_mapping.unmapped, None);
+        assert_eq!(
+            checked
+                .logout
+                .post_logout_redirect_uri
+                .as_deref(),
+            Some("https://agent-gateway-1.example.com/?signed_out=1")
+        );
         assert_eq!(exact_value_claims(&checked.required_claims), ["org_id"]);
     }
 
@@ -852,13 +906,69 @@ mod tests {
         let refused = load(file).await.unwrap_err();
         assert!(refused.contains("unknown field"), "{refused}");
 
-        for (path, value) in
-            [(&["role_mapping", "unmaped"][..], json!("user")), (&["claims"][..], json!({ "user_name": "name" }))]
-        {
+        for (path, value) in [
+            (&["role_mapping", "unmaped"][..], json!("user")),
+            (&["claims"][..], json!({ "user_name": "name" })),
+            (&["logout"][..], json!({ "back_channel": false })),
+        ] {
             let refused = load(with(valid_file(), path, value))
                 .await
                 .unwrap_err();
             assert!(refused.contains("unknown field"), "{path:?}: {refused}");
+        }
+    }
+
+    #[tokio::test]
+    async fn both_logouts_are_on_by_default_and_the_provider_shows_its_own_page_after_one() {
+        let config = load(valid_file())
+            .await
+            .unwrap();
+
+        assert_eq!(config.logout, LogoutSettings::default());
+        assert!(config.logout.backchannel && config.logout.rp_initiated);
+        assert_eq!(
+            config
+                .logout
+                .post_logout_redirect_uri,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_logout_block_turns_each_logout_off_and_returns_only_to_the_dashboard() {
+        let config = load(with(
+            valid_file(),
+            &["logout"],
+            json!({
+                "backchannel": false,
+                "rp_initiated": false,
+                "post_logout_redirect_uri": "https://gateway.example.com?signed_out=1",
+            }),
+        ))
+        .await
+        .unwrap();
+        assert!(!config.logout.backchannel);
+        assert!(!config.logout.rp_initiated);
+        assert_eq!(
+            config
+                .logout
+                .post_logout_redirect_uri
+                .as_deref(),
+            Some("https://gateway.example.com?signed_out=1"),
+            "kept as written, since the provider compares it with what is registered"
+        );
+
+        for (uri, expected) in [
+            ("https://evil.example/?signed_out=1", "same origin as redirect_uri"),
+            ("https://gateway.example.com:8443/", "same origin as redirect_uri"),
+            ("http://gateway.example.com/", "must start with https://"),
+            ("https://user:pw@gateway.example.com/", "user information"),
+            ("/?signed_out=1", "not an absolute URL"),
+        ] {
+            let refused = load(with(valid_file(), &["logout"], json!({ "post_logout_redirect_uri": uri })))
+                .await
+                .unwrap_err();
+            assert!(refused.contains(expected), "{uri}: {refused}");
         }
     }
 

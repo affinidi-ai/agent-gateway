@@ -1,7 +1,9 @@
 //! A local OpenID provider that dashboard users sign in at, for real-process scenarios. It serves
-//! discovery, its JWKS, an authorization endpoint that signs in whichever person the scenario
-//! names, and a token endpoint that answers a code with an EdDSA ID token for that person, after
-//! checking the client's Basic credentials, the PKCE verifier and the redirect URI.
+//! discovery (with an end session endpoint and back-channel logout), its JWKS, an authorization
+//! endpoint that signs in whichever person the scenario names, and a token endpoint that answers a
+//! code with an EdDSA ID token for that person, after checking the client's Basic credentials, the
+//! PKCE verifier and the redirect URI. It signs the logout tokens it posts to the gateway, and
+//! remembers the last one.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,7 +21,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use url::Url;
 
-use crate::bdd_support::jwt::{now_secs, public_jwk, sign_jwt};
+use crate::bdd_support::jwt::{get_jwks_key_id, now_secs, public_jwk, sign_jwt, sign_typed_jwt};
 
 pub const DASHBOARD_CLIENT_ID: &str = "bdd-dashboard";
 pub const DASHBOARD_CLIENT_SECRET: &str = "bdd-dashboard-secret";
@@ -27,6 +29,10 @@ pub const DASHBOARD_CLIENT_SECRET: &str = "bdd-dashboard-secret";
 pub const DASHBOARD_PROVIDER_LABEL: &str = "Example Directory";
 /// The tenant the gateway's `oidc.json` binds sign-in to.
 pub const BOUND_TENANT: &str = "org-bdd";
+/// An Ed25519 key the provider never publishes.
+const UNPUBLISHED_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIEFqkHAblN56FUDoUmgCQe3tL6BbHw4AfHm4bK2UsR8t
+-----END PRIVATE KEY-----";
 
 struct Grant {
     claims: Value,
@@ -41,6 +47,7 @@ struct ProviderState {
     signing_in: Mutex<Option<Value>>,
     grants: Mutex<HashMap<String, Grant>>,
     next_code: Mutex<u64>,
+    last_logout_token: std::sync::Mutex<Option<String>>,
 }
 
 /// The provider. It stops when dropped.
@@ -120,6 +127,88 @@ impl DashboardOp {
             .lock()
             .await = Some(person);
     }
+
+    /// The address discovery publishes as `end_session_endpoint`.
+    pub fn end_session_endpoint(&self) -> String {
+        format!("{}/logout", self.state.issuer)
+    }
+
+    /// A logout token signing the account `subject` out of the provider session `sid`, or out of
+    /// every session of the account without one. The provider remembers it as its last.
+    pub fn logout_token(
+        &self,
+        subject: &str,
+        sid: Option<&str>,
+    ) -> String {
+        let token = sign_typed_jwt(self.logout_claims(subject, sid), "logout+jwt");
+        *self
+            .state
+            .last_logout_token
+            .lock()
+            .expect("the last logout token") = Some(token.clone());
+        token
+    }
+
+    /// The last logout token the provider signed.
+    pub fn last_logout_token(&self) -> String {
+        self.state
+            .last_logout_token
+            .lock()
+            .expect("the last logout token")
+            .clone()
+            .expect("the provider has signed a logout token")
+    }
+
+    /// A logout token like [`Self::logout_token`] under the published key's id, signed with a key
+    /// the provider never published.
+    pub fn logout_token_signed_with_an_unpublished_key(
+        &self,
+        subject: &str,
+        sid: &str,
+    ) -> String {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
+        header.kid = Some(get_jwks_key_id().to_string());
+        header.typ = Some("logout+jwt".to_string());
+        let key = jsonwebtoken::EncodingKey::from_ed_pem(UNPUBLISHED_KEY_PEM.as_bytes()).expect("an Ed25519 key");
+        jsonwebtoken::encode(&header, &self.logout_claims(subject, Some(sid)), &key).expect("sign the logout token")
+    }
+
+    fn logout_claims(
+        &self,
+        subject: &str,
+        sid: Option<&str>,
+    ) -> Value {
+        let now = now_secs();
+        let mut claims = json!({
+            "iss": self.state.issuer,
+            "aud": DASHBOARD_CLIENT_ID,
+            "iat": now,
+            "exp": now + 120,
+            "jti": uuid::Uuid::new_v4().to_string(),
+            "sub": subject,
+            "events": { "http://schemas.openid.net/event/backchannel-logout": {} },
+        });
+        if let Some(sid) = sid {
+            claims["sid"] = json!(sid);
+        }
+        claims
+    }
+
+    /// An ID token for `subject`, as the token endpoint issues one, which is no logout token.
+    pub fn id_token(
+        &self,
+        subject: &str,
+    ) -> String {
+        let now = now_secs();
+        sign_jwt(json!({
+            "iss": self.state.issuer,
+            "aud": DASHBOARD_CLIENT_ID,
+            "sub": subject,
+            "nonce": "bdd-nonce",
+            "iat": now,
+            "exp": now + 300,
+        }))
+    }
 }
 
 async fn discovery(State(state): State<Arc<ProviderState>>) -> Json<Value> {
@@ -132,6 +221,9 @@ async fn discovery(State(state): State<Arc<ProviderState>>) -> Json<Value> {
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["client_secret_basic"],
         "id_token_signing_alg_values_supported": ["EdDSA"],
+        "end_session_endpoint": format!("{issuer}/logout"),
+        "backchannel_logout_supported": true,
+        "backchannel_logout_session_supported": true,
     }))
 }
 

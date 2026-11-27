@@ -22,11 +22,6 @@ Feature: OpenID Connect sign-in
     And the dashboard is handed a session
     And the session "mallory" was handed signs them in with the role "poweruser"
 
-  Scenario: Signing out of the dashboard ends the session an OpenID Connect sign-in handed over
-    Given "mallory" has signed in with OpenID Connect carrying the roles "gw-all"
-    When "mallory" signs out of the dashboard
-    Then the session "mallory" was handed is refused
-
   Scenario: A role removed at the provider is removed at the next sign-in
     Given "mallory" has signed in with OpenID Connect carrying the roles "gw-admins"
     When "mallory" signs in with OpenID Connect carrying the roles "gw-all"

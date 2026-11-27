@@ -15,7 +15,7 @@ import Dashboard from './Dashboard';
 
 // Import the CSS - only when authenticated
 import '../dashboard.css';
-import { apiClient, sessionManager } from '../api';
+import { apiClient } from '../api';
 import { ROUTES } from '../routes';
 import { integrationRoutes } from './integrationRoutes';
 import { credentialProviderRoutes } from './credentialProviderRoutes';
@@ -188,8 +188,10 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
     }
   }, []);
 
-  const handleLogout = () =>
-    sessionManager.logout(() => actions.disconnectWebSocket()).then(() => onLogout());
+  const handleLogout = () => {
+    actions.disconnectWebSocket();
+    onLogout();
+  };
 
   // Add body class for sidebar state
   useEffect(() => {

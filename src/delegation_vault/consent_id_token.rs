@@ -7,7 +7,8 @@ use crate::jwt_bearer::models::{AudienceClaim, JwtVerificationStrategy};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConsentIdTokenError {
     Malformed,
-    /// The strategy's JWKS could not be fetched, so the ID token was not checked.
+    /// The strategy's JWKS could not be fetched, or was fetched again too recently to look for
+    /// the key the ID token names, so the ID token was not checked.
     KeysUnavailable,
     Rejected(Rejection),
 }
@@ -46,7 +47,9 @@ impl ConsentIdTokenError {
 impl From<JwtBearerError> for ConsentIdTokenError {
     fn from(error: JwtBearerError) -> Self {
         match error {
-            JwtBearerError::JwksFetchFailed(_) | JwtBearerError::JwksUriBlocked => Self::KeysUnavailable,
+            JwtBearerError::JwksFetchFailed(_)
+            | JwtBearerError::JwksUriBlocked
+            | JwtBearerError::KeyNotFoundDuringCooldown(_) => Self::KeysUnavailable,
             JwtBearerError::ExpiredToken => Self::Rejected(Rejection::Expired),
             JwtBearerError::InvalidIssuer => Self::Rejected(Rejection::Issuer),
             JwtBearerError::InvalidAudience => Self::Rejected(Rejection::Audience),
@@ -506,6 +509,19 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, ConsentIdTokenError::KeysUnavailable);
         assert_eq!(error.cause(), "jwks_unavailable");
+    }
+
+    #[test]
+    fn a_key_unknown_during_the_refetch_cooldown_leaves_the_id_token_unchecked() {
+        let cooling = ConsentIdTokenError::from(JwtBearerError::KeyNotFoundDuringCooldown("key-2".into()));
+
+        assert_eq!(cooling, ConsentIdTokenError::KeysUnavailable);
+        assert_eq!(cooling.cause(), "jwks_unavailable");
+        assert_eq!(
+            ConsentIdTokenError::from(JwtBearerError::KeyNotFound("key-2".into())),
+            ConsentIdTokenError::Rejected(Rejection::Token),
+            "a key the fresh keys lack is the token's fault"
+        );
     }
 
     #[tokio::test]

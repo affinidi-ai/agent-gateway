@@ -1,5 +1,6 @@
-//! A stub OpenID provider for the OIDC tests: discovery, a JWKS with P-256 keys, and a token
-//! endpoint, served on a loopback port the tests' egress admits.
+//! A stub OpenID provider for the OIDC tests: discovery (with an end session endpoint and
+//! back-channel logout), a JWKS with P-256 keys, and a token endpoint, served on a loopback port
+//! the tests' egress admits. It also signs logout tokens.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -15,7 +16,9 @@ use serde_json::{Value, json};
 use url::Url;
 use zeroize::Zeroizing;
 
-use super::config::{ClaimNames, ClientSecret, OidcConfig, RoleMapping, TokenEndpointAuthMethod, ValueMatcher};
+use super::config::{
+    ClaimNames, ClientSecret, LogoutSettings, OidcConfig, RoleMapping, TokenEndpointAuthMethod, ValueMatcher,
+};
 use super::discovery::ProviderMetadata;
 use super::egress::ProviderEgress;
 use crate::auth::types::UserRole;
@@ -66,6 +69,43 @@ pub fn sign(
     jsonwebtoken::encode(&header, claims, &EncodingKey::from_ec_pem(pem.as_bytes()).unwrap()).unwrap()
 }
 
+/// An ES256 logout token over `claims`, typed `logout+jwt` and signed with the provider's key.
+pub fn sign_logout(claims: &Value) -> String {
+    sign_logout_with(KEY_A_PEM, Some(KEY_A_KID), claims)
+}
+
+/// An ES256 logout token over `claims`, typed `logout+jwt` and signed with the PKCS#8 key `pem`
+/// under `kid`.
+pub fn sign_logout_with(
+    pem: &str,
+    kid: Option<&str>,
+    claims: &Value,
+) -> String {
+    let mut header = Header::new(Algorithm::ES256);
+    header.typ = Some("logout+jwt".to_string());
+    header.kid = kid.map(str::to_string);
+    jsonwebtoken::encode(&header, claims, &EncodingKey::from_ec_pem(pem.as_bytes()).unwrap()).unwrap()
+}
+
+/// The claims of a valid logout token from `issuer`, for the account `user-1` and the provider
+/// session `sid`.
+pub fn logout_claims(
+    issuer: &str,
+    sid: &str,
+) -> Value {
+    let now = chrono::Utc::now().timestamp();
+    json!({
+        "iss": issuer,
+        "aud": CLIENT_ID,
+        "iat": now,
+        "exp": now + 120,
+        "jti": uuid::Uuid::new_v4().to_string(),
+        "sub": "user-1",
+        "sid": sid,
+        "events": { "http://schemas.openid.net/event/backchannel-logout": {} },
+    })
+}
+
 /// The claims of a valid ID token for `issuer` and the sign-in with `nonce`: an administrator of
 /// `org_123`.
 pub fn id_token_claims(
@@ -111,6 +151,7 @@ pub fn config_for(issuer: &str) -> OidcConfig {
             ],
             unmapped: None,
         },
+        logout: LogoutSettings::default(),
     }
 }
 
@@ -123,6 +164,8 @@ pub fn metadata_for(issuer: &str) -> ProviderMetadata {
         token_endpoint_auth_methods_supported: None,
         id_token_signing_alg_values_supported: None,
         code_challenge_methods_supported: Some(vec!["S256".to_string()]),
+        backchannel_logout_supported: Some(true),
+        end_session_endpoint: None,
     }
 }
 
@@ -140,6 +183,7 @@ struct StubState {
     discovery_fetches: usize,
     discovery_down: bool,
     discovery_overrides: Vec<(String, String)>,
+    end_session: bool,
     token_answer: (StatusCode, Value),
     token_requests: Vec<TokenRequest>,
 }
@@ -160,6 +204,7 @@ impl StubProvider {
             discovery_fetches: 0,
             discovery_down: false,
             discovery_overrides: Vec::new(),
+            end_session: true,
             token_answer: (StatusCode::BAD_REQUEST, json!({ "error": "invalid_grant" })),
             token_requests: Vec::new(),
         }));
@@ -215,6 +260,11 @@ impl StubProvider {
         jwk(None, KEY_A_X, KEY_A_Y)
     }
 
+    /// Publish key B under key A's `kid`.
+    pub fn publish_key_b_as_key_a(&self) {
+        self.set_jwks(json!({ "keys": [jwk(Some(KEY_A_KID), KEY_B_X, KEY_B_Y)] }));
+    }
+
     /// Publish key B in place of key A.
     pub fn rotate_to_key_b(&self) {
         self.set_jwks(json!({ "keys": [jwk(Some(KEY_B_KID), KEY_B_X, KEY_B_Y)] }));
@@ -258,6 +308,19 @@ impl StubProvider {
             .push((field.to_string(), value.to_string()));
     }
 
+    /// Publish no `end_session_endpoint` in discovery.
+    pub fn without_end_session(&self) {
+        self.state
+            .lock()
+            .unwrap()
+            .end_session = false;
+    }
+
+    /// The `end_session_endpoint` discovery publishes.
+    pub fn end_session_endpoint(&self) -> String {
+        format!("{}/logout", self.issuer)
+    }
+
     /// Answer the next token requests with `status` and `body`.
     pub fn answer_token_requests(
         &self,
@@ -294,7 +357,11 @@ async fn discovery(State(state): State<Arc<Mutex<StubState>>>) -> (StatusCode, J
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
         "id_token_signing_alg_values_supported": ["ES256"],
+        "backchannel_logout_supported": true,
     });
+    if state.end_session {
+        document["end_session_endpoint"] = json!(format!("{issuer}/logout"));
+    }
     for (field, value) in &state.discovery_overrides {
         document[field] = json!(value);
     }

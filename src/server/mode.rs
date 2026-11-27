@@ -207,6 +207,41 @@ pub fn spawn_signal_handlers() {}
 #[cfg(test)]
 pub(crate) static TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Holds [`TEST_GUARD`] with the instance Active and ready, for tests of handlers that answer only
+/// on a ready instance.
+#[cfg(test)]
+pub(crate) async fn ready_for_test() -> tokio::sync::MutexGuard<'static, ()> {
+    let guard = TEST_GUARD.lock().await;
+    if !is_ready_to_serve() {
+        set_server_mode(ServerMode::Active);
+        mark_activation_ready(current_activation_generation());
+    }
+    guard
+}
+
+/// Restores the server mode it was made with when dropped, Active and ready when that was Active.
+#[cfg(test)]
+pub(crate) struct RestoreMode(ServerMode);
+
+#[cfg(test)]
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        set_server_mode(self.0);
+        if self.0 == ServerMode::Active {
+            mark_activation_ready(current_activation_generation());
+        }
+    }
+}
+
+/// Sets the server mode to `mode`, not yet ready when Active, until the returned value is dropped,
+/// also when the test panics. The caller holds [`TEST_GUARD`].
+#[cfg(test)]
+pub(crate) fn switched_for_test(mode: ServerMode) -> RestoreMode {
+    let restore = RestoreMode(current_mode());
+    set_server_mode(mode);
+    restore
+}
+
 /// Runs `run` with the server mode set to `mode` under [`TEST_GUARD`], and restores the
 /// previous mode afterwards, also when `run` panics.
 #[cfg(test)]
@@ -214,19 +249,8 @@ pub(crate) async fn in_test_mode<T>(
     mode: ServerMode,
     run: impl std::future::Future<Output = T>,
 ) -> T {
-    struct Restore(ServerMode);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            set_server_mode(self.0);
-            if self.0 == ServerMode::Active {
-                mark_activation_ready(current_activation_generation());
-            }
-        }
-    }
-
     let _guard = TEST_GUARD.lock().await;
-    let _restore = Restore(current_mode());
-    set_server_mode(mode);
+    let _restore = switched_for_test(mode);
     run.await
 }
 

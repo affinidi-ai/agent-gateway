@@ -33,6 +33,10 @@ pub struct ProviderMetadata {
     pub id_token_signing_alg_values_supported: Option<Vec<String>>,
     #[serde(default)]
     pub code_challenge_methods_supported: Option<Vec<String>>,
+    #[serde(default)]
+    pub backchannel_logout_supported: Option<bool>,
+    #[serde(default)]
+    pub end_session_endpoint: Option<String>,
 }
 
 struct Cached {
@@ -235,7 +239,14 @@ fn check(
         ("authorization_endpoint", &metadata.authorization_endpoint),
         ("token_endpoint", &metadata.token_endpoint),
         ("jwks_uri", &metadata.jwks_uri),
-    ] {
+    ]
+    .into_iter()
+    .chain(
+        metadata
+            .end_session_endpoint
+            .as_ref()
+            .map(|endpoint| ("end_session_endpoint", endpoint)),
+    ) {
         let url = Url::parse(endpoint).map_err(|_| format!("discovery {field} is not an absolute URL"))?;
         if let Some(problem) = transport_problem(&url) {
             return Err(format!("discovery {field} {problem}"));
@@ -276,6 +287,13 @@ fn check(
             offered = ?algorithms,
             allowed = ?config.id_token_signing_algs,
             "The provider signs ID tokens with none of the algorithms in id_token_signing_algs; sign-in will fail"
+        );
+    }
+    if config.logout.backchannel && metadata.backchannel_logout_supported != Some(true) {
+        warn!(
+            issuer = %config.issuer,
+            "The provider does not say it supports back-channel logout; signing out there may not end dashboard \
+             sessions"
         );
     }
     Ok(())
@@ -466,6 +484,42 @@ mod tests {
             let refused = check(&metadata, &config).unwrap_err();
             assert!(refused.contains(field) && refused.contains("https://"), "{refused}");
         }
+    }
+
+    #[test]
+    fn an_end_session_endpoint_must_be_https_like_every_other_endpoint() {
+        let config = config_for("https://idp.example.com");
+        let mut metadata = metadata_for("https://idp.example.com");
+        metadata.end_session_endpoint = Some("https://idp.example.com/logout".to_string());
+        assert!(check(&metadata, &config).is_ok());
+
+        metadata.end_session_endpoint = Some("http://idp.example.com/logout".to_string());
+        let refused = check(&metadata, &config).unwrap_err();
+        assert!(refused.contains("end_session_endpoint") && refused.contains("https://"), "{refused}");
+
+        metadata.end_session_endpoint = Some("/logout".to_string());
+        let refused = check(&metadata, &config).unwrap_err();
+        assert!(refused.contains("end_session_endpoint is not an absolute URL"), "{refused}");
+    }
+
+    #[test]
+    fn a_provider_that_does_not_offer_back_channel_logout_is_warned_about_while_it_is_on() {
+        let mut config = config_for("https://idp.example.com");
+        let mut metadata = metadata_for("https://idp.example.com");
+        let warning = "does not say it supports back-channel logout";
+        let warned = |metadata: &ProviderMetadata, config: &OidcConfig| {
+            let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+            check(metadata, config).unwrap();
+            logs.text().contains(warning)
+        };
+
+        assert!(!warned(&metadata, &config), "the provider offers it");
+        metadata.backchannel_logout_supported = None;
+        assert!(warned(&metadata, &config));
+        metadata.backchannel_logout_supported = Some(false);
+        assert!(warned(&metadata, &config));
+        config.logout.backchannel = false;
+        assert!(!warned(&metadata, &config), "the route is off, so nothing is lost");
     }
 
     #[test]

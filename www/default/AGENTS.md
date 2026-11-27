@@ -109,6 +109,33 @@ mode:
   button reads "Sign in with {label}", the provider name `oidc.json` sets, and "Sign in with
   SSO" when the answer has no label. The label is rendered as text, never as markup. The
   button is `login-sso-button` in both modes, and its icon is `aria-hidden`.
+- Reached with `?signed_out=1` (where an OpenID provider sends the browser after signing the
+  person out), the page shows "You have signed out." as its success message: in the SAML and
+  OIDC form a success `Alert` with `role="status"` and `login-signed-out-notice`, in the passkey
+  form the success `Alert` registration uses. The notice is shown alone: a `session_expired`
+  flag left by the session is cleared, not shown. Before anything reads the location, the page
+  removes the marker, and the `state` the provider echoes beside it, with
+  `history.replaceState`, keeping the router's history state, the other query parameters and the
+  hash, so a reload does not show the notice again and `loginNextTarget` never sees it.
+
+### Signing out
+
+`sessionManager.logout()` (`api.ts`) posts `/api/auth/logout`, drops the session token and
+resolves to the answer's `end_session_url` when it parses as an `http:` or `https:` address (an
+OIDC session, see `docs/CONFIGURATION_REFERENCE.md`), else to nothing. It resolves to the
+parsed `href`, so the address checked is the address followed.
+
+`App.tsx` owns sign-out, and both explicit sign-outs go through its `handleLogout` once: the
+topbar user menu's **Sign Out** (`AuthenticatedApp.tsx` only disconnects the WebSocket and calls
+`onLogout`) and the Terms page's **Sign out**. `handleLogout` first shows the page loader with
+`flushSync`, which unmounts the dashboard, its pollers and any `beforeunload` prompt, then calls
+`sessionManager.signOut()`, the one `POST /api/auth/logout`. `signOut()` sends the browser to the
+provider's address with `window.location.assign` and resolves to `true`, and the loader stays
+while the browser leaves; the sign-in page is shown only when it resolves to `false`. Once the
+browser is leaving, `expireSession()` does nothing (and one already under way does not reload),
+and a page restored from the back-forward cache (`pageshow` with `persisted`) reloads, so it shows
+the sign-in page rather than the loader. `expireSession()` calls `logout()` and never follows the
+address, so a session that timed out does not sign the person out of the provider.
 
 ## CLI consent page
 

@@ -43,6 +43,11 @@ pub enum JwtBearerError {
     #[error("Key not found for kid: {0}")]
     KeyNotFound(String),
 
+    /// The `kid` is not in the cached JWKS, which was fetched again for an unknown `kid` too
+    /// recently to fetch it now; a key published since then is not seen until the cooldown ends.
+    #[error("Key not found for kid: {0}; the keys were fetched again too recently to check for it")]
+    KeyNotFoundDuringCooldown(String),
+
     /// A storage I/O error occurred.
     #[error("Storage error: {0}")]
     Storage(String),

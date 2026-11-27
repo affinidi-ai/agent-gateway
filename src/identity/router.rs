@@ -264,22 +264,41 @@ async fn ensure_vta_auth_did(
     config
 }
 
-/// The OIDC sign-in routes. `/auth/check` and `/auth/logout` behave as in SAML mode.
-fn oidc_auth_routes(
+/// The OIDC sign-in routes, the dashboard sign-out (`/auth/logout` is the OIDC sign-out), and,
+/// unless `oidc.json` turns it off, back-channel logout. `/auth/check` behaves as in SAML mode.
+pub(crate) fn oidc_auth_routes(
     oidc_state: std::sync::Arc<crate::auth::oidc::OidcState>,
     sessions: std::sync::Arc<crate::auth::SessionManager>,
     terms_manager: Arc<crate::terms::TermsManager>,
     metric_store: Option<Arc<MetricsStore>>,
 ) -> Router {
+    // The provider posts logout tokens server to server: no sign-in throttle, which would refuse
+    // a burst of legitimate logouts, but a small body limit.
+    let backchannel_logout = if oidc_state
+        .config
+        .logout
+        .backchannel
+    {
+        Router::new().route(
+            "/oidc/backchannel-logout",
+            post(crate::auth::oidc::oidc_backchannel_logout)
+                .layer(axum::extract::DefaultBodyLimit::max(crate::auth::oidc::MAX_BACKCHANNEL_LOGOUT_BYTES)),
+        )
+    } else {
+        Router::new()
+    };
     Router::new()
         .route("/oidc/login", get(crate::auth::oidc::oidc_login))
         .route("/oidc/callback", get(crate::auth::oidc::oidc_callback))
+        .route("/oidc/initiate", get(crate::auth::oidc::oidc_initiate).post(crate::auth::oidc::oidc_initiate))
+        .route("/oidc/logout", post(crate::auth::oidc::oidc_logout))
+        .route("/auth/logout", post(crate::auth::oidc::oidc_logout))
+        .merge(backchannel_logout)
         .layer(Extension(metric_store))
         .with_state(oidc_state)
         .merge(
             Router::new()
                 .route("/auth/check", get(crate::auth::saml::saml_check_auth))
-                .route("/auth/logout", post(crate::auth::saml::saml_logout_generic))
                 .layer(Extension(sessions))
                 .layer(Extension(terms_manager)),
         )
@@ -612,7 +631,7 @@ pub async fn create_identity_api_router(
                         terms_manager.clone(),
                         metric_store.clone(),
                     ));
-                info!("OIDC routes registered (login, callback, logout, check)");
+                info!("OIDC routes registered (login, callback, initiate, logout, back-channel logout, check)");
                 (router, Some(storage), Some(session_mgr))
             }
             None => {
@@ -3484,5 +3503,101 @@ mod a2a_proxy_gating_tests {
             .await
             .unwrap();
         assert_eq!(list.status(), StatusCode::OK, "list must remain available");
+    }
+}
+
+#[cfg(test)]
+mod oidc_route_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    async fn routes(backchannel: bool) -> (Router, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            crate::auth::storage::PasskeyStorage::new(
+                dir.path()
+                    .join("users")
+                    .to_string_lossy()
+                    .into_owned(),
+                dir.path()
+                    .join("avatars")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        let sessions = Arc::new(crate::auth::SessionManager::new());
+        let terms = Arc::new(crate::terms::TermsManager::disabled());
+        let mut config = crate::auth::oidc::test_support::config_for("https://idp.example.test");
+        config.logout.backchannel = backchannel;
+        let state = Arc::new(crate::auth::oidc::OidcState::new(config, storage, sessions.clone(), terms.clone()));
+        (oidc_auth_routes(state, sessions, terms, None), dir)
+    }
+
+    async fn post_form(
+        app: &Router,
+        path: &str,
+        form: &str,
+    ) -> (StatusCode, String) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(form.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn back_channel_logout_is_served_unless_oidc_json_turns_it_off() {
+        let (on, _on) = routes(true).await;
+        let (off, _off) = routes(false).await;
+
+        assert_eq!(
+            post_form(&on, "/oidc/backchannel-logout", "").await,
+            (StatusCode::BAD_REQUEST, r#"{"error":"invalid_request"}"#.to_string())
+        );
+        assert_eq!(
+            post_form(&off, "/oidc/backchannel-logout", "logout_token=x")
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn a_back_channel_logout_body_over_the_limit_is_refused_as_invalid() {
+        let (app, _dir) = routes(true).await;
+        let oversized = format!("logout_token={}", "a".repeat(crate::auth::oidc::MAX_BACKCHANNEL_LOGOUT_BYTES));
+
+        assert_eq!(
+            post_form(&app, "/oidc/backchannel-logout", &oversized).await,
+            (StatusCode::BAD_REQUEST, r#"{"error":"invalid_request"}"#.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_dashboard_sign_out_and_the_providers_link_are_the_oidc_handlers() {
+        let (app, _dir) = routes(true).await;
+
+        for path in ["/auth/logout", "/oidc/logout"] {
+            assert_eq!(post_form(&app, path, "").await, (StatusCode::OK, "{}".to_string()), "{path}");
+        }
+        let (status, page) = post_form(&app, "/oidc/initiate", "iss=https%3A%2F%2Fother.example").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(page.contains("not for this dashboard"), "{page}");
     }
 }

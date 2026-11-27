@@ -1,13 +1,13 @@
 import React from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { apiClient } from '../api';
+import { apiClient, sessionManager } from '../api';
 import { authenticateWithPasskey } from '../utils/passkeys';
 import LoginPage from './LoginPage';
 
 jest.mock('../api', () => ({
   apiClient: { fetch: jest.fn() },
   sessionManager: {
-    didSessionExpire: () => false,
+    didSessionExpire: jest.fn(),
     clearSessionExpiredError: jest.fn(),
     getSessionToken: () => null,
     getCookie: () => null,
@@ -27,7 +27,7 @@ const HOSTILE_NEXT = 'https://evil.example/steal';
 
 const originalLocation = window.location;
 
-function setLocation(pathname: string, search: string) {
+function setLocation(pathname: string, search: string, hash = '') {
   Object.defineProperty(window, 'location', {
     configurable: true,
     value: {
@@ -35,7 +35,8 @@ function setLocation(pathname: string, search: string) {
       origin: ORIGIN,
       pathname,
       search,
-      href: `${ORIGIN}${pathname}${search}`,
+      hash,
+      href: `${ORIGIN}${pathname}${search}${hash}`,
     },
   });
 }
@@ -196,4 +197,75 @@ test('a SAML sign-in keeps its SSO button and ignores a label', async () => {
   render(<LoginPage onLogin={jest.fn()} />);
 
   expect(await screen.findByTestId('login-sso-button')).toHaveTextContent(/^Sign in with SSO$/);
+});
+
+const SIGNED_OUT = 'You have signed out.';
+
+test('the login page says the person has signed out when the provider sends them back, and drops the marker', async () => {
+  const routerState = { usr: null, key: 'router-key', idx: 0 };
+  window.history.replaceState(routerState, '');
+  const replaceState = jest.spyOn(window.history, 'replaceState').mockImplementation(() => {});
+  mockAuthMode('oidc', 'Example Directory');
+  setLocation('/', '?signed_out=1&tab=a');
+
+  render(<LoginPage onLogin={jest.fn()} />);
+
+  expect(await screen.findByTestId('login-signed-out-notice')).toHaveTextContent(SIGNED_OUT);
+  expect(screen.getByRole('status')).toHaveTextContent(SIGNED_OUT);
+  expect(replaceState).toHaveBeenCalledWith(routerState, '', '/?tab=a');
+  replaceState.mockRestore();
+  window.history.replaceState(null, '');
+});
+
+test('the login page drops the state the provider echoes with the marker and keeps the rest of the address', async () => {
+  const replaceState = jest.spyOn(window.history, 'replaceState').mockImplementation(() => {});
+  mockAuthMode('oidc', 'Example Directory');
+  setLocation('/', '?signed_out=1&state=r4nd0m&tab=a', '#top');
+
+  render(<LoginPage onLogin={jest.fn()} />);
+
+  await screen.findByTestId('login-signed-out-notice');
+  expect(replaceState).toHaveBeenCalledWith(null, '', '/?tab=a#top');
+  replaceState.mockRestore();
+});
+
+test('an ordinary visit to the login page shows no signed-out notice', async () => {
+  const replaceState = jest.spyOn(window.history, 'replaceState').mockImplementation(() => {});
+  mockAuthMode('oidc', 'Example Directory');
+  setLocation('/', '?signed_out=0&state=r4nd0m');
+
+  render(<LoginPage onLogin={jest.fn()} />);
+
+  await screen.findByTestId('login-sso-button');
+  expect(screen.queryByTestId('login-signed-out-notice')).not.toBeInTheDocument();
+  expect(replaceState).not.toHaveBeenCalled();
+  replaceState.mockRestore();
+});
+
+test('a session that expired before the provider signed the person out shows only the signed-out notice', async () => {
+  const replaceState = jest.spyOn(window.history, 'replaceState').mockImplementation(() => {});
+  (sessionManager.didSessionExpire as jest.Mock).mockReturnValue(true);
+  mockAuthMode('oidc', 'Example Directory');
+  setLocation('/', '?signed_out=1');
+
+  render(<LoginPage onLogin={jest.fn()} />);
+
+  expect(await screen.findByTestId('login-signed-out-notice')).toHaveTextContent(SIGNED_OUT);
+  expect(screen.queryByText(/session has expired/)).not.toBeInTheDocument();
+  expect(sessionManager.clearSessionExpiredError).toHaveBeenCalled();
+  replaceState.mockRestore();
+});
+
+test('an expired session without the marker still says the session has expired', async () => {
+  (sessionManager.didSessionExpire as jest.Mock).mockReturnValue(true);
+  mockAuthMode('oidc', 'Example Directory');
+  setLocation('/', '');
+
+  render(<LoginPage onLogin={jest.fn()} />);
+
+  expect(
+    await screen.findByText('Your session has expired. Please sign in again.')
+  ).toBeInTheDocument();
+  expect(screen.queryByTestId('login-signed-out-notice')).not.toBeInTheDocument();
+  expect(sessionManager.clearSessionExpiredError).toHaveBeenCalled();
 });

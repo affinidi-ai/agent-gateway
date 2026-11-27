@@ -1,6 +1,7 @@
 Feature: No OpenID Connect sign-in outside OIDC mode
-  The OpenID Connect sign-in routes exist only when human users sign in with OpenID Connect. With
-  passkeys or SAML, opening them finds nothing: no redirect to a provider and no binding cookie.
+  The OpenID Connect sign-in, sign-in link and logout routes exist only when human users sign in
+  with OpenID Connect. With passkeys or SAML, opening them finds nothing: no redirect to a provider
+  and no binding cookie.
 
   Scenario: A gateway whose human users sign in with passkeys offers no OpenID Connect sign-in
     When a browser opens the OpenID Connect sign-in routes

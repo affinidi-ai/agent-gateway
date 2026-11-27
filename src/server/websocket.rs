@@ -1219,6 +1219,7 @@ mod tests {
             created_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::minutes(5),
             terms_gate,
+            oidc: None,
         }
     }
 

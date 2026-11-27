@@ -113,6 +113,26 @@ const SSO_LOGIN_PATHS: Record<SsoMode, string> = {
 
 const isSsoMode = (mode: AuthMode | null): mode is SsoMode => mode !== null && mode !== 'passkey';
 
+/**
+ * Whether the identity provider sent the browser back after signing the person out
+ * (`?signed_out=1`, the configured post-logout address). The marker, and the `state` the provider
+ * echoes beside it, are removed from the address first, so a reload does not show the notice
+ * again and a sign-in never returns to it.
+ */
+const takeSignedOutNotice = (): boolean => {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('signed_out') !== '1') return false;
+  params.delete('signed_out');
+  params.delete('state');
+  const query = params.toString();
+  window.history.replaceState(
+    window.history.state,
+    '',
+    `${window.location.pathname}${query ? `?${query}` : ''}${window.location.hash}`
+  );
+  return true;
+};
+
 const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
   const [mode, setMode] = useState<'login' | 'register'>('login');
   const [username, setUsername] = useState('');
@@ -127,7 +147,10 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
   const registrationTerms = useRegistrationTerms(mode === 'register', setError);
 
   useEffect(() => {
-    if (sessionManager.didSessionExpire()) {
+    if (takeSignedOutNotice()) {
+      sessionManager.clearSessionExpiredError();
+      setSuccess('You have signed out.');
+    } else if (sessionManager.didSessionExpire()) {
       sessionManager.clearSessionExpiredError();
       setError('Your session has expired. Please sign in again.');
     }
@@ -253,6 +276,11 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
       return (
         <>
           {error && <Alert variant="danger">{error}</Alert>}
+          {success && (
+            <Alert variant="success" role="status" data-testid="login-signed-out-notice">
+              {success}
+            </Alert>
+          )}
           <Form onSubmit={handleLogin}>
             <div className="d-grid">
               <Button

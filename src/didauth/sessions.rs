@@ -680,6 +680,7 @@ mod tests {
             created_at: now,
             expires_at: now + chrono::Duration::minutes(20),
             terms_gate: crate::auth::session::TermsSessionGate::AllowedAtLogin,
+            oidc: None,
         };
         std::fs::write(&dashboard_file, serde_json::to_vec(&dashboard_session).unwrap()).unwrap();
         let logs = FormattedLogs::capture();

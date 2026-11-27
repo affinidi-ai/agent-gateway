@@ -1,4 +1,5 @@
 import React, { Suspense, lazy } from 'react';
+import { flushSync } from 'react-dom';
 import { BrowserRouter as Router } from 'react-router-dom';
 
 import { AppButton } from './components/shared/AppButton';
@@ -17,6 +18,7 @@ const CliConsentPage = lazy(() => import('./pages/CliConsentPage'));
 
 type AppAuthState =
   | 'loading'
+  | 'signing_out'
   | 'signed_out'
   | 'consent_pending'
   | 'authenticated'
@@ -145,12 +147,14 @@ const App: React.FC = () => {
     };
   }, []);
 
-  const handleLogout = () =>
-    sessionManager.logout().then(() => {
-      setAuthState('signed_out');
+  const handleLogout = () => {
+    flushSync(() => setAuthState('signing_out'));
+    return sessionManager.signOut().then(leaving => {
+      if (!leaving) setAuthState('signed_out');
     });
+  };
 
-  if (authState === 'loading') return <PageLoader />;
+  if (authState === 'loading' || authState === 'signing_out') return <PageLoader />;
 
   return (
     <Router>

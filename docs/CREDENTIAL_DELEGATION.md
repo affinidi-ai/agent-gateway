@@ -2244,8 +2244,9 @@ refused instead:
      sealed `nonce`. A token that fails is refused with `consent_identity_missing` and logged
      as a `WARN` with a coarse `cause` (`token`, `issuer`, `audience`, `expired`, `claims`,
      `nonce`, `iat` or `malformed`, or `no_id_token` for an answer without one) and no claim
-     value. A JWKS that cannot be fetched refuses
-     the request with `credentials_unavailable` instead (`cause` `jwks_unavailable`);
+     value. A JWKS that cannot be fetched, or that was fetched again too recently to look for
+     a key the ID token names and it lacks, refuses the request with `credentials_unavailable`
+     instead (`cause` `jwks_unavailable`);
    - the identity hash recomputed from the ID token is the sealed one. The value is the
      ID-token claim's, and it is hashed under the strategy's claim name, as the caller's access
      token was.

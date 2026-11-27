@@ -2039,6 +2039,7 @@ pub async fn run_axum_proxy(
                     &network_config.client_ip,
                 );
                 let (storage, session_manager) = initialize_sso_user_stores(&bootstrap_config).await?;
+                session_manager.accept_only_sign_ins_at(&oidc_config.issuer);
                 let state = Arc::new(crate::auth::oidc::OidcState::new(
                     oidc_config,
                     storage,

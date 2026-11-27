@@ -1419,6 +1419,7 @@ mod tests {
                 "alice".to_string(),
                 TEST_USER_ID.to_string(),
                 TermsSessionGate::ConsentPending,
+                None,
             )
             .await;
         let store = Arc::new(CliLoginStore::new());

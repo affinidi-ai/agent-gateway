@@ -123,9 +123,10 @@ pub fn sign_in_with_saml(
 }
 
 /// Switches the gateway written under `base_dir` to OpenID Connect sign-in at the provider
-/// `issuer`, binding sign-in to [`BOUND_TENANT`] and mapping the `roles` claim, with `settings`
-/// written over that `oidc.json`. The client secret is a `file://` reference to a file with a
-/// trailing newline, as an operator's secret file usually has.
+/// `issuer`, binding sign-in to [`BOUND_TENANT`], mapping the `roles` claim and returning from the
+/// provider's sign-out to [`post_logout_redirect_uri`], with `settings` written over that
+/// `oidc.json`. The client secret is a `file://` reference to a file with a trailing newline, as an
+/// operator's secret file usually has.
 pub fn sign_in_with_oidc(
     base_dir: &Path,
     gateway_port: u16,
@@ -147,6 +148,7 @@ pub fn sign_in_with_oidc(
             "claim": "roles",
             "values": { "gw-admins": "administrator", "gw-power": "poweruser", "gw-all": "user" },
         },
+        "logout": { "post_logout_redirect_uri": post_logout_redirect_uri(gateway_port) },
     });
     for (key, value) in settings {
         oidc[key] = value.clone();
@@ -161,6 +163,12 @@ pub fn sign_in_with_oidc(
         .replacen("auth_mode = \"passkey\"", "auth_mode = \"oidc\"", 1)
         .replacen("[config_files]\n", &format!("[config_files]\noidc = \"{}\"\n", oidc_path.display()), 1);
     std::fs::write(&config_path, config).expect("write config.toml");
+}
+
+/// Where the OpenID provider sends the browser after signing the person out: the dashboard of the
+/// gateway on `gateway_port`, which says the person has signed out.
+pub fn post_logout_redirect_uri(gateway_port: u16) -> String {
+    format!("http://localhost:{gateway_port}/?signed_out=1")
 }
 
 /// Sets the appliance limit on human users of the gateway written under `base_dir` to `limit`.

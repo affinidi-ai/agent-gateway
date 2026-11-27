@@ -194,6 +194,7 @@ export type AgentCardResponse =
 class SessionManager {
   private static readonly YES_VALUE = '1';
   private static readonly SESSION_EXPIRED_KEY = 'session_expired';
+  private leaving = false;
 
   didSessionExpire(): boolean {
     return sessionStorage.getItem(SessionManager.SESSION_EXPIRED_KEY) === SessionManager.YES_VALUE;
@@ -241,18 +242,44 @@ class SessionManager {
     sessionStorage.setItem('session_token', sessionToken);
   }
 
-  async logout(logoutAction: () => void = () => {}): Promise<void> {
-    logoutAction();
+  /**
+   * End the dashboard session. Resolves to the identity provider's sign-out address when the
+   * server gives one (OpenID Connect sign-in), which only an explicit sign-out opens: see
+   * {@link signOut}.
+   */
+  async logout(): Promise<string | undefined> {
+    let endSessionUrl: string | undefined;
     try {
-      await fetch('/api/auth/logout', {
+      const response = await fetch('/api/auth/logout', {
         method: 'POST',
         headers: this.getAuthHeaders(),
       });
+      if (response.ok) {
+        endSessionUrl = providerSignOutAddress(await response.json().catch(() => null));
+      }
     } catch (error) {
       console.error('Logout failed:', error);
     }
 
     sessionStorage.removeItem('session_token');
+    return endSessionUrl;
+  }
+
+  /**
+   * Sign out at the person's request: end the session and, when the identity provider has a
+   * sign-out address, go there so they are signed out of the provider too. Resolves to true when
+   * the browser is leaving for it. From then on {@link expireSession} does nothing, and a page
+   * restored from the back-forward cache is reloaded, so it shows the sign-in page.
+   */
+  async signOut(): Promise<boolean> {
+    const endSessionUrl = await this.logout();
+    if (!endSessionUrl) return false;
+    this.leaving = true;
+    window.addEventListener('pageshow', event => {
+      if (event.persisted) window.location.reload();
+    });
+    window.location.assign(endSessionUrl);
+    return true;
   }
 
   /** Drop a token the server no longer recognises, without telling the server. */
@@ -261,8 +288,23 @@ class SessionManager {
   }
 
   expireSession(): void {
+    if (this.leaving) return;
     this.setSessionExpiredError();
-    this.logout().finally(() => window.location.reload());
+    this.logout().finally(() => {
+      if (!this.leaving) window.location.reload();
+    });
+  }
+}
+
+/** The `end_session_url` of a sign-out answer, when it is an `http(s)` address, as parsed. */
+function providerSignOutAddress(answer: unknown): string | undefined {
+  const url = (answer as { end_session_url?: unknown } | null)?.end_session_url;
+  if (typeof url !== 'string') return undefined;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:' ? parsed.href : undefined;
+  } catch {
+    return undefined;
   }
 }
 
