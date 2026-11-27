@@ -563,6 +563,37 @@ pub(crate) async fn hold_provider_bindings_exclusively() -> tokio::sync::RwLockW
         .await
 }
 
+/// Wait until a task is queued for [`PROVIDER_BINDINGS`] exclusively. Call it while
+/// the test holds the lock shared: the lock is fair, so a shared request stays
+/// pending only while a writer is queued ahead of it.
+#[cfg(test)]
+pub(crate) async fn wait_for_queued_bindings_writer() {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while futures::FutureExt::now_or_never(hold_provider_bindings()).is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a task queues for the exclusive bindings lock");
+}
+
+/// Assert that `task`, queued behind an exclusive hold of [`PROVIDER_BINDINGS`] the
+/// test keeps, has not finished. A reader waiting behind a writer cannot be
+/// observed, so this is a bounded wait: it fails as soon as the task finishes,
+/// and a task that respects the lock costs the whole window.
+#[cfg(test)]
+pub(crate) async fn assert_waiting_on_bindings<T>(
+    task: &tokio::task::JoinHandle<T>,
+    message: &str,
+) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+    while tokio::time::Instant::now() < deadline {
+        assert!(!task.is_finished(), "{message}");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(!task.is_finished(), "{message}");
+}
+
 /// Refuse `after` when it binds a credential provider that no longer exists,
 /// or that its tenant may no longer reference, one the surface stored now,
 /// `current`, does not bind already: its references were checked before the
@@ -1812,8 +1843,7 @@ mod tests {
                 .await
             }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!write.is_finished(), "a surface write waits for a provider delete in progress");
+        assert_waiting_on_bindings(&write, "a surface write waits for a provider delete in progress").await;
         drop(exclusive);
         write
             .await

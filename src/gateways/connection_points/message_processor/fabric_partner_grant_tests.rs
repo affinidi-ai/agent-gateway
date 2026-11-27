@@ -1744,3 +1744,87 @@ async fn a_peer_the_surface_is_not_exposed_to_is_refused_before_any_grant() {
         "{events:?}"
     );
 }
+
+/// A partner's request whose path climbs out of the Target base path gets no
+/// grant: it is refused with `400` before any grant is read, recorded as a
+/// `target_path_refused` refusal at forward, and the Target is not called,
+/// whether or not the Target releases grants to partners. The same request
+/// below the base path still gets the person's grant.
+#[tokio::test]
+async fn a_partner_request_that_climbs_out_of_the_target_base_path_gets_no_grant() {
+    if ran_in_child("ATG_FABRIC_PARTNER_GRANT_BASE_PATH_CHILD").await {
+        return;
+    }
+    let receiver = Receiver::start_with(|served| {
+        served
+            .target
+            .delegated_credentials_for_fabric_callers = true;
+        served
+            .target
+            .endpoint
+            .push_str("/base");
+    })
+    .await;
+    receiver
+        .connected("alice")
+        .await;
+
+    for releases in [true, false] {
+        let mut served = receiver.surface(releases);
+        served
+            .target
+            .endpoint
+            .push_str("/base");
+        receiver.serve(&served).await;
+        let mut message = receiver.partner_request(receiver.as_user("alice"));
+        message.message_body["path"] = json!("/%2e%2e/admin");
+        let reached = receiver
+            .target
+            .received()
+            .len();
+        let (response, events) = crate::audit::producer::capture(
+            receiver
+                .egress()
+                .scope(forward_response(&message)),
+        )
+        .await;
+        let body: Value = serde_json::from_str(
+            response["body"]
+                .as_str()
+                .unwrap_or_default(),
+        )
+        .unwrap_or(Value::Null);
+        assert_eq!(response["status"], 400, "switch {releases}: {response}");
+        assert_eq!(body["detail"], "Target authentication failed", "switch {releases}: {body}");
+        assert_eq!(body["reason"], "target_path_refused", "switch {releases}: {body}");
+        assert_eq!(
+            rejections(&events),
+            Rejections::from([(RejectionStage::Forward, RejectionReason::TargetPathRefused, true)]),
+            "switch {releases}"
+        );
+        assert_eq!(
+            receiver
+                .target
+                .received()
+                .len(),
+            reached,
+            "switch {releases}: the Target is not called"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.event, DelegationAuditAction::TokenInjected)),
+            "switch {releases}: no grant is released: {events:?}"
+        );
+    }
+
+    let mut served = receiver.surface(true);
+    served
+        .target
+        .endpoint
+        .push_str("/base");
+    receiver.serve(&served).await;
+    receiver
+        .assert_released(&receiver.partner_request(receiver.as_user("alice")), "Bearer alice-access")
+        .await;
+}

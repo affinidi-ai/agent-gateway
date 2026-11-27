@@ -386,6 +386,35 @@ async fn method_request_sent_to_surface_path_with_headers(
     send_method_request_to_surface_path(world, &method, gw_index, &surface_name, &path, headers, None).await;
 }
 
+/// The path is sent as written, so a dot segment such as `%2e%2e` reaches the
+/// gateway rather than being resolved by the HTTP client first.
+#[when(
+    expr = "the caller sends a POST request with an A2A message body to gateway {int} surface {string} raw path {string}"
+)]
+async fn a2a_request_sent_to_surface_raw_path(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    surface_name: String,
+    path: String,
+) {
+    world.start().await;
+    let (_gw, surface_id) = world.surface(&surface_name);
+    let port = world
+        .harness()
+        .gw(gw_index)
+        .port;
+    let body = build_a2a_request_body();
+    let response =
+        crate::bdd_support::caller::post_raw_path(port, &format!("/{surface_id}{path}"), &body.to_string(), &[])
+            .await
+            .expect("caller request must succeed at the transport layer");
+    world.sent_body = Some(body);
+    world.response_status = Some(response.status);
+    world.response_content_type = response.content_type;
+    world.response_headers = response.headers;
+    world.response_body = Some(response.body);
+}
+
 async fn send_method_request_to_surface_path(
     world: &mut G2gWorld,
     method: &str,

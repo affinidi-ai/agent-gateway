@@ -409,6 +409,174 @@ struct RegisteredCatalogs {
     legacy: Option<Arc<RwLock<McpServer>>>,
     modern: Arc<RwLock<McpServer>>,
     warning: Option<String>,
+    /// Why the legacy catalog could not be loaded, when it could not.
+    legacy_error: Option<String>,
+}
+
+/// What a proxy's parsed catalogs depend on: the proxy's base URL and the digest of its
+/// OpenAPI spec. Nothing else of the proxy is read when they are parsed.
+#[derive(PartialEq, Eq)]
+struct CatalogInputs {
+    base_url: String,
+    spec_digest: [u8; 32],
+}
+
+impl CatalogInputs {
+    fn of(proxy: &McpProxy) -> Self {
+        use sha2::Digest;
+        Self {
+            base_url: proxy.base_url.clone(),
+            spec_digest: sha2::Sha256::digest(proxy.openapi_spec.as_bytes()).into(),
+        }
+    }
+}
+
+/// One proxy's catalogs for one set of [`CatalogInputs`]: empty until the first request parses
+/// them. Other requests for the same slot wait on the cell without holding a runtime worker.
+struct CatalogSlot {
+    inputs: CatalogInputs,
+    catalogs: tokio::sync::OnceCell<RegisteredCatalogs>,
+}
+
+/// Every proxy's catalog slot, by proxy id. The parsed servers are never changed after they are
+/// built, so every request shares them.
+static PARSED_CATALOGS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Arc<CatalogSlot>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// How many times each proxy's spec was parsed, by proxy id.
+#[cfg(test)]
+static CATALOG_PARSES: std::sync::LazyLock<std::sync::Mutex<HashMap<String, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// The catalogs of `proxy`, parsed from its spec once and served from [`PARSED_CATALOGS`]
+/// while its id, base URL and spec stay the same; a proxy whose base URL or spec changed is
+/// parsed again. The parse runs on a blocking thread, and requests that find the catalogs
+/// unparsed wait for it on the proxy's own slot, so its spec is parsed once between them while
+/// other proxies' lookups go on. A spec or base URL that cannot be parsed, or a parse that
+/// panicked or was cancelled, is an error and is not cached: the lookup removes its empty slot
+/// ([`EvictUnfilled`]), so a proxy that was never stored leaves nothing behind.
+async fn parsed_catalogs(proxy: &McpProxy) -> Result<RegisteredCatalogs, String> {
+    let slot = catalog_slot(proxy);
+    let _unfilled = EvictUnfilled {
+        proxy_id: &proxy.id,
+        slot: &slot,
+    };
+    slot.catalogs
+        .get_or_try_init(|| {
+            let proxy = proxy.clone();
+            async move {
+                tokio::task::spawn_blocking(move || parse_catalogs(&proxy))
+                    .await
+                    .map_err(|error| format!("Failed to parse OpenAPI spec: {error}"))?
+            }
+        })
+        .await
+        .cloned()
+}
+
+/// The slot `proxy`'s catalogs are kept in: the one in [`PARSED_CATALOGS`] while it was made
+/// for the proxy's current [`CatalogInputs`], else a new empty one that replaces it.
+fn catalog_slot(proxy: &McpProxy) -> Arc<CatalogSlot> {
+    let inputs = CatalogInputs::of(proxy);
+    let mut slots = PARSED_CATALOGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match slots.get(&proxy.id) {
+        Some(slot) if slot.inputs == inputs => slot.clone(),
+        _ => {
+            let slot = Arc::new(CatalogSlot {
+                inputs,
+                catalogs: tokio::sync::OnceCell::new(),
+            });
+            slots.insert(proxy.id.clone(), slot.clone());
+            slot
+        }
+    }
+}
+
+/// Removes `proxy_id`'s entry from [`PARSED_CATALOGS`] while it still holds `slot`, so a newer
+/// slot written for the same id meanwhile is kept.
+fn evict_if_current(
+    proxy_id: &str,
+    slot: &Arc<CatalogSlot>,
+) {
+    let mut slots = PARSED_CATALOGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slots
+        .get(proxy_id)
+        .is_some_and(|current| Arc::ptr_eq(current, slot))
+    {
+        slots.remove(proxy_id);
+    }
+}
+
+/// Removes its slot from [`PARSED_CATALOGS`] when dropped while the slot is still empty: the
+/// lookup that held it failed or was cancelled before any parse filled it.
+struct EvictUnfilled<'lookup> {
+    proxy_id: &'lookup str,
+    slot: &'lookup Arc<CatalogSlot>,
+}
+
+impl Drop for EvictUnfilled<'_> {
+    fn drop(&mut self) {
+        if !self
+            .slot
+            .catalogs
+            .initialized()
+        {
+            evict_if_current(self.proxy_id, self.slot);
+        }
+    }
+}
+
+/// Parses `proxy`'s spec into its catalogs: one for both revisions, or, when the spec's schemas
+/// cannot serve the legacy catalog, the modern catalog alone with a warning.
+fn parse_catalogs(proxy: &McpProxy) -> Result<RegisteredCatalogs, String> {
+    #[cfg(test)]
+    {
+        *CATALOG_PARSES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(proxy.id.clone())
+            .or_default() += 1;
+    }
+    let openapi_json: serde_json::Value =
+        serde_yaml::from_str(&proxy.openapi_spec).map_err(|e| format!("Failed to parse OpenAPI spec: {}", e))?;
+    let base_url = Url::parse(&proxy.base_url).map_err(|e| format!("Invalid base URL: {}", e))?;
+    let mut server = McpServer::builder()
+        .openapi_spec(openapi_json)
+        .base_url(base_url)
+        .build();
+    match server.load_openapi_spec() {
+        Ok(()) => {
+            let server = Arc::new(RwLock::new(server));
+            Ok(RegisteredCatalogs {
+                legacy: Some(server.clone()),
+                modern: server,
+                warning: None,
+                legacy_error: None,
+            })
+        }
+        Err(error) => {
+            let original = server.openapi_spec.clone();
+            server.openapi_spec = super::modern_rest::routing_spec(&original).map_err(|error| error.to_string())?;
+            server
+                .load_openapi_spec()
+                .map_err(|error| format!("Failed to load modern tool routing: {error}"))?;
+            server.openapi_spec = original;
+            warn!(proxy_id = %proxy.id, error = %error, "OpenAPI schema is unavailable to the legacy tool catalog");
+            Ok(RegisteredCatalogs {
+                legacy: None,
+                modern: Arc::new(RwLock::new(server)),
+                warning: Some(format!(
+                    "OpenAPI spec is unavailable to the MCP session tool catalog, so {legacy} clients cannot use this proxy: {error}",
+                    legacy = crate::mcp::request_validation::SESSION_VERSIONS.join(", ")
+                )),
+                legacy_error: Some(format!("Failed to load OpenAPI spec: {error}")),
+            })
+        }
+    }
 }
 
 impl McpServerManager {
@@ -418,52 +586,13 @@ impl McpServerManager {
         }
     }
 
-    /// Create and register a new MCP Server for the given proxy. Returns a
-    /// warning when only the modern catalog could be registered.
+    /// Create and register a new MCP Server for the given proxy, from its catalogs parsed once
+    /// ([`parsed_catalogs`]). Returns a warning when only the modern catalog could be registered.
     pub async fn create_server(
         &self,
         proxy: &McpProxy,
     ) -> Result<Option<String>, String> {
-        // Parse the OpenAPI spec from YAML to JSON
-        let openapi_json: serde_json::Value =
-            serde_yaml::from_str(&proxy.openapi_spec).map_err(|e| format!("Failed to parse OpenAPI spec: {}", e))?;
-
-        // Parse the base URL
-        let base_url = Url::parse(&proxy.base_url).map_err(|e| format!("Invalid base URL: {}", e))?;
-
-        // Build and load the MCP server
-        let mut server = McpServer::builder()
-            .openapi_spec(openapi_json)
-            .base_url(base_url)
-            .build();
-
-        let catalogs = match server.load_openapi_spec() {
-            Ok(()) => {
-                let server = Arc::new(RwLock::new(server));
-                RegisteredCatalogs {
-                    legacy: Some(server.clone()),
-                    modern: server,
-                    warning: None,
-                }
-            }
-            Err(error) => {
-                let original = server.openapi_spec.clone();
-                server.openapi_spec = super::modern_rest::routing_spec(&original).map_err(|error| error.to_string())?;
-                server
-                    .load_openapi_spec()
-                    .map_err(|error| format!("Failed to load modern tool routing: {error}"))?;
-                server.openapi_spec = original;
-                warn!(proxy_id = %proxy.id, error = %error, "OpenAPI schema is unavailable to the legacy tool catalog");
-                RegisteredCatalogs {
-                    legacy: None,
-                    modern: Arc::new(RwLock::new(server)),
-                    warning: Some(format!(
-                        "OpenAPI spec is unavailable to the MCP session tool catalog, so {legacy} clients cannot use this proxy: {error}",
-                        legacy = crate::mcp::request_validation::SESSION_VERSIONS.join(", ")
-                    )),
-                }
-            }
-        };
+        let catalogs = parsed_catalogs(proxy).await?;
         let warning = catalogs.warning.clone();
         self.servers
             .write()
@@ -481,6 +610,10 @@ impl McpServerManager {
     ) {
         let mut servers = self.servers.write().await;
         servers.remove(proxy_id);
+        PARSED_CATALOGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(proxy_id);
         info!("Removed MCP Server for proxy ID: {}", proxy_id);
     }
 
@@ -1023,6 +1156,7 @@ async fn send_discovery_request(
                     channel_name,
                     crate::config::A2aConfig::default().max_body_size,
                     check,
+                    None,
                 )
                 .await
                 .map_err(|e| match e {
@@ -1312,21 +1446,13 @@ pub async fn create_mcp_proxy<S: McpProxyStore>(
         .into_iter()
         .collect();
 
-    // Store the proxy
-    store
-        .create(&proxy)
-        .await
-        .map_err(|e| {
-            // If storage fails, clean up the server
-            let manager_clone = manager.clone();
-            let proxy_id = proxy.id.clone();
-            tokio::spawn(async move {
-                manager_clone
-                    .remove_server(&proxy_id)
-                    .await;
-            });
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+    // A proxy that cannot be stored keeps no server and no parsed catalogs.
+    if let Err(error) = store.create(&proxy).await {
+        manager
+            .remove_server(&proxy.id)
+            .await;
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
+    }
 
     // Trigger MCP proxy created event
     if let Some(ref notif_store) = notification_store {
@@ -2285,6 +2411,104 @@ pub(crate) async fn handle_modern_surface_http_request(
     Ok(response)
 }
 
+/// Where a tool call of an MCP proxy would send its REST request, as far as a credential sent
+/// with it is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolCallDestination {
+    /// Under the proxy's base path, or no tool call the proxy sends: the request goes on.
+    InsideBase,
+    /// Outside the proxy's base path: refused with `400 target_path_refused`.
+    OutsideBase,
+    /// The proxy's catalog cannot be parsed, so the destination cannot be known: refused as
+    /// the call itself would refuse it, before any credential is resolved.
+    CatalogUnavailable,
+}
+
+/// The answer to a `2026-07-28` request to an MCP proxy whose catalog cannot be parsed.
+pub(crate) fn catalog_unavailable(
+    request: &crate::mcp::request_validation::ValidatedModernMessage
+) -> crate::mcp::request_validation::McpRequestValidationError {
+    crate::mcp::request_validation::McpRequestValidationError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        id: request.id.clone(),
+        code: crate::mcp::error_codes::INTERNAL_ERROR,
+        message: "MCP tool catalog is unavailable".to_string(),
+        data: None,
+    }
+}
+
+/// Where a `2026-07-28` `tools/call` of `proxy` would send its REST request: outside the base
+/// when its path arguments take the URL out of the proxy's base path. Any other request, and a
+/// call the REST client refuses for another reason, such as an unknown tool or arguments it
+/// cannot read, is [`ToolCallDestination::InsideBase`].
+pub(crate) async fn modern_tool_call_destination(
+    proxy: &McpProxy,
+    request: &crate::mcp::request_validation::ValidatedModernMessage,
+) -> ToolCallDestination {
+    let Ok(catalogs) = parsed_catalogs(proxy).await else {
+        return ToolCallDestination::CatalogUnavailable;
+    };
+    let Some(params) = request
+        .params
+        .as_ref()
+        .filter(|_| request.method == "tools/call")
+    else {
+        return ToolCallDestination::InsideBase;
+    };
+    let (Some(name), Some(arguments)) = (
+        params
+            .get("name")
+            .and_then(serde_json::Value::as_str),
+        params
+            .get("arguments")
+            .filter(|arguments| arguments.is_object()),
+    ) else {
+        return ToolCallDestination::InsideBase;
+    };
+    let server = catalogs.modern.read().await;
+    let Some(tool) = server.get_tool(name) else {
+        return ToolCallDestination::InsideBase;
+    };
+    let arguments = if proxy.flatten_post_params {
+        wrap_request_body_if_needed(&server, name, arguments.clone())
+    } else {
+        arguments.clone()
+    };
+    if super::modern_rest::path_arguments_leave_base(&proxy.base_url, &tool.metadata, &arguments) {
+        ToolCallDestination::OutsideBase
+    } else {
+        ToolCallDestination::InsideBase
+    }
+}
+
+/// Where a legacy request to `proxy` would send its REST request, by the same check
+/// [`prepare_mcp_request`] makes of a call carrying a credential ([`tool_call_leaves_base`]):
+/// outside the base for a `tools/call` whose path arguments resolve outside the proxy's base
+/// directory. Any other request, and a call the proxy refuses for another reason, is
+/// [`ToolCallDestination::InsideBase`].
+pub(crate) async fn legacy_tool_call_destination(
+    proxy: &McpProxy,
+    request: &serde_json::Value,
+) -> ToolCallDestination {
+    let Ok((server, base_url)) = proxy_server(proxy).await else {
+        return ToolCallDestination::CatalogUnavailable;
+    };
+    if request
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        != Some("tools/call")
+    {
+        return ToolCallDestination::InsideBase;
+    }
+    let Ok((tool_name, arguments)) = legacy_tool_call(proxy, &server, request) else {
+        return ToolCallDestination::InsideBase;
+    };
+    match server.get_tool(&tool_name) {
+        Some(tool) if tool_call_leaves_base(&base_url, &tool.metadata, &arguments) => ToolCallDestination::OutsideBase,
+        _ => ToolCallDestination::InsideBase,
+    }
+}
+
 pub(crate) async fn handle_modern_surface_request(
     proxy: &McpProxy,
     surface: &crate::config::agent_surface::AgentSurface,
@@ -2303,13 +2527,7 @@ pub(crate) async fn handle_modern_surface_request(
         .await
         .map_err(|error| {
             warn!(proxy_id = %proxy.id, error = %error, "Failed to prepare modern surface tools");
-            Box::new(crate::mcp::request_validation::McpRequestValidationError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                id: request.id.clone(),
-                code: crate::mcp::error_codes::INTERNAL_ERROR,
-                message: "MCP tool catalog is unavailable".to_string(),
-                data: None,
-            })
+            Box::new(catalog_unavailable(request))
         })?;
     process_modern_mcp_request_with_headers(
         &proxy,
@@ -2896,18 +3114,20 @@ impl PreparedMcpRequest {
 /// `base_url`: what every request to the proxy is served with. It holds no
 /// credential: a credentialed tool call is sent by the gateway's own REST
 /// client with its headers.
-fn proxy_server(proxy: &McpProxy) -> Result<(McpServer, Url), McpProxyCallError> {
-    // Parse the OpenAPI spec from YAML to JSON
-    let openapi_json: serde_json::Value =
-        serde_yaml::from_str(&proxy.openapi_spec).map_err(|e| format!("Failed to parse OpenAPI spec: {}", e))?;
-    let base_url = Url::parse(&proxy.base_url).map_err(|e| format!("Invalid base_url: {}", e))?;
-    let mut server = McpServer::builder()
-        .openapi_spec(openapi_json)
-        .base_url(base_url.clone())
-        .build();
-    server
-        .load_openapi_spec()
-        .map_err(|e| format!("Failed to load OpenAPI spec: {}", e))?;
+async fn proxy_server(proxy: &McpProxy) -> Result<(McpServer, Url), McpProxyCallError> {
+    let catalogs = parsed_catalogs(proxy).await?;
+    let Some(legacy) = catalogs.legacy else {
+        return Err(catalogs
+            .legacy_error
+            .unwrap_or_else(|| "Failed to load OpenAPI spec".to_string())
+            .into());
+    };
+    // The parsed catalog is never written to, so it is always free to read.
+    let server = legacy
+        .try_read()
+        .map_err(|_| "MCP tool catalog is unavailable".to_string())?
+        .clone();
+    let base_url = server.base_url.clone();
     Ok((server, base_url))
 }
 
@@ -2969,8 +3189,10 @@ fn sends_a_method_override(server: &McpServer) -> bool {
 /// Whether `proxy`'s spec, loaded as a request to the proxy loads it, has a
 /// tool that can send a method override ([`sends_a_method_override`]). A
 /// spec that does not load serves no tool, so it sends none.
-pub fn spec_sends_a_method_override(proxy: &McpProxy) -> bool {
-    proxy_server(proxy).is_ok_and(|(server, _)| sends_a_method_override(&server))
+pub async fn spec_sends_a_method_override(proxy: &McpProxy) -> bool {
+    proxy_server(proxy)
+        .await
+        .is_ok_and(|(server, _)| sends_a_method_override(&server))
 }
 
 enum McpCall {
@@ -2988,7 +3210,7 @@ enum McpCall {
 /// `tools/call`, a tool the spec defines that, when it carries the Target
 /// credential, stays under the proxy's base path. Nothing is sent to the
 /// backend, so a refusal here can be given before the request is charged.
-pub fn prepare_mcp_request(
+pub async fn prepare_mcp_request(
     proxy: &super::types::McpProxy,
     request: serde_json::Value,
     target_auth_header: Option<(String, String)>,
@@ -3027,7 +3249,7 @@ pub fn prepare_mcp_request(
         None
     };
 
-    let (server, base_url) = proxy_server(proxy)?;
+    let (server, base_url) = proxy_server(proxy).await?;
 
     let method = request
         .get("method")
@@ -3042,27 +3264,7 @@ pub fn prepare_mcp_request(
         "initialize" => McpCall::Initialize,
         "tools/list" => McpCall::ToolsList,
         "tools/call" => {
-            let params = request
-                .get("params")
-                .ok_or_else(|| "Missing 'params' in tools/call request".to_string())?;
-
-            let tool_name = params
-                .get("name")
-                .and_then(|n| n.as_str())
-                .ok_or_else(|| "Missing tool 'name' in params".to_string())?
-                .to_string();
-
-            let raw_arguments = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or(serde_json::json!({}));
-
-            // Auto-wrap flat arguments into request_body if the tool expects it (only when flattening is enabled)
-            let arguments = if proxy.flatten_post_params {
-                wrap_request_body_if_needed(&server, &tool_name, raw_arguments)
-            } else {
-                raw_arguments
-            };
+            let (tool_name, arguments) = legacy_tool_call(proxy, &server, &request)?;
 
             let tool = server
                 .get_tool(&tool_name)
@@ -3103,6 +3305,33 @@ pub fn prepare_mcp_request(
     Ok(PreparedMcpRequest { server, request, call })
 }
 
+/// The tool a legacy `tools/call` `request` names and its arguments, wrapped into
+/// `request_body` as `proxy` sends them when it flattens POST parameters.
+fn legacy_tool_call(
+    proxy: &McpProxy,
+    server: &McpServer,
+    request: &serde_json::Value,
+) -> Result<(String, serde_json::Value), String> {
+    let params = request
+        .get("params")
+        .ok_or_else(|| "Missing 'params' in tools/call request".to_string())?;
+    let tool_name = params
+        .get("name")
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| "Missing tool 'name' in params".to_string())?
+        .to_string();
+    let raw_arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    let arguments = if proxy.flatten_post_params {
+        wrap_request_body_if_needed(server, &tool_name, raw_arguments)
+    } else {
+        raw_arguments
+    };
+    Ok((tool_name, arguments))
+}
+
 const CIRCUIT_OPEN_ERROR: &str = "Circuit breaker open";
 
 /// Whether `error`, from [`execute_mcp_request`], says the circuit breaker
@@ -3134,6 +3363,7 @@ pub async fn execute_mcp_request(
     policy_manager: Option<&std::sync::Arc<crate::policies::SurfacePolicyManager>>,
     channel_name: &str,
     sent_token: Option<&crate::proxy::handler::SentServiceToken<'_>>,
+    sender_meta_fields: &crate::proxy::credential_delegation::SenderDelegatedMeta,
 ) -> Result<serde_json::Value, McpProxyCallError> {
     let PreparedMcpRequest { server, request, call } = prepared;
     let request_id = request.get("id").cloned();
@@ -3277,6 +3507,11 @@ pub async fn execute_mcp_request(
             {
                 match serde_json::to_vec(&request) {
                     Ok(payload) => {
+                        let payload = crate::proxy::credential_delegation::mirror_body(
+                            surface,
+                            &payload.into(),
+                            sender_meta_fields,
+                        );
                         let mirror_request = mirror::MirrorRequest::new(mirror_config, reqwest::Method::POST, payload)
                             .header("Content-Type", "application/json")
                             .mirrored(None);
@@ -3552,6 +3787,219 @@ mod tests {
     use crate::mcp_proxies::types::McpProxy;
     use crate::tenancy::PatTenantContext;
 
+    /// Many requests that find a proxy's catalogs not yet parsed at once parse its unchanged
+    /// spec once between them; a changed spec is parsed again, once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_burst_of_first_lookups_parses_an_unchanged_spec_once() {
+        let paths: serde_json::Map<String, serde_json::Value> = (0..200)
+            .map(|index| {
+                (
+                    format!("/items{index}/{{id}}"),
+                    serde_json::json!({"get": {"operationId": format!("getItem{index}"),
+                        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                        "responses": {"200": {"description": "OK"}}}}),
+                )
+            })
+            .collect();
+        let spec =
+            serde_json::json!({"openapi": "3.0.0", "info": {"title": "Items", "version": "1.0"}, "paths": paths});
+        let mut proxy = McpProxy::new(
+            "Burst".into(),
+            String::new(),
+            "http://127.0.0.1:9".into(),
+            spec.to_string(),
+            "/mcp".into(),
+            format!("/burst-{}", uuid::Uuid::new_v4()),
+        );
+        let parses = |proxy: &McpProxy| {
+            super::CATALOG_PARSES
+                .lock()
+                .unwrap()
+                .get(&proxy.id)
+                .copied()
+                .unwrap_or_default()
+        };
+        async fn burst(proxy: &McpProxy) {
+            let start = Arc::new(tokio::sync::Barrier::new(8));
+            let lookups: Vec<_> = (0..8)
+                .map(|_| {
+                    let start = start.clone();
+                    let proxy = proxy.clone();
+                    tokio::spawn(async move {
+                        start.wait().await;
+                        super::parsed_catalogs(&proxy)
+                            .await
+                            .expect("the spec parses");
+                    })
+                })
+                .collect();
+            for lookup in lookups {
+                lookup
+                    .await
+                    .expect("the lookup finished");
+            }
+        }
+
+        burst(&proxy).await;
+        assert_eq!(parses(&proxy), 1, "the unchanged spec was parsed more than once");
+        burst(&proxy).await;
+        assert_eq!(parses(&proxy), 1, "a cached spec was parsed again");
+
+        proxy.base_url = "http://127.0.0.1:10".into();
+        burst(&proxy).await;
+        assert_eq!(parses(&proxy), 2, "a changed proxy is parsed again, once");
+    }
+
+    /// A spec that cannot be parsed is not cached: every lookup of it parses it again.
+    #[tokio::test]
+    async fn a_spec_that_cannot_be_parsed_is_parsed_again_on_the_next_lookup() {
+        let proxy = McpProxy::new(
+            "Broken".into(),
+            String::new(),
+            "http://127.0.0.1:9".into(),
+            "openapi: [not, a, spec".into(),
+            "/mcp".into(),
+            format!("/broken-{}", uuid::Uuid::new_v4()),
+        );
+        let parses = || {
+            super::CATALOG_PARSES
+                .lock()
+                .unwrap()
+                .get(&proxy.id)
+                .copied()
+                .unwrap_or_default()
+        };
+        for lookup in 1..=2 {
+            assert!(
+                super::parsed_catalogs(&proxy)
+                    .await
+                    .is_err(),
+                "lookup {lookup}"
+            );
+            assert_eq!(parses(), lookup, "a failed parse was cached");
+        }
+    }
+
+    fn holds_catalog_slot(proxy_id: &str) -> bool {
+        super::PARSED_CATALOGS
+            .lock()
+            .unwrap()
+            .contains_key(proxy_id)
+    }
+
+    /// A lookup whose spec cannot be parsed leaves no catalog slot behind for the proxy.
+    #[tokio::test]
+    async fn a_failed_lookup_leaves_no_catalog_slot() {
+        let proxy = McpProxy::new(
+            "Broken".into(),
+            String::new(),
+            "http://127.0.0.1:9".into(),
+            "openapi: [not, a, spec".into(),
+            "/mcp".into(),
+            format!("/broken-slot-{}", uuid::Uuid::new_v4()),
+        );
+        assert!(
+            super::parsed_catalogs(&proxy)
+                .await
+                .is_err()
+        );
+        assert!(!holds_catalog_slot(&proxy.id), "a failed parse left its slot");
+    }
+
+    /// A failed lookup removes only the slot it parsed into: a newer slot written meanwhile
+    /// for the same proxy id stays.
+    #[tokio::test]
+    async fn a_failed_lookup_never_evicts_a_newer_slot() {
+        let mut proxy = McpProxy::new(
+            "Items".into(),
+            String::new(),
+            "http://127.0.0.1:9".into(),
+            "openapi: [not, a, spec".into(),
+            "/mcp".into(),
+            format!("/newer-slot-{}", uuid::Uuid::new_v4()),
+        );
+        let failed = super::catalog_slot(&proxy);
+        proxy.openapi_spec = SPEC.to_string();
+        super::parsed_catalogs(&proxy)
+            .await
+            .expect("the newer spec parses");
+        let newer = super::catalog_slot(&proxy);
+        assert!(!Arc::ptr_eq(&failed, &newer));
+        super::evict_if_current(&proxy.id, &failed);
+        let current = super::PARSED_CATALOGS
+            .lock()
+            .unwrap()
+            .get(&proxy.id)
+            .cloned()
+            .expect("the newer slot stays");
+        assert!(Arc::ptr_eq(&current, &newer), "the failed lookup evicted a newer slot");
+    }
+
+    /// A create the gateway refuses, for a spec that cannot be parsed or because the proxy
+    /// cannot be stored, leaves no catalog slot for the proxy id it was given.
+    #[tokio::test]
+    async fn a_refused_mcp_proxy_create_leaves_no_catalog_slot() {
+        let invalid_id = format!("invalid-{}", uuid::Uuid::new_v4());
+        let mut body = create_body(Some(&invalid_id));
+        body["openapi_spec"] = serde_json::json!("openapi: [not, a, spec");
+        let refused = create(&store_with(Vec::new()), body, None, None)
+            .await
+            .expect_err("an invalid spec is refused");
+        assert_eq!(refused.0, StatusCode::BAD_REQUEST, "{refused:?}");
+        assert!(!holds_catalog_slot(&invalid_id), "a refused create left its slot");
+
+        let unstored_id = format!("unstored-{}", uuid::Uuid::new_v4());
+        let refused = super::create_mcp_proxy(
+            Extension(Arc::new(RefusingStore)),
+            Extension(Arc::new(super::McpServerManager::new())),
+            Extension(None),
+            Extension(no_resource_owners()),
+            None,
+            None,
+            None,
+            Json(serde_json::from_value(create_body(Some(&unstored_id))).unwrap()),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("a proxy that cannot be stored is refused");
+        assert_eq!(refused.0, StatusCode::INTERNAL_SERVER_ERROR, "{refused:?}");
+        assert!(!holds_catalog_slot(&unstored_id), "a create that could not be stored left its slot");
+    }
+
+    /// A store that holds nothing and refuses every create.
+    struct RefusingStore;
+
+    #[async_trait::async_trait]
+    impl crate::mcp_proxies::McpProxyStore for RefusingStore {
+        async fn create(
+            &self,
+            _proxy: &McpProxy,
+        ) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("the store refuses writes"))
+        }
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<Option<McpProxy>> {
+            Ok(None)
+        }
+        async fn list_all(&self) -> anyhow::Result<Vec<McpProxy>> {
+            Ok(Vec::new())
+        }
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update(
+            &self,
+            _proxy: &McpProxy,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     /// `request` prepared and, when it can be served, executed, as a surface's
     /// MCP proxy Target runs it.
     async fn handle_mcp_request_with_policies(
@@ -3563,8 +4011,17 @@ mod tests {
         target_auth_header: Option<(String, String)>,
         sent_token: Option<&crate::proxy::handler::SentServiceToken<'_>>,
     ) -> Result<serde_json::Value, super::McpProxyCallError> {
-        let prepared = super::prepare_mcp_request(proxy, request, target_auth_header, channel_name)?;
-        super::execute_mcp_request(proxy, prepared, surface, policy_manager, channel_name, sent_token).await
+        let prepared = super::prepare_mcp_request(proxy, request, target_auth_header, channel_name).await?;
+        super::execute_mcp_request(
+            proxy,
+            prepared,
+            surface,
+            policy_manager,
+            channel_name,
+            sent_token,
+            &crate::proxy::credential_delegation::SenderDelegatedMeta::NONE,
+        )
+        .await
     }
 
     #[test]
@@ -3774,6 +4231,108 @@ mod tests {
         });
         let credential = credential.then(|| ("X-Api-Key".to_string(), "gateway-value".to_string()));
         handle_mcp_request_with_policies(proxy, request, &surface, None, "base-path", credential, None).await
+    }
+
+    /// The mirrored copy of a tool call carries none of the `_meta` fields delegated
+    /// credentials go into, even when the caller set them; other `_meta` stays.
+    #[tokio::test]
+    async fn a_mirrored_tool_call_carries_no_delegated_credential_meta_field() {
+        use serde_json::json;
+
+        let (proxy, _) = recording_items_proxy("/base").await;
+        let mirrored = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let log = mirrored.clone();
+        let mirror = axum::Router::new().fallback(move |body: axum::body::Bytes| {
+            let log = log.clone();
+            async move {
+                log.lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&body).unwrap());
+                StatusCode::OK
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let mirror_url = format!("http://{}/mirror", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, mirror).await });
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "mirrored", "name": "Mirrored",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "proxy://mirrored", "networking": {"mirror": {
+                "endpoint": mirror_url, "percentage": 100, "wait_for_response": true}}},
+            "outbound_credentials": [{"credential_provider_id": "calendar",
+                "inject_as": {"type": "meta", "field": "calendar"}}]
+        }))
+        .unwrap();
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "getItem", "arguments": {"id": "1"},
+                "_meta": {"calendar": "caller-set-token", "trace": "kept"}}
+        });
+        handle_mcp_request_with_policies(&proxy, request, &surface, None, "mirrored", None, None)
+            .await
+            .unwrap();
+        let mirrored = mirrored
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(mirrored.len(), 1);
+        assert_eq!(mirrored[0]["params"]["_meta"], json!({"trace": "kept"}), "{}", mirrored[0]);
+        assert_eq!(mirrored[0]["params"]["arguments"], json!({"id": "1"}));
+    }
+
+    /// A proxy's spec is parsed once and the parsed catalog served to every manager while the
+    /// proxy's id, base URL and spec stay the same; a change to any of them parses it again.
+    #[tokio::test]
+    async fn a_proxy_catalog_is_parsed_once_until_its_inputs_change() {
+        use serde_json::json;
+        let spec = json!({"openapi": "3.0.0", "info": {"title": "Cached", "version": "1.0"}, "paths": {
+            "/items/{id}": {"get": {"operationId": "getItem",
+                "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                "responses": {"200": {"description": "OK"}}}}
+        }});
+        let proxy = McpProxy::new(
+            "Cached".into(),
+            String::new(),
+            "https://cached.example/base".into(),
+            spec.to_string(),
+            "/mcp".into(),
+            "/cached".into(),
+        );
+        let catalog = |proxy: McpProxy| async move {
+            let manager = super::McpServerManager::new();
+            manager
+                .create_server(&proxy)
+                .await
+                .unwrap();
+            manager
+                .get_catalogs(&proxy.id)
+                .await
+                .unwrap()
+                .modern
+        };
+        let first = catalog(proxy.clone()).await;
+        assert!(Arc::ptr_eq(&first, &catalog(proxy.clone()).await), "parsed again for the same proxy");
+
+        let mut moved = proxy.clone();
+        moved.base_url = "https://cached.example/other".into();
+        let moved_catalog = catalog(moved).await;
+        assert!(!Arc::ptr_eq(&first, &moved_catalog), "a new base URL is parsed again");
+        assert_eq!(
+            moved_catalog
+                .read()
+                .await
+                .base_url
+                .as_str(),
+            "https://cached.example/other"
+        );
+
+        let mut edited = proxy.clone();
+        let mut edited_spec = spec.clone();
+        edited_spec["info"]["title"] = json!("Edited");
+        edited.openapi_spec = edited_spec.to_string();
+        assert!(!Arc::ptr_eq(&first, &catalog(edited).await), "a new spec is parsed again");
     }
 
     #[test]
@@ -4920,7 +5479,9 @@ mod tests {
                 "responses": {"200": {"description": "Items"}}}}}
         })
         .to_string();
-        let (server, _) = super::proxy_server(&proxy).expect("the spec loads");
+        let (server, _) = super::proxy_server(&proxy)
+            .await
+            .expect("the spec loads");
         let tool = server
             .get_tool("list_items")
             .expect("the tool exists");
@@ -4973,7 +5534,8 @@ mod tests {
         .to_string();
         let call = |tool: &str| json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": {}}});
 
-        let Err(refused) = super::prepare_mcp_request(&proxy, call("broken_attachment"), None, "legacy-files") else {
+        let Err(refused) = super::prepare_mcp_request(&proxy, call("broken_attachment"), None, "legacy-files").await
+        else {
             panic!("a malformed file declaration refuses an uncredentialed legacy call");
         };
 
@@ -4989,7 +5551,9 @@ mod tests {
             "the backend is never called for a tool whose declared file the gateway cannot read"
         );
         assert!(
-            super::prepare_mcp_request(&proxy, call("list_items"), None, "legacy-files").is_ok(),
+            super::prepare_mcp_request(&proxy, call("list_items"), None, "legacy-files")
+                .await
+                .is_ok(),
             "a tool whose answers declare no file still prepares without a Target credential"
         );
     }
@@ -6958,8 +7522,8 @@ mod tests {
     /// or a request body field named `_method` or a method override header.
     /// Another header, a path parameter of such a name, a header named
     /// `_method`, and a spec that does not load are not one.
-    #[test]
-    fn a_method_override_is_found_among_a_tools_headers_query_and_body() {
+    #[tokio::test]
+    async fn a_method_override_is_found_among_a_tools_headers_query_and_body() {
         let with = |name: &str, location: &str| {
             let mut proxy = owned("drive", None);
             proxy.openapi_spec = serde_json::json!({
@@ -6994,26 +7558,26 @@ mod tests {
             ("_METHOD", "query"),
             ("X-HTTP-Method-Override", "query"),
         ] {
-            assert!(super::spec_sends_a_method_override(&with(name, location)), "{name} in {location}");
+            assert!(super::spec_sends_a_method_override(&with(name, location)).await, "{name} in {location}");
         }
         for media_type in ["application/x-www-form-urlencoded", "application/json"] {
             for name in ["_method", "X-HTTP-Method"] {
                 assert!(
-                    super::spec_sends_a_method_override(&with_body_field(name, media_type)),
+                    super::spec_sends_a_method_override(&with_body_field(name, media_type)).await,
                     "{name} in a {media_type} body"
                 );
             }
         }
         for (name, location) in [("X-Request-Reason", "header"), ("_method", "header"), ("method", "query")] {
-            assert!(!super::spec_sends_a_method_override(&with(name, location)), "{name} in {location}");
+            assert!(!super::spec_sends_a_method_override(&with(name, location)).await, "{name} in {location}");
         }
         assert!(
-            !super::spec_sends_a_method_override(&with_body_field("title", "application/json")),
+            !super::spec_sends_a_method_override(&with_body_field("title", "application/json")).await,
             "another body field"
         );
         let mut unloadable = owned("drive", None);
         unloadable.openapi_spec = "X-HTTP-Method-Override: [".into();
-        assert!(!super::spec_sends_a_method_override(&unloadable), "a spec that does not load sends nothing");
+        assert!(!super::spec_sends_a_method_override(&unloadable).await, "a spec that does not load sends nothing");
     }
 
     fn legacy_incompatible_spec() -> String {

@@ -841,7 +841,27 @@ every protocol: modern MCP requests, legacy MCP `_meta` injection, and header in
 request, including A2A. The receiving gateway, and its Target, can use that access token until it
 expires. When the receiving gateway forwards the request to its Target it logs the name of each
 forwarded header, never its value, so a delegated credential stays out of the logs whatever header
-carries it.
+carries it. A Transit Point's legacy `forward-request` names, in `delegated_meta_fields`, the
+`_meta` fields its delegated credentials went into, every one of them and the empty name `""`
+among them; the receiving gateway posts such a request only to a Legacy SSE session endpoint
+under its Target base path and leaves those fields out of its traffic mirror, as it does for its
+own bindings' fields (see [Target base path](CREDENTIAL_DELEGATION.md#target-base-path)). A list
+the receiving gateway cannot read whole (not an array, an entry that is not a string, or more
+than 256 entries) is never cut short: every `_meta` field of the request is then held as
+carrying a delegated credential, so the Legacy SSE session endpoint is checked and the mirror
+gets no `_meta` at all. It also names, in `delegated_header_names`, the headers its delegated
+credentials went in, read by the same rules. A request whose sender names any `_meta` field or
+header, or lists either in a way the receiving gateway cannot read whole, is held to the Target
+base path whatever path it reads: a card read routed to a configured agent card location outside
+the base path is refused with `400 target_path_refused`, though a card read without them is
+served from that location. A `2026-07-28` MCP call crosses Fabric as a framed stream, whose `Open`
+names neither list, so the receiving gateway cannot see what its sender injected: every request it
+carries is held as carrying a delegated credential for the base path check, as an unreadable list
+is. An HTTP(S) Target's request URL, or the REST URL a tool call to an MCP proxy (`proxy://`) Target
+builds from its path arguments, outside the base path is refused with `400 target_path_refused` and
+recorded before the Target is called. The stream format is unchanged. That rule applies to that
+check only, not to the traffic mirror, the Legacy SSE fallback or a card read. A sender that does
+not name them is held only to the receiving surface's own bindings.
 
 The setting applies to one route only. Another `fabric://` Target or Transit Point on the same
 gateway sends no delegated credential unless it opts in too. A Transit Point on a surface without

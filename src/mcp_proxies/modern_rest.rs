@@ -648,53 +648,40 @@ pub(super) fn request_content_type(
     Ok(selected.to_string())
 }
 
+/// Why the path of a tool call's REST URL cannot be built.
+enum PathError {
+    Target,
+    Arguments,
+    OutsideBase,
+}
+
+impl From<PathError> for RestError {
+    fn from(error: PathError) -> Self {
+        match error {
+            PathError::Target => Self::Target,
+            PathError::Arguments | PathError::OutsideBase => Self::Arguments,
+        }
+    }
+}
+
+/// Whether a tool call's path arguments take its REST URL out of the path of `base`: a path
+/// segment `.` or `..`, or a URL no longer under a base path that is not the root. A call whose
+/// URL cannot be built for another reason is left to the call itself to refuse.
+pub(super) fn path_arguments_leave_base(
+    base: &str,
+    metadata: &ToolMetadata,
+    arguments: &Value,
+) -> bool {
+    ToolGenerator::extract_parameters(metadata, arguments)
+        .is_ok_and(|parameters| matches!(request_path(base, metadata, &parameters), Err(PathError::OutsideBase)))
+}
+
 fn request_url(
     base: &str,
     metadata: &ToolMetadata,
     parameters: &ExtractedParameters,
 ) -> Result<Url, RestError> {
-    let mut url = Url::parse(base).map_err(|_| RestError::Target)?;
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || !metadata.path.starts_with('/')
-        || metadata
-            .path
-            .starts_with("//")
-        || metadata
-            .path
-            .contains(['\\', '?', '#'])
-    {
-        return Err(RestError::Target);
-    }
-    let base = url.clone();
-    {
-        let mut segments = url
-            .path_segments_mut()
-            .map_err(|_| RestError::Target)?;
-        segments.pop_if_empty();
-        for template in metadata.path[1..].split('/') {
-            let mut segment = template.to_string();
-            for (name, value) in &parameters.path {
-                segment = segment.replace(&format!("{{{name}}}"), &text(value));
-            }
-            if matches!(segment.as_str(), "." | "..") || segment.contains(['{', '}']) {
-                return Err(RestError::Arguments);
-            }
-            segments.push(&segment);
-        }
-    }
-    if !base
-        .path()
-        .trim_matches('/')
-        .is_empty()
-        && !crate::proxy::paths::is_within_target_base(base.as_str(), url.as_str())
-    {
-        return Err(RestError::Arguments);
-    }
+    let mut url = request_path(base, metadata, parameters)?;
     if !parameters.query.is_empty() {
         let mut query = url.query_pairs_mut();
         for (name, parameter) in &parameters.query {
@@ -721,6 +708,59 @@ fn request_url(
         }
     }
     crate::url_validation::reject_cloud_metadata_url(url.as_str()).map_err(|_| RestError::Target)?;
+    Ok(url)
+}
+
+fn request_path(
+    base: &str,
+    metadata: &ToolMetadata,
+    parameters: &ExtractedParameters,
+) -> Result<Url, PathError> {
+    let mut url = Url::parse(base).map_err(|_| PathError::Target)?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !metadata.path.starts_with('/')
+        || metadata
+            .path
+            .starts_with("//")
+        || metadata
+            .path
+            .contains(['\\', '?', '#'])
+    {
+        return Err(PathError::Target);
+    }
+    let base = url.clone();
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| PathError::Target)?;
+        segments.pop_if_empty();
+        for template in metadata.path[1..].split('/') {
+            let mut segment = template.to_string();
+            for (name, value) in &parameters.path {
+                segment = segment.replace(&format!("{{{name}}}"), &text(value));
+            }
+            if matches!(segment.as_str(), "." | "..") {
+                return Err(PathError::OutsideBase);
+            }
+            if segment.contains(['{', '}']) {
+                return Err(PathError::Arguments);
+            }
+            segments.push(&segment);
+        }
+    }
+    if !base
+        .path()
+        .trim_matches('/')
+        .is_empty()
+        && !crate::proxy::paths::is_within_target_base(base.as_str(), url.as_str())
+    {
+        return Err(PathError::OutsideBase);
+    }
     Ok(url)
 }
 

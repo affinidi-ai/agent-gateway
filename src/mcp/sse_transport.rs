@@ -711,6 +711,20 @@ mod consume_sse_tests {
     }
 }
 
+/// `Ok` when no `credential_base` applies or the session endpoint `post_url` is under its base
+/// path ([`crate::proxy::paths::is_within_target_base`]).
+fn session_endpoint_within(
+    credential_base: Option<&str>,
+    post_url: &str,
+) -> Result<(), LegacySseError> {
+    match credential_base {
+        Some(base) if !crate::proxy::paths::is_within_target_base(base, post_url) => {
+            Err(LegacySseError::OutsideTargetBase)
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Resolve the Legacy-SSE session POST URL from an `endpoint` event, locked to
 /// the SSE stream's own origin.
 ///
@@ -820,6 +834,10 @@ pub enum LegacySseError {
     /// A response from the upstream failed the surface's Response authentication.
     #[error("the upstream response failed response authentication: {}", .0.reason())]
     Unauthenticated(ResponseAuthFailure),
+    /// The session endpoint the upstream advertised is outside the base path the request's
+    /// credential may go under; the request was not posted to it.
+    #[error("the Legacy SSE session endpoint is outside the Target base path")]
+    OutsideTargetBase,
     #[error("{0}")]
     Failed(String),
 }
@@ -956,13 +974,16 @@ impl UpstreamSseSession {
     ///
     /// Opens `GET {base_url}/sse`, reads the `endpoint` event, spawns a
     /// background task to read responses, and returns the session handle.
-    /// The stream and every response to the session's own messages pass `check`.
+    /// The stream and every response to the session's own messages pass `check`. With
+    /// `credential_base`, an advertised endpoint outside it is refused as
+    /// [`LegacySseError::OutsideTargetBase`] before the session is initialized.
     pub async fn connect(
         client: &reqwest::Client,
         base_url: &str,
         channel_name: &str,
         max_event_bytes: usize,
         check: Option<ResponseCheck<'_>>,
+        credential_base: Option<&str>,
     ) -> Result<Self, LegacySseError> {
         use tokio::time::{Duration, timeout};
 
@@ -1020,6 +1041,7 @@ impl UpstreamSseSession {
         .map_err(|_| "Timeout waiting for endpoint event".to_string())??;
 
         let post_url = resolve_session_post_url(&raw_endpoint, &sse_url)?;
+        session_endpoint_within(credential_base, &post_url)?;
 
         info!(channel = channel_name, "UpstreamSseSession: posting messages to {}", loggable::origin(&post_url));
 
@@ -1124,7 +1146,7 @@ impl UpstreamSseSession {
                     .store(false, std::sync::atomic::Ordering::SeqCst);
                 return Err(match e {
                     LegacySseError::Unauthenticated(failure) => LegacySseError::Unauthenticated(failure),
-                    LegacySseError::Failed(e) => format!("SSE session initialize failed: {e}").into(),
+                    e => format!("SSE session initialize failed: {e}").into(),
                 });
             }
         }
@@ -1147,6 +1169,15 @@ impl UpstreamSseSession {
         }
 
         Ok(session)
+    }
+
+    /// `Ok` when no `credential_base` applies or the session endpoint is under its base path
+    /// ([`crate::proxy::paths::is_within_target_base`]).
+    fn accepts_credentials_under(
+        &self,
+        credential_base: Option<&str>,
+    ) -> Result<(), LegacySseError> {
+        session_endpoint_within(credential_base, &self.inner.post_url)
     }
 
     /// Returns `true` if the background SSE reader is still running.
@@ -1323,7 +1354,8 @@ impl UpstreamSseSessionManager {
     /// [`session_key`]. Evicts dead sessions automatically. A new session of a surface with
     /// Response authentication evicts that surface's sessions on `base_url` under the same
     /// setting with older certificates; its sessions under another setting, such as another
-    /// surface variant's, are kept.
+    /// surface variant's, are kept. A new session is connected with `credential_base`
+    /// ([`UpstreamSseSession::connect`]).
     pub async fn get_or_connect(
         &self,
         client: &reqwest::Client,
@@ -1331,6 +1363,7 @@ impl UpstreamSseSessionManager {
         channel_name: &str,
         max_event_bytes: usize,
         check: Option<ResponseCheck<'_>>,
+        credential_base: Option<&str>,
     ) -> Result<Arc<UpstreamSseSession>, LegacySseError> {
         let key = session_key(base_url, check);
         // Fast path: read lock — return cached session if alive
@@ -1357,7 +1390,9 @@ impl UpstreamSseSessionManager {
             sessions.remove(&key);
         }
 
-        let session = UpstreamSseSession::connect(client, base_url, channel_name, max_event_bytes, check).await?;
+        let session =
+            UpstreamSseSession::connect(client, base_url, channel_name, max_event_bytes, check, credential_base)
+                .await?;
         let session = Arc::new(session);
         sessions.retain(|stored, _| !stored.is_superseded_by(&key));
         sessions.insert(key, session.clone());
@@ -1429,7 +1464,10 @@ fn forget_sessions(surface_id: Option<String>) {
 /// incomplete SSE event (`a2a.max_body_size`); a session shared by several
 /// callers keeps the cap it connected with. Every response of the session
 /// must pass `check`; one that fails ends the request as
-/// [`LegacySseError::Unauthenticated`], without a retry.
+/// [`LegacySseError::Unauthenticated`], without a retry. With `credential_base`, the
+/// Target endpoint of a request that carries a credential in its body, the request is posted
+/// only to a session endpoint under that endpoint's base path, and is otherwise refused as
+/// [`LegacySseError::OutsideTargetBase`] without being posted.
 pub async fn send_via_persistent_sse(
     client: &reqwest::Client,
     base_url: &str,
@@ -1437,10 +1475,12 @@ pub async fn send_via_persistent_sse(
     channel_name: &str,
     max_event_bytes: usize,
     check: Option<ResponseCheck<'_>>,
+    credential_base: Option<&str>,
 ) -> Result<String, LegacySseError> {
     let session = UPSTREAM_SSE_SESSIONS
-        .get_or_connect(client, base_url, channel_name, max_event_bytes, check)
+        .get_or_connect(client, base_url, channel_name, max_event_bytes, check, credential_base)
         .await?;
+    session.accepts_credentials_under(credential_base)?;
     match session
         .send_request(json_rpc_body, check)
         .await
@@ -1460,8 +1500,9 @@ pub async fn send_via_persistent_sse(
                 .await
                 .remove(&session_key(base_url, check));
             let new_session = UPSTREAM_SSE_SESSIONS
-                .get_or_connect(client, base_url, channel_name, max_event_bytes, check)
+                .get_or_connect(client, base_url, channel_name, max_event_bytes, check, credential_base)
                 .await?;
+            new_session.accepts_credentials_under(credential_base)?;
             new_session
                 .send_request(json_rpc_body, check)
                 .await
@@ -1553,6 +1594,7 @@ mod tests {
             &format!("http://{address}"),
             "test",
             1024 * 1024,
+            None,
             None,
         )
         .await
@@ -1655,6 +1697,7 @@ mod tests {
             &format!("http://{address}"),
             "test",
             1024 * 1024,
+            None,
             None,
         )
         .await
@@ -1805,7 +1848,7 @@ mod tests {
         };
 
         let answer =
-            send_via_persistent_sse(&reqwest::Client::new(), &base, TOOLS_CALL, "test", 1024 * 1024, Some(check))
+            send_via_persistent_sse(&reqwest::Client::new(), &base, TOOLS_CALL, "test", 1024 * 1024, Some(check), None)
                 .await
                 .expect("the session answers");
 
@@ -1828,9 +1871,16 @@ mod tests {
         ] {
             let base = keyed_legacy_upstream(stream_key, post_key, post_key).await;
 
-            let outcome =
-                send_via_persistent_sse(&reqwest::Client::new(), &base, TOOLS_CALL, "test", 1024 * 1024, Some(check))
-                    .await;
+            let outcome = send_via_persistent_sse(
+                &reqwest::Client::new(),
+                &base,
+                TOOLS_CALL,
+                "test",
+                1024 * 1024,
+                Some(check),
+                None,
+            )
+            .await;
 
             assert!(
                 matches!(outcome, Err(LegacySseError::Unauthenticated(ResponseAuthFailure::KeyMissing))),
@@ -1865,7 +1915,7 @@ mod tests {
         let manager = UpstreamSseSessionManager::new();
 
         let outcome = manager
-            .get_or_connect(&reqwest::Client::new(), &base, "test", 1024 * 1024, Some(check))
+            .get_or_connect(&reqwest::Client::new(), &base, "test", 1024 * 1024, Some(check), None)
             .await
             .err();
 
@@ -1985,7 +2035,7 @@ mod tests {
         };
 
         manager
-            .get_or_connect(&reqwest::Client::new(), &base, "test", 1024 * 1024, Some(check))
+            .get_or_connect(&reqwest::Client::new(), &base, "test", 1024 * 1024, Some(check), None)
             .await
             .map_err(|error| error.to_string())
             .expect("the session connects");
@@ -2101,7 +2151,7 @@ mod tests {
             stamp: Some(tls.stamp),
         };
 
-        let outcome = send_via_persistent_sse(&client, &base, TOOLS_CALL, "test", 1024 * 1024, Some(check)).await;
+        let outcome = send_via_persistent_sse(&client, &base, TOOLS_CALL, "test", 1024 * 1024, Some(check), None).await;
 
         assert!(
             matches!(outcome, Err(LegacySseError::Unauthenticated(ResponseAuthFailure::ServerUntrusted))),
@@ -2150,7 +2200,7 @@ mod tests {
         };
 
         manager
-            .get_or_connect(&reqwest::Client::new(), &base, "test", 1024 * 1024, Some(check))
+            .get_or_connect(&reqwest::Client::new(), &base, "test", 1024 * 1024, Some(check), None)
             .await
             .map_err(|error| error.to_string())
             .expect("the session connects");

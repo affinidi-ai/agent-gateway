@@ -1285,6 +1285,167 @@ pub fn inject_delegated_credential_into_mcp_meta(
     Ok(serde_json::to_vec(&json_body)?)
 }
 
+/// `body` without the `_meta` `fields` a delegated credential is injected into, for a copy
+/// of the request that must carry no credential, such as a mirrored one. A body that is not
+/// JSON, or has none of the fields, is returned unchanged.
+pub fn without_delegated_credentials_in_mcp_meta(
+    body: &bytes::Bytes,
+    fields: &[&str],
+) -> bytes::Bytes {
+    if fields.is_empty() {
+        return body.clone();
+    }
+    let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    let original = json_body.clone();
+    for field in fields {
+        crate::mcp::meta::remove_metadata_key(&mut json_body, field);
+    }
+    if json_body == original {
+        body.clone()
+    } else {
+        bytes::Bytes::from(json_body.to_string())
+    }
+}
+
+/// `body` without any `_meta` object, for a copy of a request whose delegated `_meta` fields
+/// are not known. A body that is not JSON, or has no `_meta`, is returned unchanged.
+fn without_mcp_meta(body: &bytes::Bytes) -> bytes::Bytes {
+    let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    let mut removed = false;
+    for path in ["", "/params", "/result"] {
+        if let Some(container) = json_body
+            .pointer_mut(path)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            removed |= container
+                .remove("_meta")
+                .is_some();
+        }
+    }
+    if removed {
+        bytes::Bytes::from(json_body.to_string())
+    } else {
+        body.clone()
+    }
+}
+
+/// The body a surface's traffic mirror is sent for `body`: without the `_meta` field of any
+/// delegated credential binding of the Access Point Target that injects into `_meta`, whoever
+/// set it, nor any `_meta` field `sender` holds as carrying a delegated credential
+/// ([`sender_delegated_meta_fields`]); without any `_meta` at all when it holds every one.
+pub fn mirror_body(
+    surface: &crate::config::agent_surface::AgentSurface,
+    body: &bytes::Bytes,
+    sender: &SenderDelegatedMeta,
+) -> bytes::Bytes {
+    let sender_fields = match sender {
+        SenderDelegatedMeta::Every => return without_mcp_meta(body),
+        SenderDelegatedMeta::Fields(fields) => fields,
+    };
+    let fields: Vec<&str> = surface
+        .agent_keyed_outbound_credentials()
+        .filter_map(|binding| match &binding.inject_as {
+            crate::config::types::CredentialInjection::Meta { field } => Some(field.as_str()),
+            _ => None,
+        })
+        .chain(
+            sender_fields
+                .iter()
+                .map(String::as_str),
+        )
+        .collect();
+    without_delegated_credentials_in_mcp_meta(body, &fields)
+}
+
+/// Whether `body` carries a `_meta` field a delegated credential goes into: one a binding of the
+/// Access Point Target injects into, whoever set it, or one `sender` holds as carrying one.
+pub fn carries_delegated_meta_field(
+    surface: &crate::config::agent_surface::AgentSurface,
+    body: &bytes::Bytes,
+    sender: &SenderDelegatedMeta,
+) -> bool {
+    mirror_body(surface, body, sender) != *body
+}
+
+/// The top-level `forward-request` field a sending gateway lists, in a Fabric request, the
+/// `_meta` fields it put a delegated credential into.
+pub const DELEGATED_META_FIELDS: &str = "delegated_meta_fields";
+
+/// The most `_meta` fields [`sender_delegated_meta_fields`] reads from one request; a longer
+/// list is held as naming every field. A sender names one field per binding that injected
+/// into `_meta`, so a real list is far shorter.
+const MAX_SENDER_DELEGATED_META_FIELDS: usize = 256;
+
+/// The `_meta` fields a sending gateway put a delegated credential into, as a receiving
+/// gateway reads them ([`sender_delegated_meta_fields`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SenderDelegatedMeta {
+    /// Exactly these fields, the empty name among them when the sender named it.
+    Fields(Vec<String>),
+    /// The sender's list could not be read whole, so every `_meta` field is held as carrying a
+    /// delegated credential.
+    Every,
+}
+
+impl SenderDelegatedMeta {
+    /// No field: the sender named none, or the request came from no sending gateway.
+    pub const NONE: Self = Self::Fields(Vec::new());
+}
+
+/// The `_meta` fields a sending gateway says, in a received Fabric `forward-request` body, it
+/// put a delegated credential into ([`DELEGATED_META_FIELDS`]): every name, the empty one
+/// included, or none when the field is absent. A list that cannot be read whole (not an
+/// array, an entry that is not a string, or more than [`MAX_SENDER_DELEGATED_META_FIELDS`]
+/// entries) is held as [`SenderDelegatedMeta::Every`], never cut short.
+pub fn sender_delegated_meta_fields(forward_request: &serde_json::Value) -> SenderDelegatedMeta {
+    sender_named(forward_request, DELEGATED_META_FIELDS)
+}
+
+/// The top-level `forward-request` field a sending gateway lists, in a Fabric request, the
+/// headers it put a delegated credential in.
+pub const DELEGATED_HEADER_NAMES: &str = "delegated_header_names";
+
+/// Whether a sending gateway says, in a received Fabric `forward-request` body, it put a
+/// delegated credential into the request: it names a `_meta` field
+/// ([`DELEGATED_META_FIELDS`]) or a header ([`DELEGATED_HEADER_NAMES`]), or lists either in a
+/// way that cannot be read whole, read as [`sender_delegated_meta_fields`] reads its list.
+pub fn sender_named_delegated_credential(forward_request: &serde_json::Value) -> bool {
+    [DELEGATED_META_FIELDS, DELEGATED_HEADER_NAMES]
+        .into_iter()
+        .any(|key| sender_named(forward_request, key) != SenderDelegatedMeta::NONE)
+}
+
+/// The names a sending gateway lists under `key`: every name, or [`SenderDelegatedMeta::Every`]
+/// for a list that is not an array, has an entry that is not a string, or has more than
+/// [`MAX_SENDER_DELEGATED_META_FIELDS`] entries.
+fn sender_named(
+    forward_request: &serde_json::Value,
+    key: &str,
+) -> SenderDelegatedMeta {
+    let Some(named) = forward_request.get(key) else {
+        return SenderDelegatedMeta::NONE;
+    };
+    let Some(entries) = named
+        .as_array()
+        .filter(|entries| entries.len() <= MAX_SENDER_DELEGATED_META_FIELDS)
+    else {
+        return SenderDelegatedMeta::Every;
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            entry
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect::<Option<Vec<_>>>()
+        .map_or(SenderDelegatedMeta::Every, SenderDelegatedMeta::Fields)
+}
+
 /// Why a binding with no stored credential is refused without asking for
 /// consent: its provider was deactivated and takes no new consent.
 const PROVIDER_DEACTIVATED: &str = "provider_deactivated";
@@ -2027,6 +2188,112 @@ mod tests {
             matches!(result, Err(super::McpMetaInjectionError::RootNotObject)),
             "expected non-object JSON roots to fail injection, got {result:?}"
         );
+    }
+
+    #[test]
+    fn without_delegated_credentials_in_mcp_meta_removes_only_the_credential_fields() {
+        let body = bytes::Bytes::from_static(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"schedule_meeting","_meta":{"calendar":"bdd-token","maps":"bdd-maps-token","region":"eu"}}}"#,
+        );
+
+        let stripped = super::without_delegated_credentials_in_mcp_meta(&body, &["calendar", "maps"]);
+        let parsed: serde_json::Value = serde_json::from_slice(&stripped).expect("valid JSON");
+
+        assert_eq!(parsed["params"]["_meta"], serde_json::json!({ "region": "eu" }));
+        assert_eq!(parsed["params"]["name"].as_str(), Some("schedule_meeting"));
+    }
+
+    #[test]
+    fn sender_delegated_meta_fields_reads_every_named_field_the_empty_name_included() {
+        use super::SenderDelegatedMeta;
+        use serde_json::json;
+        assert_eq!(
+            super::sender_delegated_meta_fields(&json!({"delegated_meta_fields": ["calendar", "", "maps"]})),
+            SenderDelegatedMeta::Fields(vec!["calendar".into(), String::new(), "maps".into()])
+        );
+        for none in [json!({}), json!({"delegated_meta_fields": []})] {
+            assert_eq!(super::sender_delegated_meta_fields(&none), SenderDelegatedMeta::NONE, "{none}");
+        }
+        let bound: Vec<String> = (0..super::MAX_SENDER_DELEGATED_META_FIELDS)
+            .map(|index| format!("field-{index}"))
+            .collect();
+        assert_eq!(
+            super::sender_delegated_meta_fields(&json!({ "delegated_meta_fields": bound.clone() })),
+            SenderDelegatedMeta::Fields(bound)
+        );
+    }
+
+    #[test]
+    fn sender_delegated_meta_fields_holds_every_field_when_the_list_cannot_be_read_whole() {
+        use super::SenderDelegatedMeta;
+        use serde_json::json;
+        let over: Vec<String> = (0..=super::MAX_SENDER_DELEGATED_META_FIELDS)
+            .map(|index| format!("field-{index}"))
+            .collect();
+        for unreadable in [
+            json!({ "delegated_meta_fields": over }),
+            json!({"delegated_meta_fields": ["calendar", 7]}),
+            json!({"delegated_meta_fields": ["calendar", null]}),
+            json!({"delegated_meta_fields": "calendar"}),
+            json!({"delegated_meta_fields": {}}),
+            json!({"delegated_meta_fields": null}),
+        ] {
+            assert_eq!(super::sender_delegated_meta_fields(&unreadable), SenderDelegatedMeta::Every, "{unreadable}");
+        }
+    }
+
+    #[test]
+    fn a_sender_names_a_delegated_credential_by_a_meta_field_a_header_or_an_unreadable_list() {
+        use serde_json::json;
+        let over: Vec<String> = (0..=super::MAX_SENDER_DELEGATED_META_FIELDS)
+            .map(|index| format!("x-header-{index}"))
+            .collect();
+        for named in [
+            json!({"delegated_meta_fields": ["calendar"]}),
+            json!({"delegated_header_names": ["x-partner-grant"]}),
+            json!({"delegated_header_names": [""]}),
+            json!({"delegated_header_names": "x-partner-grant"}),
+            json!({"delegated_header_names": ["x-partner-grant", 7]}),
+            json!({ "delegated_header_names": over }),
+            json!({"delegated_meta_fields": null}),
+        ] {
+            assert!(super::sender_named_delegated_credential(&named), "{named}");
+        }
+        for none in [json!({}), json!({"delegated_meta_fields": [], "delegated_header_names": []})] {
+            assert!(!super::sender_named_delegated_credential(&none), "{none}");
+        }
+    }
+
+    #[test]
+    fn a_mirror_body_drops_the_empty_named_field_and_every_field_when_held_whole() {
+        use super::SenderDelegatedMeta;
+        let surface = crate::config::agent_surface::AgentSurface::default();
+        let body = bytes::Bytes::from_static(br#"{"params": {"name": "t", "_meta": {"": "grant", "trace": "kept"}}}"#);
+
+        let named = super::mirror_body(&surface, &body, &SenderDelegatedMeta::Fields(vec![String::new()]));
+        let named: serde_json::Value = serde_json::from_slice(&named).expect("valid JSON");
+        assert_eq!(named["params"]["_meta"], serde_json::json!({ "trace": "kept" }));
+
+        let every = super::mirror_body(&surface, &body, &SenderDelegatedMeta::Every);
+        let every: serde_json::Value = serde_json::from_slice(&every).expect("valid JSON");
+        assert_eq!(every["params"], serde_json::json!({ "name": "t" }));
+
+        assert!(super::carries_delegated_meta_field(&surface, &body, &SenderDelegatedMeta::Every));
+        let without_meta = bytes::Bytes::from_static(br#"{"params": {"name": "t"}}"#);
+        assert!(!super::carries_delegated_meta_field(&surface, &without_meta, &SenderDelegatedMeta::Every));
+        assert!(!super::carries_delegated_meta_field(&surface, &body, &SenderDelegatedMeta::NONE));
+    }
+
+    #[test]
+    fn without_delegated_credentials_in_mcp_meta_leaves_a_body_without_them_unchanged() {
+        let body = bytes::Bytes::from_static(br#"{"params": {"_meta": {"region": "eu"}}}"#);
+        assert_eq!(super::without_delegated_credentials_in_mcp_meta(&body, &["calendar"]), body);
+
+        let not_json = bytes::Bytes::from_static(b"calendar=bdd-token");
+        assert_eq!(super::without_delegated_credentials_in_mcp_meta(&not_json, &["calendar"]), not_json);
+
+        let with_credential = bytes::Bytes::from_static(br#"{"params": {"_meta": {"calendar": "bdd-token"}}}"#);
+        assert_eq!(super::without_delegated_credentials_in_mcp_meta(&with_credential, &[]), with_credential);
     }
 
     #[test]

@@ -20,8 +20,8 @@ use crate::bdd_support::mock_server::MockServer;
 use crate::bdd_support::oidc::OidcProvider;
 use crate::bdd_support::temp::{TempDirGuard, create_project_temp_dir};
 use crate::world::{
-    JwtSourceAuthConfig, RecordedResponse, ScenarioInfra, SurfaceSourceAuthConfig, SurfaceWorld, TargetObservations,
-    debug_line, mcp_identity_schema_with_field,
+    JwtSourceAuthConfig, MIRROR_COLLABORATOR_KEY, RecordedResponse, ScenarioInfra, SurfaceSourceAuthConfig,
+    SurfaceWorld, TargetObservations, debug_line, mcp_identity_schema_with_field,
 };
 
 /// The identity hash pepper of a gateway whose callers can sign in at their identity provider.
@@ -292,6 +292,22 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         } else {
             transit_point_mocks.insert(collaborator_key, mock);
         }
+    }
+    if world
+        .collaborators
+        .contains_key(MIRROR_COLLABORATOR_KEY)
+    {
+        let mirror = MockServer::start(
+            world
+                .collaborator_target(MIRROR_COLLABORATOR_KEY)
+                .configured_response
+                .clone(),
+        )
+        .await;
+        world
+            .surface_config
+            .mirror_endpoint = Some(mirror.url());
+        transit_point_mocks.insert(MIRROR_COLLABORATOR_KEY.to_string(), mirror);
     }
     for collaborator_key in &world.plain_http_collaborators {
         let url = collaborator_urls
@@ -2632,10 +2648,13 @@ async fn request_with_tampered_token(world: &mut SurfaceWorld) {
 #[when("the caller sends a request to the surface with a valid token")]
 async fn request_with_valid_token(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
-    let issuer = get_jwt_source_auth_issuer(world);
-    let audience = caller_token_audience(world);
-    let token = create_valid_jwt_for_issuer_with_audience(issuer, audience);
+    let token = valid_caller_token(world);
     send_request_with_bearer_token(world, token).await;
+}
+
+/// A JWT the surface's JWT Bearer source authentication accepts.
+pub(crate) fn valid_caller_token(world: &SurfaceWorld) -> String {
+    create_valid_jwt_for_issuer_with_audience(get_jwt_source_auth_issuer(world), caller_token_audience(world))
 }
 
 #[when(expr = "the caller sends a request to the surface with a valid token and header {string} set to {string}")]
@@ -2948,6 +2967,20 @@ async fn caller_sends_method_request_to_route_path(
     }
     let method = reqwest::Method::from_bytes(method.as_bytes()).expect("step method must be a valid HTTP method");
     request_path_and_record(world, method, &full_path, vec![]).await;
+}
+
+#[when(expr = "the caller sends a {word} request to the surface route path {string} with a valid token")]
+async fn caller_sends_method_request_to_route_path_with_valid_token(
+    world: &mut SurfaceWorld,
+    method: String,
+    path: String,
+) {
+    let full_path = format!("{}{}", world.surface_config.route, path);
+    let method = reqwest::Method::from_bytes(method.as_bytes()).expect("step method must be a valid HTTP method");
+    ensure_gateway_running(world).await;
+    let token = valid_caller_token(world);
+    request_path_and_record(world, method, &full_path, vec![("authorization".to_string(), format!("Bearer {token}"))])
+        .await;
 }
 
 async fn request_path_and_record(
@@ -3303,7 +3336,7 @@ pub(crate) fn reissued_transit_token(
 
 /// The headers a managed agent's Transit Point call carries: its transit token,
 /// and `extra`.
-fn with_transit_token(
+pub(crate) fn with_transit_token(
     world: &SurfaceWorld,
     extra: Vec<(String, String)>,
 ) -> Vec<(String, String)> {
@@ -3999,7 +4032,30 @@ async fn mcp_tool_call_with_city_argument_using_protocol_version(
     city: String,
     protocol_version: String,
 ) {
-    let protocol_version = McpVersion::from(protocol_version.as_str());
+    let (body, headers) = mcp_tool_call_with_city_at_version(tool_name, city, &protocol_version);
+    send_json_request_and_record(world, body, headers).await;
+}
+
+#[when(
+    expr = "the caller invokes the MCP tool {string} for city {string} using protocol version {string} with a valid API key"
+)]
+async fn mcp_tool_call_with_city_argument_using_protocol_version_and_valid_api_key(
+    world: &mut SurfaceWorld,
+    tool_name: String,
+    city: String,
+    protocol_version: String,
+) {
+    let (body, mut headers) = mcp_tool_call_with_city_at_version(tool_name, city, &protocol_version);
+    headers.push(build_valid_api_key_source_auth_header(world));
+    send_json_request_and_record(world, body, headers).await;
+}
+
+fn mcp_tool_call_with_city_at_version(
+    tool_name: String,
+    city: String,
+    protocol_version: &str,
+) -> (serde_json::Value, Vec<(String, String)>) {
+    let protocol_version = McpVersion::from(protocol_version);
     let mut body = crate::bdd_support::json_rpc::build_modern_mcp_tool_call_body(
         serde_json::json!("bdd-modern-call"),
         &tool_name,
@@ -4008,7 +4064,7 @@ async fn mcp_tool_call_with_city_argument_using_protocol_version(
     body["params"]["arguments"] = serde_json::json!({ "city": city });
     let mut headers = modern_mcp_request_headers(&protocol_version, "tools/call");
     headers.push(("Mcp-Name".to_string(), tool_name));
-    send_json_request_and_record(world, body, headers).await;
+    (body, headers)
 }
 
 #[when(expr = "the caller invokes the MCP tool {string} for city {string} once without and once with a valid API key")]

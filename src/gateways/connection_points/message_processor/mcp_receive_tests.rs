@@ -1488,6 +1488,369 @@ async fn fabric_consent_flow() {
     assert_eq!(pending.1["result"]["resultType"], "input_required");
     assert!(calls.lock().await.is_empty());
     {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        use crate::delegation_vault::audit::DelegationAuditAction;
+        let (mut message, stream) = make_request(&body, &surface, &sender_did, &bearer);
+        message.message_body["path"] = json!("/%2e%2e/admin");
+        let (result, events) = crate::audit::producer::capture(Box::pin(
+            super::process_forward_request_with_mcp_runtime(&message, Some(stream), versions, Some(runtime.clone())),
+        ))
+        .await;
+        let refused = decode(result).await;
+        assert_eq!(refused.0, 400, "{:?}", refused.1);
+        assert_ne!(refused.1["result"]["resultType"], "input_required", "{:?}", refused.1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.event,
+                    DelegationAuditAction::RequestRejected {
+                        stage: RejectionStage::Forward,
+                        reason: RejectionReason::TargetPathRefused,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(
+                    event.event,
+                    DelegationAuditAction::ConsentRequired
+                        | DelegationAuditAction::ElicitationSent
+                        | DelegationAuditAction::TokenInjected
+                        | DelegationAuditAction::TokenNotFound
+                        | DelegationAuditAction::TokenRefreshed
+                )),
+            "{events:?}"
+        );
+        assert!(calls.lock().await.is_empty(), "the Target is not called");
+    }
+    {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        use crate::delegation_vault::audit::DelegationAuditAction;
+        use crate::mcp_proxies::filesystem::McpProxyStore;
+        let proxies = Arc::new(
+            crate::mcp_proxies::FileSystemMcpProxyStore::new(
+                directory
+                    .path()
+                    .join("proxies"),
+            )
+            .await
+            .unwrap(),
+        );
+        let proxy = crate::mcp_proxies::types::McpProxy::new(
+            "Items".into(),
+            String::new(),
+            format!("http://{target_address}/base"),
+            json!({"openapi": "3.0.0", "info": {"title": "Items", "version": "1.0"}, "paths": {
+                "/items/{id}": {"get": {"operationId": "getItem",
+                    "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                    "responses": {"200": {"description": "OK"}}}}
+            }})
+            .to_string(),
+            "/mcp".into(),
+            "/items-base".into(),
+        );
+        proxies
+            .create(&proxy)
+            .await
+            .unwrap();
+        let mut broken = proxy.clone();
+        broken.id = uuid::Uuid::new_v4().to_string();
+        broken.endpoint_path = "/items-broken".into();
+        broken.openapi_spec = "openapi: [not, a, spec".into();
+        proxies
+            .create(&broken)
+            .await
+            .unwrap();
+        super::init_mcp_proxy_store(proxies).await;
+        {
+            let mut proxied = surface.clone();
+            proxied.target.endpoint = format!("proxy://{}", broken.id);
+            let body = json!({"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {
+                "name": "getItem", "arguments": {"id": "1"}, "_meta": body["params"]["_meta"].clone()
+            }});
+            let (message, mut stream) = make_request(&body, &proxied, &sender_did, &bearer);
+            stream
+                .headers
+                .insert("mcp-name", axum::http::HeaderValue::from_static("getItem"));
+            let (result, events) =
+                crate::audit::producer::capture(Box::pin(super::process_forward_request_with_mcp_runtime(
+                    &message,
+                    Some(stream),
+                    versions,
+                    Some(runtime.clone()),
+                )))
+                .await;
+            let unavailable = decode(result).await;
+            assert_eq!(unavailable.0, 503, "{:?}", unavailable.1);
+            assert!(
+                unavailable
+                    .1
+                    .to_string()
+                    .contains("MCP tool catalog is unavailable"),
+                "{:?}",
+                unavailable.1
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(
+                        event.event,
+                        DelegationAuditAction::ConsentRequired | DelegationAuditAction::ElicitationSent
+                    )),
+                "{events:?}"
+            );
+        }
+        {
+            let mut proxied = surface.clone();
+            proxied.target.endpoint = "proxy://missing-proxy".to_string();
+            let body = json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {
+                "name": "getItem", "arguments": {"id": "1"}, "_meta": body["params"]["_meta"].clone()
+            }});
+            let (message, mut stream) = make_request(&body, &proxied, &sender_did, &bearer);
+            stream
+                .headers
+                .insert("mcp-name", axum::http::HeaderValue::from_static("getItem"));
+            let (result, events) =
+                crate::audit::producer::capture(Box::pin(super::process_forward_request_with_mcp_runtime(
+                    &message,
+                    Some(stream),
+                    versions,
+                    Some(runtime.clone()),
+                )))
+                .await;
+            let missing = decode(result).await;
+            assert_ne!(missing.1["result"]["resultType"], "input_required", "{:?}", missing.1);
+            assert_eq!(missing.0, 404, "{:?}", missing.1);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(
+                        event.event,
+                        DelegationAuditAction::ConsentRequired | DelegationAuditAction::ElicitationSent
+                    )),
+                "a proxy that cannot be loaded starts no consent: {events:?}"
+            );
+        }
+        {
+            let mut unbound = surface.clone();
+            unbound.target.endpoint = format!("proxy://{}", proxy.id);
+            unbound
+                .outbound_credentials
+                .clear();
+            assert!(
+                unbound
+                    .target_auth()
+                    .is_none()
+            );
+            let stream_call = |id: &str| {
+                let body = json!({"jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": {
+                    "name": "getItem", "arguments": {"id": id}, "_meta": body["params"]["_meta"].clone()
+                }});
+                let (message, mut stream) = make_request(&body, &unbound, &sender_did, &bearer);
+                stream
+                    .headers
+                    .insert("mcp-name", axum::http::HeaderValue::from_static("getItem"));
+                (message, stream)
+            };
+            let (message, stream) = stream_call("../admin");
+            let (result, events) =
+                crate::audit::producer::capture(Box::pin(super::process_forward_request_with_mcp_runtime(
+                    &message,
+                    Some(stream),
+                    versions,
+                    Some(runtime.clone()),
+                )))
+                .await;
+            let refused = decode(result).await;
+            assert_eq!(refused.0, 400, "{:?}", refused.1);
+            assert!(
+                refused
+                    .1
+                    .to_string()
+                    .contains("target_path_refused"),
+                "{:?}",
+                refused.1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event.event,
+                        DelegationAuditAction::RequestRejected {
+                            stage: RejectionStage::Forward,
+                            reason: RejectionReason::TargetPathRefused,
+                            ..
+                        }
+                    ))
+                    .count(),
+                1,
+                "a stream that may carry a sender's credential is held to the base path: {events:?}"
+            );
+            assert!(calls.lock().await.is_empty(), "the Target is not called");
+            let (message, stream) = stream_call("1");
+            let served = decode(
+                Box::pin(super::process_forward_request_with_mcp_runtime(
+                    &message,
+                    Some(stream),
+                    versions,
+                    Some(runtime.clone()),
+                ))
+                .await,
+            )
+            .await;
+            assert_eq!(served.0, 200, "a call under the base path is served: {:?}", served.1);
+            assert!(
+                !served
+                    .1
+                    .to_string()
+                    .contains("target_path_refused"),
+                "{:?}",
+                served.1
+            );
+            calls.lock().await.clear();
+
+            let mut url_target = unbound.clone();
+            url_target.target.endpoint = format!("http://{target_address}/base");
+            assert!(
+                url_target
+                    .target_auth()
+                    .is_none()
+            );
+            let (mut message, stream) = make_request(&body, &url_target, &sender_did, &bearer);
+            message.message_body["path"] = json!("/%2e%2e/%2e%2e/admin");
+            let (result, events) =
+                crate::audit::producer::capture(Box::pin(super::process_forward_request_with_mcp_runtime(
+                    &message,
+                    Some(stream),
+                    versions,
+                    Some(runtime.clone()),
+                )))
+                .await;
+            let refused = decode(result).await;
+            assert_eq!(refused.0, 400, "{:?}", refused.1);
+            assert!(
+                refused
+                    .1
+                    .to_string()
+                    .contains("target_path_refused"),
+                "{:?}",
+                refused.1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event.event,
+                        DelegationAuditAction::RequestRejected {
+                            stage: RejectionStage::Forward,
+                            reason: RejectionReason::TargetPathRefused,
+                            ..
+                        }
+                    ))
+                    .count(),
+                1,
+                "a stream to a URL Target is held to the base path: {events:?}"
+            );
+            assert!(calls.lock().await.is_empty(), "the Target is not called");
+            let (message, stream) = make_request(&body, &url_target, &sender_did, &bearer);
+            let served = decode(
+                Box::pin(super::process_forward_request_with_mcp_runtime(
+                    &message,
+                    Some(stream),
+                    versions,
+                    Some(runtime.clone()),
+                ))
+                .await,
+            )
+            .await;
+            assert_eq!(served.0, 200, "a request under the base path is served: {:?}", served.1);
+            assert!(
+                !served
+                    .1
+                    .to_string()
+                    .contains("target_path_refused"),
+                "{:?}",
+                served.1
+            );
+            assert_eq!(calls.lock().await.len(), 1, "the in-base request reaches the Target");
+            calls.lock().await.clear();
+        }
+        let mut proxied = surface.clone();
+        proxied.target.endpoint = format!("proxy://{}", proxy.id);
+        let call = |id: &str| {
+            let body = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {
+                "name": "getItem", "arguments": {"id": id}, "_meta": body["params"]["_meta"].clone()
+            }});
+            let (message, mut stream) = make_request(&body, &proxied, &sender_did, &bearer);
+            stream
+                .headers
+                .insert("mcp-name", axum::http::HeaderValue::from_static("getItem"));
+            (message, stream)
+        };
+        for climbing in ["../admin", ".."] {
+            let (message, stream) = call(climbing);
+            let (result, events) =
+                crate::audit::producer::capture(Box::pin(super::process_forward_request_with_mcp_runtime(
+                    &message,
+                    Some(stream),
+                    versions,
+                    Some(runtime.clone()),
+                )))
+                .await;
+            let refused = decode(result).await;
+            assert_eq!(refused.0, 400, "{climbing}: {:?}", refused.1);
+            assert_ne!(refused.1["result"]["resultType"], "input_required", "{climbing}: {:?}", refused.1);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event.event,
+                        DelegationAuditAction::RequestRejected {
+                            stage: RejectionStage::Forward,
+                            reason: RejectionReason::TargetPathRefused,
+                            ..
+                        }
+                    ))
+                    .count(),
+                1,
+                "{climbing}: {events:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(
+                        event.event,
+                        DelegationAuditAction::ConsentRequired
+                            | DelegationAuditAction::ElicitationSent
+                            | DelegationAuditAction::TokenInjected
+                            | DelegationAuditAction::TokenNotFound
+                            | DelegationAuditAction::TokenRefreshed
+                    )),
+                "{climbing}: {events:?}"
+            );
+        }
+        let (message, stream) = call("1");
+        let pending = decode(
+            Box::pin(super::process_forward_request_with_mcp_runtime(
+                &message,
+                Some(stream),
+                versions,
+                Some(runtime.clone()),
+            ))
+            .await,
+        )
+        .await;
+        assert_eq!(pending.0, 200, "{:?}", pending.1);
+        assert_eq!(pending.1["result"]["resultType"], "input_required");
+        assert!(calls.lock().await.is_empty(), "the Target is not called");
+    }
+    {
         let send = |body: Value, token: Option<String>, runtime: Arc<ContinuationRuntime>| {
             let token = token.unwrap_or_else(|| bearer.clone());
             let (message, stream) = make_request(&body, &surface, &sender_did, &token);

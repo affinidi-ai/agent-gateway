@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::bdd_support::actors::TargetActorKind;
 use crate::bdd_support::admin_client::ExternalMediatorBlob;
 use crate::bdd_support::config::fabric_surface_fixture::{
-    McpProxySpec, McpToolPolicySpec, SourceAuthSpec, SurfaceSpec, TargetAuthSpec,
+    McpProxySpec, McpToolPolicySpec, ServiceCredentialSpec, SourceAuthSpec, SurfaceSpec, TargetAuthSpec,
     TransitPointHeaderMetadataMappingRowSpec, TransitPointSpec,
 };
 use crate::bdd_support::config::modern_consent::ModernConsentFixture;
@@ -752,6 +752,26 @@ fn surface_is_stored_as_a_legacy_surface(
     surface_name: String,
 ) {
     surface_spec_mut(world, &surface_name).legacy_access_point = true;
+}
+
+#[given(expr = "surface {string} targets base path {string} on its Target")]
+fn surface_targets_base_path(
+    world: &mut G2gWorld,
+    surface_name: String,
+    base_path: String,
+) {
+    surface_spec_mut(world, &surface_name).target_base_path = Some(base_path);
+}
+
+#[given(expr = "surface {string} sends a service credential from API-key provider {string} as header {string}")]
+fn surface_sends_service_credential(
+    world: &mut G2gWorld,
+    surface_name: String,
+    provider_id: String,
+    header_name: String,
+) {
+    surface_spec_mut(world, &surface_name).service_credential =
+        Some(ServiceCredentialSpec { provider_id, header_name });
 }
 
 #[given(expr = "surface {string} fetches its agent card from path {string}")]

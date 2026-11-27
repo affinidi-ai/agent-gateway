@@ -945,7 +945,7 @@ mod tests {
         };
         let writing = crate::identity::handlers::surface_grants::hold_provider_bindings().await;
         let delete = tokio::spawn(delete_with(recording.clone(), None, references, None, false));
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::identity::handlers::surface_grants::wait_for_queued_bindings_writer().await;
         assert!(!delete.is_finished(), "the delete waits for the write that holds the lock");
         save_billing_surface(surfaces.as_ref(), None).await;
         drop(writing);

@@ -176,7 +176,23 @@ impl From<serde_json::Value> for MockResponse {
 #[derive(Debug, Clone)]
 enum MockBehavior {
     Static,
-    DirectLine { reply_text: Option<String> },
+    DirectLine {
+        reply_text: Option<String>,
+    },
+    /// A Legacy SSE MCP server: a plain POST is refused with `404`, a `GET` of a path ending in
+    /// `/sse` opens a stream whose first event advertises `endpoint`, and a POST to a path ending
+    /// in `/messages` is accepted and answered on that stream.
+    LegacySse {
+        endpoint: String,
+        events: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    },
+}
+
+/// What a [`MockBehavior::LegacySse`] mock answers a request with.
+enum LegacySseAnswer {
+    Stream(String, tokio::sync::mpsc::UnboundedReceiver<String>),
+    Accepted,
+    NotFound,
 }
 
 struct MockState {
@@ -600,6 +616,21 @@ impl MockServer {
         server
     }
 
+    /// Serve as a Legacy SSE MCP server whose session endpoint is `endpoint` (see
+    /// `MockBehavior::LegacySse`).
+    pub async fn serve_legacy_sse(
+        &self,
+        endpoint: impl Into<String>,
+    ) {
+        self.state
+            .lock()
+            .await
+            .behavior = MockBehavior::LegacySse {
+            endpoint: endpoint.into(),
+            events: None,
+        };
+    }
+
     pub async fn start_direct_line_without_reply() -> Self {
         let server = Self::start(MockResponse::json(serde_json::json!({"unintended_response": true}))).await;
         server
@@ -768,6 +799,34 @@ fn received_headers(headers: &axum::http::HeaderMap) -> (HashMap<String, String>
     (joined, all)
 }
 
+/// The response of a [`MockBehavior::LegacySse`] mock.
+fn legacy_sse_response(answer: LegacySseAnswer) -> Response<Body> {
+    use futures::StreamExt;
+    match answer {
+        LegacySseAnswer::Stream(endpoint, receiver) => {
+            let first = futures::stream::once(async move { format!("event: endpoint\ndata: {endpoint}\n\n") });
+            let rest = tokio_stream::wrappers::UnboundedReceiverStream::new(receiver)
+                .map(|message| format!("event: message\ndata: {message}\n\n"));
+            let body = first
+                .chain(rest)
+                .map(Ok::<_, std::convert::Infallible>);
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(body))
+                .unwrap()
+        }
+        LegacySseAnswer::Accepted => Response::builder()
+            .status(202)
+            .body(Body::empty())
+            .unwrap(),
+        LegacySseAnswer::NotFound => Response::builder()
+            .status(404)
+            .body(Body::empty())
+            .unwrap(),
+    }
+}
+
 async fn handler(
     State(state): State<Arc<Mutex<MockState>>>,
     request: Request<Body>,
@@ -816,8 +875,29 @@ async fn handler(
                 content_type,
                 path_and_query: path_and_query.clone(),
             });
+        if let MockBehavior::LegacySse { endpoint, events } = &mut state.behavior {
+            let path = path_and_query
+                .split('?')
+                .next()
+                .unwrap_or_default();
+            let answer = if method == "GET" && path.ends_with("/sse") {
+                let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+                *events = Some(sender);
+                LegacySseAnswer::Stream(endpoint.clone(), receiver)
+            } else if method == "POST" && path.ends_with("/messages") {
+                if let (Some(sender), Some(id)) = (events.as_ref(), body.get("id")) {
+                    let _ = sender
+                        .send(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"content": []}}).to_string());
+                }
+                LegacySseAnswer::Accepted
+            } else {
+                LegacySseAnswer::NotFound
+            };
+            drop(state);
+            return legacy_sse_response(answer);
+        }
         let response = match &state.behavior {
-            MockBehavior::Static => state.response.clone(),
+            MockBehavior::Static | MockBehavior::LegacySse { .. } => state.response.clone(),
             MockBehavior::DirectLine { reply_text } => {
                 direct_line_response(&method, &path_and_query, reply_text.as_deref())
             }

@@ -209,6 +209,17 @@ Feature: MCP credential delegation
     And the gateway log records delegation event "token_injected" for API-key provider "maps"
     And the gateway log does not contain "bdd-delegated-api-key"
 
+  Scenario: A Legacy SSE fallback does not send a delegated credential to a message endpoint outside the Target base path
+    Given the surface's Target endpoint has the base path "/base"
+    And the surface requires delegated credentials from API-key provider "maps"
+    And the surface injects delegated credentials from API-key provider "maps" into MCP metadata key "maps"
+    And MCP server "bravo" serves only Legacy SSE, advertising its message endpoint at "/other-app/messages"
+    When caller "alice" invokes MCP tool "lookup_place" with a valid token
+    Then the response status is 400
+    And the response reason is "target_path_refused"
+    And the VP Audit Log records a request refusal for "a path outside the Target base path"
+    And MCP server "bravo" received no request at path "/other-app/messages"
+
   Scenario: A delegated credential injects as a custom header when configured
     Given the surface requires delegated credentials from OAuth provider "calendar"
     And the surface injects delegated credentials from OAuth provider "calendar" as header "x-calendar-token"

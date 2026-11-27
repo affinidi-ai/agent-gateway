@@ -633,6 +633,11 @@ pub struct OutboundPipelineContext {
     /// managed agent's headers and sent after the agent's headers are filtered, in
     /// place of any agent header of the same name.
     pub delegated_credential_headers: HeaderMap,
+    /// Whether a delegated credential was put into the request, as a header or in `_meta`.
+    pub carries_delegated_credential: bool,
+    /// The `_meta` fields a delegated credential was put into, which a Fabric request names
+    /// to the receiving gateway.
+    pub delegated_meta_fields: Vec<String>,
     /// The only origin a request carrying a grant by binding may be sent to: its
     /// provider's `resource`. Set when such a grant is injected; the forward then
     /// goes through Strict pinned egress to that origin only, never over Fabric.
@@ -940,6 +945,8 @@ impl OutboundPipelineContext {
             original_method,
             original_headers,
             delegated_credential_headers: HeaderMap::new(),
+            carries_delegated_credential: false,
+            delegated_meta_fields: Vec::new(),
             grant_destination: None,
             released_grant: None,
             proxy_backend_status: None,
@@ -1305,6 +1312,10 @@ async fn outbound_proxy_handler_in_request_scope(
 
     // [11] Credential Injection (§5.3 / §6.2 step 12)
     // Inject delegated OAuth tokens from the credential vault, or signal consent_required.
+    if let Err(error) = step_refuse_delegated_credential_outside_target_base(&state, &mut ctx).await {
+        step_record_metrics(&state, &ctx, false);
+        return Err(error);
+    }
     if let Some(response) = step_prepare_modern_credentials(&state, &mut ctx, subscription_lifetime.as_mut()).await? {
         return Ok(response);
     }
@@ -5563,6 +5574,161 @@ pub(crate) fn delegation_agent_did(ctx: &OutboundPipelineContext) -> Option<&str
     })
 }
 
+/// Whether a delegated credential was put into a Transit Point request, legacy or `2026-07-28`.
+fn carries_delegated_transit_credential(ctx: &OutboundPipelineContext) -> bool {
+    ctx.carries_delegated_credential
+        || ctx
+            .modern_delegation
+            .as_ref()
+            .is_some_and(|prepared| prepared.attaches_credentials())
+}
+
+/// Whether a delegated credential binding applies to a Transit Point request, so that
+/// [`step_inject_credentials`] or [`step_prepare_modern_credentials`] would put one into it: a
+/// binding for every request (tool-scoped bindings never apply on a Transit Point), on a
+/// request that is not a discovery read, to a destination that does not withhold them.
+fn delegated_transit_binding_applies(ctx: &OutboundPipelineContext) -> bool {
+    transit_caller_assertion(ctx).permits_target_credential()
+        && !ctx
+            .virtual_channel
+            .withholds_delegated_credentials()
+        && (ctx
+            .surface
+            .transit_point_outbound_credentials(&ctx.virtual_channel)
+            .iter()
+            .any(|binding| matches!(binding.required_for, crate::config::types::CredentialRequirement::All))
+            || ctx
+                .surface
+                .transit_point_external_credentials(&ctx.virtual_channel)
+                .is_some())
+}
+
+/// The MCP Proxy `proxy_id` a Transit Point names, when the surface's tenant may reference it
+/// ([`crate::proxy::credential_destination::owned_proxy`]); one it cannot load is refused as the
+/// Transit Point refuses an MCP Proxy it cannot serve.
+async fn transit_proxy(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+    proxy_id: &str,
+) -> Result<crate::mcp_proxies::types::McpProxy, OutboundPipelineError> {
+    let proxy = crate::proxy::credential_destination::owned_proxy(
+        state
+            .mcp_proxy_store
+            .as_deref(),
+        proxy_id,
+        ctx.surface
+            .tenant_id
+            .as_deref(),
+    )
+    .await;
+    proxy.map_err(|_| refuse_mcp_proxy_transit(ctx, "mcp_proxy_unavailable"))
+}
+
+/// Where a Transit Point request carrying a Target credential (`target_credential`) or a
+/// delegated credential (`delegated_credential`) would send it
+/// ([`crate::proxy::credential_destination::verdict`]): the path a `fabric://` destination
+/// appends, the REST URL a tool call to a `proxy://` MCP Proxy builds, or the URL an `http(s)`
+/// destination is sent. An MCP Proxy that cannot be loaded is refused here.
+async fn transit_credential_destination(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+    target_credential: bool,
+    delegated_credential: bool,
+) -> Result<crate::mcp_proxies::handlers::ToolCallDestination, OutboundPipelineError> {
+    use crate::mcp_proxies::handlers::ToolCallDestination;
+    use crate::proxy::credential_destination::{Destination, ProxyCall, verdict};
+    if !target_credential && !delegated_credential {
+        return Ok(ToolCallDestination::InsideBase);
+    }
+    let endpoint = ctx
+        .virtual_channel
+        .target_endpoint
+        .clone();
+    if endpoint.starts_with("fabric://") {
+        let path = transit_fabric_path(ctx);
+        return Ok(verdict(target_credential, delegated_credential, Destination::AppendedPath(&path)).await);
+    }
+    if let Some(proxy_id) = crate::mcp_proxies::types::endpoint_proxy_id(&endpoint) {
+        let proxy = transit_proxy(state, ctx, proxy_id).await?;
+        let Some(request) = ctx
+            .body_bytes
+            .as_deref()
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+        else {
+            return Ok(ToolCallDestination::InsideBase);
+        };
+        let call = Destination::ProxyCall {
+            proxy: &proxy,
+            call: ProxyCall::Legacy(&request),
+        };
+        return Ok(verdict(target_credential, delegated_credential, call).await);
+    }
+    let url = transit_http_target_url(ctx);
+    let card_location = ctx
+        .virtual_channel
+        .agent_card_path
+        .clone();
+    let method = ctx.original_method.clone();
+    let destination = Destination::Url {
+        endpoint: &endpoint,
+        method: method.as_str(),
+        url: &url,
+        card_location: card_location.as_deref(),
+    };
+    Ok(verdict(target_credential, delegated_credential, destination).await)
+}
+
+/// Refuses a Transit Point request that leaves its destination's base path while a delegated
+/// credential binding applies to it, before any grant is read, token requested or consent
+/// started, internal or external consent. A delegated credential never goes to the agent card
+/// location outside the base path: a discovery read carries none. Through an MCP Proxy, a tool
+/// call is checked against the REST URL its path arguments build, and an MCP Proxy that cannot
+/// be loaded, or whose catalog cannot be parsed, is refused before any grant is read.
+async fn step_refuse_delegated_credential_outside_target_base(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+) -> Result<(), OutboundPipelineError> {
+    use crate::mcp_proxies::handlers::ToolCallDestination;
+    let delegated = delegated_transit_binding_applies(ctx);
+    match transit_credential_destination(state, ctx, false, delegated).await? {
+        ToolCallDestination::InsideBase => Ok(()),
+        ToolCallDestination::OutsideBase => Err(refuse_path_outside_target_base(ctx)),
+        ToolCallDestination::CatalogUnavailable => Err(refuse_mcp_proxy_transit(ctx, "mcp_proxy_catalog_unavailable")),
+    }
+}
+
+/// Refuses a Transit Point request about to be forwarded whose destination leaves the base path
+/// while it carries the Target credential or a delegated credential attached to it, in a header
+/// or `_meta`.
+async fn step_refuse_credential_outside_target_base(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+) -> Result<(), OutboundPipelineError> {
+    let target_credential = ctx
+        .virtual_channel
+        .target_auth
+        .is_some();
+    let delegated = carries_delegated_transit_credential(ctx);
+    match transit_credential_destination(state, ctx, target_credential, delegated).await? {
+        crate::mcp_proxies::handlers::ToolCallDestination::OutsideBase => Err(refuse_path_outside_target_base(ctx)),
+        _ => Ok(()),
+    }
+}
+
+/// Records and refuses with `400 target_path_refused` a Transit Point request whose path
+/// leaves the target endpoint's base path while it carries a Target or delegated credential,
+/// whatever the `fallback`: the caller's error.
+fn refuse_path_outside_target_base(ctx: &OutboundPipelineContext) -> OutboundPipelineError {
+    crate::proxy::credential_destination::refuse_outside_base(
+        &transit_audit_facts(ctx),
+        Some(&ctx.virtual_channel.alias),
+        ctx.virtual_channel
+            .target_auth
+            .as_ref(),
+    );
+    target_auth_failed(ctx, crate::proxy::handler::TargetAuthFailure::PathRefused)
+}
+
 /// Refuse with `502` a request the Transit Point does not forward for a reason other than
 /// its Target credential: the egress policy blocks the target endpoint, or a credential
 /// header it carries cannot be sent.
@@ -5591,15 +5757,6 @@ fn refuse_unsendable_target_credential(
     target_auth: &crate::config::TargetAuthConfig,
 ) -> OutboundPipelineError {
     record_and_refuse(ctx, target_auth, crate::proxy::handler::TargetAuthFailure::Misconfigured)
-}
-
-/// Records and refuses a Transit Point request whose path leaves the target endpoint's base
-/// path, whatever its `fallback`: the caller's error.
-fn refuse_path_outside_target_base(
-    ctx: &OutboundPipelineContext,
-    target_auth: &crate::config::TargetAuthConfig,
-) -> OutboundPipelineError {
-    record_and_refuse(ctx, target_auth, crate::proxy::handler::TargetAuthFailure::PathRefused)
 }
 
 fn record_and_refuse(
@@ -5994,6 +6151,8 @@ fn apply_credential_injections(
                 ) {
                     Ok(modified) => {
                         ctx.body_bytes = Some(modified.into());
+                        ctx.delegated_meta_fields
+                            .push(field.clone());
                         debug!(
                             target: "credential_delegation",
                             request_id = %ctx.request_id,
@@ -6042,6 +6201,7 @@ fn apply_credential_injections(
                     .insert(header_name, header_value);
             }
         }
+        ctx.carries_delegated_credential = true;
     }
     Ok(())
 }
@@ -6762,7 +6922,6 @@ async fn step_forward_request_mcp_proxy(
     ctx: &mut OutboundPipelineContext,
     proxy_id: &str,
 ) -> Result<reqwest::Response, OutboundPipelineError> {
-    use crate::mcp_proxies::McpProxyStore;
     use crate::mcp_proxies::handlers::{McpProxyCallError, TransitProxyAnswer};
 
     ctx.proxy_backend_status = None;
@@ -6786,23 +6945,7 @@ async fn step_forward_request_mcp_proxy(
     {
         return Err(modern_mcp_unsupported(ctx));
     }
-    let proxy = match state.mcp_proxy_store.as_ref() {
-        Some(store) => store
-            .get(proxy_id)
-            .await
-            .ok()
-            .flatten(),
-        None => None,
-    }
-    .filter(|proxy| {
-        crate::tenancy::can_reference(
-            ctx.surface
-                .tenant_id
-                .as_deref(),
-            proxy.tenant_id.as_deref(),
-        )
-    })
-    .ok_or_else(|| refuse_mcp_proxy_transit(ctx, "mcp_proxy_unavailable"))?;
+    let proxy = transit_proxy(state, ctx, proxy_id).await?;
     let grant = proxy_grant(ctx, &proxy)?;
     let request = ctx
         .body_bytes
@@ -6844,7 +6987,7 @@ async fn step_forward_request_mcp_proxy(
         .as_ref()
         .map(|grant| grant.header.clone());
     let progress = crate::mcp_proxies::handlers::TransitCallProgress::default();
-    let answer = match crate::mcp_proxies::handlers::prepare_mcp_request(&proxy, request, header, &config_id) {
+    let answer = match crate::mcp_proxies::handlers::prepare_mcp_request(&proxy, request, header, &config_id).await {
         Ok(prepared) => {
             if grant.is_some() && prepared.sends_a_method_override() {
                 return Err(refuse_external_grant(ctx, "mcp_proxy_spec_overrides_the_method"));
@@ -6902,9 +7045,7 @@ async fn step_forward_request_mcp_proxy(
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::UNAUTHORIZED);
             Ok(own_answer(status, headers, Vec::new()))
         }
-        Err(McpProxyCallError::OutsideTargetBase) => {
-            Err(refuse_external_grant(ctx, "tool_call_outside_the_mcp_proxy_base_path"))
-        }
+        Err(McpProxyCallError::OutsideTargetBase) => Err(refuse_path_outside_target_base(ctx)),
         Err(McpProxyCallError::Failed(message)) => {
             warn!(
                 request_id = %ctx.request_id,
@@ -7040,6 +7181,67 @@ async fn fabric_forward_headers(
     Ok((headers_map, stream_headers))
 }
 
+/// The path a `fabric://` Transit Point destination's gateway appends to its channel target
+/// endpoint, identical to what a direct HTTP target would receive.
+fn transit_fabric_path(ctx: &OutboundPipelineContext) -> String {
+    let remainder = compute_outbound_remainder_path(
+        &ctx.request_path,
+        &ctx.surface.access_point.route,
+        &ctx.virtual_channel.alias,
+        ctx.virtual_channel
+            .listen_path
+            .as_deref(),
+    );
+    format!("/{remainder}")
+}
+
+/// The extra top-level fields of a Transit Point's legacy Fabric `forward-request`: the `_meta`
+/// fields ([`crate::proxy::credential_delegation::DELEGATED_META_FIELDS`]) and the headers
+/// ([`crate::proxy::credential_delegation::DELEGATED_HEADER_NAMES`]) its delegated credentials
+/// went into, each listed only when there is one, so the receiving gateway keeps them under its
+/// Target base path and the `_meta` fields out of its traffic mirror.
+fn transit_fabric_extra_body(ctx: &OutboundPipelineContext) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let header_names: Vec<&str> = ctx
+        .delegated_credential_headers
+        .keys()
+        .map(axum::http::HeaderName::as_str)
+        .collect();
+    let mut extra = serde_json::Map::new();
+    if !ctx
+        .delegated_meta_fields
+        .is_empty()
+    {
+        extra.insert(
+            crate::proxy::credential_delegation::DELEGATED_META_FIELDS.to_string(),
+            serde_json::json!(ctx.delegated_meta_fields),
+        );
+    }
+    if !header_names.is_empty() {
+        extra.insert(
+            crate::proxy::credential_delegation::DELEGATED_HEADER_NAMES.to_string(),
+            serde_json::json!(header_names),
+        );
+    }
+    (!extra.is_empty()).then_some(extra)
+}
+
+/// The URL an `http(s)` Transit Point destination is sent the request on.
+fn transit_http_target_url(ctx: &OutboundPipelineContext) -> String {
+    build_outbound_target_url(
+        &ctx.virtual_channel
+            .target_endpoint,
+        &ctx.request_path,
+        &ctx.surface.access_point.route,
+        &ctx.virtual_channel.alias,
+        ctx.virtual_channel
+            .listen_path
+            .as_deref(),
+        ctx.virtual_channel
+            .agent_card_path
+            .as_deref(),
+    )
+}
+
 /// Forward the prepared request to a remote gateway channel over `fabric://`.
 async fn step_forward_request_fabric(
     state: &OutboundProxyState,
@@ -7052,30 +7254,8 @@ async fn step_forward_request_fabric(
         .target_endpoint
         .clone();
 
-    // Path suffix the remote gateway appends to its channel target endpoint —
-    // identical to what a direct HTTP target would receive.
-    let remainder = compute_outbound_remainder_path(
-        &ctx.request_path,
-        &ctx.surface.access_point.route,
-        &ctx.virtual_channel.alias,
-        ctx.virtual_channel
-            .listen_path
-            .as_deref(),
-    );
-    let path = if remainder.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", remainder)
-    };
-    if let Some(target_auth) = ctx
-        .virtual_channel
-        .target_auth
-        .as_ref()
-        && !crate::proxy::paths::appended_path_stays_below_base(&path)
-    {
-        warn!(request_id = %ctx.request_id, "Refusing a Transit Point request that climbs out of its path: it would carry the Target credential");
-        return Err(refuse_path_outside_target_base(ctx, target_auth));
-    }
+    let path = transit_fabric_path(ctx);
+    step_refuse_credential_outside_target_base(state, ctx).await?;
 
     let is_modern = matches!(
         ctx.mcp_classification
@@ -7153,7 +7333,7 @@ async fn step_forward_request_fabric(
             timeout,
             trace_id: &ctx.request_id,
             log_label: &ctx.surface.name,
-            extra_body: None,
+            extra_body: transit_fabric_extra_body(ctx),
         },
     )
     .await
@@ -7225,37 +7405,9 @@ async fn step_forward_request_http(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<reqwest::Response, OutboundPipelineError> {
-    let target_url = build_outbound_target_url(
-        &ctx.virtual_channel
-            .target_endpoint,
-        &ctx.request_path,
-        &ctx.surface.access_point.route,
-        &ctx.virtual_channel.alias,
-        ctx.virtual_channel
-            .listen_path
-            .as_deref(),
-        ctx.virtual_channel
-            .agent_card_path
-            .as_deref(),
-    );
+    let target_url = transit_http_target_url(ctx);
 
-    if let Some(target_auth) = ctx
-        .virtual_channel
-        .target_auth
-        .as_ref()
-        && !crate::proxy::paths::is_target_credential_destination(
-            &ctx.virtual_channel
-                .target_endpoint,
-            ctx.original_method.as_str(),
-            &target_url,
-            ctx.virtual_channel
-                .agent_card_path
-                .as_deref(),
-        )
-    {
-        warn!(request_id = %ctx.request_id, "Refusing a Transit Point request outside its base path: it would carry the Target credential");
-        return Err(refuse_path_outside_target_base(ctx, target_auth));
-    }
+    step_refuse_credential_outside_target_base(state, ctx).await?;
 
     // Defense-in-depth SSRF guard at the forwarding layer. `pinned_forward_client`
     // fails closed on an unparseable URL, resolves DNS once to block a host that
@@ -8653,6 +8805,8 @@ mod tests {
             original_method: Method::POST,
             original_headers: HeaderMap::new(),
             delegated_credential_headers: HeaderMap::new(),
+            carries_delegated_credential: false,
+            delegated_meta_fields: Vec::new(),
             grant_destination: None,
             released_grant: None,
             proxy_backend_status: None,
@@ -24322,10 +24476,14 @@ mod tests {
                 "secret_id": "target-key", "header_name": header, "header_format": "Key {value}"}}}))
             .unwrap()
         });
-        for (name, value) in delegated {
-            ctx.delegated_credential_headers
-                .insert(*name, HeaderValue::from_static(value));
-        }
+        let injections: Vec<_> = delegated
+            .iter()
+            .map(|(name, value)| crate::proxy::credential_delegation::ResolvedCredentialInjection::Header {
+                name: (*name).into(),
+                value: (*value).into(),
+            })
+            .collect();
+        apply_credential_injections(&mut ctx, &injections).unwrap();
         ctx
     }
 
@@ -24525,6 +24683,389 @@ mod tests {
                 })
                 .collect();
             assert_eq!(records, vec![(Some(400), TargetAuthOutcome::Rejected, Some(alias))], "{fallback} {endpoint}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_request_outside_its_base_path_is_refused_when_it_carries_a_delegated_credential_on_either_leg()
+     {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        let header = crate::proxy::credential_delegation::ResolvedCredentialInjection::Header {
+            name: "authorization".into(),
+            value: "Bearer person-token".into(),
+        };
+        let meta = crate::proxy::credential_delegation::ResolvedCredentialInjection::McpMeta {
+            field: "calendar".into(),
+            value: "person-token".into(),
+        };
+        for endpoint in ["http://127.0.0.1:9/base", "fabric://peer-gateway/partner"] {
+            for (injections, refused_for_the_path) in
+                [(std::slice::from_ref(&header), true), (std::slice::from_ref(&meta), true), (&[][..], false)]
+            {
+                let mut ctx = credential_header_case(
+                    &state,
+                    None,
+                    &[],
+                    Method::POST,
+                    "/outbound/surfaces/order/partner-a/%2e%2e/admin",
+                )
+                .await;
+                ctx.body_bytes = Some(Bytes::from_static(
+                    br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read"}}"#,
+                ));
+                apply_credential_injections(&mut ctx, injections).unwrap();
+                ctx.virtual_channel
+                    .target_endpoint = endpoint.to_string();
+                let (result, events) = crate::audit::producer::capture(async {
+                    if endpoint.starts_with("fabric://") {
+                        step_forward_request_fabric(&state, &mut ctx)
+                            .await
+                            .map(drop)
+                    } else {
+                        step_forward_request_http(&state, &mut ctx)
+                            .await
+                            .map(drop)
+                    }
+                })
+                .await;
+                let records: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match &event.event {
+                        crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                            stage,
+                            reason: RejectionReason::TargetPathRefused,
+                            http_status,
+                            ..
+                        } => Some((stage, http_status)),
+                        _ => None,
+                    })
+                    .collect();
+                if refused_for_the_path {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(OutboundPipelineError::TargetAuthFailed {
+                                failure: crate::proxy::handler::TargetAuthFailure::PathRefused,
+                                ..
+                            })
+                        ),
+                        "{endpoint} {injections:?}: {result:?}"
+                    );
+                    assert_eq!(records, vec![(&RejectionStage::Forward, &Some(400))], "{endpoint} {injections:?}");
+                } else {
+                    assert!(
+                        !matches!(
+                            result,
+                            Err(OutboundPipelineError::TargetAuthFailed {
+                                failure: crate::proxy::handler::TargetAuthFailure::PathRefused,
+                                ..
+                            })
+                        ),
+                        "{endpoint}: {result:?}"
+                    );
+                    assert_eq!(records, Vec::new(), "{endpoint}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_modern_delegation_counts_as_a_transit_credential_only_when_it_attaches_one() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        let header = crate::proxy::credential_delegation::ResolvedCredentialInjection::Header {
+            name: "authorization".into(),
+            value: "Bearer person-token".into(),
+        };
+        for endpoint in ["http://127.0.0.1:9/base", "fabric://peer-gateway/partner"] {
+            for attaches in [true, false] {
+                let mut ctx = credential_header_case(
+                    &state,
+                    None,
+                    &[],
+                    Method::POST,
+                    "/outbound/surfaces/order/partner-a/%2e%2e/admin",
+                )
+                .await;
+                ctx.body_bytes = Some(Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#));
+                let mut prepared = crate::proxy::credential_delegation::modern::PreparedDelegation::handling(
+                    crate::mcp::request_validation::ValidatedModernMessage {
+                        protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+                        client_capabilities: None,
+                        client_info: None,
+                        method: "tools/list".into(),
+                        id: Some(json!(1)),
+                        kind: crate::mcp::request_validation::McpMessageKind::Request,
+                        params: None,
+                    },
+                    vec!["provider".to_string()],
+                );
+                if attaches {
+                    prepared.injections = vec![header.clone()];
+                }
+                ctx.modern_delegation = Some(Box::new(prepared));
+                ctx.virtual_channel
+                    .target_endpoint = endpoint.to_string();
+                let (result, events) = crate::audit::producer::capture(async {
+                    if endpoint.starts_with("fabric://") {
+                        step_forward_request_fabric(&state, &mut ctx)
+                            .await
+                            .map(drop)
+                    } else {
+                        step_forward_request_http(&state, &mut ctx)
+                            .await
+                            .map(drop)
+                    }
+                })
+                .await;
+                let records: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match &event.event {
+                        crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                            stage,
+                            reason: RejectionReason::TargetPathRefused,
+                            http_status,
+                            ..
+                        } => Some((stage, http_status)),
+                        _ => None,
+                    })
+                    .collect();
+                if attaches {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(OutboundPipelineError::TargetAuthFailed {
+                                failure: crate::proxy::handler::TargetAuthFailure::PathRefused,
+                                ..
+                            })
+                        ),
+                        "{endpoint}: {result:?}"
+                    );
+                    assert_eq!(records, vec![(&RejectionStage::Forward, &Some(400))], "{endpoint}");
+                } else {
+                    assert!(
+                        !matches!(
+                            result,
+                            Err(OutboundPipelineError::TargetAuthFailed {
+                                failure: crate::proxy::handler::TargetAuthFailure::PathRefused,
+                                ..
+                            })
+                        ),
+                        "{endpoint}: {result:?}"
+                    );
+                    assert_eq!(records, Vec::new(), "{endpoint}");
+                }
+            }
+        }
+    }
+
+    /// A Transit Point's Fabric request names the `_meta` fields and the headers its delegated
+    /// credentials went into, and a request without one names none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_fabric_request_names_the_meta_fields_it_put_a_delegated_credential_into() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        let meta = crate::proxy::credential_delegation::ResolvedCredentialInjection::McpMeta {
+            field: "calendar".into(),
+            value: "person-token".into(),
+        };
+        let header = crate::proxy::credential_delegation::ResolvedCredentialInjection::Header {
+            name: "authorization".into(),
+            value: "Bearer person-token".into(),
+        };
+        let custom = crate::proxy::credential_delegation::ResolvedCredentialInjection::Header {
+            name: "X-Partner-Grant".into(),
+            value: "partner-token".into(),
+        };
+        for (injections, named) in [
+            (
+                vec![meta.clone(), header.clone()],
+                Some(json!({"delegated_meta_fields": ["calendar"], "delegated_header_names": ["authorization"]})),
+            ),
+            (vec![header], Some(json!({"delegated_header_names": ["authorization"]}))),
+            (vec![custom], Some(json!({"delegated_header_names": ["x-partner-grant"]}))),
+            (Vec::new(), None),
+        ] {
+            let mut ctx =
+                credential_header_case(&state, None, &[], Method::POST, "/outbound/surfaces/order/partner-a/rpc").await;
+            ctx.body_bytes =
+                Some(Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read"}}"#));
+            apply_credential_injections(&mut ctx, &injections).unwrap();
+            assert_eq!(transit_fabric_extra_body(&ctx).map(serde_json::Value::Object), named, "{injections:?}");
+        }
+
+        let fields: Vec<String> = std::iter::once(String::new())
+            .chain((0..300).map(|index| format!("field-{index}")))
+            .collect();
+        let injections: Vec<_> = fields
+            .iter()
+            .map(|field| crate::proxy::credential_delegation::ResolvedCredentialInjection::McpMeta {
+                field: field.clone(),
+                value: "person-token".into(),
+            })
+            .collect();
+        let mut ctx =
+            credential_header_case(&state, None, &[], Method::POST, "/outbound/surfaces/order/partner-a/rpc").await;
+        ctx.body_bytes =
+            Some(Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read"}}"#));
+        apply_credential_injections(&mut ctx, &injections).unwrap();
+        assert_eq!(
+            transit_fabric_extra_body(&ctx).map(serde_json::Value::Object),
+            Some(json!({ "delegated_meta_fields": fields })),
+            "every field is named, the empty one included, with no cap"
+        );
+    }
+
+    /// A Transit Point context whose surface has one delegated credential binding,
+    /// `required_for`, for a `method` request to `remainder` below the Transit Point.
+    fn delegated_binding_case(
+        endpoint: &str,
+        required_for: serde_json::Value,
+        method: Method,
+        remainder: &str,
+    ) -> OutboundPipelineContext {
+        let mut ctx = test_pipeline_context();
+        Arc::make_mut(&mut ctx.surface).outbound_credentials = vec![
+            serde_json::from_value(json!({"credential_provider_id": "provider", "required_for": required_for}))
+                .unwrap(),
+        ];
+        ctx.virtual_channel
+            .target_endpoint = endpoint.to_string();
+        ctx.virtual_channel
+            .fabric_delegated_credentials = true;
+        ctx.original_method = method;
+        ctx.request_path = format!("/outbound/surfaces/order/partner-a/{remainder}");
+        ctx
+    }
+
+    fn path_refusal_records(events: &[crate::delegation_vault::audit::DelegationAuditEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event,
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        reason: crate::audit::request_events::RejectionReason::TargetPathRefused,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_transit_point_request_outside_its_base_path_is_refused_before_any_delegated_credential_is_resolved() {
+        let state = test_outbound_state();
+        for endpoint in ["http://127.0.0.1:9/base", "fabric://peer-gateway/partner"] {
+            let mut ctx = delegated_binding_case(endpoint, json!("all"), Method::POST, "%2e%2e/admin");
+            assert!(
+                ctx.modern_delegation
+                    .is_none()
+                    && !ctx.carries_delegated_credential
+            );
+            let (result, events) =
+                crate::audit::producer::capture(step_refuse_delegated_credential_outside_target_base(&state, &mut ctx))
+                    .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(OutboundPipelineError::TargetAuthFailed {
+                        failure: crate::proxy::handler::TargetAuthFailure::PathRefused,
+                        ..
+                    })
+                ),
+                "{endpoint}: {result:?}"
+            );
+            assert_eq!(path_refusal_records(&events), 1, "{endpoint}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transit_point_request_no_delegated_credential_would_follow_is_not_refused_for_its_path_early() {
+        let cases = [
+            ("http://127.0.0.1:9/base", json!("all"), Method::POST, "rpc"),
+            ("fabric://peer-gateway/partner", json!("all"), Method::POST, "rpc"),
+            ("http://127.0.0.1:9/base", json!({"tools": ["read"]}), Method::POST, "%2e%2e/admin"),
+            ("http://127.0.0.1:9/base", json!("all"), Method::GET, ".well-known/agent-card.json"),
+        ];
+        let state = test_outbound_state();
+        for (endpoint, required_for, method, remainder) in cases {
+            let mut ctx = delegated_binding_case(endpoint, required_for.clone(), method.clone(), remainder);
+            ctx.virtual_channel
+                .agent_card_path = Some("/card".to_string());
+            let (result, events) =
+                crate::audit::producer::capture(step_refuse_delegated_credential_outside_target_base(&state, &mut ctx))
+                    .await;
+            assert!(result.is_ok(), "{endpoint} {required_for} {method} {remainder}: {result:?}");
+            assert_eq!(path_refusal_records(&events), 0, "{endpoint} {remainder}");
+        }
+        let mut withheld =
+            delegated_binding_case("fabric://peer-gateway/partner", json!("all"), Method::POST, "%2e%2e/admin");
+        withheld
+            .virtual_channel
+            .fabric_delegated_credentials = false;
+        assert!(
+            step_refuse_delegated_credential_outside_target_base(&state, &mut withheld)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_sends_no_delegated_credential_to_its_agent_card_location_but_for_a_discovery_read() {
+        let mut early = delegated_binding_case(
+            "http://127.0.0.1:9/base",
+            json!("all"),
+            Method::GET,
+            "x/.well-known/agent-card.json",
+        );
+        early
+            .virtual_channel
+            .agent_card_path = Some("/card".to_string());
+        assert!(matches!(
+            step_refuse_delegated_credential_outside_target_base(&test_outbound_state(), &mut early).await,
+            Err(OutboundPipelineError::TargetAuthFailed {
+                failure: crate::proxy::handler::TargetAuthFailure::PathRefused,
+                ..
+            })
+        ));
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        for (target_auth_header, delegated, refused) in [
+            (None, &[("authorization", "Bearer person-token")][..], true),
+            (Some("x-target-key"), &[("authorization", "Bearer person-token")][..], true),
+            (Some("x-target-key"), &[][..], false),
+        ] {
+            let mut ctx = credential_header_case(
+                &state,
+                target_auth_header,
+                delegated,
+                Method::GET,
+                "/outbound/surfaces/order/partner-a/x/.well-known/agent-card.json",
+            )
+            .await;
+            ctx.virtual_channel
+                .target_endpoint = "http://127.0.0.1:9/base".to_string();
+            ctx.virtual_channel
+                .agent_card_path = Some("/card".to_string());
+            let result = step_forward_request_http(&state, &mut ctx)
+                .await
+                .map(drop);
+            assert_eq!(
+                matches!(
+                    result,
+                    Err(OutboundPipelineError::TargetAuthFailed {
+                        failure: crate::proxy::handler::TargetAuthFailure::PathRefused,
+                        ..
+                    })
+                ),
+                refused,
+                "{target_auth_header:?} {delegated:?}: {result:?}"
+            );
         }
     }
 
@@ -25764,6 +26305,177 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
         assert_eq!(recorded_connection_statuses(&metrics).await, [crate::metrics::ConnectionStatus::Failed]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_records_a_request_refused_outside_its_base_path_as_a_failed_call() {
+        let metrics = Arc::new(crate::metrics::MetricsStore::new(10));
+        let mut state = test_outbound_state();
+        state.metrics_store = Some(metrics.clone());
+        let mut surface = transit_surface(
+            json!([{"alias": "partner", "protocol": "http", "require_transit_token": false,
+                "allow_unauthenticated_callers": true, "target_endpoint": "http://127.0.0.1:9/base"}]),
+            json!([]),
+        );
+        surface.outbound_credentials =
+            vec![serde_json::from_value(json!({"credential_provider_id": "provider"})).unwrap()];
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(surface);
+
+        let (status, body) = send_through_the_pipeline(
+            &state,
+            "POST",
+            "/outbound/mcp/partner/%2e%2e/admin",
+            &protocol_request_body("http"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["reason"], "target_path_refused", "{body}");
+        assert_eq!(recorded_connection_statuses(&metrics).await, [crate::metrics::ConnectionStatus::Failed]);
+    }
+
+    /// A Transit Point whose external-consent grant would go with a request is refused for a
+    /// path outside its destination's base path before the grant is looked up: over HTTPS for a
+    /// path that climbs out, and through an MCP Proxy for a tool path argument that does. A
+    /// request under the base path is not refused for its path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_external_grant_request_outside_the_base_path_is_refused_before_the_grant_is_looked_up() {
+        use crate::mcp_proxies::filesystem::McpProxyStore;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::mcp_proxies::FileSystemMcpProxyStore::new(directory.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let proxy = crate::mcp_proxies::types::McpProxy::new(
+            "Items".into(),
+            String::new(),
+            "https://api.example/base".into(),
+            json!({"openapi": "3.0.0", "info": {"title": "Items", "version": "1.0"}, "paths": {
+                "/{id}": {"get": {"operationId": "getItem",
+                    "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                    "responses": {"200": {"description": "OK"}}}}
+            }})
+            .to_string(),
+            "/mcp".into(),
+            "/items-transit".into(),
+        );
+        store
+            .create(&proxy)
+            .await
+            .unwrap();
+        let external = json!({"credential_provider_id": "vendor", "consent_mode": "external", "subject": "owner"});
+        let tool_call = |id: &str| {
+            json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "getItem", "arguments": {"id": id}}}).to_string()
+        };
+        let proxy_endpoint = format!("proxy://{}", proxy.id);
+        let cases = [
+            (
+                "https",
+                "https://partner.example/base",
+                "/outbound/mcp/partner/%2e%2e/admin",
+                protocol_request_body("http"),
+                true,
+            ),
+            (
+                "https",
+                "https://partner.example/base",
+                "/outbound/mcp/partner/inside",
+                protocol_request_body("http"),
+                false,
+            ),
+            ("mcp", proxy_endpoint.as_str(), "/outbound/mcp/partner", tool_call("../../admin"), true),
+            ("mcp", proxy_endpoint.as_str(), "/outbound/mcp/partner", tool_call("/admin"), true),
+            ("mcp", proxy_endpoint.as_str(), "/outbound/mcp/partner", tool_call("//admin"), true),
+            ("mcp", proxy_endpoint.as_str(), "/outbound/mcp/partner", tool_call("1"), false),
+        ];
+        for (protocol, endpoint, path, body, refused) in cases {
+            let mut state = test_outbound_state();
+            state.mcp_proxy_store = Some(store.clone());
+            state
+                .channel_state
+                .write()
+                .unwrap()
+                .surface = Arc::new(transit_surface(
+                json!([{"alias": "partner", "protocol": if protocol == "mcp" { "mcp" } else { "http" },
+                    "require_transit_token": false, "allow_unauthenticated_callers": true,
+                    "target_endpoint": endpoint, "transit_credentials": external}]),
+                json!([]),
+            ));
+            let ((status, answer), events) =
+                crate::audit::producer::capture(send_through_the_pipeline(&state, "POST", path, &body)).await;
+            let path_refusals = rejections_of(events)
+                .into_iter()
+                .filter(|(_, reason, _)| {
+                    matches!(reason, crate::audit::request_events::RejectionReason::TargetPathRefused)
+                })
+                .count();
+            let reason = if protocol == "mcp" {
+                answer["error"]["data"]["reason"].clone()
+            } else {
+                answer["reason"].clone()
+            };
+            if refused {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{endpoint} {path} {body}: {answer}");
+                assert_eq!(reason, "target_path_refused", "{endpoint} {path} {body}: {answer}");
+                assert_eq!(path_refusals, 1, "{endpoint} {path} {body}");
+            } else {
+                assert_ne!(reason, "target_path_refused", "{endpoint} {path} {body}: {answer}");
+                assert_eq!(path_refusals, 0, "{endpoint} {path} {body}");
+            }
+        }
+
+        let mut broken = proxy.clone();
+        broken.id = uuid::Uuid::new_v4().to_string();
+        broken.endpoint_path = "/items-broken".into();
+        broken.openapi_spec = "openapi: [not, a, spec".into();
+        store
+            .create(&broken)
+            .await
+            .unwrap();
+        let mut state = test_outbound_state();
+        state.mcp_proxy_store = Some(store.clone());
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(transit_surface(
+            json!([{"alias": "partner", "protocol": "mcp", "require_transit_token": false,
+                "allow_unauthenticated_callers": true, "target_endpoint": format!("proxy://{}", broken.id),
+                "transit_credentials": external}]),
+            json!([]),
+        ));
+        let (status, answer) =
+            send_through_the_pipeline(&state, "POST", "/outbound/mcp/partner", &tool_call("1")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
+        assert_ne!(
+            answer["error"]["data"]["reason"], "connector_unavailable",
+            "the grant is never looked up: {answer}"
+        );
+        assert_ne!(answer["reason"], "connector_unavailable", "{answer}");
+
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(transit_surface(
+            json!([{"alias": "partner", "protocol": "mcp", "require_transit_token": false,
+                "allow_unauthenticated_callers": true, "target_endpoint": "proxy://missing-proxy",
+                "transit_credentials": external}]),
+            json!([]),
+        ));
+        let (status, answer) =
+            send_through_the_pipeline(&state, "POST", "/outbound/mcp/partner", &tool_call("1")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
+        assert_ne!(
+            answer["error"]["data"]["reason"], "connector_unavailable",
+            "a proxy that cannot be loaded has no grant looked up: {answer}"
+        );
+        assert_ne!(answer["reason"], "connector_unavailable", "{answer}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

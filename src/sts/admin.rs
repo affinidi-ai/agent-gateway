@@ -1115,9 +1115,16 @@ mod tests {
             let fixture = fixture.clone();
             async move { update_as_tenant_a(&fixture).await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!creating.is_finished(), "a create waits for the secret delete that holds the lock");
-        assert!(!updating.is_finished(), "an update waits for the secret delete that holds the lock");
+        crate::identity::handlers::surface_grants::assert_waiting_on_bindings(
+            &creating,
+            "a create waits for the secret delete that holds the lock",
+        )
+        .await;
+        crate::identity::handlers::surface_grants::assert_waiting_on_bindings(
+            &updating,
+            "an update waits for the secret delete that holds the lock",
+        )
+        .await;
         drop(deleting);
         assert_eq!(creating.await.unwrap(), StatusCode::CREATED);
         assert_eq!(updating.await.unwrap(), StatusCode::OK);
@@ -1175,8 +1182,11 @@ mod tests {
                 .status()
             }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!creating.is_finished(), "the create waits for the secret delete that holds the lock");
+        crate::identity::handlers::surface_grants::assert_waiting_on_bindings(
+            &creating,
+            "the create waits for the secret delete that holds the lock",
+        )
+        .await;
         secrets
             .delete(&secret.id)
             .await

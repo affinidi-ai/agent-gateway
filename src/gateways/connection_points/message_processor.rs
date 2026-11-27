@@ -4006,20 +4006,63 @@ pub(super) fn fabric_caller_did_and_source(
     }
 }
 
-/// Whether `binding`, of the receiving surface's Target, applies to a Fabric
-/// request calling `tool`.
-fn fabric_binding_applies(
-    binding: &crate::config::types::OutboundCredentialBinding,
-    tool: Option<&str>,
-) -> bool {
-    match &binding.required_for {
-        crate::config::types::CredentialRequirement::All => true,
-        crate::config::types::CredentialRequirement::Tools(tools) => tool.is_some_and(|tool| {
-            tools
-                .iter()
-                .any(|named| named == tool)
-        }),
+/// The URL a Fabric request for `path` is forwarded to: `path` under the Target endpoint, or,
+/// for an agent card request on a surface with an agent card location, that location on the
+/// Target's origin.
+fn fabric_target_url(
+    surface: &crate::config::agent_surface::AgentSurface,
+    config_id: &str,
+    path: &str,
+    card_request: bool,
+) -> String {
+    if card_request
+        && surface
+            .agent_card_location_path()
+            .is_some()
+    {
+        let url = crate::proxy::handler::agent_card::card_target_url(surface);
+        channel_info!(config_id, "Agent card location override applied: {}", loggable::url(&url));
+        url
+    } else {
+        join_endpoint_path(surface.target_endpoint(), path)
     }
+}
+
+/// The MCP proxy `proxy_id` a Fabric request's `proxy://` Target names, when a surface of
+/// `tenant_id` may reference it ([`crate::proxy::credential_destination::owned_proxy`]).
+async fn load_fabric_proxy(
+    proxy_id: &str,
+    tenant_id: Option<&str>,
+) -> Result<crate::mcp_proxies::types::McpProxy, crate::proxy::credential_destination::ProxyLookupFailure> {
+    crate::proxy::credential_destination::owned_proxy(
+        GLOBAL_MCP_PROXY_STORE
+            .get()
+            .map(Arc::as_ref),
+        proxy_id,
+        tenant_id,
+    )
+    .await
+}
+
+/// The answer to a Fabric request whose MCP proxy Target cannot be loaded.
+fn fabric_proxy_lookup_refusal(
+    failure: crate::proxy::credential_destination::ProxyLookupFailure
+) -> axum::response::Response {
+    use crate::proxy::credential_destination::ProxyLookupFailure;
+    match failure {
+        ProxyLookupFailure::StoreUnavailable | ProxyLookupFailure::LoadFailed => crate::a2a::create_error_response(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "MCP proxy storage is unavailable",
+        ),
+        ProxyLookupFailure::NotFound => crate::protocols::no_mcp_proxy_response(),
+    }
+}
+
+/// The answer to a Fabric request whose Legacy SSE session endpoint is outside the Target base
+/// path: recorded as a `target_path_refused` refusal, nothing posted to it.
+fn refuse_legacy_sse_outside_base(audit_facts: &crate::audit::request_events::RequestFacts<'_>) -> ProcessingResult {
+    crate::proxy::credential_destination::refuse_outside_base(audit_facts, None, None);
+    target_auth_failure_result(crate::proxy::handler::TargetAuthFailure::PathRefused)
 }
 
 /// Whether a delegated credential binding of the receiving surface's Target
@@ -4031,7 +4074,7 @@ fn fabric_delegation_applies(
 ) -> bool {
     bindings
         .iter()
-        .any(|binding| fabric_binding_applies(binding, tool))
+        .any(|binding| binding.applies_to_tool(tool))
 }
 
 /// Whether a binding that applies to a Fabric request calling `tool` releases
@@ -4046,7 +4089,7 @@ async fn fabric_per_user_binding_applies(
 ) -> bool {
     for binding in bindings
         .iter()
-        .filter(|binding| fabric_binding_applies(binding, tool))
+        .filter(|binding| binding.applies_to_tool(tool))
     {
         let Some(providers) = providers else {
             return true;
@@ -5783,6 +5826,69 @@ async fn process_charged_forward_request(
         evidence: None,
         received_at,
     };
+    let credentialed_card_fetch =
+        surface.target_auth().is_some() && crate::proxy::handler::is_fabric_card_fetch(&surface, method, path);
+    let target_url = fabric_target_url(&surface, config_id, path, is_agent_card_request || credentialed_card_fetch);
+    let forwards_to_target_url = !surface.dispatches_to_a2a_proxy()
+        && (!surface.target_endpoint().starts_with("proxy://") || modern_request.is_some());
+    // A credential the sending gateway put into the request goes with it whatever path it
+    // reads, a card read included, so only this surface's own bindings follow the card rule.
+    let carries_delegated_credential = crate::proxy::credential_delegation::sender_named_delegated_credential(
+        &message.message_body,
+    ) || (!is_agent_card_request
+        && !credentialed_card_fetch
+        && surface.agent_keyed_binding_applies(crate::mcp::tool_analyzer::called_tool_name(&body_bytes).as_deref()));
+    // An MCP proxy Target that cannot be loaded refuses a modern request here, before any
+    // credential or grant is resolved for it.
+    let modern_proxy = match (modern_request.as_ref(), surface.target_endpoint().strip_prefix("proxy://")) {
+        (Some(_), Some(proxy_id)) => match load_fabric_proxy(proxy_id, surface.tenant_id.as_deref()).await {
+            Ok(proxy) => Some(proxy),
+            Err(failure) => return axum_response_to_forward_result(fabric_proxy_lookup_refusal(failure)).await,
+        },
+        _ => None,
+    };
+    let verdict = if forwards_to_target_url {
+        let destination = match (modern_request.as_ref(), modern_proxy.as_ref()) {
+            (Some(request), Some(proxy)) => crate::proxy::credential_destination::Destination::ProxyCall {
+                proxy,
+                call: crate::proxy::credential_destination::ProxyCall::Modern(request),
+            },
+            _ => crate::proxy::credential_destination::Destination::Url {
+                endpoint: surface.target_endpoint(),
+                method,
+                url: &target_url,
+                card_location: surface.agent_card_location_path(),
+            },
+        };
+        // A Fabric stream does not say what its sender injected, so every request it carries is
+        // held as carrying a delegated credential for this check.
+        let unnamed_stream_credential = stream_request.is_some();
+        crate::proxy::credential_destination::verdict(
+            surface.target_auth().is_some(),
+            carries_delegated_credential || unnamed_stream_credential,
+            destination,
+        )
+        .await
+    } else {
+        crate::mcp_proxies::handlers::ToolCallDestination::InsideBase
+    };
+    match verdict {
+        crate::mcp_proxies::handlers::ToolCallDestination::InsideBase => {}
+        crate::mcp_proxies::handlers::ToolCallDestination::OutsideBase => {
+            crate::proxy::credential_destination::refuse_outside_base(&audit_facts, None, surface.target_auth());
+            return target_auth_failure_result(crate::proxy::handler::TargetAuthFailure::PathRefused);
+        }
+        crate::mcp_proxies::handlers::ToolCallDestination::CatalogUnavailable => {
+            let response = match modern_request.as_ref() {
+                Some(request) => crate::mcp_proxies::handlers::catalog_unavailable(request).into_response(),
+                None => crate::a2a::create_error_response(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "MCP tool catalog is unavailable",
+                ),
+            };
+            return axum_response_to_forward_result(response).await;
+        }
+    }
     let mut modern_delegation = None;
     if let Some(request) = modern_request.as_ref()
         && surface.has_agent_keyed_outbound_credentials()
@@ -6019,24 +6125,11 @@ async fn process_charged_forward_request(
     // request, as on the direct path: a bodiless GET of the card path that keeps
     // only content-negotiation headers from the peer, and carries no caller's
     // delegated credential, caller key or transit token.
-    let credentialed_card_fetch =
-        surface.target_auth().is_some() && crate::proxy::handler::is_fabric_card_fetch(&surface, method, path);
     if credentialed_card_fetch {
         body_bytes = Default::default();
         outbound_creds.clear();
         modern_delegation = None;
     }
-
-    // An agent card request at a configured card location goes to that path on the
-    // Target's origin, dropping any sub-path of the Target endpoint.
-    let target_url = if (is_agent_card_request || credentialed_card_fetch) && surface.agent_card_location_path().is_some() {
-        let url = crate::proxy::handler::agent_card::card_target_url(&surface);
-        channel_info!(config_id, "Agent card location override applied: {}", loggable::url(&url));
-        url
-    } else {
-        join_endpoint_path(surface.target_endpoint(), path)
-    };
-
     channel_info!(
         config_id,
         "🌐 Making HTTP request: {} {}{}",
@@ -6182,17 +6275,6 @@ async fn process_charged_forward_request(
     // Inject target authentication credentials (if configured on the channel)
     let mut target_token = None;
     if let Some(target_auth) = surface.target_auth() {
-        if !crate::proxy::paths::is_target_credential_destination(
-            surface.target_endpoint(),
-            method,
-            &target_url,
-            surface.agent_card_location_path(),
-        ) {
-            channel_warn!(config_id, "Refusing a request outside the Target base path: it would carry the Target credential");
-            let refusal = crate::proxy::handler::TargetAuthFailure::PathRefused;
-            crate::proxy::handler::record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
-            return target_auth_failure_result(refusal);
-        }
         // Build a secrets store from the storage path passed via message context
         let secrets_store: Option<Arc<dyn crate::secrets::SecretsStore>> = match message
             .context
@@ -6637,26 +6719,8 @@ async fn process_charged_forward_request(
         }
     }
 
-    // An MCP proxy Target that cannot be loaded, and a request that cannot be
-    // built for it, are refused before the payment is taken.
-    let modern_proxy = match (modern_request.as_ref(), surface.target_endpoint().strip_prefix("proxy://")) {
-        (Some(_), Some(proxy_id)) => {
-            use crate::mcp_proxies::McpProxyStore;
-            let Some(store) = GLOBAL_MCP_PROXY_STORE.get() else {
-                return axum_response_to_forward_result(crate::a2a::create_error_response(
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE, "MCP proxy storage is unavailable",
-                )).await;
-            };
-            match store.get(proxy_id).await {
-                Ok(Some(proxy)) => Some(proxy),
-                Ok(None) => return axum_response_to_forward_result(crate::protocols::no_mcp_proxy_response()).await,
-                Err(_) => return axum_response_to_forward_result(crate::a2a::create_error_response(
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE, "MCP proxy storage is unavailable",
-                )).await,
-            }
-        }
-        _ => None,
-    };
+    // A request that cannot be built for the MCP proxy Target loaded above is refused before
+    // the payment is taken.
     if modern_proxy.is_some() && req.try_clone().is_none_or(|request| request.build().is_err()) {
         return axum_response_to_forward_result(crate::a2a::create_error_response(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to prepare modern MCP proxy request",
@@ -6707,6 +6771,10 @@ async fn process_charged_forward_request(
         secrets: response_secrets.as_ref(),
         stamp: target_tls_stamp,
     };
+    let sender_meta_fields = crate::proxy::credential_delegation::sender_delegated_meta_fields(&message.message_body);
+    let legacy_sse_credential_base =
+        crate::proxy::credential_delegation::carries_delegated_meta_field(&surface, &body_bytes, &sender_meta_fields)
+            .then_some(surface.target_endpoint());
     if surface_protocol == crate::config::ChannelProtocol::Mcp && modern_request.is_none() && !body_bytes.is_empty() {
         // Check if a persistent session already exists (cheap read lock check)
         let has_session = {
@@ -6728,6 +6796,7 @@ async fn process_charged_forward_request(
                 channel_id,
                 fabric_max_response_bytes(),
                 Some(legacy_sse_check),
+                legacy_sse_credential_base,
             )
             .await
             {
@@ -6760,6 +6829,9 @@ async fn process_charged_forward_request(
                             "body": "",
                         }),
                     };
+                }
+                Err(crate::mcp::sse_transport::LegacySseError::OutsideTargetBase) => {
+                    return refuse_legacy_sse_outside_base(&audit_facts);
                 }
                 Err(crate::mcp::sse_transport::LegacySseError::Unauthenticated(failure)) => {
                     return axum_response_to_forward_result(crate::proxy::response_auth::refuse(
@@ -6876,6 +6948,7 @@ async fn process_charged_forward_request(
                     channel_id,
                     fabric_max_response_bytes(),
                     Some(legacy_sse_check),
+                    legacy_sse_credential_base,
                 )
                 .await
                 {
@@ -6910,6 +6983,9 @@ async fn process_charged_forward_request(
                                 "body": "",
                             }),
                         };
+                    }
+                    Err(crate::mcp::sse_transport::LegacySseError::OutsideTargetBase) => {
+                        return refuse_legacy_sse_outside_base(&audit_facts);
                     }
                     Err(crate::mcp::sse_transport::LegacySseError::Unauthenticated(failure)) => {
                         return axum_response_to_forward_result(crate::proxy::response_auth::refuse(
@@ -9106,48 +9182,27 @@ async fn handle_mcp_proxy_forward(
     }
 
     // Load MCP proxy configuration
-    let mcp_proxy_store = match GLOBAL_MCP_PROXY_STORE.get() {
-        Some(store) => store,
-        None => {
-            channel_warn!(config_id, "MCP proxy store not initialized");
-            let error_body = serde_json::json!({
-                "error": "MCP proxy store not initialized",
-                "status": 500,
-            });
-            return ProcessingResult::RequiresResponse {
-                response_type: MessageType::ForwardResponse.to_string(),
-                response_body: error_body,
-            };
-        }
-    };
-
-    use crate::mcp_proxies::filesystem::McpProxyStore;
-    let proxy = match mcp_proxy_store
-        .as_ref()
-        .get(proxy_id)
-        .await
+    let proxy = match crate::proxy::credential_destination::owned_proxy(
+        GLOBAL_MCP_PROXY_STORE
+            .get()
+            .map(Arc::as_ref),
+        proxy_id,
+        surface.tenant_id.as_deref(),
+    )
+    .await
     {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            channel_warn!(config_id, "MCP proxy not found: {}", proxy_id);
-            let error_body = serde_json::json!({
-                "error": format!("MCP proxy not found: {}", proxy_id),
-                "status": 404,
-            });
-            return ProcessingResult::RequiresResponse {
-                response_type: MessageType::ForwardResponse.to_string(),
-                response_body: error_body,
+        Ok(proxy) => proxy,
+        Err(failure) => {
+            use crate::proxy::credential_destination::ProxyLookupFailure;
+            channel_warn!(config_id, "MCP proxy {} could not be loaded: {:?}", proxy_id, failure);
+            let (error, status) = match failure {
+                ProxyLookupFailure::StoreUnavailable => ("MCP proxy store not initialized".to_string(), 500),
+                ProxyLookupFailure::LoadFailed => ("Failed to load MCP proxy".to_string(), 500),
+                ProxyLookupFailure::NotFound => (format!("MCP proxy not found: {proxy_id}"), 404),
             };
-        }
-        Err(e) => {
-            channel_warn!(config_id, "Failed to load MCP proxy {}: {}", proxy_id, e);
-            let error_body = serde_json::json!({
-                "error": format!("Failed to load MCP proxy: {}", e),
-                "status": 500,
-            });
             return ProcessingResult::RequiresResponse {
                 response_type: MessageType::ForwardResponse.to_string(),
-                response_body: error_body,
+                response_body: serde_json::json!({ "error": error, "status": status }),
             };
         }
     };
@@ -9196,9 +9251,28 @@ async fn handle_mcp_proxy_forward(
             .and_then(serde_json::Value::as_str),
         via_fabric: true,
     };
-    // Resolve target auth header if configured on the channel
+    let destination = crate::proxy::credential_destination::verdict(
+        surface
+            .target_auth()
+            .is_some(),
+        false,
+        crate::proxy::credential_destination::Destination::ProxyCall {
+            proxy: &proxy,
+            call: crate::proxy::credential_destination::ProxyCall::Legacy(&mcp_request),
+        },
+    )
+    .await;
+    if destination == crate::mcp_proxies::handlers::ToolCallDestination::OutsideBase {
+        crate::proxy::credential_destination::refuse_outside_base(&audit_facts, None, surface.target_auth());
+        return target_auth_failure_result(crate::proxy::handler::TargetAuthFailure::PathRefused);
+    }
+    // Resolve target auth header if configured on the channel; a proxy whose catalog cannot be
+    // read is refused below, as the proxy refuses it, without resolving the credential.
     let vault = get_delegation_vault_store();
-    let target_credential = if let Some(target_auth) = surface.target_auth() {
+    let target_credential = if let Some(target_auth) = surface
+        .target_auth()
+        .filter(|_| destination != crate::mcp_proxies::handlers::ToolCallDestination::CatalogUnavailable)
+    {
         let secrets_store: Option<Arc<dyn crate::secrets::SecretsStore>> = match message
             .context
             .get("secrets_storage_path")
@@ -9262,7 +9336,8 @@ async fn handle_mcp_proxy_forward(
     // The proxy has to be able to serve the request before it is charged: its
     // spec and base URL, the method and the tool must be known.
     let prepared =
-        crate::mcp_proxies::handlers::prepare_mcp_request(&proxy, mcp_request.clone(), target_auth_header, config_id);
+        crate::mcp_proxies::handlers::prepare_mcp_request(&proxy, mcp_request.clone(), target_auth_header, config_id)
+            .await;
 
     // Every refusal that does not depend on payment has been made: the rate
     // limit, the proxy itself, its target authentication and an open circuit
@@ -9298,6 +9373,7 @@ async fn handle_mcp_proxy_forward(
                     policy_manager,
                     &surface.name,
                     sent_token.as_ref(),
+                    &crate::proxy::credential_delegation::sender_delegated_meta_fields(&message.message_body),
                 )
                 .await;
                 if let Err(error) = &executed
@@ -9444,11 +9520,8 @@ async fn handle_mcp_proxy_forward(
             }
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::OutsideTargetBase) => {
-            let refusal = crate::proxy::handler::TargetAuthFailure::PathRefused;
-            if let Some(target_auth) = surface.target_auth() {
-                crate::proxy::handler::record_target_auth_refusal(&audit_facts, None, target_auth, refusal.status());
-            }
-            target_auth_failure_result(refusal)
+            crate::proxy::credential_destination::refuse_outside_base(&audit_facts, None, surface.target_auth());
+            target_auth_failure_result(crate::proxy::handler::TargetAuthFailure::PathRefused)
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::Failed(error_msg)) => {
             let config_id = surface

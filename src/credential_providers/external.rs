@@ -1366,8 +1366,8 @@ pub const PROXY_OVERRIDES_THE_METHOD: &str = "consent_mode external needs an MCP
 /// operation behind the same tool name, past name-based tool gating. Checked
 /// when the surface is saved, when a connect starts, and on every tool call
 /// that carries the grant.
-pub fn check_proxy_grant_spec(proxy: &crate::mcp_proxies::types::McpProxy) -> Result<(), &'static str> {
-    if crate::mcp_proxies::handlers::spec_sends_a_method_override(proxy) {
+pub async fn check_proxy_grant_spec(proxy: &crate::mcp_proxies::types::McpProxy) -> Result<(), &'static str> {
+    if crate::mcp_proxies::handlers::spec_sends_a_method_override(proxy).await {
         return Err(PROXY_OVERRIDES_THE_METHOD);
     }
     Ok(())
@@ -1385,7 +1385,7 @@ pub async fn check_transit_grant_spec(
         return Ok(());
     };
     match store.get(proxy_id).await {
-        Ok(Some(proxy)) => check_proxy_grant_spec(&proxy),
+        Ok(Some(proxy)) => check_proxy_grant_spec(&proxy).await,
         _ => Ok(()),
     }
 }

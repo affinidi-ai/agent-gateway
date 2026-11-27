@@ -350,7 +350,7 @@ modes; see
 [Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
 To move to `"enforce"` safely, run `"warn"`, read the report's `provider_key_tenant` lines, fix
 those surfaces, then restart with `"enforce"`. An
-unknown value fails startup, and an absent section means every rule is `"warn"`. The report also names a stored JWT Bearer provider without a subject under a fifth rule, `jwt_subject`, which only warns and has no setting. A provider with
+unknown value fails startup, and an absent section means every rule is `"warn"`. The report also names a stored JWT Bearer provider without a subject under `jwt_subject`, which only warns and has no setting. It also lists a stored Target authentication that breaks a header rule under `target_auth_header`; that rule has no setting and is always reported as enforced (see [Target authentication rules](CREDENTIAL_DELEGATION.md#target-authentication-rules)). A provider with
 an `issuer` always needs public `https` endpoints, whatever `insecure_token_endpoints` says, and
 its issuer metadata and revocation calls have their own 10 second timeouts, not
 `token_request_timeout_secs`. `external_consent_resource_origins`, `external_consent_issuers` and

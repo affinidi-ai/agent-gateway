@@ -820,7 +820,8 @@ this request. It then adds the `target_auth` header, and then the `bearer_header
 name. On a `2026-07-28` MCP request, the credentials prepared for `outbound_credentials` are
 applied last in the same way. So the managed agent can neither supply nor replace a
 credential, and a delegated credential under the same name as `target_auth` replaces it;
-give them different names to send both.
+give them different names to send both. A delegated credential goes only under the Transit
+Point's target base path, as `target_auth` does (see [Target base path](#target-base-path)).
 
 A credential header value that is not ASCII is sent to an HTTP target byte for byte. A Fabric
 target can carry only text header values, so a Transit Point refuses a Fabric request whose
@@ -969,9 +970,14 @@ partner's users apart, by the same rule as a Transit Point's switch (see
 Target whose endpoint is an `http://` or `https://` URL exactly as written (a lower-case scheme
 with nothing before it), the only URL Fabric receive dials through a client pinned to the address
 it vetted. On any other Target the view behaves as with the switch off: a `fabric://` or other
-non-HTTP Target refuses a per-user binding with `delegation_not_enabled_for_partners`, and a
-legacy request to a `proxy://` or `a2a-proxy://` Target is forwarded before any binding applies,
-so Fabric receive sends it no delegated credential at all. The served view is checked on
+non-HTTP Target refuses a per-user binding with `delegation_not_enabled_for_partners`; a legacy
+request to a `proxy://` Target, and a request to an A2A or AP2 surface's `a2a-proxy://` Target, is
+handed to the MCP or A2A proxy before any binding applies, so Fabric receive sends it no
+delegated credential at all; an `a2a-proxy://` Target on any other surface is not handed to
+the A2A proxy on Fabric receive (`dispatches_to_a2a_proxy` is false) and is treated as the other non-HTTP Targets above. A released
+grant goes only under the Target base path: a partner's request whose path climbs out is refused
+with `400 target_path_refused` before any grant is read, ahead of the refusals above (see
+[Target base path](#target-base-path)). The served view is checked on
 every request, so turning the switch off refuses the next partner request. A view that releases
 its grants this way keeps each person's grant per person and surface: the agent half of the key is
 the surface's id, on legacy direct calls too, whatever agent a request names, and the user half is
@@ -1254,10 +1260,12 @@ Transit Point. The [agent card preview](PROTOCOLS.md#agent-card-preview) reports
 cannot be obtained is recorded in the VP Audit Log as a `request_rejected` record with reason
 `target_auth_failed` (see [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)), and
 so is a request refused for leaving the Target base path, with outcome `rejected` whatever the
-`fallback`. An
+`fallback` (a request carrying only a delegated credential is recorded as `target_path_refused`). An
 `a2a-proxy://` Target sends its A2A proxy's Direct Line credential rather than `target.auth`:
-that credential follows `target_source_auth` (withheld with a warning, the request goes on
-without it and no audit record is written), on the direct path and Fabric receive alike, and
+that credential follows `target_source_auth` (withheld, the request goes on
+without it, no audit record is written, and the one warning per request is "Withholding the A2A
+proxy backend credential", naming the rule; the Direct Line runtime logs that it sends no
+credential at debug only), on the direct path and Fabric receive alike, and
 `target_https` does not apply to it because it goes to the proxy's own Direct Line endpoint. A
 caller whose authentication failed, including one that carries credentials for more than one
 `caller_authentication` method (`ambiguous_credentials`), and a public discovery read, never get
@@ -1681,6 +1689,102 @@ returned, never followed. A request whose path climbs out, such as `{route}/%2e%
 tool calls; the rules and each path's answer are in
 [Target Credential Scope](PROTOCOLS.md#target-credential-scope).
 
+A delegated credential (an `outbound_credentials` or `transit_credentials` binding, legacy or
+`2026-07-28`, a person's grant or a service grant, in a header or `_meta`) is held to the same
+rule on every leg that attaches one: the direct path, Fabric send (`2026-07-28` MCP), Fabric
+receive (including a grant released to a partner's request), and Transit Points over HTTP and
+Fabric. A request that would carry one outside the Target base path gets the same
+`400 target_path_refused` as for the Target credential. On the direct path, Fabric receive and Fabric send that happens before
+any grant is read, token requested or consent started, for legacy and `2026-07-28` requests
+alike on the direct path and Fabric receive, and for `2026-07-28` requests on a Fabric send
+whose Target has `fabric_delegated_credentials` on: the request would carry one when a binding
+applies to it, that is a binding for every request, or a binding scoped to tools when the
+request is a `tools/call` of one of them. On a Transit Point it also happens before any grant
+is read, token requested or consent started, legacy or `2026-07-28`, internal or external
+consent, when a binding for every request or the Transit Point's `consent_mode: external`
+binding applies (a binding scoped to tools never applies on a Transit Point) and the request is
+not a discovery read, on a destination that does not withhold delegated credentials; through
+a `proxy://` MCP Proxy the tool call is checked against the REST URL its path arguments build.
+The refusal counts as a failed call in the connection metrics and task activity, and the
+forward step refuses again any request a credential was attached to, in a header or `_meta`. A
+request that carries no delegated credential, such as a `2026-07-28` `tools/list` against a
+binding scoped to tools, is not refused for its path. It is recorded as a `request_rejected` record at `forward` with reason
+`target_path_refused`, or as `target_auth_failed` when the leg also has a Target credential. On
+Fabric receive a discovery read (the agent card) is not counted as carrying a delegated
+credential of the receiving surface's bindings, since that leg injects none into it, but one
+whose sending gateway names a delegated `_meta` field or header (`delegated_meta_fields`,
+`delegated_header_names`, or a list of either it cannot read whole; see
+[Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric)) is, so a card
+read carrying a credential a Transit Point put in it is refused at a card location outside the
+base path; the direct path counts every request a binding applies to. The configured agent card location outside the base path takes only the Target
+credential, never a delegated one: the direct path serves the card read itself, a Transit
+Point sends a discovery read no delegated credential, and Fabric receive clears every delegated
+credential from the gateway's own card fetch, so a request routed there for another path, such
+as a direct `GET {route}/.well-known/not-a-card`, a Transit Point
+`GET {listen path}/x/.well-known/agent-card.json` or a partner's `GET /%2e%2e/card`, is refused
+with `400 target_path_refused` when a binding applies to it. A tool call to an MCP proxy Target
+is checked against the REST URL its path arguments build under the proxy's `base_url` before
+anything is resolved: a `2026-07-28` call on the direct path and Fabric receive, by the REST
+client's rule (a `.` or `..` segment, or a URL outside a base path that is not the root, as for
+`../admin`), before any grant is read, token requested or consent started; and a legacy call
+with a Target credential, or through a Transit Point's MCP Proxy with its external-consent
+grant, by the same rule the proxy applies to a call carrying a credential (each path argument
+put into the tool's path as it is and the URL resolved against the proxy's base directory, as
+for `/admin` or `//admin`), before that credential is resolved or the grant read. It gets the
+same `400 target_path_refused` and audit record; the proxy's and the REST client's own checks
+stay as a second guard. A proxy whose spec cannot be parsed is refused there too, before any
+credential is resolved, as its call would be: `503` "MCP tool catalog is unavailable" for a
+`2026-07-28` call, the proxy's own error for a legacy call, and `503` on a Transit Point. So is
+a proxy that cannot be loaded (none with that id, or one the surface's tenant may not
+reference, or a store that cannot be read), with the answer its dispatch gives: a `2026-07-28`
+call on the direct path or Fabric receive gets no consent prompt and no grant read for a
+request that could never be served. Every leg loads the proxy it checks in one way, scoped to
+the surface's tenant. Each
+proxy's spec is parsed once and kept while its id, base URL and spec stay the same, so the
+check and the call it guards share one parse; requests that find it unparsed wait for one parse
+of that proxy's spec, while other proxies' lookups go on. On Fabric receive a `2026-07-28` MCP
+request arrives over a Fabric stream, which does not say what its sender injected, so every request
+a stream carries is held as carrying a delegated credential for this check whatever the Target and
+the receiving surface's own bindings, as an unreadable `delegated_meta_fields` list is: an HTTP(S)
+Target's request URL is held to the Target base path, and an MCP proxy's tool call to the REST URL
+its path arguments build, both refused with `400 target_path_refused` and recorded before the Target
+is called. The stream format is unchanged (see
+[Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric)). When a legacy MCP
+Target refuses the plain POST and the request falls back to Legacy SSE, on the direct path or
+Fabric receive, the session endpoint the Target advertises is known only after the first
+attempt, so it is checked as soon as it is advertised, before the session is initialized and
+after the credential was resolved: a request whose body carries a `_meta` field a delegated
+credential goes into (a field of a binding of the receiving surface, or on Fabric receive one
+the sending gateway names in `delegated_meta_fields`, see
+[Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric)) is posted
+only to a session endpoint under the Target base path, and is otherwise refused with
+`400 target_path_refused` and a `target_path_refused` record at `forward`, with nothing posted
+to it, not even the session's `initialize`. The fallback sends no header of the request, so
+neither the Target credential nor a delegated credential in a header reaches the session
+endpoint. Many Legacy SSE servers advertise a root endpoint such as `/messages?sessionId=...`;
+on a Target such as `https://host/mcp`, a fallback request carrying a `_meta` delegated
+credential is then refused, so set the Target endpoint to the base path both share, such as
+`https://host`. A Target bound by
+external consent keeps its stricter admission check (400).
+
+A surface's traffic mirror (`target.networking.mirror`) never receives the Target credential, a
+delegated credential this gateway injects, or one a sending gateway names as delegated over
+Fabric, on the direct path, on Fabric send or from an MCP proxy Target. The mirrored copy carries
+the caller's headers without the caller's own credentials or any header named like a credential
+header. On the direct path, including a legacy `proxy://` tool call, on Fabric send, and on a
+legacy `proxy://` tool call received over Fabric, its body has none of the `_meta` fields delegated credentials
+go into, even when the caller set them: the fields of the surface's own bindings, and on Fabric
+receive those the sending gateway names in `delegated_meta_fields`, the empty name included, or
+the whole `_meta` when that list cannot be read whole (see
+[Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric)). Custom
+metadata, DID identity and the identity binding VP stay in the body. On Fabric send the copy is
+taken before the gateway adds any credential to the body, and a value the caller set in a field
+of the surface's own bindings is left out too. Fabric receive otherwise, and Transit Points, send
+no traffic mirror. A request from another gateway's Transit Point that reaches this surface over
+HTTP is an ordinary caller's request here: a credential that gateway put into a `_meta` field
+the surface has no binding for is part of the caller's own metadata, which the gateway cannot
+tell from any other, and is mirrored with it.
+
 ## Caller keys
 
 A Target that keeps data for each caller, such as an agent's memory of each signed-in user,
@@ -1962,7 +2066,10 @@ it, including A2A through header injection. A Transit Point on a surface without
 `transit_credentials`, never another Transit Point's, whatever its destination. The surface's
 Target uses only `outbound_credentials`, never a Transit Point's `transit_credentials`. Consent, refresh
 and revocation stay on the sending gateway. See
-[Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric).
+[Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric). A delegated
+credential sent over Fabric is held to the Target base path on the sending leg, since the
+receiving gateway forwards a header it does not own unchanged (see
+[Target base path](#target-base-path)).
 
 A grant by binding never crosses Fabric: a Target or Transit Point bound by external consent must
 be a public `https` URL, and a surface whose Target is bound by external consent refuses every

@@ -258,6 +258,20 @@ pub struct ValidatedModernMessage {
     pub kind: McpMessageKind,
 }
 
+impl ValidatedModernMessage {
+    /// The tool a `tools/call` request names.
+    pub fn called_tool_name(&self) -> Option<&str> {
+        (self.method == "tools/call")
+            .then(|| {
+                self.params
+                    .as_ref()?
+                    .get("name")?
+                    .as_str()
+            })
+            .flatten()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum McpRequestClassification {
     Legacy(LegacyRequestKind),
@@ -977,6 +991,23 @@ mod tests {
 
     use super::*;
     use crate::mcp::MCP_MODERN_VERSION;
+
+    #[test]
+    fn a_modern_message_names_a_called_tool_only_for_tools_call() {
+        let message = |method: &str, params: Option<serde_json::Value>| ValidatedModernMessage {
+            protocol_version: MCP_MODERN_VERSION.into(),
+            client_capabilities: None,
+            client_info: None,
+            method: method.into(),
+            params,
+            id: Some(json!(1)),
+            kind: McpMessageKind::Request,
+        };
+        assert_eq!(message("tools/call", Some(json!({"name": "read"}))).called_tool_name(), Some("read"));
+        assert_eq!(message("prompts/get", Some(json!({"name": "read"}))).called_tool_name(), None);
+        assert_eq!(message("tools/call", Some(json!({"name": 1}))).called_tool_name(), None);
+        assert_eq!(message("tools/call", None).called_tool_name(), None);
+    }
 
     #[test]
     fn every_transport_path_admits_modern_alongside_legacy() {
