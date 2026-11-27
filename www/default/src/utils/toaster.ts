@@ -436,9 +436,9 @@ export const showUndoToast = ({
 /**
  * Warning toast laid out as the undo toast: a countdown progress bar, and a Keep open
  * button where Undo is, which keeps the toast until it is closed, with later toasts shown below
- * it. Closes after `duration` ms (default 8000). Screen readers announce it assertively.
+ * it. Closes after `duration` ms (default 10000). Screen readers announce it assertively.
  */
-export const showKeepOpenWarningToast = (message: string, duration = 8000): (() => void) =>
+export const showKeepOpenWarningToast = (message: string, duration = 10000): (() => void) =>
   showCountdownToast({
     message,
     duration,

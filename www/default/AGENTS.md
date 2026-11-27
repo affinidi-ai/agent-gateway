@@ -78,7 +78,7 @@ the replaced toast's timer and `u` key no longer act, and an Undo toast counts a
 without Undo (its `onExpire` runs). `removeToast` does the same and also closes a kept toast.
 This holds on every page.
 
-`showKeepOpenWarningToast` is a warning toast that counts down 8 seconds, and the next toast
+`showKeepOpenWarningToast` is a warning toast that counts down 10 seconds, and the next toast
 replaces it while it does. Its **Keep open** button stops the countdown, removes the bar and
 the button, moves focus to the close button and keeps the toast (`#app-toast-kept`) until it is
 closed: a later toast no longer replaces it but is shown below it, moving back to the top when
@@ -473,7 +473,7 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   undo toast (`showCountdownToast` in `utils/toaster.ts`), with its countdown bar and inline
   close button. "<saved>" alone is `showSuccessCountdownToast`: the success icon and colour, no
   other button, closing after 3 seconds. A toast with warnings is `showKeepOpenWarningToast`:
-  **Keep open** where Undo is, closing after 8 seconds unless Keep open is pressed, which
+  **Keep open** where Undo is, closing after 10 seconds unless Keep open is pressed, which
   keeps it until it is closed, with later toasts (a blocked Save's, the next save's) shown below
   it rather than replacing it; screen readers announce it assertively. The close button and live regions are those of every toast;
   see _Toasts_. The warnings toast is the only place a save's warnings are listed, with

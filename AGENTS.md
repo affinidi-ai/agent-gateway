@@ -547,7 +547,7 @@ The Dashboard shows the metrics **Delete** button only to users with `settings.e
 _Maintenance actions_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#maintenance-actions).
 
 A surface save's warnings are listed once, in full, in the save toast, laid out as the "Changes
-discarded." undo toast with a countdown bar and closing after 8 seconds unless **Keep open**
+discarded." undo toast with a countdown bar and closing after 10 seconds unless **Keep open**
 is pressed, which keeps it, with later toasts shown below it, until it is closed or the page
 leaves that surface; there is no
 save-warnings banner, and a save without warnings shows the same layout

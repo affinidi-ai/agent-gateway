@@ -23,7 +23,7 @@ changes:
         "The last save drew a warning" banner above the canvas and in the save toast.
         The banner is gone, and the save toast is the one place they are listed. It is
         laid out like the "Changes discarded." toast, with a countdown bar, and closes
-        after 8 seconds unless Keep open is pressed, which keeps it until it is closed
+        after 10 seconds, as before, unless Keep open is pressed, which keeps it until it is closed
         or the page leaves that surface, as the banner did, and moves focus to its close
         button; a later notification, such as a blocked Save's, is then shown below it
         instead of replacing it. Screen readers announce it, as they did the banner, and its icon uses the

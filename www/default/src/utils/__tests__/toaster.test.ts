@@ -269,13 +269,13 @@ describe('showKeepOpenWarningToast', () => {
   const keepOpenedButton = () =>
     Array.from(getToast().querySelectorAll('button')).find(b => b.textContent === 'Keep open');
 
-  it('counts down beside Keep open and the close button, then closes', () => {
+  it('counts down 10 seconds by default beside Keep open and the close button, then closes', () => {
     act(() => {
-      showKeepOpenWarningToast('Saved, with warnings:\nfirst\nsecond', 8000);
+      showKeepOpenWarningToast('Saved, with warnings:\nfirst\nsecond');
     });
 
     const fill = getToast().querySelector<HTMLElement>('#app-toast-bar-fill');
-    expect(fill?.style.transitionDuration).toBe('8000ms');
+    expect(fill?.style.transitionDuration).toBe('10000ms');
     expect(fill?.style.width).toBe('0%');
     expect(keepOpenedButton()).toBeDefined();
     expect(getToast().querySelector('#app-toast-close')).not.toBeNull();
@@ -284,7 +284,7 @@ describe('showKeepOpenWarningToast', () => {
     );
 
     act(() => {
-      jest.advanceTimersByTime(7999);
+      jest.advanceTimersByTime(9999);
     });
     expect(document.getElementById('app-toast')).not.toBeNull();
     act(() => {
@@ -297,7 +297,7 @@ describe('showKeepOpenWarningToast', () => {
 
   const showAndKeep = (message: string) => {
     act(() => {
-      showKeepOpenWarningToast(message, 8000);
+      showKeepOpenWarningToast(message);
     });
     act(() => {
       keepOpenedButton()?.click();
