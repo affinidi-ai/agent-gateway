@@ -4553,17 +4553,13 @@ mod tests {
                 "listen_path": "/transit/partner", "listen_address": listen_address }])
         };
 
-        let on_own_base = surface_with_points(
-            point("https://partner.example.com:9100"),
-            point("https://gateway.example.com:9000"),
-        );
+        let on_own_base =
+            surface_with_points(point("https://partner.example.com:9100"), point("https://gateway.example.com:9000"));
         let problems = listen_path_problems(&on_own_base, &network);
         assert!(problems.is_empty(), "the base listener has its own hostname: {problems:?}");
 
-        let on_shared_base = surface_with_points(
-            point("https://gateway.example.com:9000"),
-            point("https://partner.example.com:9100"),
-        );
+        let on_shared_base =
+            surface_with_points(point("https://gateway.example.com:9000"), point("https://partner.example.com:9100"));
         let codes: Vec<&str> = listen_path_problems(&on_shared_base, &network)
             .iter()
             .map(|problem| problem.code)
