@@ -37,6 +37,11 @@ the requests the run makes on loopback; a value of `*` is kept as it is. The
 `UV_PROJECT_ENVIRONMENT` say. Other `UV_*` and `PIP_*` settings, such as an
 index mirror, still apply.
 
+CI runs both suites on every push to `main`, and on a pull request that changes
+this directory or the A2A code its path filter lists (the `a2a-conformance` job
+and the `a2a` filter in `.github/workflows/ci.yml`). A pull request that
+changes A2A behaviour somewhere else still needs a run by hand.
+
 | Option | Effect |
 | --- | --- |
 | `--a2a-version VERSION` | Suite to run: `1.0` (default) or `0.3` |

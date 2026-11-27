@@ -13,7 +13,8 @@ changes:
         runs the A2A 0.3 suite the same way. A run fails on a difference no baseline lists and on
         a listed one that no longer applies; ARGS=--report writes every difference to a file
         instead. The suite and its packages are pinned and installed under target/, and the
-        gateway itself is unchanged.
+        gateway itself is unchanged. CI runs both suites on every push to main and on pull
+        requests that change the harness or the A2A code its path filter lists.
   changed: []
   fixed:
     - timestamp: '2026-11-27T12:54:26Z'

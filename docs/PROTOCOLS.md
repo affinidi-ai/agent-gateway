@@ -848,7 +848,8 @@ A2A behaviour is measured with the A2A project's own conformance suite, the
 `scripts/a2a-conformance/` runs it end to end: `make a2a-conformance` runs the A2A `1.0` suite
 and `make a2a-conformance-legacy` the `0.3` suite, both on the JSON-RPC binding.
 [Its README](../scripts/a2a-conformance/README.md) covers options, pins, outputs and baseline
-maintenance.
+maintenance. CI runs both suites on every push to `main`, and on a pull request that changes the
+harness or the A2A code listed in the `a2a` path filter of `.github/workflows/ci.yml`.
 
 The suite's own test agent is measured twice with the same suite: directly, and through the
 gateway. A forwarding target is scored on the tests whose outcome differs from the direct run, so
