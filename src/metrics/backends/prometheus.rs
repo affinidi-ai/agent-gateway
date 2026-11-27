@@ -182,6 +182,29 @@ lazy_static! {
         counter
     };
 
+    /// Agent presentations refused (labeled by flow and reason).
+    pub static ref VP_PRESENTATION_REFUSED: IntCounterVec = {
+        let opts = Opts::new(
+            names::VP_PRESENTATION_REFUSED_TOTAL,
+            "Agent presentations refused (reason = replay|domain_missing|domain_wrong|domain_label|lifetime|\
+             store_unavailable|limit_total|limit_holder)",
+        );
+        let counter = IntCounterVec::new(opts, &["flow", "reason"]).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
+    /// Agent presentation proofs this node holds as used until they expire
+    pub static ref VP_PROOF_RECORDS: IntGauge = {
+        let opts = Opts::new(
+            names::VP_PROOF_RECORDS,
+            "Number of agent presentation proofs this node holds as used until they expire",
+        );
+        let gauge = IntGauge::with_opts(opts).unwrap();
+        REGISTRY.register(Box::new(gauge.clone())).unwrap();
+        gauge
+    };
+
     /// Managed identity resolution attempts (labeled by channel_id, mode, result)
     pub static ref MANAGED_IDENTITY_RESOLVE: IntCounterVec = {
         let opts = Opts::new(
@@ -803,6 +826,22 @@ pub fn track_proof_purpose_mismatch(
     PROOF_PURPOSE_MISMATCH
         .with_label_values(&[role, reason])
         .inc();
+}
+
+/// Count an agent presentation refused on `flow` for `reason`.
+#[allow(dead_code)]
+pub fn track_vp_presentation_refused(
+    flow: &str,
+    reason: &str,
+) {
+    VP_PRESENTATION_REFUSED
+        .with_label_values(&[flow, reason])
+        .inc();
+}
+
+#[allow(dead_code)]
+pub fn set_vp_proof_records(count: i64) {
+    VP_PROOF_RECORDS.set(count);
 }
 
 /// Track a managed-identity resolution outcome.

@@ -32,6 +32,12 @@ pub mod prom {
     // Verified credentials and presentations whose signing key is not listed under the proof purpose.
     pub const PROOF_PURPOSE_MISMATCH_TOTAL: &str = "agent_gateway_proof_purpose_mismatch_total";
 
+    // Agent presentations refused for their receiver, lifetime or replay, and the live replay records.
+    #[allow(dead_code)]
+    pub const VP_PRESENTATION_REFUSED_TOTAL: &str = "agent_gateway_vp_presentation_refused_total";
+    #[allow(dead_code)]
+    pub const VP_PROOF_RECORDS: &str = "agent_gateway_vp_proof_records";
+
     // Managed identity resolution (FromMtls / FromApiKey / Static / PayloadExtraction)
     pub const MANAGED_IDENTITY_RESOLVE_TOTAL: &str = "agent_gateway_managed_identity_resolve_total";
     pub const MANAGED_IDENTITY_RESOLVE_DURATION_SECONDS: &str =

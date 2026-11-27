@@ -256,7 +256,7 @@ fn verify_vc_lifetime(vc: &Value) -> Result<()> {
 
 /// How far a VP proof's `created` may be ahead of this gateway's clock, and how far its `expires`
 /// may run past the VP lifetime from now.
-const VP_CLOCK_SKEW_SECS: i64 = 120;
+pub(crate) const VP_CLOCK_SKEW_SECS: i64 = 120;
 
 /// Checks one VP proof's lifetime and returns when it expires: its `expires`, or its `created`
 /// plus the VP lifetime when it has none.

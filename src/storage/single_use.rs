@@ -47,6 +47,9 @@ pub enum Namespace {
     McpIdJag,
     FabricEnvelope,
     VoidedEvidence,
+    /// Kept in this node's memory only: never journaled or sent to the
+    /// backend, and lost on a restart, a take-over or a step-down.
+    VpProof,
 }
 
 impl Namespace {
@@ -58,6 +61,7 @@ impl Namespace {
             Self::McpIdJag => "mcp-id-jag",
             Self::FabricEnvelope => "fabric-envelope",
             Self::VoidedEvidence => "voided-evidence",
+            Self::VpProof => "vp-proof",
         }
     }
 
@@ -67,7 +71,12 @@ impl Namespace {
             Self::McpIdJag => "SingleUseMcpIdJag",
             Self::FabricEnvelope => "SingleUseFabricEnvelope",
             Self::VoidedEvidence => "SingleUseVoidedEvidence",
+            Self::VpProof => "SingleUseVpProof",
         }
+    }
+
+    fn is_memory_only(self) -> bool {
+        matches!(self, Self::VpProof)
     }
 }
 
@@ -359,6 +368,11 @@ impl SingleUseStore {
         now: u64,
     ) -> Result<bool, SingleUseError> {
         let slot = (namespace, *key);
+        if namespace.is_memory_only() {
+            return self
+                .record_in_memory(slot, expires_at, now)
+                .await;
+        }
         loop {
             self.wait_for_forget(&slot)
                 .await;
@@ -393,6 +407,47 @@ impl SingleUseStore {
             if let Some(recorded) = recorded {
                 return recorded;
             }
+        }
+    }
+
+    /// Holds `slot` in memory until `expires_at`, writing nothing. A disk store
+    /// that does not hold the journals refuses it, as it refuses every record.
+    async fn record_in_memory(
+        &self,
+        slot: Slot,
+        expires_at: u64,
+        now: u64,
+    ) -> Result<bool, SingleUseError> {
+        self.prune(now);
+        let held = match &self.backend {
+            Backend::Disk(disk) => Some(disk.held.read().await),
+            Backend::Dynamodb { .. } => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        namespace = slot.0.name(),
+                        "VP replay records are per node: they are kept in this node's memory, not in DynamoDB, so other nodes do not see them"
+                    );
+                });
+                None
+            }
+            #[cfg(test)]
+            Backend::Memory { fail: true } => {
+                return Err(SingleUseError::Storage("test store refuses writes".into()));
+            }
+            #[cfg(test)]
+            Backend::Memory { fail: false } => None,
+        };
+        if held
+            .as_ref()
+            .is_some_and(|held| held.is_none())
+        {
+            return Err(SingleUseError::Unavailable);
+        }
+        match self.claim(slot, expires_at, now) {
+            Claim::Taken => Ok(false),
+            Claim::Claimed => Ok(true),
+            Claim::Forgetting => Err(SingleUseError::Unavailable),
         }
     }
 
@@ -501,6 +556,9 @@ impl SingleUseStore {
                 if self.holds(namespace, key, now) {
                     return Ok(true);
                 }
+                if namespace.is_memory_only() {
+                    return Ok(false);
+                }
                 let expires_at = dynamodb_expiry(client, table, namespace, key).await?;
                 match expires_at {
                     Some(expires_at) if expires_at > now => {
@@ -551,6 +609,10 @@ impl SingleUseStore {
         now: u64,
     ) {
         let slot = (namespace, *key);
+        if namespace.is_memory_only() {
+            self.memory.remove(&slot);
+            return;
+        }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             self.memory.remove(&slot);
             tracing::warn!(
