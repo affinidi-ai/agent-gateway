@@ -640,6 +640,10 @@ pub struct OutboundPipelineContext {
     /// The grant by binding the request carries, so a vendor's `401` can be
     /// answered by a refresh and one retry.
     pub released_grant: Option<Box<ReleasedGrant>>,
+    /// The Connection Point DID of a `fabric://` destination's peer, read when
+    /// the presentation of the agent was signed for it; the forward goes to
+    /// that DID.
+    pub fabric_peer_did: Option<String>,
     /// The status a `proxy://` Transit Point's MCP Proxy's backend answered the
     /// last tool call sent with, which the proxy answers the agent as a tool
     /// result; `None` when no backend answered.
@@ -942,6 +946,7 @@ impl OutboundPipelineContext {
             delegated_credential_headers: HeaderMap::new(),
             grant_destination: None,
             released_grant: None,
+            fabric_peer_did: None,
             proxy_backend_status: None,
             request_path,
             resolved_identity: ProtectedAgentIdentity::Anonymous,
@@ -5106,13 +5111,14 @@ fn capture_workload_binding_caller(
 }
 
 /// The receiver a Transit Point's presentation names: the peer's Connection
-/// Point DID for a `fabric://` destination, otherwise the receiver
+/// Point DID for a `fabric://` destination, returned too for the forward to
+/// send to, otherwise the receiver
 /// [`VpDomain::for_endpoint`](crate::identity::VpDomain::for_endpoint) gives.
 /// A `fabric://` peer that cannot be resolved fails as the forward step would.
 async fn transit_point_receiver(
     state: &OutboundProxyState,
     destination: &str,
-) -> Result<crate::identity::VpDomain, OutboundPipelineError> {
+) -> Result<(crate::identity::VpDomain, Option<String>), OutboundPipelineError> {
     if destination.starts_with("fabric://") {
         use crate::proxy::fabric_forward::FabricForwardError;
         let not_forwarded = |e: FabricForwardError| OutboundPipelineError::UpstreamConnectionFailed(e.to_string());
@@ -5127,16 +5133,17 @@ async fn transit_point_receiver(
         return manager
             .get_gateway_did(gateway_id)
             .await
-            .as_deref()
-            .and_then(crate::identity::VpDomain::did)
+            .and_then(|did| crate::identity::VpDomain::did(&did).map(|receiver| (receiver, Some(did))))
             .ok_or_else(|| not_forwarded(FabricForwardError::GatewayDidNotFound(gateway_id.to_string())));
     }
-    crate::identity::VpDomain::for_endpoint(destination).ok_or_else(|| {
-        OutboundPipelineError::IdentityInjectionFailed(format!(
-            "the destination {} names no receiver for the presentation",
-            loggable::url(destination)
-        ))
-    })
+    crate::identity::VpDomain::for_endpoint(destination)
+        .map(|receiver| (receiver, None))
+        .ok_or_else(|| {
+            OutboundPipelineError::IdentityInjectionFailed(format!(
+                "the destination {} names no receiver for the presentation",
+                loggable::url(destination)
+            ))
+        })
 }
 
 /// [5] Trusted Identity Injection — removes the raw `agent-identity/v1` extension
@@ -5239,7 +5246,7 @@ async fn step_inject_trusted_identity(
     let parsed_a2a = matches!(protocol, ChannelProtocol::A2a | ChannelProtocol::Ap2)
         .then(|| serde_json::from_slice::<serde_json::Value>(body).ok())
         .flatten();
-    let receiver = transit_point_receiver(
+    let (receiver, fabric_peer_did) = transit_point_receiver(
         state,
         &ctx.virtual_channel
             .target_endpoint,
@@ -5327,6 +5334,7 @@ async fn step_inject_trusted_identity(
         }
         _ => unreachable!("unsupported protocols filtered above"),
     };
+    ctx.fabric_peer_did = fabric_peer_did;
 
     // Audit the transit-point VP injection so the MA→TP identity binding is
     // recorded on this (producing) gateway, mirroring the direct/`fabric://`
@@ -7147,6 +7155,7 @@ async fn step_forward_request_fabric(
                     .clone()
                     .unwrap_or_default(),
                 trace_id: uuid::Uuid::parse_str(&ctx.request_id).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+                peer_did: ctx.fabric_peer_did.as_deref(),
             },
         )
         .await
@@ -7187,6 +7196,7 @@ async fn step_forward_request_fabric(
             trace_id: &ctx.request_id,
             log_label: &ctx.surface.name,
             extra_body: None,
+            peer_did: ctx.fabric_peer_did.as_deref(),
         },
     )
     .await
@@ -8385,6 +8395,10 @@ mod tests {
             OutboundPipelineError::UpstreamConnectionFailed(_)
         ));
         assert!(matches!(
+            modern_fabric_failure(FabricForwardError::GatewayDidNotFound("gw".into()), None),
+            OutboundPipelineError::UpstreamConnectionFailed(_)
+        ));
+        assert!(matches!(
             modern_fabric_failure(FabricForwardError::NoResponse("gw".into()), None),
             OutboundPipelineError::UpstreamTimeout
         ));
@@ -8688,6 +8702,7 @@ mod tests {
             delegated_credential_headers: HeaderMap::new(),
             grant_destination: None,
             released_grant: None,
+            fabric_peer_did: None,
             proxy_backend_status: None,
             request_path: "/outbound/surfaces/order/partner-a/message/send".to_string(),
             resolved_identity: ProtectedAgentIdentity::Anonymous,
@@ -15053,6 +15068,25 @@ mod tests {
         destination: &str,
         protocol: ChannelProtocol,
     ) -> Result<Vec<Option<String>>, OutboundPipelineError> {
+        let ctx = transit_point_presenting_the_agent(state, destination, protocol).await?;
+        Ok(crate::identity::test_helpers::presentation_domains(
+            &serde_json::from_slice(
+                ctx.body_bytes
+                    .as_ref()
+                    .unwrap(),
+            )
+            .unwrap(),
+        ))
+    }
+
+    /// A request of `protocol` through a Transit Point to `destination`, with
+    /// the presentation of the agent signed into it, or the error injection
+    /// fails with.
+    async fn transit_point_presenting_the_agent(
+        state: &OutboundProxyState,
+        destination: &str,
+        protocol: ChannelProtocol,
+    ) -> Result<OutboundPipelineContext, OutboundPipelineError> {
         let mut ctx = test_pipeline_context();
         Arc::make_mut(&mut ctx.surface)
             .identity_slots
@@ -15087,14 +15121,68 @@ mod tests {
             .await
             .unwrap();
         step_inject_trusted_identity(state, &mut ctx).await?;
-        Ok(crate::identity::test_helpers::presentation_domains(
-            &serde_json::from_slice(
-                ctx.body_bytes
-                    .as_ref()
-                    .unwrap(),
-            )
-            .unwrap(),
-        ))
+        Ok(ctx)
+    }
+
+    /// A `fabric://` Transit Point sends its request to the peer DID its
+    /// presentation names, read once: the peer's record changing after the
+    /// presentation is signed does not send it elsewhere.
+    #[tokio::test]
+    async fn a_fabric_transit_point_sends_to_the_peer_its_presentation_names() {
+        let root = tempfile::tempdir().unwrap();
+        let peer_did = format!("did:example:transit-peer-{}", uuid::Uuid::new_v4());
+        let mut peer = crate::gateways::types::Gateway::new(
+            "Peer".into(),
+            String::new(),
+            peer_did.clone(),
+            crate::gateways::types::GatewayType::Remote,
+        );
+        let gateways = Arc::new(
+            crate::gateways::FileSystemGatewayStore::new(root.path().join("gateways"), None)
+                .await
+                .unwrap(),
+        );
+        crate::gateways::GatewayStore::create(gateways.as_ref(), &peer)
+            .await
+            .unwrap();
+        let (manager, _manager_issuer_dir) = crate::gateways::test_helpers::test_listener_manager(root.path()).await;
+        let manager = manager.with_gateway_store(gateways.clone());
+        let mut listener = crate::gateways::test_helpers::test_listener("transit-fabric").await;
+        listener.gateway_id = peer.id.clone();
+        manager
+            .register_test_listener(listener)
+            .await;
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = sent.clone();
+        crate::comm::didcomm::client::test_send_hook::install(&peer_did, move |request| {
+            recorded
+                .lock()
+                .unwrap()
+                .push(request.body.clone());
+        });
+        let (vc_issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let mut state = test_outbound_state();
+        state.vc_issuer = Some(Arc::new(vc_issuer));
+        state.listener_manager = Arc::new(tokio::sync::RwLock::new(Some(Arc::new(manager))));
+        let mut ctx = transit_point_presenting_the_agent(
+            &state,
+            &format!("fabric://{}/partner-surface", peer.id),
+            ChannelProtocol::A2a,
+        )
+        .await
+        .unwrap();
+        ctx.virtual_channel.networking = Some(serde_json::from_value(json!({"timeout": {"request_secs": 1}})).unwrap());
+        peer.did = format!("did:example:moved-{}", uuid::Uuid::new_v4());
+        crate::gateways::GatewayStore::update(gateways.as_ref(), &peer)
+            .await
+            .unwrap();
+
+        let _unanswered = step_forward_request(&state, &mut ctx).await;
+
+        crate::comm::didcomm::client::test_send_hook::uninstall(&peer_did);
+        let sent = sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "the request goes to the peer DID the presentation names");
+        assert_eq!(crate::identity::test_helpers::presentation_domains(&sent[0]["body"]), vec![Some(peer_did)]);
     }
 
     /// A Transit Point's presentation names its destination: the origin of a

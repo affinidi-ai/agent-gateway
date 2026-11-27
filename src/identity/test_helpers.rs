@@ -605,30 +605,43 @@ async fn a_signed_agent_presentation_names_its_receiver() {
 /// The proof `domain` of every presentation in `value`, read inside the JSON
 /// text a `verifiablePresentation` carries; `None` for a proof without one.
 pub fn presentation_domains(value: &serde_json::Value) -> Vec<Option<String>> {
+    presentation_proof_fields(value, "domain")
+}
+
+/// The proof `proofValue` of every presentation in `value`, found as
+/// [`presentation_domains`] finds the domains.
+pub fn presentation_proof_values(value: &serde_json::Value) -> Vec<Option<String>> {
+    presentation_proof_fields(value, "proofValue")
+}
+
+fn presentation_proof_fields(
+    value: &serde_json::Value,
+    field: &str,
+) -> Vec<Option<String>> {
     let mut found = Vec::new();
     match value {
         serde_json::Value::String(text) => {
             if let Ok(decoded @ serde_json::Value::Object(_)) = serde_json::from_str::<serde_json::Value>(text) {
-                found.extend(presentation_domains(&decoded));
+                found.extend(presentation_proof_fields(&decoded, field));
             }
         }
         serde_json::Value::Array(values) => values
             .iter()
-            .for_each(|value| found.extend(presentation_domains(value))),
+            .for_each(|value| found.extend(presentation_proof_fields(value, field))),
         serde_json::Value::Object(map) => {
             if map.contains_key("verifiableCredential")
                 && let Some(proof) = map.get("proof")
             {
                 found.push(
                     proof
-                        .get("domain")
+                        .get(field)
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_string),
                 );
             }
             map.iter()
                 .filter(|(key, _)| key.as_str() != "verifiableCredential")
-                .for_each(|(_, value)| found.extend(presentation_domains(value)));
+                .for_each(|(_, value)| found.extend(presentation_proof_fields(value, field)));
         }
         _ => {}
     }

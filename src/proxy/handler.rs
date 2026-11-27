@@ -7471,8 +7471,9 @@ async fn proxy_charged_request(
     // (TokenInjected / TokenRefreshed / NotApplicable / ConsentRequired /
     // elicitation_*). The resulting VP is:
     //   1. injected into the outbound body (replacing any earlier VP slot), and
-    //   2. recorded in the delegation audit log as a single `VpInjected` event
-    //      that operators can verify cryptographically.
+    //   2. recorded in the delegation audit log as a `VpInjected` event, one
+    //      per VP sent, retries included, that operators can verify
+    //      cryptographically.
     //
     // Skipped silently when there's no identity selector or no resolved agent
     // identity — those are configuration gaps surfaced elsewhere.
@@ -7491,6 +7492,45 @@ async fn proxy_charged_request(
         .as_ref()
         .map(|s| s.get_vc_issuer())
         .or_else(|| state.vc_issuer.clone());
+    // The presentation signed into the body, which each retry signs again.
+    let mut target_presentation: Option<TargetPresentation<'_>> = None;
+    let record_vp_injected = |vp_jwt: &str| {
+        crate::delegation_vault::audit::emit("vp_injected", || {
+            crate::delegation_vault::audit::vp_injected_event(crate::delegation_vault::audit::VpInjection {
+                agent_did: request_agent_did.as_deref(),
+                user_hash: request_user_hash.as_deref(),
+                surface_id: Some(
+                    state
+                        .surface
+                        .surface_id
+                        .as_str(),
+                ),
+                channel_name: &channel_name,
+                target_endpoint: &state.surface.target.endpoint,
+                protocol: &format!(
+                    "{:?}",
+                    state
+                        .surface
+                        .channel_protocol()
+                )
+                .to_lowercase(),
+                mcp_tool_name: mcp_context
+                    .as_ref()
+                    .and_then(crate::surface_context::McpContext::called_tool_name),
+                vp_jwt,
+                trace_id: Some(&trace_id),
+                detail: if egress_trace_id != trace_id {
+                    format!("request_path; downstream_trace_id={egress_trace_id}")
+                } else {
+                    "request_path".to_string()
+                },
+                caller: authenticated_identity
+                    .as_ref()
+                    .map(crate::delegation_vault::audit::build_caller_context),
+                via_fabric: false,
+            })
+        });
+    };
     if let (Some(vc_issuer), Some(result)) = (vc_issuer_for_vp, identity_result.as_ref()) {
         let wb = build_target_request_workload_binding(
             &state.surface,
@@ -7502,15 +7542,35 @@ async fn proxy_charged_request(
         );
         let final_vp = match crate::identity::VpDomain::for_endpoint(&target_url) {
             Some(receiver) => {
-                vc_issuer
-                    .create_agent_identity_presentation_with_binding(
-                        &result.did,
-                        &result.identity_fields,
-                        wb,
-                        &receiver,
-                        &state.key_scope(),
-                    )
+                let presentation = TargetPresentation {
+                    vc_issuer,
+                    agent_did: &result.did,
+                    identity_fields: &result.identity_fields,
+                    workload_binding: wb,
+                    receiver,
+                    key_scope: state.key_scope(),
+                    body: body_bytes.clone(),
+                    protocol: state
+                        .surface
+                        .channel_protocol(),
+                    channel_name: &channel_name,
+                    meta_field_to_strip: state
+                        .surface
+                        .inbound_identity()
+                        .and_then(|c| {
+                            if let crate::source_auth::ManagedIdentityConfig::PayloadExtraction(cfg) = c {
+                                cfg.strip_raw_meta
+                                    .then(|| cfg.meta_field.clone())
+                            } else {
+                                None
+                            }
+                        }),
+                    mcp_metadata_context,
+                };
+                presentation
+                    .sign()
                     .await
+                    .map(|vp| (vp, presentation))
             }
             None => Err(anyhow::anyhow!(
                 "the Target {} has no origin to name as the presentation's receiver",
@@ -7518,7 +7578,7 @@ async fn proxy_charged_request(
             )),
         };
         match final_vp {
-            Ok(final_vp_jwt) => {
+            Ok((final_vp_jwt, presentation)) => {
                 // 1. inject into outbound body (replaces the slot if any existed)
                 if (state
                     .surface
@@ -7530,31 +7590,12 @@ async fn proxy_charged_request(
                     && method == "POST"
                     && !body_bytes.is_empty()
                 {
-                    let inbound_meta_field_to_strip: Option<String> = state
-                        .surface
-                        .inbound_identity()
-                        .and_then(|c| {
-                            if let crate::source_auth::ManagedIdentityConfig::PayloadExtraction(cfg) = c {
-                                cfg.strip_raw_meta
-                                    .then(|| cfg.meta_field.clone())
-                            } else {
-                                None
-                            }
-                        });
-                    match inject_identity_binding_vp_into_request(
-                        &body_bytes,
-                        &final_vp_jwt,
-                        &state
-                            .surface
-                            .channel_protocol(),
-                        &channel_name,
-                        inbound_meta_field_to_strip.as_deref(),
-                        mcp_metadata_context,
-                    ) {
+                    match presentation.inject(&final_vp_jwt) {
                         Ok(modified) => {
                             info!(channel = channel_name, "Identity binding VP injected into outbound request");
                             body_bytes = modified;
                             upstream_req = upstream_req.body(body_bytes.clone());
+                            target_presentation = Some(presentation);
                         }
                         Err(e) => {
                             warn!(
@@ -7582,41 +7623,7 @@ async fn proxy_charged_request(
                 deferred_audit.flush_with_vp(&final_vp_jwt);
 
                 // 3. audit the request-path VP injection itself
-                crate::delegation_vault::audit::emit("vp_injected", || {
-                    crate::delegation_vault::audit::vp_injected_event(crate::delegation_vault::audit::VpInjection {
-                        agent_did: request_agent_did.as_deref(),
-                        user_hash: request_user_hash.as_deref(),
-                        surface_id: Some(
-                            state
-                                .surface
-                                .surface_id
-                                .as_str(),
-                        ),
-                        channel_name: &channel_name,
-                        target_endpoint: &state.surface.target.endpoint,
-                        protocol: &format!(
-                            "{:?}",
-                            state
-                                .surface
-                                .channel_protocol()
-                        )
-                        .to_lowercase(),
-                        mcp_tool_name: mcp_context
-                            .as_ref()
-                            .and_then(crate::surface_context::McpContext::called_tool_name),
-                        vp_jwt: &final_vp_jwt,
-                        trace_id: Some(&trace_id),
-                        detail: if egress_trace_id != trace_id {
-                            format!("request_path; downstream_trace_id={egress_trace_id}")
-                        } else {
-                            "request_path".to_string()
-                        },
-                        caller: authenticated_identity
-                            .as_ref()
-                            .map(crate::delegation_vault::audit::build_caller_context),
-                        via_fabric: false,
-                    })
-                });
+                record_vp_injected(&final_vp_jwt);
             }
             Err(e) => {
                 warn!(
@@ -7974,6 +7981,38 @@ async fn proxy_charged_request(
         {
             let mut attempt = 0;
             let mut _last_error = None;
+            // A retry carries a presentation signed for it, never the one an
+            // earlier attempt sent; one that cannot be signed is not retried.
+            let mut signed_again: Option<bytes::Bytes> = None;
+            let target_presentation = target_presentation.as_ref();
+            let record_vp_injected = &record_vp_injected;
+            let channel: &str = &channel_name;
+            let sign_for_the_retry = |resendable: bool| async move {
+                match target_presentation {
+                    None => Ok(None),
+                    Some(_) if !resendable => {
+                        warn!(
+                            channel = channel,
+                            "The request cannot be sent again with a newly signed identity binding VP - not retrying"
+                        );
+                        Err(())
+                    }
+                    Some(presentation) => match Box::pin(presentation.signed_again()).await {
+                        Ok((vp_jwt, body)) => {
+                            record_vp_injected(&vp_jwt);
+                            Ok(Some(body))
+                        }
+                        Err(error) => {
+                            warn!(
+                                channel = channel,
+                                error = %error,
+                                "Failed to sign the identity binding VP for a retry - not retrying"
+                            );
+                            Err(())
+                        }
+                    },
+                }
+            };
 
             loop {
                 attempt += 1;
@@ -7992,6 +8031,10 @@ async fn proxy_charged_request(
                     // If we can't clone, send the original and break the retry loop
                     let result = upstream_req.send().await;
                     break result;
+                };
+                let req_to_send = match signed_again.take() {
+                    Some(body) => req_to_send.body(body),
+                    None => req_to_send,
                 };
 
                 let sent = req_to_send.send().await;
@@ -8043,6 +8086,16 @@ async fn proxy_charged_request(
 
                             info!(channel = channel_name, backoff_ms = backoff_ms, "Retrying after backoff");
                             tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                            let Ok(body) = sign_for_the_retry(
+                                upstream_req
+                                    .try_clone()
+                                    .is_some(),
+                            )
+                            .await
+                            else {
+                                break Ok(resp);
+                            };
+                            signed_again = body;
                             _last_error = Some(format!("HTTP {}", status.as_u16()));
                             continue;
                         }
@@ -8069,6 +8122,16 @@ async fn proxy_charged_request(
 
                             info!(channel = channel_name, backoff_ms = backoff_ms, "Retrying after backoff");
                             tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                            let Ok(body) = sign_for_the_retry(
+                                upstream_req
+                                    .try_clone()
+                                    .is_some(),
+                            )
+                            .await
+                            else {
+                                break Err(e);
+                            };
+                            signed_again = body;
                             _last_error = Some(e.to_string());
                             continue;
                         } else {
@@ -13102,6 +13165,7 @@ async fn handle_fabric_request_inner(
                     .clone()
                     .unwrap_or_default(),
                 trace_id: uuid::Uuid::parse_str(&egress_trace_id).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+                peer_did: None,
             },
         )
         .await
@@ -16815,6 +16879,60 @@ fn remove_a2a_identity_proofs(request: &mut serde_json::Value) -> bool {
         }
     }
     removed
+}
+
+/// The identity binding VP of a request to the Target: what it is signed with
+/// and for, and the body as it was before the VP went in, so each retry
+/// carries a VP signed for it.
+struct TargetPresentation<'a> {
+    vc_issuer: Arc<crate::identity::VCIssuer>,
+    agent_did: &'a str,
+    identity_fields: &'a std::collections::HashMap<String, serde_json::Value>,
+    workload_binding: Option<serde_json::Value>,
+    receiver: crate::identity::VpDomain,
+    key_scope: crate::vta::key_directory::KeyScope,
+    body: bytes::Bytes,
+    protocol: crate::config::ChannelProtocol,
+    channel_name: &'a str,
+    meta_field_to_strip: Option<String>,
+    mcp_metadata_context: crate::mcp::meta::McpMetadataContext,
+}
+
+impl TargetPresentation<'_> {
+    async fn sign(&self) -> anyhow::Result<String> {
+        self.vc_issuer
+            .create_agent_identity_presentation_with_binding(
+                self.agent_did,
+                self.identity_fields,
+                self.workload_binding.clone(),
+                &self.receiver,
+                &self.key_scope,
+            )
+            .await
+    }
+
+    /// The body before the VP, carrying `vp_jwt`.
+    fn inject(
+        &self,
+        vp_jwt: &str,
+    ) -> anyhow::Result<bytes::Bytes> {
+        inject_identity_binding_vp_into_request(
+            &self.body,
+            vp_jwt,
+            &self.protocol,
+            self.channel_name,
+            self.meta_field_to_strip
+                .as_deref(),
+            self.mcp_metadata_context,
+        )
+    }
+
+    /// A newly signed VP, and the body before the VP carrying it.
+    async fn signed_again(&self) -> anyhow::Result<(String, bytes::Bytes)> {
+        let vp_jwt = self.sign().await?;
+        let body = self.inject(&vp_jwt)?;
+        Ok((vp_jwt, body))
+    }
 }
 
 /// Inject an identity binding VP into an outbound request body.
@@ -25477,6 +25595,385 @@ mod fabric_send_tests {
             serde_json::from_slice(&answered).unwrap(),
             format!("http://{}", target.addr),
         )
+    }
+
+    /// A surface whose HTTP Target answers with `answers` in turn and that
+    /// retries a `503` or a dropped connection as its `retry` setting says.
+    struct RetryingTarget {
+        peer: FabricPeer,
+        target: crate::delegation_vault::revocation::tests::RecordingServer,
+        issuer_dir: Option<tempfile::TempDir>,
+    }
+
+    impl RetryingTarget {
+        /// With `presentation`, the surface signs a presentation of the agent
+        /// into each request to its Target; it retries once.
+        async fn new(
+            answers: Vec<crate::delegation_vault::revocation::tests::Answer>,
+            presentation: bool,
+        ) -> Self {
+            Self::with_retry(
+                answers,
+                presentation,
+                json!({"max_attempts": 1, "initial_backoff_ms": 1, "retryable_status_codes": [503]}),
+            )
+            .await
+        }
+
+        async fn with_retry(
+            answers: Vec<crate::delegation_vault::revocation::tests::Answer>,
+            presentation: bool,
+            retry: serde_json::Value,
+        ) -> Self {
+            let target = crate::delegation_vault::revocation::tests::RecordingServer::start_answering(answers).await;
+            let endpoint = format!("{}/agent", target.origin());
+            let mut peer = fabric_peer_fronted_by(200, json!({}), |_| {
+                json!({
+                    "surface_id": "retrying-a2a", "name": "Retrying A2A",
+                    "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+                    "target": {"endpoint": endpoint, "networking": {"retry": retry}}
+                })
+            })
+            .await;
+            let issuer_dir = match presentation {
+                true => Some(with_request_agent_identity(&mut peer).await),
+                false => None,
+            };
+            Self { peer, target, issuer_dir }
+        }
+
+        /// Sends an A2A message carrying an agent identity; the status answered.
+        async fn send(&self) -> axum::http::StatusCode {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/a2a")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(message_with_agent_identity().to_string()))
+                .unwrap();
+            match Box::pin(super::proxy_handler_with_mcp_runtime(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                self.peer.state.clone(),
+                request,
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                None,
+            ))
+            .await
+            {
+                Ok(response) => response.status(),
+                Err(refused) => refused.status(),
+            }
+        }
+
+        /// The body of each request the Target received, as sent.
+        fn bodies(&self) -> Vec<String> {
+            self.target
+                .requests()
+                .into_iter()
+                .map(|(_, body)| body)
+                .collect()
+        }
+    }
+
+    fn target_answered_after_a_retry() -> Vec<crate::delegation_vault::revocation::tests::Answer> {
+        use crate::delegation_vault::revocation::tests::Answer;
+        vec![Answer::status(503), Answer::json(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}}))]
+    }
+
+    /// Each attempt of a retried request to the Target carries a presentation
+    /// signed for that attempt, naming the Target's origin, in the body the
+    /// first attempt carried.
+    #[test]
+    fn each_retry_to_the_target_carries_a_newly_signed_presentation() {
+        run_on_large_stack(each_retry_carries_a_newly_signed_presentation());
+    }
+
+    async fn each_retry_carries_a_newly_signed_presentation() {
+        use crate::identity::test_helpers::{presentation_domains, presentation_proof_values};
+        let retrying = RetryingTarget::new(target_answered_after_a_retry(), true).await;
+
+        assert_eq!(retrying.send().await, axum::http::StatusCode::OK);
+
+        let sent: Vec<serde_json::Value> = retrying
+            .bodies()
+            .iter()
+            .map(|body| serde_json::from_str(body).unwrap())
+            .collect();
+        assert_eq!(sent.len(), 2, "one retry");
+        let origin = retrying.target.origin();
+        for body in &sent {
+            assert_eq!(presentation_domains(body), vec![Some(origin.clone())]);
+        }
+        let proofs: Vec<_> = sent
+            .iter()
+            .map(presentation_proof_values)
+            .collect();
+        assert!(proofs[0][0].is_some(), "{proofs:?}");
+        assert_ne!(proofs[0], proofs[1], "the retry carries a newly signed presentation");
+        let without_presentation = |body: &serde_json::Value| {
+            let mut body = body.clone();
+            body["params"]["message"]["metadata"]
+                .as_object_mut()
+                .unwrap()
+                .remove(crate::config::AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION)
+                .expect("a presentation");
+            body
+        };
+        assert_eq!(without_presentation(&sent[0]), without_presentation(&sent[1]));
+    }
+
+    /// A retried request that carries no presentation is sent again as it was.
+    #[test]
+    fn a_retry_without_a_presentation_sends_the_same_body() {
+        run_on_large_stack(retry_without_a_presentation_sends_the_same_body());
+    }
+
+    async fn retry_without_a_presentation_sends_the_same_body() {
+        let retrying = RetryingTarget::new(target_answered_after_a_retry(), false).await;
+
+        assert_eq!(retrying.send().await, axum::http::StatusCode::OK);
+
+        let sent = retrying.bodies();
+        assert_eq!(sent.len(), 2, "one retry");
+        assert_eq!(sent[0], sent[1]);
+        assert!(
+            crate::identity::test_helpers::presentation_domains(&serde_json::from_str(&sent[0]).unwrap()).is_empty()
+        );
+    }
+
+    /// A retry whose presentation cannot be signed again is not sent: the
+    /// caller is answered what the Target answered the attempt before.
+    #[test]
+    fn a_retry_whose_presentation_cannot_be_signed_is_not_sent() {
+        run_on_large_stack(retry_whose_presentation_cannot_be_signed_is_not_sent());
+    }
+
+    async fn retry_whose_presentation_cannot_be_signed_is_not_sent() {
+        use crate::delegation_vault::revocation::tests::Answer;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut answers = target_answered_after_a_retry();
+        answers[0] = Answer::status(503).held(&gate);
+        let retrying = RetryingTarget::new(answers, true).await;
+        let issuer = retrying
+            .peer
+            .state
+            .vc_issuer
+            .clone()
+            .unwrap();
+        let signing_fails_from_now_on = async {
+            while retrying
+                .target
+                .requests()
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            crate::identity::test_helpers::map_surface_to_unusable_trust_agent(
+                &issuer,
+                retrying
+                    .issuer_dir
+                    .as_ref()
+                    .unwrap()
+                    .path(),
+                "retrying-a2a",
+            )
+            .await;
+            gate.add_permits(1);
+        };
+
+        let (status, ()) = tokio::join!(retrying.send(), signing_fails_from_now_on);
+
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retrying.bodies().len(), 1, "no retry with the presentation already sent");
+    }
+
+    /// A retry's presentation is signed once its backoff has passed: a signer
+    /// that breaks during the backoff leaves the retry unsent.
+    #[test]
+    fn a_retry_presentation_is_signed_after_the_backoff() {
+        run_on_large_stack(retry_presentation_is_signed_after_the_backoff());
+    }
+
+    async fn retry_presentation_is_signed_after_the_backoff() {
+        use crate::delegation_vault::revocation::tests::Answer;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut answers = target_answered_after_a_retry();
+        answers[0] = Answer::status(503).held(&gate);
+        let retrying = RetryingTarget::with_retry(
+            answers,
+            true,
+            json!({"max_attempts": 1, "initial_backoff_ms": 1000, "max_backoff_ms": 1000,
+                "retryable_status_codes": [503]}),
+        )
+        .await;
+        let issuer = retrying
+            .peer
+            .state
+            .vc_issuer
+            .clone()
+            .unwrap();
+        let signing_fails_during_the_backoff = async {
+            while retrying
+                .target
+                .requests()
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            gate.add_permits(1);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            crate::identity::test_helpers::map_surface_to_unusable_trust_agent(
+                &issuer,
+                retrying
+                    .issuer_dir
+                    .as_ref()
+                    .unwrap()
+                    .path(),
+                "retrying-a2a",
+            )
+            .await;
+        };
+
+        let (status, ()) = tokio::join!(retrying.send(), signing_fails_during_the_backoff);
+
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retrying.bodies().len(), 1, "the retry is signed after the backoff");
+    }
+
+    /// Asserts the Target received `expected` requests, each carrying its own
+    /// newly signed presentation naming the Target's origin, in the body the
+    /// first attempt carried.
+    fn assert_each_attempt_carries_a_newly_signed_presentation(
+        retrying: &RetryingTarget,
+        expected: usize,
+    ) {
+        use crate::identity::test_helpers::{presentation_domains, presentation_proof_values};
+        let sent: Vec<serde_json::Value> = retrying
+            .bodies()
+            .iter()
+            .map(|body| serde_json::from_str(body).unwrap())
+            .collect();
+        assert_eq!(sent.len(), expected);
+        let origin = retrying.target.origin();
+        let mut proofs = std::collections::HashSet::new();
+        for body in &sent {
+            assert_eq!(presentation_domains(body), vec![Some(origin.clone())]);
+            let proof = presentation_proof_values(body);
+            assert_eq!(proof.len(), 1);
+            assert!(proofs.insert(proof[0].clone().unwrap()), "proofValue reused: {proof:?}");
+        }
+        let without_presentation = |body: &serde_json::Value| {
+            let mut body = body.clone();
+            body["params"]["message"]["metadata"]
+                .as_object_mut()
+                .unwrap()
+                .remove(crate::config::AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION)
+                .expect("a presentation");
+            body
+        };
+        for body in &sent[1..] {
+            assert_eq!(without_presentation(&sent[0]), without_presentation(body));
+        }
+    }
+
+    fn retrying_503s(max_attempts: u32) -> serde_json::Value {
+        json!({"max_attempts": max_attempts, "initial_backoff_ms": 1, "retryable_status_codes": [503]})
+    }
+
+    /// Retries after `503`s and after a dropped connection each carry a newly
+    /// signed presentation, up to the third retry.
+    #[test]
+    fn retries_after_a_503_and_a_dropped_connection_each_carry_a_newly_signed_presentation() {
+        use crate::delegation_vault::revocation::tests::Answer;
+        run_on_large_stack(async {
+            let retrying = RetryingTarget::with_retry(
+                vec![
+                    Answer::status(503),
+                    Answer::hung_up(),
+                    Answer::status(503),
+                    Answer::json(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})),
+                ],
+                true,
+                retrying_503s(3),
+            )
+            .await;
+
+            assert_eq!(retrying.send().await, axum::http::StatusCode::OK);
+
+            assert_each_attempt_carries_a_newly_signed_presentation(&retrying, 4);
+        });
+    }
+
+    /// When retries run out, every attempt carried a newly signed presentation
+    /// and the caller is answered the last attempt's status.
+    #[test]
+    fn every_attempt_until_retries_run_out_carries_a_newly_signed_presentation() {
+        use crate::delegation_vault::revocation::tests::Answer;
+        run_on_large_stack(async {
+            let retrying = RetryingTarget::with_retry(
+                vec![Answer::status(503), Answer::status(503), Answer::status(503)],
+                true,
+                retrying_503s(2),
+            )
+            .await;
+
+            assert_eq!(retrying.send().await, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+
+            assert_each_attempt_carries_a_newly_signed_presentation(&retrying, 3);
+        });
+    }
+
+    /// Each presentation signed for a retried request is recorded as injected.
+    #[test]
+    fn each_presentation_signed_for_a_retry_is_recorded_as_injected() {
+        run_on_large_stack(async {
+            let retrying = RetryingTarget::new(target_answered_after_a_retry(), true).await;
+
+            let (status, events) = crate::audit::producer::capture(retrying.send()).await;
+
+            assert_eq!(status, axum::http::StatusCode::OK);
+            let injected: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::VpInjected)
+                })
+                .collect();
+            assert_eq!(injected.len(), 2, "{injected:?}");
+        });
+    }
+
+    /// An MCP body injected again from the body before injection carries only
+    /// the new presentation, with the raw `_meta` identity field still stripped.
+    #[test]
+    fn an_mcp_presentation_injected_again_replaces_the_one_before_and_strips_the_raw_meta() {
+        let before = bytes::Bytes::from(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "t", "arguments": {}, "_meta": {"agentIdentity": {"model": "x"}}}})
+            .to_string(),
+        );
+        let context = crate::mcp::meta::McpMetadataContext::default();
+        let inject = |vp: &str| {
+            String::from_utf8(
+                super::inject_identity_binding_vp_into_request(
+                    &before,
+                    vp,
+                    &crate::config::ChannelProtocol::Mcp,
+                    "c",
+                    Some("agentIdentity"),
+                    context,
+                )
+                .unwrap()
+                .to_vec(),
+            )
+            .unwrap()
+        };
+
+        let (first, again) = (inject("VP-ONE"), inject("VP-TWO"));
+
+        assert!(first.contains("VP-ONE") && !first.contains("agentIdentity"), "{first}");
+        assert!(again.contains("VP-TWO") && !again.contains("VP-ONE") && !again.contains("agentIdentity"), "{again}");
+        assert_eq!(first.replace("VP-ONE", "X"), again.replace("VP-TWO", "X"));
     }
 
     #[tokio::test]

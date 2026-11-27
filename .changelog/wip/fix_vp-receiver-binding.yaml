@@ -12,6 +12,15 @@ changes:
         record, a request to one of the gateway's own MCP Proxies) carries a reserved
         `urn:agent-gateway:label:` value instead. The agent card presentation stays without a
         domain.
+    - timestamp: '2026-11-27T12:00:00Z'
+      title: Sign a new agent presentation for every retry the gateway sends to a Target
+      description: >-
+        When the gateway retries a request to a Target after a 5xx answer or a dropped connection,
+        each retry now carries a newly signed agent Verifiable Presentation, signed after the
+        backoff wait, instead of the one sent first. A retry whose presentation cannot be signed is
+        not sent, and the caller gets the previous attempt's answer. Each presentation sent is
+        recorded as `vp_injected`. On a `fabric://` Transit Point the peer gateway is looked up once,
+        so the presentation names the gateway the request is sent to.
   fixed: []
   removed: []
   security:

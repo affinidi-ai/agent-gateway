@@ -190,6 +190,7 @@ pub(crate) async fn read_fabric_card(
                 trace_id: request.trace_id,
                 log_label: request.log_label,
                 extra_body: None,
+                peer_did: None,
             },
         )
     })
@@ -298,6 +299,10 @@ pub(crate) struct FabricForwardRequest<'a> {
     /// Extra top-level `forward-request` fields (e.g. `payment_context`); they
     /// never replace the fields set here.
     pub extra_body: Option<serde_json::Map<String, serde_json::Value>>,
+    /// The peer's Connection Point DID, when the caller already read it to
+    /// sign the body's presentation for it; read from the peer's record when
+    /// `None`.
+    pub peer_did: Option<&'a str>,
 }
 
 pub(crate) struct FabricStreamForwardRequest<'request> {
@@ -308,6 +313,9 @@ pub(crate) struct FabricStreamForwardRequest<'request> {
     pub header_timeout: Duration,
     pub limits: crate::config::McpHttpConfig,
     pub trace_id: uuid::Uuid,
+    /// The peer's Connection Point DID the body's presentation was signed
+    /// for; the request is refused when the peer's record names another.
+    pub peer_did: Option<&'request str>,
 }
 
 /// A request's part in a capability probe, which ends with the probe's last
@@ -407,6 +415,12 @@ async fn forward_stream_with_runtime(
         .get_active_stream_peer(gateway_id)
         .await
         .ok_or(FabricForwardError::StreamingUnavailable)?;
+    if request
+        .peer_did
+        .is_some_and(|signed_for| signed_for != peer_did)
+    {
+        return Err(FabricForwardError::GatewayDidNotFound(gateway_id.to_string()));
+    }
     let (listener_instance_id, recipient_did) = runtime
         .listener_context(&listener.connection_point_id)
         .filter(|(_, recipient)| recipient == &listener.gateway_did)
@@ -768,10 +782,13 @@ pub(crate) async fn forward_via_fabric(
         .await
         .ok_or_else(|| FabricForwardError::GatewayNotConnected(gateway_id.to_string()))?;
 
-    let remote_gateway_did = listener_mgr
-        .get_gateway_did(gateway_id)
-        .await
-        .ok_or_else(|| FabricForwardError::GatewayDidNotFound(gateway_id.to_string()))?;
+    let remote_gateway_did = match req.peer_did {
+        Some(did) => did.to_string(),
+        None => listener_mgr
+            .get_gateway_did(gateway_id)
+            .await
+            .ok_or_else(|| FabricForwardError::GatewayDidNotFound(gateway_id.to_string()))?,
+    };
 
     debug!(
         target = %req.fabric_target,
@@ -1242,6 +1259,7 @@ mod tests {
             trace_id: "trace",
             log_label: "Orders",
             extra_body: None,
+            peer_did: None,
         };
         for (channel, surface, alias) in [("orders", "orders", None), ("orders$v", "orders", Some("v"))] {
             let body = forward_request_body(channel, &request, serde_json::Value::Null, 0);
@@ -1270,6 +1288,7 @@ mod tests {
                 trace_id: "trace",
                 log_label: "Orders",
                 extra_body: None,
+                peer_did: None,
             };
 
             let body = forward_request_body("orders", &request, serde_json::Value::Null, 0);
@@ -1720,6 +1739,7 @@ mod tests {
                     header_timeout: Duration::from_secs(20),
                     limits: Default::default(),
                     trace_id: uuid::Uuid::new_v4(),
+                    peer_did: None,
                 },
                 sender_runtime.clone(),
             ),
@@ -1829,6 +1849,7 @@ mod tests {
                         header_timeout: Duration::from_secs(20),
                         limits: Default::default(),
                         trace_id: uuid::Uuid::new_v4(),
+                        peer_did: None,
                     },
                     sender_runtime.clone(),
                 ),
@@ -2009,6 +2030,7 @@ mod tests {
                             header_timeout: Duration::from_secs(20),
                             limits: Default::default(),
                             trace_id: uuid::Uuid::new_v4(),
+                            peer_did: None,
                         },
                         runtime,
                     ),
@@ -2300,6 +2322,7 @@ mod tests {
                 header_timeout: Duration::from_secs(1),
                 limits: Default::default(),
                 trace_id: uuid::Uuid::new_v4(),
+                peer_did: None,
             },
         )
         .await;
@@ -2307,6 +2330,72 @@ mod tests {
             matches!(result, Err(FabricForwardError::ListenerManagerUnavailable)),
             "a stream needs a running listener manager"
         );
+    }
+
+    /// What a modern forward to a connected peer whose record names
+    /// `did:example:stream-peer` fails with, when its body's presentation was
+    /// signed for `signed_for`. The test runtime has no listener for the
+    /// peer's connection point, so a forward that passes the peer check stops
+    /// there with `StreamingUnavailable`.
+    async fn modern_forward_signed_for(signed_for: &str) -> FabricForwardError {
+        let root = tempfile::tempdir().unwrap();
+        let peer = crate::gateways::types::Gateway::new(
+            "Peer".into(),
+            String::new(),
+            "did:example:stream-peer".into(),
+            crate::gateways::types::GatewayType::Remote,
+        );
+        let gateways = Arc::new(
+            crate::gateways::FileSystemGatewayStore::new(root.path().join("gateways"), None)
+                .await
+                .unwrap(),
+        );
+        crate::gateways::GatewayStore::create(gateways.as_ref(), &peer)
+            .await
+            .unwrap();
+        let (manager, _issuer_dir) = crate::gateways::test_helpers::test_listener_manager(root.path()).await;
+        let manager = manager.with_gateway_store(gateways);
+        let mut listener = crate::gateways::test_helpers::test_listener("modern-peer").await;
+        listener.gateway_id = peer.id.clone();
+        manager
+            .register_test_listener(listener)
+            .await;
+        let target = format!("fabric://{}/surface", peer.id);
+
+        forward_stream_with_runtime(
+            &Arc::new(RwLock::new(Some(Arc::new(manager)))),
+            FabricStreamForwardRequest {
+                fabric_target: &target,
+                path: "/mcp",
+                headers: Default::default(),
+                body: Bytes::new(),
+                header_timeout: Duration::from_secs(1),
+                limits: Default::default(),
+                trace_id: uuid::Uuid::new_v4(),
+                peer_did: Some(signed_for),
+            },
+            crate::proxy::fabric_stream::StreamRuntime::test_runtime(),
+        )
+        .await
+        .unwrap_err()
+    }
+
+    /// A modern forward whose presentation names a peer other than the one
+    /// the peer's record names is not sent.
+    #[tokio::test]
+    async fn a_modern_fabric_forward_to_a_peer_its_presentation_does_not_name_is_refused() {
+        let refused = modern_forward_signed_for("did:example:elsewhere").await;
+
+        assert!(matches!(refused, FabricForwardError::GatewayDidNotFound(_)), "{refused:?}");
+    }
+
+    /// A modern forward whose presentation names the peer's record DID passes
+    /// the peer check.
+    #[tokio::test]
+    async fn a_modern_fabric_forward_to_the_peer_its_presentation_names_goes_on() {
+        let failed = modern_forward_signed_for("did:example:stream-peer").await;
+
+        assert!(matches!(failed, FabricForwardError::StreamingUnavailable), "{failed:?}");
     }
 
     #[test]

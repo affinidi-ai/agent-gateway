@@ -577,7 +577,9 @@ event names the Target (`target_endpoint`), `protocol` and `mcp_tool_name`. A
 agent its presentation is for as `agent_did`. `vp_injected` also records a presentation a gateway
 received over Fabric and verified: on the request, detail `request_path_fabric_received`, and on
 the answer to a `fabric://` Target, detail `response_path_fabric_received` (see
-[`FABRIC.md`](FABRIC.md#peer-issuer-dids)).
+[`FABRIC.md`](FABRIC.md#peer-issuer-dids)). A request to the Target that is retried carries a
+newly signed presentation on each attempt and records one `vp_injected`, detail `request_path`,
+for each.
 
 **File size.** The VP Audit Log is rotated: once the live file reaches
 `[audit] vp_audit_log_max_bytes` (8 MiB by default) it is renamed to the next free position,

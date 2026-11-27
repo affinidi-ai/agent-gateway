@@ -1222,6 +1222,7 @@ impl GateTransport for FabricTransport {
                     trace_id: &request.trace_id,
                     log_label: "payment-gate",
                     extra_body: Some(extra_body),
+                    peer_did: None,
                 },
             )
             .await
