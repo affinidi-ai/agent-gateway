@@ -12,6 +12,7 @@ import {
   deleteSuccessMessage,
   isDeletedKeptUser,
   keptAccountLabel,
+  type SignInMethod,
 } from '../utils/userDelete';
 
 interface User {
@@ -30,7 +31,7 @@ interface User {
   avatar_path?: string;
   oidc?: { issuer: string; subject: string };
   saml_id?: string;
-  has_oidc_account?: boolean;
+  sign_in_method?: SignInMethod;
 }
 
 interface UserForm {

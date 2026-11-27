@@ -6,11 +6,12 @@ changes:
       description: >-
         A new sign-in mode, auth_mode = "oidc", signs human users in to the dashboard at one
         OpenID provider configured in oidc.json, using the authorization code flow with PKCE, a
-        nonce and a browser-binding cookie. The ID token is fully verified, its signature
+        nonce and a browser-binding cookie. The ID token is fully verified, its signature and nbf
         included, against the provider's published keys. Users are created at their first
         sign-in, approved and never the primary administrator, and identified by the provider
-        account (issuer and sub), never by email. role_mapping maps a string or array claim to a
-        gateway role at every sign-in, raising or lowering it and ending the user's other
+        account (issuer and sub), never by email; an account whose every candidate username
+        other users hold is refused with a 403 page. role_mapping maps a string or array claim
+        to a gateway role at every sign-in, raising or lowering it and ending the user's other
         sessions when it changes, and refuses unmapped accounts by default. required_claims
         binds the deployment to one tenant at the provider and is required unless
         allow_any_account is set; values may be strings, booleans or regex: patterns. The client
@@ -78,30 +79,15 @@ changes:
       description: >-
         DELETE /v1/users/{user_id} now answers with an outcome of removed or disabled, so a
         client can tell that an OpenID Connect or SAML user's record was kept; a repeat delete
-        of a kept record answers disabled. The user API returns has_oidc_account for users who
-        sign in with OpenID Connect, and the provider account (oidc or saml_id) on kept records
-        only. In the dashboard the delete confirm step on the Users list and the Edit User page
-        shows a visible notice for an OpenID Connect user, also on touch devices, and the
-        success messages, the Notifications reject message included, follow the outcome. A
-        kept record shows its provider account. Approving a kept record again raises
-        user.approved, and user.deleted fires only for the delete that changed the record.
-  fixed:
-    - timestamp: '2026-11-27T14:00:00Z'
-      title: ⭐ Keep a deleted SAML user out and refuse SAML users who are not approved
-      description: >-
-        Deleting a user who signs in with SAML used to remove the record, so their next
-        sign-in created a new approved user with the mapped role, and a SAML user who was not
-        approved was still handed a session. Delete now clears the user's profile and passkeys
-        and keeps a disabled record under their SAML user ID, as it does for an OpenID Connect
-        user under their provider account, so the next sign-in is refused with a 403 page
-        until an administrator approves the record again; that record does not count toward
-        the users limit, and approving it is checked against the limit. A SAML user whose
-        asserted username another user holds gets their SAML user ID as username instead.
-        Every delete now also revokes the user's access tokens, including those whose secret
-        they created or rotated for others, ends their sessions and removes their uploaded
-        avatar files. Administrator updates and deletes now write by user id under the same
-        lock as sign-ins, so neither overwrites the other, and a passkey sign-in or avatar
-        upload overtaken by a delete no longer brings the user back.
+        of a kept record answers disabled. The user API returns sign_in_method (passkey, oidc or
+        saml) for every user, and the provider account (oidc or saml_id) on kept records only.
+        In the dashboard the delete confirm step on the Users list and the Edit User page shows
+        a visible notice for an OpenID Connect or SAML user that names the method, also on touch
+        devices, and the success messages, the Notifications reject message included, follow
+        the outcome. A kept record shows its provider account. Approving a kept record again
+        raises user.approved, and user.deleted fires only for the delete that changed the
+        record.
+  fixed: []
   removed: []
   security:
     - timestamp: '2026-11-27T11:45:00Z'
@@ -121,6 +107,26 @@ changes:
         an invalid credential, or answered as keys unavailable by consent confirmation and the
         OIDC sign-in and back-channel logout, until it has passed. The key id of such a token is
         logged escaped.
+    - timestamp: '2026-11-27T14:00:00Z'
+      title: ⭐ Keep a deleted SAML user out and refuse SAML users who are not approved
+      description: >-
+        Deleting a user who signs in with SAML used to remove the record, so their next
+        sign-in created a new approved user with the mapped role, and a SAML user who was not
+        approved was still handed a session. Delete now clears the user's profile and passkeys
+        and keeps a disabled record under their SAML user ID, as it does for an OpenID Connect
+        user under their provider account, so the next sign-in is refused with a 403 page
+        until an administrator approves the record again; that record does not count toward
+        the users limit, and approving it is checked against the limit. A SAML user whose
+        asserted username another user holds gets their SAML user ID as username instead.
+        Every delete now also revokes the user's access tokens, including those whose secret
+        they created or rotated for others, ends their sessions and removes their uploaded
+        avatar files. Administrator updates and deletes now write by user id under the same
+        lock as sign-ins, so neither overwrites the other, a passkey sign-in or avatar upload
+        overtaken by a delete no longer brings the user back, and a profile update overtaken by
+        a delete no longer writes profile data onto the kept record. Upgrade note: SAML users
+        deleted before this release were created again, approved, at their next sign-in, and
+        personal access tokens they created were not revoked. Delete such users again and
+        review their access tokens.
   breaking:
     - timestamp: '2026-11-27T14:00:00Z'
       title: Answer a user delete with 200 and its outcome instead of 204

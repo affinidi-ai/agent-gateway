@@ -211,7 +211,7 @@ pub async fn verify_logout_token(
 }
 
 /// Check the header's algorithm against `id_token_signing_algs`, the signature against the
-/// provider's keys, `iss`, `aud`, `exp`, and that the registered claims in `required` are
+/// provider's keys, `iss`, `aud`, `exp`, `nbf` when present, and that the registered claims in `required` are
 /// present. Returns the header and claims. Keys are cached under their `jwks_uri`, so a key set
 /// the provider moves is read afresh rather than matched against the old one.
 async fn signed_claims(
@@ -266,6 +266,7 @@ async fn signed_claims(
     validation.set_audience(&[&config.client_id]);
     validation.set_required_spec_claims(required);
     validation.leeway = LEEWAY_SECS;
+    validation.validate_nbf = true;
     let claims = decode::<Map<String, Value>>(token, &key, &validation)
         .map_err(|e| TokenFailure::Invalid(format!("{e}")))?
         .claims;
@@ -649,6 +650,25 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_token_not_yet_valid_beyond_the_leeway_is_refused() {
+        let provider = StubProvider::start().await;
+        let now = chrono::Utc::now().timestamp();
+        let with_nbf = |nbf: i64| {
+            let mut claims = id_token_claims(&provider.issuer, "nonce-1");
+            claims["nbf"] = json!(nbf);
+            provider.id_token(claims)
+        };
+
+        let refused = verify(&provider, &with_nbf(now + 300))
+            .await
+            .unwrap_err();
+        let within_leeway = verify(&provider, &with_nbf(now + 30)).await;
+
+        assert!(refused.contains("ImmatureSignature"), "{refused}");
+        assert!(within_leeway.is_ok(), "{within_leeway:?}");
+    }
+
     fn checked(change: Value) -> Result<(), String> {
         let config = config_for("https://idp.example.com");
         let mut claims = id_token_claims("https://idp.example.com", "nonce-1");
@@ -989,6 +1009,8 @@ mod tests {
         other_issuer["iss"] = json!("https://other.example");
         let mut expired = claims.clone();
         expired["exp"] = json!(chrono::Utc::now().timestamp() - 120);
+        let mut not_yet_valid = claims.clone();
+        not_yet_valid["nbf"] = json!(chrono::Utc::now().timestamp() + 300);
 
         for (token, expected) in [
             (provider.id_token(id_token_claims(&provider.issuer, "nonce-1")), "not logout+jwt"),
@@ -1000,6 +1022,7 @@ mod tests {
             (sign_logout(&misaddressed), "InvalidAudience"),
             (sign_logout(&other_issuer), "InvalidIssuer"),
             (sign_logout(&expired), "ExpiredSignature"),
+            (sign_logout(&not_yet_valid), "ImmatureSignature"),
             ("not-a-token".to_string(), "unreadable header"),
         ] {
             let refused = verify_logout(&provider, &jwks, &seen, &token)

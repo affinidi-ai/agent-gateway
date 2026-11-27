@@ -1,18 +1,27 @@
 export type DeleteOutcome = 'removed' | 'disabled';
 
+export type SignInMethod = 'passkey' | 'oidc' | 'saml';
+
+type KeptSignInMethod = Exclude<SignInMethod, 'passkey'>;
+
+interface DeletableUser {
+  sign_in_method?: SignInMethod;
+}
+
+const PROVIDER_NAME: Record<KeptSignInMethod, string> = {
+  oidc: 'OpenID Connect',
+  saml: 'SAML',
+};
+
+const keptSignInMethod = (user: DeletableUser): KeptSignInMethod | undefined =>
+  user.sign_in_method === 'oidc' || user.sign_in_method === 'saml'
+    ? user.sign_in_method
+    : undefined;
+
 export const DELETE_USER_TITLE =
   'Delete user. A user who signs in through OpenID Connect or SAML is disabled and kept instead, so they cannot sign in until an administrator approves them again. Access tokens bound to the user, and tokens the user created or rotated for others, are revoked.';
 
 export const DELETE_USER_SUCCESS = 'User deleted successfully';
-
-export const DELETE_OIDC_USER_NOTICE =
-  'This user signs in with OpenID Connect. Their record is not removed: it is kept disabled under their provider account, so their next sign-in is refused until an administrator approves them again.';
-
-export const DELETE_OIDC_USER_NOTICE_SHORT =
-  'OpenID Connect user: the record is kept disabled, not removed.';
-
-export const DELETE_OIDC_USER_SUCCESS =
-  'User disabled. Their OpenID Connect account stays on a disabled record and is refused at sign-in until an administrator approves them again.';
 
 export const DELETE_KEPT_USER_SUCCESS =
   'User disabled. Their record is kept and is refused at sign-in until an administrator approves them again.';
@@ -44,24 +53,29 @@ export const keptAccountDetail = (label: string): string => `kept disabled for t
 export const isDeletedKeptUser = (user: KeptAccount & { status: string }): boolean =>
   user.status === 'disabled' && keptAccountLabel(user) !== null;
 
-export const deleteConfirmNotice = (
-  user: { has_oidc_account?: boolean },
-  compact = false
-): string | undefined => {
-  if (!user.has_oidc_account) {
+export const deleteConfirmNotice = (user: DeletableUser, compact = false): string | undefined => {
+  const method = keptSignInMethod(user);
+  if (!method) {
     return undefined;
   }
-  return compact ? DELETE_OIDC_USER_NOTICE_SHORT : DELETE_OIDC_USER_NOTICE;
+  if (compact) {
+    return `${PROVIDER_NAME[method]} user: the record is kept disabled, not removed.`;
+  }
+  return `This user signs in with ${PROVIDER_NAME[method]}. Their record is not removed: it is kept disabled under their provider account, so their next sign-in is refused until an administrator approves them again.`;
 };
 
 export const deleteSuccessMessage = (
   outcome: DeleteOutcome | undefined,
-  user: { has_oidc_account?: boolean }
+  user: DeletableUser
 ): string => {
   if (outcome !== 'disabled') {
     return DELETE_USER_SUCCESS;
   }
-  return user.has_oidc_account ? DELETE_OIDC_USER_SUCCESS : DELETE_KEPT_USER_SUCCESS;
+  const method = keptSignInMethod(user);
+  if (!method) {
+    return DELETE_KEPT_USER_SUCCESS;
+  }
+  return `User disabled. Their ${PROVIDER_NAME[method]} account stays on a disabled record and is refused at sign-in until an administrator approves them again.`;
 };
 
 export const rejectSuccessMessage = (outcome: DeleteOutcome | undefined, name: string): string =>

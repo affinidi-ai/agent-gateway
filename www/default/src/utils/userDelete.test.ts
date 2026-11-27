@@ -1,8 +1,5 @@
 import {
   DELETE_KEPT_USER_SUCCESS,
-  DELETE_OIDC_USER_NOTICE,
-  DELETE_OIDC_USER_NOTICE_SHORT,
-  DELETE_OIDC_USER_SUCCESS,
   DELETE_USER_SUCCESS,
   DELETE_USER_TITLE,
   deleteConfirmNotice,
@@ -64,40 +61,53 @@ describe('isDeletedKeptUser', () => {
 });
 
 describe('deleteConfirmNotice', () => {
-  it('explains the kept record for a user with an OIDC account', () => {
-    expect(deleteConfirmNotice({ has_oidc_account: true })).toBe(DELETE_OIDC_USER_NOTICE);
-    expect(DELETE_OIDC_USER_NOTICE).toContain('kept disabled');
-  });
-
-  it('has a shorter text for the users table, for an OIDC user only', () => {
-    expect(deleteConfirmNotice({ has_oidc_account: true }, true)).toBe(
-      DELETE_OIDC_USER_NOTICE_SHORT
+  it('explains the kept record and names the provider for an OIDC or SAML user', () => {
+    expect(deleteConfirmNotice({ sign_in_method: 'oidc' })).toBe(
+      'This user signs in with OpenID Connect. Their record is not removed: it is kept disabled under their provider account, so their next sign-in is refused until an administrator approves them again.'
     );
-    expect(DELETE_OIDC_USER_NOTICE_SHORT.length).toBeLessThan(DELETE_OIDC_USER_NOTICE.length);
-    expect(deleteConfirmNotice({}, true)).toBeUndefined();
+    expect(deleteConfirmNotice({ sign_in_method: 'saml' })).toBe(
+      'This user signs in with SAML. Their record is not removed: it is kept disabled under their provider account, so their next sign-in is refused until an administrator approves them again.'
+    );
   });
 
-  it('says nothing for a user without an OIDC account', () => {
+  it('has a shorter text for the users table, for an OIDC or SAML user only', () => {
+    const oidc = deleteConfirmNotice({ sign_in_method: 'oidc' }, true);
+    expect(oidc).toBe('OpenID Connect user: the record is kept disabled, not removed.');
+    expect(deleteConfirmNotice({ sign_in_method: 'saml' }, true)).toBe(
+      'SAML user: the record is kept disabled, not removed.'
+    );
+    expect((oidc ?? '').length).toBeLessThan(
+      (deleteConfirmNotice({ sign_in_method: 'oidc' }) ?? '').length
+    );
+    expect(deleteConfirmNotice({ sign_in_method: 'passkey' }, true)).toBeUndefined();
+  });
+
+  it('says nothing for a passkey user or one whose sign-in method is not known', () => {
+    expect(deleteConfirmNotice({ sign_in_method: 'passkey' })).toBeUndefined();
     expect(deleteConfirmNotice({})).toBeUndefined();
-    expect(deleteConfirmNotice({ has_oidc_account: false })).toBeUndefined();
   });
 });
 
 describe('deleteSuccessMessage', () => {
-  it('says the OIDC record was kept when the outcome is disabled', () => {
-    expect(deleteSuccessMessage('disabled', { has_oidc_account: true })).toBe(
-      DELETE_OIDC_USER_SUCCESS
+  it('names the provider whose account stays on the kept record', () => {
+    expect(deleteSuccessMessage('disabled', { sign_in_method: 'oidc' })).toBe(
+      'User disabled. Their OpenID Connect account stays on a disabled record and is refused at sign-in until an administrator approves them again.'
+    );
+    expect(deleteSuccessMessage('disabled', { sign_in_method: 'saml' })).toBe(
+      'User disabled. Their SAML account stays on a disabled record and is refused at sign-in until an administrator approves them again.'
     );
   });
 
-  it('does not mention OIDC for a kept user who has no OIDC account', () => {
-    const message = deleteSuccessMessage('disabled', {});
-    expect(message).toBe(DELETE_KEPT_USER_SUCCESS);
-    expect(message).not.toContain('OpenID');
+  it('names no provider for a kept user whose sign-in method is a passkey or not known', () => {
+    for (const user of [{ sign_in_method: 'passkey' as const }, {}]) {
+      const message = deleteSuccessMessage('disabled', user);
+      expect(message).toBe(DELETE_KEPT_USER_SUCCESS);
+      expect(message).not.toMatch(/OpenID|SAML/);
+    }
   });
 
   it('says deleted when the record was removed or the answer names no outcome', () => {
-    expect(deleteSuccessMessage('removed', { has_oidc_account: true })).toBe(DELETE_USER_SUCCESS);
+    expect(deleteSuccessMessage('removed', { sign_in_method: 'oidc' })).toBe(DELETE_USER_SUCCESS);
     expect(deleteSuccessMessage(undefined, {})).toBe(DELETE_USER_SUCCESS);
   });
 });

@@ -204,8 +204,9 @@ pub struct SurfaceWorld {
     pub sign_in_stream: Option<RedisStreamStandIn>,
     /// The OpenID provider dashboard users sign in at.
     pub dashboard_op: Option<crate::bdd_support::dashboard_op::DashboardOp>,
-    /// The dashboard session each human user's OpenID Connect sign-in handed over, by username.
-    pub oidc_sessions: HashMap<String, String>,
+    /// The dashboard session each human user's OpenID Connect or SAML sign-in handed over, by
+    /// username.
+    pub dashboard_sessions: HashMap<String, String>,
     /// The caller that signs the presentations the scenario sends.
     pub presentation_signer: Option<PresentationSigner>,
     /// The passkeys console users registered in the scenario, by username.
@@ -329,7 +330,7 @@ impl SurfaceWorld {
             api_keys: HashMap::new(),
             sign_in_stream: None,
             dashboard_op: None,
-            oidc_sessions: HashMap::new(),
+            dashboard_sessions: HashMap::new(),
             presentation_signer: None,
             passkeys: HashMap::new(),
             started_sign_in: None,

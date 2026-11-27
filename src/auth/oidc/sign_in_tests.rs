@@ -804,28 +804,39 @@ async fn a_user_who_is_not_approved_is_refused_even_with_a_valid_token_and_signe
     }
 }
 
+fn passkey_user(
+    user_id: &str,
+    username: &str,
+) -> UserData {
+    let now = chrono::Utc::now();
+    UserData {
+        user_id: user_id.to_string(),
+        username: username.to_string(),
+        passkeys: Vec::new(),
+        role: UserRole::User,
+        status: UserStatus::Approved,
+        is_primary: false,
+        first_name: None,
+        last_name: None,
+        email: None,
+        department: None,
+        job_title: None,
+        avatar_path: None,
+        created_at: now,
+        updated_at: now,
+        last_logged_in: None,
+        saml_id: None,
+        oidc: None,
+        deleted_at: None,
+    }
+}
+
 impl Flow {
     async fn administrator(&self) -> UserData {
-        let now = chrono::Utc::now();
         let admin = UserData {
-            user_id: "admin-1".to_string(),
-            username: "admin".to_string(),
-            passkeys: Vec::new(),
             role: UserRole::Administrator,
-            status: UserStatus::Approved,
             is_primary: true,
-            first_name: None,
-            last_name: None,
-            email: None,
-            department: None,
-            job_title: None,
-            avatar_path: None,
-            created_at: now,
-            updated_at: now,
-            last_logged_in: None,
-            saml_id: None,
-            oidc: None,
-            deleted_at: None,
+            ..passkey_user("admin-1", "admin")
         };
         self.oidc
             .storage
@@ -965,6 +976,36 @@ async fn a_deleted_user_signs_in_as_the_same_user_once_an_administrator_approves
     assert_eq!(back.username, "alice", "the next sign-in gives the record its username again");
     assert!(back.deleted_at.is_none());
     assert_eq!(flow.stored_user_count().await, 2);
+}
+
+#[tokio::test]
+async fn an_account_whose_every_username_other_users_hold_is_refused_and_no_user_is_created() {
+    let flow = Flow::new().await;
+    for (user_id, username) in [("holder-1", "alice"), ("holder-2", "user-1")] {
+        flow.oidc
+            .storage
+            .save_user(&passkey_user(user_id, username))
+            .await
+            .unwrap();
+    }
+    let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+    let response = flow.sign_in(|_| {}).await;
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        body(response)
+            .await
+            .contains("not allowed to use this dashboard")
+    );
+    assert!(flow.user().await.is_none(), "no user was created");
+    assert_eq!(flow.stored_user_count().await, 2);
+    assert!(
+        logs.text()
+            .contains("username_taken"),
+        "{}",
+        logs.text()
+    );
 }
 
 #[tokio::test]

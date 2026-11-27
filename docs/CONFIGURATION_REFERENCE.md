@@ -803,9 +803,9 @@ for it after the person has left the organisation.
   not tried again for a minute, as for JWT bearer callers in
   [`SOURCE_AUTH.md`](SOURCE_AUTH.md); a token without `kid` matches only a key published without
   one), then `iss` equals the issuer, `aud` includes `client_id` (`azp` must equal it when there
-  are several audiences), `exp` has not passed and `iat` is not more than 60 seconds ahead (60
-  seconds of leeway each), `nonce` is this sign-in's, `sub` is 1 to 255 characters, and `sid`,
-  when present, is 1 to 255 characters. The session remembers the provider sign-in it came
+  are several audiences), `exp` has not passed, `nbf`, when present, has been reached, and
+  `iat` is not more than 60 seconds ahead (60 seconds of leeway each), `nonce` is this
+  sign-in's, `sub` is 1 to 255 characters, and `sid`, when present, is 1 to 255 characters. The session remembers the provider sign-in it came
   from: the issuer, `sub`, `sid` and the ID token, which is used only as the hint of a sign-out at
   the provider and never appears in the log.
 - **Users.** A user is identified by the provider account, the issuer and `sub` together,
@@ -813,8 +813,8 @@ for it after the person has left the organisation.
   the primary administrator, within the appliance user limit. The username is the
   `claims.username` claim, else the email, else `sub` (a claim over 255 characters is skipped);
   when another user has it, the username is `sub`, and when another user has that too the
-  sign-in is refused. Every sign-in sets the username, email, first and last name, and role
-  again from the ID token. A user who is not approved is refused even with a valid ID token.
+  sign-in is refused with `403` (`username_taken`) and no user is created. Every sign-in sets
+  the username, email, first and last name, and role again from the ID token. A user who is not approved is refused even with a valid ID token.
   Deleting an OIDC user keeps a disabled record under their provider account, so their next
   sign-in is refused rather than creating a new user; see
   [Deleting an OIDC or SAML user](#deleting-an-oidc-or-saml-user).
@@ -851,15 +851,15 @@ for it after the person has left the organisation.
   page as SAML sign-in, with `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. A
   refused sign-in shows a page that does not say why, and the log records a reason code:
   `issuer_mismatch`, `state_unknown`, `binding_mismatch`, `code_missing`, `access_denied`, `exchange_failed`,
-  `id_token_invalid`, `claim_not_allowed`, `role_unmapped`, `user_disabled`, `user_limit`,
-  `op_unavailable`, `server_error` or `throttled`. No token, code, secret or claim value is
+  `id_token_invalid`, `claim_not_allowed`, `role_unmapped`, `user_disabled`, `username_taken`,
+  `user_limit`, `op_unavailable`, `server_error` or `throttled`. No token, code, secret or claim value is
   logged, and the provider's `error_description` is never shown.
 
 | Callback outcome | Status |
 | --- | --- |
 | Unknown or expired `state`, no binding cookie for it, or neither a code nor an error | `400` |
 | The provider refused the code (`invalid_grant`) | `401` |
-| The provider declined the sign-in, `required_claims` or `role_mapping` refused the account, the user is not approved, or the user limit is reached | `403` |
+| The provider declined the sign-in, `required_claims` or `role_mapping` refused the account, the user is not approved, other users hold every username the account could have, or the user limit is reached | `403` |
 | The ID token did not verify | `502` |
 | The provider, its token endpoint or its keys could not be reached | `503` |
 | Any other token endpoint error, such as `invalid_client` | `500` |
@@ -886,8 +886,8 @@ sign-in, with `LOGIN_METHOD` `oidc`, and a refused one raises `user.login_failed
   `logout_token` (OpenID Connect Back-Channel Logout 1.0), server to server and without
   cookies, to `/oidc/backchannel-logout`. The body is capped at 16 KiB. The token is checked
   like an ID token (an algorithm in `id_token_signing_algs`, its `kid`, the signature, `iss`,
-  `aud`, `azp` and `exp`, which must be present), then: a `typ` header, when present, is
-  `logout+jwt` with or without `application/` in any case; `iat` is present and not more than 60
+  `aud`, `azp`, `exp`, which must be present, and `nbf` when present), then: a `typ` header,
+  when present, is `logout+jwt` with or without `application/` in any case; `iat` is present and not more than 60
   seconds ahead; `events` holds the member
   `http://schemas.openid.net/event/backchannel-logout` as an object; there is no `nonce`, so an
   ID token is never accepted as a logout token; `sub` or `sid` is present (each 1 to 255
@@ -949,8 +949,9 @@ demoted before they can be deleted.
   The user API returns that account as `oidc` or `saml_id` on a kept record only, and keeps
   returning it after approval until the user's next sign-in gives the record a username again,
   so an administrator knows whose sign-in approving it allows. It also returns
-  `has_oidc_account: true` for every user with an OIDC account, before and after delete, and
-  leaves the field out for other users; it says how the account signs in and nothing more.
+  `sign_in_method` for every user, before and after delete: `oidc` for a user with an OIDC
+  account, `saml` for one with a SAML user ID and no OIDC account, and `passkey` otherwise; it
+  names the kind of account and nothing more.
 - **Every delete:** the user's sessions end, their personal access tokens are revoked (see
   [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#token-contract)), and their uploaded avatar files are
   removed; the shared default avatar never is, and only files directly in the avatars directory
@@ -969,13 +970,21 @@ demoted before they can be deleted.
 - Updates, deletes and sign-ins of users take one lock, so an administrator's change and a
   sign-in cannot write over each other, and a sign-in that a delete overtakes does not bring
   the record back.
+- **Profile:** a kept record takes no profile data. The user's own profile update
+  (`PUT /v1/profile`) that a delete overtakes answers `404` and writes nothing, and an
+  administrator's update of a kept record sets its role and status but not its profile fields,
+  unless the same update approves it again.
 - No action removes a kept record, because removing it lets the account sign in again as a new
   user. To answer an erasure request, disable the account at the provider first, then delete the
   record's file from `_storage/` and restart the gateway or reload its configuration.
+- **Upgrading:** before this release, deleting a SAML user removed the record, so the user was
+  created again, approved, at their next sign-in, and the personal access tokens they created
+  were not revoked. Delete such users again and review their access tokens.
 
 The dashboard shows the provider account on a kept record in the Users list, its detail view and
-the Edit User page. For a user with `has_oidc_account` the delete confirm step shows a notice that
-the record is kept, and the success message follows the outcome the delete returns.
+the Edit User page. For a user whose `sign_in_method` is `oidc` or `saml` the delete confirm step
+shows a notice, naming that method, that the record is kept, and the success message follows the
+outcome the delete returns.
 
 ### Registering the gateway at the provider
 

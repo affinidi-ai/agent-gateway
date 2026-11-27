@@ -77,6 +77,16 @@ pub enum DeleteOutcome {
     Disabled,
 }
 
+/// How a user signs in to the dashboard. A user with an OpenID provider or SAML account is kept,
+/// not removed, when deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SignInMethod {
+    Passkey,
+    Oidc,
+    Saml,
+}
+
 /// The result of a delete: the outcome, and whether this call changed the record. A delete of a
 /// record that is already kept changes nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +116,18 @@ fn avatar_file_name(avatar_path: Option<&str>) -> Option<std::ffi::OsString> {
 impl StorableEntity for UserData {
     fn id(&self) -> &str {
         &self.user_id
+    }
+}
+
+impl UserData {
+    pub fn sign_in_method(&self) -> SignInMethod {
+        if self.oidc.is_some() {
+            SignInMethod::Oidc
+        } else if self.saml_id.is_some() {
+            SignInMethod::Saml
+        } else {
+            SignInMethod::Passkey
+        }
     }
 }
 
@@ -336,7 +358,9 @@ impl PasskeyStorage {
         Ok(None)
     }
 
-    /// Update user profile information
+    /// Update user profile information and return whether it was written. A missing user and a
+    /// deleted user's kept record are left unchanged, so an update that waited for the guard
+    /// behind a delete does not write profile data back onto the scrubbed record.
     pub async fn update_profile(
         &self,
         user_id: &str,
@@ -346,12 +370,15 @@ impl PasskeyStorage {
         department: Option<String>,
         job_title: Option<String>,
         avatar_path: Option<String>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let _user_write_guard = self.user_write_guard().await;
-        let mut user_data = self
+        let Some(mut user_data) = self
             .load_user_by_id(user_id)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("User not found: {}", user_id))?;
+            .filter(|user| user.deleted_at.is_none())
+        else {
+            return Ok(false);
+        };
 
         if let Some(fn_val) = first_name {
             user_data.first_name = Some(fn_val);
@@ -374,7 +401,8 @@ impl PasskeyStorage {
         user_data.updated_at = chrono::Utc::now();
 
         self.save_user(&user_data)
-            .await
+            .await?;
+        Ok(true)
     }
 
     /// List all user_ids from cache
@@ -425,7 +453,7 @@ impl PasskeyStorage {
         }
 
         let avatar_path = user_data.avatar_path.clone();
-        let outcome = if user_data.oidc.is_none() && user_data.saml_id.is_none() {
+        let outcome = if user_data.sign_in_method() == SignInMethod::Passkey {
             self.storage
                 .delete(&user_data.user_id)
                 .await?;
@@ -553,7 +581,9 @@ impl PasskeyStorage {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeleteOutcome, DeleteResult, OidcIdentity, PasskeyStorage, UserData, UserRole, UserStatus};
+    use super::{
+        DeleteOutcome, DeleteResult, OidcIdentity, PasskeyStorage, SignInMethod, UserData, UserRole, UserStatus,
+    };
     use crate::config::{LimitDefinition, LimitExceeded, LimitsConfig};
     use tempfile::tempdir;
 
@@ -1164,6 +1194,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_sign_in_method_follows_the_provider_account_the_user_has() {
+        let mut both = oidc_user("both");
+        both.saml_id = Some("saml-1".to_string());
+
+        assert_eq!(user("plain", None).sign_in_method(), SignInMethod::Passkey);
+        assert_eq!(saml_user("saml-1").sign_in_method(), SignInMethod::Saml);
+        assert_eq!(oidc_user("oidc-1").sign_in_method(), SignInMethod::Oidc);
+        assert_eq!(both.sign_in_method(), SignInMethod::Oidc);
+        for (method, text) in
+            [(SignInMethod::Passkey, "passkey"), (SignInMethod::Oidc, "oidc"), (SignInMethod::Saml, "saml")]
+        {
+            assert_eq!(serde_json::to_value(method).unwrap(), text);
+        }
+    }
+
     #[tokio::test]
     async fn every_write_of_a_user_waits_for_the_user_write_guard() {
         let dir = tempdir().unwrap();
@@ -1193,10 +1239,12 @@ mod tests {
         assert!(role_update.is_err(), "update_user waits for the guard");
         assert!(profile_update.is_err(), "update_profile waits for the guard");
         assert!(delete.is_err(), "delete_user waits for the guard");
-        storage
-            .update_profile("oidc-1", Some("X".to_string()), None, None, None, None, None)
-            .await
-            .unwrap();
+        assert!(
+            storage
+                .update_profile("oidc-1", Some("X".to_string()), None, None, None, None, None)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             stored(&storage, "oidc-1")
                 .await
@@ -1204,6 +1252,61 @@ mod tests {
                 .first_name
                 .as_deref(),
             Some("X")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_profile_update_that_lands_after_a_delete_leaves_the_kept_record_scrubbed() {
+        let dir = tempdir().unwrap();
+        let storage = storage(dir.path()).await;
+        storage
+            .save_user(&oidc_user("oidc-1"))
+            .await
+            .unwrap();
+        storage
+            .delete_user("oidc-1")
+            .await
+            .unwrap();
+
+        let written = storage
+            .update_profile(
+                "oidc-1",
+                Some("Ada".to_string()),
+                Some("Lovelace".to_string()),
+                Some("ada@example.com".to_string()),
+                Some("Ops".to_string()),
+                Some("Engineer".to_string()),
+                Some("avatars/oidc-1.png".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert!(!written);
+        let kept = stored(&storage, "oidc-1")
+            .await
+            .unwrap();
+        assert!(kept.deleted_at.is_some());
+        assert_eq!(
+            (kept.first_name, kept.last_name, kept.email, kept.department, kept.job_title, kept.avatar_path),
+            (None, None, None, None, None, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_profile_update_of_a_missing_user_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let storage = storage(dir.path()).await;
+
+        let written = storage
+            .update_profile("missing", Some("X".to_string()), None, None, None, None, None)
+            .await
+            .unwrap();
+
+        assert!(!written);
+        assert!(
+            stored(&storage, "missing")
+                .await
+                .is_none()
         );
     }
 

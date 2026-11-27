@@ -153,8 +153,8 @@ or the ID token does not verify, and when a verified sign-in is refused by `requ
 `role_mapping` or because the user is not approved. A passkey sign-in whose
 challenge is unknown or expired has nothing to verify and raises nothing, and neither does an OIDC
 callback with an unknown `state` or without its binding cookie, one the provider declined, or any
-other failure after verification, such as reaching the user limit, a provisioning error or opening
-the session.
+other failure after verification, such as reaching the user limit, other users holding every
+username the account could have, a provisioning error or opening the session.
 
 `user.login_failed` carries the user variables of `user.login`, `LOGIN_METHOD`, and
 `FAILURE_REASON`:

@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use crate::bdd_support::admin_client::RecordedResponse;
 use crate::bdd_support::config::sign_in::post_logout_redirect_uri;
 use crate::bdd_support::dashboard_op::{BOUND_TENANT, DASHBOARD_CLIENT_ID, DashboardOp};
+use crate::bdd_support::http::handed_off_session;
 use crate::steps::sign_in_events::stored_users;
 use crate::steps::when::ensure_gateway_running;
 use crate::world::SurfaceWorld;
@@ -124,7 +125,7 @@ async fn open_callback(
         .expect("the callback's page");
     if let Some(session) = handed_off_session(&body) {
         world
-            .oidc_sessions
+            .dashboard_sessions
             .insert(person.to_string(), session);
     }
     world.caller_response = Some(RecordedResponse {
@@ -178,16 +179,6 @@ async fn sign_in_with(
     open_callback(world, person, &approved.callback, Some(&approved.binding_cookie)).await;
 }
 
-/// The session token the hand-off page stores for the dashboard, when it stores one.
-fn handed_off_session(page: &str) -> Option<String> {
-    let literal = page
-        .split("sessionStorage.setItem('session_token', ")
-        .nth(1)?
-        .split(')')
-        .next()?;
-    serde_json::from_str(literal).ok()
-}
-
 /// The key the session `person` was handed in the provider session `sid` is kept under, beside
 /// the one under `person`, which names their latest session.
 fn provider_session_key(
@@ -202,7 +193,7 @@ fn session_of(
     person: &str,
 ) -> String {
     world
-        .oidc_sessions
+        .dashboard_sessions
         .get(person)
         .cloned()
         .unwrap_or_else(|| panic!("{person} was handed no session"))
@@ -435,7 +426,7 @@ async fn has_signed_in_in_provider_session(
     assert_eq!(recorded(world).status, 200, "the earlier sign-in succeeds: {:?}", world.caller_response);
     let session = session_of(world, &person);
     world
-        .oidc_sessions
+        .dashboard_sessions
         .insert(provider_session_key(&person, &sid), session);
 }
 
@@ -942,19 +933,21 @@ fn no_human_user_is_stored(world: &mut SurfaceWorld) {
     assert!(stored.is_empty(), "the refused sign-in stored a user: {stored:?}");
 }
 
-/// The stored human users that sign in with `person`'s account at the OpenID provider.
+/// The stored human users that sign in with `person`'s account at the OpenID provider, or with
+/// `person` as their SAML user ID.
 fn stored_users_of_account(
     world: &SurfaceWorld,
     person: &str,
 ) -> Vec<Value> {
     stored_users(world)
         .into_iter()
-        .filter(|user| user["oidc"]["subject"] == person)
+        .filter(|user| user["oidc"]["subject"] == person || user["saml_id"] == person)
         .collect()
 }
 
 /// `administrator`, signed in, sends `method` with `body` to the user management route of the one
-/// human user that signs in with `person`'s account, and gets the gateway's answer.
+/// human user that signs in with `person`'s OpenID Connect or SAML account, and gets the
+/// gateway's answer.
 async fn manage_human_user(
     world: &SurfaceWorld,
     administrator: &str,
@@ -1029,7 +1022,7 @@ fn delete_answers_outcome(
     assert_eq!(answer.body, json!({ "outcome": outcome }), "{answer:?}");
 }
 
-#[then(expr = "the OpenID Connect account {string} has one stored human user, who is {string}")]
+#[then(regex = r#"^the (?:OpenID Connect|SAML) account "([^"]+)" has one stored human user, who is "([^"]+)"$"#)]
 fn account_has_one_stored_human_user(
     world: &mut SurfaceWorld,
     person: String,

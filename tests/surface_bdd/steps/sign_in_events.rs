@@ -468,6 +468,11 @@ async fn sign_in_with_saml_layout(
     let answer =
         crate::bdd_support::saml_idp::sign_in(infra._temp_dir.path(), infra.gateway_port, &subject, &roles, layout)
             .await;
+    if let Some(session) = crate::bdd_support::http::handed_off_session(&answer.body) {
+        world
+            .dashboard_sessions
+            .insert(subject, session);
+    }
     world.caller_response = Some(crate::bdd_support::admin_client::RecordedResponse {
         status: answer.status,
         headers: if answer.set_cookies.is_empty() {
@@ -671,17 +676,22 @@ fn the_gateway_issues_no_session_cookie(world: &mut SurfaceWorld) {
 }
 
 /// The human users the gateway stored, read from its user directory; none before the first is
-/// stored.
+/// stored. A missing storage root or a user directory that cannot be read fails the step, so a
+/// moved storage path never reads as no users.
 pub(crate) fn stored_users(world: &SurfaceWorld) -> Vec<Value> {
-    let users_dir = world
+    let storage_root = world
         .infra
         .as_ref()
         .expect("the gateway runs")
         ._temp_dir
         .path()
-        .join("_storage/passkeys");
-    let Ok(entries) = std::fs::read_dir(&users_dir) else {
-        return Vec::new();
+        .join("_storage");
+    assert!(storage_root.is_dir(), "the gateway's storage root {} is missing", storage_root.display());
+    let users_dir = storage_root.join("passkeys");
+    let entries = match std::fs::read_dir(&users_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => panic!("the user directory {} cannot be read: {error}", users_dir.display()),
     };
     entries
         .filter_map(Result::ok)

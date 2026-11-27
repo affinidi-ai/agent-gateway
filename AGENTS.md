@@ -278,8 +278,9 @@ _Confirm popover_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-del
 Deleting a user keeps an OIDC or SAML user's record disabled under their provider account, and
 `DELETE /v1/users/{user_id}` answers `{"outcome": "removed" | "disabled"}`. The shared
 `DeleteButton` shows a visible `confirmNotice` during its confirm step (a `role="status"` region
-that stays mounted), which the Users list and Edit User page pass only for a user with
-`has_oidc_account`; success messages follow the outcome, and all of this wording lives in
+that stays mounted), which the Users list and Edit User page pass only for a user whose
+`sign_in_method` is `oidc` or `saml`, naming that method; success messages follow the outcome
+and name the method too, and all of this wording lives in
 `utils/userDelete.ts`. See _User delete_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#user-delete) and
 [`docs/CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#deleting-an-oidc-or-saml-user).

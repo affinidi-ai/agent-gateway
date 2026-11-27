@@ -17,6 +17,7 @@ import {
   keptAccountDetail,
   keptAccountLabel,
   PROVIDER_ACCOUNT_HEADING,
+  type SignInMethod,
 } from '../utils/userDelete';
 
 const ROLE_BADGE: Record<string, string> = {
@@ -47,7 +48,7 @@ interface User {
   avatar_path?: string;
   oidc?: { issuer: string; subject: string };
   saml_id?: string;
-  has_oidc_account?: boolean;
+  sign_in_method?: SignInMethod;
 }
 
 const UsersPage: React.FC = () => {

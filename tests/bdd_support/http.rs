@@ -33,3 +33,13 @@ fn decode_sse_json(raw: &str) -> Option<serde_json::Value> {
         .map(str::trim)
         .find_map(|payload| serde_json::from_str(payload).ok())
 }
+
+/// The session token a sign-in's hand-off page stores for the dashboard, when it stores one.
+pub fn handed_off_session(page: &str) -> Option<String> {
+    let literal = page
+        .split("sessionStorage.setItem('session_token', ")
+        .nth(1)?
+        .split(')')
+        .next()?;
+    serde_json::from_str(literal).ok()
+}

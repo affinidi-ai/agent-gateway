@@ -2043,12 +2043,13 @@ kept user's provider account and the deleted notice on the Edit User page.
   a notice the button keeps a `role="status"` region (`delete-confirm-notice`) mounted and fills
   it only while confirming; without one there is no region.
 - The Users list (Settings → Users, its row and its detail modal) and the Edit User page
-  (`/users/:userId`) pass a notice only for a user with `has_oidc_account`; the table row uses
-  the shorter text, on its own line under the row actions. A SAML user gets no notice.
+  (`/users/:userId`) pass a notice only for a user whose `sign_in_method` is `oidc` or `saml`,
+  naming the method ("OpenID Connect" or "SAML"); the table row uses the shorter text, on its own
+  line under the row actions. A passkey user gets no notice.
 - The success message follows the `outcome` the `DELETE` answers: "User deleted successfully"
-  for `removed` or no outcome, a kept-record message for `disabled` (OpenID Connect wording
-  only for a user with `has_oidc_account`). The Notifications page's reject-and-delete message
-  follows the outcome the same way. The Edit User page's toast comes from `useSaveAction` with a
+  for `removed` or no outcome, a kept-record message for `disabled` that names the method for a
+  user whose `sign_in_method` is `oidc` or `saml`. The Notifications page's reject-and-delete
+  message follows the outcome the same way. The Edit User page's toast comes from `useSaveAction` with a
   `successMessage` built from the answer.
 - A kept record shows its provider account (`oidc` or `saml_id`) under the username in the
   Users list (`users-kept-account-<user_id>`), in the detail modal

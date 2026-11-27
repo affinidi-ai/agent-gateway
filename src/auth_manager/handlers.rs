@@ -319,14 +319,18 @@ pub async fn update_user(
             None => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update user: {}", e)),
         })?;
 
-    // Update profile fields if provided
-    if req.first_name.is_some()
-        || req.last_name.is_some()
-        || req.email.is_some()
-        || req.department.is_some()
-        || req.job_title.is_some()
+    let stays_deleted = user_before
+        .deleted_at
+        .is_some()
+        && !reapproved;
+    if !stays_deleted
+        && (req.first_name.is_some()
+            || req.last_name.is_some()
+            || req.email.is_some()
+            || req.department.is_some()
+            || req.job_title.is_some())
     {
-        storage
+        let written = storage
             .update_profile(
                 &user_id,
                 req.first_name.clone(),
@@ -338,6 +342,9 @@ pub async fn update_user(
             )
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update profile: {}", e)))?;
+        if !written {
+            return Err((StatusCode::NOT_FOUND, "User not found".to_string()));
+        }
     }
 
     // Load updated user data
@@ -530,7 +537,7 @@ pub async fn update_profile(
     Extension(user_id): Extension<String>,
     Json(req): Json<UpdateProfileRequest>,
 ) -> Result<Json<User>, (StatusCode, String)> {
-    storage
+    let written = storage
         .update_profile(
             &user_id,
             req.first_name.clone(),
@@ -542,6 +549,9 @@ pub async fn update_profile(
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update profile: {}", e)))?;
+    if !written {
+        return Err((StatusCode::NOT_FOUND, "User not found".to_string()));
+    }
 
     let user_data = storage
         .load_user_by_id(&user_id)
@@ -666,6 +676,7 @@ pub(crate) fn user_routes_for_tests(
 ) -> axum::Router {
     axum::Router::new()
         .route("/v1/users/{user_id}", axum::routing::put(update_user).delete(delete_user))
+        .route("/v1/profile", axum::routing::put(update_profile))
         .route("/v1/profile/avatar", axum::routing::post(upload_avatar))
         .layer(Extension(tokens))
         .layer(Extension(sessions))
@@ -1190,6 +1201,23 @@ mod tests {
                     .0
             }
 
+            async fn put_json(
+                &self,
+                caller: &str,
+                uri: &str,
+                body: Value,
+            ) -> StatusCode {
+                let request = Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                self.send(None, caller, request)
+                    .await
+                    .0
+            }
+
             async fn upload_avatar(
                 &self,
                 user_id: &str,
@@ -1491,6 +1519,97 @@ mod tests {
                     .revoked_for()
                     .is_empty()
             );
+        }
+
+        #[tokio::test]
+        async fn an_approved_user_can_update_their_profile() {
+            let fixture = fixture().await;
+            fixture
+                .member("oidc-1", UserStatus::Approved, true)
+                .await;
+
+            let status = fixture
+                .put_json("oidc-1", "/v1/profile", serde_json::json!({ "first_name": "Ada" }))
+                .await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                fixture
+                    .stored("oidc-1")
+                    .await
+                    .unwrap()
+                    .first_name
+                    .as_deref(),
+                Some("Ada")
+            );
+        }
+
+        #[tokio::test]
+        async fn a_profile_update_from_a_deleted_user_is_refused_and_writes_nothing() {
+            let fixture = fixture().await;
+            fixture
+                .member("oidc-1", UserStatus::Approved, true)
+                .await;
+            fixture
+                .storage
+                .delete_user("oidc-1")
+                .await
+                .unwrap();
+
+            let status = fixture
+                .put_json(
+                    "oidc-1",
+                    "/v1/profile",
+                    serde_json::json!({ "first_name": "Ada", "email": "ada@example.com", "job_title": "Engineer" }),
+                )
+                .await;
+
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            let kept = fixture
+                .stored("oidc-1")
+                .await
+                .unwrap();
+            assert!(kept.deleted_at.is_some());
+            assert_eq!((kept.first_name, kept.email, kept.job_title), (None, None, None));
+        }
+
+        #[tokio::test]
+        async fn a_kept_record_takes_profile_fields_from_an_administrator_only_once_approved_again() {
+            let fixture = fixture().await;
+            fixture
+                .member("oidc-1", UserStatus::Approved, true)
+                .await;
+            fixture
+                .storage
+                .delete_user("oidc-1")
+                .await
+                .unwrap();
+
+            let still_deleted = fixture
+                .put_json(
+                    ADMIN,
+                    "/v1/users/oidc-1",
+                    serde_json::json!({ "role": "poweruser", "status": "disabled", "first_name": "Ada" }),
+                )
+                .await;
+            let kept = fixture
+                .stored("oidc-1")
+                .await
+                .unwrap();
+            let approved = fixture
+                .put_json(ADMIN, "/v1/users/oidc-1", serde_json::json!({ "status": "approved", "first_name": "Ada" }))
+                .await;
+            let back = fixture
+                .stored("oidc-1")
+                .await
+                .unwrap();
+
+            assert_eq!(still_deleted, StatusCode::OK);
+            assert_eq!((kept.role, kept.first_name), (UserRole::PowerUser, None), "the role is set, no profile field");
+            assert!(kept.deleted_at.is_some());
+            assert_eq!(approved, StatusCode::OK);
+            assert_eq!(back.first_name.as_deref(), Some("Ada"));
+            assert!(back.deleted_at.is_none());
         }
 
         #[tokio::test]

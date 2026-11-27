@@ -1,4 +1,4 @@
-use crate::auth::storage::{DeleteOutcome, OidcIdentity, UserData};
+use crate::auth::storage::{DeleteOutcome, OidcIdentity, SignInMethod, UserData};
 use crate::auth::types::{UserRole, UserStatus};
 use serde::{Deserialize, Serialize};
 
@@ -36,10 +36,9 @@ pub struct User {
     /// is. Absent for every other user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saml_id: Option<String>,
-    /// True when the user signs in through an OpenID provider, so the dashboard can say what
-    /// deleting them does before the record is kept.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub has_oidc_account: bool,
+    /// How the user signs in, so the dashboard can say what deleting them does. It names the kind
+    /// of account only, never the account itself.
+    pub sign_in_method: SignInMethod,
 }
 
 /// Response of `DELETE /v1/users/{user_id}`.
@@ -51,7 +50,7 @@ pub struct DeleteUserResponse {
 impl From<UserData> for User {
     fn from(user: UserData) -> Self {
         let kept = user.deleted_at.is_some() || user.username == user.user_id;
-        let has_oidc_account = user.oidc.is_some();
+        let sign_in_method = user.sign_in_method();
         Self {
             username: user.username,
             user_id: user.user_id,
@@ -69,7 +68,7 @@ impl From<UserData> for User {
             last_logged_in: user.last_logged_in,
             oidc: user.oidc.filter(|_| kept),
             saml_id: user.saml_id.filter(|_| kept),
-            has_oidc_account,
+            sign_in_method,
         }
     }
 }
@@ -169,27 +168,16 @@ mod tests {
     }
 
     #[test]
-    fn a_user_with_an_oidc_account_is_flagged_before_and_after_delete() {
+    fn every_user_reports_how_they_sign_in_before_and_after_delete() {
         let mut data = user_data();
-        assert_eq!(serde_json::to_value(User::from(data.clone())).unwrap()["has_oidc_account"], true);
+        assert_eq!(serde_json::to_value(User::from(data.clone())).unwrap()["sign_in_method"], "oidc");
         data.deleted_at = Some(chrono::Utc::now());
-        assert!(User::from(data).has_oidc_account);
-    }
+        assert_eq!(User::from(data.clone()).sign_in_method, SignInMethod::Oidc);
 
-    #[test]
-    fn a_user_without_an_oidc_account_is_not_flagged_and_omits_the_field() {
-        let mut data = user_data();
         data.oidc = None;
-
-        let user = User::from(data);
-
-        assert!(!user.has_oidc_account);
-        assert!(
-            serde_json::to_value(&user)
-                .unwrap()
-                .get("has_oidc_account")
-                .is_none()
-        );
+        assert_eq!(serde_json::to_value(User::from(data.clone())).unwrap()["sign_in_method"], "saml");
+        data.saml_id = None;
+        assert_eq!(serde_json::to_value(User::from(data)).unwrap()["sign_in_method"], "passkey");
     }
 
     #[test]

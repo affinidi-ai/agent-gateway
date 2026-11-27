@@ -118,6 +118,7 @@ pub(super) enum Refusal {
     ClaimNotAllowed,
     RoleUnmapped,
     UserDisabled,
+    UsernameTaken,
     UserLimit(crate::config::LimitExceeded),
     OpUnavailable,
     ServerError,
@@ -136,6 +137,7 @@ impl Refusal {
             Self::ClaimNotAllowed => "claim_not_allowed",
             Self::RoleUnmapped => "role_unmapped",
             Self::UserDisabled => "user_disabled",
+            Self::UsernameTaken => "username_taken",
             Self::UserLimit(_) => "user_limit",
             Self::OpUnavailable => "op_unavailable",
             Self::ServerError => "server_error",
@@ -146,7 +148,7 @@ impl Refusal {
     /// caller sends that could be a guess. `400` for a sign-in link naming another provider, an
     /// unknown or unbound `state` or a callback without a code; `502` for an ID token that did not
     /// verify, which comes from the provider and never from the caller; `403` for an account the
-    /// settings refuse.
+    /// settings refuse or whose every username another user holds.
     fn status(&self) -> StatusCode {
         match self {
             Self::IssuerMismatch | Self::StateUnknown | Self::BindingMismatch | Self::CodeMissing => {
@@ -158,6 +160,7 @@ impl Refusal {
             | Self::ClaimNotAllowed
             | Self::RoleUnmapped
             | Self::UserDisabled
+            | Self::UsernameTaken
             | Self::UserLimit(_) => StatusCode::FORBIDDEN,
             Self::OpUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::ServerError => StatusCode::INTERNAL_SERVER_ERROR,
@@ -169,6 +172,7 @@ impl Refusal {
             Self::ClaimNotAllowed
             | Self::RoleUnmapped
             | Self::UserDisabled
+            | Self::UsernameTaken
             | Self::UserLimit(_)
             | Self::OpUnavailable => "Sign-in unavailable",
             _ => "Sign-in failed",
@@ -183,7 +187,7 @@ impl Refusal {
                     .to_string()
             }
             Self::AccessDenied => "The OpenID provider did not complete the sign-in.".to_string(),
-            Self::ClaimNotAllowed | Self::RoleUnmapped | Self::UserDisabled => {
+            Self::ClaimNotAllowed | Self::RoleUnmapped | Self::UserDisabled | Self::UsernameTaken => {
                 "Your account is not allowed to use this dashboard. Please contact your administrator.".to_string()
             }
             Self::UserLimit(limit) => limit.message(),
@@ -452,8 +456,8 @@ async fn complete_sign_in(
             }
             Err(ProvisionRefusal::UsernameTaken) => {
                 return Err(refused(
-                    Refusal::ServerError,
-                    None,
+                    Refusal::UsernameTaken,
+                    existing_id,
                     "every username for this account belongs to another user",
                 ));
             }
@@ -639,7 +643,13 @@ mod tests {
         assert_eq!(Refusal::IdTokenInvalid.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(Refusal::OpUnavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(Refusal::ServerError.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        for refusal in [Refusal::AccessDenied, Refusal::ClaimNotAllowed, Refusal::RoleUnmapped, Refusal::UserDisabled] {
+        for refusal in [
+            Refusal::AccessDenied,
+            Refusal::ClaimNotAllowed,
+            Refusal::RoleUnmapped,
+            Refusal::UserDisabled,
+            Refusal::UsernameTaken,
+        ] {
             assert_eq!(refusal.status(), StatusCode::FORBIDDEN, "{}", refusal.code());
         }
     }
@@ -666,10 +676,11 @@ mod tests {
 
     #[test]
     fn a_refused_account_learns_nothing_about_why() {
-        let messages: Vec<String> = [Refusal::ClaimNotAllowed, Refusal::RoleUnmapped, Refusal::UserDisabled]
-            .iter()
-            .map(Refusal::message)
-            .collect();
+        let messages: Vec<String> =
+            [Refusal::ClaimNotAllowed, Refusal::RoleUnmapped, Refusal::UserDisabled, Refusal::UsernameTaken]
+                .iter()
+                .map(Refusal::message)
+                .collect();
         assert!(
             messages
                 .windows(2)
