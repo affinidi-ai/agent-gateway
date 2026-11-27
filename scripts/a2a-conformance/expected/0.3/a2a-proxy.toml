@@ -1,12 +1,17 @@
-# Failures of the gateway-owned A2A proxy when the suite treats it as an agent. It is scored on
-# its own failures, not against the direct run. Its backend is the Direct Line stand-in
-# (directline.py), which only echoes text
-# (target "a2a-proxy", A2A 0.3 suite). The run fails on an entry that is missing here, on a
-# listed test with another outcome, and on a listed test that no longer applies.
+# Failures of the gateway-owned A2A proxy when the suite treats it as an agent
+# (target "a2a-proxy", A2A 0.3 suite). It is scored on its own failures, not against the direct
+# run. The run fails on an entry that is missing here, on a listed test with another outcome,
+# and on a listed test that no longer applies.
 #
-# minimum_passed is how many tests pass today. Fewer means tests stopped running
-# or started being skipped, which a list of failures alone would not show.
-minimum_passed = 36
+# Its backend is the Direct Line stand-in (directline.py), which only echoes text. Its surface
+# is stored accepting A2A 0.3 and 1.0, a setting the gateway keeps for an older A2A proxy
+# surface. One the admin API creates today accepts 1.0 only and would refuse every request of
+# this suite.
+#
+# passed is how many tests pass. A different count fails the run: fewer means
+# tests stopped running or started being skipped, which a list of failures
+# alone would not show; more means this number is out of date.
+passed = 36
 
 [[expected]]
 tests = [

@@ -41,14 +41,18 @@ def json_object(response: httpx.Response) -> dict:
 
 
 def get_task(url: str) -> tuple[bool, str]:
-    """Ask for a task that does not exist; any JSON-RPC answer shows the binding is served."""
+    """Ask for a task that does not exist; a JSON-RPC answer with HTTP 200 shows the binding is served.
+
+    An agent answers a JSON-RPC error with HTTP 200. The gateway answers a
+    request it refuses itself with HTTP 4xx, which must not count as the agent.
+    """
     body = {'jsonrpc': '2.0', 'id': 1, 'method': dialect['get_task'], 'params': {'id': str(uuid.uuid4())}}
     try:
         response = httpx.post(url, json=body, headers=dialect['headers'], timeout=TIMEOUT)
     except httpx.HTTPError as error:
         return False, type(error).__name__
-    served = json_object(response).get('jsonrpc') == '2.0'
-    return served, f'HTTP {response.status_code}' + ('' if served else ', not a JSON-RPC answer')
+    served = response.status_code == 200 and json_object(response).get('jsonrpc') == '2.0'
+    return served, f'HTTP {response.status_code}' + ('' if served else ', not a JSON-RPC answer from the agent')
 
 
 def rest_get_task(url: str) -> tuple[bool, str]:

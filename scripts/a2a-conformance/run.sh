@@ -6,7 +6,7 @@
 # scripts/a2a-conformance/README.md.
 #
 # Exit codes: 0 pass, 1 failure, 2 invalid options or precondition not met,
-# 3 dependency fetch failed, 130 SIGINT, 143 SIGTERM.
+# 3 dependency fetch failed, 129 SIGHUP, 130 SIGINT, 143 SIGTERM.
 
 set -euo pipefail
 unset CDPATH
@@ -44,8 +44,8 @@ Usage: scripts/a2a-conformance/run.sh [options]
 Environment:
   A2A_CONFORMANCE_PORT_BASE      First of the local ports used (default 18860)
   A2A_CONFORMANCE_TCK_REPO       Git URL or mirror of a2aproject/a2a-tck
-  A2A_CONFORMANCE_PYTHON         Python 3.15 or later, for the 1.0 suite
-  A2A_CONFORMANCE_LEGACY_PYTHON  Python 3.13 or 3.14, for the 0.3 suite
+  A2A_CONFORMANCE_PYTHON         Python 3.15 or later, for the 1.0 suite; the only one tried when set
+  A2A_CONFORMANCE_LEGACY_PYTHON  Python 3.13 or 3.14, for the 0.3 suite; the only one tried when set
 EOF
 }
 
@@ -86,7 +86,7 @@ case "${A2A_VERSION}" in
         SUITE_PYTHON="${TCK_DIR}/.venv/bin/python"
         PYTHON_MIN="3.15"
         PYTHON_BELOW=""
-        PYTHON_OVERRIDE="${A2A_CONFORMANCE_PYTHON:-}"
+        PYTHON_OVERRIDE_NAME="A2A_CONFORMANCE_PYTHON"
         PYTHON_CANDIDATES=(python3.15 python3)
         AGENT_VENV="${WORK}/agent-venv"
         AGENT_REQUIREMENTS="${HERE}/agent-requirements.txt"
@@ -104,7 +104,7 @@ case "${A2A_VERSION}" in
         SUITE_REQUIREMENTS="${HERE}/legacy-suite-requirements.txt"
         PYTHON_MIN="3.13"
         PYTHON_BELOW="3.15"
-        PYTHON_OVERRIDE="${A2A_CONFORMANCE_LEGACY_PYTHON:-}"
+        PYTHON_OVERRIDE_NAME="A2A_CONFORMANCE_LEGACY_PYTHON"
         PYTHON_CANDIDATES=(python3.14 python3.13 python3)
         AGENT_VENV="${WORK}/agent-venv-0.3"
         AGENT_REQUIREMENTS="${HERE}/legacy-agent-requirements.txt"
@@ -116,6 +116,7 @@ case "${A2A_VERSION}" in
         ;;
     *) echo "--a2a-version must be 1.0 or 0.3" >&2; exit 2 ;;
 esac
+PYTHON_OVERRIDE="${!PYTHON_OVERRIDE_NAME:-}"
 LOGS="${RUN}/logs"
 RESULTS="${RUN}/results"
 EXPECTED="${HERE}/expected/${A2A_VERSION}"
@@ -281,8 +282,10 @@ write_summary() {
 cleanup() {
     local code=$?
     local pid
-    # A second signal must not cut the cleanup short and leave processes on the ports.
-    trap '' INT TERM
+    # A second signal must not cut the cleanup short and leave processes on the
+    # ports, and neither may a failed write: after a hangup the terminal is gone.
+    trap '' HUP INT TERM
+    set +e
     for pid in "${STARTED_PIDS[@]+"${STARTED_PIDS[@]}"}"; do
         stop_pid "${pid}"
     done
@@ -302,6 +305,7 @@ cleanup() {
     exit "${code}"
 }
 trap cleanup EXIT
+trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -353,10 +357,12 @@ below = tuple(map(int, sys.argv[2].split("."))) if sys.argv[2] else (99,)
 sys.exit(0 if low <= version < below else 1)' "${PYTHON_MIN}" "${PYTHON_BELOW}" 2>/dev/null
 }
 
+# An interpreter the caller names is the only one tried: falling back to
+# another would run the suite on a Python the caller did not choose.
 find_python() {
-    local candidate
-    for candidate in "${PYTHON_OVERRIDE}" "${PYTHON_CANDIDATES[@]}"; do
-        [[ -n "${candidate}" ]] || continue
+    local candidate candidates=("${PYTHON_CANDIDATES[@]}")
+    [[ -z "${PYTHON_OVERRIDE}" ]] || candidates=("${PYTHON_OVERRIDE}")
+    for candidate in "${candidates[@]}"; do
         if command -v "${candidate}" > /dev/null 2>&1 && python_in_range "${candidate}"; then
             PYTHON="$(command -v "${candidate}")"
             return 0
@@ -413,14 +419,18 @@ fetch_tck() {
 }
 
 # A virtual environment holding exactly the pinned packages of a requirements
-# file. It is rebuilt when the file changes and reused otherwise.
+# file, built with the chosen interpreter. It is rebuilt when the file or the
+# interpreter changes, or when its own interpreter no longer runs, and reused
+# otherwise.
 pinned_venv() {
-    local venv="$1" requirements="$2" stamp="$1/.requirements"
-    if cmp -s "${requirements}" "${stamp}" 2>/dev/null; then return; fi
+    local venv="$1" requirements="$2" stamp="$1/.requirements" wanted
+    wanted="$(cat "${requirements}" && "${PYTHON}" -c 'import sys; print("# built with", sys.version.split()[0], sys.executable)')" ||
+        return 1
+    if "${venv}/bin/python" -c '' 2>/dev/null && [[ "$(cat "${stamp}" 2>/dev/null)" == "${wanted}" ]]; then return; fi
     rm -rf "${venv}" &&
         "${PYTHON}" -m venv "${venv}" &&
         "${venv}/bin/pip" install --disable-pip-version-check --quiet --requirement "${requirements}" &&
-        cp "${requirements}" "${stamp}"
+        printf '%s\n' "${wanted}" > "${stamp}"
 }
 
 # The 1.0 suite pins its packages in uv.lock, so uv installs them. uv itself is
@@ -520,8 +530,11 @@ start_gateway() {
         cd "${ENV_DIR}/config"
         export "$(cat "${ENV_DIR}/backup-key-var")=$(openssl rand -hex 32)"
         export RUST_LOG="${RUST_LOG:-info}"
-        # The A2A proxy refuses a loopback backend unless this development switch is set.
-        export AG_TEST_MODE=true AG_ALLOW_LOCAL_A2A_PROXY=true
+        # The A2A proxy refuses a loopback backend unless this development switch
+        # is set. Test mode is not needed, and one inherited from the caller's
+        # shell would let other test switches change the gateway under test.
+        unset AG_TEST_MODE
+        export AG_ALLOW_LOCAL_A2A_PROXY=true
         exec "${BINARY}" --config config.toml
     ) > "${LOGS}/gateway.log" 2>&1 &
     GATEWAY_PID=$!
@@ -539,24 +552,26 @@ target_url() {
 }
 
 # One pytest invocation of the suite, from its checkout, with the harness
-# plugin on the path. pytest exits 0 when every test passed and 1 when some
-# failed; both leave complete results, which check_results.py scores. Any other
-# exit code means the suite did not run to the end.
+# plugins on the path. pytest exits 0 when every test passed and 1 when some
+# failed; both leave a complete JUnit report, which check_results.py scores.
+# The 1.0 suite's pytest also exits 1 when it stops before collecting (a plugin
+# that does not import), and then writes no report, so the report is required
+# as well. Anything else means the suite did not run to the end.
 suite_pytest() {
-    local log="$1" status=0
-    shift
-    (cd "${TCK_DIR}" && PYTHONPATH="${HERE}/plugins" "${SUITE_PYTHON}" -m pytest -p no:cacheprovider --tb=short -q "$@") \
-        >> "${log}" 2>&1 || status=$?
-    [[ ${status} -le 1 ]]
+    local log="$1" junit="$2" status=0
+    shift 2
+    (cd "${TCK_DIR}" && PYTHONPATH="${HERE}/plugins" "${SUITE_PYTHON}" -m pytest -p no:cacheprovider -p tck_loopback \
+        --tb=short -q "--junitxml=${junit}" "$@") >> "${log}" 2>&1 || status=$?
+    [[ ${status} -le 1 && -s "${junit}" ]]
 }
 
 # The 1.0 suite, as its run_tck.py runs it, on the JSON-RPC binding.
 run_modern_suite() {
     local url="$1" log="$2" out="$3"
     shift 3
-    suite_pytest "${log}" tests/compatibility/ -p tck_plugin "--sut-host=${url}" --transport=jsonrpc \
-        "--compatibility-report=${out}/compatibility" "--html=${out}/tck_report.html" --self-contained-html \
-        "--junitxml=${out}/junitreport.xml" "$@"
+    suite_pytest "${log}" "${out}/junitreport.xml" tests/compatibility/ -p tck_plugin "--sut-host=${url}" \
+        --transport=jsonrpc "--compatibility-report=${out}/compatibility" "--html=${out}/tck_report.html" \
+        --self-contained-html "$@"
 }
 
 # The 0.3 suite's two categories that decide compliance, as its run_tck.py
@@ -564,9 +579,9 @@ run_modern_suite() {
 run_legacy_suite() {
     local url="$1" log="$2" out="$3"
     local common=(-p tck_plugin_legacy "--sut-url=${url}" --test-scope=all --transport-strategy prefer_jsonrpc --transports jsonrpc)
-    suite_pytest "${log}" tests/mandatory/ -m "mandatory_jsonrpc or mandatory_protocol" "${common[@]}" \
-        "--junitxml=${out}/junit-mandatory.xml" &&
-        suite_pytest "${log}" tests/optional/capabilities/ "${common[@]}" "--junitxml=${out}/junit-capabilities.xml"
+    suite_pytest "${log}" "${out}/junit-mandatory.xml" tests/mandatory/ \
+        -m "mandatory_jsonrpc or mandatory_protocol" "${common[@]}" &&
+        suite_pytest "${log}" "${out}/junit-capabilities.xml" tests/optional/capabilities/ "${common[@]}"
 }
 
 run_suite() {
@@ -605,7 +620,12 @@ TOOLS=(git openssl)
 for tool in "${TOOLS[@]}"; do
     command -v "${tool}" > /dev/null 2>&1 || fail 2 "preflight: ${tool} is required"
 done
-find_python || fail 2 "preflight: the A2A ${A2A_VERSION} suite needs Python >= ${PYTHON_MIN}${PYTHON_BELOW:+ and < ${PYTHON_BELOW}}; see --help for the variable that names one"
+PYTHON_NEEDED="Python >= ${PYTHON_MIN}${PYTHON_BELOW:+ and < ${PYTHON_BELOW}}"
+if ! find_python; then
+    [[ -z "${PYTHON_OVERRIDE}" ]] ||
+        fail 2 "preflight: ${PYTHON_OVERRIDE_NAME}=${PYTHON_OVERRIDE} is not ${PYTHON_NEEDED}, which the A2A ${A2A_VERSION} suite needs"
+    fail 2 "preflight: the A2A ${A2A_VERSION} suite needs ${PYTHON_NEEDED}; set ${PYTHON_OVERRIDE_NAME} to one"
+fi
 if [[ -z "${BINARY}" && ( -n "${RUSTFLAGS:-}" || -n "${CARGO_ENCODED_RUSTFLAGS:-}" ) ]]; then
     fail 2 "preflight: unset RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS; Cargo would use them instead of the rustflags in .cargo/config.toml"
 fi

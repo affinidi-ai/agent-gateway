@@ -3,8 +3,8 @@
 --strip-trailing-slash makes the TCK's JSON-RPC client call the interface URL
 exactly as the agent card gives it. The TCK always appends "/" to that URL; a
 gateway entry point that refuses the extra slash would otherwise fail every
-test for that one reason. run.sh probes the slash itself and reports it as its
-own check.
+test for that one reason. probes.py probes the slash itself and reports it as
+its own check.
 """
 
 import httpx

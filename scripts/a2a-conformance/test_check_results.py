@@ -182,18 +182,35 @@ class Baselines(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 self.load(text)
 
-    def test_an_agent_baseline_sets_minimum_passed_and_lists_failures_only(self):
-        self.assertEqual(self.load('minimum_passed = 7\n' + self.ENTRY, is_agent=True),
+    def test_an_agent_baseline_sets_passed_and_lists_failures_only(self):
+        self.assertEqual(self.load('passed = 7\n' + self.ENTRY, is_agent=True),
                          Baseline({'a': Expected(('fail',), 'r')}, 7))
-        for text in (self.ENTRY, 'minimum_passed = "7"\n', 'minimum_passed = 7\n' + self.ENTRY.replace('"fail"', '"skip"')):
-            with self.subTest(text=text), self.assertRaises(ValueError):
-                self.load(text, is_agent=True)
+        with self.assertRaises(ValueError):
+            self.load('passed = 7\n' + self.ENTRY.replace('"fail"', '"skip"'), is_agent=True)
         with self.assertRaises(FileNotFoundError):
             check_results.load_baseline(Path('/nonexistent/target.toml'), True)
 
-    def test_a_forwarding_baseline_must_not_set_minimum_passed(self):
+    def test_a_baseline_refuses_a_key_it_does_not_know(self):
+        for text, is_agent in (('passed = 7\nminimum_passed = 5\n', True), ('pased = 7\n', False),
+                               ('[[expect]]\ntest = "a"\noutcome = "fail"\nreason = "r"\n', False)):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self.load(text, is_agent=is_agent)
+
+    def test_an_agent_baseline_refuses_a_pass_count_that_would_check_nothing(self):
+        for text in (
+            self.ENTRY,
+            'passed = "7"\n',
+            'passed = 7.0\n',
+            'passed = true\n',
+            'passed = 0\n',
+            'passed = -1\n',
+        ):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self.load(text, is_agent=True)
+
+    def test_a_forwarding_baseline_must_not_set_passed(self):
         with self.assertRaises(ValueError):
-            self.load('minimum_passed = 7\n')
+            self.load('passed = 7\n')
 
 
 class Main(unittest.TestCase):
@@ -202,7 +219,7 @@ class Main(unittest.TestCase):
     def setUp(self):
         self.work = Path(self.enterContext(tempfile.TemporaryDirectory()))
         (self.work / 'expected').mkdir()
-        self.baseline('direct', 'minimum_passed = 1\n')
+        self.baseline('direct', 'passed = 1\n')
 
     def baseline(self, target: str, text: str) -> None:
         (self.work / 'expected' / f'{target}.toml').write_text(text)
@@ -224,6 +241,13 @@ class Main(unittest.TestCase):
         finally:
             sys.argv = original
         return code, output.getvalue()
+
+    def proxy(self, passed: int, *cases: str) -> tuple[int, str]:
+        self.baseline('direct', 'passed = 2\n')
+        self.suite('direct', testcase('test_etag'), testcase('test_get'))
+        self.suite('a2a-proxy', *cases)
+        self.baseline('a2a-proxy', f'passed = {passed}\n' + self.LISTED)
+        return self.main('direct,a2a-proxy', '--agents', 'a2a-proxy')
 
     def access_point(self, outcome: str, baseline: str, *extra: str) -> tuple[int, str]:
         self.suite('direct', testcase('test_etag'))
@@ -263,21 +287,44 @@ class Main(unittest.TestCase):
         self.assertFalse(report.exists())
 
     def test_an_agent_target_passes_on_its_listed_failures_whatever_direct_does(self):
-        self.suite('direct', testcase('test_etag'), testcase('test_get'))
-        self.suite('a2a-proxy', testcase('test_etag', 'fail'), testcase('test_get'))
-        self.baseline('a2a-proxy', 'minimum_passed = 1\n' + self.LISTED)
-        code, output = self.main('direct,a2a-proxy', '--agents', 'a2a-proxy')
+        code, output = self.proxy(1, testcase('test_etag', 'fail'), testcase('test_get'))
         self.assertEqual(code, 0)
         self.assertIn('PASS  a2a-proxy: 1 passed, 1 failed, 0 skipped, 0 xfail; 1 expected failure(s)', output)
 
-    def test_an_agent_target_fails_when_fewer_tests_pass_than_its_baseline_says(self):
-        self.suite('direct', testcase('test_etag'), testcase('test_get'))
-        self.suite('a2a-proxy', testcase('test_etag', 'fail'), testcase('test_get'))
-        self.baseline('a2a-proxy', 'minimum_passed = 2\n' + self.LISTED)
-        code, output = self.main('direct,a2a-proxy', '--agents', 'a2a-proxy')
+    def test_an_agent_target_fails_when_fewer_tests_pass_than_its_baseline_records(self):
+        code, output = self.proxy(2, testcase('test_etag', 'fail'), testcase('test_get'))
         self.assertEqual(code, 1)
         self.assertIn('FAIL  a2a-proxy', output)
-        self.assertIn("1 tests passed, fewer than the baseline's minimum_passed 2", output)
+        self.assertIn('1 tests passed where the baseline records passed = 2', output)
+
+    def test_an_agent_target_fails_when_a_passing_test_is_skipped(self):
+        skipped = '<testcase classname="tests.compatibility.card" name="test_get"><skipped message="timed out"/></testcase>'
+        code, output = self.proxy(1, testcase('test_etag', 'fail'), skipped)
+        self.assertEqual(code, 1)
+        self.assertIn('0 tests passed where the baseline records passed = 1', output)
+
+    def test_an_agent_target_fails_when_more_tests_pass_than_its_baseline_records(self):
+        code, output = self.proxy(1, testcase('test_etag', 'fail'), testcase('test_get'), testcase('test_list'))
+        self.assertEqual(code, 1)
+        self.assertIn('2 tests passed where the baseline records passed = 1', output)
+
+    def test_report_mode_lists_a_pass_count_mismatch_and_exits_zero(self):
+        report = self.work / 'gaps.md'
+        self.baseline('direct', 'passed = 2\n')
+        self.suite('direct', testcase('test_etag'), testcase('test_get'))
+        self.suite('a2a-proxy', testcase('test_etag', 'fail'), testcase('test_get'))
+        self.baseline('a2a-proxy', 'passed = 2\n' + self.LISTED)
+        code, output = self.main('direct,a2a-proxy', '--agents', 'a2a-proxy', '--report', str(report))
+        self.assertEqual(code, 0)
+        self.assertIn('FAIL  a2a-proxy', output)
+        self.assertIn('1 tests passed where the baseline records passed = 2', report.read_text())
+
+    def test_an_unreadable_direct_run_fails_without_scoring_the_other_targets(self):
+        self.suite('access-point', testcase('test_etag'))
+        code, output = self.main('direct,access-point')
+        self.assertEqual(code, 1)
+        self.assertIn('FAIL  direct: no suite results', output)
+        self.assertNotIn('access-point:', output)
 
     def test_the_direct_target_is_required(self):
         code, output = self.main('access-point')

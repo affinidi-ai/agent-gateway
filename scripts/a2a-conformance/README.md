@@ -35,14 +35,15 @@ installed outside that directory.
 | --- | --- | --- |
 | `A2A_CONFORMANCE_PORT_BASE` | `18860` | First local port. The 1.0 suite uses base+0, +1, +2, +10 and +11; the 0.3 suite base+20, +22, +30 and +31 |
 | `A2A_CONFORMANCE_TCK_REPO` | GitHub `a2aproject/a2a-tck` | Git URL or mirror holding the pinned commits |
-| `A2A_CONFORMANCE_PYTHON` | `python3.15`, then `python3` | Interpreter for the 1.0 suite |
-| `A2A_CONFORMANCE_LEGACY_PYTHON` | `python3.14`, `python3.13`, then `python3` | Interpreter for the 0.3 suite |
+| `A2A_CONFORMANCE_PYTHON` | `python3.15`, then `python3` | Interpreter for the 1.0 suite. When set, it is the only one tried; a missing or unsuitable one stops the run in preflight. A cached virtual environment built with another interpreter is rebuilt |
+| `A2A_CONFORMANCE_LEGACY_PYTHON` | `python3.14`, `python3.13`, then `python3` | Interpreter for the 0.3 suite, with the same rule |
 
 Exit codes: `0` pass, `1` failure, `2` invalid options or precondition not met
 (another run in progress, missing tool or Python, `RUSTFLAGS` or
 `CARGO_ENCODED_RUSTFLAGS` set when Cargo runs, a binary path that is not an
 executable file, port in use), `3` the pinned suite or its packages could not
-be fetched, `130` interrupted (SIGINT), `143` terminated (SIGTERM).
+be fetched, `129` hung up (SIGHUP, such as a closed terminal), `130` interrupted
+(SIGINT), `143` terminated (SIGTERM).
 
 ## What is pinned
 
@@ -76,9 +77,11 @@ Both run on the JSON-RPC binding only, the one binding the gateway serves.
    against it. This is the reference for the forwarding targets.
 5. **Gateway targets.** Builds the gateway, writes a fresh env with `env.py`,
    starts the gateway, waits for its health endpoint, and runs the suite once
-   per target. The surfaces accept
-   A2A `1.0` for the 1.0 suite and `0.3` and `1.0`, the default of a surface,
-   for the 0.3 suite.
+   per target. The surfaces accept A2A `1.0` for the 1.0 suite, and `0.3` and
+   `1.0` for the 0.3 suite. That is the default of a forwarding surface. For
+   the A2A proxy surface it is a stored setting the gateway keeps for an older
+   surface: the admin API creates a new A2A proxy surface with `1.0` only,
+   which the 0.3 suite could not call at all.
 6. **Score.** `check_results.py` compares every target with the direct run and
    the baselines.
 
@@ -116,8 +119,10 @@ The suite's test agent fails some checks with no gateway in front of it, so a
 forwarding target is not scored on what fails. It is scored on what changes:
 
 - **Agents** (`direct`, `a2a-proxy`): every failure must be listed in the
-  target's baseline, and at least its `minimum_passed` tests must pass, so
-  tests that stop running or start being skipped cannot go unnoticed.
+  target's baseline, and the number of passing tests must equal its `passed`,
+  so a test that stops running or starts being skipped fails the run. The
+  count includes the two probes below. A pass lost and a pass gained in the
+  same run cancel out and are not seen.
 - **Forwarding targets** (`access-point`, `access-point-full`, `transit`):
   every test whose outcome differs from the direct run must be listed, with
   that outcome. A test that fails in both is the agent's and does not count.
@@ -140,8 +145,8 @@ applies, so a baseline cannot keep an entry the gateway has outgrown.
 `expected/<version>/<target>.toml`. Each entry names one `test` or several
 `tests`, the `outcome`, and the `reason`: the cause, not a restatement of the
 failure. An outcome that depends on timing is a list. An agent's baseline lists
-failures only and sets `minimum_passed`, the number of tests that pass today;
-raise it when more tests pass.
+failures only and sets `passed`, the number of tests that pass; the run fails
+until it is updated when that number changes in either direction.
 
 ```toml
 [[expected]]
@@ -159,7 +164,7 @@ removes a difference must remove its entry in the same change.
 
 ## Where the harness adapts the suite
 
-The suite and its test agents run unchanged. Four small adapters sit around
+The suite and its test agents run unchanged. Five small adapters sit around
 them, each for one reason:
 
 - `agent.py` and `agent_legacy.py` start the test agents on `127.0.0.1` only.
@@ -176,6 +181,9 @@ them, each for one reason:
 - `plugins/tck_plugin_legacy.py` makes the 0.3 suite look for the agent card under the
   URL it was given. That suite otherwise asks the root of the host, where a
   gateway surface, served under a path, has no card.
+- `plugins/tck_loopback.py` narrows the webhook receiver both suites start
+  for their push notification tests to `127.0.0.1`. The suites bind it on
+  every interface, and start it even for a test that then skips itself.
 
 `directline.py` stands in for the Direct Line service behind the A2A proxy. It
 answers every text with one text reply, so the suite's checks that need a

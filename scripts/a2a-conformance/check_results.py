@@ -7,8 +7,10 @@ target that is an agent in its own right is scored on its own results:
 
   agents (direct, and those named by --agents)
                  every failure must be listed in the target's baseline, and
-                 at least the baseline's `minimum_passed` tests must pass, so
-                 tests that stop running cannot go unnoticed
+                 the number of passing tests must equal the baseline's
+                 `passed`, so a test that stops running or starts being
+                 skipped changes the count and fails the run. A pass lost and
+                 a pass gained in the same run cancel out and are not seen.
   other targets  every test whose outcome differs from the direct run must be
                  listed, with that outcome, in the target's baseline
 
@@ -56,7 +58,7 @@ class Expected:
 @dataclass(frozen=True)
 class Baseline:
     expected: dict[str, Expected] = field(default_factory=dict)
-    minimum_passed: int = 0
+    passed: int | None = None
 
 
 @dataclass(frozen=True)
@@ -116,18 +118,23 @@ def load_baseline(path: Path, is_agent: bool) -> Baseline:
     """Read a baseline: [[expected]] entries naming one `test` or several `tests` that share a reason.
 
     `outcome` is one outcome, or a list when timing decides between several. An
-    agent's baseline lists failures only and must set `minimum_passed`; a
-    forwarding target's baseline may be absent, which means no differences.
+    agent's baseline lists failures only and must set `passed`, the number of
+    tests that pass; a forwarding target's baseline may be absent, which means
+    no differences.
     """
     if not path.exists():
         if is_agent:
-            raise FileNotFoundError(f'{path} is missing: an agent target needs a baseline with minimum_passed')
+            raise FileNotFoundError(f'{path} is missing: an agent target needs a baseline that sets passed')
         return Baseline()
     document = tomllib.loads(path.read_text())
-    minimum_passed = document.get('minimum_passed')
-    if is_agent != isinstance(minimum_passed, int) or (not is_agent and minimum_passed is not None):
-        needs = 'needs an integer minimum_passed' if is_agent else 'must not set minimum_passed'
-        raise ValueError(f'{path}: the baseline of {"an agent" if is_agent else "a forwarding"} target {needs}')
+    unknown = sorted(document.keys() - {'expected', 'passed'})
+    if unknown:
+        raise ValueError(f'{path}: unknown key(s) {", ".join(unknown)}; a baseline holds expected and, for an agent, passed')
+    passed = document.get('passed')
+    if is_agent and not (type(passed) is int and passed > 0):
+        raise ValueError(f'{path}: the baseline of an agent target needs passed, a whole number above 0')
+    if not is_agent and passed is not None:
+        raise ValueError(f'{path}: the baseline of a forwarding target must not set passed')
     allowed = ('fail',) if is_agent else OUTCOMES
     expected: dict[str, Expected] = {}
     for entry in document.get('expected', []):
@@ -142,7 +149,7 @@ def load_baseline(path: Path, is_agent: bool) -> Baseline:
             if test in expected:
                 raise ValueError(f'{path}: {test} is listed twice')
             expected[test] = Expected(outcomes, reason)
-    return Baseline(expected, minimum_passed or 0)
+    return Baseline(expected, passed)
 
 
 def differences(is_agent: bool, results: dict[str, Result], direct: dict[str, Result]) -> dict[str, tuple[str, Result]]:
@@ -242,8 +249,8 @@ def main() -> int:
         listed, unlisted, stale = score(is_agent, results, direct, baseline.expected)
         totals = tally(results)
         notes = [f'stale baseline entry: {entry}' for entry in stale]
-        if totals['pass'] < baseline.minimum_passed:
-            notes.append(f'{totals["pass"]} tests passed, fewer than the baseline\'s minimum_passed {baseline.minimum_passed}')
+        if baseline.passed is not None and totals['pass'] != baseline.passed:
+            notes.append(f'{totals["pass"]} tests passed where the baseline records passed = {baseline.passed}')
         noun = 'failure(s)' if is_agent else 'difference(s) from direct'
         summary = (f'{totals["pass"]} passed, {totals["fail"]} failed, {totals["skip"]} skipped, {totals["xfail"]} xfail; '
                    f'{len(listed)} expected {noun}')

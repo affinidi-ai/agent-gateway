@@ -3,9 +3,10 @@
 # that fails the same test is not scored for it. The run fails on a failure
 # not listed here and on a listed test that no longer fails.
 #
-# minimum_passed is how many tests pass today. Fewer means tests stopped running
-# or started being skipped, which a list of failures alone would not show.
-minimum_passed = 87
+# passed is how many tests pass. A different count fails the run: fewer means
+# tests stopped running or started being skipped, which a list of failures
+# alone would not show; more means this number is out of date.
+passed = 87
 
 [[expected]]
 test = "agent_card.test_agent_card_caching.TestAgentCardCacheControl::test_cache_control_present"
