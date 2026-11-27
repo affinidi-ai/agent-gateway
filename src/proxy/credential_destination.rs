@@ -54,7 +54,7 @@ pub(crate) async fn verdict(
         Destination::ProxyCall {
             proxy,
             call: ProxyCall::Legacy(request),
-        } => return crate::mcp_proxies::handlers::legacy_tool_call_destination(proxy, request),
+        } => return crate::mcp_proxies::handlers::legacy_tool_call_destination(proxy, request).await,
     };
     if outside {
         ToolCallDestination::OutsideBase

@@ -9250,7 +9250,8 @@ async fn handle_mcp_proxy_forward(
     // The proxy has to be able to serve the request before it is charged: its
     // spec and base URL, the method and the tool must be known.
     let prepared =
-        crate::mcp_proxies::handlers::prepare_mcp_request(&proxy, mcp_request.clone(), target_auth_header, config_id);
+        crate::mcp_proxies::handlers::prepare_mcp_request(&proxy, mcp_request.clone(), target_auth_header, config_id)
+            .await;
 
     // Every refusal that does not depend on payment has been made: the rate
     // limit, the proxy itself, its target authentication and an open circuit

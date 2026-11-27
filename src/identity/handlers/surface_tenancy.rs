@@ -5192,7 +5192,10 @@ mod tests {
             .unwrap();
         for header in ["X-HTTP-Method-Override", "x-http-method", "X-Method-OVERRIDE"] {
             drive.openapi_spec = spec(header, "header");
-            assert!(crate::mcp_proxies::handlers::spec_sends_a_method_override(&drive), "{header}: the spec loads");
+            assert!(
+                crate::mcp_proxies::handlers::spec_sends_a_method_override(&drive).await,
+                "{header}: the spec loads"
+            );
             proxies
                 .update(&drive)
                 .await

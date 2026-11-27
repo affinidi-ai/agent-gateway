@@ -6904,7 +6904,7 @@ async fn step_forward_request_mcp_proxy(
         .as_ref()
         .map(|grant| grant.header.clone());
     let progress = crate::mcp_proxies::handlers::TransitCallProgress::default();
-    let answer = match crate::mcp_proxies::handlers::prepare_mcp_request(&proxy, request, header, &config_id) {
+    let answer = match crate::mcp_proxies::handlers::prepare_mcp_request(&proxy, request, header, &config_id).await {
         Ok(prepared) => {
             if grant.is_some() && prepared.sends_a_method_override() {
                 return Err(refuse_external_grant(ctx, "mcp_proxy_spec_overrides_the_method"));
