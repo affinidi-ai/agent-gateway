@@ -130,12 +130,49 @@ export interface PolicyChangeData {
   reason?: string | null;
 }
 
+/** How a leg of a surface obtains the credential it sends. */
+export type TargetAuthMethodKind =
+  | 'none'
+  | 'static_secret'
+  | 'credential_provider'
+  | 'credential_lookup';
+
+/** A `target_auth_changed` record: one leg of a surface whose Target authentication changed. */
+export interface TargetAuthChangeData {
+  actor: PolicyChangeActor;
+  /** The variant's alias, or `_base_` for the base surface. */
+  surface_variant?: string | null;
+  variant_id?: string | null;
+  /** `target` or `transit_point`. */
+  leg: string;
+  transit_point_id?: string | null;
+  /** The Transit Point's alias. */
+  transit_point?: string | null;
+  previous_method: TargetAuthMethodKind;
+  method: TargetAuthMethodKind;
+  previous_provider_id?: string | null;
+  provider_id?: string | null;
+  /** The parts a change replaced, by name; absent when the setting was added or removed. */
+  changed?: string[];
+}
+
+/** A `secret_force_deleted` record. Never carries the secret's value. */
+export interface SecretForceDeleteData {
+  actor: PolicyChangeActor;
+  secret_id: string;
+  force?: boolean;
+  /** The records that still used the secret, by kind and id. */
+  referrers?: { kind: string; id: string }[];
+}
+
 export type AuditEventField =
   | string
   | { policy_decision: PolicyDecisionData }
   | { trust_check: TrustCheckData }
   | { trace_terminated: TraceTerminatedData }
   | { request_rejected: RequestRejectedData }
+  | { target_auth_changed: TargetAuthChangeData }
+  | { secret_force_deleted: SecretForceDeleteData }
   | Partial<Record<PolicyChangeEvent, PolicyChangeData>>
   | Record<string, unknown>;
 

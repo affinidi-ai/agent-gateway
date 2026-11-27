@@ -11,13 +11,22 @@ import {
   isTargetAuthPassthrough,
   requestRejected,
   scopeLabel,
+  secretForceDelete,
   slotLabel,
   surfaceIdOf,
+  targetAuthChange,
+  targetAuthMethodLabel,
   targetLabel,
   traceTerminated,
   trustCheck,
 } from './auditHelpers';
-import type { AuditEntry, PolicyChangeActor, PolicyChangeData, PolicyChangeEvent } from './types';
+import type {
+  AuditEntry,
+  PolicyChangeActor,
+  PolicyChangeData,
+  PolicyChangeEvent,
+  TargetAuthChangeData,
+} from './types';
 import { isBaseSurfaceVariant, surfaceVariantPhrase } from '../../utils/surfaceVariant';
 import { formatDateTime } from '../../utils/stringUtils';
 
@@ -98,6 +107,7 @@ export function eventTone(entry: AuditEntry): EventTone {
   const rejected = requestRejected(entry);
   if (rejected) return isTargetAuthPassthrough(rejected) ? 'warn' : 'deny';
   const name = eventTypeName(entry);
+  if (name === 'secret_force_deleted') return 'warn';
   if (name === 'consent_required' || name === 'consent_expired' || name === 'consent_limited')
     return 'warn';
   if (DENY_EVENTS.has(name)) return 'deny';
@@ -237,6 +247,44 @@ function surfaceSlotPhrase(change: PolicyChangeData, slot: string): string {
   return `its ${slot}`;
 }
 
+/** The leg a Target authentication change names, e.g. "the Target of Orders, on variant beta". */
+function targetAuthLeg(change: TargetAuthChangeData, surface?: string): string {
+  const leg =
+    change.leg === 'transit_point'
+      ? `Transit Point ${change.transit_point ?? change.transit_point_id ?? ''}`.trim()
+      : 'the Target';
+  const variantPhrase = isBaseSurfaceVariant(change.surface_variant)
+    ? undefined
+    : surfaceVariantPhrase(change.surface_variant);
+  return `${leg}${surface ? ` of ${surface}` : ''}${variantPhrase ? `, ${variantPhrase}` : ''}`;
+}
+
+function describeTargetAuthChange(
+  change: TargetAuthChangeData,
+  surface: string | undefined,
+  userName?: UserNameResolver
+): EventNarrative {
+  const leg = targetAuthLeg(change, surface);
+  const provider = change.provider_id ? ` (provider ${change.provider_id})` : '';
+  let summary: string;
+  if (change.previous_method === 'none' && change.method !== 'none') {
+    summary = `Target authentication was added to ${leg}: it now uses ${targetAuthMethodLabel(change.method)}${provider}.`;
+  } else if (change.method === 'none' && change.previous_method !== 'none') {
+    summary = `Target authentication was removed from ${leg}: it no longer sends a credential.`;
+  } else if (change.previous_method !== change.method) {
+    summary = `Target authentication of ${leg} changed from ${targetAuthMethodLabel(change.previous_method)} to ${targetAuthMethodLabel(change.method)}${provider}.`;
+  } else {
+    const parts = changedPartsLabel(change.changed);
+    summary = `Target authentication of ${leg} changed${parts ? `: ${parts}` : ''}.`;
+  }
+  return {
+    title: 'Target authentication changed',
+    tone: 'neutral',
+    summary,
+    detail: `By ${actorLabel(change.actor, userName)}.`,
+  };
+}
+
 /**
  * Turns an audit entry into a human-friendly title + two-line description used
  * by the master list. Title colour comes from {@link eventTone}; the summary and
@@ -353,6 +401,23 @@ export function describeEntry(entry: AuditEntry, userName?: UserNameResolver): E
         !tc.ok && tc.error_code
           ? `Failed because ${trustErrorClause(tc.error_code, tc.leg)}.`
           : undefined,
+    };
+  }
+
+  const authChange = targetAuthChange(entry);
+  if (authChange) return describeTargetAuthChange(authChange, surface, userName);
+
+  const forced = secretForceDelete(entry);
+  if (forced) {
+    const count = forced.referrers?.length ?? 0;
+    return {
+      title: 'Secret force-deleted',
+      tone,
+      summary:
+        count > 0
+          ? `Secret ${forced.secret_id} was deleted while ${count} ${count === 1 ? 'record' : 'records'} still used it.`
+          : `Secret ${forced.secret_id} was deleted with force.`,
+      detail: `By ${actorLabel(forced.actor, userName)}.`,
     };
   }
 

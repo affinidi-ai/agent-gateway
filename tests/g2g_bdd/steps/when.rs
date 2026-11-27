@@ -805,7 +805,6 @@ pub async fn mcp_list_tools_accepting_an_event_stream(
 
 /// Two `tools/list` calls, with distinct ids, over one session of the deprecated HTTP+SSE
 /// transport (`GET {route}/sse`, then POSTs to the announced session URL).
-/// Each request is recorded with the SSE `message` event reply it got, if any.
 #[when(
     expr = "the caller asks gateway {int} MCP surface {string} for available tools twice over one Legacy SSE session"
 )]
@@ -814,11 +813,42 @@ pub async fn mcp_list_tools_twice_over_legacy_sse(
     gw_index: usize,
     surface_name: String,
 ) {
+    // Distinct ids, as a real client sends, so the target sees two requests.
+    let bodies = ["legacy-sse-1", "legacy-sse-2"].map(|id| {
+        let mut body = build_mcp_list_tools_body();
+        body["id"] = Value::from(id);
+        body
+    });
+    send_over_one_legacy_sse_session(world, gw_index, &surface_name, bodies.to_vec()).await;
+}
+
+/// A notification, then a `tools/list` call, over one Legacy SSE session. The reply read
+/// after the call is the first `message` event of the session.
+#[when(
+    expr = "the caller sends an MCP notification and then asks gateway {int} MCP surface {string} for available tools over one Legacy SSE session"
+)]
+pub async fn mcp_notification_then_list_tools_over_legacy_sse(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    surface_name: String,
+) {
+    let bodies = vec![build_mcp_initialized_notification_body(), build_mcp_list_tools_body()];
+    send_over_one_legacy_sse_session(world, gw_index, &surface_name, bodies).await;
+}
+
+/// Sends `bodies` in order over one Legacy SSE session and records each with the SSE
+/// `message` event reply it got, if any; a notification gets none.
+async fn send_over_one_legacy_sse_session(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    surface_name: &str,
+    bodies: Vec<Value>,
+) {
     world.start().await;
     world
         .remember_fabric_forward_baseline()
         .await;
-    let (_, surface_id) = world.surface(&surface_name);
+    let (_, surface_id) = world.surface(surface_name);
     let route = world
         .surface_spec(gw_index, &surface_id)
         .route
@@ -827,12 +857,6 @@ pub async fn mcp_list_tools_twice_over_legacy_sse(
         .harness()
         .gw(gw_index)
         .port;
-    // Distinct ids, as a real client sends, so the target sees two requests.
-    let bodies = ["legacy-sse-1", "legacy-sse-2"].map(|id| {
-        let mut body = build_mcp_list_tools_body();
-        body["id"] = Value::from(id);
-        body
-    });
     world.sent_body = bodies.last().cloned();
     let exchange =
         crate::bdd_support::sse_client::legacy_sse_session(&format!("http://127.0.0.1:{port}"), &route, &bodies)
@@ -857,7 +881,12 @@ pub async fn mcp_list_tools_twice_over_legacy_sse(
     let mut replies = exchange.replies.into_iter();
     world.legacy_sse_exchange = bodies
         .into_iter()
-        .map(|request| (request, replies.next()))
+        .map(|request| {
+            let reply = request
+                .get("id")
+                .and_then(|_| replies.next());
+            (request, reply)
+        })
         .collect();
 }
 

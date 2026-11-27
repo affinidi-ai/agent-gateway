@@ -9,8 +9,11 @@ import {
   policyChangeTitle,
   requestRejected,
   scopeLabel,
+  secretForceDelete,
   slotLabel,
   surfaceIdOf,
+  targetAuthChange,
+  targetAuthMethodLabel,
   targetHref,
   targetLabel,
   traceTerminated,
@@ -22,6 +25,8 @@ import type {
   PolicyChangeData,
   PolicyChangeEvent,
   PolicyDecisionData,
+  SecretForceDeleteData,
+  TargetAuthChangeData,
   TrustCheckData,
 } from './types';
 
@@ -86,6 +91,11 @@ export function fieldGroups(
   const change = policyChange(entry);
   if (change)
     return [{ label: 'Identity', items: identity }, ...changeGroups(entry, change, add, userName)];
+
+  const authChange = targetAuthChange(entry);
+  if (authChange) return authChangeGroups(entry, authChange, add, userName);
+  const forced = secretForceDelete(entry);
+  if (forced) return secretDeleteGroups(entry, forced, add, userName);
 
   const routing: FieldItem[] = [];
   if (surfaceName) {
@@ -263,5 +273,94 @@ function changeGroups(
     { label: 'Policy', items: policy },
     { label: 'Where', items: where },
     { label: 'Refusal', items: refusal },
+  ];
+}
+
+const FIELD_LABEL: Record<string, string> = {
+  secret_id: 'secret',
+  provider_id: 'provider',
+};
+
+/** The Change, Where and Authentication groups of a Target authentication change record. */
+function authChangeGroups(
+  entry: AuditEntry,
+  change: TargetAuthChangeData,
+  add: AddField,
+  userName?: UserNameResolver
+): FieldGroup[] {
+  const what: FieldItem[] = [];
+  add(what, 'Action', 'Target authentication changed');
+  add(what, 'Actor', actorLabel(change.actor, userName));
+  add(what, 'Request', fieldStr(entry.request_id), { mono: true });
+
+  const where: FieldItem[] = [];
+  const surfaceId = surfaceIdOf(entry);
+  const surfaceName = fieldStr(entry.channel_name) ?? surfaceId ?? undefined;
+  if (surfaceName) {
+    where.push({
+      term: 'Agent surface',
+      value: surfaceName,
+      href: surfaceId ? `/surfaces/${encodeURIComponent(surfaceId)}` : undefined,
+    });
+  }
+  add(where, 'Variant', surfaceVariantLabel(fieldStr(change.surface_variant)));
+  add(where, 'Leg', change.leg === 'transit_point' ? 'Transit Point' : 'Target');
+  add(where, 'Transit point', fieldStr(change.transit_point), { mono: true });
+
+  const auth: FieldItem[] = [];
+  add(
+    auth,
+    'Method',
+    transition(targetAuthMethodLabel(change.previous_method), targetAuthMethodLabel(change.method))
+  );
+  const providerId = fieldStr(change.provider_id) ?? fieldStr(change.previous_provider_id);
+  const previousProvider = fieldStr(change.previous_provider_id);
+  const nextProvider = fieldStr(change.provider_id);
+  add(
+    auth,
+    'Provider',
+    previousProvider && !nextProvider
+      ? `${previousProvider} → none`
+      : transition(previousProvider, nextProvider),
+    {
+      mono: true,
+      ...(providerId ? { href: `/credential-providers/${encodeURIComponent(providerId)}` } : {}),
+    }
+  );
+  add(
+    auth,
+    'Changed',
+    change.changed?.map(part => FIELD_LABEL[part] ?? part.replace(/_/g, ' ')).join(', ')
+  );
+
+  return [
+    { label: 'Change', items: what },
+    { label: 'Where', items: where },
+    { label: 'Authentication', items: auth },
+  ];
+}
+
+/** The Change and Records still using it groups of a forced secret delete record. */
+function secretDeleteGroups(
+  entry: AuditEntry,
+  forced: SecretForceDeleteData,
+  add: AddField,
+  userName?: UserNameResolver
+): FieldGroup[] {
+  const what: FieldItem[] = [];
+  add(what, 'Action', 'Secret force-deleted');
+  add(what, 'Actor', actorLabel(forced.actor, userName));
+  add(what, 'Secret', fieldStr(forced.secret_id), { mono: true });
+  add(what, 'Request', fieldStr(entry.request_id), { mono: true });
+
+  const referrers: FieldItem[] = (forced.referrers ?? []).map(referrer => ({
+    term: referrer.kind.replace(/_/g, ' '),
+    value: referrer.id,
+    mono: true,
+  }));
+
+  return [
+    { label: 'Change', items: what },
+    { label: 'Records still using it', items: referrers },
   ];
 }

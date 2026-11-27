@@ -1699,6 +1699,20 @@ issuer and the keys, one field decides who a caller is:
 
 See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#which-claim-names-a-jwt-caller).
 
+## Credential provider records
+
+Credential providers live in `_storage/credential_providers/`, not in a configuration file, and
+are managed through `/v1/credential-providers`. Three fields decide how a provider's client
+authenticates at its token endpoint:
+
+| Field | Values | Behaviour |
+| --- | --- | --- |
+| `client_authentication` | `client_secret_basic`, `client_secret_post`, and on `oauth2_jwt_bearer` also `none` | On `oauth2_client_credentials` and on `oauth2_authorization_code` without an `issuer`: absent sends the client ID and secret in the form body, as `client_secret_post` does, and `client_secret_basic` sends them by HTTP Basic, on the grant, the code exchange and every refresh. On `oauth2_jwt_bearer`: absent sends no client identity. Refused on the other types. A record without the field keeps today's behaviour. |
+| `jwt_signing_algorithm` | `RS256`, `PS256`, `ES256` | `oauth2_jwt_bearer` takes `RS256` (default) or `ES256`; `oauth2_client_credentials_jwt_auth` takes `PS256` (default), `RS256` or `ES256`. |
+| `jwt_audience` | An https URL | The `aud` of the signed JWT; absent means the token endpoint. Servers that follow RFC 7523bis want their issuer identifier here. |
+
+See [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#client-secret-authentication).
+
 ## Related
 
 - [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md): what a reload does and does not re-read.

@@ -1,0 +1,35 @@
+branch: feat/mcp-conformance-coverage
+changes:
+  added:
+    - timestamp: '2026-11-19T15:00:00Z'
+      title: Test the gateway as an MCP client with the conformance suite
+      description: >-
+        `make mcp-conformance` gains a `client` target. It runs the eight published client
+        scenarios that need no authorization with the suite's reference client, directly and
+        through a gateway whose Target is the suite's own server, and requires the same suite
+        verdict and checks both ways. It also runs the suite's JWT client-credentials scenario
+        through the gateway only, with the gateway itself signing the client assertion,
+        fetching the token and attaching it, so outbound Target authentication is measured
+        against the suite for the first time.
+    - timestamp: '2026-11-24T22:30:00Z'
+      title: Show unscored conformance failures and add a report-only run
+      description: >-
+        Each suite line of the `make mcp-conformance` summary now counts the checks that
+        passed, the failures the baseline expects and the failures in scenarios the
+        requirement set does not score, which a passing run used to hide. The exit code is
+        unchanged. `make mcp-conformance ARGS="--report"` runs every scenario the suite
+        has against each target, including the authorization scenarios the normal run
+        leaves out, ignores baselines, exits 0 unless the harness itself fails, and lists
+        the open gaps in `target/mcp-conformance/run/gaps.md` with credentials redacted.
+  changed:
+    - timestamp: '2026-11-19T15:00:00Z'
+      title: Move the MCP conformance harness to suite release 0.2.0-alpha.12
+      description: >-
+        The harness now pins `@modelcontextprotocol/conformance@0.2.0-alpha.12` and the
+        reference server at that release's commit. Every existing target still passes with
+        unchanged baselines. The conformance documentation now describes the GitHub CI job
+        that runs the harness instead of a job that no longer exists.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

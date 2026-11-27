@@ -245,8 +245,10 @@ The Target authentication fallback select on the Managed Agent and on a Transit 
 its reject option **Reject request**, with no status; see _Target authentication fallback_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#target-authentication-fallback).
 
-The credential provider editor's **Client authentication** select (JWT Bearer) keeps its
-explanation behind `FieldHelp`; see _Credential provider editor_ in
+The credential provider editor's **Client authentication** select keeps its explanation behind
+`FieldHelp`. JWT Bearer offers Not sent, Client ID only, HTTP Basic and Form body; Client
+Credentials and Authorization Code (without an `issuer`) offer Form body (default) and HTTP Basic;
+see _Credential provider editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 
 The credential provider editor and list warn when a provider's token requests send `resource`
@@ -374,6 +376,10 @@ _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-
 A Transit Point's static-secret target authentication picks its secret from a tenant-aware list
 with a refresh button beside it, and Save is blocked while no secret is picked; see _Surface
 Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+The Managed Agent and Transit Point editors open a stored Target header as the same type, read
+by one rule (`storedHeaderKind`) as the gateway reads it; see _One reading of a stored header_
+under _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 A Trust Check on a Managed Agent → Transit Point arrow belongs to that Transit Point and saves
 to `transit.points[i].trust_check_list`, and each query's **Checks** select picks the destination

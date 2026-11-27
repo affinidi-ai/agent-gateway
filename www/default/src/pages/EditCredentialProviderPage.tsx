@@ -34,6 +34,7 @@ import {
   consentConfirmationRedirectUri,
   missingConsentConfirmationField,
   clientAuthenticationOf,
+  clientAuthenticationsOf,
   consentLimitOf,
   consentLimitSeconds,
   JwtFormFields,
@@ -851,8 +852,9 @@ const EditCredentialProviderPage: React.FC = () => {
                     />
                   )}
 
-                  {form.provider_type === 'oauth2_jwt_bearer' && (
+                  {!form.issuer && clientAuthenticationsOf(form.provider_type).length > 0 && (
                     <ClientAuthenticationSelect
+                      providerType={form.provider_type}
                       value={form.client_authentication}
                       onChange={handleChange}
                     />

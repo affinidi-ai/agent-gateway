@@ -88,7 +88,8 @@ pub struct DelegationToken {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consent_identity: Option<modern_consent::identity::VerifiedConsentIdentity>,
 
-    /// When the user granted consent
+    /// When the user granted consent; for a service token, when the provider issued it. A
+    /// renewal keeps the row's `created_at`, so this, not `created_at`, dates a service token.
     pub consent_granted_at: DateTime<Utc>,
 
     /// When the consent ends, as the person was told when giving it: the

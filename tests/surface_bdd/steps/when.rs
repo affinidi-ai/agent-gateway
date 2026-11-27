@@ -3924,6 +3924,18 @@ async fn caller_asks_mcp_surface_at_path_for_available_tools(
     send_json_request_to_path_and_record(world, &path, body, vec![]).await;
 }
 
+#[when(expr = "the caller asks the MCP surface at path {string} for available tools using protocol version {string}")]
+async fn caller_asks_mcp_surface_at_path_using_protocol_version(
+    world: &mut SurfaceWorld,
+    path: String,
+    protocol_version: String,
+) {
+    let protocol_version = McpVersion::from(protocol_version.as_str());
+    let body = build_modern_mcp_list_tools_body(serde_json::json!("modern-mcp-tools-list"), &protocol_version, true);
+    let headers = modern_mcp_request_headers(&protocol_version, "tools/list");
+    send_json_request_to_path_and_record(world, &path, body, headers).await;
+}
+
 #[when(
     expr = "the caller asks the MCP surface at path {string} for available tools with a valid alternate variant API key"
 )]
@@ -4029,6 +4041,19 @@ async fn mcp_tool_call_with_city_argument_over_legacy_sse(
 ) {
     let body = build_mcp_tool_call_body(&tool_name, serde_json::json!({ "city": city }));
     send_over_legacy_sse_session_and_record(world, vec![body]).await;
+}
+
+#[when(
+    expr = "the caller sends an MCP notification and then invokes the MCP tool {string} for city {string} over Legacy SSE"
+)]
+async fn mcp_notification_then_tool_call_over_legacy_sse(
+    world: &mut SurfaceWorld,
+    tool_name: String,
+    city: String,
+) {
+    let notification = build_mcp_initialized_notification_body();
+    let call = build_mcp_tool_call_body(&tool_name, serde_json::json!({ "city": city }));
+    send_over_legacy_sse_session_and_record(world, vec![notification, call]).await;
 }
 
 #[when(expr = "the caller invokes the MCP tool {string} for city {string} over Streamable HTTP")]

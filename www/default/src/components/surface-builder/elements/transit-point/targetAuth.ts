@@ -10,7 +10,12 @@ import {
   mergedTargetAuth,
   noTargetAuthProblems,
   parseScopes,
+  providerTargetAuthFromApi,
   providerTargetAuthToApi,
+  record,
+  sameHeaderName,
+  storedHeaderKind,
+  storedHeaderValue,
   trimSpaces,
 } from '../_shared/providerTargetAuth';
 import { authenticatesCallers } from './callerAuth';
@@ -81,7 +86,9 @@ function editedTargetAuth(c: TransitPointTargetAuthForm): Record<string, unknown
   let headerFormat: string;
   switch (type) {
     case 'bearer':
-      headerName = 'Authorization';
+      headerName = sameHeaderName(header(c.auth_header_name), 'Authorization')
+        ? header(c.auth_header_name)
+        : 'Authorization';
       headerFormat = format('Bearer {value}');
       break;
     case 'api_key':
@@ -103,22 +110,52 @@ function editedTargetAuth(c: TransitPointTargetAuthForm): Record<string, unknown
   };
 }
 
-/** The panel's auth type for a stored static secret, so opening the panel keeps its header. */
+/**
+ * The panel's auth type for a stored static secret: its `storedHeaderKind`, shown as Custom
+ * Header for Basic, which the panel has no type for.
+ */
 export function staticSecretAuthType(
   headerName: string,
   headerFormat: string
 ): 'bearer' | 'api_key' | 'custom_header' {
-  if (headerFormat.startsWith('Bearer ') && headerName === 'Authorization') {
-    return 'bearer';
-  }
-  if (headerName === 'X-API-Key' || headerName.toLowerCase().includes('api-key')) {
-    return 'api_key';
-  }
-  return 'custom_header';
+  const kind = storedHeaderKind(headerName, headerFormat);
+  return kind === 'bearer' || kind === 'api_key' ? kind : 'custom_header';
 }
 
 /**
- * The Transit Point's wire `target_auth`. A Transit Point whose auth form was never opened
+ * The auth form fields the panel shows for a stored `target_auth`, or null for a method it
+ * cannot show. The panel writes them only with the operator's first edit.
+ */
+export function storedTransitPointAuthForm(targetAuth: unknown): Record<string, unknown> | null {
+  const ta = record(targetAuth);
+  if (!ta) return null;
+  const provider = providerTargetAuthFromApi(ta);
+  if (provider) {
+    return {
+      auth_type: 'credential_provider',
+      auth_provider_id: provider.providerId,
+      auth_header_name: provider.headerName,
+      auth_header_format: provider.headerFormat,
+      auth_fallback: provider.fallback,
+      auth_scopes: (provider.scopes ?? []).join(' '),
+    };
+  }
+  const ss =
+    record(record(ta.method)?.static_secret) ?? (ta.method === 'static_secret' ? ta : null);
+  if (!ss) return null;
+  const headerName = storedHeaderValue(ss.header_name, 'Authorization');
+  const headerFormat = storedHeaderValue(ss.header_format, '{value}');
+  return {
+    auth_type: staticSecretAuthType(headerName, headerFormat),
+    auth_secret: ss.secret_id || '',
+    auth_header_name: headerName,
+    auth_header_format: headerFormat,
+    auth_fallback: ta.fallback || 'reject',
+  };
+}
+
+/**
+ * The Transit Point's wire `target_auth`. A Transit Point whose auth form was never edited
  * sends the stored one unchanged, whatever its method; an edited one is laid over the stored
  * one, so a field the panel does not show survives. `undefined` when none is set.
  */

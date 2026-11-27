@@ -160,8 +160,10 @@ const JwtAssertionSection: React.FC<JwtAssertionSectionProps> = ({
               Audience
             </label>
             <FieldHelp ariaLabel="About Audience" testId="field-help-jwt-audience">
-              The <code>aud</code> claim. Leave empty to use the token endpoint, which is what
-              Google and Entra expect.
+              The <code>aud</code> claim. Leave empty to use the token endpoint, which Google, Entra
+              and Ory Hydra accept. An authorization server that follows RFC 7523bis wants its
+              issuer identifier instead, the <code>issuer</code> of its metadata: enter that here
+              when the server refuses the assertion&apos;s audience.
             </FieldHelp>
           </div>
           <input

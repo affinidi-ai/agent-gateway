@@ -8,7 +8,7 @@ import AuditFilters from './AuditFilters';
 import AuditInfoBanner from './AuditInfoBanner';
 import AuditList from './AuditList';
 import AuditLogSize from './AuditLogSize';
-import { policyChange } from './auditHelpers';
+import { changeActor } from './auditHelpers';
 import { useAuditLog } from './useAuditLog';
 import { useUserNames } from './useUserNames';
 
@@ -17,7 +17,7 @@ const AuditPage: React.FC = () => {
   const [infoOpen, setInfoOpen] = useState(false);
   const { hasPermission } = usePermissions();
   const userName = useUserNames(
-    hasPermission('users.view') && audit.filteredEntries.some(entry => policyChange(entry) != null)
+    hasPermission('users.view') && audit.filteredEntries.some(entry => changeActor(entry) != null)
   );
 
   // Compute decision counts from entries

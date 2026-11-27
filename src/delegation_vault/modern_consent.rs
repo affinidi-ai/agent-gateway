@@ -624,6 +624,7 @@ pub async fn exchange_code(
         .await
         .map_err(|_| ContinuationError::Unavailable)?,
     );
+    let grant_client = super::oauth::GrantClient::with_secret(provider, client_id.clone(), client_secret);
     let verifier = ticket
         .code_verifier
         .as_deref()
@@ -633,18 +634,18 @@ pub async fn exchange_code(
             .pinned_client(endpoint)
             .await
             .map_err(|_| ContinuationError::Unavailable)?;
-        let mut response = client
+        let mut form =
+            vec![("grant_type", "authorization_code"), ("code", code), ("redirect_uri", ticket.callback_url.as_str())];
+        let authorization = grant_client.apply(&mut form);
+        form.extend([("code_verifier", verifier), ("resource", resource)]);
+        let mut request = client
             .post(url)
             .header("accept", "application/json")
-            .form(&[
-                ("grant_type", "authorization_code"),
-                ("code", code),
-                ("redirect_uri", ticket.callback_url.as_str()),
-                ("client_id", client_id.as_str()),
-                ("client_secret", client_secret.as_str()),
-                ("code_verifier", verifier),
-                ("resource", resource),
-            ])
+            .form(&form);
+        if let Some(authorization) = authorization {
+            request = super::oauth::with_sensitive_authorization(request, authorization);
+        }
+        let mut response = request
             .send()
             .await
             .map_err(|_| ContinuationError::Unavailable)?;
@@ -1294,6 +1295,148 @@ mod tests {
             Err(ContinuationError::Unavailable)
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exchange_code_sends_the_client_secret_by_http_basic_only_when_the_provider_says_so() {
+        use base64::Engine as _;
+        use std::sync::{Arc, Mutex};
+
+        let expected_basic =
+            format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("provider-client:client%2Bsecret"));
+        let seen = Arc::new(Mutex::new(Vec::<(Option<String>, Vec<String>)>::new()));
+        let recorder = seen.clone();
+        let accepted = expected_basic.clone();
+        let app = axum::Router::new().fallback(axum::routing::post(
+            move |headers: axum::http::HeaderMap,
+                  axum::Form(form): axum::Form<std::collections::HashMap<String, String>>| {
+                let recorder = recorder.clone();
+                let accepted = accepted.clone();
+                async move {
+                    let authorization = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    let basic_only = authorization.as_deref() == Some(accepted.as_str())
+                        && !form.contains_key("client_id")
+                        && !form.contains_key("client_secret");
+                    let mut fields: Vec<String> = form.into_keys().collect();
+                    fields.sort_unstable();
+                    recorder
+                        .lock()
+                        .unwrap()
+                        .push((authorization, fields));
+                    if basic_only {
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::Json(json!({"access_token": "provider-access", "token_type": "Bearer",
+                                              "expires_in": 60, "id_token": "provider-id-token"})),
+                        )
+                    } else {
+                        (axum::http::StatusCode::UNAUTHORIZED, axum::Json(json!({"error": "invalid_client"})))
+                    }
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let secrets: Arc<dyn crate::secrets::SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new(
+                directory
+                    .path()
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        for (secret_id, value) in
+            [("provider-client-id", "provider-client"), ("provider-client-secret", "client+secret")]
+        {
+            secrets
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: value.into(),
+                    secret_type: "General".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let provider = |client_authentication: Option<&str>| -> CredentialProvider {
+            serde_json::from_value(json!({
+                "id": "provider", "name": "Provider", "provider_id": "provider", "token_endpoint": token_endpoint,
+                "client_id_secret_ref": "provider-client-id", "client_secret_secret_ref": "provider-client-secret",
+                "client_authentication": client_authentication,
+                "resource": "https://provider.example/api",
+                "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let ticket: ConsentTicket = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(), "continuation_id": uuid::Uuid::new_v4(), "issued_at": 10, "expires_at": 100,
+            "provider_digest": ([3; 32]), "surface_digest": ([4; 32]), "identity_strategy_digest": ([5; 32]),
+            "callback_url": "https://gateway.example/mcp-consent/callback/provider", "code_verifier": "v".repeat(43),
+            "binding": {"deployment": "deployment", "principal": "principal", "agent_did": "did:web:agent", "user_identity_hash": "user",
+                "authorization_digest": ([1; 32]), "tenant_id": null, "surface_id": "surface", "variant_id": null, "route": {"kind": "access_point"},
+                "resource": "https://gateway.example/mcp", "provider_id": "provider", "scopes": ["read"], "method": "tools/call", "arguments_digest": ([2; 32])}
+        }))
+        .unwrap();
+        let egress = super::super::oauth::TokenEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: Some(token_endpoint.clone()),
+            policy: Default::default(),
+        };
+
+        let exchanged = exchange_code(&provider(Some("client_secret_basic")), &ticket, "code", &secrets, &egress)
+            .await
+            .unwrap();
+        assert_eq!(exchanged.token.access_token, "provider-access");
+        assert_eq!(exchanged.client_id, "provider-client");
+        assert!(matches!(
+            exchange_code(&provider(None), &ticket, "code", &secrets, &egress).await,
+            Err(ContinuationError::Unavailable)
+        ));
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            [
+                (
+                    Some(expected_basic),
+                    vec![
+                        "code".into(),
+                        "code_verifier".into(),
+                        "grant_type".into(),
+                        "redirect_uri".into(),
+                        "resource".into()
+                    ]
+                ),
+                (
+                    None,
+                    vec![
+                        "client_id".into(),
+                        "client_secret".into(),
+                        "code".into(),
+                        "code_verifier".into(),
+                        "grant_type".into(),
+                        "redirect_uri".into(),
+                        "resource".into()
+                    ]
+                ),
+            ]
+        );
         tasks.shutdown().await;
     }
 

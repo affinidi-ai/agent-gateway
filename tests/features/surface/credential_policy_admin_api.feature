@@ -6,7 +6,8 @@ Feature: Credential rules when saving through the admin API
   endpoint. While the gateway only warns on plain http token endpoints, an update cannot give
   a client secret to a provider that keeps such an endpoint and holds none, unless the
   gateway lists that endpoint as insecure on purpose, but can point one that holds a client
-  secret at another. A surface that already stores an appliance-wide
+  secret at another. A credential provider changed to an API key provider keeps no token
+  endpoint and no client references. A surface that already stores an appliance-wide
   secret keeps it while tenant credential isolation only warns, and is refused once the
   gateway enforces it. A surface whose stored Target credential, on the Target or a Transit
   Point, breaks the https or caller rule saves again unchanged and the save answers with a
@@ -60,6 +61,16 @@ Feature: Credential rules when saving through the admin API
     Then the admin API response status is 400
     And the admin API error response mentions "token_endpoint must be an https URL"
     And the stored credential provider has no client secret
+
+  Scenario: An authorization code provider with an http token endpoint keeps no client once it is an API key provider
+    Given an A2A surface targeting managed agent "bravo"
+    And the appliance stores an authorization code provider that no surface uses
+    And the credential provider has a plain http token endpoint
+    And the gateway only warns on the credential rule "token_endpoint_https"
+    And the appliance holds the secret "provider-api-key"
+    When the operator changes the credential provider to an API key provider using the secret "provider-api-key"
+    Then the admin API response status is 200
+    And the stored credential provider has no token endpoint and no client references
 
   Scenario: A stored credential provider with a listed http token endpoint and no client secret is given one
     Given an A2A surface targeting managed agent "bravo"
