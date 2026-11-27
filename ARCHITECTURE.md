@@ -166,6 +166,7 @@ logic.
 | Surface OPA | The per-surface policy gate | [`src/policies/surface_manager.rs`](src/policies/surface_manager.rs) |
 | Policy input capture | Sends each request and response policy evaluation's masked input and decision to dashboard connections listening to the surface | [`src/policies/input_capture.rs`](src/policies/input_capture.rs), [`POLICY.md`](docs/POLICY.md#policy-input-capture) |
 | MCP tool gating | The allow/deny firewall over tool names | [`src/policies/mcp_tool_gating.rs`](src/policies/mcp_tool_gating.rs) |
+| Presentation claim | Claiming the proofs of the request's identity presentations once, just before the request is charged, free requests included; a presentation used before gets `422`, a holder over its limit `429`, a full or unavailable record `503`; the claim is released when nothing was charged or sent ([`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#identity-presentation-receiver-and-single-use)) | [`src/identity/ssi/vp_replay.rs`](src/identity/ssi/vp_replay.rs), [`src/proxy/handler.rs`](src/proxy/handler.rs) |
 | Delegated payment | Deciding whether an `agent_pay` request is chargeable and asking agent-pay to take the payment, last, just before the request is forwarded; receipts, audit, metrics and the payments ledger. Manifest discovery in [`src/gateways/payment_manifest.rs`](src/gateways/payment_manifest.rs) and the held-payment status query in [`src/gateways/payment_case.rs`](src/gateways/payment_case.rs) | [`src/proxy/handler/agent_pay_gate.rs`](src/proxy/handler/agent_pay_gate.rs), [`src/x402/delegate.rs`](src/x402/delegate.rs) |
 | Headers | Trace ID, `did:webvh` identity headers (`x-did-identity`, `x-did-signed-identity`), caller-info headers (`x-caller-did`, `x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`), and, after target authentication, the caller key of a surface with `caller_key` for a caller whose JWT was verified on the request; the caller's own copies of these headers are dropped | [`src/proxy/handler.rs`](src/proxy/handler.rs), [`src/proxy/caller_identity.rs`](src/proxy/caller_identity.rs), [`src/proxy/caller_key.rs`](src/proxy/caller_key.rs) |
 | Transit token | The token a managed agent echoes back on its Transit Point calls. Fabric receive issues one too, for an HTTP(S) Target | [`src/proxy/transit_token.rs`](src/proxy/transit_token.rs) |
@@ -238,7 +239,7 @@ policies → extension inspection → caller identity → custom metadata → Tr
 leg) → Access Point OPA → appliance-wide surface policy → surface OPA → MCP tool gating
 (`tools/call`) → consent preparation (modern MCP) → identity and caller-info headers → transit
 token generation → MCP custom metadata → target authentication → credential delegation and
-consent → deferred VP injection → Target circuit breaker check → delegated `agent_pay` payment (an
+consent → deferred VP injection → Target circuit breaker check → presentation claim → delegated `agent_pay` payment (an
 A2A proxy or MCP proxy Target is charged here too, once the proxy is found and its own checks have
 passed) → mirroring → forward → resolve protected identity → response processing, including the
 `tools/list` filter → metrics.
@@ -259,7 +260,8 @@ agent's records in the background on every request except a discovery read, neve
 managed-agent elements ask about the managed agent calling out, see
 [`docs/POLICY.md`](docs/POLICY.md#self-recognition-check)) → gateway OPA →
 surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection →
-forward (a `proxy://` Transit Point is answered by its MCP Proxy, whose backend gets only a
+forward (the identity presentation sent names the destination's origin as its receiver, or the
+peer's Gateway DID for a `fabric://` Transit Point; a `proxy://` Transit Point is answered by its MCP Proxy, whose backend gets only a
 `consent_mode: external` grant) → response and agent-card rewrite → metrics. A discovery read (a `GET` or `HEAD` of a discovery document on the Transit Point) runs
 the same stages, transit token validation included, except identity resolution and the self
 recognition check: it has no body to resolve an identity from, so it reaches Trust Check and
@@ -340,7 +342,10 @@ gateway issued, naming the peer, the hop count and any caller the receiving surf
 and opening the surface's Transit Points as an Access Point's token does (see
 [`docs/FABRIC.md`](docs/FABRIC.md#chains-across-gateways)). Each gateway keeps its own trust
 boundary: an identity presentation is attributed to the caller only when its issuer is
-one of that connection's issuers.
+one of that connection's issuers. A presentation must also name the receiving Connection Point DID
+in its `domain`, and is claimed once, just before the request is charged; a message admitted but
+never answered releases its claim, so its redelivery is accepted
+([`docs/FABRIC.md`](docs/FABRIC.md#peer-issuer-dids)).
 
 See [`docs/FABRIC.md`](docs/FABRIC.md) for the attestation format, the connection-issuer
 set, the receive-path attribution rule, and envelope replay protection.
@@ -357,6 +362,7 @@ Breaking one of these is a correctness bug, not a style question.
 | DNS is resolved once per forward, and the request is pinned to that address with redirects disabled. | A host could rebind to an internal or metadata address between vetting and connect. |
 | DashMap is authoritative at runtime; disk is written immediately. | Reads and writes would disagree after a reload. |
 | Identity attribution fails closed. A presentation that does not verify never becomes the caller identity. | An unverified DID would reach policy as if it were proven. |
+| An agent presentation is accepted only when its proof `domain` names this gateway, built from configuration and never from the request's `Host`, and only once: the claim is made before the request is charged or forwarded, and fails closed when the record is full or unavailable. Every presentation the gateway signs, except the agent card's, names its receiver ([`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#identity-presentation-receiver-and-single-use)). | A receiver would accept a presentation meant for another, or one it already accepted. |
 | Every event of a forwarded A2A event stream gets the response checks a non-streaming reply gets before it is sent, and one that fails them ends the stream. | Streaming would bypass the response policy and the agent identity credential. |
 | A caller whose source authentication failed is never forwarded with the surface's stored target credential, or the A2A proxy's Direct Line secret, on the inbound and Fabric forwarding paths (direct, `proxy://` MCP, `a2a-proxy://`, Fabric send, Fabric receive). The gateway's own agent card fetch is not a forward: on Fabric receive a `GET` of the card path is answered by a new bodiless `GET` the gateway builds, which carries the target credential and none of the caller's headers, body or credentials. | An unauthenticated caller would reach the Target with the operator's credential. |
 | A Transit Point authenticates its caller with a transit token, a Resource Server token, or its `source_auth`, before anything is forwarded or any credential resolved, unless it is marked `allow_unauthenticated_callers`; one whose caller authentication cannot be enforced refuses every request. Discovery reads (`GET`/`HEAD` of discovery documents) on a Transit Point configured with `require_transit_token: true` must carry a valid transit token and undergo the same trust context collection, Trust Check evaluation, and all three levels of OPA policy evaluation as other requests. A Transit Point with `require_transit_token: false` allows discovery reads without a token, but still checks one the agent sends: a valid one names the caller to policy, an invalid one is ignored. | Anyone who reaches a Transit Point would call its target as this gateway, with its target credentials, and discovery reads would leak the target's metadata to unauthenticated callers. |

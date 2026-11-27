@@ -378,7 +378,11 @@ output modes; `compatibility` is not a security bypass.
 
 Presented MCP binding and credential VPs are verified once at admission, before
 forwarding, using the existing signature, credential lifetime, holder/subject,
-and issuer checks. The extraction audit is emitted at that admission boundary,
+and issuer checks. A VP's proof `domain` must also name this gateway: an origin of
+the Access Point's inbound `external_urls`, or the receiving Connection Point DID on
+Fabric receive. Each VP is claimed once, before payment and forwarding, and one
+already used is refused with `422` (see
+[Identity presentation receiver and single use](SOURCE_AUTH.md#identity-presentation-receiver-and-single-use)). The extraction audit is emitted at that admission boundary,
 not again when a later stage consumes the verified context. An outer `did` must agree with the verified holder. Missing
 or invalid proof is rejected with the existing HTTP `422` identity-problem
 response, never forwarded as gateway-issued identity. On Fabric receive, the
@@ -386,7 +390,8 @@ issuer must be one of the sending connection's issuers: the paired gateway's
 attested issuer DID or an issuer DID the operator trusts for that connection
 (see "Peer issuer DIDs" in `AGENTS.md`); a caller-supplied HTTP header is not a
 substitute.
-The verified context is reused so a challenge is not consumed twice.
+The verified context is reused so a challenge is not consumed twice, and a request that verifies
+the same VP twice makes one claim.
 
 Extracting declaration data for policy is not cryptographic verification.
 Verified identity provenance remains separate. Configured raw identity payloads

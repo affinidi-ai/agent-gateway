@@ -126,7 +126,9 @@ holds and a node stepping down to Standby releases (see
 [Single-use store](CONFIGURATION_REFERENCE.md#single-use-store)). Instances that each have their
 own `_storage` and serve at the same time need `single_use_store` set to the `dynamodb` backend,
 or a replayed ID-JAG, Fabric envelope or voided payment receipt is accepted by the node that has
-not seen it. The file server must grant each lock to one host at a time:
+not seen it. Agent presentation records are kept in each node's memory under either backend: a
+restart forgets them, a Standby node that becomes Active does not have the previous Active node's,
+and nothing is written to DynamoDB. More than one Active node is not covered. The file server must grant each lock to one host at a time:
 
 | Volume | Locks hold across hosts |
 | --- | --- |

@@ -30,6 +30,16 @@ changes:
         The gateway refuses an agent Verifiable Presentation whose proof expires more than five
         minutes and 120 seconds from now, or whose proof was created more than 120 seconds ahead
         of the gateway's clock. A proof with no expiry expires five minutes after it was created.
+        A trust agent whose clock runs more than 120 seconds fast has its presentations refused.
+    - timestamp: '2026-11-27T15:30:00Z'
+      title: Check that an agent presentation names this gateway as its receiver
+      description: >-
+        The gateway accepts an agent Verifiable Presentation only when its proof's `domain` names
+        a receiver it expects, built from configuration and never from the request's `Host`: an
+        origin of the inbound `external_urls` at an Access Point, the receiving Connection Point
+        DID over Fabric, and the gateway DID or one of its `alsoKnownAs` aliases at the token
+        exchange. A missing or empty domain, a reserved label or another receiver is refused.
+        Refusals are counted in `agent_gateway_vp_presentation_refused_total`.
     - timestamp: '2026-11-27T18:00:00Z'
       title: Refuse an agent presentation used a second time at this gateway
       description: >-
@@ -51,4 +61,5 @@ changes:
         reserved label or another receiver refuses the request with 422 at an Access Point and over
         Fabric, a Fabric answer with 502, and a token exchange with `invalid_grant`. The agent card
         presentation is not checked. Gateways must be upgraded together, and third-party agents
-        must set `domain`.
+        must set `domain`, keep presentation lifetimes at five minutes or less, and sign a new
+        presentation for every retry, since a presentation is accepted once.

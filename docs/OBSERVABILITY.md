@@ -438,6 +438,22 @@ counted, except when the gateway dropped the signer's cached document to fetch i
 relationship; an `unresolvable` one, a DID host the gateway cannot reach. See
 [Peer issuer DIDs](FABRIC.md#peer-issuer-dids).
 
+## Presentation refusal metrics
+
+`agent_gateway_vp_presentation_refused_total{flow,reason}` is a Prometheus counter incremented once
+for each agent presentation refused. `flow` is where: `access_point`, `fabric_request`,
+`fabric_answer` or `sts` (the token exchange). `reason` is why: `replay` (already used),
+`domain_missing`, `domain_wrong` (another receiver, or a `domain` that is not a DID or an http(s)
+origin), `domain_label` (a reserved `urn:agent-gateway:label:` value), `lifetime`,
+`store_unavailable`, `limit_total` or `limit_holder`. At an Access Point and on a Fabric request a
+`lifetime` count is a presentation that failed verification, and the request goes on without a
+caller identity. Every other refused request there is also a `request_rejected` record (reason
+`extension_rejected`) in the audit log; the token exchange logs them only. See
+[Identity presentation receiver and single use](SOURCE_AUTH.md#identity-presentation-receiver-and-single-use).
+
+`agent_gateway_vp_proof_records` is a gauge of the presentation proof records this node holds. The
+total limit is 250,000.
+
 ## Credential policy report
 
 At startup and on every configuration reload (including the reload that follows a surface
@@ -578,8 +594,8 @@ agent its presentation is for as `agent_did`. `vp_injected` also records a prese
 received over Fabric and verified: on the request, detail `request_path_fabric_received`, and on
 the answer to a `fabric://` Target, detail `response_path_fabric_received` (see
 [`FABRIC.md`](FABRIC.md#peer-issuer-dids)). A request to the Target that is retried carries a
-newly signed presentation on each attempt and records one `vp_injected`, detail `request_path`,
-for each.
+newly signed presentation on each attempt and records one `vp_injected`, with the same detail as
+the first, for each. A retry whose presentation cannot be signed is not sent.
 
 **File size.** The VP Audit Log is rotated: once the live file reaches
 `[audit] vp_audit_log_max_bytes` (8 MiB by default) it is renamed to the next free position,

@@ -196,8 +196,8 @@ Each Remote gateway record therefore carries a set of **connection issuers**
   `issuer_did_source` records which. It cannot be set through the API.
 - `trusted_issuer_dids` — issuer DIDs an operator adds to this one connection.
 
-Trust is connection-scoped, never per surface or appliance-wide, so a peer cannot replay a
-presentation another gateway issued. A sender with neither an established nor a trusted issuer is
+Trust is connection-scoped, never per surface or appliance-wide, so a presentation another
+gateway issued is not accepted from this peer. A sender with neither an established nor a trusted issuer is
 rejected with 403; a sender with trusted issuers but a failed attestation exchange is admitted for
 those issuers only.
 
@@ -260,9 +260,20 @@ continues with no caller identity, only the audit record for the unverified DID 
 written, and no weaker identity source is consulted for that request, neither the identity
 binding VP nor a raw identity extension.
 
+A presentation on a Fabric request must also name the receiving Connection Point DID in its proof's
+`domain`, the DID the listener received the request on, never the envelope's `to`, which the
+sender writes. A missing, empty, reserved-label or other `domain` refuses the request with `422`.
+Each presentation is also used once: the receiving gateway claims it at admission, before the
+payment charge, and a repeat is refused with `422`. A Fabric message admitted but never answered
+releases its claim, so the mediator's redelivery is accepted. The claim records are in memory, one
+set per node, and are not part of the single-use store's `dynamodb` backend. See
+[Identity presentation receiver and single
+use](SOURCE_AUTH.md#identity-presentation-receiver-and-single-use).
+
 The calling gateway checks the presentation on a `2xx` answer the same way, when the calling
 surface's Target is `fabric://` and the surface has a managed identity. The presentation must
-verify, which includes its holder being its credential's subject, and its issuer must be one of
+verify, which includes its holder being its credential's subject and its `domain` naming the
+Connection Point DID the request was sent from, and its issuer must be one of
 the issuers of the connection to the Remote gateway the Target names. The calling gateway
 establishes that gateway's issuer DID through the issuer exchange when its record does not hold
 one yet, and skips the exchange when the issuers its record holds already include the
@@ -282,7 +293,9 @@ outcome `invalid`. One whose issuer is not one of the connection's issuers, incl
 cannot be established, also refuses the answer with `502`: the answering agent's DID is not
 stored, and the VP Audit Log records `identity_binding_failed` with outcome `untrusted`. A verified
 one records `identity_binding_verified` and the received presentation (`vp_injected`, detail
-`response_path_fabric_received`), both with `via_fabric: true` and the request's trace id. Answers
+`response_path_fabric_received`), both with `via_fabric: true` and the request's trace id. A
+verified presentation that was already used at this gateway, or that its record cannot take,
+also refuses the answer with `502`. Answers
 to a Transit Point over Fabric, to MCP requests over Fabric, and agent cards fetched over Fabric
 are not checked.
 

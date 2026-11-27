@@ -71,7 +71,14 @@ VP (`urn:affinidi:params:oauth:token-type:vp`).
   below). A VP is
   verified via `VCIssuer::verify_agent_presentation_full` (`VcIssuerVpVerifier`)
   and the exchanged token's subject becomes the cryptographically-proven
-  credential-subject DID. Each proof in the VP must be signed with a key its
+  credential-subject DID. The VP's proof `domain` must name this gateway: its DID or
+  one of the DIDs its DID document also names it by (`alsoKnownAs`); a missing, empty,
+  reserved-label or other `domain` is `invalid_grant`. A VP is accepted once: a repeat is
+  `invalid_grant` ("VP subject_token was already used"), a holder over its limit or a gateway
+  that cannot record the VP gets `temporarily_unavailable` (`429` or `503`), and the refusals are
+  logged and counted only (see
+  [Identity presentation receiver and single use](SOURCE_AUTH.md#identity-presentation-receiver-and-single-use)).
+  Each proof in the VP must be signed with a key its
   signer's DID document lists under the proof's purpose (`assertionMethod` for a
   credential, `assertionMethod` or `authentication` for the presentation); a VP
   that breaks this is refused like one with a bad signature (see
@@ -293,7 +300,8 @@ Per-connection controls:
 - `allowed_subject_token_types` — matched against the declared
   `subject_token_type`, except that an ID-JAG-typed token counts as `id-jag`.
 - `allowed_subject_audiences` — opt-in; when non-empty, a JWT subject token's
-  `aud` must include one, else `invalid_grant`. VP subjects are exempt.
+  `aud` must include one, else `invalid_grant`. VP subjects are exempt: a VP's proof `domain`
+  must name this gateway instead.
 - `max_ttl_secs`
 - `issue_id_jag`
 - `allow_impersonation`

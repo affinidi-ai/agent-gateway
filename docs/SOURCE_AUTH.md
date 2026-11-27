@@ -1606,6 +1606,77 @@ reload or restart. An agent that publishes no identity, such as a Microsoft Foun
 discoverable. Its messages are still refused while the slot reads the identity from the response.
 See [`PROTOCOLS.md`](PROTOCOLS.md#generated-agent-cards) for which cards qualify and the codes.
 
+### Identity presentation receiver and single use
+
+Every identity presentation (VP) the gateway signs names its receiver in the proof's `domain`:
+
+| Presentation sent | `domain` |
+| --- | --- |
+| A Fabric request | The peer's Connection Point DID |
+| A Fabric answer | The `from_did` of the request it answers |
+| A request to an HTTP or HTTPS Target or Transit Point destination | The destination's origin: lowercase scheme and host, no default port, no path, and one trailing dot of the host removed |
+| A request to a `fabric://` Transit Point | The peer's Gateway DID |
+| A direct answer to a caller, a consent audit record, a request to one of the gateway's own MCP Proxies | A reserved label: `urn:agent-gateway:label:answer`, `urn:agent-gateway:label:audit` or `urn:agent-gateway:label:proxy` |
+
+The agent card presentation has no `domain` and is not checked.
+
+The gateway refuses a presentation it receives unless `domain`, a string or an array, names a
+receiver it expects. It builds them from configuration, never from the `Host` header or the
+envelope's `to`:
+
+| Where | Expected receivers | Refused with |
+| --- | --- | --- |
+| Access Point | The origins of the inbound listeners' `external_urls`. None configured refuses every presentation. | `422` |
+| Fabric request | The Connection Point DID the listener received the request on | `422` |
+| Fabric answer | The Connection Point DID the request was sent from | `502` |
+| Token exchange ([`STS.md`](STS.md)) | The gateway DID and the DIDs its DID document also names it by (`alsoKnownAs`) | `invalid_grant` |
+
+A missing or empty `domain`, a reserved label and another receiver are all refused. At an Access
+Point and on a Fabric request only a wrong `domain` refuses the request; a presentation that fails
+verification for another reason (signature, issuer, lifetime) still leaves the request without a
+caller identity. Origins are compared as `external_urls` writes them, so a gateway behind a proxy
+whose `external_urls` differ from the URL its senders use refuses every presentation sent to that
+URL: keep `external_urls` complete. Surfaces that share one origin cannot be told apart by `domain`.
+
+A presentation is refused when its proof's `expires` is later than 5 minutes and 120 seconds from
+now, or its `created` is later than 120 seconds from now. A proof with no `expires` expires 5
+minutes after `created`. The gateway signs presentations that live 5 minutes, and an agent that
+signs its own must keep to that. A trust agent whose clock runs more than 120 seconds fast has its
+presentations refused. A presentation that carries a `challenge` the gateway did not issue is
+refused.
+
+Each presentation is used once. At admission, before the payment charge and before the request is
+forwarded, free requests included, the gateway claims the proofs of the request's presentations.
+The key is the SHA-256 of the proof's `proofValue` (of its `jws` for a JWS proof), and a record
+lives 5 minutes plus 2 x 120 seconds. A request that verifies the same presentation twice makes one
+claim. A request that stops for consent ends before the claim.
+
+| Refusal | Access Point and Fabric request | Fabric answer | Token exchange |
+| --- | --- | --- | --- |
+| The presentation was already used | `422` | `502` | `invalid_grant`, "VP subject_token was already used" |
+| The holder is over its limit | `429` | `502` | `temporarily_unavailable` (`429`) |
+| The record is full or cannot be written | `503` | `502` | `temporarily_unavailable` (`503`) |
+
+The claim is released, so a paid resend with the same presentation is accepted, when the request
+ends in a `402`, `429` or `503` that took no money, when its payment is revoked, and when nothing
+was sent to the Target. A Fabric message admitted but never answered releases it too, and is
+accepted again on redelivery. Refusals are `request_rejected` audit records (reason
+`extension_rejected`); the token exchange logs and counts them only.
+
+Records are kept in this node's memory. They are not journaled, so a restart forgets them, and a
+Standby node that becomes Active does not have the records of the node it replaces. Only the
+`disk` [single-use store](CONFIGURATION_REFERENCE.md#single-use-store) backend is supported: with
+`dynamodb` the records stay in memory, nothing is written to the table and the gateway logs one
+warning. More than one Active node is not covered.
+
+The limits are fixed, with no setting: 250,000 records in total (`503`) and 25,000 per holder DID
+within 420 seconds (`429`). Both refuse when reached. The holder is counted by DID, so each DID has
+its own count; on Fabric receive it is the managed agent's DID, which all of a peer surface's
+requests share. The total is shared by every Access Point and flow on the node, and at the limit
+each answers `503` until records expire. Inbound rate limiting is the only other bound on how fast
+presentations arrive. The refusals are counted in
+[`agent_gateway_vp_presentation_refused_total`](OBSERVABILITY.md#presentation-refusal-metrics).
+
 ### `from_api_key` on the inbound slot
 
 The inbound slot stores no key. Each request's caller DID comes from the API key that request

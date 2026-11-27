@@ -373,6 +373,12 @@ storage unencrypted.
 One listener can serve several Access Points, and one transit listener several Transit
 Points. A request is matched to its surface by route.
 
+An inbound listener's `external_urls` are also the receivers of the agent presentations sent to its
+Access Points: a presentation's proof `domain` must name the origin of one of them. Keep them
+complete, with every URL senders use, including one a proxy or load balancer in front of the gateway
+changes. With none listed, every presentation is refused (see [Identity presentation receiver and
+single use](SOURCE_AUTH.md#identity-presentation-receiver-and-single-use)).
+
 An outbound listener's `bind_address` and `external_urls` also decide whether its Transit
 Points are reachable from other hosts: a bind address other than loopback, or an external URL
 whose host is not `localhost` or a loopback or unspecified address (private addresses
@@ -474,6 +480,12 @@ Several nodes serving at once, each with its own `_storage`, need the `dynamodb`
 the gateway refuses to start when `[mcp.continuations]` keeps continuations in DynamoDB while
 this store is on disk, since a payment voided on one node would still pay on another. A `table`
 that is not 3 to 255 letters, digits, `_`, `-` or `.` stops the gateway from starting.
+
+The proofs of admitted agent presentations are also recorded here, in this node's memory only:
+never in the journals or in DynamoDB, so a restart forgets them (see [Identity presentation
+receiver and single use](SOURCE_AUTH.md#identity-presentation-receiver-and-single-use)). Their
+limits, 250,000 records in total and 25,000 per holder DID within 420 seconds, are fixed, with no
+setting.
 
 Every node also keeps the records it has seen in memory, so a duplicate is refused without a
 backend call. A record the store cannot write fails closed: the ID-JAG is not redeemed

@@ -808,6 +808,9 @@ no presentation was rejected (a bare `did` claim, or on the fabric path a
 gateway with no VC issuer), or, on the direct path, a surface-configured
 identity (`unverified` or `source_auth`). A rule such as
 `input.extension_identity.verification == "vp"` therefore denies those requests.
+A presentation whose `domain` does not name this gateway, or that was already used, refuses
+the request before policy runs (see [Identity presentation receiver and single
+use](SOURCE_AUTH.md#identity-presentation-receiver-and-single-use)).
 The same rule denies every request on the direct A2A path, which never produces
 `vp`; a rule for that path accepts `vp_unanchored` together with a check on
 `input.agent.identity_issuer_did`.
@@ -1149,7 +1152,9 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   that does not answer in time refuses the mirror, though the lookup keeps its blocking thread until
   the OS resolver returns. The mirror is sent the caller headers the Target is sent, never one the
   Target is refused: a header named like a Target credential header is dropped, and a Target bound by
-  external consent gets only the protocol headers, so its mirror does too. A refused mirror is never
+  external consent gets only the protocol headers, so its mirror does too. On a direct HTTP or HTTPS Target the mirror
+is sent the Target's body, so an identity presentation the gateway injected reaches it too; the
+presentation names the Target's origin as its receiver, not the mirror's. A refused mirror is never
   contacted: a direct or MCP Proxy request logs a warning and continues, and a `fabric://` request
   that waits for its mirror answers `503` with the failure class and the text "the mirror request did
   not complete" (see [Known limitations](#known-limitations)). A fire-and-forget mirror is vetted
