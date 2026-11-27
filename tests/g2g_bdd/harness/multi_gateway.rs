@@ -1128,9 +1128,7 @@ async fn spawn_node(
     let mut extra_env: HashMap<String, String> = HashMap::new();
     for surface in surfaces.iter_mut() {
         if let Some(proxy) = &mut surface.a2a_proxy {
-            let mock =
-                MockServer::start_direct_line(serde_json::json!({ "agent": surface.surface_id.clone() }).to_string())
-                    .await;
+            let mock = MockServer::start_direct_line(direct_line_reply_text(&surface.surface_id)).await;
             proxy.base_url = format!("{}/v3/directline", mock.url());
             // The A2A proxy dial refuses loopback backends unless the gateway's
             // dev/test hatch is on.
@@ -1429,6 +1427,11 @@ fn mediator_http_endpoint(doc: &Value) -> Option<String> {
         }
     }
     None
+}
+
+/// The text the non-A2A managed agent behind an A2A proxy surface replies with.
+pub(crate) fn direct_line_reply_text(surface_id: &str) -> String {
+    serde_json::json!({ "agent": surface_id }).to_string()
 }
 
 pub(crate) fn fabric_route_ready_timeout() -> Duration {

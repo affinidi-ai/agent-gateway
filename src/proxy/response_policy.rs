@@ -235,27 +235,32 @@ pub fn response_context(
 /// The lines of a buffered `text/event-stream` answer a caller receives: its
 /// `data` and `event` fields and the blank lines that end its events. Comments,
 /// `id`, `retry`, unknown fields and anything else are dropped, as they are from
-/// a direct A2A caller's stream, which is rebuilt from its parsed events.
-fn relayed_event_stream(body: &str) -> String {
+/// a direct A2A caller's stream, which is rebuilt from its parsed events. The
+/// flag says whether a dropped line was anything but a comment, `id` or `retry`.
+fn relayed_event_stream(body: &str) -> (String, bool) {
     let text = body
         .replace("\r\n", "\n")
         .replace('\r', "\n");
     let text = text
         .strip_prefix('\u{feff}')
         .unwrap_or(&text);
-    let is_relayed = |line: &str| {
-        line.is_empty()
-            || ["data", "event"]
-                .iter()
-                .any(|field| {
-                    line.strip_prefix(field)
-                        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
-                })
+    let is_field = |line: &str, fields: &[&str]| {
+        fields.iter().any(|field| {
+            line.strip_prefix(field)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+        })
     };
-    text.lines()
-        .filter(|line| is_relayed(line))
+    let mut dropped_content = false;
+    let relayed = text
+        .lines()
+        .filter(|line| {
+            let relayed = line.is_empty() || is_field(line, &["data", "event"]);
+            dropped_content |= !relayed && !line.starts_with(':') && !is_field(line, &["id", "retry"]);
+            relayed
+        })
         .map(|line| format!("{line}\n"))
-        .collect()
+        .collect();
+    (relayed, dropped_content)
 }
 
 /// What a response policy sees of each event of `relayed`, a buffered
@@ -304,8 +309,11 @@ fn event_stream_contexts(
 /// response policy. An answer still framed as an event stream is first reduced
 /// to the lines a caller receives ([`relayed_event_stream`]), in `body`, and
 /// gives one context per event ([`event_stream_contexts`]), none when no data
-/// event is left (nothing reaches the caller to check); any other answer gives
-/// one context. `None` when an event of the stream is not a JSON object.
+/// event is left and its other lines were only comments, `id`, `retry`, `event`
+/// and blank lines (keep-alives: nothing reaches the caller to check); any other
+/// answer gives one context. `None` when an
+/// event of the stream is not a JSON object, or when no data event is left but
+/// other lines were dropped (a body that is not an event stream).
 pub fn answer_contexts(
     status: u16,
     body: &mut String,
@@ -313,8 +321,10 @@ pub fn answer_contexts(
 ) -> Option<Vec<ResponseContext>> {
     match content_type {
         Some(content_type) if crate::mcp::sse_transport::is_sse_content_type(content_type) => {
-            *body = relayed_event_stream(body);
-            event_stream_contexts(status, body)
+            let (relayed, dropped_content) = relayed_event_stream(body);
+            *body = relayed;
+            let contexts = event_stream_contexts(status, body)?;
+            (!(contexts.is_empty() && dropped_content)).then_some(contexts)
         }
         _ => Some(vec![response_context(status, body.as_bytes(), content_type)]),
     }
@@ -907,8 +917,9 @@ mod tests {
             relayed_event_stream(
                 "\u{feff}: keep-alive\r\nid: 7\r\nretry: 100\r\nevent: message\r\ndata: {\"a\":1}\r\n\r\nsecret line\ndatum: x\ndata\n\n"
             ),
-            "event: message\ndata: {\"a\":1}\n\ndata\n\n"
+            ("event: message\ndata: {\"a\":1}\n\ndata\n\n".to_string(), true)
         );
+        assert_eq!(relayed_event_stream(": keep-alive\nid: 7\nretry: 100\n\n"), ("\n".to_string(), false));
     }
 
     #[test]
@@ -922,13 +933,17 @@ mod tests {
     }
 
     #[test]
-    fn a_json_body_labelled_as_an_event_stream_sends_nothing() {
+    fn a_json_body_labelled_as_an_event_stream_is_unreadable() {
         let mut body = "{\"result\":{\"secret\":\"s\"}}".to_string();
 
-        let contexts = answer_contexts(200, &mut body, Some("text/event-stream")).unwrap();
-
-        assert!(contexts.is_empty());
+        assert!(answer_contexts(200, &mut body, Some("text/event-stream")).is_none());
         assert_eq!(body, "");
+    }
+
+    #[test]
+    fn an_unknown_field_with_no_data_event_is_unreadable() {
+        assert!(stream_contexts(b"foo: bar\n\n").is_none());
+        assert!(stream_contexts(b"foo: bar\n\ndata: {\"a\":1}\n\n").is_some_and(|contexts| contexts.len() == 1));
     }
 
     #[test]

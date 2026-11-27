@@ -656,9 +656,10 @@ gating on each side composes: a tool hidden or denied by either surface remains 
 same holds for response policies: the answer meets the receiving surface's, then the sending
 surface's. The receiving surface settles a payment it took on its own delivery, so a refusal by
 the sending surface's response policy does not void a payment the receiving surface already
-captured. The sending surface relays the peer's answers marked with an `error` field, and its
-`402`s, without checking them, and checks the peer gateway's own refusals as error answers; see
-[`POLICY.md`](POLICY.md).
+captured. The sending surface checks every body it relays, including the peer's `402`s and its
+answers marked with an `error` field, and the error it writes itself with the peer's `error`
+text; a policy that denies by default must allow the peer answers its callers need, such as a
+`402` payment challenge or a `429`. See [`POLICY.md`](POLICY.md).
 
 Fabric finds the destination surface by id, never by its Access Point route, but a surface reached
 only over Fabric, or used only for its Transit Points, still needs a route a surface prefix serves:

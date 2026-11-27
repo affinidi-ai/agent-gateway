@@ -1755,15 +1755,8 @@ pub async fn response_says(
     world: &mut G2gWorld,
     expected: String,
 ) {
-    let body = world
-        .response_body
-        .as_ref()
-        .expect("a When must record the response body before this Then");
-    let text = match body {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    };
-    assert!(text.contains(&expected), "response body {text:?} does not contain {expected:?}");
+    let text = response_as_received(world);
+    assert!(text.contains(&expected), "response {text:?} does not contain {expected:?}");
 }
 
 #[then(expr = "the response does not say {string}")]
@@ -1771,15 +1764,40 @@ pub async fn response_does_not_say(
     world: &mut G2gWorld,
     unexpected: String,
 ) {
+    let text = response_as_received(world);
+    assert!(!text.contains(&unexpected), "response {text:?} contains {unexpected:?}");
+}
+
+/// The response body as the step that sent the request decoded it, followed by
+/// the body text exactly as it arrived when that step kept it, so a line the
+/// decoding drops, such as an event-stream comment, is still read.
+fn response_as_received(world: &G2gWorld) -> String {
     let body = world
         .response_body
         .as_ref()
         .expect("a When must record the response body before this Then");
-    let text = match body {
+    let decoded = match body {
         Value::String(text) => text.clone(),
         other => other.to_string(),
     };
-    assert!(!text.contains(&unexpected), "response body {text:?} contains {unexpected:?}");
+    match world.response_text.as_deref() {
+        Some(received) => format!("{decoded}\n{received}"),
+        None => decoded,
+    }
+}
+
+#[then(expr = "the A2A response result contains text from non-A2A managed agent {string}")]
+pub async fn a2a_response_result_contains_text_from_non_a2a_managed_agent(
+    world: &mut G2gWorld,
+    agent_name: String,
+) {
+    let (_, surface_id) = world.target(&agent_name);
+    let reply = crate::harness::multi_gateway::direct_line_reply_text(&surface_id);
+    crate::bdd_support::assertions::assert_a2a_result_text_from_non_a2a_managed_agent(
+        response_body(world),
+        &agent_name,
+        &reply,
+    );
 }
 
 #[then(expr = "the caller receives no result from MCP server {string}")]

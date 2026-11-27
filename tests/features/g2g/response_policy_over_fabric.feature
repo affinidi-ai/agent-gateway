@@ -133,6 +133,17 @@ Feature: Surface response policies over Fabric
     And non-A2A managed agent "bravo" received text "g2g-bdd"
     And the VP Audit Log of gateway 2 records a response policy "deny" on the Fabric request
 
+  Scenario: A response policy lets an A2A proxy answer through to a Fabric caller
+    Given a fabric with 2 gateways
+    And gateway 2 exposes A2A surface "alpha" backed by non-A2A managed agent "bravo" through an A2A proxy endpoint
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And the VP Audit Log of gateway 2 keeps every audit event
+    And surface "alpha" has a response policy that allows every response
+    When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
+    Then the response status is 200
+    And the A2A response result contains text from non-A2A managed agent "bravo"
+    And the VP Audit Log of gateway 2 records a response policy "allow" on the Fabric request
+
   Scenario: A response policy refuses a legacy MCP answer to a Fabric caller
     Given a fabric with 2 gateways
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
@@ -172,6 +183,18 @@ Feature: Surface response policies over Fabric
     And MCP server "bravo" received the forwarded MCP request
     And the VP Audit Log of gateway 2 records a response policy "deny" on the Fabric request
 
+  Scenario: A response policy lets a modern MCP answer through to a Fabric caller
+    Given a fabric with 2 gateways
+    And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
+    And MCP server "bravo" serves a modern MCP tool catalog
+    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And the VP Audit Log of gateway 2 keeps every audit event
+    And surface "alpha" has a response policy that allows every response
+    When the caller asks gateway 1 MCP surface "charlie" for available tools using protocol version "2026-07-28"
+    Then the response status is 200
+    And the MCP response tool catalog includes a tool named "echo"
+    And the VP Audit Log of gateway 2 records a response policy "allow" on the Fabric request
+
   Scenario: MCP tool gating hides a tool from an MCP Proxy's tool list sent over Fabric
     Given a fabric with 2 gateways
     And gateway 2 exposes MCP surface "alpha" backed by REST API "bravo" through an MCP proxy endpoint
@@ -193,3 +216,15 @@ Feature: Surface response policies over Fabric
     Then the response status is 200
     And the MCP response is a JSON-RPC error with code -32000
     And the VP Audit Log of gateway 2 records a response policy "deny" on the Fabric request
+
+  Scenario: A response policy lets an MCP Proxy answer through to a Fabric caller
+    Given a fabric with 2 gateways
+    And gateway 2 exposes MCP surface "alpha" backed by REST API "bravo" through an MCP proxy endpoint
+    And the MCP proxy of surface "alpha" offers the weather tools
+    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And the VP Audit Log of gateway 2 keeps every audit event
+    And surface "alpha" has a response policy that allows every response
+    When the caller asks gateway 1 MCP surface "charlie" for available tools
+    Then the response status is 200
+    And the MCP response tool catalog includes a tool named "get_weather"
+    And the VP Audit Log of gateway 2 records a response policy "allow" on the Fabric request

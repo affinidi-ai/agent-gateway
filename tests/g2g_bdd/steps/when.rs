@@ -78,6 +78,7 @@ pub(crate) async fn send_a2a_request_through_transit_point(
     world.response_status = Some(response.status);
     world.response_content_type = response.content_type;
     world.response_body = Some(response.body);
+    world.response_text = Some(response.text);
 }
 
 #[when(
@@ -334,6 +335,7 @@ async fn fetch_agent_card(
         .await
         .unwrap_or_default();
     world.response_body = Some(parse_json_or_sse_body(&raw, content_type.as_deref()));
+    world.response_text = Some(raw);
     world.response_status = Some(status);
     world.response_content_type = content_type;
 }
@@ -426,9 +428,10 @@ async fn send_method_request_to_surface_path(
         .await
         .unwrap_or_default();
     world.response_body = Some(match parse_json_or_sse_body(&raw, content_type.as_deref()) {
-        Value::Null if !raw.is_empty() => Value::String(raw),
+        Value::Null if !raw.is_empty() => Value::String(raw.clone()),
         parsed => parsed,
     });
+    world.response_text = Some(raw);
     world.response_status = Some(status);
     world.response_content_type = content_type;
 }
@@ -697,6 +700,7 @@ pub(crate) async fn accept_pending_oob(
         .map(str::to_string);
     world.response_status = Some(response.status);
     world.response_body = Some(response.body);
+    world.response_text = None;
 }
 
 #[when(regex = r"^the gateways pair$")]
@@ -722,6 +726,7 @@ pub async fn gateway_deletes_the_gateway_it_accepted_last(
         .expect("delete request completes at the transport layer");
     world.response_status = Some(deleted.status);
     world.response_body = Some(deleted.body);
+    world.response_text = None;
 }
 
 #[when(regex = r"^gateway (\d+) accepts the invitation again$")]
@@ -878,6 +883,7 @@ async fn send_over_one_legacy_sse_session(
         .replies
         .last()
         .cloned();
+    world.response_text = None;
     let mut replies = exchange.replies.into_iter();
     world.legacy_sse_exchange = bodies
         .into_iter()
@@ -1097,6 +1103,7 @@ pub(crate) async fn send_rpc(
     world.response_headers = response.headers;
     world.response_content_type = response.content_type;
     world.response_body = Some(response.body);
+    world.response_text = Some(response.text);
 }
 
 async fn send_raw_rpc_body(
@@ -1155,6 +1162,7 @@ async fn send_raw_string(
     world.response_status = Some(status);
     world.response_content_type = content_type;
     world.response_body = Some(body);
+    world.response_text = Some(raw);
 }
 
 fn conformance_setting(name: &str) -> String {

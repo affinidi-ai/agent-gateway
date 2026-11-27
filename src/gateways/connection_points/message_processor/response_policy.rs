@@ -589,6 +589,160 @@ mod tests {
             .remove(0)
     }
 
+    /// A Target answering every request with `body` as `content_type`.
+    async fn target_answering(
+        content_type: &'static str,
+        body: &'static str,
+    ) -> String {
+        let app = axum::Router::new()
+            .fallback(move || async move { ([(axum::http::header::CONTENT_TYPE, content_type)], body) });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let target = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .ok();
+        });
+        target
+    }
+
+    fn a2a_message() -> serde_json::Value {
+        serde_json::json!({ "jsonrpc": "2.0", "id": 7, "method": "message/send",
+            "params": { "message": { "role": "user", "messageId": "m-1", "parts": [{ "kind": "text", "text": "hi" }] } } })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_legacy_sse_answer_a_fabric_response_policy_allows_goes_back_with_an_allow() {
+        use super::super::fabric_transit_tests::{ran_in_child, surface};
+
+        if ran_in_child("ATG_FABRIC_LEGACY_SSE_RESPONSE_ALLOW_CHILD").await {
+            return;
+        }
+        let target = crate::proxy::response_policy::test_targets::legacy_sse_only_target().await;
+        let served = with_target(
+            surface("mcp", &target, &[]),
+            serde_json::json!({"response_policy": {"policy_definition_id": "allow-every-response"}}),
+        );
+        let policies = crate::policies::SurfacePolicyManager::new();
+        policies
+            .load_policy_text("response:allow-every-response", "package surface.policy\n\ndefault allow := true\n")
+            .unwrap();
+
+        for (response, decisions) in receive_mcp(&served, policies, "tools/call", 2).await {
+            assert_eq!(response["status"], 200, "{response}");
+            assert!(
+                response["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("secret")),
+                "{response}"
+            );
+            assert_eq!(response_decisions(&decisions), vec![("allow", "fabric")]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_comment_in_an_event_stream_answer_is_not_relayed_to_a_fabric_caller() {
+        use super::super::fabric_transit_tests::{
+            CALLER_KEY, forward_request, forward_response, ran_in_child, receiver, surface,
+        };
+
+        if ran_in_child("ATG_FABRIC_STREAM_COMMENT_CHILD").await {
+            return;
+        }
+        let target = target_answering(
+            "text/event-stream",
+            ": unchecked-note\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"kind\":\"message\",\"note\":\"delivered\"}}\n\n",
+        )
+        .await;
+        let served = with_target(
+            surface("a2a", &target, &[]),
+            serde_json::json!({"response_policy": {"policy_definition_id": "allow-every-response"}}),
+        );
+        let policies = crate::policies::SurfacePolicyManager::new();
+        policies
+            .load_policy_text("response:allow-every-response", "package surface.policy\n\ndefault allow := true\n")
+            .unwrap();
+        super::super::init_policy_manager(std::sync::Arc::new(policies)).await;
+        let root = tempfile::tempdir().unwrap();
+        let _receiver = receiver(root.path(), &served).await;
+
+        let response = forward_response(&forward_request(
+            root.path(),
+            serde_json::json!({ "x-api-key": CALLER_KEY, "content-type": "application/json" }),
+            a2a_message(),
+        ))
+        .await;
+
+        assert_eq!(response["status"], 200, "{response}");
+        let body = response["body"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(body.contains("delivered"), "{response}");
+        assert!(!body.contains("unchecked-note"), "the comment reached the peer: {response}");
+    }
+
+    #[tokio::test]
+    async fn a_fabric_response_decision_shares_the_trace_of_the_request_decisions() {
+        use super::super::fabric_transit_tests::{
+            CALLER_KEY, forward_request, forward_response, ran_in_child, receiver, surface,
+        };
+        use crate::delegation_vault::audit::DelegationAuditAction;
+
+        if ran_in_child("ATG_FABRIC_RESPONSE_TRACE_CHILD").await {
+            return;
+        }
+        let target = target_answering("application/json", "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}").await;
+        let served = with_target(
+            surface("a2a", &target, &[]),
+            serde_json::json!({
+                "policy": {"policy_definition_id": "allow-requests"},
+                "response_policy": {"policy_definition_id": "deny-every-response"}
+            }),
+        );
+        let policies = crate::policies::SurfacePolicyManager::new();
+        policies
+            .load_policy_text(&served.surface_id, "package surface.policy\n\ndefault allow := true\n")
+            .unwrap();
+        policies
+            .load_policy_text("response:deny-every-response", "package surface.policy\n\ndefault allow := false\n")
+            .unwrap();
+        super::super::init_policy_manager(std::sync::Arc::new(policies)).await;
+        let root = tempfile::tempdir().unwrap();
+        let _receiver = receiver(root.path(), &served).await;
+        let mut message = forward_request(
+            root.path(),
+            serde_json::json!({ "x-api-key": CALLER_KEY, "content-type": "application/json" }),
+            a2a_message(),
+        );
+        message.message_body["otel_context"] = serde_json::json!({
+            "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+            "span_id": "00f067aa0ba902b7",
+            "trace_flags": 1
+        });
+
+        let (response, events) = crate::audit::producer::capture(forward_response(&message)).await;
+
+        assert_eq!(response["status"], 403, "{response}");
+        let traces: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                DelegationAuditAction::PolicyDecision { scope, .. } => Some((scope.clone(), event.trace_id.clone())),
+                _ => None,
+            })
+            .collect();
+        let trace_of = |scope: &str| {
+            traces
+                .iter()
+                .find(|(decided, _)| decided == scope)
+                .map(|(_, trace)| trace.clone())
+                .unwrap_or_else(|| panic!("no {scope} decision: {traces:?}"))
+        };
+        assert_eq!(trace_of("surface"), Some("trace-from-the-peer".to_string()));
+        assert_eq!(trace_of("response"), trace_of("surface"));
+    }
+
     #[tokio::test]
     async fn a_response_policy_over_fabric_sees_the_response_custom_metadata() {
         if super::super::fabric_transit_tests::ran_in_child("ATG_FABRIC_RESPONSE_METADATA_POLICY_CHILD").await {

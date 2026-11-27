@@ -358,26 +358,10 @@ fn a2a_response_result_contains_text_from_non_a2a_managed_agent(
     world: &mut SurfaceWorld,
     agent_name: String,
 ) {
-    let response = get_caller_response(world);
-    // The scenarios send `message/send`, so the reply is the A2A 0.3 result: the
-    // message itself, with `kind: "text"` parts.
-    let parts = response
-        .body
-        .pointer("/result/parts")
-        .and_then(serde_json::Value::as_array)
-        .unwrap_or_else(|| panic!("A2A response result.parts must be an array, got {}", response.body));
-    assert!(
-        parts.iter().any(|part| {
-            part.get("kind")
-                .and_then(serde_json::Value::as_str)
-                == Some("text")
-                && part
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|text| text.contains(&agent_name))
-        }),
-        "A2A response should contain text from non-A2A managed agent '{agent_name}', got {}",
-        response.body
+    crate::bdd_support::assertions::assert_a2a_result_text_from_non_a2a_managed_agent(
+        &get_caller_response(world).body,
+        &agent_name,
+        &agent_name,
     );
 }
 

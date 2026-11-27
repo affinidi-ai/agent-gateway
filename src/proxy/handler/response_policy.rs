@@ -411,6 +411,30 @@ impl DirectResponsePolicy {
         (!decision.allow).then(denied_response)
     }
 
+    /// The JSON `error` answer the gateway writes for a `fabric://` peer's answer
+    /// marked with an `error` field, which carries the peer's `error` text, or as
+    /// `Err` the `403` the caller gets when the policy refuses it. A `GET` or
+    /// `HEAD` of the public agent card is not checked.
+    pub(super) async fn checked_peer_error(
+        &self,
+        error: Response,
+    ) -> Result<Response, Response> {
+        if crate::proxy::paths::is_public_agent_card_read(&self.method, &self.path) {
+            return Ok(error);
+        }
+        let (parts, body) = error.into_parts();
+        let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
+            return Err(denied_response());
+        };
+        if let Some(refusal) = self
+            .refusal(parts.status.as_u16(), &bytes, Some("application/json"))
+            .await
+        {
+            return Err(refusal);
+        }
+        Ok(Response::from_parts(parts, axum::body::Body::from(bytes)))
+    }
+
     /// The A2A proxy's `answer`, or the `403` the policy gives when it refuses a
     /// successful one.
     pub(super) async fn a2a_proxy_answer(

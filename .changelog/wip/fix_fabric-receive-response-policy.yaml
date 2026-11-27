@@ -40,11 +40,14 @@ changes:
       description: >-
         A surface whose Target is fabric:// now runs its own response policy on every body the peer
         gateway sends back that it relays to the caller (the answer, a 402 payment challenge, and
-        on MCP a JSON-RPC error body), refusing it with 403 response_policy_denied when the policy
-        denies it. Before, the sending surface's own response policy never ran on these. Errors
-        the sending gateway writes itself, which carry the peer's error text, and the peer's empty
-        202 acknowledgement of a notification are not checked. A response policy already set on such a surface starts
-        running on upgrade, including on the peer gateway's own refusals, so review it first.
+        on MCP a JSON-RPC error body, and the error the gateway writes with the peer's error text),
+        refusing it with 403 response_policy_denied when the policy denies it. Before, the sending
+        surface's own response policy never ran on these. Only the peer's empty 202
+        acknowledgement of a notification is not checked. A response policy already set on such a
+        surface starts running on upgrade, including on the peer gateway's own refusals, its 429
+        rate limit, its 402 payment challenge and a payment it holds for review, so review it
+        first: a policy that denies by default should allow those answers, for example by
+        input.response.status_code, or callers lose the challenge and the retry hint.
     - timestamp: '2026-11-25T18:00:00Z'
       title: Check each event of a streamed A2A answer sent back over Fabric
       description: >-
@@ -54,16 +57,20 @@ changes:
         policy event by event, each event's JSON as input.response.body, as a direct caller's
         stream does. The answer is refused when an event is denied or its data is not a JSON
         object. Comments, id, retry and any other line are dropped rather than relayed unchecked,
-        as a direct A2A stream drops them, and a stream with no data event left, such as keep-alive
-        comments only, gets no decision. A surface without a response policy relays the stream as
-        received.
+        as a direct A2A stream drops them. A stream with no data event whose lines are only
+        comments, id, retry, event and blank lines (keep-alives) gets no decision, and one with no
+        data event that held any other line, such as a JSON body labelled as an event stream, is
+        refused as unreadable_event_stream. A surface without a response policy
+        relays the stream as received.
     - timestamp: '2026-11-25T18:00:00Z'
       title: Apply a surface's response policy to a2a-proxy Target answers
       description: >-
         A surface whose Target is an a2a-proxy:// endpoint now runs its response policy on each
         successful answer, directly and over Fabric, refusing it with 403 response_policy_denied
-        when the policy denies it. The proxy's own JSON-RPC error answers pass unchecked. A response
-        policy already set on such a surface starts running on upgrade, so review it first.
+        when the policy denies it. The proxy's own JSON-RPC error answers pass unchecked. Over
+        Fabric, a proxy answer the gateway cannot read is refused with 502 instead of being sent
+        back empty. A response policy already set on such a surface starts running on upgrade, so
+        review it first.
     - timestamp: '2026-11-25T18:00:00Z'
       title: Apply a surface's response policy to answers from Legacy SSE MCP Targets
       description: >-

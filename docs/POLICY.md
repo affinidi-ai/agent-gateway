@@ -894,8 +894,10 @@ event stream is first cut down to the lines the caller receives (its `data` and 
 and the blank lines between events; comments, `id`, `retry` and any other line are dropped, as a
 direct A2A stream drops them), then checked event by event, and gets one decision: the first deny, `unreadable_event_stream`
 (naming the policy, its version and hash) for an event that is not a JSON object, or one allow.
-A stream with no data event left (keep-alive comments only, or a JSON body labelled as an event
-stream) has nothing to check, gets no decision and reaches the caller with no content. The answer
+A stream with no data event whose lines are only comments, `id`, `retry`, `event` and blank lines
+(keep-alives) has nothing to check, gets no decision and reaches the caller with no data. A stream
+with no data event that held any other line, such as a JSON body labelled as an event stream, is
+refused as `unreadable_event_stream`. The answer
 is cut down only on a surface with a response policy; without one it is relayed as received. In
 practice this reaches A2A answers: Fabric receive turns an MCP event stream into JSON before the
 policy sees it. A direct answer that reaches the
@@ -914,12 +916,15 @@ configured card location sent to an ordinary Target route, are checked. Other di
 documents and an extended agent card are checked. A surface with a `fabric://` Target checks
 every body the peer gateway sends back that it relays to the caller: the answer, a `402`
 payment challenge, and, on an MCP surface, a JSON-RPC body the peer marks with an `error` field.
-An error the sending gateway writes itself for an answer marked with an `error` field is not
-checked; it carries the peer's `error` text as its message, and on an A2A surface the peer's
-status. The peer gateway's own refusals (a `403` from its request policy, a `401`, a `429`
-or a `503`) carry no such mark, so the sending surface's response policy checks them as error
-answers (`input.response.is_error`); a policy that denies by default refuses them with its own
-`403`. A refusal by the sending surface does not void a payment the receiving surface already
+For any other answer marked with an `error` field the sending gateway writes its own JSON error,
+which carries the peer's `error` text (and on an A2A surface the peer's status), and checks that.
+Some of the peer gateway's own refusals carry the mark, such as its policy, Fabric admission and
+egress refusals; others, such as its rate limit (`429`) and its payment challenge (`402`), do
+not, and reach the policy as they come. Either way the sending surface's response policy checks
+them, as error answers (`input.response.is_error`), so a policy that denies by default refuses
+them with its own `403`. Such a policy should allow the answers its callers need, for example by
+`input.response.status_code`, to keep a peer's payment challenge (`402`), its retry hint
+(`429`) or a payment it holds for review (a `202` that carries a body). A refusal by the sending surface does not void a payment the receiving surface already
 captured for the answer. A denied answer is refused with `403 response_policy_denied`,
 or, on an MCP Proxy Target, with a JSON-RPC `-32000` error that carries the deny reason. A
 denied modern MCP result ends its stream when the Target answered with an event stream, and is

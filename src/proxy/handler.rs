@@ -11062,6 +11062,45 @@ fn fabric_send_route(surface: &crate::config::agent_surface::AgentSurface) -> Op
     })
 }
 
+/// Records, from `start_time`, the request of a `fabric://` send whose answer
+/// the sending surface's response policy refused as a failed connection.
+async fn record_refused_fabric_send(
+    state: &ProxyState,
+    source_addr: &str,
+    trace_id: &str,
+    ucp_operation: Option<&str>,
+    start_time: std::time::Instant,
+) {
+    let Some(metrics) = state.metrics_store.as_ref() else {
+        return;
+    };
+    let latency_ms = start_time
+        .elapsed()
+        .as_millis() as u64;
+    metrics
+        .record_connection_with_ucp(
+            state
+                .surface
+                .config_id_string(),
+            source_addr.to_string(),
+            state
+                .surface
+                .target
+                .endpoint
+                .clone(),
+            crate::metrics::ConnectionStatus::Failed,
+            Some(latency_ms),
+            None,
+            crate::metrics::ConnectionDirection::Request,
+            trace_id.to_string(),
+            ucp_operation.map(str::to_string),
+            None,
+            None,
+            latency_ms,
+        )
+        .await;
+}
+
 /// A request for a `fabric://` Target.
 struct FabricSend<'a> {
     channel_name: &'a str,
@@ -13470,6 +13509,16 @@ async fn handle_fabric_request_inner(
                                 .refusal_of_peer_answer(status, &mut response_body, &response_headers)
                                 .await
                         {
+                            if !is_modern_response {
+                                record_refused_fabric_send(
+                                    &state,
+                                    &source_addr,
+                                    &trace_id,
+                                    ucp_operation.as_deref(),
+                                    start_time,
+                                )
+                                .await;
+                            }
                             return Err(refusal);
                         }
                         return Err(response_builder
@@ -13524,12 +13573,22 @@ async fn handle_fabric_request_inner(
                                 .refusal_of_peer_answer(status, &mut response_body, &response_headers)
                                 .await
                         {
+                            if !is_modern_response {
+                                record_refused_fabric_send(
+                                    &state,
+                                    &source_addr,
+                                    &trace_id,
+                                    ucp_operation.as_deref(),
+                                    start_time,
+                                )
+                                .await;
+                            }
                             connection_guard
                                 .decrement()
                                 .await;
                             return Err(refusal);
                         }
-                        let error_response = if relays_peer_body && !response_body.is_empty() {
+                        let error_response = if relays_peer_body {
                             response_body
                         } else {
                             jsonrpc_error()
@@ -13564,9 +13623,29 @@ async fn handle_fabric_request_inner(
                         connection_guard
                             .decrement()
                             .await;
-                        return Ok(response_builder
+                        let error_answer = response_builder
                             .body(axum::body::Body::from(error_response))
-                            .unwrap());
+                            .unwrap();
+                        if !relays_peer_body
+                            && error.as_str().is_some()
+                            && let Some(policy) = response_policy.as_ref()
+                        {
+                            let checked = policy
+                                .checked_peer_error(error_answer)
+                                .await;
+                            if checked.is_err() && !is_modern_response {
+                                record_refused_fabric_send(
+                                    &state,
+                                    &source_addr,
+                                    &trace_id,
+                                    ucp_operation.as_deref(),
+                                    start_time,
+                                )
+                                .await;
+                            }
+                            return checked;
+                        }
+                        return Ok(error_answer);
                     }
 
                     // For non-MCP requests, return HTTP error as before
@@ -13574,12 +13653,38 @@ async fn handle_fabric_request_inner(
                     connection_guard
                         .decrement()
                         .await;
-                    return Err(create_error_response(
+                    let error_answer = create_error_response(
                         error_status,
                         error
                             .as_str()
                             .unwrap_or("Gateway forwarding failed"),
-                    ));
+                    );
+                    if error.as_str().is_some()
+                        && let Some(policy) = response_policy.as_ref()
+                    {
+                        return Err(
+                            match policy
+                                .checked_peer_error(error_answer)
+                                .await
+                            {
+                                Ok(answer) => answer,
+                                Err(refusal) => {
+                                    if !is_modern_response {
+                                        record_refused_fabric_send(
+                                            &state,
+                                            &source_addr,
+                                            &trace_id,
+                                            ucp_operation.as_deref(),
+                                            start_time,
+                                        )
+                                        .await;
+                                    }
+                                    refusal
+                                }
+                            },
+                        );
+                    }
+                    return Err(error_answer);
                 }
 
                 // Check if status is 402 Payment Required (even without error field)
@@ -13613,6 +13718,16 @@ async fn handle_fabric_request_inner(
                             .refusal_of_peer_answer(status, &mut response_body, &response_headers)
                             .await
                     {
+                        if !is_modern_response {
+                            record_refused_fabric_send(
+                                &state,
+                                &source_addr,
+                                &trace_id,
+                                ucp_operation.as_deref(),
+                                start_time,
+                            )
+                            .await;
+                        }
                         return Err(refusal);
                     }
                     return Err(response_builder
@@ -14287,32 +14402,15 @@ async fn handle_fabric_request_inner(
                         .refusal_of_peer_answer(status, &mut response_body, &response_headers)
                         .await
                 {
-                    if !is_modern_response && let Some(ref metrics) = state.metrics_store {
-                        let latency_ms = start_time
-                            .elapsed()
-                            .as_millis() as u64;
-                        metrics
-                            .record_connection_with_ucp(
-                                state
-                                    .surface
-                                    .config_id_string(),
-                                source_addr.clone(),
-                                state
-                                    .surface
-                                    .target
-                                    .endpoint
-                                    .clone(),
-                                crate::metrics::ConnectionStatus::Failed,
-                                Some(latency_ms),
-                                None,
-                                crate::metrics::ConnectionDirection::Request,
-                                trace_id.clone(),
-                                ucp_operation.clone(),
-                                None,
-                                None,
-                                latency_ms,
-                            )
-                            .await;
+                    if !is_modern_response {
+                        record_refused_fabric_send(
+                            &state,
+                            &source_addr,
+                            &trace_id,
+                            ucp_operation.as_deref(),
+                            start_time,
+                        )
+                        .await;
                     }
                     connection_guard
                         .decrement()
@@ -25600,18 +25698,87 @@ mod fabric_send_tests {
     }
 
     #[test]
-    fn a_gateway_written_error_for_a_failed_fabric_answer_is_not_checked() {
+    fn a_relayed_peer_body_the_response_policy_refuses_is_recorded_as_a_failed_connection() {
+        run_on_large_stack(async {
+            let challenge = json!({"accepts": []}).to_string();
+            let peer_error =
+                json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32000, "message": "secret"}}).to_string();
+            let tools_list = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}});
+            for (protocol, request, message_body) in [
+                (
+                    "a2a",
+                    a2a_message(),
+                    json!({"status": 402, "headers": {"content-type": "application/json"}, "body": challenge}),
+                ),
+                (
+                    "a2a",
+                    a2a_message(),
+                    json!({"status": 402, "headers": {"content-type": "application/json"}, "body": challenge,
+                        "error": "payment required"}),
+                ),
+                (
+                    "mcp",
+                    tools_list.clone(),
+                    json!({"status": 500, "headers": {"content-type": "application/json"}, "body": peer_error,
+                        "error": "Target failed"}),
+                ),
+                (
+                    "mcp",
+                    tools_list.clone(),
+                    json!({"status": 500, "headers": {"content-type": "text/plain"}, "body": "x", "error": "secret"}),
+                ),
+                (
+                    "a2a",
+                    a2a_message(),
+                    json!({"status": 500, "headers": {"content-type": "text/plain"}, "body": "x", "error": "secret"}),
+                ),
+            ] {
+                let mut peer = fabric_peer_relaying(protocol, message_body.clone(), DENY_ALL_RESPONSES).await;
+                let metrics = Arc::new(crate::metrics::MetricsStore::new(10));
+                peer.state.metrics_store = Some(metrics.clone());
+
+                let (status, _, body) =
+                    answer(post(&peer.state, &format!("https://gateway.example/{protocol}"), &request, None).await)
+                        .await;
+
+                assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{message_body} {body}");
+                let connections = metrics
+                    .get_recent_connections(10)
+                    .await;
+                assert!(
+                    connections
+                        .iter()
+                        .any(|connection| matches!(connection.status, crate::metrics::ConnectionStatus::Failed)),
+                    "{message_body}: {connections:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_gateway_written_mcp_error_carrying_the_peers_error_text_meets_the_response_policy() {
         run_on_large_stack(async {
             let message_body = json!({"status": 500, "headers": {"content-type": "text/plain"},
-                "body": "upstream exploded", "error": "Target failed"});
+                "body": "upstream exploded", "error": "secret"});
             let tools_list = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}});
-            let peer = fabric_peer_relaying("mcp", message_body, DENY_ALL_RESPONSES).await;
 
+            let peer = fabric_peer_relaying("mcp", message_body.clone(), DENY_ALL_RESPONSES).await;
             let (status, _, body) =
                 answer(post(&peer.state, "https://gateway.example/mcp", &tools_list, None).await).await;
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+            assert!(
+                !body
+                    .to_string()
+                    .contains("secret"),
+                "{body}"
+            );
 
+            let peer = fabric_peer_relaying("mcp", message_body, ALLOW_ALL_RESPONSES).await;
+            let (status, _, body) =
+                answer(post(&peer.state, "https://gateway.example/mcp", &tools_list, None).await).await;
             assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
             assert_eq!(body["error"]["code"], -32603, "{body}");
+            assert_eq!(body["error"]["message"], "secret", "{body}");
             assert!(
                 !body
                     .to_string()
@@ -25622,7 +25789,36 @@ mod fabric_send_tests {
     }
 
     #[test]
-    fn a_jsonrpc_error_body_labelled_as_an_event_stream_becomes_a_gateway_error() {
+    fn a_gateway_written_a2a_error_carrying_the_peers_error_text_meets_the_response_policy() {
+        run_on_large_stack(async {
+            let message_body = json!({"status": 500, "headers": {"content-type": "text/plain"},
+                "body": "upstream exploded", "error": "secret"});
+
+            let peer = fabric_peer_relaying("a2a", message_body.clone(), DENY_ALL_RESPONSES).await;
+            let (status, _, body) =
+                answer(post(&peer.state, "https://gateway.example/a2a", &a2a_message(), None).await).await;
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+            assert!(
+                !body
+                    .to_string()
+                    .contains("secret"),
+                "{body}"
+            );
+
+            let peer = fabric_peer_relaying("a2a", message_body, ALLOW_ALL_RESPONSES).await;
+            let (status, _, body) =
+                answer(post(&peer.state, "https://gateway.example/a2a", &a2a_message(), None).await).await;
+            assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+            assert!(
+                body.to_string()
+                    .contains("secret"),
+                "{body}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_jsonrpc_error_body_labelled_as_an_event_stream_is_refused() {
         run_on_large_stack(async {
             let peer_error =
                 json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32000, "message": "secret"}}).to_string();
@@ -25634,8 +25830,7 @@ mod fabric_send_tests {
             let (status, _, body) =
                 answer(post(&peer.state, "https://gateway.example/mcp", &tools_list, None).await).await;
 
-            assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-            assert_eq!(body["error"]["code"], -32603, "{body}");
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
             assert!(
                 !body
                     .to_string()

@@ -72,6 +72,31 @@ pub fn assert_direct_line_activity_text(
     );
 }
 
+/// Asserts that an A2A 0.3 `message/send` result, the message itself, has a
+/// `kind: "text"` part containing `expected_text` from non-A2A managed agent `agent_name`.
+pub fn assert_a2a_result_text_from_non_a2a_managed_agent(
+    body: &serde_json::Value,
+    agent_name: &str,
+    expected_text: &str,
+) {
+    let parts = body
+        .pointer("/result/parts")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("A2A response result.parts must be an array, got {body}"));
+    assert!(
+        parts.iter().any(|part| {
+            part.get("kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("text")
+                && part
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| text.contains(expected_text))
+        }),
+        "A2A response should contain text {expected_text:?} from non-A2A managed agent '{agent_name}', got {body}"
+    );
+}
+
 pub fn json_body_mentions(
     body: &serde_json::Value,
     expected: &str,

@@ -135,9 +135,9 @@ flowchart TB
 A `fabric://` Target leaves after request validation. It then runs its own surface policy
 and, for MCP, the MCP tool policies and gating, target authentication and credential delegation,
 and only then the delegated payment, just before fabric dispatch. It runs its own response
-policy on every body the peer sends back that it relays: a `402` or an `error`-marked JSON-RPC
-body as it arrives, and the answer after MCP tool gating on a `tools/list`, before the answer is
-captured as delivered. Payment is the last step on every
+policy on every body the peer sends back that it relays: a `402`, an `error`-marked JSON-RPC
+body, or the error it writes with the peer's `error` text, as it arrives, and the answer after
+MCP tool gating on a `tools/list`, before the answer is captured as delivered. Payment is the last step on every
 path, so a request is never charged and then refused for a reason that does not depend on payment.
 Version negotiation and request validation run on the sending gateway, before
 that; the fabric receive pipeline does not run them again.

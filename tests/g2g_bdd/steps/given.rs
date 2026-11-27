@@ -1713,6 +1713,7 @@ pub async fn managed_agent_has_obtained_identity_presentation(
     world.sent_body = None;
     world.response_status = None;
     world.response_body = None;
+    world.response_text = None;
 }
 
 /// The mediator is both disabled and unregistered (no gateway identity on it),

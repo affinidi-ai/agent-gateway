@@ -12,6 +12,8 @@ pub struct RecordedHttpResponse {
     pub headers: HashMap<String, String>,
     pub body: Value,
     pub content_type: Option<String>,
+    /// The body as received, before `body` decodes it.
+    pub text: String,
 }
 
 pub async fn post_json(
@@ -49,6 +51,7 @@ pub async fn post_json(
         headers,
         body,
         content_type,
+        text: raw,
     })
 }
 
@@ -85,6 +88,7 @@ pub async fn post_form(
         headers,
         body,
         content_type,
+        text: raw,
     })
 }
 
@@ -155,7 +159,7 @@ fn parse_raw_response(raw: &str) -> Result<RecordedHttpResponse> {
         payload.to_string()
     };
     let body = match parse_json_or_sse_body(&payload, content_type.as_deref()) {
-        Value::Null if !payload.is_empty() => Value::String(payload),
+        Value::Null if !payload.is_empty() => Value::String(payload.clone()),
         parsed => parsed,
     };
     Ok(RecordedHttpResponse {
@@ -163,6 +167,7 @@ fn parse_raw_response(raw: &str) -> Result<RecordedHttpResponse> {
         headers,
         body,
         content_type,
+        text: payload,
     })
 }
 

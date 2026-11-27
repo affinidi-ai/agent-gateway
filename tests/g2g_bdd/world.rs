@@ -359,6 +359,9 @@ pub struct G2gWorld {
     pub sent_body: Option<Value>,
     pub response_status: Option<u16>,
     pub response_body: Option<Value>,
+    /// The last surface response body as received, for steps that record it;
+    /// `response_body` keeps only the first JSON event of an event stream.
+    pub response_text: Option<String>,
     pub response_content_type: Option<String>,
     /// Headers of the last surface response, for steps that record them.
     pub response_headers: HashMap<String, String>,
@@ -440,6 +443,7 @@ impl G2gWorld {
             sent_body: None,
             response_status: None,
             response_body: None,
+            response_text: None,
             response_content_type: None,
             response_headers: HashMap::new(),
             response_elapsed: None,

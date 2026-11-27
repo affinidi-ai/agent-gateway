@@ -8910,9 +8910,17 @@ async fn handle_a2a_proxy_forward(
 
     let request_body_bytes = body_bytes;
     let (parts, body) = response.into_parts();
-    let dispatched_body = axum::body::to_bytes(body, usize::MAX)
-        .await
-        .unwrap_or_default();
+    let dispatched_body = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            channel_warn!(config_id, "GW2: Could not read the A2A proxy's answer: {}", error);
+            return axum_response_to_forward_result(crate::a2a::create_error_response(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "The A2A proxy's answer could not be read",
+            ))
+            .await;
+        }
+    };
     let connection_status = crate::proxy::handler::a2a_proxy_connection_status(parts.status, &dispatched_body);
     let response = axum::response::Response::from_parts(parts, axum::body::Body::from(dispatched_body));
     let response = match response_policy {
