@@ -11,8 +11,12 @@ Feature: A Transit Point's listen_path is held to the routes the gateway serves
   A listen_path outside the outbound prefix is served on the outbound
   listener's own address alone, so where an inbound listener shares that
   hostname, as it does here, the save that introduces one is refused as well;
-  a deployment whose outbound listener has a hostname of its own keeps it,
-  with a Warning on a path already stored.
+  a deployment whose outbound listener has a hostname of its own serves such a
+  path and stores it without a word. A path a surface already holds is answered
+  with a Warning rather than refused, and a path that is a route another Transit
+  Point answers on is refused when a save introduces it. A variant answers at
+  its base Transit Point's routes, so a variant listen_path the base point does
+  not hold is served nowhere and refused when a save introduces it.
 
   Background:
     Given A2A surface "example-surface" is defined for route "/example" with managed agent "example-agent" as its target
@@ -71,7 +75,35 @@ Feature: A Transit Point's listen_path is held to the routes the gateway serves
     Given Transit Point "charlie" routes to MCP server "delta"
     When the operator sets Transit Point "alpha" listen_path to "/outbound/example/charlie"
     Then the admin API response status is 400
+    And the admin API error response carries the code "listen_path_route_clash"
     And the admin API error response mentions "Transit Point 'charlie'"
+
+  Scenario: Saving a surface stored with a listen_path on another Transit Point's route warns about it
+    Given a surface "legacy-surface" is stored on route "/legacy" with Transit Point "gamma" listening on "/outbound/example/alpha"
+    When the operator changes the description of surface "legacy-surface"
+    Then the admin API response status is 200
+    And the admin API response carries a Warning header containing "listen_path '/outbound/example/alpha'"
+    And the admin API response carries a Warning header containing "Transit Point 'alpha' of surface 'example-surface'"
+
+  Scenario: The warning does not name a surface the saving token cannot read
+    Given the surface belongs to tenant "beta"
+    And a surface "legacy-surface" of tenant "acme" is stored on route "/legacy" with Transit Point "gamma" listening on "/outbound/example/alpha"
+    And a personal access token of tenant "acme"
+    When the personal access token changes the description of surface "legacy-surface"
+    Then the admin API response status is 200
+    And the admin API response carries a Warning header containing "a route a Transit Point of another surface answers on"
+    And the admin API response carries no Warning header containing "example-surface"
+
+  Scenario: A variant listen_path its base Transit Point does not hold is refused
+    When the operator adds variant "beta" in which Transit Point "alpha" has listen_path "/outbound/example/partner-beta"
+    Then the admin API response status is 400
+    And the admin API error response carries the code "listen_path_variant_unserved"
+    And the admin API error response mentions "Transit Point 'alpha' in variant 'beta'"
+
+  Scenario: A variant repeating its base Transit Point's listen_path is saved
+    Given the operator updates Transit Point "alpha" listen_path to "/outbound/example/partner-alpha"
+    When the operator adds variant "beta" in which Transit Point "alpha" has listen_path "/outbound/example/partner-alpha"
+    Then the admin API response status is 200
 
   Scenario: The surface routing settings name the prefixes a Transit Point may listen under
     When the operator reads the surface routing settings

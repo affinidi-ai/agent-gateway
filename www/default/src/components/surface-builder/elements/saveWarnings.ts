@@ -23,23 +23,31 @@ export function shownSaveWarnings(headerWarnings: readonly string[]): string[] {
 export interface SurfaceSaveToastOptions {
   /** Messages of the save response's `Warning` headers. */
   headerWarnings?: readonly string[];
+  /**
+   * What the save changed against the surface as it was stored, which `payload`, the
+   * saved surface, can no longer show, such as a Listen Path it cleared
+   * (`clearedListenPathWarnings`).
+   */
+  changeWarnings?: readonly string[];
 }
 
 /**
  * Shows a save in one toast, since a later toast replaces an earlier one:
  * `saved` alone, or with the save's warnings, the gateway's first (its
- * `Warning` headers but the Access Point's), then the dashboard's non-blocking
- * issues, each once.
+ * `Warning` headers but the Access Point's), then what the save changed, then the
+ * dashboard's non-blocking issues, each once.
  */
 export function showSurfaceSaveToast(
   saved: string,
   payload: unknown,
-  { headerWarnings = [] }: SurfaceSaveToastOptions = {}
+  { headerWarnings = [], changeWarnings = [] }: SurfaceSaveToastOptions = {}
 ): void {
   const fromDashboard = validateSurfacePayload(payload)
     .filter(i => i.severity === 'warning')
     .map(i => i.message);
-  const all = Array.from(new Set([...shownSaveWarnings(headerWarnings), ...fromDashboard]));
+  const all = Array.from(
+    new Set([...shownSaveWarnings(headerWarnings), ...changeWarnings, ...fromDashboard])
+  );
   if (all.length === 0) {
     showToast('success', saved);
     return;

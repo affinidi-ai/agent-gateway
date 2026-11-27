@@ -10,6 +10,8 @@ import { CanvasNode, getIncompleteReason } from '../components/surface-builder/S
 import {
   registry,
   validateSurfacePayload,
+  variantListenPathProblem,
+  clearedListenPathWarnings,
   buildCanvasBlob,
 } from '../components/surface-builder/elements';
 import {
@@ -47,6 +49,7 @@ import {
 import {
   useVariantSnapshots,
   BASE_VARIANT_ID,
+  propagateBaseListenPaths,
 } from '../components/surface-builder/variants/useVariantSnapshots';
 import {
   resolveVariant,
@@ -881,18 +884,19 @@ const SurfaceDetailPage: React.FC = () => {
    * against the base surface, or against nothing, therefore reads an untouched legacy
    * value as newly introduced and blocks a save that never touched it. `null` when the
    * view is not stored at all, such as a variant added in this session, where everything
-   * it carries really is new.
+   * it carries really is new. `of` reads the view from another surface, such as the
+   * one a save returns.
    */
-  const storedViewFor = (variantId: string): unknown => {
-    if (!surface) return null;
-    if (variantId === BASE_VARIANT_ID) return surface;
-    const variants: unknown = (surface as unknown as { variants?: unknown }).variants;
+  const storedViewFor = (variantId: string, of: AgentSurface | null = surface): unknown => {
+    if (!of) return null;
+    if (variantId === BASE_VARIANT_ID) return of;
+    const variants: unknown = (of as unknown as { variants?: unknown }).variants;
     const stored = Array.isArray(variants)
       ? (variants as Array<{ id?: unknown; overrides?: SurfaceOverrides }>).find(
           v => String(v?.id) === variantId
         )
       : undefined;
-    return stored ? resolveVariant(surface, stored.overrides) : null;
+    return stored ? resolveVariant(of, stored.overrides) : null;
   };
 
   /**
@@ -976,8 +980,16 @@ const SurfaceDetailPage: React.FC = () => {
       // Against the stored view the canvas is showing, which is a variant whenever one is
       // active, not the base surface underneath it.
       const activeId = variantSnapshots.activeVariantId ?? BASE_VARIANT_ID;
+      // A variant view may repeat a path its base point keeps, which the gateway exempts
+      // even in a variant added in this session, so each is also read against the base as
+      // stored and as this save sends it.
+      const baseDraft =
+        activeId === BASE_VARIANT_ID ? draftPayload : getVariantSnapshot(BASE_VARIANT_ID);
+      const baseFor = (vid: string) =>
+        vid === BASE_VARIANT_ID || !surface ? undefined : { stored: surface, draft: baseDraft };
       const issues = validateSurfacePayload(draftPayload, {
         stored: surface ? storedViewFor(activeId) : undefined,
+        base: baseFor(activeId),
       });
       const firstError = issues.find(i => i.severity === 'error');
       if (firstError) {
@@ -990,9 +1002,22 @@ const SurfaceDetailPage: React.FC = () => {
       // returns the last resolved payload for each id; for the active
       // variant we already used the live `draftPayload` above.
       const ids: string[] = [BASE_VARIANT_ID, ...variantSnapshots.variants.map(v => v.id)];
+      // Each inactive snapshot as the save will send it. A base Listen Path edit on the
+      // live canvas reaches the variants that held the old path only in
+      // `buildVariantsWireSlice`, so it is carried in here first: checked before it, a
+      // variant's stale copy of a path the base is repairing would block a save that
+      // never sends it. With a variant active, switching away from the base already did.
+      const snapshotsAsSaved: Record<string, unknown> =
+        activeId === BASE_VARIANT_ID
+          ? propagateBaseListenPaths(
+              Object.fromEntries(ids.map(id => [id, getVariantSnapshot(id)])),
+              getVariantSnapshot(BASE_VARIANT_ID),
+              draftPayload
+            )
+          : Object.fromEntries(ids.map(id => [id, getVariantSnapshot(id)]));
       for (const vid of ids) {
         if (vid === activeId) continue;
-        const snap = getVariantSnapshot(vid);
+        const snap = snapshotsAsSaved[vid];
         if (!snap) continue;
         const label =
           vid === BASE_VARIANT_ID
@@ -1058,7 +1083,10 @@ const SurfaceDetailPage: React.FC = () => {
         }
         // Each snapshot against its own stored view, so a legacy value this save never
         // touched stays exempt, as it is for the gateway.
-        const variantIssues = validateSurfacePayload(snap, { stored: storedViewFor(vid) });
+        const variantIssues = validateSurfacePayload(snap, {
+          stored: storedViewFor(vid),
+          base: baseFor(vid),
+        });
         const variantErr = variantIssues.find(i => i.severity === 'error');
         if (variantErr) {
           return {
@@ -1363,6 +1391,13 @@ const SurfaceDetailPage: React.FC = () => {
           payload = activePayload;
         }
       }
+      // Read on the wire payload, once a base Listen Path edit has been carried into the
+      // variants that held the old path, which the per-view checks above run before.
+      const unservedVariantPath = variantListenPathProblem(payload, surface);
+      if (unservedVariantPath) {
+        showBlockingToast({ message: unservedVariantPath });
+        return;
+      }
       payload.surface_id = surfaceId;
       payload.name = name;
       payload.description = description;
@@ -1391,6 +1426,17 @@ const SurfaceDetailPage: React.FC = () => {
         }
       );
       const serverWarnings = [...headerWarnings, ...saveWarningMessages(bodyWarnings)];
+      // Each view as saved against the same view as it was stored, so a Listen Path the
+      // save cleared is told after it, as the pre-save check cannot show a warning.
+      const storedViewIds: string[] = [
+        BASE_VARIANT_ID,
+        ...(
+          (surface as unknown as { variants?: Array<{ id?: unknown }> } | null)?.variants ?? []
+        ).map(v => String(v?.id)),
+      ];
+      const changeWarnings = storedViewIds.flatMap(vid =>
+        clearedListenPathWarnings(storedViewFor(vid, updated), storedViewFor(vid))
+      );
       setSavedWarnings({ surfaceId, warnings: shownSaveWarnings(serverWarnings) });
       setSurface(updated);
       setSaveCount(count => count + 1);
@@ -1484,6 +1530,7 @@ const SurfaceDetailPage: React.FC = () => {
       // transit points without being prevented from saving.
       showSurfaceSaveToast(`Agent Surface "${updated.name}" saved`, updated, {
         headerWarnings: serverWarnings,
+        changeWarnings,
       });
     } catch (err: any) {
       setError(err.message || 'Failed to save surface');

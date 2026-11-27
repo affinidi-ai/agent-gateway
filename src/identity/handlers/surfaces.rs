@@ -1288,6 +1288,8 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResp
 /// each JWT bearer method stored without an audience
 /// ([`AgentSurface::unchecked_audience_warnings`]), then one naming
 /// each Transit Point that serves callers it does not authenticate where other hosts reach it, each
+/// whose `listen_path` the gateway cannot serve ([`crate::proxy::server::listen_path_warnings`])
+/// or is a route another Transit Point answers on ([`listen_path_route_clash_warnings`]), each
 /// that accepts the Access Point's own tokens ([`shared_audience_warnings`]),
 /// each whose JWT verification strategy names an issuer the surface also
 /// accepts through another ([`shared_issuer_warnings`]), each whose DID comes
@@ -1314,6 +1316,9 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResp
 async fn save_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
+    others: &[AgentSurface],
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
 ) -> axum::http::HeaderMap {
     let issuers = jwt_strategy_issuers(state, surface).await;
     let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
@@ -1325,6 +1330,7 @@ async fn save_warnings(
         surface,
     )
     .await;
+    let route_clashes = stored_listen_path_route_clash_warnings(state, surface, others, context, scope);
     let mut headers = axum::http::HeaderMap::new();
     for warning in surface
         .access_point_warnings()
@@ -1336,6 +1342,7 @@ async fn save_warnings(
                 .filter_map(crate::proxy::server::OpenTransitPoint::exposure),
         )
         .chain(crate::proxy::server::listen_path_warnings(&state.network_config, surface))
+        .chain(route_clashes)
         .chain(shared_audience_warnings(surface))
         .chain(shared_issuer_warnings(surface, &issuers))
         .chain(unnamespaced_transit_claim_warnings(surface))
@@ -2355,12 +2362,17 @@ fn transit_point_listeners<'a>(
 /// points claim no custom path, so a path a variant override alone sets is
 /// still seen. `stored` is the surface as the gateway holds it, `None` on
 /// create.
+///
+/// Returns the surfaces it listed, empty when `surface` has no Transit Point,
+/// so [`save_warnings`] compares against them without listing the store again.
 async fn validate_listen_paths(
     surface: &AgentSurface,
     stored: Option<&AgentSurface>,
     store: &std::sync::Arc<crate::surfaces::FileSystemAgentSurfaceStore>,
     network_config: &crate::config::NetworkConfig,
-) -> Result<(), SurfaceApiError> {
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
+) -> Result<Vec<AgentSurface>, SurfaceApiError> {
     check_listen_paths(surface, stored, network_config)?;
 
     let resolve_port = |addr: &str| network_config.map_url_to_port_for_type(addr, Some("outbound"));
@@ -2372,7 +2384,7 @@ async fn validate_listen_paths(
         .next()
         .is_none()
     {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let existing = store
@@ -2380,8 +2392,12 @@ async fn validate_listen_paths(
         .await
         .map_err(|e| SurfaceApiError::InternalError(format!("Failed to list surfaces for route validation: {}", e)))?;
 
-    check_listen_path_shadowing(surface, stored, &existing, &resolve_port)?;
-    check_listen_path_collisions(surface, &existing, resolve_port)
+    // A refusal names another surface only where the caller may read it, as
+    // the save's Warning does.
+    let visible = |other: &AgentSurface| surface_visible(other.tenant_id.as_deref(), &other.surface_id, context, scope);
+    check_listen_path_shadowing(surface, stored, &existing, &resolve_port, &visible)?;
+    check_listen_path_collisions(surface, &existing, resolve_port)?;
+    Ok(existing)
 }
 
 /// Refuse a `listen_path` that is a route another Transit Point is reached at
@@ -2405,51 +2421,32 @@ async fn validate_listen_paths(
 ///
 /// Only a path this save introduces or changes is refused, as in
 /// [`check_listen_paths`], so a surface stored with such a clash stays
-/// editable; the listener build still logs it.
+/// editable; its save is answered with a `Warning` of the same text
+/// ([`listen_path_route_clash_warnings`]), and the listener build still logs it.
+///
+/// A refusal names another surface and its Transit Point only where `visible`
+/// says the caller may read that surface; otherwise it says the route or path
+/// is another surface's, so probing listen paths discloses no other tenant's
+/// names.
 fn check_listen_path_shadowing(
     surface: &AgentSurface,
     stored: Option<&AgentSurface>,
     others: &[AgentSurface],
     resolve_port: &impl Fn(&str) -> Option<u16>,
+    visible: &impl Fn(&AgentSurface) -> bool,
 ) -> Result<(), SurfaceApiError> {
     if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
         return Ok(());
     }
-    let kept: std::collections::HashSet<(ListenerKey, String)> = claiming_stored_surface(stored)
+    // Keyed by point as well as path: the same path moved to another or a
+    // renamed Transit Point is a new claim.
+    let kept: std::collections::HashSet<(ListenerKey, String, String)> = claiming_stored_surface(stored)
         .map(|stored| {
-            outbound_listen_path_claims(stored, resolve_port)
-                .into_iter()
+            transit_point_listeners(stored, resolve_port)
+                .filter_map(|(key, tp)| Some((key, tp.alias.clone(), registered_path(tp.listen_path.as_deref()?))))
                 .collect()
         })
         .unwrap_or_default();
-
-    // Every derived route on every listener, with the point and surface it
-    // belongs to. The surface being saved is held as `Mine`, never by name or
-    // id: two surfaces may carry the same name, and an id is empty on a create,
-    // so only the walk itself says whose route this is. It is inserted last, so
-    // its own routes win over another surface's identical entry and the
-    // exemption below still applies.
-    let mut derived: std::collections::HashMap<(ListenerKey, String), RouteOwner> = std::collections::HashMap::new();
-    let active_others = || {
-        others.iter().filter(|other| {
-            other.surface_id != surface.surface_id
-                && other.status != crate::config::agent_surface::SurfaceStatus::Disabled
-        })
-    };
-    for owner in active_others() {
-        for (key, route, point) in outbound_derived_route_claims(owner, resolve_port) {
-            derived.insert(
-                (key, route),
-                RouteOwner::Theirs {
-                    surface: owner.name.clone(),
-                    point,
-                },
-            );
-        }
-    }
-    for (key, route, point) in outbound_derived_route_claims(surface, resolve_port) {
-        derived.insert((key, route), RouteOwner::Mine { point });
-    }
 
     // The other direction: a route this save introduces, from a new point, a
     // new variant or a changed surface route, landing on a `listen_path`
@@ -2464,9 +2461,11 @@ fn check_listen_path_shadowing(
                 .collect()
         })
         .unwrap_or_default();
-    let mut claimed_paths: std::collections::HashMap<(ListenerKey, String), (String, String)> =
+    // The owner's surface name and Transit Point alias, `None` where the
+    // caller may not read that surface.
+    let mut claimed_paths: std::collections::HashMap<(ListenerKey, String), Option<(String, String)>> =
         std::collections::HashMap::new();
-    for other in active_others() {
+    for other in active_other_surfaces(surface, others) {
         for (key, path) in outbound_listen_path_claims(other, resolve_port) {
             for (_, point) in transit_point_listeners(other, resolve_port) {
                 if point
@@ -2476,7 +2475,10 @@ fn check_listen_path_shadowing(
                     .as_deref()
                     == Some(path.as_str())
                 {
-                    claimed_paths.insert((key.clone(), path.clone()), (other.name.clone(), point.alias.clone()));
+                    claimed_paths.insert(
+                        (key.clone(), path.clone()),
+                        visible(other).then(|| (other.name.clone(), point.alias.clone())),
+                    );
                     break;
                 }
             }
@@ -2487,13 +2489,16 @@ fn check_listen_path_shadowing(
         if kept_routes.contains(&claim) {
             continue;
         }
-        if let Some((owner, owner_alias)) = claimed_paths.get(&claim) {
+        if let Some(owner) = claimed_paths.get(&claim) {
+            let whose = match owner {
+                Some((owner, owner_alias)) => format!("Transit Point '{owner_alias}' of surface '{owner}'"),
+                None => "a Transit Point of another surface".to_string(),
+            };
             return Err(SurfaceApiError::BadRequestCode(
                 crate::proxy::server::LISTEN_PATH_ROUTE_CLASH,
                 format!(
-                    "{} answers on {route} on {}, which is the listen_path of Transit Point '{owner_alias}' of \
-                     surface '{owner}'; the listener would register one of the two and skip the other, so change \
-                     one of them",
+                    "{} answers on {route} on {}, which is the listen_path of {whose}; the listener would register \
+                     one of the two and skip the other, so change one of them",
                     point.describe(),
                     key.label("outbound")
                 ),
@@ -2501,6 +2506,84 @@ fn check_listen_path_shadowing(
         }
     }
 
+    for clash in listen_path_route_clashes(surface, others, resolve_port, visible) {
+        let claim = (clash.key.clone(), clash.path.clone());
+        // A path the same Transit Point already held is exempt, unless the route it now
+        // clashes with is one of this surface's own that this save introduces:
+        // adding a point whose derived route is an older point's path is the
+        // same clash, arriving from the other side, and the save that
+        // introduces it is this one. Another surface's route is never this
+        // save's to introduce.
+        let introduced_here = clash.on_own_route && !kept_routes.contains(&claim);
+        if kept.contains(&(clash.key, clash.alias, clash.path)) && !introduced_here {
+            continue;
+        }
+        return Err(SurfaceApiError::BadRequestCode(crate::proxy::server::LISTEN_PATH_ROUTE_CLASH, clash.message));
+    }
+
+    Ok(())
+}
+
+/// The surfaces in `others` whose routes the outbound listener registers beside
+/// `surface`'s: every one but `surface` itself, and none that is disabled.
+fn active_other_surfaces<'a>(
+    surface: &'a AgentSurface,
+    others: &'a [AgentSurface],
+) -> impl Iterator<Item = &'a AgentSurface> + 'a {
+    others.iter().filter(|other| {
+        other.surface_id != surface.surface_id && other.status != crate::config::agent_surface::SurfaceStatus::Disabled
+    })
+}
+
+/// One `listen_path` of the surface being saved that is a route another
+/// Transit Point answers on ([`listen_path_route_clashes`]).
+struct ListenPathRouteClash {
+    key: ListenerKey,
+    alias: String,
+    /// The path as the listener registers it ([`registered_path`]).
+    path: String,
+    /// Whether the route it lands on is one of the saved surface's own.
+    on_own_route: bool,
+    /// What the operator is told, as the refusal of a save that introduces
+    /// the clash or as the `Warning` of one that keeps it.
+    message: String,
+}
+
+/// Every `listen_path` of `surface` that is a route another Transit Point
+/// answers on, of this surface or of an active one in `others`, whatever the
+/// stored surface held: [`check_listen_path_shadowing`] refuses the ones a
+/// save introduces, and [`listen_path_route_clash_warnings`] tells the rest.
+///
+/// `names_owner` says whether a message may name another surface and its
+/// Transit Point; one it may not is called another surface's route alone.
+fn listen_path_route_clashes(
+    surface: &AgentSurface,
+    others: &[AgentSurface],
+    resolve_port: &impl Fn(&str) -> Option<u16>,
+    names_owner: &impl Fn(&AgentSurface) -> bool,
+) -> Vec<ListenPathRouteClash> {
+    // Every derived route on every listener, with the point and surface it
+    // belongs to. The surface being saved is held as `Mine`, never by name or
+    // id: two surfaces may carry the same name, and an id is empty on a create,
+    // so only the walk itself says whose route this is. It is inserted last, so
+    // its own routes win over another surface's identical entry and the
+    // exemption in the save gate still applies.
+    let mut derived: std::collections::HashMap<(ListenerKey, String), RouteOwner> = std::collections::HashMap::new();
+    for owner in active_other_surfaces(surface, others) {
+        for (key, route, point) in outbound_derived_route_claims(owner, resolve_port) {
+            derived.insert(
+                (key, route),
+                RouteOwner::Theirs {
+                    named: names_owner(owner).then(|| (owner.name.clone(), point)),
+                },
+            );
+        }
+    }
+    for (key, route, point) in outbound_derived_route_claims(surface, resolve_port) {
+        derived.insert((key, route), RouteOwner::Mine { point });
+    }
+
+    let mut clashes = Vec::new();
     for (key, tp) in transit_point_listeners(surface, resolve_port) {
         let Some(path) = tp
             .listen_path
@@ -2511,9 +2594,6 @@ fn check_listen_path_shadowing(
         };
         let path = &path;
         let claim = (key.clone(), path.clone());
-        if kept.contains(&claim) {
-            continue;
-        }
         // A point claiming its own derived route changes nothing: that route is
         // registered for it either way and reaches the Target it names. Only
         // that one route is exempt, never a variant form of it, which is a
@@ -2545,25 +2625,76 @@ fn check_listen_path_shadowing(
                     point.describe()
                 )
             }
-            Some(RouteOwner::Theirs { surface, point }) => {
+            Some(RouteOwner::Theirs { named: Some((surface, point)) }) => {
                 format!(
                     "the route {} of surface '{surface}' answers on, so the listener would register one of the \
                      two and skip the other",
                     point.describe()
                 )
             }
+            Some(RouteOwner::Theirs { named: None }) => "a route a Transit Point of another surface answers on, so \
+                                                         the listener would register one of the two and skip the \
+                                                         other"
+                .to_string(),
         };
-        return Err(SurfaceApiError::BadRequestCode(
-            crate::proxy::server::LISTEN_PATH_ROUTE_CLASH,
-            format!(
-                "listen_path '{}' on {} is {reason}; choose a different listener path",
-                path,
-                key.label("outbound")
-            ),
-        ));
+        let message = format!(
+            "Transit Point '{}' has listen_path '{}' on {}, which is {reason}; choose a different listener path",
+            tp.alias,
+            path,
+            key.label("outbound")
+        );
+        clashes.push(ListenPathRouteClash {
+            on_own_route: matches!(derived.get(&claim), Some(RouteOwner::Mine { .. })),
+            key,
+            alias: tp.alias.clone(),
+            path: path.clone(),
+            message,
+        });
     }
+    clashes
+}
 
-    Ok(())
+/// What an operator is told on a save about each `listen_path` of `surface`
+/// that is a route another Transit Point answers on
+/// ([`listen_path_route_clashes`]). The save that introduces one is refused
+/// ([`check_listen_path_shadowing`]), so a warning is what a clash the surface
+/// is already stored with gets. A disabled surface registers no route, so it
+/// clashes with nothing. Another surface is named only where `visible` says
+/// the caller may read it, so the header discloses nothing a read would not.
+fn listen_path_route_clash_warnings(
+    surface: &AgentSurface,
+    others: &[AgentSurface],
+    resolve_port: &impl Fn(&str) -> Option<u16>,
+    visible: &impl Fn(&AgentSurface) -> bool,
+) -> Vec<String> {
+    if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+        return Vec::new();
+    }
+    listen_path_route_clashes(surface, others, resolve_port, visible)
+        .into_iter()
+        .map(|clash| clash.message)
+        .collect()
+}
+
+/// [`listen_path_route_clash_warnings`] for a surface just saved, against
+/// `others`, the surfaces [`validate_listen_paths`] listed for the same save,
+/// naming only those the caller may read ([`surface_visible`] for `context`
+/// and `scope`).
+fn stored_listen_path_route_clash_warnings(
+    state: &IdentityApiState,
+    surface: &AgentSurface,
+    others: &[AgentSurface],
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
+) -> Vec<String> {
+    let resolve_port = |addr: &str| {
+        state
+            .network_config
+            .map_url_to_port_for_type(addr, Some("outbound"))
+    };
+    listen_path_route_clash_warnings(surface, others, &resolve_port, &|other: &AgentSurface| {
+        surface_visible(other.tenant_id.as_deref(), &other.surface_id, context, scope)
+    })
 }
 
 /// Whose Transit Point answers on a derived route: the surface being saved, or
@@ -2571,8 +2702,14 @@ fn check_listen_path_shadowing(
 /// route, so no two surfaces can be confused for sharing a name or an id.
 #[derive(Debug)]
 enum RouteOwner {
-    Mine { point: RoutePoint },
-    Theirs { surface: String, point: RoutePoint },
+    Mine {
+        point: RoutePoint,
+    },
+    /// Another surface's, with its name and point where the message may name
+    /// them, `None` where the caller may not read that surface.
+    Theirs {
+        named: Option<(String, RoutePoint)>,
+    },
 }
 
 /// The stored surface a save's exemptions may rest on: none while that surface
@@ -2606,9 +2743,12 @@ fn claiming_stored_surface(stored: Option<&AgentSurface>) -> Option<&AgentSurfac
 ///
 /// Only a path this save introduces or changes is refused: the same Transit
 /// Point, in the same variant, keeping the same path is exempt, so a surface
-/// stored with such a path before this release stays editable, while moving a
-/// path, copying it into a variant, or renaming the point or the variant is a
-/// new claim. A disabled surface registers no route, and is skipped as
+/// stored with such a path before this release stays editable, as is a variant
+/// repeating the path its base point holds in this save and held before it
+/// ([`crate::proxy::server::inherits_a_kept_base_claim`]). Moving a path,
+/// copying the base point's old path into a variant in the save that moves it,
+/// or renaming the point or the variant is a new claim. A disabled surface
+/// registers no route, and is skipped as
 /// `check_listen_path_collisions` skips it; it claims nothing either
 /// ([`claiming_stored_surface`]).
 fn check_listen_paths(
@@ -2622,8 +2762,10 @@ fn check_listen_paths(
     let kept = crate::proxy::server::kept_listen_path_claims(claiming_stored_surface(stored));
     match crate::proxy::server::listen_path_problems(surface, network_config)
         .into_iter()
-        .find(|problem| !kept.contains(&problem.claim))
-    {
+        .find(|problem| {
+            !kept.contains(&problem.claim)
+                && !crate::proxy::server::inherits_a_kept_base_claim(&problem.claim, &kept, surface)
+        }) {
         Some(problem) => Err(SurfaceApiError::BadRequestCode(problem.code, problem.message)),
         None => Ok(()),
     }
@@ -3803,7 +3945,15 @@ pub async fn create_surface(
     // Reject outbound listener paths the gateway does not serve, and
     // overlapping ones before they can reach the Axum router and panic the
     // gateway on rebuild.
-    validate_listen_paths(&surface, None, store, &state.network_config).await?;
+    let others = validate_listen_paths(
+        &surface,
+        None,
+        store,
+        &state.network_config,
+        tenant_context(&context),
+        resource_scope(&scope),
+    )
+    .await?;
 
     // Reject duplicate access point routes — two surfaces on the same
     // (listen_address, route) would cause one to silently never receive traffic.
@@ -3878,7 +4028,7 @@ pub async fn create_surface(
 
     Ok((
         StatusCode::CREATED,
-        save_warnings(&state, &surface).await,
+        save_warnings(&state, &surface, &others, tenant_context(&context), resource_scope(&scope)).await,
         SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, surface).await, warnings),
     ))
 }
@@ -3972,7 +4122,7 @@ pub async fn update_surface(
     retain_browser_origins(&mut surface, &existing, &sent);
     super::surface_response_auth::retain_response_auth(&mut surface, &existing, &sent);
 
-    let (saved, warnings) = validate_and_save_surface(
+    let (saved, warnings, others) = validate_and_save_surface(
         &state,
         store,
         surface,
@@ -3985,7 +4135,7 @@ pub async fn update_surface(
     )
     .await?;
     Ok((
-        save_warnings(&state, &saved).await,
+        save_warnings(&state, &saved, &others, tenant_context(&context), resource_scope(&scope)).await,
         SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, saved).await, warnings),
     ))
 }
@@ -4765,7 +4915,8 @@ async fn validate_mcp_resource_declarations(
 /// PATCH on `/v1/surfaces/{id}`. The caller is responsible for resolving
 /// `surface_id`/`existing` and asserting that the surface already exists
 /// (PUT/PATCH semantics differ from POST on first-write). Takes `surface`
-/// by value so it can be returned to the caller without a defensive clone.
+/// by value so it can be returned to the caller without a defensive clone,
+/// beside the surfaces [`validate_listen_paths`] listed, for [`save_warnings`].
 async fn validate_and_save_surface(
     state: &IdentityApiState,
     store: &std::sync::Arc<crate::surfaces::FileSystemAgentSurfaceStore>,
@@ -4776,7 +4927,7 @@ async fn validate_and_save_surface(
     resource_scoped: bool,
     actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
     signing_editor: &super::signing_choice::SigningEditor,
-) -> Result<(AgentSurface, Vec<SurfaceWarning>), SurfaceApiError> {
+) -> Result<(AgentSurface, Vec<SurfaceWarning>, Vec<AgentSurface>), SurfaceApiError> {
     drop_inbound_api_key_ids(&mut surface);
     // Normalize the route BEFORE the shape check so the historical "missing
     // slash is auto-fixed" behaviour is preserved.
@@ -4829,7 +4980,7 @@ async fn validate_and_save_surface(
     validate_trust_checks(&surface)?;
     super::surface_tenancy::validate_authority_sources(state, &mut surface, existing).await?;
     super::surface_tenancy::validate_external_consent_bindings(state, &mut surface, existing).await?;
-    validate_listen_paths(&surface, existing, store, &state.network_config).await?;
+    let others = validate_listen_paths(&surface, existing, store, &state.network_config, context, scope).await?;
     validate_access_point_route_collisions(&surface, store, &state.network_config).await?;
     let warnings = validate_surface_payment_policies(state.gateway_store.as_ref(), &mut surface, existing).await?;
     validate_delegation_source_auth(&surface)?;
@@ -4890,7 +5041,7 @@ async fn validate_and_save_surface(
 
     apply_surface_change(state, SurfaceChange::Upsert(&surface)).await;
 
-    Ok((surface, warnings))
+    Ok((surface, warnings, others))
 }
 
 /// Whether an edit added, removed or changed the entries of the surface's Trust Recorder or
@@ -5020,7 +5171,7 @@ pub async fn patch_surface(
         refuse_a2a_settings_sent_on_other_protocols(&surface)?;
     }
 
-    let (saved, warnings) = validate_and_save_surface(
+    let (saved, warnings, others) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -5033,7 +5184,7 @@ pub async fn patch_surface(
     )
     .await?;
     Ok((
-        save_warnings(&state, &saved).await,
+        save_warnings(&state, &saved, &others, tenant_context(&context), resource_scope(&scope)).await,
         SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, saved).await, warnings),
     ))
 }
@@ -5142,7 +5293,7 @@ pub async fn patch_variant(
     super::surface_tenancy::forget_mcp_proxy_pins(&mut surface);
     surface.variants[variant_index] = new_variant;
 
-    let (saved, warnings) = validate_and_save_surface(
+    let (saved, warnings, others) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -5155,7 +5306,7 @@ pub async fn patch_variant(
     )
     .await?;
     Ok((
-        save_warnings(&state, &saved).await,
+        save_warnings(&state, &saved, &others, tenant_context(&context), resource_scope(&scope)).await,
         SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, saved).await, warnings),
     ))
 }
@@ -5894,7 +6045,7 @@ pub async fn create_variant(
         .variants
         .push(new_variant.clone());
 
-    let (saved, warnings) = validate_and_save_surface(
+    let (saved, warnings, others) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -5915,7 +6066,7 @@ pub async fn create_variant(
 
     info!("Created variant '{}' (id={}) on surface '{}'", new_variant.alias, new_variant.id, surface_id);
 
-    let mut headers = save_warnings(&state, &saved).await;
+    let mut headers = save_warnings(&state, &saved, &others, tenant_context(&context), resource_scope(&scope)).await;
     if left_out_target_binding && let Some(value) = warning_header(&copied_target_binding_warning(&new_variant.alias)) {
         headers.append(axum::http::header::WARNING, value);
     }
@@ -6065,7 +6216,7 @@ pub async fn update_variant(
     }
     settle_retained_protected_resources(&mut surface, false, &retained, &state.network_config)?;
 
-    let (saved, warnings) = validate_and_save_surface(
+    let (saved, warnings, others) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -6093,7 +6244,7 @@ pub async fn update_variant(
     info!("Updated variant '{}' (id={}) on surface '{}'", updated.alias, updated.id, surface_id);
 
     Ok((
-        save_warnings(&state, &saved).await,
+        save_warnings(&state, &saved, &others, tenant_context(&context), resource_scope(&scope)).await,
         SurfaceSaveResponse::new(SurfaceResponse::variant(updated, &saved), warnings),
     ))
 }
@@ -6219,7 +6370,7 @@ pub async fn promote_variant_to_default(
     let variant_alias = variant.alias.clone();
     surface.default_variant_id = Some(variant_id.clone());
 
-    let (saved, warnings) = validate_and_save_surface(
+    let (saved, warnings, others) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -6235,7 +6386,7 @@ pub async fn promote_variant_to_default(
     info!("Promoted variant '{}' (id={}) to default on surface '{}'", variant_alias, variant_id, surface_id);
 
     Ok((
-        save_warnings(&state, &saved).await,
+        save_warnings(&state, &saved, &others, tenant_context(&context), resource_scope(&scope)).await,
         SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, saved).await, warnings),
     ))
 }
@@ -9776,6 +9927,77 @@ mod validation_tests {
         None
     }
 
+    /// [`super::check_listen_path_shadowing`] for a caller that may read every
+    /// surface, which is what the tests of the rule itself need.
+    fn check_listen_path_shadowing(
+        surface: &AgentSurface,
+        stored: Option<&AgentSurface>,
+        others: &[AgentSurface],
+        resolve_port: &impl Fn(&str) -> Option<u16>,
+    ) -> Result<(), SurfaceApiError> {
+        super::check_listen_path_shadowing(surface, stored, others, resolve_port, &|_| true)
+    }
+
+    /// Both refusals name another surface and its Transit Point only for a
+    /// caller that may read that surface, as the save's Warning does.
+    #[test]
+    fn a_route_clash_refusal_names_another_surface_only_where_the_caller_may_read_it() {
+        let refusal =
+            |surface: &AgentSurface, other: &AgentSurface, visible: bool| match super::check_listen_path_shadowing(
+                surface,
+                None,
+                std::slice::from_ref(other),
+                &no_ports,
+                &|_| visible,
+            ) {
+                Err(SurfaceApiError::BadRequestCode(code, message)) => {
+                    assert_eq!(code, crate::proxy::server::LISTEN_PATH_ROUTE_CLASH);
+                    message
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            };
+
+        // This save's path on another surface's derived route.
+        let mut other = surface_with_points(
+            "s1",
+            "other",
+            serde_json::json!([{ "alias": "alpha", "target_endpoint": "https://a.example", "protocol": "a2a" }]),
+        );
+        other.access_point.route = "/agents/a".to_string();
+        let mut claiming = surface_with_points(
+            "s2",
+            "one",
+            serde_json::json!([{ "alias": "beta", "target_endpoint": "https://b.example", "protocol": "a2a",
+                                 "listen_path": "/outbound/agents/a/alpha" }]),
+        );
+        claiming.access_point.route = "/agents/b".to_string();
+        let named = refusal(&claiming, &other, true);
+        assert!(named.contains("Transit Point 'alpha' of surface 'other'"), "{named}");
+        let hidden = refusal(&claiming, &other, false);
+        assert!(hidden.contains("a Transit Point of another surface"), "{hidden}");
+        assert!(!hidden.contains("'other'") && !hidden.contains("'alpha'"), "{hidden}");
+
+        // This save's derived route on another surface's path.
+        let mut holder = surface_with_points(
+            "s3",
+            "holder",
+            serde_json::json!([{ "alias": "gamma", "target_endpoint": "https://c.example", "protocol": "a2a",
+                                 "listen_path": "/outbound/agents/b/delta" }]),
+        );
+        holder.access_point.route = "/agents/c".to_string();
+        let mut adding = surface_with_points(
+            "s2",
+            "one",
+            serde_json::json!([{ "alias": "delta", "target_endpoint": "https://d.example", "protocol": "a2a" }]),
+        );
+        adding.access_point.route = "/agents/b".to_string();
+        let named = refusal(&adding, &holder, true);
+        assert!(named.contains("Transit Point 'gamma' of surface 'holder'"), "{named}");
+        let hidden = refusal(&adding, &holder, false);
+        assert!(hidden.contains("the listen_path of a Transit Point of another surface"), "{hidden}");
+        assert!(!hidden.contains("'holder'") && !hidden.contains("'gamma'"), "{hidden}");
+    }
+
     #[test]
     fn listen_path_claims_uses_channel_address_when_tp_has_none() {
         let s = surface_with_tp("s1", "one", "0.0.0.0:9443", "partner", "/hook");
@@ -10091,6 +10313,95 @@ mod validation_tests {
             .expect("a path under the derived route is a route of its own");
     }
 
+    /// The clash with another surface's route is that surface's save to
+    /// introduce, so this surface's unrelated saves stay open.
+    #[test]
+    fn a_stored_path_on_another_surfaces_derived_route_stays_editable() {
+        let mut other = surface_with_points(
+            "s1",
+            "other",
+            serde_json::json!([{ "alias": "alpha", "target_endpoint": "https://a.example", "protocol": "a2a" }]),
+        );
+        other.access_point.route = "/agents/a".to_string();
+
+        let mut stored = surface_with_points(
+            "s2",
+            "one",
+            serde_json::json!([{ "alias": "beta", "target_endpoint": "https://b.example", "protocol": "a2a",
+                                 "listen_path": "/outbound/agents/a/alpha" }]),
+        );
+        stored.access_point.route = "/agents/b".to_string();
+
+        check_listen_path_shadowing(&stored, Some(&stored), std::slice::from_ref(&other), &no_ports)
+            .expect("a path the surface already held, saved unchanged, is exempt");
+
+        // Exempt, and still told: the save answers it with a Warning.
+        let warnings = listen_path_route_clash_warnings(&stored, std::slice::from_ref(&other), &no_ports, &|_| true);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("Transit Point 'beta' has listen_path '/outbound/agents/a/alpha'"),
+            "names the point whose path must change: {warnings:?}"
+        );
+        assert!(warnings[0].contains("Transit Point 'alpha' of surface 'other'"), "{warnings:?}");
+        // A caller that may not read the other surface is told of the clash
+        // without its name or its Transit Point's alias.
+        let hidden = listen_path_route_clash_warnings(&stored, std::slice::from_ref(&other), &no_ports, &|_| false);
+        assert_eq!(hidden.len(), 1, "{hidden:?}");
+        assert!(hidden[0].contains("a Transit Point of another surface"), "{hidden:?}");
+        assert!(!hidden[0].contains("'other'") && !hidden[0].contains("'alpha'"), "{hidden:?}");
+        let mut disabled = stored.clone();
+        disabled.status = SurfaceStatus::Disabled;
+        assert!(
+            listen_path_route_clash_warnings(&disabled, std::slice::from_ref(&other), &no_ports, &|_| true).is_empty(),
+            "a disabled surface registers no route, so it clashes with nothing"
+        );
+
+        let mut renamed = stored.clone();
+        renamed
+            .transit
+            .as_mut()
+            .expect("transit")
+            .points[0]
+            .alias = "gamma".to_string();
+        match check_listen_path_shadowing(&renamed, Some(&stored), std::slice::from_ref(&other), &no_ports) {
+            Err(SurfaceApiError::BadRequestCode(code, _)) => {
+                assert_eq!(code, crate::proxy::server::LISTEN_PATH_ROUTE_CLASH)
+            }
+            result => panic!("the path held by another Transit Point is a new claim, got {result:?}"),
+        }
+    }
+
+    /// A new point whose derived route is an older point's held path is the
+    /// clash arriving from the other side, and this save introduces it.
+    #[test]
+    fn a_new_point_on_an_older_points_held_path_is_refused() {
+        let stored = surface_with_points(
+            "s1",
+            "one",
+            serde_json::json!([{ "alias": "pa", "target_endpoint": "https://a.example", "protocol": "a2a",
+                                 "listen_path": "/outbound/api/pc" }]),
+        );
+        let mut added = stored.clone();
+        added
+            .transit
+            .as_mut()
+            .expect("transit")
+            .points
+            .push(
+                serde_json::from_value(serde_json::json!({
+                    "alias": "pc", "target_endpoint": "https://c.example", "protocol": "a2a"
+                }))
+                .expect("point fixture"),
+            );
+
+        match check_listen_path_shadowing(&added, Some(&stored), &[], &no_ports) {
+            Err(SurfaceApiError::BadRequestCode(code, _)) => {
+                assert_eq!(code, crate::proxy::server::LISTEN_PATH_ROUTE_CLASH)
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
     #[test]
     fn collision_check_accepts_unique_paths_across_surfaces() {
         let a = surface_with_tp("s1", "one", "0.0.0.0:9443", "pa", "/hook-a");
@@ -10268,8 +10579,10 @@ mod validation_tests {
             });
         }
 
-        let variant_only = surface_with_a_variant_only_listen_path("/transit/pb");
-        listen_path_check(&variant_only, None).expect("a variant's path under a surface prefix saves too");
+        // Under a surface prefix and still refused: no route is registered for
+        // an alias only a variant defines.
+        let (code, _) = listen_path_refusal(&surface_with_a_variant_only_listen_path("/transit/pb"), None);
+        assert_eq!(code, crate::proxy::server::LISTEN_PATH_VARIANT_UNSERVED);
     }
 
     #[test]
@@ -10369,8 +10682,70 @@ mod validation_tests {
         // alone, so this alias has none and the path adds none.
         let under_the_prefix = surface_with_a_variant_only_listen_path("/outbound/api/partner-b");
         let (code, msg) = listen_path_refusal(&under_the_prefix, None);
-        assert_eq!(code, crate::proxy::server::LISTEN_PATH_VARIANT_ONLY);
+        assert_eq!(code, crate::proxy::server::LISTEN_PATH_VARIANT_UNSERVED);
         assert!(msg.contains("Define the alias in the base surface too"), "{msg}");
+    }
+
+    /// A surface whose base point `pa` holds `base_path` and whose variant
+    /// `candidate` overrides `pa` with `variant_path`, or with no path.
+    fn surface_with_a_variant_copy(
+        base_path: &str,
+        variant_path: Option<&str>,
+    ) -> AgentSurface {
+        let mut surface = with_transit(
+            base_surface(),
+            serde_json::json!({
+                "outbound_listen_address": "0.0.0.0:9443",
+                "points": [{ "alias": "pa", "target_endpoint": "https://a.example.com", "protocol": "a2a",
+                             "listen_path": base_path }],
+            }),
+        );
+        surface.variants = serde_json::from_value(serde_json::json!([{
+            "id": "candidate",
+            "alias": "candidate",
+            "name": "Candidate",
+            "overrides": { "transit": { "points": [{
+                "alias": "pa",
+                "target_endpoint": "https://b.example.com",
+                "protocol": "a2a",
+                "listen_path": variant_path,
+            }] } },
+        }]))
+        .expect("variant fixture");
+        surface
+    }
+
+    /// A variant copy of the base path the variant already held is kept, so a
+    /// save that moves the base path stores it with a Warning rather than
+    /// refusing it; one the same save sets is introduced, and refused.
+    #[test]
+    fn a_variant_copy_of_the_old_base_path_is_kept_only_where_the_variant_held_it() {
+        let stored = surface_with_a_variant_copy("/outbound/api/old", Some("/outbound/api/old"));
+        let saved = surface_with_a_variant_copy("/outbound/api/new", Some("/outbound/api/old"));
+
+        listen_path_check(&saved, Some(&stored)).expect("the variant's own stored copy is held");
+
+        // Set in this save rather than kept: equal to the stored base point's
+        // path only, which the same save moves, so nothing registers it.
+        for variant_path in [None, Some("/outbound/api/other")] {
+            let stored = surface_with_a_variant_copy("/outbound/api/old", variant_path);
+            let (code, msg) = listen_path_refusal(&saved, Some(&stored));
+            assert_eq!(code, crate::proxy::server::LISTEN_PATH_VARIANT_UNSERVED, "{variant_path:?}");
+            assert!(msg.contains("which here is '/outbound/api/new'"), "{msg}");
+        }
+
+        // The base point keeping its path keeps the variant's copy exempt.
+        let unmoved = surface_with_a_variant_copy("/outbound/api/old", Some("/outbound/api/old"));
+        listen_path_check(&unmoved, Some(&surface_with_a_variant_copy("/outbound/api/old", None)))
+            .expect("a variant repeating its base point's path adds no route");
+
+        let warnings = crate::proxy::server::listen_path_warnings(&network_with_channels(), &saved);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("Transit Point 'pa' in variant 'candidate'"), "{warnings:?}");
+        assert!(warnings[0].contains("which here is '/outbound/api/new'"), "{warnings:?}");
+
+        let (code, _) = listen_path_refusal(&saved, None);
+        assert_eq!(code, crate::proxy::server::LISTEN_PATH_VARIANT_UNSERVED);
     }
 
     #[test]

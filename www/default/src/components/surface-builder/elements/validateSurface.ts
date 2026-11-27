@@ -66,6 +66,68 @@ function text(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+/** The Transit Points a variant entry of a surface overrides, or none. */
+function variantTransitPoints(variant: unknown): StoredTransitPoint[] {
+  const points = (variant as { overrides?: { transit?: { points?: unknown } } } | null)?.overrides
+    ?.transit?.points;
+  return Array.isArray(points) ? (points as StoredTransitPoint[]) : [];
+}
+
+/**
+ * The first variant Listen Path in a wire payload that no route serves, as the gateway's
+ * `listen_path_variant_unserved` refusal says it, or `null`.
+ *
+ * The outbound listener registers routes from the base surface's Transit Points alone and
+ * builds each variant's from the base point's alias and path, so a variant's own path is
+ * served only where the base point holds the same path. As the gateway does, a path the
+ * same variant's copy of that point already held in `stored` is exempt, and answered with
+ * a `Warning` instead; a disabled surface, stored or saved, claims nothing. This reads the
+ * wire payload, after `buildVariantsWireSlice` has carried a base path edit into the
+ * variants that held the old one (`propagateBaseListenPaths`), since a per-view check runs
+ * before that and would read those copies as stale.
+ */
+export function variantListenPathProblem(payload: unknown, stored: unknown): string | null {
+  if (!payload || typeof payload !== 'object') return null;
+  const draft = payload as { status?: unknown; transit?: unknown; variants?: unknown };
+  if (text(draft.status) === 'disabled') return null;
+  const basePoints = (draft.transit as { points?: unknown } | null | undefined)?.points;
+  const base: StoredTransitPoint[] = Array.isArray(basePoints) ? basePoints : [];
+  const storedActive =
+    !!stored &&
+    typeof stored === 'object' &&
+    (stored as { status?: unknown }).status !== 'disabled';
+  const storedVariants: unknown[] =
+    storedActive && Array.isArray((stored as { variants?: unknown }).variants)
+      ? (stored as { variants: unknown[] }).variants
+      : [];
+  const variants: unknown[] = Array.isArray(draft.variants) ? draft.variants : [];
+  for (const variant of variants) {
+    const variantAlias = text((variant as { alias?: unknown } | null)?.alias);
+    const before = storedVariants.find(
+      v => text((v as { alias?: unknown } | null)?.alias) === variantAlias
+    );
+    for (const point of variantTransitPoints(variant)) {
+      const path = text(point?.listen_path);
+      if (!path) continue;
+      const alias = text(point?.alias);
+      const basePoint = base.find(p => text(p?.alias) === alias);
+      const basePath = text(basePoint?.listen_path);
+      if (basePoint && basePath === path) continue;
+      const kept = variantTransitPoints(before).some(
+        p => text(p?.alias) === alias && text(p?.listen_path) === path
+      );
+      if (kept) continue;
+      const named = `Transit point "${alias}" in variant "${variantAlias}"`;
+      if (!basePoint) {
+        return `${named} has Listen Path "${path}", which no route serves: the gateway registers routes for the base surface's Transit Points alone. Define the Transit Point in the base surface too.`;
+      }
+      const held = basePath ? `"${basePath}"` : 'unset';
+      return `${named} has Listen Path "${path}", which no route serves: the gateway builds a variant's routes from the base Transit Point's path, which is ${held}. Set the path on the base Transit Point, or give this variant the base point's path.`;
+    }
+  }
+  return null;
+}
+
 export interface ValidateSurfaceOptions {
   /**
    * The stored surface, or null when there is none to compare with. When given, the Target
@@ -80,6 +142,41 @@ export interface ValidateSurfaceOptions {
    * is judged, so a slow fetch never blocks a save.
    */
   routing?: RoutingConfig | null;
+  /**
+   * For a variant view: the base surface as stored and as this save sends it. A variant
+   * Listen Path equal to its base point's path in both repeats the base point's kept claim,
+   * which adds no route, so it is exempt as the gateway exempts it, even in a variant added
+   * in this session, which has no stored view of its own.
+   */
+  base?: { stored: unknown; draft: unknown };
+}
+
+/**
+ * A warning for each Transit Point of the `stored` view that `view` keeps without the
+ * `listen_path` it had. Such a point stops answering there and falls back to the route
+ * the gateway derives from its alias. Clearing the field is the only way to ask for
+ * that, so this informs rather than blocks: what the save gate refuses is a path the
+ * gateway would not serve (`listenPathProblem`), not the absence of one.
+ */
+export function clearedListenPathWarnings(view: unknown, stored: unknown): string[] {
+  const points = (view as { transit?: { points?: unknown } } | null)?.transit?.points;
+  const tps: StoredTransitPoint[] = Array.isArray(points) ? points : [];
+  const warnings: string[] = [];
+  for (const before of storedTransitPoints(stored)) {
+    const was = text(before?.listen_path);
+    if (!was) continue;
+    const alias = text(before?.alias);
+    const now = tps.find(
+      tp => (alias && tp?.alias === alias) || (before?.id && tp?.id === before.id)
+    );
+    // The point itself being gone is a removal the operator can see on the canvas.
+    if (!now) continue;
+    if (text(now.listen_path)) continue;
+    warnings.push(
+      `Transit point "${alias}" no longer has a Listen Path, so "${was}" stops answering and callers reach it at its derived /outbound route.`
+    );
+  }
+  return warnings;
 }
 
 /**
@@ -221,14 +318,29 @@ export function validateSurfacePayload(
   // What the stored surface's Transit Points already claim, so a save that keeps a
   // claim is told apart from one that introduces or changes it. Empty on a create.
   const storedPoints: StoredTransitPoint[] = storedTransitPoints(options.stored);
+  // The base point paths a variant view may repeat without introducing them: kept by the
+  // stored base and still held by the base this save sends. A disabled stored base claims
+  // nothing (`storedTransitPoints`).
+  const storedBasePoints = options.base ? storedTransitPoints(options.base.stored) : [];
+  const draftBase = (options.base?.draft as { transit?: { points?: unknown } } | null)?.transit
+    ?.points;
+  const draftBasePoints: StoredTransitPoint[] = Array.isArray(draftBase) ? draftBase : [];
+  const repeatsKeptBasePath = (alias: string, path: string) =>
+    !!alias &&
+    storedBasePoints.some(p => text(p?.alias) === alias && text(p?.listen_path) === path) &&
+    draftBasePoints.some(p => text(p?.alias) === alias && text(p?.listen_path) === path);
 
   // A Listen Path the gateway will not serve, refused here before the round trip, and
   // only when this save introduces or changes it. That is what the admin API refuses:
   // the same point keeping the same path is exempt, so a surface stored with such a
   // path stays editable and its save is answered with a `Warning` header instead.
-  // Variant overrides are left to the gateway's own refusal.
+  // A disabled surface registers no route, so it claims no path and the gateway
+  // returns before reading one; saving one is never blocked here either. This
+  // reads the points of the view it is given; a variant path its base point does
+  // not hold is checked on the wire payload (`variantListenPathProblem`), and a
+  // path that is another surface's route is refused by the gateway.
   const routing = options.routing === undefined ? getCachedRoutingConfig() : options.routing;
-  if (routing) {
+  if (routing && text(payload?.status) !== 'disabled') {
     tps.forEach((tp, idx) => {
       const path = text(tp?.listen_path);
       if (!path) return;
@@ -238,6 +350,7 @@ export function validateSurfacePayload(
       const before = storedPoints.find(stored => alias && text(stored?.alias) === alias);
       const kept = text(before?.listen_path);
       if (kept === path) return;
+      if (repeatsKeptBasePath(alias, path)) return;
       const problem = listenPathProblem(tp, routing);
       if (problem) {
         issues.push({
@@ -250,26 +363,8 @@ export function validateSurfacePayload(
   }
 
   if (options.stored !== undefined) {
-    // A Transit Point that loses its stored `listen_path` stops answering there and
-    // falls back to the route the gateway derives from its alias. Clearing the field
-    // is the only way to ask for that, so this informs rather than blocks: what the
-    // save gate refuses is a path the gateway would not serve (`listenPathProblem`),
-    // not the absence of one.
-    for (const stored of storedPoints) {
-      const was = text(stored?.listen_path);
-      if (!was) continue;
-      const alias = text(stored?.alias);
-      const now = tps.find(
-        tp => (alias && tp?.alias === alias) || (stored?.id && tp?.id === stored.id)
-      );
-      // The point itself being gone is a removal the operator can see on the canvas.
-      if (!now) continue;
-      if (text(now.listen_path)) continue;
-      issues.push({
-        severity: 'warning',
-        message: `Transit point "${alias}" no longer has a Listen Path, so "${was}" stops answering and callers reach it at its derived /outbound route.`,
-        path: 'transit.points',
-      });
+    for (const message of clearedListenPathWarnings(payload, options.stored)) {
+      issues.push({ severity: 'warning', message, path: 'transit.points' });
     }
     for (const { rule, message, nodeId } of targetAuthBreaches(payload, options.stored)) {
       issues.push({

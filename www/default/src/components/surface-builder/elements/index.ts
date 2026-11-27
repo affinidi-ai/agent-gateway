@@ -83,7 +83,12 @@ export type { DependencyWarning } from './registry';
 export { buildCanvasBlob, readCanvasSurfaceSize, readCanvasView } from './registry';
 export type { CanvasBlob } from './registry';
 export { buildSurfaceContext } from './surfaceContext';
-export { validateSurfacePayload, hasBlockingIssues } from './validateSurface';
+export {
+  validateSurfacePayload,
+  hasBlockingIssues,
+  variantListenPathProblem,
+  clearedListenPathWarnings,
+} from './validateSurface';
 export type { ValidationIssue, ValidationSeverity } from './validateSurface';
 export type {
   NodeDefinition,

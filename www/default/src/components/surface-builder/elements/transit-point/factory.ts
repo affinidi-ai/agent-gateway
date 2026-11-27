@@ -215,16 +215,23 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
     requires: {},
     incompleteReason: config => {
       if (!config.listen_address) return 'Outbound listener address is required';
+      // The destination is told first, as the panel asks for it first.
       if (inferEndpointType(config) === 'gateway') {
         if (!transitPointGatewayRoute(config).gatewayId) return 'Select a gateway';
         if (!config.target_endpoint) return 'Select an Agent Surface on the gateway';
-        return null;
+      } else if (!config.target_endpoint) {
+        return 'Target endpoint URL is required';
       }
-      if (!config.target_endpoint) return 'Target endpoint URL is required';
-      // The Listen Path is not checked here: the gateway refuses only a path a
-      // save introduces or changes, so whether this one blocks depends on what
-      // the surface already holds, which this node cannot see. That check lives
-      // in `validateSurfacePayload`, which is given the stored surface.
+      // A path typed with no prefix under it composes no route, so the panel
+      // keeps the one the node holds and the typed path would be dropped on
+      // save. Block it here, where the node is all that has to be read, for
+      // every routing target: the Listen Path is the same on a gateway route.
+      const suffix = typeof config.route_suffix === 'string' ? config.route_suffix.trim() : '';
+      const prefix = typeof config.route_prefix === 'string' ? config.route_prefix.trim() : '';
+      if (suffix && !prefix) return 'Pick a surface prefix for the Listen Path';
+      // Whether the path itself is refused depends on what the surface already
+      // holds, which this node cannot see; that check lives in
+      // `validateSurfacePayload`, which is given the stored surface.
       return null;
     },
     validate: c => {

@@ -1632,6 +1632,57 @@ async fn operator_sets_transit_point_listen_path(
     record_admin_response(world, response);
 }
 
+/// The surface saved with a new variant `variant` whose copy of
+/// `transit_point` sets `listen_path`, whatever the appliance answered.
+#[when(expr = "the operator adds variant {string} in which Transit Point {string} has listen_path {string}")]
+async fn operator_adds_variant_with_transit_point_listen_path(
+    world: &mut SurfaceWorld,
+    variant: String,
+    transit_point: String,
+    listen_path: String,
+) {
+    ensure_admin_session(world).await;
+    let surface_id = get_tracked_surface_id(world, "adding a variant with a Transit Point listen_path");
+    let client = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist");
+    let current = client
+        .get_surface_recorded(&surface_id)
+        .await
+        .unwrap_or_else(|error| panic!("fetch surface before adding a variant: {error}"));
+    assert_eq!(
+        current.status, 200,
+        "fetch surface before adding a variant should succeed, got status {} body {}",
+        current.status, current.body
+    );
+
+    let mut payload = current.body;
+    let mut point = payload["transit"]["points"]
+        .as_array()
+        .and_then(|points| {
+            points
+                .iter()
+                .find(|point| point["alias"] == transit_point.as_str())
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("surface '{}' has no Transit Point aliased '{}'", surface_id, transit_point));
+    point["listen_path"] = serde_json::json!(listen_path);
+    payload["variants"] = serde_json::json!([{
+        "id": format!("variant-{variant}"),
+        "alias": variant,
+        "name": variant,
+        "enabled": true,
+        "overrides": { "transit": { "points": [point] } }
+    }]);
+
+    let response = client
+        .update_surface_recorded(&surface_id, &payload)
+        .await
+        .unwrap_or_else(|error| panic!("add a variant through admin API: {error}"));
+    record_admin_response(world, response);
+}
+
 #[when(expr = "the operator saves Transit Point {string} with no way to authenticate its callers")]
 async fn operator_saves_a_transit_point_that_authenticates_no_caller(
     world: &mut SurfaceWorld,

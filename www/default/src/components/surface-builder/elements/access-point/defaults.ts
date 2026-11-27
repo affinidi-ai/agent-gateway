@@ -48,7 +48,7 @@ export const OUTBOUND_PREFIX = '/outbound';
  *
  * The result is used to:
  * - Label shared addresses in the TP "Listen Address" dropdown.
- * - Show the `/outbound/` channel-prefix options only for shared selections.
+ * - Narrow the channel-prefix options to the `/outbound/` forms on a shared selection.
  */
 export function computeSharedOutboundAddresses(config: RoutingConfig): Set<string> {
   const outbound = config.available_outbound_listen_addresses ?? [];
@@ -195,10 +195,35 @@ export interface TransitPointRoute {
 }
 
 /**
- * What blocks a save of one Transit Point's Listen Path, or `null`. The two refusals the
+ * What is wrong with the shape of a Listen Path the outbound router cannot register as
+ * written, or `null`: the gateway's `listen_path_invalid` refusal, mirroring
+ * `validate_outbound_listen_path_format` in `src/config/types.rs`. A path with no
+ * segment of its own is left to `listenPathProblem`'s prefix check, which names the
+ * prefixes to use instead.
+ */
+export function listenPathFormatProblem(path: string): string | null {
+  if (!path.startsWith('/')) return `Listen Path "${path}" must start with "/".`;
+  const segments = path.split('/');
+  if (segments.some(segment => segment === '..')) {
+    return `Listen Path "${path}" must not contain ".." segments.`;
+  }
+  if (/[{}]/.test(path)) {
+    return `Listen Path "${path}" must not contain "{" or "}": the gateway would read them as a path parameter.`;
+  }
+  const parameter = segments.find(segment => segment.startsWith(':') || segment.startsWith('*'));
+  if (parameter !== undefined) {
+    return `Listen Path "${path}" must not contain a segment starting with ":" or "*" ("${parameter}"): the outbound listener cannot register it.`;
+  }
+  return null;
+}
+
+/**
+ * What blocks a save of one Transit Point's Listen Path, or `null`. The refusals the
  * admin API answers such a save with, in the same order, so the dashboard refuses exactly
  * what the gateway would (`listen_path_problems` in `src/proxy/server.rs`):
  *
+ * - `listen_path_invalid`: a path the outbound router cannot register as written
+ *   (`listenPathFormatProblem`).
  * - `listen_path_not_a_channel_prefix`: the path must sit under one of the configured
  *   surface prefixes, with or without `/outbound` in front, and needs a segment of its own
  *   after it. Both forms are accepted wherever the path is reachable, which is why this is
@@ -220,6 +245,8 @@ export function listenPathProblem(
   if (!routing) return null;
   const composed = typeof point.listen_path === 'string' ? point.listen_path.trim() : '';
   if (!composed) return null;
+  const formatProblem = listenPathFormatProblem(composed);
+  if (formatProblem) return formatProblem;
   const channels = routing.channel_path_prefix ?? [];
   const outbound = outboundChannelPrefixes(routing);
   const every = channels.flatMap((c, idx) => {
@@ -227,10 +254,10 @@ export function listenPathProblem(
     return [plain, outbound[idx]?.prefix ?? `${OUTBOUND_PREFIX}${plain}`].filter(Boolean);
   });
   const offered = every.map(p => `${p}/`).join(', ') || 'this gateway configures none';
-  // Every prefix, not the first that matches, and read as the listener registers
-  // the path: this mirrors `claims_a_channel_prefix`, so `/agents/team` listed
-  // before `/agents` no longer blocks a path the gateway accepts, and a path whose
-  // only remainder is slashes is refused here as it is there.
+  // Matched against every prefix, and read as the listener registers the path,
+  // which is what `claims_a_channel_prefix` does: a nested prefix listed first
+  // claims no path its own segments do not cover, and a path whose only
+  // remainder is slashes claims the bare prefix.
   const registered = composed.replace(/\/+$/, '');
   const match = every.find(
     p => registered.startsWith(`${p}/`) && registered.slice(p.length).replace(/\//g, '') !== ''

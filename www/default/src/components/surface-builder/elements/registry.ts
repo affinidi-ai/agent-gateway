@@ -791,6 +791,16 @@ class ElementRegistry {
         delete tpConfig.trust_check_migrated;
         delete tpConfig.trust_recorder;
         tpConfig[STORED_TARGET_AUTH_KEY] = storedTargetAuth(tp.target_auth);
+        // A point with no listener of its own answers on the surface's outbound one, so
+        // it is shown there and the panel does not seed it as a new point.
+        const inheritedListener = payload?.transit?.outbound_listen_address;
+        if (
+          !tpConfig.listen_address &&
+          typeof inheritedListener === 'string' &&
+          inheritedListener
+        ) {
+          tpConfig.listen_address = inheritedListener;
+        }
       }
       nodes.push({
         id: tpId,

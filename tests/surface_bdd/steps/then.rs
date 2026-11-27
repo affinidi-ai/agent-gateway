@@ -1147,6 +1147,21 @@ fn admin_api_error_response_mentions(
     assert_json_body_mentions(&get_admin_response(world).body, &expected, "admin API error response");
 }
 
+/// The machine-readable `code` a refusal carries, which a client reads instead
+/// of the message text.
+#[then(expr = "the admin API error response carries the code {string}")]
+fn admin_api_error_response_carries_the_code(
+    world: &mut SurfaceWorld,
+    expected: String,
+) {
+    let body = &get_admin_response(world).body;
+    let code = body
+        .get("code")
+        .and_then(|code| code.as_str())
+        .unwrap_or_else(|| panic!("the refusal carries no code: {body}"));
+    assert_eq!(code, expected, "refusal code in {body}");
+}
+
 fn assert_neutral_problem_response(
     world: &SurfaceWorld,
     expected: &serde_json::Value,

@@ -19,7 +19,61 @@ fn surface_stored_on_route(
     world
         .surface_config
         .stored_surfaces_on_routes
-        .push(StoredSurfaceFixture { id, route, status });
+        .push(StoredSurfaceFixture {
+            id,
+            route,
+            status,
+            transit_point: None,
+            tenant_id: None,
+        });
+}
+
+/// An active surface stored before the gateway starts, so its `listen_path`
+/// passes no save gate: the way a clash the gate now refuses is held.
+#[given(expr = "a surface {string} is stored on route {string} with Transit Point {string} listening on {string}")]
+fn surface_stored_with_transit_point(
+    world: &mut SurfaceWorld,
+    id: String,
+    route: String,
+    alias: String,
+    listen_path: String,
+) {
+    store_surface_with_transit_point(world, id, route, alias, listen_path, None);
+}
+
+/// [`surface_stored_with_transit_point`], owned by `tenant`.
+#[given(
+    expr = "a surface {string} of tenant {string} is stored on route {string} with Transit Point {string} listening on {string}"
+)]
+fn tenant_surface_stored_with_transit_point(
+    world: &mut SurfaceWorld,
+    id: String,
+    tenant: String,
+    route: String,
+    alias: String,
+    listen_path: String,
+) {
+    store_surface_with_transit_point(world, id, route, alias, listen_path, Some(tenant));
+}
+
+fn store_surface_with_transit_point(
+    world: &mut SurfaceWorld,
+    id: String,
+    route: String,
+    alias: String,
+    listen_path: String,
+    tenant_id: Option<String>,
+) {
+    world
+        .surface_config
+        .stored_surfaces_on_routes
+        .push(StoredSurfaceFixture {
+            id,
+            route,
+            status: "active".to_string(),
+            transit_point: Some((alias, listen_path)),
+            tenant_id,
+        });
 }
 
 async fn stored_surface(

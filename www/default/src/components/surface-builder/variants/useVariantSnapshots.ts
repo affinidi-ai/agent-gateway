@@ -9,6 +9,7 @@ import {
 } from './resolve';
 import type { BaseSurfaceView } from '../elements/types';
 import { storedA2aProxyVersions } from '../elements/access-point/a2aSettings';
+import { isTransitPointType } from '../elements/edges/archetypes';
 
 /**
  * Synthetic id used for the always-present "base" pseudo-variant. The
@@ -200,6 +201,148 @@ export function syncAccessPointIdentifiers(
     out[id] = next;
   }
   return out;
+}
+
+const LISTEN_PATH_CANVAS_FIELDS = ['listen_path', 'route_prefix', 'route_suffix'] as const;
+
+/** `value` as a plain object whose fields may be read, or `undefined`. */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+/** A snapshot payload's `transit.points`, each entry still to be narrowed, or none. */
+function transitPointsOf(payload: unknown): unknown[] {
+  const points = asRecord(asRecord(payload)?.transit)?.points;
+  return Array.isArray(points) ? points : [];
+}
+
+/** A snapshot payload's `canvas.nodes`, each entry still to be narrowed, or `undefined`. */
+function canvasNodesOf(payload: unknown): unknown[] | undefined {
+  const nodes = asRecord(asRecord(payload)?.canvas)?.nodes;
+  return Array.isArray(nodes) ? nodes : undefined;
+}
+
+/**
+ * Whether canvas node `node` is the one for Transit Point `point`: by the point's
+ * id, which a node keeps while its alias may be derived, else by alias.
+ */
+function isCanvasNodeOf(node: unknown, point: unknown): boolean {
+  const n = asRecord(node);
+  if (typeof n?.type !== 'string' || !isTransitPointType(n.type)) return false;
+  const config = asRecord(n.config);
+  if (!config) return false;
+  const p = asRecord(point);
+  if (typeof p?.id === 'string' && p.id && config.id === p.id) return true;
+  return typeof config.alias === 'string' && config.alias === p?.alias;
+}
+
+function transitPointCanvasConfig(
+  payload: unknown,
+  point: unknown
+): Record<string, unknown> | undefined {
+  const node = canvasNodesOf(payload)?.find(n => isCanvasNodeOf(n, point));
+  return asRecord(asRecord(node)?.config);
+}
+
+function withFieldsFrom(
+  record: Record<string, unknown>,
+  source: Record<string, unknown> | undefined,
+  fields: readonly string[]
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...record };
+  for (const f of fields) {
+    if (source?.[f] === undefined) delete out[f];
+    else out[f] = source[f];
+  }
+  return out;
+}
+
+/**
+ * Carry a base Transit Point's `listen_path` edit into every variant snapshot
+ * that still holds the base's previous path for that alias.
+ *
+ * The gateway registers a variant's routes from the base point's path, so a
+ * variant path that differs from its base point's is never served
+ * (`listen_path_variant_unserved` on a save that introduces it). A variant
+ * snapshot frozen from the base before the edit keeps the base's old path, and
+ * its stored config would disagree with where it answers, so the copy follows
+ * the base path. A variant whose
+ * path already differed from the base's keeps it. The Listen Path picker's
+ * `route_prefix` / `route_suffix` in the variant's canvas blob follow the
+ * base's too, so the panel shows the path that is saved.
+ */
+export function propagateBaseListenPaths<S extends Record<string, unknown>>(
+  snapshots: S,
+  previousBase: unknown,
+  nextBase: unknown
+): S {
+  const previous = transitPointsOf(previousBase).map(asRecord);
+  const changes = transitPointsOf(nextBase).flatMap(entry => {
+    const point = asRecord(entry);
+    const alias = point?.alias;
+    if (!point || typeof alias !== 'string') return [];
+    const before = previous.find(p => p?.alias === alias);
+    if (!before || before.listen_path === point.listen_path) return [];
+    return [
+      {
+        alias,
+        from: before.listen_path,
+        to: point.listen_path,
+        canvas: transitPointCanvasConfig(nextBase, point),
+      },
+    ];
+  });
+  if (changes.length === 0) return snapshots;
+  const out: Record<string, unknown> = {};
+  for (const [id, snap] of Object.entries(snapshots)) {
+    const record = asRecord(snap);
+    if (id === BASE_VARIANT_ID || !record) {
+      out[id] = snap;
+      continue;
+    }
+    let next: Record<string, unknown> = record;
+    for (const change of changes) {
+      const points = transitPointsOf(next);
+      const index = points.findIndex(entry => {
+        const p = asRecord(entry);
+        return p?.alias === change.alias && p.listen_path === change.from;
+      });
+      if (index < 0) continue;
+      const moved = asRecord(points[index]) ?? {};
+      const nextPoints = [...points];
+      nextPoints[index] = withFieldsFrom(moved, { listen_path: change.to }, ['listen_path']);
+      next = { ...next, transit: { ...asRecord(next.transit), points: nextPoints } };
+      const nodes = canvasNodesOf(next);
+      if (nodes) {
+        const canvasSource = change.canvas ?? { listen_path: change.to };
+        next = {
+          ...next,
+          canvas: {
+            ...asRecord(next.canvas),
+            nodes: nodes.map(n => {
+              const node = asRecord(n);
+              return node && isCanvasNodeOf(node, moved)
+                ? {
+                    ...node,
+                    config: withFieldsFrom(
+                      asRecord(node.config) ?? {},
+                      canvasSource,
+                      LISTEN_PATH_CANVAS_FIELDS
+                    ),
+                  }
+                : n;
+            }),
+          },
+        };
+      }
+    }
+    out[id] = next;
+  }
+  // Every entry is the caller's own snapshot, or that snapshot with its Listen Path fields
+  // rewritten, so the map keeps the caller's type.
+  return out as S;
 }
 
 /**
@@ -467,9 +610,13 @@ export function useVariantSnapshots(): UseVariantSnapshotsResult {
       // stale catalog leak back into the canvas the next time we
       // rebuild from this snapshot (e.g. resurrecting a variant the
       // user just deleted).
+      const snapshotted = resolveVariant(currentPayload, {});
+      const previous = snapshotsRef.current;
       const stored = {
-        ...snapshotsRef.current,
-        [activeVariantId]: resolveVariant(currentPayload, {}),
+        ...(activeVariantId === BASE_VARIANT_ID
+          ? propagateBaseListenPaths(previous, previous[BASE_VARIANT_ID], snapshotted)
+          : previous),
+        [activeVariantId]: snapshotted,
       };
       // The access point URL is surface-level: propagate the just-edited
       // canvas's identifier fields into every snapshot so the variant we
@@ -490,9 +637,13 @@ export function useVariantSnapshots(): UseVariantSnapshotsResult {
   );
 
   const setSnapshot = useCallback((variantId: string, payload: any) => {
+    const snapshotted = resolveVariant(payload, {});
+    const previous = snapshotsRef.current;
     snapshotsRef.current = {
-      ...snapshotsRef.current,
-      [variantId]: resolveVariant(payload, {}),
+      ...(variantId === BASE_VARIANT_ID
+        ? propagateBaseListenPaths(previous, previous[BASE_VARIANT_ID], snapshotted)
+        : previous),
+      [variantId]: snapshotted,
     };
   }, []);
 
@@ -555,10 +706,16 @@ export function useVariantSnapshots(): UseVariantSnapshotsResult {
     } => {
       // Always re-snapshot the active variant from the live canvas
       // payload so the wire output reflects the latest edits.
+      const previous = snapshotsRef.current;
       const spliced: Record<string, any> =
         activeVariantId !== null
-          ? { ...snapshotsRef.current, [activeVariantId]: activePayload }
-          : snapshotsRef.current;
+          ? {
+              ...(activeVariantId === BASE_VARIANT_ID
+                ? propagateBaseListenPaths(previous, previous[BASE_VARIANT_ID], activePayload)
+                : previous),
+              [activeVariantId]: activePayload,
+            }
+          : previous;
       // Access point URL identifiers are surface-level. The active canvas
       // may carry a freshly-edited URL that must land on the wire base
       // payload even when the active variant is a named one — per-variant

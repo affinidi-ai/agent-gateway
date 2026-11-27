@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import RouteListenerSection from '../RouteListenerSection';
 import { fetchRoutingConfig, type RoutingConfig } from '../../access-point/defaults';
@@ -102,6 +102,65 @@ describe('a Transit Point on an outbound address with a hostname of its own', ()
     await waitFor(() => expect(updateFields).toHaveBeenCalled());
     expect(held.listen_address).toBe(OWN);
     expect(held.route_prefix).toBe('/agents');
+  });
+
+  // Clearing the path is how the dashboard asks for the derived route, and both
+  // refusals tell the operator to do it, so the empty value has to be written.
+  it('clears the stored listen_path when Custom Path is emptied', async () => {
+    const { held, updateFields } = renderTransitPoint({
+      listen_address: OWN,
+      listen_path: '/agents/partner-a',
+      route_prefix: '/agents',
+      route_suffix: 'partner-a',
+    });
+
+    // Wait for the routing config, so the field is the one the loaded section renders.
+    await waitFor(() => expect(screen.getAllByRole('option').length).toBeGreaterThan(1));
+    fireEvent.change(screen.getByPlaceholderText('my-agent/v1'), { target: { value: '' } });
+
+    expect(updateFields).toHaveBeenCalledWith(expect.objectContaining({ listen_path: '' }));
+    expect(held.listen_path).toBe('');
+    // The prefix is cleared with it, so the empty pair is not marked invalid after Save.
+    expect(held.route_prefix).toBe('');
+  });
+
+  it('keeps a prefix picked while Custom Path is still empty', async () => {
+    const { held } = renderTransitPoint({
+      listen_address: OWN,
+      listen_path: '',
+      route_prefix: '',
+      route_suffix: '',
+    });
+
+    await waitFor(() => expect(screen.getAllByRole('option').length).toBeGreaterThan(1));
+    const select = screen.getAllByRole('combobox').at(-1) as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: '/agents' } });
+
+    expect(held.route_prefix).toBe('/agents');
+    expect(select.value).toBe('/agents');
+  });
+
+  // A cleared path answers at the derived route: reopening the panel must not seed a
+  // random one, nor move the point to the first listener on offer.
+  it('keeps a cleared Listen Path unset, on its own listener, when the panel reopens', async () => {
+    const second = 'https://second.example.net';
+    (fetchRoutingConfig as jest.Mock).mockResolvedValue(
+      routing({
+        available_outbound_listen_addresses: [OWN, second],
+        shared_hostname_outbound_addresses: [],
+      })
+    );
+    const { held, updateFields } = renderTransitPoint({
+      listen_address: second,
+      listen_path: '',
+      route_prefix: '/agents',
+      route_suffix: '',
+    });
+
+    await waitFor(() => expect(screen.getAllByRole('option').length).toBeGreaterThan(1));
+    expect(updateFields).not.toHaveBeenCalled();
+    expect(held.listen_address).toBe(second);
+    expect(held.listen_path).toBe('');
   });
 
   it('resolves a stored /outbound path, since the save accepts both forms there', async () => {
