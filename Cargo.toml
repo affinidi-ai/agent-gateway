@@ -50,7 +50,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
 
 # OpenTelemetry for distributed tracing and observability
 opentelemetry = { version = "0.31", features = ["trace", "metrics", "logs"] }
-opentelemetry_sdk = { version = "0.31", features = [
+opentelemetry_sdk = { version = "0.33", features = [
     "rt-tokio",
     "trace",
     "metrics",
