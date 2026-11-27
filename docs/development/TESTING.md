@@ -169,7 +169,7 @@ make npm-test
 | `make test-policies` | The OPA policy engine tests |
 | `make test-all` | Rust, frontend, and dashboard tests |
 | `make test-rust-ci` | Coverage plus `surface_bdd`, against the coverage threshold |
-| `make ci-happy` | The blocking CI jobs as CI runs them, side by side ([`DEVELOPMENT.md`](DEVELOPMENT.md#full-local-preflight)) |
+| `make ci-happy-full` | The blocking CI jobs as CI runs them, side by side; `make ci-happy-quick` runs only the checks ([`DEVELOPMENT.md`](DEVELOPMENT.md#full-local-preflight)) |
 | `make test-junit` | Nextest with a JUnit report at `test-results.xml` |
 | `make test-coverage` | Coverage at `coverage.xml` plus the JUnit report |
 

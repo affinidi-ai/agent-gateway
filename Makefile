@@ -19,7 +19,7 @@ SHELL := /bin/bash
         config-certs config-debug config-debug-dev config-debug-x config-test config-release install-deps install-rust-deps verify-rust-deps install-python-deps install-git-hooks setup-vscode \
         docker-build-local docker-build-local-dev docker-rebuild-local docker-rebuild-local-dev docker-run docker-run-dev docker-shell docker-network \
         config-docker \
-	test test-unit test-bins test-policies test-coverage test-junit test-rust-ci npm-test npm-test-ci npm-build npm-build-ci npm-install npm-install-ci clippy clippy-ci fmt fmt-www-all fmt-check lint lint-changelog npm-lint shellcheck npm-lint-www-all npm-lint-ci check cargo-build-ci node-ci rust-ci ci-happy ci-fmt ci-clippy ci-audit ci-deny ci-frontend ci-docs ci-gherkin ci-changelog ci-toolchain ci-test ci-coverage ci-surface-bdd ci-g2g-bdd ci-mcp-conformance ci-suites g2g-bdd-run node-local rust-local local audit-www-all audit-fix-www-all browserslist-update license-check \
+	test test-unit test-bins test-policies test-coverage test-junit test-rust-ci npm-test npm-test-ci npm-build npm-build-ci npm-install npm-install-ci clippy clippy-ci fmt fmt-www-all fmt-check lint lint-changelog npm-lint shellcheck npm-lint-www-all npm-lint-ci check cargo-build-ci node-ci rust-ci ci-happy ci-happy-full ci-happy-quick ci-fmt ci-clippy ci-audit ci-deny ci-frontend ci-frontend-lint ci-docs ci-gherkin ci-changelog ci-toolchain ci-test ci-coverage ci-surface-bdd ci-g2g-bdd ci-mcp-conformance ci-suites g2g-bdd-run node-local rust-local local audit-www-all audit-fix-www-all browserslist-update license-check \
         www www-dev \
         clean clean-all clear-storage clear-storage-local \
 		demo-multi-tenancy \
@@ -801,6 +801,11 @@ ci-frontend: ## CI job frontend: npm ci, audit (non-blocking), format check, lin
 	@cd $(WWW_DIR) && CI=true npm test -- --watch=false
 	@cd $(WWW_DIR) && npm run build
 
+ci-frontend-lint: ## The frontend job's install, format check and lint, without its tests and build
+	@cd $(WWW_DIR) && npm ci
+	@cd $(WWW_DIR) && npm run format:check
+	@cd $(WWW_DIR) && npm run lint
+
 ci-docs: ## CI job docs: local links and documented Make targets
 	@python3 .github/scripts/check_docs.py
 
@@ -840,8 +845,12 @@ ci-surface-bdd: ## CI job surface-bdd: the surface BDD suite
 ci-g2g-bdd: ## CI job g2g-bdd: the gateway-to-gateway BDD suite (needs Docker)
 	@$(MAKE) --no-print-directory gw-e2e
 
+# The harness's fabric suite runs one mediator on a fixed port, 7037 unless
+# FABRIC_BDD_MEDIATOR_PORT names another. CI's runner is fresh; locally a free
+# port keeps a leftover mediator or another checkout's run from blocking it.
 ci-mcp-conformance: ## CI job mcp-conformance: the MCP conformance harness (needs Node 22 or later)
-	@$(MAKE) --no-print-directory mcp-conformance
+	@FABRIC_BDD_MEDIATOR_PORT="$${FABRIC_BDD_MEDIATOR_PORT:-$$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')}" \
+		$(MAKE) --no-print-directory mcp-conformance
 
 # One cargo call builds both BDD test binaries, then each suite runs its binary
 # directly, side by side, so neither waits on the lock cargo holds on target/
@@ -873,15 +882,26 @@ ci-suites: ## Build the BDD suites once, run surface-bdd and g2g-bdd side by sid
 # the suites in target/, so the three builds run beside each other. Coverage
 # runs after the frontend checks (-k: whatever they find; -j1: even under make -j), because its ts-rs
 # tests rewrite www/default/src/generated/, which those checks read.
-CI_HAPPY_GROUPS := "fmt=ci-fmt" "toolchain=ci-toolchain" "docs=ci-docs" "gherkin=ci-gherkin" \
-	"changelog=ci-changelog" "audit=ci-audit" "deny=ci-deny" \
-	"frontend-coverage=-k -j1 ci-frontend ci-coverage" "clippy=ci-clippy" "suites=ci-suites"
-ci-happy: ## Run the blocking CI jobs locally as CI runs them, side by side, no autofix (PARALLEL=0: one at a time; CI_BASE=origin/main)
+CI_CHECK_GROUPS := "fmt=ci-fmt" "toolchain=ci-toolchain" "docs=ci-docs" "gherkin=ci-gherkin" \
+	"changelog=ci-changelog" "audit=ci-audit" "deny=ci-deny" "clippy=ci-clippy"
+CI_HAPPY_GROUPS := $(CI_CHECK_GROUPS) \
+	"frontend-coverage=-k -j1 ci-frontend ci-coverage" "suites=ci-suites"
+CI_HAPPY_QUICK_GROUPS := $(CI_CHECK_GROUPS) "frontend-lint=ci-frontend-lint"
+
+ci-happy-full: ## Run the blocking CI jobs locally as CI runs them, side by side, no autofix (PARALLEL=0: one at a time; CI_BASE=origin/main)
 	@$(MAKE) --no-print-directory verify-rust-deps
 	@$(MAKE) --no-print-directory config-test
 	@MAKE="$(MAKE)" PARALLEL=$(PARALLEL) bash scripts/local/parallel.sh "CI" $(CI_HAPPY_GROUPS)
 	@secs=$$(( $$(date +%s) - $(LOCAL_STARTED) )); \
 	  echo "$(GREEN)✅ CI is happy, in $$((secs / 60))m $$((secs % 60))s.$(NC)"
+
+ci-happy: ci-happy-full ## Alias of ci-happy-full
+
+ci-happy-quick: ## Run the CI format, lint and dependency checks side by side, no tests or frontend build (PARALLEL=0: one at a time)
+	@$(MAKE) --no-print-directory verify-rust-deps
+	@MAKE="$(MAKE)" PARALLEL=$(PARALLEL) bash scripts/local/parallel.sh "CI checks" $(CI_HAPPY_QUICK_GROUPS)
+	@secs=$$(( $$(date +%s) - $(LOCAL_STARTED) )); \
+	  echo "$(GREEN)✅ CI checks are happy, in $$((secs / 60))m $$((secs % 60))s; the tests are left to make ci-happy-full.$(NC)"
 
 # --- Local targets: autofix, for development workflow ---
 

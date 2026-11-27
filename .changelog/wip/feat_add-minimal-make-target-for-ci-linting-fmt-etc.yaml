@@ -11,7 +11,9 @@ changes:
         It leaves the unit test job out, since coverage runs the same tests, uses the locally
         installed tools, and runs the gateway-to-gateway scenarios in parallel, where CI runs
         them one by one. Each job is also its own `ci-<job>` target to
-        rerun alone, and `PARALLEL=0` runs them one at a time. `make ci-happy` and `make local`
+        rerun alone, and `PARALLEL=0` runs them one at a time. `make ci-happy-quick` runs only
+        the format, lint and dependency checks, with no tests, in a minute or two; `make
+        ci-happy-full` is `make ci-happy` by its full name. `make ci-happy` and `make local`
         report each group as it ends and, every 30 seconds, what each group still running is
         doing.
   changed: []

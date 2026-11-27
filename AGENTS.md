@@ -703,7 +703,8 @@ directly.
 | Frontend unit tests                                     | `make npm-test`                                    |
 | Playwright UI tests                                     | `make ui-test`                                     |
 | Lint everything (fmt check, Clippy, ESLint, ShellCheck) | `make lint`                                        |
-| Blocking CI jobs as CI runs them, side by side          | `make ci-happy`                                    |
+| CI's format, lint and dependency checks, no tests       | `make ci-happy-quick`                              |
+| Blocking CI jobs as CI runs them, side by side          | `make ci-happy-full` (alias `make ci-happy`)       |
 | Format Rust and frontend                                | `make fmt`                                         |
 | Local CI preflight                                      | `make ci`                                          |
 | MCP conformance                                         | `make mcp-conformance`                             |

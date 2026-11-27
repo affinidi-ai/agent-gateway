@@ -329,11 +329,18 @@ needs PyYAML, either in the repository-local `.venv` that `make install-python-d
 ### Full Local Preflight
 
 ```bash
-make ci-happy
+make ci-happy-quick   # CI's format, lint and dependency checks, no tests
+make ci-happy-full    # every blocking CI job, tests included (make ci-happy is the same)
 make ci
 ```
 
-`make ci-happy` runs the blocking jobs of `.github/workflows/ci.yml`, `checks.yml` and
+`make ci-happy-quick` runs the quick part of CI side by side, usually in a minute or two once
+the builds are warm: rustfmt, Clippy, cargo audit and deny, the docs, Gherkin, changelog and
+toolchain checks, and the frontend's `npm ci`, format check and lint. It runs no test, no
+coverage and no frontend build, so it does not need `make config-test`, Docker or Node beyond
+what the frontend lint uses.
+
+`make ci-happy-full` (or `make ci-happy`) runs the blocking jobs of `.github/workflows/ci.yml`, `checks.yml` and
 `release-guards.yml` with each job's own commands and no autofix, one `ci-<job>` target per job
 (`make help` lists them), so a single failing job can be rerun alone. It differs from CI in three
 ways: it uses the tools installed locally rather than CI's pinned versions (see the
@@ -352,8 +359,9 @@ after the frontend checks, because its tests rewrite `www/default/src/generated/
 checks read. The gateway-to-gateway suite needs Docker, the conformance harness Node 22 or later,
 and `ci-suites` jq and a checkout path without spaces. The changelog job, as in CI, looks for the
 branch's fragment in the commits since `CI_BASE` (`origin/main`), so commit it first. It does not
-clear BDD mediator containers left by a crashed run, which hold the port the conformance fabric
-suite needs: run `make clean-e2e` first after such a crash. Not run:
+clear BDD mediator containers left by a crashed run (`make clean-e2e` does); the conformance
+fabric suite gets a free mediator port of its own (`FABRIC_BDD_MEDIATOR_PORT`, 7037 in CI), so
+such a leftover or another checkout's run does not block it. Not run:
 the non-blocking smoke job, `rust-scan`, CodeQL, the Docker build and the PR title check.
 
 `make ci` is the older preflight: it runs the frontend and Rust checks one after another, with a
