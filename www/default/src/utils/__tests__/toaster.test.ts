@@ -119,7 +119,7 @@ describe('showToast', () => {
       showToast('success', `Surface "${'x'.repeat(200)}" deleted`);
 
       const body = getToast().querySelector<HTMLElement>('.flex-grow-1');
-      expect(body?.style.minWidth).toBe('0px');
+      expect(parseFloat(body?.style.minWidth ?? '')).toBe(0);
       expect(body?.style.overflowWrap).toBe('anywhere');
     });
 
