@@ -266,9 +266,9 @@ describe('showKeepOpenWarningToast', () => {
   });
 
   const keepOpenedButton = () =>
-    Array.from(getToast().querySelectorAll('button')).find(b => b.textContent === 'Keep Opened');
+    Array.from(getToast().querySelectorAll('button')).find(b => b.textContent === 'Keep open');
 
-  it('counts down beside Keep Opened and the close button, then closes', () => {
+  it('counts down beside Keep open and the close button, then closes', () => {
     act(() => {
       showKeepOpenWarningToast('Saved, with warnings:\nfirst\nsecond', 8000);
     });
@@ -292,26 +292,81 @@ describe('showKeepOpenWarningToast', () => {
     expect(document.getElementById('app-toast')).toBeNull();
   });
 
-  it('stays open after Keep Opened, with no bar or button, until it is closed', () => {
-    act(() => {
-      showKeepOpenWarningToast('Saved, with warnings:\nfirst', 8000);
-    });
+  const kept = () => document.getElementById('app-toast-kept');
 
+  const showAndKeep = (message: string) => {
+    act(() => {
+      showKeepOpenWarningToast(message, 8000);
+    });
     act(() => {
       keepOpenedButton()?.click();
     });
+  };
+
+  it('stays open after Keep open, with no bar or button, until it is closed', () => {
+    showAndKeep('Saved, with warnings:\nfirst');
     act(() => {
       jest.advanceTimersByTime(60000);
     });
 
-    expect(document.getElementById('app-toast')).not.toBeNull();
-    expect(getToast().querySelector('#app-toast-bar-fill')).toBeNull();
-    expect(keepOpenedButton()).toBeUndefined();
+    expect(kept()).not.toBeNull();
+    expect(document.getElementById('app-toast')).toBeNull();
+    expect(kept()?.querySelector('#app-toast-bar-fill')).toBeNull();
+    expect(kept()?.querySelector('[data-testid="app-toast-keep-open-button"]')).toBeNull();
+    expect(document.activeElement).toBe(kept()?.querySelector('#app-toast-close'));
 
     act(() => {
-      getToast().querySelector<HTMLButtonElement>('#app-toast-close')?.click();
+      kept()?.querySelector<HTMLButtonElement>('#app-toast-close')?.click();
     });
-    expect(document.getElementById('app-toast')).toBeNull();
+    expect(kept()).toBeNull();
+  });
+
+  it('is not replaced by a later toast once kept: the later toast is shown below it', () => {
+    showAndKeep('Saved, with warnings:\nfirst');
+
+    act(() => {
+      showToast('error', 'Save blocked');
+    });
+
+    expect(kept()?.textContent).toContain('first');
+    expect(getToast().textContent).toContain('Save blocked');
+    expect(getToast().querySelector<HTMLElement>('.alert')?.style.top).toBe('30px');
+
+    act(() => {
+      kept()?.querySelector<HTMLButtonElement>('#app-toast-close')?.click();
+    });
+    expect(kept()).toBeNull();
+    expect(getToast().querySelector<HTMLElement>('.alert')?.style.top).toBe('20px');
+  });
+
+  it('is replaced by a later toast while it is still counting down', () => {
+    act(() => {
+      showKeepOpenWarningToast('Saved, with warnings:\nfirst');
+    });
+    act(() => {
+      showToast('error', 'Save blocked');
+    });
+
+    expect(kept()).toBeNull();
+    expect(document.querySelectorAll('#app-toast')).toHaveLength(1);
+    expect(getToast().textContent).not.toContain('first');
+  });
+
+  it('closes an earlier kept toast when a newer one is kept, so only the latest stays', () => {
+    showAndKeep('Saved, with warnings:\nfirst');
+    showAndKeep('Saved, with warnings:\nsecond');
+
+    expect(document.querySelectorAll('#app-toast-kept')).toHaveLength(1);
+    expect(kept()?.textContent).toContain('second');
+  });
+
+  it('is removed by removeToast', () => {
+    showAndKeep('Saved, with warnings:\nfirst');
+
+    act(() => {
+      removeToast();
+    });
+    expect(kept()).toBeNull();
   });
 
   it('renders markup in the message literally', () => {
@@ -323,14 +378,24 @@ describe('showKeepOpenWarningToast', () => {
     expect(getToast().textContent).toContain(PAYLOAD);
   });
 
-  it('gives Keep Opened its test id', () => {
+  it('colours its icon with the text-safe warning token, keeping the brand colour for the border', () => {
+    act(() => {
+      showKeepOpenWarningToast('Saved, with warnings:\nfirst');
+    });
+
+    expect(getToast().querySelector('i.fas')?.getAttribute('style')).toContain(
+      'var(--warning-text)'
+    );
+  });
+
+  it('gives Keep open its test id', () => {
     act(() => {
       showKeepOpenWarningToast('Saved, with warnings:\nfirst');
     });
 
     expect(
       getToast().querySelector('[data-testid="app-toast-keep-open-button"]')?.textContent
-    ).toBe('Keep Opened');
+    ).toBe('Keep open');
   });
 
   it('announces the warning through a live region that outlives the toast, without focus', () => {
@@ -375,6 +440,7 @@ describe('showSuccessCountdownToast', () => {
 
     const toast = getToast();
     expect(toast.querySelector('i.fas')).toHaveClass('fa-check-circle');
+    expect(toast.querySelector('i.fas')?.getAttribute('style')).toContain('var(--success-text)');
     expect(toast.querySelector<HTMLElement>('#app-toast-bar-fill')?.style.transitionDuration).toBe(
       '3000ms'
     );

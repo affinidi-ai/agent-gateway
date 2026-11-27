@@ -29,7 +29,7 @@ export interface SurfaceSaveToastOptions {
  * `saved` alone, or with the save's warnings, the gateway's first (its
  * `Warning` headers but the Access Point's), then the dashboard's non-blocking
  * issues, each once and in full. Both are laid out as the undo toast, with its countdown
- * bar; one with warnings closes after 8 seconds unless Keep Opened is pressed.
+ * bar; one with warnings closes after 8 seconds unless Keep open is pressed.
  */
 export function showSurfaceSaveToast(
   saved: string,

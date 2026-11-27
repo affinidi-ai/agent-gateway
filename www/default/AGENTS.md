@@ -69,13 +69,23 @@ Applies to:
 
 ## Toasts
 
-`showToast` and `showUndoToast` (`utils/toaster.ts`) render the message and the action label as
-text (`textContent`), never as HTML, so a name or a server error message in a toast cannot run
-script. Pass plain text only: markup such as `<b>` shows literally, and callers must not
+`showToast`, `showUndoToast`, `showKeepOpenWarningToast` and `showSuccessCountdownToast`
+(`utils/toaster.ts`) render the message and the action label as text (`textContent`), never as
+HTML, so a name or a server error message in a toast cannot run script. Pass plain text only: markup such as `<b>` shows literally, and callers must not
 escape the text themselves. `showUndoToast` returns a function that dismisses that toast
 without Undo, as its close button does. A new toast replaces the one on screen and stops it:
 the replaced toast's timer and `u` key no longer act, and an Undo toast counts as dismissed
-without Undo (its `onExpire` runs). `removeToast` does the same. This holds on every page.
+without Undo (its `onExpire` runs). `removeToast` does the same and also closes a kept toast.
+This holds on every page.
+
+`showKeepOpenWarningToast` is a warning toast that counts down 8 seconds, and the next toast
+replaces it while it does. Its **Keep open** button stops the countdown, removes the bar and
+the button, moves focus to the close button and keeps the toast (`#app-toast-kept`) until it is
+closed: a later toast no longer replaces it but is shown below it, moving back to the top when
+the kept toast closes, and keeping a newer warnings toast closes the older kept one.
+`showSuccessCountdownToast` is a success toast that counts down 3 seconds with no other button.
+Both colour the left border with the brand colour (`UI_COLORS`) and the icon with the text-safe
+token (`--warning-text`, `--success-text`), so the icon keeps 3:1 in both themes.
 
 Every toast closes with the same × button (`closeButtonHtml`, `#app-toast-close`, title
 "Dismiss"), the last item of its row. The message beside it shrinks and wraps (`min-width:0`,
@@ -83,7 +93,7 @@ Every toast closes with the same × button (`closeButtonHtml`, `#app-toast-close
 countdown toasts (`showUndoToast`, `showKeepOpenWarningToast`, `showSuccessCountdownToast`) are
 announced to screen readers through two live regions that stay in the page between toasts,
 `#app-toast-live-polite` (`role="status"`) and `#app-toast-live-assertive` (`role="alert"`, for
-the warning toast), without taking focus. **Keep Opened** carries
+the warning toast), without taking focus. **Keep open** carries
 `data-testid="app-toast-keep-open-button"`.
 
 ## Test identifiers
@@ -460,9 +470,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   undo toast (`showCountdownToast` in `utils/toaster.ts`), with its countdown bar and inline
   close button. "<saved>" alone is `showSuccessCountdownToast`: the success icon and colour, no
   other button, closing after 3 seconds. A toast with warnings is `showKeepOpenWarningToast`:
-  **Keep Opened** where Undo is, closing after 8 seconds unless Keep Opened is pressed, which
-  stops the countdown and removes the bar and the button until the toast is closed; screen
-  readers announce it assertively. The close button and live regions are those of every toast;
+  **Keep open** where Undo is, closing after 8 seconds unless Keep open is pressed, which
+  keeps it until it is closed, with later toasts (a blocked Save's, the next save's) shown below
+  it rather than replacing it; screen readers announce it assertively. The close button and live regions are those of every toast;
   see _Toasts_. The warnings toast is the only place a save's warnings are listed, with
   no banner above the canvas. A create that drew any opens the new surface's page, carrying
   them so the Transit Point a warning names shows it in its panel.
