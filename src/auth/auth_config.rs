@@ -258,7 +258,12 @@ impl SamlConfig {
     /// Warnings about a role setup that is valid but admits more or fewer sign-ins than intended.
     pub fn role_warnings(&self) -> Vec<&'static str> {
         let mut warnings = Vec::new();
-        if self.default_role.as_deref() == Some("administrator") {
+        if self
+            .default_role
+            .as_deref()
+            .and_then(crate::auth::types::UserRole::from_config_name)
+            == Some(crate::auth::types::UserRole::Administrator)
+        {
             warnings.push(
                 "SAML default_role is administrator: every sign-in whose role has no role_mapping entry becomes an administrator",
             );

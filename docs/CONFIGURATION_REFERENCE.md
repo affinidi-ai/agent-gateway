@@ -547,7 +547,7 @@ exports.
 ## `rbac.json`
 
 Maps each management permission to the minimum role that holds it. Roles are
-`administrator`, `poweruser`, and `user`.
+`administrator`, `poweruser`, and `user`, spelled exactly so in lower case, as in `saml.json`.
 
 ```json
 {
@@ -561,13 +561,15 @@ Maps each management permission to the minimum role that holds it. Roles are
 
 The file is merged over the built-in defaults in `RbacConfig::default()`, so it only needs
 the permissions you change; the example above lowers `gateways.edit`, which defaults to
-`administrator`. A role value other than the three names denies the permission to every
-role, `administrator` included. The file is read at startup, so a change needs a restart.
+`administrator`. The file is read at startup, so a change needs a restart.
 
-A missing or unparseable file does not stop startup: the gateway logs a warning and runs
-with the built-in defaults. A misspelled permission key is accepted without an error and
-matches nothing, so the permission it meant to change keeps its default. Check the startup
-log before relying on tightened permissions.
+A missing file does not stop startup: the gateway logs a warning and runs with the built-in
+defaults. A file that exists but cannot be read or parsed stops the gateway at startup, naming
+the file and the reason, so a mistake never replaces your permissions with the defaults. A role
+value other than the three names, `Administrator` included, is such an error and names the
+permission. A misspelled permission key is accepted without an error and matches nothing, so
+the permission it meant to change keeps its default. Check the startup log before relying on
+tightened permissions.
 
 Lowering a permission to a weaker role grants it to everyone at that role and above,
 appliance-wide. Enforcement and the permissions response contract are in

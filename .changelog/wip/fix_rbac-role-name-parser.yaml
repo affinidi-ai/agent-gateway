@@ -1,0 +1,17 @@
+branch: fix/rbac-role-name-parser
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-11-27T09:00:00Z'
+      title: Refuse to start on a rbac.json that names a mis-cased role or fails to parse
+      description: >-
+        rbac.json accepted role names in any letter case while saml.json refused anything but
+        lower case. Both files now take only administrator, poweruser or user in lower case. An
+        rbac.json that names another role, such as Administrator, is an error naming the
+        permission, and the gateway no longer runs on the built-in defaults when the file exists
+        but cannot be read or parsed: it stops at startup. A missing file still runs on the
+        defaults. Before upgrading, lower-case every role value in rbac.json.

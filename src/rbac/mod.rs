@@ -21,6 +21,13 @@ where
     D: Deserializer<'de>,
 {
     let overrides: HashMap<String, String> = HashMap::deserialize(deserializer)?;
+    for (feature, role) in &overrides {
+        if UserRole::from_config_name(role).is_none() {
+            return Err(serde::de::Error::custom(format!(
+                "rbac.json permission '{feature}' names unknown role '{role}' (expected administrator, poweruser or user, in lower case)"
+            )));
+        }
+    }
     let normalized_overrides = normalize_legacy_permissions(overrides);
     let mut merged = default_permissions();
     merged.extend(normalized_overrides);
@@ -461,14 +468,8 @@ impl RbacConfig {
             .permissions
             .get(feature_str)
         {
-            let required_role = match required_role_str
-                .to_lowercase()
-                .as_str()
-            {
-                "administrator" => UserRole::Administrator,
-                "poweruser" => UserRole::PowerUser,
-                "user" => UserRole::User,
-                _ => return false, // Invalid role specified
+            let Some(required_role) = UserRole::from_config_name(required_role_str) else {
+                return false;
             };
 
             // Check if user's role meets or exceeds required role
@@ -526,7 +527,7 @@ mod tests {
     fn default_base_role_holds_no_write_and_no_credential_read() {
         let config = RbacConfig::default();
         for (feature, role) in &config.permissions {
-            let base_role_granted = role.to_lowercase() == "user";
+            let base_role_granted = role == "user";
             if !base_role_granted {
                 continue;
             }
@@ -716,5 +717,25 @@ mod tests {
         assert!(!config.has_permission(&UserRole::User, &Feature::IssuersView));
         assert!(!config.has_permission(&UserRole::PowerUser, &Feature::IssuersView));
         assert!(config.has_permission(&UserRole::Administrator, &Feature::IssuersView));
+    }
+
+    #[test]
+    fn rbac_json_naming_an_unknown_or_mis_cased_role_is_refused_naming_the_permission() {
+        for role in ["Administrator", "root", ""] {
+            let json = format!(r#"{{"permissions": {{"users.edit": "{role}"}}}}"#);
+            let err = serde_json::from_str::<RbacConfig>(&json)
+                .expect_err("an unknown role must be refused")
+                .to_string();
+            assert!(err.contains("users.edit") && err.contains(&format!("'{role}'")), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_role_in_the_permissions_map_grants_nothing() {
+        let mut config = RbacConfig::default();
+        config
+            .permissions
+            .insert("users.edit".to_string(), "Administrator".to_string());
+        assert!(!config.has_permission(&UserRole::Administrator, &Feature::UsersEdit));
     }
 }

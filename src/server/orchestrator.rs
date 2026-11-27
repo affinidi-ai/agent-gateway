@@ -976,22 +976,12 @@ pub async fn run_axum_proxy(
 
     // Load RBAC configuration early
     let rbac_config = Arc::new(
-        crate::config::load_rbac_config(
+        crate::config::load_rbac_config_or_default(
             &bootstrap_config
                 .config_files
                 .rbac,
         )
-        .unwrap_or_else(|e| {
-            warn!(
-                "Failed to load RBAC config from {}: {}",
-                bootstrap_config
-                    .config_files
-                    .rbac,
-                e
-            );
-            warn!("Continuing with default (empty) RBAC configuration");
-            crate::rbac::RbacConfig::default()
-        }),
+        .map_err(|e| anyhow::anyhow!("Failed to load RBAC config: {e:#}"))?,
     );
 
     // Tenancy hardening config: shared by PAT issue-time enforcement (the
