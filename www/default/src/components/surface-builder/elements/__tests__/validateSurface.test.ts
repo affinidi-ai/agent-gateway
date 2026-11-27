@@ -6,6 +6,7 @@ import {
   validateSurfacePayload,
   hasBlockingIssues,
   variantListenPathProblem,
+  clearedListenPathWarnings,
 } from '../validateSurface';
 // Side-effect import: registers every element definition so the
 // validator's registry-aware checks (e.g. parent-type classification
@@ -98,6 +99,22 @@ describe('validateSurfacePayload', () => {
         { stored: surface('/outbound/agents/partner-a') }
       );
       expect(issues.find(i => i.message.includes('no longer has a Listen Path'))).toBeUndefined();
+    });
+
+    // The save toast reads the saved surface against the stored one with the same rule.
+    it('is told for a saved surface against the stored one, and only for a cleared path', () => {
+      const [warning, ...rest] = clearedListenPathWarnings(
+        surface(),
+        surface('/outbound/agents/partner-a')
+      );
+      expect(warning).toContain('"/outbound/agents/partner-a" stops answering');
+      expect(rest).toEqual([]);
+      expect(
+        clearedListenPathWarnings(
+          surface('/outbound/agents/partner-a'),
+          surface('/outbound/agents/partner-a')
+        )
+      ).toEqual([]);
     });
   });
 

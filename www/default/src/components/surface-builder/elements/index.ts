@@ -87,6 +87,7 @@ export {
   validateSurfacePayload,
   hasBlockingIssues,
   variantListenPathProblem,
+  clearedListenPathWarnings,
 } from './validateSurface';
 export type { ValidationIssue, ValidationSeverity } from './validateSurface';
 export type {

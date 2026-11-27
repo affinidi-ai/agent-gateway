@@ -292,7 +292,8 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
     // A Transit Point that holds a listener but no Listen Path is not new: its path was
     // cleared, or never set, and it answers at the route the gateway derives from its
     // alias. Seeding would replace that route with a random one, and the listener with
-    // the first on offer. Only a node with no address yet is a new one.
+    // the first on offer. Only a node with no address yet is a new one: a stored point
+    // that inherits `transit.outbound_listen_address` is hydrated with that address.
     if (routeFieldName === 'listen_path' && config.listen_address) return;
     const suffix = generateRandomPath();
     const path = suffix.startsWith('/') ? suffix : `/${suffix}`;

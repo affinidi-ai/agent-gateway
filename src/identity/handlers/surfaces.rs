@@ -1316,6 +1316,7 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResp
 async fn save_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
+    others: &[AgentSurface],
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
 ) -> axum::http::HeaderMap {
@@ -1329,7 +1330,7 @@ async fn save_warnings(
         surface,
     )
     .await;
-    let route_clashes = stored_listen_path_route_clash_warnings(state, surface, context, scope).await;
+    let route_clashes = stored_listen_path_route_clash_warnings(state, surface, others, context, scope);
     let mut headers = axum::http::HeaderMap::new();
     for warning in surface
         .access_point_warnings()
@@ -2361,6 +2362,9 @@ fn transit_point_listeners<'a>(
 /// points claim no custom path, so a path a variant override alone sets is
 /// still seen. `stored` is the surface as the gateway holds it, `None` on
 /// create.
+///
+/// Returns the surfaces it listed, empty when `surface` has no Transit Point,
+/// so [`save_warnings`] compares against them without listing the store again.
 async fn validate_listen_paths(
     surface: &AgentSurface,
     stored: Option<&AgentSurface>,
@@ -2368,7 +2372,7 @@ async fn validate_listen_paths(
     network_config: &crate::config::NetworkConfig,
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
-) -> Result<(), SurfaceApiError> {
+) -> Result<Vec<AgentSurface>, SurfaceApiError> {
     check_listen_paths(surface, stored, network_config)?;
 
     let resolve_port = |addr: &str| network_config.map_url_to_port_for_type(addr, Some("outbound"));
@@ -2380,7 +2384,7 @@ async fn validate_listen_paths(
         .next()
         .is_none()
     {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let existing = store
@@ -2392,7 +2396,8 @@ async fn validate_listen_paths(
     // the save's Warning does.
     let visible = |other: &AgentSurface| surface_visible(other.tenant_id.as_deref(), &other.surface_id, context, scope);
     check_listen_path_shadowing(surface, stored, &existing, &resolve_port, &visible)?;
-    check_listen_path_collisions(surface, &existing, resolve_port)
+    check_listen_path_collisions(surface, &existing, resolve_port)?;
+    Ok(existing)
 }
 
 /// Refuse a `listen_path` that is a route another Transit Point is reached at
@@ -2670,42 +2675,25 @@ fn listen_path_route_clash_warnings(
         .collect()
 }
 
-/// [`listen_path_route_clash_warnings`] for a surface just saved, against every
-/// surface the store holds, naming only those the caller may read
-/// ([`surface_visible`] for `context` and `scope`). A store that cannot be
-/// listed costs the warning, never the save, which has already happened.
-async fn stored_listen_path_route_clash_warnings(
+/// [`listen_path_route_clash_warnings`] for a surface just saved, against
+/// `others`, the surfaces [`validate_listen_paths`] listed for the same save,
+/// naming only those the caller may read ([`surface_visible`] for `context`
+/// and `scope`).
+fn stored_listen_path_route_clash_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
+    others: &[AgentSurface],
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
 ) -> Vec<String> {
-    let Some(store) = state
-        .agent_surface_store
-        .as_ref()
-    else {
-        return Vec::new();
-    };
     let resolve_port = |addr: &str| {
         state
             .network_config
             .map_url_to_port_for_type(addr, Some("outbound"))
     };
-    if transit_point_listeners(surface, &resolve_port)
-        .next()
-        .is_none()
-    {
-        return Vec::new();
-    }
-    match store.list_all().await {
-        Ok(others) => listen_path_route_clash_warnings(surface, &others, &resolve_port, &|other: &AgentSurface| {
-            surface_visible(other.tenant_id.as_deref(), &other.surface_id, context, scope)
-        }),
-        Err(error) => {
-            tracing::warn!("Could not list surfaces for listen_path clash warnings: {error}");
-            Vec::new()
-        }
-    }
+    listen_path_route_clash_warnings(surface, others, &resolve_port, &|other: &AgentSurface| {
+        surface_visible(other.tenant_id.as_deref(), &other.surface_id, context, scope)
+    })
 }
 
 /// Whose Transit Point answers on a derived route: the surface being saved, or
@@ -3956,7 +3944,7 @@ pub async fn create_surface(
     // Reject outbound listener paths the gateway does not serve, and
     // overlapping ones before they can reach the Axum router and panic the
     // gateway on rebuild.
-    validate_listen_paths(
+    let others = validate_listen_paths(
         &surface,
         None,
         store,
@@ -4039,7 +4027,7 @@ pub async fn create_surface(
 
     Ok((
         StatusCode::CREATED,
-        save_warnings(&state, &surface, tenant_context(&context), resource_scope(&scope)).await,
+        save_warnings(&state, &surface, &others, tenant_context(&context), resource_scope(&scope)).await,
         SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, surface).await, warnings),
     ))
 }
@@ -4133,7 +4121,7 @@ pub async fn update_surface(
     retain_browser_origins(&mut surface, &existing, &sent);
     super::surface_response_auth::retain_response_auth(&mut surface, &existing, &sent);
 
-    let (saved, warnings) = validate_and_save_surface(
+    let (saved, warnings, others) = validate_and_save_surface(
         &state,
         store,
         surface,
@@ -4146,7 +4134,7 @@ pub async fn update_surface(
     )
     .await?;
     Ok((
-        save_warnings(&state, &saved, tenant_context(&context), resource_scope(&scope)).await,
+        save_warnings(&state, &saved, &others, tenant_context(&context), resource_scope(&scope)).await,
         SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, saved).await, warnings),
     ))
 }
@@ -4926,7 +4914,8 @@ async fn validate_mcp_resource_declarations(
 /// PATCH on `/v1/surfaces/{id}`. The caller is responsible for resolving
 /// `surface_id`/`existing` and asserting that the surface already exists
 /// (PUT/PATCH semantics differ from POST on first-write). Takes `surface`
-/// by value so it can be returned to the caller without a defensive clone.
+/// by value so it can be returned to the caller without a defensive clone,
+/// beside the surfaces [`validate_listen_paths`] listed, for [`save_warnings`].
 async fn validate_and_save_surface(
     state: &IdentityApiState,
     store: &std::sync::Arc<crate::surfaces::FileSystemAgentSurfaceStore>,
@@ -4937,7 +4926,7 @@ async fn validate_and_save_surface(
     resource_scoped: bool,
     actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
     signing_editor: &super::signing_choice::SigningEditor,
-) -> Result<(AgentSurface, Vec<SurfaceWarning>), SurfaceApiError> {
+) -> Result<(AgentSurface, Vec<SurfaceWarning>, Vec<AgentSurface>), SurfaceApiError> {
     drop_inbound_api_key_ids(&mut surface);
     // Normalize the route BEFORE the shape check so the historical "missing
     // slash is auto-fixed" behaviour is preserved.
@@ -4990,7 +4979,7 @@ async fn validate_and_save_surface(
     validate_trust_checks(&surface)?;
     super::surface_tenancy::validate_authority_sources(state, &mut surface, existing).await?;
     super::surface_tenancy::validate_external_consent_bindings(state, &mut surface, existing).await?;
-    validate_listen_paths(&surface, existing, store, &state.network_config, context, scope).await?;
+    let others = validate_listen_paths(&surface, existing, store, &state.network_config, context, scope).await?;
     validate_access_point_route_collisions(&surface, store, &state.network_config).await?;
     let warnings = validate_surface_payment_policies(state.gateway_store.as_ref(), &mut surface, existing).await?;
     validate_delegation_source_auth(&surface)?;
@@ -5051,7 +5040,7 @@ async fn validate_and_save_surface(
 
     apply_surface_change(state, SurfaceChange::Upsert(&surface)).await;
 
-    Ok((surface, warnings))
+    Ok((surface, warnings, others))
 }
 
 /// Whether an edit added, removed or changed the entries of the surface's Trust Recorder or
@@ -5181,7 +5170,7 @@ pub async fn patch_surface(
         refuse_a2a_settings_sent_on_other_protocols(&surface)?;
     }
 
-    let (saved, warnings) = validate_and_save_surface(
+    let (saved, warnings, others) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -5194,7 +5183,7 @@ pub async fn patch_surface(
     )
     .await?;
     Ok((
-        save_warnings(&state, &saved, tenant_context(&context), resource_scope(&scope)).await,
+        save_warnings(&state, &saved, &others, tenant_context(&context), resource_scope(&scope)).await,
         SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, saved).await, warnings),
     ))
 }
@@ -5303,7 +5292,7 @@ pub async fn patch_variant(
     super::surface_tenancy::forget_mcp_proxy_pins(&mut surface);
     surface.variants[variant_index] = new_variant;
 
-    let (saved, warnings) = validate_and_save_surface(
+    let (saved, warnings, others) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -5316,7 +5305,7 @@ pub async fn patch_variant(
     )
     .await?;
     Ok((
-        save_warnings(&state, &saved, tenant_context(&context), resource_scope(&scope)).await,
+        save_warnings(&state, &saved, &others, tenant_context(&context), resource_scope(&scope)).await,
         SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, saved).await, warnings),
     ))
 }
@@ -6055,7 +6044,7 @@ pub async fn create_variant(
         .variants
         .push(new_variant.clone());
 
-    let (saved, warnings) = validate_and_save_surface(
+    let (saved, warnings, others) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -6076,7 +6065,7 @@ pub async fn create_variant(
 
     info!("Created variant '{}' (id={}) on surface '{}'", new_variant.alias, new_variant.id, surface_id);
 
-    let mut headers = save_warnings(&state, &saved, tenant_context(&context), resource_scope(&scope)).await;
+    let mut headers = save_warnings(&state, &saved, &others, tenant_context(&context), resource_scope(&scope)).await;
     if left_out_target_binding && let Some(value) = warning_header(&copied_target_binding_warning(&new_variant.alias)) {
         headers.append(axum::http::header::WARNING, value);
     }
@@ -6226,7 +6215,7 @@ pub async fn update_variant(
     }
     settle_retained_protected_resources(&mut surface, false, &retained, &state.network_config)?;
 
-    let (saved, warnings) = validate_and_save_surface(
+    let (saved, warnings, others) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -6254,7 +6243,7 @@ pub async fn update_variant(
     info!("Updated variant '{}' (id={}) on surface '{}'", updated.alias, updated.id, surface_id);
 
     Ok((
-        save_warnings(&state, &saved, tenant_context(&context), resource_scope(&scope)).await,
+        save_warnings(&state, &saved, &others, tenant_context(&context), resource_scope(&scope)).await,
         SurfaceSaveResponse::new(SurfaceResponse::variant(updated, &saved), warnings),
     ))
 }
@@ -6380,7 +6369,7 @@ pub async fn promote_variant_to_default(
     let variant_alias = variant.alias.clone();
     surface.default_variant_id = Some(variant_id.clone());
 
-    let (saved, warnings) = validate_and_save_surface(
+    let (saved, warnings, others) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -6396,7 +6385,7 @@ pub async fn promote_variant_to_default(
     info!("Promoted variant '{}' (id={}) to default on surface '{}'", variant_alias, variant_id, surface_id);
 
     Ok((
-        save_warnings(&state, &saved, tenant_context(&context), resource_scope(&scope)).await,
+        save_warnings(&state, &saved, &others, tenant_context(&context), resource_scope(&scope)).await,
         SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, saved).await, warnings),
     ))
 }

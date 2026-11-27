@@ -152,6 +152,34 @@ export interface ValidateSurfaceOptions {
 }
 
 /**
+ * A warning for each Transit Point of the `stored` view that `view` keeps without the
+ * `listen_path` it had. Such a point stops answering there and falls back to the route
+ * the gateway derives from its alias. Clearing the field is the only way to ask for
+ * that, so this informs rather than blocks: what the save gate refuses is a path the
+ * gateway would not serve (`listenPathProblem`), not the absence of one.
+ */
+export function clearedListenPathWarnings(view: unknown, stored: unknown): string[] {
+  const points = (view as { transit?: { points?: unknown } } | null)?.transit?.points;
+  const tps: any[] = Array.isArray(points) ? points : [];
+  const warnings: string[] = [];
+  for (const before of storedTransitPoints(stored)) {
+    const was = text(before?.listen_path);
+    if (!was) continue;
+    const alias = text(before?.alias);
+    const now = tps.find(
+      tp => (alias && tp?.alias === alias) || (before?.id && tp?.id === before.id)
+    );
+    // The point itself being gone is a removal the operator can see on the canvas.
+    if (!now) continue;
+    if (text(now.listen_path)) continue;
+    warnings.push(
+      `Transit point "${alias}" no longer has a Listen Path, so "${was}" stops answering and callers reach it at its derived /outbound route.`
+    );
+  }
+  return warnings;
+}
+
+/**
  * Validate the built payload. Cheap, side-effect-free, no async. Caller
  * access never blocks a save and raises no issue here: the gateway's save
  * answers with a `Warning` header for a public, a not-ready, and a legacy
@@ -335,26 +363,8 @@ export function validateSurfacePayload(
   }
 
   if (options.stored !== undefined) {
-    // A Transit Point that loses its stored `listen_path` stops answering there and
-    // falls back to the route the gateway derives from its alias. Clearing the field
-    // is the only way to ask for that, so this informs rather than blocks: what the
-    // save gate refuses is a path the gateway would not serve (`listenPathProblem`),
-    // not the absence of one.
-    for (const stored of storedPoints) {
-      const was = text(stored?.listen_path);
-      if (!was) continue;
-      const alias = text(stored?.alias);
-      const now = tps.find(
-        tp => (alias && tp?.alias === alias) || (stored?.id && tp?.id === stored.id)
-      );
-      // The point itself being gone is a removal the operator can see on the canvas.
-      if (!now) continue;
-      if (text(now.listen_path)) continue;
-      issues.push({
-        severity: 'warning',
-        message: `Transit point "${alias}" no longer has a Listen Path, so "${was}" stops answering and callers reach it at its derived /outbound route.`,
-        path: 'transit.points',
-      });
+    for (const message of clearedListenPathWarnings(payload, options.stored)) {
+      issues.push({ severity: 'warning', message, path: 'transit.points' });
     }
     for (const { rule, message, nodeId } of targetAuthBreaches(payload, options.stored)) {
       issues.push({

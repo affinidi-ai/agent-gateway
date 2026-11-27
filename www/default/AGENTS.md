@@ -398,7 +398,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   them is left unresolved rather than relabelled, and a brand-new node seeds the first offered
   prefix with a two-word random path. A Transit Point that already holds a listen address but no
   Listen Path is not seeded: its path was cleared, or never set, and it answers at its derived
-  route. After a save attempt (`hasAttemptedSave`) an empty prefix and
+  route. A stored Transit Point with no `listen_address` of its own is hydrated with the surface's
+  `transit.outbound_listen_address`, the listener it answers on, so it is not taken for a new
+  node either. After a save attempt (`hasAttemptedSave`) an empty prefix and
   an empty path are each marked invalid, the prefix with "Pick a surface prefix." naming the stored
   route as under none of those offered and the path with "Enter a path."; `validatePath`'s own
   message still wins over the latter. A Transit Point with no Listen Path at all is exempt from
@@ -415,8 +417,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   it, so a variant repeating a path its base point keeps is exempt as the gateway exempts it,
   even in a variant added in this session, which has no stored view.
   That comparison is why the rule cannot live in the node's `incompleteReason`, which sees no
-  stored surface. Clearing the path saves, and `validateSurfacePayload` warns that the stored path
-  stops answering. A base Transit Point's Listen Path edit is carried into every variant snapshot
+  stored surface. Clearing the path saves, and the save toast warns that the stored path stops
+  answering: `clearedListenPathWarnings`, the rule `validateSurfacePayload` uses, reads each view
+  the save returned against the same view as stored and passes its messages to
+  `showSurfaceSaveToast` as `changeWarnings`, after the gateway's. A base Transit Point's Listen Path edit is carried into every variant snapshot
   whose copy of that alias held the base's previous path (`propagateBaseListenPaths`), since a
   variant path that differs from its base point's is never served (`listen_path_variant_unserved`
   on a save that introduces it); a variant whose path already differed keeps it. The save then

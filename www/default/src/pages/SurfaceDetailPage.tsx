@@ -11,6 +11,7 @@ import {
   registry,
   validateSurfacePayload,
   variantListenPathProblem,
+  clearedListenPathWarnings,
   buildCanvasBlob,
 } from '../components/surface-builder/elements';
 import {
@@ -883,18 +884,19 @@ const SurfaceDetailPage: React.FC = () => {
    * against the base surface, or against nothing, therefore reads an untouched legacy
    * value as newly introduced and blocks a save that never touched it. `null` when the
    * view is not stored at all, such as a variant added in this session, where everything
-   * it carries really is new.
+   * it carries really is new. `of` reads the view from another surface, such as the
+   * one a save returns.
    */
-  const storedViewFor = (variantId: string): unknown => {
-    if (!surface) return null;
-    if (variantId === BASE_VARIANT_ID) return surface;
-    const variants: unknown = (surface as unknown as { variants?: unknown }).variants;
+  const storedViewFor = (variantId: string, of: AgentSurface | null = surface): unknown => {
+    if (!of) return null;
+    if (variantId === BASE_VARIANT_ID) return of;
+    const variants: unknown = (of as unknown as { variants?: unknown }).variants;
     const stored = Array.isArray(variants)
       ? (variants as Array<{ id?: unknown; overrides?: SurfaceOverrides }>).find(
           v => String(v?.id) === variantId
         )
       : undefined;
-    return stored ? resolveVariant(surface, stored.overrides) : null;
+    return stored ? resolveVariant(of, stored.overrides) : null;
   };
 
   /**
@@ -1424,6 +1426,17 @@ const SurfaceDetailPage: React.FC = () => {
         }
       );
       const serverWarnings = [...headerWarnings, ...saveWarningMessages(bodyWarnings)];
+      // Each view as saved against the same view as it was stored, so a Listen Path the
+      // save cleared is told after it, as the pre-save check cannot show a warning.
+      const storedViewIds: string[] = [
+        BASE_VARIANT_ID,
+        ...(
+          (surface as unknown as { variants?: Array<{ id?: unknown }> } | null)?.variants ?? []
+        ).map(v => String(v?.id)),
+      ];
+      const changeWarnings = storedViewIds.flatMap(vid =>
+        clearedListenPathWarnings(storedViewFor(vid, updated), storedViewFor(vid))
+      );
       setSavedWarnings({ surfaceId, warnings: shownSaveWarnings(serverWarnings) });
       setSurface(updated);
       setSaveCount(count => count + 1);
@@ -1517,6 +1530,7 @@ const SurfaceDetailPage: React.FC = () => {
       // transit points without being prevented from saving.
       showSurfaceSaveToast(`Agent Surface "${updated.name}" saved`, updated, {
         headerWarnings: serverWarnings,
+        changeWarnings,
       });
     } catch (err: any) {
       setError(err.message || 'Failed to save surface');

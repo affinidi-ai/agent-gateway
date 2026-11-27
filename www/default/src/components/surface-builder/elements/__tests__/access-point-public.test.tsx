@@ -281,6 +281,18 @@ describe('showSurfaceSaveToast', () => {
     expect(toast.mock.calls).toEqual([['success', 'Saved']]);
   });
 
+  it("shows what the save changed after the gateway's warnings, each once", () => {
+    const cleared = 'Transit point "partner-a" no longer has a Listen Path';
+    showSurfaceSaveToast(
+      'Saved',
+      storedSurface({ public: false, caller_authentication: API_KEY_AUTH }),
+      { headerWarnings: ['from the gateway'], changeWarnings: [cleared, cleared] }
+    );
+    expect(toast.mock.calls).toEqual([
+      ['warning', `Saved, with warnings:\nfrom the gateway\n${cleared}`, expect.anything()],
+    ]);
+  });
+
   it('shows success alone for a closed surface with a Caller Context', () => {
     showSurfaceSaveToast(
       'Saved',

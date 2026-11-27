@@ -46,6 +46,22 @@ changes:
         segment (listen_path_invalid), and a variant path its base Transit Point does not hold,
         which no route serves (listen_path_variant_unserved), with the same exemptions the gateway
         applies to a path the surface or variant already holds.
+    - timestamp: '2026-11-27T10:00:00Z'
+      title: Keep a Transit Point on the surface's outbound listener when its panel opens
+      description: >-
+        A Transit Point stored without a listener address of its own answers on the surface's
+        transit.outbound_listen_address. The Surface Builder loaded it with no address, so opening
+        its panel took it for a new point, seeded a random Listen Path and moved it to the first
+        outbound listener, and a later unrelated save took it off the route its callers use. The
+        point now loads on the listener it answers on and its panel leaves it as it is.
+    - timestamp: '2026-11-27T10:10:00Z'
+      title: Warn after saving a surface whose Transit Point Listen Path was cleared
+      description: >-
+        Clearing a stored Transit Point Listen Path and saving was answered with a plain success
+        toast, although the old URL stops answering and callers reach the point at its derived
+        /outbound route. The warning was raised only before the save, where warnings are dropped.
+        The save toast now reads each saved view against the same view as stored and names the
+        path that stopped answering.
   removed: []
   security: []
   breaking:

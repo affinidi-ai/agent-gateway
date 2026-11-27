@@ -92,7 +92,7 @@ describe('transit-point listen_address validation', () => {
 
 describe('transit-point Listen Path typed without a prefix', () => {
   const incompleteReason = (config: Record<string, unknown>) =>
-    registry.get('transit-point-a2a')?.incompleteReason?.(config as any);
+    registry.get('transit-point-a2a')?.incompleteReason?.(config);
   const typedWithoutPrefix = {
     listen_address: 'https://out.example.com',
     route_prefix: '',
@@ -110,5 +110,53 @@ describe('transit-point Listen Path typed without a prefix', () => {
         'Pick a surface prefix for the Listen Path'
       );
     }
+  });
+});
+
+describe('a stored Transit Point with no listener of its own', () => {
+  const pointConfigs = (transit: Record<string, unknown>) =>
+    registry
+      .nodesFromPayload({
+        name: 's',
+        access_point: { route: '/a2a', protocol: 'a2a' },
+        target: { endpoint: 'https://agent.example.com/a2a' },
+        transit: {
+          points: [
+            {
+              id: 'tp-1',
+              alias: 'partner',
+              protocol: 'a2a',
+              target_endpoint: 'https://upstream.example.com',
+            },
+            {
+              id: 'tp-2',
+              alias: 'own',
+              protocol: 'a2a',
+              target_endpoint: 'https://upstream.example.com',
+              listen_address: 'https://own.example.com',
+            },
+          ],
+          ...transit,
+        },
+      })
+      .filter(n => n.type === 'transit-point-a2a')
+      .map(n => n.config ?? {});
+
+  // The panel seeds a node with no address as a new one, so the inherited listener has
+  // to be on the node, or opening it would move the point and give it a random path.
+  it('shows the surface outbound listener it answers on', () => {
+    const [inherited, own] = pointConfigs({
+      outbound_listen_address: 'https://second.example.com',
+    });
+
+    expect(inherited.listen_address).toBe('https://second.example.com');
+    expect(inherited.listen_path).toBeUndefined();
+    expect(own.listen_address).toBe('https://own.example.com');
+  });
+
+  it('is left without one when the surface names none', () => {
+    const [inherited] = pointConfigs({});
+
+    expect(inherited.listen_address).toBeUndefined();
   });
 });
