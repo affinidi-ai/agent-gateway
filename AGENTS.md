@@ -548,10 +548,11 @@ _Maintenance actions_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#mainten
 
 A surface save's warnings are listed once, in full, in the save toast, laid out as the "Changes
 discarded." undo toast with a countdown bar and closing after 10 seconds unless **Keep open**
-is pressed, which keeps it, with later toasts shown below it, until it is closed or the page
-leaves that surface; there is no
-save-warnings banner, and a save without warnings shows the same layout
-for 3 seconds. Every toast closes with the same × button at the end of its row, its message
+is pressed, which keeps it, with later toasts shown below it, until it is closed, the next save
+shows its toast, or the surface page leaves that surface (a create with only the dashboard's own
+warnings returns to the surface list, where a kept toast stays until closed or the next save);
+there is no save-warnings banner, and a save without warnings shows the same layout for 3
+seconds. Every toast closes with the same × button at the end of its row, its message
 wrapping so the button stays reachable, and the countdown toasts are announced to screen readers
 through live regions that stay in the page; see _Toasts_ and _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#toasts).

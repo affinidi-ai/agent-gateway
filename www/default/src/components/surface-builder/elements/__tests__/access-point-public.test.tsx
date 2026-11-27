@@ -9,6 +9,7 @@ import { nodesFromSurface } from '../../nodesFromSurface';
 import { showSurfaceSaveToast } from '../saveWarnings';
 import { withCallerAccessSettled } from '../access-point/publicAccess';
 import {
+  closeKeptToast,
   showKeepOpenWarningToast,
   showSuccessCountdownToast,
   showToast,
@@ -27,11 +28,13 @@ jest.mock('../../../../utils/toaster', () => ({
   showToast: jest.fn(),
   showKeepOpenWarningToast: jest.fn(),
   showSuccessCountdownToast: jest.fn(),
+  closeKeptToast: jest.fn(),
 }));
 
 const toast = showToast as jest.Mock;
 const keepOpenToast = showKeepOpenWarningToast as jest.Mock;
 const successToast = showSuccessCountdownToast as jest.Mock;
+const closeKept = closeKeptToast as jest.Mock;
 
 const PUBLIC_MESSAGE =
   'This Access Point is public. Anyone who can reach it can call your agent without credentials.';
@@ -252,6 +255,30 @@ describe('showSurfaceSaveToast', () => {
     toast.mockReset();
     keepOpenToast.mockReset();
     successToast.mockReset();
+    closeKept.mockReset();
+  });
+
+  it('closes a kept toast from an earlier save before showing a clean save', () => {
+    showSurfaceSaveToast(
+      'Saved',
+      storedSurface({ public: false, caller_authentication: API_KEY_AUTH })
+    );
+    expect(closeKept).toHaveBeenCalledTimes(1);
+    expect(closeKept.mock.invocationCallOrder[0]).toBeLessThan(
+      successToast.mock.invocationCallOrder[0]
+    );
+  });
+
+  it('closes a kept toast from an earlier save before showing a save with warnings', () => {
+    showSurfaceSaveToast(
+      'Saved',
+      storedSurface({ public: false, caller_authentication: API_KEY_AUTH }),
+      { headerWarnings: ['from the gateway'] }
+    );
+    expect(closeKept).toHaveBeenCalledTimes(1);
+    expect(closeKept.mock.invocationCallOrder[0]).toBeLessThan(
+      keepOpenToast.mock.invocationCallOrder[0]
+    );
   });
 
   it("leaves out the Access Point's Warning headers, a variant's too", () => {

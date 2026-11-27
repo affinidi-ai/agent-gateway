@@ -1,4 +1,8 @@
-import { showKeepOpenWarningToast, showSuccessCountdownToast } from '../../../utils/toaster';
+import {
+  closeKeptToast,
+  showKeepOpenWarningToast,
+  showSuccessCountdownToast,
+} from '../../../utils/toaster';
 import { validateSurfacePayload } from './validateSurface';
 
 /**
@@ -29,13 +33,15 @@ export interface SurfaceSaveToastOptions {
  * `saved` alone, or with the save's warnings, the gateway's first (its
  * `Warning` headers but the Access Point's), then the dashboard's non-blocking
  * issues, each once and in full. Both are laid out as the undo toast, with its countdown
- * bar; one with warnings closes after 10 seconds unless Keep open is pressed.
+ * bar; one with warnings closes after 10 seconds unless Keep open is pressed. A kept toast
+ * from an earlier save closes, since this save's toast now says what holds.
  */
 export function showSurfaceSaveToast(
   saved: string,
   payload: unknown,
   { headerWarnings = [] }: SurfaceSaveToastOptions = {}
 ): void {
+  closeKeptToast();
   const fromDashboard = validateSurfacePayload(payload)
     .filter(i => i.severity === 'warning')
     .map(i => i.message);

@@ -5,7 +5,8 @@
  * format problems shown next to the fields and blocking Save, a Target that is not https and an
  * Access Point that checks no caller shown as advisories that allow Save (the gateway refuses
  * them only while its `target_https` or `target_source_auth` rule is `enforce`, and answers a
- * save in `warn` with a `Warning` header), advice for a passthrough fallback, a stored method
+ * save in `warn` with a `Warning` header, which stays above a blocked Save's toast once it is
+ * kept open), advice for a passthrough fallback, a stored method
  * the editor cannot show kept through a save, and a valid setting, scopes included, saving and
  * loading again unchanged.
  *
@@ -366,6 +367,35 @@ test.describe('Managed Agent Target authentication: credential provider', () => 
         await saveButton(page).click();
         await expect.poll(() => saved.length).toBe(1);
         await expect(page.locator('#app-toast')).toContainText(warning);
+    });
+
+    test('a kept save warning stays while a blocked Save shows its own toast below it', async ({page}) => {
+        const saved: Request[] = [];
+        const warning =
+            'target.auth: Target authentication sends a credential, so its Target must be an https URL';
+        await mockSurface(page, surfaceFixture({endpoint: 'http://agent.example.com'}), saved, {warning});
+        await openTargetAuth(page);
+        await pickProvider(page);
+        await saveButton(page).click();
+        await expect.poll(() => saved.length).toBe(1);
+
+        await page.getByTestId('app-toast-keep-open-button').click();
+        const kept = page.locator('#app-toast-kept');
+        await expect(kept).toContainText(warning);
+
+        await page.getByTestId('surface-node-target').click();
+        await page.getByRole('button', {name: /Configure/}).click();
+        await page.locator('#target-auth-header-format').fill('');
+        await saveButton(page).click();
+        await expectSaveBlocked(page, 'Header format must contain {value} exactly once');
+        expect(saved).toHaveLength(1);
+
+        await expect(kept).toContainText(warning);
+        const keptBox = await kept.locator(':scope > div').boundingBox();
+        const blockedBox = await page.locator('#app-toast > div').boundingBox();
+        expect(keptBox).not.toBeNull();
+        expect(blockedBox).not.toBeNull();
+        expect(blockedBox!.y).toBeGreaterThanOrEqual(keptBox!.y + keptBox!.height);
     });
 
     test('while target_https is enforce the gateway refuses an http Target and its 400 is shown on the page', async ({page}) => {

@@ -80,12 +80,15 @@ This holds on every page.
 
 `showKeepOpenWarningToast` is a warning toast that counts down 10 seconds, and the next toast
 replaces it while it does. Its **Keep open** button stops the countdown, removes the bar and
-the button, moves focus to the close button and keeps the toast (`#app-toast-kept`) until it is
-closed: a later toast no longer replaces it but is shown below it, moving back to the top when
-the kept toast closes, and keeping a newer warnings toast closes the older kept one.
-`closeKeptToast` closes a kept toast and leaves the replaceable one; the surface page calls it
-when it leaves its surface, for another surface or another page, so kept save warnings stay
-with their surface as the save-warnings banner did.
+the button, moves focus to the close button and keeps the toast (`#app-toast-kept`, its close
+button and message renamed `#app-toast-kept-close` and `#app-toast-kept-message` so no id is on
+screen twice) until it is closed: a later toast no longer replaces it but is shown below it,
+capped at the height left in the viewport and scrolling, laid out again on a window resize and
+moving back to the top when the kept toast closes. Keeping a newer warnings toast closes the
+older kept one. `closeKeptToast` closes a kept toast and leaves the replaceable one; the surface
+page calls it when it leaves its surface, for another surface or another page, and
+`showSurfaceSaveToast` calls it before every save's toast, so kept save warnings last no longer
+than the save and the surface they are about.
 `showSuccessCountdownToast` is a success toast that counts down 3 seconds with no other button.
 Both colour the left border with the brand colour (`UI_COLORS`) and the icon with the text-safe
 token (`--warning-text`, `--success-text`), so the icon keeps 3:1 in both themes.
@@ -96,7 +99,8 @@ Every toast closes with the same × button (`closeButtonHtml`, `#app-toast-close
 countdown toasts (`showUndoToast`, `showKeepOpenWarningToast`, `showSuccessCountdownToast`) are
 announced to screen readers through two live regions that stay in the page between toasts,
 `#app-toast-live-polite` (`role="status"`) and `#app-toast-live-assertive` (`role="alert"`, for
-the warning toast), without taking focus. **Keep open** carries
+the warning toast), without taking focus. A toast closed or replaced before its announcement is
+written is not announced. Plain `showToast` toasts are not announced. **Keep open** carries
 `data-testid="app-toast-keep-open-button"`.
 
 ## Test identifiers
@@ -474,11 +478,14 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   close button. "<saved>" alone is `showSuccessCountdownToast`: the success icon and colour, no
   other button, closing after 3 seconds. A toast with warnings is `showKeepOpenWarningToast`:
   **Keep open** where Undo is, closing after 10 seconds unless Keep open is pressed, which
-  keeps it until it is closed, with later toasts (a blocked Save's, the next save's) shown below
-  it rather than replacing it; screen readers announce it assertively. The close button and live regions are those of every toast;
-  see _Toasts_. The warnings toast is the only place a save's warnings are listed, with
-  no banner above the canvas. A create that drew any opens the new surface's page, carrying
-  them so the Transit Point a warning names shows it in its panel.
+  keeps it until it is closed, the next save shows its toast, or the page leaves that surface,
+  with other later toasts (a blocked Save's) shown below it rather than replacing it; screen
+  readers announce it assertively. The close button is that of every toast and the live regions
+  are those of the countdown toasts; see _Toasts_. The warnings toast is the only place a save's
+  warnings are listed, with no banner above the canvas. A create that drew gateway warnings opens
+  the new surface's page, carrying them so the Transit Point a warning names shows it in its
+  panel; one with only the dashboard's own warnings returns to the surface list, where a kept
+  toast stays until it is closed or the next save shows its toast.
 - **Transit Settings** has no listener authentication control: the gateway does not support
   `transit.source_auth` and refuses a save that sets it. **Transit Token Mode** is shown, not
   chosen: only the embedded token exists, signed and readable by the agent, not encrypted, so

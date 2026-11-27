@@ -41,7 +41,15 @@ const LIVE_REGION_ID = {
 /** How long a cleared live region stays empty before it gets the new text, so a repeat is read. */
 export const ANNOUNCE_DELAY_MS = 100;
 
-const announce = (message: string, politeness: keyof typeof LIVE_REGION_ID) => {
+/** The announcement waiting to be written to each region; a newer one cancels it. */
+const pendingAnnounce: Partial<Record<keyof typeof LIVE_REGION_ID, ReturnType<typeof setTimeout>>> =
+  {};
+
+/** Announces `message` and returns its pending announcement, for `cancelAnnounce`. */
+const announce = (
+  message: string,
+  politeness: keyof typeof LIVE_REGION_ID
+): ReturnType<typeof setTimeout> => {
   const id = LIVE_REGION_ID[politeness];
   let region = document.getElementById(id);
   if (!region) {
@@ -55,9 +63,23 @@ const announce = (message: string, politeness: keyof typeof LIVE_REGION_ID) => {
   }
   const target = region;
   target.textContent = '';
-  setTimeout(() => {
+  clearTimeout(pendingAnnounce[politeness]);
+  const pending = setTimeout(() => {
+    delete pendingAnnounce[politeness];
     target.textContent = message;
   }, ANNOUNCE_DELAY_MS);
+  pendingAnnounce[politeness] = pending;
+  return pending;
+};
+
+/** Cancels `pending` if it is still waiting, so a toast closed before it is read stays quiet. */
+const cancelAnnounce = (
+  politeness: keyof typeof LIVE_REGION_ID,
+  pending: ReturnType<typeof setTimeout>
+) => {
+  if (pendingAnnounce[politeness] !== pending) return;
+  clearTimeout(pending);
+  delete pendingAnnounce[politeness];
 };
 
 // Removes the toast on screen with its timer and key handler; a new toast replaces it through this.
@@ -78,14 +100,24 @@ let dismissKept: (() => void) | null = null;
 const TOAST_TOP_PX = 20;
 const TOAST_GAP_PX = 10;
 
-/** Places the replaceable toast below a kept one, or at the top when none is kept. */
+/**
+ * Places the replaceable toast below a kept one, or at the top when none is kept, and caps its
+ * height at the room left in the viewport so it scrolls rather than running off the screen.
+ */
 const layoutToasts = () => {
   const active = document.getElementById('app-toast')?.firstElementChild as HTMLElement | null;
   if (!active) return;
   const kept = document.getElementById(KEPT_TOAST_ID)?.firstElementChild;
-  const below = kept ? kept.getBoundingClientRect().height + TOAST_GAP_PX : 0;
-  active.style.top = `${TOAST_TOP_PX + below}px`;
+  const top = TOAST_TOP_PX + (kept ? kept.getBoundingClientRect().height + TOAST_GAP_PX : 0);
+  active.style.top = `${top}px`;
+  active.style.maxHeight = `${Math.max(window.innerHeight - top - TOAST_TOP_PX, 0)}px`;
+  active.style.overflowY = 'auto';
 };
+
+if (typeof window !== 'undefined') window.addEventListener('resize', layoutToasts);
+
+/** The ids inside a toast that a kept toast renames, so two toasts on screen never share one. */
+const KEPT_INNER_IDS = ['app-toast-close', 'app-toast-message'] as const;
 
 export const showToast = (
   type: ToastType,
@@ -245,8 +277,6 @@ export interface UndoToastOptions {
 interface CountdownToastControls {
   /** Removes the toast; `expired` runs its `onExpire`. */
   remove: (expired: boolean) => void;
-  /** Stops the countdown and removes the bar and the button, so the toast stays until closed. */
-  stopCountdown: () => void;
   /**
    * Stops the countdown and keeps the toast until it is closed: a later toast is shown below it
    * instead of replacing it, and an earlier kept toast is closed.
@@ -332,7 +362,7 @@ const showCountdownToast = ({
   if (messageEl) messageEl.textContent = message;
   document.body.appendChild(toast);
   layoutToasts();
-  announce(message, politeness);
+  const announcement = announce(message, politeness);
 
   let buttonRoot: Root | null = null;
   const unmountButton = () => {
@@ -348,6 +378,7 @@ const showCountdownToast = ({
     if (dismissKept === dismiss) dismissKept = null;
     document.removeEventListener('keydown', keyHandler);
     clearTimeout(timer);
+    cancelAnnounce(politeness, announcement);
     unmountButton();
     toast.remove();
     layoutToasts();
@@ -370,9 +401,13 @@ const showCountdownToast = ({
     dismissKept?.();
     if (dismissActive === dismiss) dismissActive = null;
     toast.id = KEPT_TOAST_ID;
+    for (const id of KEPT_INNER_IDS) {
+      const inner = toast.querySelector(`#${id}`);
+      if (inner) inner.id = id.replace('app-toast-', `${KEPT_TOAST_ID}-`);
+    }
     dismissKept = dismiss;
   };
-  const pressButton = () => onButton?.({ remove, stopCountdown, keep });
+  const pressButton = () => onButton?.({ remove, keep });
 
   if (!buttonLabel) {
     mountEl?.remove();
