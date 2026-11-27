@@ -167,6 +167,33 @@ impl TokenEndpointThrottle {
         }
     }
 
+    /// How long the caller's IP must still wait, when it is blocked.
+    pub fn client_retry_after(
+        &self,
+        client_ip: Option<IpAddr>,
+    ) -> Option<u64> {
+        self.retry_after(None, client_ip, now_secs())
+    }
+
+    /// Record one failed attempt for the caller's IP.
+    pub fn record_client_failure(
+        &self,
+        client_ip: Option<IpAddr>,
+    ) {
+        self.record(None, client_ip, now_secs());
+    }
+
+    /// Forget what was recorded for the caller's IP, as a successful sign-in does.
+    pub fn forget_client(
+        &self,
+        client_ip: Option<IpAddr>,
+    ) {
+        if let Some(ip) = client_ip {
+            self.state
+                .remove(&ip_key(&source_key(ip)));
+        }
+    }
+
     /// Whether only failed client authentications should be recorded (vs every request).
     pub fn failed_attempts_only(&self) -> bool {
         self.failed_attempts_only
@@ -347,6 +374,29 @@ mod tests {
             },
             lockout_secs: lockout,
         }
+    }
+
+    #[test]
+    fn a_client_ip_is_blocked_after_its_failures_until_it_is_forgotten() {
+        let mut config = cfg(1000, 60, 300);
+        config.per_ip.requests = 2;
+        let t = TokenEndpointThrottle::from_config(&config);
+        let ip: IpAddr = "192.0.2.7".parse().unwrap();
+        let other: IpAddr = "192.0.2.8".parse().unwrap();
+
+        t.record_client_failure(Some(ip));
+        t.record_client_failure(Some(ip));
+        assert_eq!(t.client_retry_after(Some(ip)), None, "at the limit, not over it");
+        t.record_client_failure(Some(ip));
+        let wait = t
+            .client_retry_after(Some(ip))
+            .expect("over the limit");
+        assert!(wait > 0 && wait <= 300, "{wait}");
+        assert_eq!(t.client_retry_after(Some(other)), None);
+
+        t.forget_client(Some(ip));
+        assert_eq!(t.client_retry_after(Some(ip)), None);
+        t.forget_client(None);
     }
 
     #[test]

@@ -184,6 +184,12 @@ pub struct SurfaceConfigBuilder {
     pub signs_in_with_saml: bool,
     /// Further `saml.json` settings, key to JSON value, written over the SAML fixture's.
     pub saml_settings: serde_json::Map<String, serde_json::Value>,
+    /// Console users sign in with OpenID Connect at the provider with this issuer.
+    pub signs_in_with_oidc: Option<String>,
+    /// Further `oidc.json` settings, key to JSON value, written over the OIDC fixture's.
+    pub oidc_settings: serde_json::Map<String, serde_json::Value>,
+    /// The appliance limit on human users, when the scenario sets one.
+    pub human_user_limit: Option<u64>,
     /// The gateway is expected to exit at startup, so the harness waits for it to exit
     /// instead of waiting for it to serve.
     pub refuses_to_start: bool,
@@ -387,6 +393,9 @@ impl Default for SurfaceConfigBuilder {
             streams_sign_in_records: false,
             signs_in_with_saml: false,
             saml_settings: serde_json::Map::new(),
+            signs_in_with_oidc: None,
+            oidc_settings: serde_json::Map::new(),
+            human_user_limit: None,
             refuses_to_start: false,
             rbac_permissions: Vec::new(),
             caller_key: None,

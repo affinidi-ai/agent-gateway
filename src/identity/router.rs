@@ -264,11 +264,33 @@ async fn ensure_vta_auth_did(
     config
 }
 
+/// The OIDC sign-in routes. `/auth/check` and `/auth/logout` behave as in SAML mode.
+fn oidc_auth_routes(
+    oidc_state: std::sync::Arc<crate::auth::oidc::OidcState>,
+    sessions: std::sync::Arc<crate::auth::SessionManager>,
+    terms_manager: Arc<crate::terms::TermsManager>,
+    metric_store: Option<Arc<MetricsStore>>,
+) -> Router {
+    Router::new()
+        .route("/oidc/login", get(crate::auth::oidc::oidc_login))
+        .route("/oidc/callback", get(crate::auth::oidc::oidc_callback))
+        .layer(Extension(metric_store))
+        .with_state(oidc_state)
+        .merge(
+            Router::new()
+                .route("/auth/check", get(crate::auth::saml::saml_check_auth))
+                .route("/auth/logout", post(crate::auth::saml::saml_logout_generic))
+                .layer(Extension(sessions))
+                .layer(Extension(terms_manager)),
+        )
+}
+
 pub async fn create_identity_api_router(
     state: IdentityApiState,
     dashboard_state: crate::observability::DashboardState,
     auth_state: Option<std::sync::Arc<crate::auth::AuthState>>,
     saml_state: Option<std::sync::Arc<crate::auth::saml::SamlState>>,
+    oidc_state: Option<std::sync::Arc<crate::auth::oidc::OidcState>>,
     gateway_store: Option<std::sync::Arc<crate::gateways::FileSystemGatewayStore>>,
     mediator_store: Option<std::sync::Arc<crate::mediators::FileSystemMediatorStore>>,
     trust_registry_store: Option<std::sync::Arc<crate::trust_registries::FileSystemTrustRegistryStore>>,
@@ -324,6 +346,11 @@ pub async fn create_identity_api_router(
             saml_state
                 .as_ref()
                 .map(|saml| saml.session_manager.clone())
+        })
+        .or_else(|| {
+            oidc_state
+                .as_ref()
+                .map(|oidc| oidc.session_manager.clone())
         });
     let gateway_user_storage = auth_state
         .as_ref()
@@ -332,6 +359,11 @@ pub async fn create_identity_api_router(
             saml_state
                 .as_ref()
                 .map(|saml| saml.storage.clone())
+        })
+        .or_else(|| {
+            oidc_state
+                .as_ref()
+                .map(|oidc| oidc.storage.clone())
         });
 
     // Reuse trust registry listener manager for agents-api onboarding
@@ -355,24 +387,12 @@ pub async fn create_identity_api_router(
 
     // Add WebSocket routes conditionally based on auth requirement
     info!(
-        "Setting up WebSocket routes: websocket_require_auth={}, auth_state={}, saml_state={}",
+        "Setting up WebSocket routes: websocket_require_auth={}, sign-in sessions={}",
         websocket_require_auth,
-        auth_state.is_some(),
-        saml_state.is_some()
+        gateway_session_mgr.is_some()
     );
 
-    let dashboard_router = if websocket_require_auth && (auth_state.is_some() || saml_state.is_some()) {
-        // Get session manager from whichever auth mode is active
-        let session_mgr = if let Some(auth) = auth_state.as_ref() {
-            info!("Using passkey session manager for WebSocket authentication");
-            auth.session_manager.clone()
-        } else if let Some(saml) = saml_state.as_ref() {
-            info!("Using SAML session manager for WebSocket authentication");
-            saml.session_manager.clone()
-        } else {
-            unreachable!("Session manager must exist when auth_state or saml_state is Some");
-        };
-
+    let dashboard_router = if websocket_require_auth && let Some(session_mgr) = gateway_session_mgr.clone() {
         info!("WebSocket routes configured with authentication required");
         dashboard_router
             .route("/ws/dashboard", get(crate::server::ws_handler_authenticated))
@@ -445,11 +465,12 @@ pub async fn create_identity_api_router(
         .layer(Extension(agents_api_listener_manager.clone()))
         .with_state(state.clone());
 
-    // Determine auth mode from what was actually passed to this function
-    // If saml_state is Some, we're in SAML mode
-    // If auth_state is Some, we're in Passkey mode
+    // Determine auth mode from what was actually passed to this function: SAML or OIDC state when
+    // that mode is on, otherwise passkey.
     let auth_mode = if saml_state.is_some() {
         crate::auth::AuthMode::Saml
+    } else if oidc_state.is_some() {
+        crate::auth::AuthMode::Oidc
     } else {
         crate::auth::AuthMode::Passkey
     };
@@ -569,6 +590,42 @@ pub async fn create_identity_api_router(
                 )
             }
         }
+        crate::auth::AuthMode::Oidc => match oidc_state {
+            Some(oidc_state_arc) => {
+                let session_mgr = oidc_state_arc
+                    .session_manager
+                    .clone();
+                let storage = oidc_state_arc.storage.clone();
+                let label = crate::auth::mode_handler::SignInLabel(
+                    oidc_state_arc
+                        .config
+                        .label
+                        .clone(),
+                );
+                let router = Router::new()
+                    .route("/v1/auth/mode", get(crate::auth::mode_handler::get_auth_mode))
+                    .layer(Extension(auth_mode.clone()))
+                    .layer(Extension(label))
+                    .merge(oidc_auth_routes(
+                        oidc_state_arc,
+                        session_mgr.clone(),
+                        terms_manager.clone(),
+                        metric_store.clone(),
+                    ));
+                info!("OIDC routes registered (login, callback, logout, check)");
+                (router, Some(storage), Some(session_mgr))
+            }
+            None => {
+                error!("OIDC mode enabled but no OIDC state available");
+                (
+                    Router::new()
+                        .route("/v1/auth/mode", get(crate::auth::mode_handler::get_auth_mode))
+                        .layer(Extension(auth_mode.clone())),
+                    None,
+                    None,
+                )
+            }
+        },
     };
 
     // Create auth manager routes if passkey storage and session manager are available
@@ -666,14 +723,7 @@ pub async fn create_identity_api_router(
                 .with_state(state.clone()),
         );
 
-        info!(
-            "Auth manager routes registered (users, profile, permissions) for {} mode",
-            if auth_mode == crate::auth::AuthMode::Saml {
-                "SAML"
-            } else {
-                "Passkey"
-            }
-        );
+        info!("Auth manager routes registered (users, profile, permissions) for {} mode", auth_mode.as_str());
 
         router
     } else {

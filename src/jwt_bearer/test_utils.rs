@@ -102,22 +102,30 @@ pub async fn start_jwks_server(
         }),
     );
 
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
-    let addr: SocketAddr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app)
+    TestServer::serve(app).await
+}
+
+impl TestServer {
+    /// Serve `app` on a loopback port, its origin admitted as a JWKS fixture while the returned
+    /// guard lives. Returns the origin and the guard.
+    pub async fn serve(app: Router) -> (String, Self) {
+        let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap();
-    });
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
 
-    let origin = format!("http://{}", addr);
-    JWKS_FIXTURE_ORIGINS
-        .lock()
-        .unwrap()
-        .push(origin.clone());
-    (origin.clone(), TestServer { handle, origin })
+        let origin = format!("http://{}", addr);
+        JWKS_FIXTURE_ORIGINS
+            .lock()
+            .unwrap()
+            .push(origin.clone());
+        (origin.clone(), TestServer { handle, origin })
+    }
 }
 
 /// The origins of the running loopback JWKS servers [`start_jwks_server`] started,

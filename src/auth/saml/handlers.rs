@@ -1,19 +1,21 @@
 use axum::{
     Extension, Form, Json,
     extract::{Query, State},
-    http::{HeaderValue, StatusCode, header},
-    response::{Html, IntoResponse, Redirect, Response},
+    http::StatusCode,
+    response::{IntoResponse, Redirect, Response},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use super::service::{SamlService, TooManyPendingAuthnRequests};
-use super::user_provisioning::{SignInChange, SignInEvent, provision_user_from_saml, sign_in_events};
-use crate::auth::cli_login::CLI_AUTHORIZE_PATH;
+use super::user_provisioning::provision_user_from_saml;
 use crate::auth::session::SessionManager;
 use crate::auth::session_finalizer::{
     AuthenticatedPrincipal, SessionFinalizationError, SessionFinalizer, SessionManagerFinalizer,
+};
+use crate::auth::sign_in_pages::{
+    is_allowed_return_target, sign_in_error_page, sign_in_success_response, throttled_sign_in_page,
 };
 use crate::auth::storage::PasskeyStorage;
 use crate::observability::loggable;
@@ -88,37 +90,6 @@ pub struct SamlLoginQuery {
     pub next: Option<String>,
 }
 
-/// The dashboard's new access token form. Its query only presets the form, which the signed-in
-/// user still has to submit.
-pub(crate) const ACCESS_TOKEN_NEW_PATH: &str = "/access-tokens/new";
-
-/// Only the dashboard root, the new access token form (with or without its preset query) and the
-/// CLI authorize path (with its query) may be a return target. Anything else, including
-/// off-origin and protocol-relative targets, an encoded slash or backslash in the path, and
-/// characters that could break out of the ACS markup, is rejected. The query may carry an encoded
-/// slash or backslash, since the CLI `state` is opaque.
-pub(crate) fn is_allowed_return_target(target: &str) -> bool {
-    let path = target
-        .split_once('?')
-        .map_or(target, |(path, _)| path)
-        .to_ascii_lowercase();
-    if path.contains("%2f") || path.contains("%5c") {
-        return false;
-    }
-    let charset_ok = target.len() <= 1024
-        && target.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(b, b'-' | b'_' | b'.' | b'/' | b'?' | b'&' | b'=' | b'%' | b'~' | b':' | b'+')
-        });
-    if !charset_ok {
-        return false;
-    }
-    match target.split_once('?') {
-        None => target == "/" || target == ACCESS_TOKEN_NEW_PATH,
-        Some((path, query)) => (path == CLI_AUTHORIZE_PATH && !query.is_empty()) || path == ACCESS_TOKEN_NEW_PATH,
-    }
-}
-
 /// Initiate SAML login (SP-initiated flow)
 /// GET /saml/login
 ///
@@ -139,7 +110,7 @@ pub async fn saml_login(
         .record_client_attempt(client_ip.map(|Extension(ClientIp(ip))| ip))
     {
         warn!("Throttling SAML login from a source over its limit");
-        return throttled_login_page(retry_after);
+        return throttled_sign_in_page(retry_after);
     }
 
     let return_target = query
@@ -154,7 +125,7 @@ pub async fn saml_login(
         Ok(authn_request) => Redirect::to(&authn_request).into_response(),
         Err(e) if e.is::<TooManyPendingAuthnRequests>() => {
             warn!("Refusing SAML login: {}", e);
-            saml_error_page(
+            sign_in_error_page(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Sign-in busy",
                 "Too many sign-ins are in progress. Please try again in a few minutes.",
@@ -167,47 +138,6 @@ pub async fn saml_login(
     }
 }
 
-fn throttled_login_page(retry_after: u64) -> Response {
-    let mut response = saml_error_page(
-        StatusCode::TOO_MANY_REQUESTS,
-        "Too many sign-in attempts",
-        &format!("Please try again in {retry_after} seconds."),
-    );
-    let headers = response.headers_mut();
-    headers.insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response
-}
-
-/// Render a self-contained HTML error page for a failed SAML sign-in, so the
-/// user sees why (e.g. the appliance user limit was reached) instead of a blank
-/// status page.
-fn saml_error_page(
-    status: StatusCode,
-    title: &str,
-    message: &str,
-) -> Response {
-    let escape = |s: &str| {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-    };
-    let html = format!(
-        r#"<!DOCTYPE html>
-<html>
-<head><title>{title}</title></head>
-<body style="font-family: system-ui, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem;">
-    <h1>{title}</h1>
-    <p>{message}</p>
-    <p><a href="/login">Return to sign in</a></p>
-</body>
-</html>"#,
-        title = escape(title),
-        message = escape(message),
-    );
-    (status, Html(html)).into_response()
-}
-
 /// Where the ACS sends the signed-in browser: the target stored for the `RelayState` key, used
 /// once and checked against the return-target allowlist again, or the dashboard root.
 fn acs_return_target(
@@ -218,73 +148,6 @@ fn acs_return_target(
         .and_then(|key| saml_service.take_return_target(key))
         .filter(|target| is_allowed_return_target(target))
         .unwrap_or_else(|| "/".to_string())
-}
-
-fn js_string_literal(value: &str) -> String {
-    serde_json::Value::String(value.to_owned())
-        .to_string()
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('&', "\\u0026")
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029")
-}
-
-fn acs_script_nonce() -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 16]>())
-}
-
-fn acs_content_security_policy(nonce: &str) -> String {
-    format!(
-        "default-src 'none'; script-src 'nonce-{nonce}'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
-    )
-}
-
-fn acs_success_html(
-    redirect_target: &str,
-    session_token: &str,
-    nonce: &str,
-) -> String {
-    let redirect_target_js = js_string_literal(redirect_target);
-    let session_token_js = js_string_literal(session_token);
-    let redirect_target_attr = redirect_target
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-
-    format!(
-        r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>Login Successful</title>
-    <meta http-equiv="refresh" content="0;url={redirect_target_attr}">
-    <script nonce="{nonce}">
-        sessionStorage.setItem('session_token', {session_token_js});
-        window.location.href = {redirect_target_js};
-    </script>
-</head>
-<body>
-    <p>Login successful. Redirecting...</p>
-</body>
-</html>"#
-    )
-}
-
-fn acs_success_response(
-    mut headers: axum::http::HeaderMap,
-    redirect_target: &str,
-    session_token: &str,
-) -> Result<Response, StatusCode> {
-    let nonce = acs_script_nonce();
-    let html = acs_success_html(redirect_target, session_token, &nonce);
-    let policy = axum::http::HeaderValue::from_str(&acs_content_security_policy(&nonce)).map_err(|e| {
-        error!("Failed to build the SAML success page Content-Security-Policy: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    headers.insert(axum::http::header::CONTENT_SECURITY_POLICY, policy);
-    Ok((headers, Html(html)).into_response())
 }
 
 /// Assertion Consumer Service - receives SAML response from Azure AD
@@ -335,7 +198,7 @@ pub async fn saml_acs(
             // readable page rather than a blank 500.
             if let Some(limit) = e.downcast_ref::<crate::config::LimitExceeded>() {
                 error!("SAML sign-in blocked by appliance limit: {}", limit.message());
-                return Ok(saml_error_page(StatusCode::FORBIDDEN, "Sign-in unavailable", &limit.message()));
+                return Ok(sign_in_error_page(StatusCode::FORBIDDEN, "Sign-in unavailable", &limit.message()));
             }
             if let Some(refused) = e.downcast_ref::<super::user_provisioning::RoleRefused>() {
                 warn!(saml_subject = ?refused.subject, idp_role = ?refused.idp_role, "SAML sign-in refused: {}", e);
@@ -343,7 +206,7 @@ pub async fn saml_acs(
                     crate::integrations::LoginMethod::Saml,
                     crate::integrations::LoginFailure::RoleNotMapped,
                 );
-                return Ok(saml_error_page(
+                return Ok(sign_in_error_page(
                     StatusCode::FORBIDDEN,
                     "Sign-in unavailable",
                     "Your account has no role in this application. Please contact your administrator.",
@@ -355,14 +218,14 @@ pub async fn saml_acs(
                     crate::integrations::LoginMethod::Saml,
                     crate::integrations::LoginFailure::AmbiguousAttribute,
                 );
-                return Ok(saml_error_page(
+                return Ok(sign_in_error_page(
                     StatusCode::FORBIDDEN,
                     "Sign-in unavailable",
                     "Your identity provider sent conflicting account details. Please contact your administrator.",
                 ));
             }
             error!("Failed to provision user from SAML: {}", e);
-            return Ok(saml_error_page(
+            return Ok(sign_in_error_page(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Sign-in failed",
                 "We couldn't complete your sign-in. Please contact your administrator.",
@@ -381,39 +244,19 @@ pub async fn saml_acs(
     .finalize_session(AuthenticatedPrincipal::new(user.username.clone(), user.user_id.clone()))
     .await?;
 
-    if let Some(metrics) = metric_store {
-        let user_role = user.role.to_string();
-        let created = matches!(provisioned.change, SignInChange::Created);
-        tokio::spawn(async move {
-            if created {
-                metrics
-                    .record_user_event("created", &user_role)
-                    .await;
-            }
-            metrics
-                .record_user_login(&user_role)
-                .await;
-        });
-    }
-
     info!(user_id = %user.user_id, role = %user.role, "SAML login successful");
 
-    // Raise the sign-in's user events in order; each is delivered in the background
-    for event in sign_in_events(&provisioned) {
-        match event {
-            SignInEvent::Created(user) => crate::integrations::trigger_user_created(user),
-            SignInEvent::Updated { old, new } => crate::integrations::trigger_user_updated(old, new),
-            SignInEvent::Login(user) => {
-                crate::integrations::trigger_user_login(user, crate::integrations::LoginMethod::Saml)
-            }
-        }
-    }
+    crate::auth::sign_in_events::raise_sign_in_events(
+        &provisioned,
+        crate::integrations::LoginMethod::Saml,
+        metric_store,
+    );
 
     tracing::info!("Setting SAML session cookie");
 
     let redirect_target = acs_return_target(&saml_state.saml_service, form.relay_state.as_deref());
 
-    Ok(acs_success_response(finalized_session.headers, &redirect_target, &finalized_session.session_token)?)
+    Ok(sign_in_success_response(finalized_session.headers, &redirect_target, &finalized_session.session_token)?)
 }
 
 /// Serve SAML metadata
@@ -544,191 +387,12 @@ mod tests {
     use super::*;
     use crate::auth::auth_config::{SamlAttributeMapping, SamlConfig};
     use crate::config::types::LoginThrottleConfig;
+    use axum::http::HeaderValue;
+    use axum::http::header;
     use axum::http::header::LOCATION;
     use std::collections::HashMap;
 
     const CLI_TARGET: &str = "/api/auth/cli/authorize?port=52111&state=st&challenge=ch";
-
-    #[test]
-    fn return_target_accepts_the_dashboard_root_and_cli_authorize() {
-        assert!(is_allowed_return_target("/"));
-        assert!(is_allowed_return_target(CLI_TARGET));
-        assert!(is_allowed_return_target("/api/auth/cli/authorize?port=52111&state=a%20b&challenge=ch"));
-    }
-
-    #[test]
-    fn return_target_accepts_the_new_access_token_form_with_its_preset_query() {
-        assert!(is_allowed_return_target("/access-tokens/new"));
-        assert!(is_allowed_return_target(
-            "/access-tokens/new?name=CI&scopes=gateways.view%2Csecrets.view&expires_at=2026-12-31T00%3A00%3A00.000Z"
-        ));
-        assert!(is_allowed_return_target(
-            "/access-tokens/new?resource_pattern=TENANT%3A%24%7Baccount%7D%3Agateways%3A.%2A&header=account%3Atenant-a"
-        ));
-    }
-
-    #[test]
-    fn return_target_rejects_other_access_token_paths() {
-        assert!(!is_allowed_return_target("/access-tokens/new/extra?name=x"));
-        assert!(!is_allowed_return_target("/access-tokens/agpat_1?name=x"));
-        assert!(!is_allowed_return_target("/access-tokens/new%2f..%2fsettings?x=1"));
-        assert!(!is_allowed_return_target("//access-tokens/new?name=x"));
-        assert!(!is_allowed_return_target("/access-tokens/new?name=a\"<script>"));
-    }
-
-    #[test]
-    fn return_target_rejects_paths_outside_the_allow_list() {
-        assert!(!is_allowed_return_target("/settings"));
-        assert!(!is_allowed_return_target("/api/auth/cli/authorize"));
-        assert!(!is_allowed_return_target("/api/auth/cli/authorize?"));
-        assert!(!is_allowed_return_target("/api/auth/cli/authorize/extra?port=1"));
-        assert!(!is_allowed_return_target("/?port=52111"));
-        assert!(!is_allowed_return_target("/api/v1/secrets?x=1"));
-    }
-
-    #[test]
-    fn return_target_rejects_off_origin_targets() {
-        assert!(!is_allowed_return_target("//evil.example"));
-        assert!(!is_allowed_return_target("https://evil.example"));
-        assert!(!is_allowed_return_target("/\\evil.example"));
-        assert!(!is_allowed_return_target("/%2fevil.example"));
-        assert!(!is_allowed_return_target("/%5Cevil.example"));
-        assert!(!is_allowed_return_target("evil.example"));
-    }
-
-    #[test]
-    fn return_target_accepts_an_encoded_slash_or_backslash_in_the_cli_state() {
-        let target = format!("/api/auth/cli/authorize?port=52111&state={}&challenge=ch", urlencoding::encode("a/b\\c"));
-        assert_eq!(target, "/api/auth/cli/authorize?port=52111&state=a%2Fb%5Cc&challenge=ch");
-
-        assert!(is_allowed_return_target(&target));
-    }
-
-    #[test]
-    fn return_target_rejects_traversal_in_the_path_even_with_a_query() {
-        assert!(!is_allowed_return_target("/api/auth/cli/authorize%2f?port=1"));
-        assert!(!is_allowed_return_target("/api/auth/cli%2Fauthorize?port=1"));
-        assert!(!is_allowed_return_target("/api/auth/cli%5cauthorize?port=1"));
-        assert!(!is_allowed_return_target("/api/auth/cli\\authorize?port=1"));
-        assert!(!is_allowed_return_target("/api/auth/../auth/cli/authorize?port=1"));
-        assert!(!is_allowed_return_target("/api/auth/%2e%2e/cli/authorize?port=1"));
-        assert!(!is_allowed_return_target("//api/auth/cli/authorize?port=1"));
-        assert!(!is_allowed_return_target("/%2f/api/auth/cli/authorize?port=1"));
-    }
-
-    #[test]
-    fn return_target_rejects_markup_and_control_characters() {
-        assert!(!is_allowed_return_target("/a\"</script><script>alert(1)"));
-        assert!(!is_allowed_return_target("/a'b"));
-        assert!(!is_allowed_return_target("/a b"));
-        assert!(!is_allowed_return_target("/api/auth/cli/authorize?port=1<"));
-        assert!(!is_allowed_return_target("/api/auth/cli/authorize?port=1>"));
-        assert!(!is_allowed_return_target("/api/auth/cli/authorize?port=1\n"));
-        assert!(!is_allowed_return_target("/api/auth/cli/authorize?port=1\u{7f}"));
-    }
-
-    #[test]
-    fn acs_html_redirects_to_the_target_in_markup_and_script() {
-        let html = acs_success_html(CLI_TARGET, "tok-1", "n0nce");
-
-        assert!(html.contains("content=\"0;url=/api/auth/cli/authorize?port=52111&amp;state=st&amp;challenge=ch\""));
-        assert!(html.contains(
-            "window.location.href = \"/api/auth/cli/authorize?port=52111\\u0026state=st\\u0026challenge=ch\";"
-        ));
-        assert!(html.contains("sessionStorage.setItem('session_token', \"tok-1\");"));
-        assert!(html.contains("<script nonce=\"n0nce\">"));
-    }
-
-    #[test]
-    fn acs_html_encodes_a_hostile_token_as_a_script_safe_string_literal() {
-        let html = acs_success_html("/", "a'\"\\</script><script>x()</script>&\u{2028}", "n");
-
-        assert!(!html.contains("</script><script>x()"));
-        assert!(html.contains(
-            "sessionStorage.setItem('session_token', \"a'\\\"\\\\\\u003c/script\\u003e\\u003cscript\\u003ex()\\u003c/script\\u003e\\u0026\\u2028\");"
-        ));
-        assert_eq!(
-            html.matches("</script>")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn acs_html_encodes_a_hostile_target_as_a_script_safe_string_literal() {
-        let html = acs_success_html("/a\"</script><script>x()</script>&\u{2029}", "tok-1", "n");
-
-        assert!(!html.contains("</script><script>x()"));
-        assert!(html.contains(
-            "window.location.href = \"/a\\\"\\u003c/script\\u003e\\u003cscript\\u003ex()\\u003c/script\\u003e\\u0026\\u2029\";"
-        ));
-        assert_eq!(
-            html.matches("</script>")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn acs_content_security_policy_allows_only_the_nonced_script() {
-        let policy = acs_content_security_policy("abc");
-
-        assert!(policy.contains("script-src 'nonce-abc'"));
-        assert!(policy.contains("default-src 'none'"));
-        assert!(policy.contains("frame-ancestors 'none'"));
-        assert!(!policy.contains("unsafe-inline"));
-    }
-
-    #[tokio::test]
-    async fn acs_response_pairs_the_policy_nonce_with_the_script_nonce() {
-        let mut session_headers = axum::http::HeaderMap::new();
-        session_headers.insert(axum::http::header::SET_COOKIE, "session=abc".parse().unwrap());
-        let response = acs_success_response(session_headers, "/", "tok-1").unwrap();
-        assert_eq!(
-            response
-                .headers()
-                .get(axum::http::header::SET_COOKIE)
-                .unwrap(),
-            "session=abc"
-        );
-        let policy = response
-            .headers()
-            .get(axum::http::header::CONTENT_SECURITY_POLICY)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let html = String::from_utf8(body.to_vec()).unwrap();
-        let nonce = policy
-            .split("'nonce-")
-            .nth(1)
-            .and_then(|rest| rest.split('\'').next())
-            .unwrap();
-
-        assert!(html.contains(&format!("<script nonce=\"{nonce}\">")));
-    }
-
-    #[test]
-    fn acs_script_nonces_are_unique_and_url_safe() {
-        let (a, b) = (acs_script_nonce(), acs_script_nonce());
-
-        assert_ne!(a, b);
-        assert_eq!(a.len(), 22);
-        assert!(
-            a.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        );
-    }
-
-    #[test]
-    fn acs_html_escapes_a_hostile_target_in_the_meta_refresh() {
-        let html = acs_success_html("/a\"><script>x</script>", "tok-1", "n");
-
-        assert!(html.contains("content=\"0;url=/a&quot;&gt;&lt;script&gt;x&lt;/script&gt;\""));
-    }
 
     async fn saml_state(dir: &std::path::Path) -> Arc<SamlState> {
         saml_state_with_throttle(dir, LoginThrottleConfig::default()).await

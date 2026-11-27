@@ -39,6 +39,7 @@ const TOKEN_SELF_INSPECTION_PATHS: &[&str] = &["/v1/token-info", "/api/v1/token-
 const PUBLIC_PATH_PREFIXES: &[&str] = &[
     "/auth/",                    // Passkey auth flows
     "/saml/",                    // SAML auth flows
+    "/oidc/",                    // OpenID Connect sign-in flows
     "/internal/test-support/",   // Internal UI-test auth bootstrap
     "/v1/auth/",                 // Auth mode endpoint
     "/v1/alive",                 // Liveness check
@@ -876,6 +877,8 @@ mod tests {
             .route("/saml/login", get(ok_handler))
             .route("/saml/acs", get(ok_handler))
             .route("/saml/metadata", get(ok_handler))
+            .route("/oidc/login", get(ok_handler))
+            .route("/oidc/callback", get(ok_handler))
             .route("/v1/auth/mode", get(ok_handler))
             .route("/v1/terms/provider-health", get(ok_handler))
             .route("/v1/health", get(ok_handler))
@@ -994,6 +997,7 @@ mod tests {
                 updated_at: now,
                 last_logged_in: None,
                 saml_id: None,
+                oidc: None,
             })
             .await
             .unwrap();
@@ -1147,6 +1151,8 @@ mod tests {
             "/saml/login",
             "/saml/acs",
             "/saml/metadata",
+            "/oidc/login",
+            "/oidc/callback",
             "/v1/auth/mode",
             "/v1/terms/provider-health",
             "/v1/health",
@@ -1296,6 +1302,7 @@ mod tests {
             updated_at: now,
             last_logged_in: None,
             saml_id: None,
+            oidc: None,
         }
     }
 

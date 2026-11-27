@@ -1454,6 +1454,7 @@ fn render_default_bootstrap_toml(
             rbac: "rbac.json".to_string(),
             limits: "limits.json".to_string(),
             saml: "saml.json".to_string(),
+            oidc: "oidc.json".to_string(),
             x402: "x402.json".to_string(),
             x402_proxy: "x402-proxy.json".to_string(),
             test_endpoints: "config/test-endpoints.json".to_string(),

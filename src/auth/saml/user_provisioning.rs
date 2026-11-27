@@ -5,57 +5,9 @@ use tracing::{info, warn};
 use crate::auth::auth_config::SamlConfig;
 use crate::auth::saml::graph_api::GraphApiClient;
 use crate::auth::saml::service::{ROLE_VALUES_KEY, SamlAttributes};
+use crate::auth::sign_in_events::{Provisioned, SignInChange};
 use crate::auth::storage::{PasskeyStorage, UserData};
 use crate::auth::types::{UserRole, UserStatus};
-
-/// What a SAML sign-in did to the stored user.
-#[derive(Debug)]
-pub enum SignInChange {
-    Created,
-    Updated { previous: Box<UserData> },
-}
-
-/// The signed-in user and what the sign-in changed.
-#[derive(Debug)]
-pub struct Provisioned {
-    pub user: UserData,
-    pub change: SignInChange,
-}
-
-/// A user event a sign-in raises, in the order it is raised.
-#[derive(Debug)]
-pub enum SignInEvent<'a> {
-    Created(&'a UserData),
-    Updated { old: &'a UserData, new: &'a UserData },
-    Login(&'a UserData),
-}
-
-/// The user events a sign-in raises: `user.created` for a new user, `user.updated` when the
-/// sign-in changed what user events report, then `user.login`.
-pub fn sign_in_events(provisioned: &Provisioned) -> Vec<SignInEvent<'_>> {
-    let user = &provisioned.user;
-    let mut events = match &provisioned.change {
-        SignInChange::Created => vec![SignInEvent::Created(user)],
-        SignInChange::Updated { previous } if changes_reported_state(previous, user) => {
-            vec![SignInEvent::Updated {
-                old: previous.as_ref(),
-                new: user,
-            }]
-        }
-        SignInChange::Updated { .. } => Vec::new(),
-    };
-    events.push(SignInEvent::Login(user));
-    events
-}
-
-/// Whether the role, status or primary flag changed: the parts of a user that user events
-/// report and that a sign-in can change.
-fn changes_reported_state(
-    old: &UserData,
-    new: &UserData,
-) -> bool {
-    old.role != new.role || old.status != new.status || old.is_primary != new.is_primary
-}
 
 /// Whether `attribute` carries more than one distinct value.
 fn carries_several_values(
@@ -278,6 +230,7 @@ pub async fn provision_user_from_saml(
             avatar_path: None,
             last_logged_in: Some(now),
             saml_id: Some(user_id_attr.clone()),
+            oidc: None,
         };
 
         info!(user_id = %user.user_id, role = %final_role, "Created SAML user");
@@ -350,14 +303,6 @@ impl RoleRefused {
     }
 }
 
-fn privilege(role: &UserRole) -> u8 {
-    match role {
-        UserRole::Administrator => 2,
-        UserRole::PowerUser => 1,
-        UserRole::User => 0,
-    }
-}
-
 /// Resolve the gateway role from the identity provider's role values: the highest role an
 /// explicit `role_mapping` entry gives any value, else `default_role`, else refused.
 fn determine_role(
@@ -372,7 +317,7 @@ fn determine_role(
         .iter()
         .filter_map(|value| config.role_mapping.get(value))
         .filter_map(|name| UserRole::from_config_name(name))
-        .max_by_key(privilege);
+        .max_by_key(UserRole::rank);
     let role = mapped.or_else(|| {
         config
             .default_role
@@ -556,28 +501,6 @@ mod tests {
         attributes
     }
 
-    fn user(role: UserRole) -> UserData {
-        let now = chrono::Utc::now();
-        UserData {
-            user_id: "u-1".to_string(),
-            username: "jane".to_string(),
-            passkeys: Vec::new(),
-            role,
-            status: UserStatus::Approved,
-            is_primary: false,
-            first_name: Some("Jane".to_string()),
-            last_name: None,
-            email: Some("jane@example.test".to_string()),
-            department: None,
-            job_title: None,
-            avatar_path: None,
-            created_at: now,
-            updated_at: now,
-            last_logged_in: Some(now),
-            saml_id: Some("saml-1".to_string()),
-        }
-    }
-
     #[tokio::test]
     async fn the_first_sign_in_creates_the_user() {
         let dir = tempdir().unwrap();
@@ -624,56 +547,6 @@ mod tests {
             other => panic!("expected an update, got {other:?}"),
         }
         assert_eq!(second.user.role, UserRole::PowerUser);
-    }
-
-    #[test]
-    fn a_created_user_raises_created_then_login() {
-        let provisioned = Provisioned {
-            user: user(UserRole::User),
-            change: SignInChange::Created,
-        };
-
-        let events = sign_in_events(&provisioned);
-
-        assert!(matches!(events.as_slice(), [SignInEvent::Created(_), SignInEvent::Login(_)]));
-    }
-
-    #[test]
-    fn a_role_change_raises_updated_then_login() {
-        let previous = user(UserRole::User);
-        let mut current = previous.clone();
-        current.role = UserRole::PowerUser;
-        let provisioned = Provisioned {
-            user: current,
-            change: SignInChange::Updated { previous: Box::new(previous) },
-        };
-
-        let events = sign_in_events(&provisioned);
-
-        match events.as_slice() {
-            [SignInEvent::Updated { old, new }, SignInEvent::Login(_)] => {
-                assert_eq!(old.role, UserRole::User);
-                assert_eq!(new.role, UserRole::PowerUser);
-            }
-            other => panic!("expected updated then login, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_sign_in_that_changes_only_profile_details_raises_only_login() {
-        let previous = user(UserRole::User);
-        let mut current = previous.clone();
-        current.first_name = Some("Janet".to_string());
-        current.updated_at = previous.updated_at + chrono::Duration::minutes(5);
-        current.last_logged_in = Some(current.updated_at);
-        let provisioned = Provisioned {
-            user: current,
-            change: SignInChange::Updated { previous: Box::new(previous) },
-        };
-
-        let events = sign_in_events(&provisioned);
-
-        assert!(matches!(events.as_slice(), [SignInEvent::Login(_)]));
     }
 
     #[tokio::test]

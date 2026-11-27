@@ -2912,6 +2912,10 @@ pub struct ConfigFilePaths {
     #[serde(default = "crate::auth::auth_config::default_saml_config_path")]
     pub saml: String,
 
+    /// OpenID Connect sign-in configuration file path (the OpenID provider, client and role mapping)
+    #[serde(default = "crate::auth::auth_config::default_oidc_config_path")]
+    pub oidc: String,
+
     /// x402 payment configuration file path - defines blockchain networks, recipients, and payment settings
     #[serde(default = "default_payment_policy_path")]
     pub x402: String,
@@ -2939,6 +2943,7 @@ impl Default for ConfigFilePaths {
             rbac: default_rbac_config_path(),
             limits: default_limits_config_path(),
             saml: crate::auth::auth_config::default_saml_config_path(),
+            oidc: crate::auth::auth_config::default_oidc_config_path(),
             x402: default_payment_policy_path(),
             x402_proxy: default_x402_proxy_config_path(),
             test_endpoints: default_test_endpoints_config_path(),
@@ -3305,7 +3310,7 @@ pub struct BootstrapConfig {
     #[serde(default = "default_metrics_cache_ttl")]
     pub metrics_cache_ttl_seconds_legacy: u64,
 
-    /// Authentication mode (passkey or saml)
+    /// Authentication mode (passkey, saml or oidc)
     #[serde(default)]
     pub auth_mode: crate::auth::auth_config::AuthMode,
 

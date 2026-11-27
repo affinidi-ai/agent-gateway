@@ -125,23 +125,26 @@ catalog, where existing integrations name them, but are never raised. Only
 
 A passkey registration that creates an account raises `user.created` (registering a username that
 already has an account creates nothing and raises nothing), and an administrator's approval `user.approved`. A
-SAML sign-in that creates the user raises `user.created`; SAML users are approved on creation,
-so no `user.approved` follows. A later SAML sign-in that changes the user's role, status, or
-primary flag raises `user.updated`. Every SAML sign-in then raises `user.login`, in that order
-([`saml/user_provisioning.rs`](../src/auth/saml/user_provisioning.rs)).
+SAML or OIDC sign-in that creates the user raises `user.created`; such users are approved on
+creation, so no `user.approved` follows. A later sign-in that changes the user's role, status, or
+primary flag raises `user.updated`. Every SAML or OIDC sign-in then raises `user.login`, in that
+order ([`sign_in_events.rs`](../src/auth/sign_in_events.rs)).
 
 ### Sign-in events
 
-A console sign-in raises `user.login`, with `LOGIN_METHOD` set to `passkey` or `saml`. A failed one
-raises `user.login_failed` ([`user_integration_triggers.rs`](../src/integrations/user_integration_triggers.rs)):
+A console sign-in raises `user.login`, with `LOGIN_METHOD` set to `passkey`, `saml` or `oidc`. A
+failed one raises `user.login_failed` ([`user_integration_triggers.rs`](../src/integrations/user_integration_triggers.rs)):
 a passkey sign-in whose credential does not verify, and a SAML response the gateway rejects at the
 Assertion Consumer Service (bad or missing signature, untrusted certificate, wrong destination or
 audience, an unknown, used or expired AuthnRequest, expired conditions), and a verified SAML
 sign-in refused because its identity-provider role maps to no gateway role or its user ID or username
-attribute carries conflicting values. A passkey sign-in whose
-challenge is unknown or expired has nothing to verify and raises nothing, and neither does any other
-failure after verification, such as reaching the user limit, a provisioning error or opening the
-session.
+attribute carries conflicting values. An OIDC sign-in raises it when the provider refuses the code
+or the ID token does not verify, and when a verified sign-in is refused by `required_claims`, by
+`role_mapping` or because the user is not approved. A passkey sign-in whose
+challenge is unknown or expired has nothing to verify and raises nothing, and neither does an OIDC
+callback with an unknown `state` or without its binding cookie, one the provider declined, or any
+other failure after verification, such as reaching the user limit, a provisioning error or opening
+the session.
 
 `user.login_failed` carries the user variables of `user.login`, `LOGIN_METHOD`, and
 `FAILURE_REASON`:
@@ -152,11 +155,15 @@ session.
 | `not_approved` | The account exists but is not approved. A browser rarely sends this sign-in: the challenge for such an account names decoy credentials, not its passkeys, so the browser finds no passkey to use |
 | `unknown_user` | No account has the username the sign-in named, or the account was deleted before the sign-in finished |
 | `saml_rejected` | The SAML response was rejected |
-| `role_not_mapped` | The SAML response was valid, but none of the identity-provider role values has a `role_mapping` entry and `saml.json` sets no `default_role` |
+| `role_not_mapped` | The SAML response was valid, but none of the identity-provider role values has a `role_mapping` entry and `saml.json` sets no `default_role`; or the OIDC ID token was valid, but no value of its role claim is mapped and `oidc.json` `role_mapping.unmapped` is `deny` |
 | `ambiguous_attribute` | The SAML response was valid, but its user ID or username attribute carried more than one distinct value, so it named no single user |
+| `oidc_rejected` | The OpenID provider refused the authorization code (`invalid_grant`), or the ID token it issued did not verify |
+| `claim_not_allowed` | The OIDC ID token was valid, but it did not meet a `required_claims` entry of `oidc.json`: the account is not in the tenant the gateway is bound to |
 
 `USER_ID`, `USERNAME`, `USER_EMAIL`, `USER_ROLE`, `USER_STATUS` and `NEW_STATE` are set only when the
-account exists, from the account as stored. For `unknown_user`, `saml_rejected`, `role_not_mapped` and `ambiguous_attribute` they are absent:
+account exists, from the account as stored, and an OIDC `not_approved` names the account the
+provider's subject belongs to. For `unknown_user`, `saml_rejected`, `role_not_mapped`,
+`ambiguous_attribute`, `oidc_rejected` and `claim_not_allowed` they are absent:
 a template placeholder for them is empty and `EVENT_DATA` leaves them out, so neither the username a
 caller typed nor anything in a rejected SAML response leaves the appliance. With the default
 `webhook` or `stream` template, `data` holds `login_method`, `failure_reason` and, for an existing

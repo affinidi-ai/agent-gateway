@@ -33,12 +33,13 @@ backup_encryption_key = "env://AG_BACKUP_ENCRYPTION_KEY"
 # after restoring and creating a fresh backup.
 # legacy_backup_encryption_keys = "env://AG_LEGACY_BACKUP_KEYS"
 
-# Authentication mode (passkey or saml)
-# Options: "passkey" or "saml"
+# Authentication mode (passkey, saml or oidc)
+# Options: "passkey", "saml" or "oidc"
 auth_mode = "passkey"
 #auth_mode = "saml"
+#auth_mode = "oidc"
 
-# Session timeout in minutes (applies to both passkey and SAML)
+# Session timeout in minutes (applies to every authentication mode)
 session_timeout_minutes = 20
 
 # Require authentication for WebSocket connections (default: true)
@@ -105,6 +106,7 @@ metrics = "metrics.json"
 rbac = "rbac.json"
 limits = "limits.json"
 saml = "saml.json"
+oidc = "oidc.json"
 x402 = "x402.json"
 agent_surface_templates_dir = "agent_surface_templates"
 

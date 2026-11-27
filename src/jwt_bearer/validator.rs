@@ -182,7 +182,7 @@ impl JwtBearerVerifier {
 // ── Key and algorithm helpers ─────────────────────────────────────────────────
 
 /// Build a [`DecodingKey`] from a [`crate::jwt_bearer::jwks::Jwk`].
-fn decoding_key_from_jwk(jwk: &crate::jwt_bearer::jwks::Jwk) -> JwtBearerResult<DecodingKey> {
+pub(crate) fn decoding_key_from_jwk(jwk: &crate::jwt_bearer::jwks::Jwk) -> JwtBearerResult<DecodingKey> {
     match jwk.kty.as_str() {
         "RSA" => {
             let n = jwk

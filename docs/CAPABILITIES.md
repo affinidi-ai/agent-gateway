@@ -440,7 +440,12 @@ After onboarding, payload capture lets you watch the traffic at every stage. See
 ## Managing the gateway
 
 Everything is managed from a web dashboard, signed into with a passkey or, for enterprise
-deployments, SAML single sign-on. A SAML sign-in must return from the identity provider within
+deployments, single sign-on through SAML or an OpenID Connect provider. An OIDC sign-in uses the
+authorization code flow with PKCE, verifies the ID token's signature against the provider's keys,
+admits only accounts that meet the tenant binding `oidc.json` sets (unless it sets
+`allow_any_account`), is always throttled per client, and creates each human user at their
+first sign-in with the role their role claim maps to, set again at every sign-in
+([`oidc.json`](CONFIGURATION_REFERENCE.md#oidcjson)). A SAML sign-in must return from the identity provider within
 five minutes and is accepted once. The gateway holds at most 100,000 unfinished SAML sign-ins;
 past that, `/api/saml/login` answers 503 until older ones expire. An optional per-client-IP
 limit on `/api/saml/login` is off by default: set `login_throttle.enabled` to `true` in
@@ -448,7 +453,7 @@ limit on `/api/saml/login` is off by default: set `login_throttle.enabled` to `t
 `Retry-After` past that. With SAML sign-in, signing out leaves the identity provider session
 in place ([`saml.json`](CONFIGURATION_REFERENCE.md#samljson)).
 
-The SAML login and CLI login limits count by client IP, taken from the TCP connection.
+The SAML, OIDC and CLI login limits count by client IP, taken from the TCP connection.
 `X-Forwarded-For` is only read when the connection comes from an address in
 `client_ip.trusted_proxies` (`gateway.json`), and then from the right, skipping trusted hops.
 Every listed proxy must append the address it saw to `X-Forwarded-For`, or overwrite the
@@ -472,7 +477,7 @@ table is rescanned for expired IPs at most once a second. The STS token endpoint
 its own address rule, see [`STS.md`](STS.md#token-endpoint-throttle).
 
 The `fabric` CLI signs in through the browser. It opens `/api/auth/cli/authorize` with a
-loopback port and a PKCE challenge. After the dashboard sign-in (passkey or SAML) the browser
+loopback port and a PKCE challenge. After the dashboard sign-in (passkey, SAML or OIDC) the browser
 shows a confirmation page that names the signed-in user and the loopback port. Only when the
 user chooses Allow does the dashboard request a short-lived, single-use code and return it to
 `127.0.0.1`. Cancel issues no code and sends the browser to the CLI's callback with
@@ -486,7 +491,8 @@ characters as defined in RFC 7636. The consent page and its API must be served f
 origin: the consent request is accepted only when `Sec-Fetch-Site` is `same-origin`, or when
 `Origin` equals `Host` for clients that do not send it. The user must also be approved. After
 sign-in, the browser returns only to the dashboard root, the CLI authorize path, or the new
-access token form (`/access-tokens/new`) with its preset query, which only fills in the form. For SAML the
+access token form (`/access-tokens/new`) with its preset query, which only fills in the form. An OIDC
+sign-in keeps the return target with the sign-in's `state` on the gateway for ten minutes. For SAML the
 gateway keeps that return target for five minutes and sends only a one-time 32 character key as
 `RelayState`, within the 80 byte limit of the HTTP-Redirect binding. The assertion consumer
 service uses the key once and checks the target again; an unknown, expired or reused key lands
@@ -506,7 +512,7 @@ verifier. The wire contract a CLI must follow is in
 
 Known limitations: the login hands the CLI the browser's own session, so signing out in either
 place ends both: the browser signing out, or the CLI calling `/api/auth/logout`. The code store
-and the SAML return targets are in memory, so the login works with one gateway instance. With
+and the SAML and OIDC return targets are in memory, so the login works with one gateway instance. With
 more than one replica, an exchange that reaches a different instance than the consent gets
 `invalid_grant`, and session stickiness does not help, because the CLI's exchange request
 carries no browser cookie.

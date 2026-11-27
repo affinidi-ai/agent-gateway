@@ -13,6 +13,16 @@ Protected routes apply `require_feature(...)`. The middleware resolves the authe
 and rejects a missing feature with `403 Forbidden`. Dashboard visibility checks are convenience and
 defence in depth; they do not replace route enforcement.
 
+With single sign-on, the identity provider assigns roles. SAML sets each user's role from
+`saml.json` `role_mapping` at every sign-in, except the first user's, who is the primary
+`administrator`. OIDC sets every user's role from `oidc.json` `role_mapping` at every sign-in,
+raising or lowering it, and has no primary administrator: administrators come only from the
+mapping. In both, an administrator's role change for such a user lasts until that user next signs
+in, and an OIDC sign-in that changes the role ends the user's other sessions. The role is read
+from storage on each request, so the new role applies at once. See
+[`saml.json`](CONFIGURATION_REFERENCE.md#samljson) and
+[`oidc.json`](CONFIGURATION_REFERENCE.md#oidcjson).
+
 Management PAT authorization further intersects the bound user's role with the PAT's feature scopes.
 A PAT with explicit feature scopes is also refused with `403` by the authentication middleware on
 any route none of its scopes covers, including routes a session reaches with no permission; deny is

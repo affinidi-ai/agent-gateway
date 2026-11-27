@@ -670,27 +670,24 @@ fn the_gateway_issues_no_session_cookie(world: &mut SurfaceWorld) {
     );
 }
 
-fn stored_users(world: &SurfaceWorld) -> Vec<Value> {
-    let base = world
+/// The human users the gateway stored, read from its user directory; none before the first is
+/// stored.
+pub(crate) fn stored_users(world: &SurfaceWorld) -> Vec<Value> {
+    let users_dir = world
         .infra
         .as_ref()
         .expect("the gateway runs")
         ._temp_dir
         .path()
-        .to_path_buf();
-    let users_dir = ["_storage/passkeys"]
-        .iter()
-        .map(|relative| base.join(relative))
-        .find(|dir| dir.is_dir())
-        .unwrap_or_else(|| panic!("no stored users directory under {base:?}"));
-    let stored: Vec<Value> = std::fs::read_dir(&users_dir)
-        .expect("read the users directory")
+        .join("_storage/passkeys");
+    let Ok(entries) = std::fs::read_dir(&users_dir) else {
+        return Vec::new();
+    };
+    entries
         .filter_map(Result::ok)
         .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
         .filter_map(|text| serde_json::from_str(&text).ok())
-        .collect();
-    assert!(!stored.is_empty(), "the first user's account is stored in {users_dir:?}");
-    stored
+        .collect()
 }
 
 #[then("only the first human user is stored")]

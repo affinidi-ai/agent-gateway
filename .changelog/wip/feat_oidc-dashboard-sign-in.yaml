@@ -1,0 +1,34 @@
+branch: feat/oidc-dashboard-sign-in
+changes:
+  added:
+    - timestamp: '2026-11-27T08:00:00Z'
+      title: ⭐ Sign in to the dashboard with any OpenID Connect provider
+      description: >-
+        A new sign-in mode, auth_mode = "oidc", signs human users in to the dashboard at one
+        OpenID provider configured in oidc.json, using the authorization code flow with PKCE, a
+        nonce and a browser-binding cookie. The ID token is fully verified, its signature
+        included, against the provider's published keys. Users are created at their first
+        sign-in, approved and never the primary administrator, and identified by the provider
+        account (issuer and sub), never by email. role_mapping maps a string or array claim to a
+        gateway role at every sign-in, raising or lowering it and ending the user's other
+        sessions when it changes, and refuses unmapped accounts by default. required_claims
+        binds the deployment to one tenant at the provider and is required unless
+        allow_any_account is set; values may be strings, booleans or regex: patterns. The client
+        secret is a secret reference, never written into the file, and a field oidc.json does
+        not define stops startup. The provider's endpoints are reached under the Configured
+        egress policy, discovery is fetched once and cached, and a provider that cannot be
+        reached neither stops nor delays startup. Sign-in is always throttled per client, with a
+        lockout after repeated refused codes. Sign-ins raise the user.login and user.login_failed
+        events with login method oidc, and the login page shows one "Sign in with {label}"
+        button.
+  changed:
+    - timestamp: '2026-11-27T08:00:00Z'
+      title: Return the sign-in label from the auth mode endpoint
+      description: >-
+        GET /v1/auth/mode now returns a label field beside mode: the provider name the sign-in
+        button shows in OIDC mode, and null in passkey and SAML modes. Clients that read only
+        mode are unaffected.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

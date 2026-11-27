@@ -33,6 +33,16 @@ impl UserRole {
             _ => None,
         }
     }
+
+    /// How much the role may do, for picking the highest of several: `administrator` over
+    /// `poweruser` over `user`.
+    pub fn rank(&self) -> u8 {
+        match self {
+            UserRole::Administrator => 2,
+            UserRole::PowerUser => 1,
+            UserRole::User => 0,
+        }
+    }
 }
 
 /// User status enum

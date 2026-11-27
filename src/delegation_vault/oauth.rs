@@ -1686,7 +1686,7 @@ pub async fn resolve_api_key(
 
 /// Generate a PKCE code_verifier (RFC 7636 §4.1)
 /// 128 bytes of random data, base64url-encoded (no padding), resulting in a 43-128 char string
-pub(super) fn generate_pkce_verifier() -> String {
+pub(crate) fn generate_pkce_verifier() -> String {
     let mut rng = rand::rng();
     let bytes: Vec<u8> = (0..32)
         .map(|_| rng.random::<u8>())
@@ -1696,7 +1696,7 @@ pub(super) fn generate_pkce_verifier() -> String {
 
 /// Generate a PKCE code_challenge from a code_verifier (RFC 7636 §4.2)
 /// code_challenge = BASE64URL(SHA256(code_verifier))
-pub(super) fn generate_pkce_challenge(verifier: &str) -> String {
+pub(crate) fn generate_pkce_challenge(verifier: &str) -> String {
     let digest = Sha256::digest(verifier.as_bytes());
     base64_url_encode_bytes(&digest)
 }

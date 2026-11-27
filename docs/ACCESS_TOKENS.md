@@ -526,7 +526,7 @@ interface:
 ### CLI browser login
 
 The `fabric` CLI does not use a management token. It signs in through the dashboard:
-`/api/auth/cli/authorize` sends the browser through the normal passkey or SAML sign-in to a
+`/api/auth/cli/authorize` sends the browser through the normal passkey, SAML or OIDC sign-in to a
 consent page, `/api/auth/cli/consent` issues a single-use code once the signed-in, approved
 user allows it, and the CLI redeems that code with its PKCE verifier at
 `/api/auth/cli/exchange`. What the CLI receives is the browser's own dashboard session. It

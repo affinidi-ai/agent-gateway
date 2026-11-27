@@ -223,6 +223,10 @@ with the gateway's own key; the connect wizard's Complete step points to **Setti
 Gateway signing** for changing the default later. See _Key Management tab_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#key-management-tab).
 
+The login page shows, in OIDC mode, one button reading "Sign in with {label}" (the provider name
+from `GET /api/v1/auth/mode`) that starts the sign-in at `/api/oidc/login`, as the SAML button does
+at `/api/saml/login`; see _Login page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#login-page).
+
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 
 The endpoint editor picks a Kafka endpoint's security protocol (`plaintext`, `ssl`,

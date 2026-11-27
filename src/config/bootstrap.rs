@@ -74,6 +74,12 @@ impl BootstrapConfig {
                     .to_string_lossy()
                     .to_string();
             }
+            if PathBuf::from(&config.config_files.oidc).is_relative() {
+                config.config_files.oidc = config_dir
+                    .join(&config.config_files.oidc)
+                    .to_string_lossy()
+                    .to_string();
+            }
             if PathBuf::from(&config.config_files.x402).is_relative() {
                 config.config_files.x402 = config_dir
                     .join(&config.config_files.x402)

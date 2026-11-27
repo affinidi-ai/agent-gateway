@@ -53,6 +53,18 @@ pub struct UserData {
     /// SAML user ID (for SAML-authenticated users)
     #[serde(default)]
     pub saml_id: Option<String>,
+
+    /// The OpenID provider account this user signs in with (OIDC mode)
+    #[serde(default)]
+    pub oidc: Option<OidcIdentity>,
+}
+
+/// An account at an OpenID provider: its issuer and the subject (`sub`) it gave the account.
+/// Together they identify the person; email never does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OidcIdentity {
+    pub issuer: String,
+    pub subject: String,
 }
 
 impl StorableEntity for UserData {
@@ -169,6 +181,7 @@ impl PasskeyStorage {
             avatar_path: Some("avatars/default.png".to_string()),
             last_logged_in: None,
             saml_id: None,
+            oidc: None,
         }
     }
 
@@ -281,12 +294,126 @@ impl PasskeyStorage {
             .into_iter()
             .find(|u| u.saml_id.as_deref() == Some(saml_id)))
     }
+
+    /// Load the user who signs in with this OpenID provider account (scans in-memory cache)
+    pub async fn load_user_by_oidc_identity(
+        &self,
+        identity: &OidcIdentity,
+    ) -> Result<Option<UserData>> {
+        let users = self
+            .storage
+            .list_all()
+            .await?;
+        Ok(users
+            .into_iter()
+            .find(|u| u.oidc.as_ref() == Some(identity)))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PasskeyStorage, UserData, UserRole, UserStatus};
+    use super::{OidcIdentity, PasskeyStorage, UserData, UserRole, UserStatus};
     use tempfile::tempdir;
+
+    async fn storage(dir: &std::path::Path) -> PasskeyStorage {
+        PasskeyStorage::new(
+            dir.join("users")
+                .to_string_lossy()
+                .into_owned(),
+            dir.join("avatars")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn user(
+        user_id: &str,
+        oidc: Option<OidcIdentity>,
+    ) -> UserData {
+        let now = chrono::Utc::now();
+        UserData {
+            user_id: user_id.to_string(),
+            username: user_id.to_string(),
+            passkeys: vec![],
+            role: UserRole::User,
+            status: UserStatus::Approved,
+            is_primary: false,
+            first_name: None,
+            last_name: None,
+            email: Some("shared@example.com".to_string()),
+            department: None,
+            job_title: None,
+            avatar_path: None,
+            created_at: now,
+            updated_at: now,
+            last_logged_in: None,
+            saml_id: None,
+            oidc,
+        }
+    }
+
+    fn identity(
+        issuer: &str,
+        subject: &str,
+    ) -> OidcIdentity {
+        OidcIdentity {
+            issuer: issuer.to_string(),
+            subject: subject.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_user_is_found_by_the_issuer_and_subject_together() {
+        let dir = tempdir().unwrap();
+        let storage = storage(dir.path()).await;
+        for stored in [
+            user("u1", Some(identity("https://idp.example", "sub-1"))),
+            user("u2", Some(identity("https://other.example", "sub-1"))),
+            user("u3", None),
+        ] {
+            storage
+                .save_user(&stored)
+                .await
+                .unwrap();
+        }
+
+        let found = storage
+            .load_user_by_oidc_identity(&identity("https://other.example", "sub-1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            found
+                .map(|user| user.user_id)
+                .as_deref(),
+            Some("u2")
+        );
+        for missing in [identity("https://idp.example", "sub-2"), identity("https://idp.example/", "sub-1")] {
+            assert!(
+                storage
+                    .load_user_by_oidc_identity(&missing)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{missing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_stored_before_oidc_sign_in_still_loads() {
+        let mut stored = serde_json::to_value(user("u1", None)).unwrap();
+        stored
+            .as_object_mut()
+            .unwrap()
+            .remove("oidc");
+
+        let loaded: UserData = serde_json::from_value(stored).unwrap();
+
+        assert_eq!(loaded.user_id, "u1");
+        assert!(loaded.oidc.is_none());
+    }
 
     #[tokio::test]
     async fn deleting_a_user_logs_its_user_id_but_not_its_username() {
@@ -324,6 +451,7 @@ mod tests {
             updated_at: now,
             last_logged_in: None,
             saml_id: None,
+            oidc: None,
         };
         storage
             .save_user(&user)

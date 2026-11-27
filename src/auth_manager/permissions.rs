@@ -383,6 +383,7 @@ mod tests {
             updated_at: Utc::now(),
             last_logged_in: None,
             saml_id: None,
+            oidc: None,
         };
         std::fs::write(users_dir.join(format!("{}.json", user_id)), serde_json::to_string(&user_data).unwrap())
             .unwrap();
