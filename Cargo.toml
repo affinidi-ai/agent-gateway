@@ -168,7 +168,7 @@ didwebvh-rs = { version = "0.8.2", optional = true }
 
 # WebAuthn for passkey authentication
 webauthn-rs = "0.5"
-webauthn-rs-proto = "0.5"
+webauthn-rs-proto = "0.6"
 url = "2.5.8"
 
 # SAML authentication
