@@ -40,7 +40,10 @@ index mirror, still apply.
 CI runs both suites on every push to `main`, and on a pull request that changes
 this directory or the A2A code its path filter lists (the `a2a-conformance` job
 and the `a2a` filter in `.github/workflows/ci.yml`). A pull request that
-changes A2A behaviour somewhere else still needs a run by hand.
+changes A2A behaviour somewhere else still needs a run by hand. That includes
+the inbound handler, `src/proxy/handler.rs`, which applies the A2A version and
+envelope checks: about two in five gateway changes touch it, so it is left out
+of the filter, as it is for the MCP conformance job.
 
 | Option | Effect |
 | --- | --- |

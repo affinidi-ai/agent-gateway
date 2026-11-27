@@ -7,9 +7,10 @@ changes:
         make a2a-conformance runs the A2A project's conformance suite (the A2A TCK) on the JSON-RPC
         binding against the suite's own test agent, once directly and once through an A2A Access
         Point (with envelope and with full validation) and an A2A Transit Point, and against the
-        gateway's A2A proxy. A forwarding entry point is scored on the tests whose outcome differs
-        from the direct run, so a failure of the test agent never counts against the gateway, and
-        each known difference is listed in a baseline with its cause. make a2a-conformance-legacy
+        gateway's A2A proxy over a Direct Line stand-in. A forwarding entry point is scored on the
+        tests whose outcome differs from the direct run, so a failure of the test agent never
+        counts against the gateway, and each known difference is listed in a baseline with its
+        cause. make a2a-conformance-legacy
         runs the A2A 0.3 suite the same way. A run fails on a difference no baseline lists and on
         a listed one that no longer applies; ARGS=--report writes every difference to a file
         instead. The suite and its packages are pinned and installed under target/, and the

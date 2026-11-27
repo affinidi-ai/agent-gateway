@@ -59,6 +59,7 @@ jobs:
               - 'src/proxy/handler/a2a_stream.rs'
               - 'src/proxy/handler/agent_card.rs'
               - 'src/proxy/agent_card_cache.rs'
+              - 'src/proxy/protocol_router.rs'
               - 'scripts/a2a-conformance/**'
 
   frontend:
