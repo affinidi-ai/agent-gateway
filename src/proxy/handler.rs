@@ -6666,7 +6666,7 @@ async fn proxy_charged_request(
             connection_guard
                 .decrement()
                 .await;
-            return Ok(TargetAuthFailure::PathRefused.response());
+            return Ok(TargetAuthFailure::PathRefused.response_for(&state.surface, &body_bytes));
         }
         crate::mcp_proxies::handlers::ToolCallDestination::CatalogUnavailable => {
             connection_guard
@@ -8457,7 +8457,7 @@ async fn proxy_charged_request(
                 connection_guard
                     .decrement()
                     .await;
-                return Ok(TargetAuthFailure::PathRefused.response());
+                return Ok(TargetAuthFailure::PathRefused.response_for(&state.surface, &body_bytes));
             }
             Err(e) => {
                 warn!(
@@ -12457,7 +12457,7 @@ async fn handle_fabric_request_inner(
         connection_guard
             .decrement()
             .await;
-        return Err(TargetAuthFailure::PathRefused.response());
+        return Err(TargetAuthFailure::PathRefused.response_for(&state.surface, &body_bytes));
     }
 
     let inbound_payment = InboundPayment {
@@ -16168,7 +16168,7 @@ async fn handle_mcp_proxy_request_inner(
     .await;
     if destination == crate::mcp_proxies::handlers::ToolCallDestination::OutsideBase {
         crate::proxy::credential_destination::refuse_outside_base(&audit_facts, None, state.surface.target_auth());
-        return Err(TargetAuthFailure::PathRefused.response());
+        return Err(TargetAuthFailure::PathRefused.response_for(&state.surface, body_bytes));
     }
     // Resolve target auth header if configured on the channel; a proxy whose catalog cannot be
     // read is refused below, as the proxy refuses it, without resolving the credential.

@@ -122,6 +122,37 @@ async fn a_credential_withheld_by_an_enforced_rule_is_recorded() {
 }
 
 #[tokio::test]
+async fn a_path_refusal_is_a_jsonrpc_error_on_an_mcp_surface_and_a_problem_response_elsewhere() {
+    let body = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call"}"#;
+    let read = |response: axum::response::Response| async move {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+    };
+
+    let mut mcp = surface("https://target.example/base", Value::Null);
+    mcp.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::Mcp;
+    let (status, refused) = read(super::TargetAuthFailure::PathRefused.response_for(&mcp, body)).await;
+    assert_eq!(status.as_u16(), 400);
+    assert_eq!(refused["jsonrpc"], "2.0", "{refused}");
+    assert_eq!(refused["id"], 7, "{refused}");
+    assert_eq!(refused["error"]["data"]["reason"], "target_path_refused", "{refused}");
+
+    let a2a = surface("https://target.example/base", Value::Null);
+    let (status, refused) = read(super::TargetAuthFailure::PathRefused.response_for(&a2a, body)).await;
+    assert_eq!(status.as_u16(), 400);
+    assert!(
+        refused
+            .get("jsonrpc")
+            .is_none(),
+        "{refused}"
+    );
+    assert_eq!(refused["reason"], "target_path_refused", "{refused}");
+}
+
+#[tokio::test]
 async fn a_request_outside_the_target_base_path_is_recorded_as_rejected_whatever_the_fallback() {
     let target = agent().await;
     for fallback in ["reject", "passthrough"] {

@@ -228,6 +228,14 @@ async fn call(router: crate::state::MultiSurfaceProxyState) -> (StatusCode, Stri
     (status, String::from_utf8_lossy(&body).into_owned(), events)
 }
 
+/// The refusal is a JSON-RPC error that echoes the request id and names the reason.
+fn assert_jsonrpc_path_refusal(body: &str) {
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(body["jsonrpc"], "2.0", "{body}");
+    assert_eq!(body["id"], 1, "{body}");
+    assert_eq!(body["error"]["data"]["reason"], "target_path_refused", "{body}");
+}
+
 fn path_refusals(events: &[DelegationAuditEvent]) -> Vec<(RejectionStage, Option<u16>)> {
     events
         .iter()
@@ -249,7 +257,7 @@ async fn a_session_endpoint_outside_the_target_base_path_gets_no_delegated_crede
     let (router, _directory) = router(&format!("{}/base", server.url)).await;
     let (status, body, events) = call(router).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.contains("target_path_refused"), "{body}");
+    assert_jsonrpc_path_refusal(&body);
     assert_eq!(path_refusals(&events), vec![(RejectionStage::Forward, Some(400))]);
     assert_eq!(server.tool_calls(), Vec::new(), "the request is not posted to the advertised endpoint");
 }
@@ -262,7 +270,7 @@ async fn a_session_endpoint_outside_the_base_path_is_refused_before_the_session_
     let (router, _directory) = router(&format!("{}/base", server.url)).await;
     let (status, body, events) = call(router).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.contains("target_path_refused"), "{body}");
+    assert_jsonrpc_path_refusal(&body);
     assert_eq!(path_refusals(&events), vec![(RejectionStage::Forward, Some(400))]);
     assert_eq!(server.session_post_count(), 0, "nothing, not even the initialize, is posted");
 }
