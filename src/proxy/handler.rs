@@ -1743,6 +1743,8 @@ struct InboundPayment<'a> {
     intake: Option<&'a agent_pay_gate::Intake>,
     identity: Option<&'a crate::source_auth::AuthenticatedIdentity>,
     identity_binding: Option<&'a crate::surface_context::IdentityBindingContext>,
+    /// The proofs of every presentation the request was verified from.
+    presented: &'a crate::identity::ssi::vp_replay::Presented,
     trace_id: &'a str,
     egress_trace_id: &'a str,
     source_addr: &'a str,
@@ -1750,14 +1752,39 @@ struct InboundPayment<'a> {
 }
 
 impl InboundPayment<'_> {
-    /// Puts the request through the gate, just before it is forwarded.
-    /// `Continue(None)` when it is free and `Continue(Some(receipt))` when it was
-    /// paid for; the receipt holds the payment's claim until
-    /// [`agent_pay_gate::Receipt::commit`]. `Break(answer)` is what the caller is
-    /// answered instead, already recorded in the connection metrics.
+    /// Claims the request's presentation proofs once, just before it is
+    /// charged. `Err` is the recorded answer to a request not admitted.
+    async fn admit(
+        &self,
+        state: &ProxyState,
+    ) -> Result<crate::identity::ssi::vp_replay::Admitted, Response> {
+        crate::identity::ssi::vp_replay::admit(crate::identity::ssi::vp_replay::FLOW_ACCESS_POINT, self.presented)
+            .await
+            .map_err(|refusal| {
+                presentation_not_admitted(
+                    refusal,
+                    &state.surface,
+                    &crate::audit::request_events::RequestFacts {
+                        surface_id: &state.surface.surface_id,
+                        channel_name: &state.surface.name,
+                        trace_id: Some(self.trace_id),
+                        via_fabric: false,
+                    },
+                )
+            })
+    }
+
+    /// Puts the admitted request through the gate, just before it is
+    /// forwarded. `Continue(None)` when it is free and `Continue(Some(receipt))`
+    /// when it was paid for; the receipt holds the payment's claim until
+    /// [`agent_pay_gate::Receipt::commit`] and releases `admitted` when it is
+    /// revoked. `Break(answer)` is what the caller is answered instead, already
+    /// recorded in the connection metrics; a `402`, `429` or `503` releases
+    /// `admitted`.
     async fn charge(
         &self,
         state: &ProxyState,
+        admitted: &crate::identity::ssi::vp_replay::Admitted,
         evidence: Option<&crate::mcp::continuations::protected::ContinuationPayment>,
     ) -> ControlFlow<agent_pay_gate::Answer, Option<agent_pay_gate::Receipt>> {
         let Some(intake) = self.intake else {
@@ -1785,8 +1812,12 @@ impl InboundPayment<'_> {
         .await
         {
             agent_pay_gate::GateOutcome::Free => ControlFlow::Continue(None),
-            agent_pay_gate::GateOutcome::Paid(paid) => ControlFlow::Continue(Some(paid.receipt)),
+            agent_pay_gate::GateOutcome::Paid(paid) => ControlFlow::Continue(Some(
+                paid.receipt
+                    .releasing(admitted.clone()),
+            )),
             agent_pay_gate::GateOutcome::Answered(answer) => {
+                answer.release_unpaid(admitted);
                 record_payment_refusal(state, self.source_addr, self.start_time, self.trace_id, answer.status());
                 ControlFlow::Break(answer)
             }
@@ -1934,8 +1965,6 @@ fn routing_facts(
     }
 }
 
-/// Records a request refused by request-extension inspection: an extension
-/// rule, or an inbound identity that is missing or fails validation.
 /// The receivers a caller's presentation must name at an Access Point: the
 /// origins of the inbound listeners' `external_urls`, never the `Host` a
 /// request carries.
@@ -1943,6 +1972,8 @@ fn access_point_receivers(network: &crate::config::NetworkConfig) -> crate::iden
     crate::identity::ExpectedReceivers::origins(network.get_inbound_external_urls())
 }
 
+/// Records a request refused by request-extension inspection: an extension
+/// rule, or an inbound identity that is missing or fails validation.
 fn record_extension_refusal(
     response: &Response,
     facts: &crate::audit::request_events::RequestFacts<'_>,
@@ -1954,6 +1985,41 @@ fn record_extension_refusal(
         response.status().as_u16(),
         None,
     );
+}
+
+/// The recorded `422` a request is refused with when an identity
+/// presentation it carries refuses it.
+fn refuse_presentation(facts: &crate::audit::request_events::RequestFacts<'_>) -> Response {
+    let response = create_error_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        crate::protocols::extensions::PRESENTATION_RECEIVER_REFUSED,
+    );
+    record_extension_refusal(&response, facts);
+    response
+}
+
+/// The recorded answer to a request whose presentations were not admitted:
+/// the surface's `422` for a presentation already used, `429` for a holder
+/// over its limit and `503` when the replay record cannot take them.
+fn presentation_not_admitted(
+    refusal: crate::identity::ssi::vp_replay::VpRefusal,
+    surface: &crate::config::agent_surface::AgentSurface,
+    facts: &crate::audit::request_events::RequestFacts<'_>,
+) -> Response {
+    use crate::identity::ssi::vp_replay::VpRefusal;
+    warn!(channel = %surface.name, ?refusal, "Agent presentation not admitted");
+    let response = match refusal {
+        VpRefusal::Duplicate if surface.channel_protocol() == crate::config::ChannelProtocol::Mcp => {
+            create_error_response(StatusCode::UNPROCESSABLE_ENTITY, "Invalid MCP identity presentation")
+        }
+        VpRefusal::Duplicate => return refuse_presentation(facts),
+        VpRefusal::HolderLimit => create_error_response(StatusCode::TOO_MANY_REQUESTS, "Too many agent presentations"),
+        VpRefusal::Unavailable | VpRefusal::TotalLimit => {
+            create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Agent presentations cannot be recorded")
+        }
+    };
+    record_extension_refusal(&response, facts);
+    response
 }
 
 /// Refuses a body that is not a JSON-RPC 2.0 request on a legacy MCP surface.
@@ -4721,6 +4787,7 @@ async fn proxy_charged_request(
                     policy_input: &policy_input,
                     mcp_context: mcp_context.as_ref(),
                     payment: payment.as_ref(),
+                    mcp_binding: mcp_verified_binding.as_ref(),
                 },
             )
             .await;
@@ -4828,6 +4895,7 @@ async fn proxy_charged_request(
                     policy_input: &policy_input,
                     mcp_context: mcp_context.as_ref(),
                     payment: payment.as_ref(),
+                    mcp_binding: mcp_verified_binding.as_ref(),
                 },
             )
             .await;
@@ -4958,6 +5026,7 @@ async fn proxy_charged_request(
                     policy_input: &policy_input,
                     mcp_context: mcp_context.as_ref(),
                     payment: payment.as_ref(),
+                    mcp_binding: mcp_verified_binding.as_ref(),
                 },
             )
             .await
@@ -5309,6 +5378,10 @@ async fn proxy_charged_request(
         debug!(channel = channel_name, protocol = ?state.surface.channel_protocol(), "Skipping extension inspection - conditions not met");
         (None, false)
     };
+    let mut presented = identity_result
+        .as_ref()
+        .map(|identity| identity.presented.clone())
+        .unwrap_or_default();
 
     // ── Configured caller identity (FromMtls / FromApiKey / Static) ─────────
     if !caller_identified {
@@ -5448,6 +5521,7 @@ async fn proxy_charged_request(
                             is_new: response.is_new,
                             identity_fields,
                             issuer_did: None,
+                            presented: Default::default(),
                         });
                     }
                     Err(e) => {
@@ -5572,23 +5646,21 @@ async fn proxy_charged_request(
     };
     let identity_binding = match binding_result {
         Ok(binding) => binding,
-        Err(e) if e.receiver.is_some() => {
+        Err(e) if e.refusal.is_some() => {
             warn!(channel = channel_name, error = %e, "Identity binding VP names no receiver of this Access Point");
-            let response = create_error_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                crate::protocols::extensions::PRESENTATION_RECEIVER_REFUSED,
-            );
-            record_extension_refusal(&response, &audit_facts);
             connection_guard
                 .decrement()
                 .await;
-            return Err(response);
+            return Err(refuse_presentation(&audit_facts));
         }
         Err(e) => {
             warn!(channel = channel_name, error = %e, "Identity binding VP present but invalid");
             None // Continue without binding context — OPA can decide
         }
     };
+    if let Some(binding) = &identity_binding {
+        presented.add(&binding.presented);
+    }
 
     // Persist the verified external agent DID so it appears on the local
     // Identities page (mirrors `fabric_identity.rs` response-path handling).
@@ -6480,6 +6552,7 @@ async fn proxy_charged_request(
         intake: payment.as_ref(),
         identity: authenticated_identity.as_ref(),
         identity_binding: identity_binding.as_ref(),
+        presented: &presented,
         trace_id: &trace_id,
         egress_trace_id: &egress_trace_id,
         source_addr: &source_addr,
@@ -6534,8 +6607,20 @@ async fn proxy_charged_request(
                 Ok(prepared) => prepared,
                 Err(refusal) => break 'dispatch *refusal,
             };
+            let admitted = match inbound_payment
+                .admit(&state)
+                .await
+            {
+                Ok(admitted) => admitted,
+                Err(response) => {
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Err(response);
+                }
+            };
             match inbound_payment
-                .charge(&state, None)
+                .charge(&state, &admitted, None)
                 .await
             {
                 ControlFlow::Continue(receipt) => {
@@ -6564,6 +6649,7 @@ async fn proxy_charged_request(
                         .tenant_id
                         .as_deref(),
                 ),
+                &admitted,
             )
             .await
         };
@@ -6631,11 +6717,15 @@ async fn proxy_charged_request(
                 connection_guard
                     .decrement()
                     .await;
+                let admitted = inbound_payment
+                    .admit(&state)
+                    .await?;
                 match inbound_payment
-                    .charge(&state, None)
+                    .charge(&state, &admitted, None)
                     .await
                 {
                     ControlFlow::Break(answer) => return Ok(answer.into_response()),
+                    ControlFlow::Continue(None) => admitted.release(),
                     ControlFlow::Continue(receipt) => *receipt_out = receipt,
                 }
                 return Err(ModernDelegationError::Unpaid.response(request));
@@ -7710,9 +7800,22 @@ async fn proxy_charged_request(
             .await;
         return Err(circuit_open_response(retry_after));
     }
+    let admitted = match inbound_payment
+        .admit(&state)
+        .await
+    {
+        Ok(admitted) => admitted,
+        Err(response) => {
+            connection_guard
+                .decrement()
+                .await;
+            return Err(response);
+        }
+    };
     match inbound_payment
         .charge(
             &state,
+            &admitted,
             modern_delegation
                 .as_ref()
                 .and_then(|prepared| prepared.payment()),
@@ -7951,6 +8054,7 @@ async fn proxy_charged_request(
                         gate_receipt
                             .iter()
                             .for_each(|receipt| receipt.revoke());
+                        admitted.release();
                         create_error_response(StatusCode::SERVICE_UNAVAILABLE, "MCP proxy circuit breaker is open")
                     }
                     crate::policies::CircuitBreakerError::Inner(response) => response,
@@ -8190,6 +8294,7 @@ async fn proxy_charged_request(
                     gate_receipt
                         .iter()
                         .for_each(|receipt| receipt.revoke());
+                    admitted.release();
                     return Err(circuit_open_response(retry_after));
                 }
                 Err(crate::policies::CircuitBreakerError::Inner(e)) => {
@@ -8197,6 +8302,7 @@ async fn proxy_charged_request(
                         gate_receipt
                             .iter()
                             .for_each(|receipt| receipt.revoke());
+                        admitted.release();
                     }
                     return Err(send_failed(e));
                 }
@@ -8210,6 +8316,7 @@ async fn proxy_charged_request(
                         gate_receipt
                             .iter()
                             .for_each(|receipt| receipt.revoke());
+                        admitted.release();
                     }
                     send_failed(e)
                 })?
@@ -10865,6 +10972,7 @@ async fn resolve_configured_caller_identity(
                 is_new: false,
                 identity_fields,
                 issuer_did: None,
+                presented: Default::default(),
             }
         }
         Ok(Some(CredentialIdentity::Derived {
@@ -10932,6 +11040,7 @@ async fn resolve_configured_caller_identity(
                 is_new: response.is_new,
                 identity_fields,
                 issuer_did: None,
+                presented: Default::default(),
             }
         }
         Ok(None) => return Ok(None),
@@ -11140,6 +11249,7 @@ async fn resolve_presented_api_key_identity(
         is_new: response.is_new,
         identity_fields,
         issuer_did: None,
+        presented: Default::default(),
     }))
 }
 
@@ -11482,31 +11592,27 @@ async fn handle_fabric_request_inner(
     };
     let identity_binding = match binding_result {
         Ok(binding) => binding,
-        Err(e) if e.receiver.is_some() => {
+        Err(e) if e.refusal.is_some() => {
             channel_warn!(config_id, "Identity binding VP names no receiver of this Access Point error={}", e);
-            let response = create_error_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                crate::protocols::extensions::PRESENTATION_RECEIVER_REFUSED,
-            );
-            record_extension_refusal(
-                &response,
-                &crate::audit::request_events::RequestFacts {
-                    surface_id: config_id,
-                    channel_name,
-                    trace_id: Some(&trace_id),
-                    via_fabric: false,
-                },
-            );
             connection_guard
                 .decrement()
                 .await;
-            return Err(response);
+            return Err(refuse_presentation(&crate::audit::request_events::RequestFacts {
+                surface_id: config_id,
+                channel_name,
+                trace_id: Some(&trace_id),
+                via_fabric: false,
+            }));
         }
         Err(e) => {
             channel_warn!(config_id, "Identity binding VP present but invalid error={}", e);
             None
         }
     };
+    let mut presented = identity_binding
+        .as_ref()
+        .map(|binding| binding.presented.clone())
+        .unwrap_or_default();
 
     // ── Inbound identity resolution — fabric path ────────────────────────
     //
@@ -11555,6 +11661,9 @@ async fn handle_fabric_request_inner(
         {
             Ok(identity) => {
                 channel_debug!(config_id, "Extension inspection passed in fabric path");
+                if let Some(identity) = &identity {
+                    presented.add(&identity.presented);
+                }
                 identity_result = identity;
             }
             Err(response) => {
@@ -11713,6 +11822,7 @@ async fn handle_fabric_request_inner(
                             is_new: response.is_new,
                             identity_fields,
                             issuer_did: None,
+                            presented: Default::default(),
                         });
                     }
                     Err(e) => {
@@ -12350,6 +12460,7 @@ async fn handle_fabric_request_inner(
         intake: payment,
         identity: authenticated_identity.as_ref(),
         identity_binding: identity_binding.as_ref(),
+        presented: &presented,
         trace_id: &trace_id,
         egress_trace_id: &egress_trace_id,
         source_addr: &source_addr,
@@ -12438,11 +12549,15 @@ async fn handle_fabric_request_inner(
                     connection_guard
                         .decrement()
                         .await;
+                    let admitted = inbound_payment
+                        .admit(&state)
+                        .await?;
                     match inbound_payment
-                        .charge(&state, None)
+                        .charge(&state, &admitted, None)
                         .await
                     {
                         ControlFlow::Break(answer) => return Ok(answer.into_response()),
+                        ControlFlow::Continue(None) => admitted.release(),
                         ControlFlow::Continue(receipt) => *gate_receipt = receipt,
                     }
                     return Err(ModernDelegationError::Unpaid.response(request));
@@ -13040,9 +13155,22 @@ async fn handle_fabric_request_inner(
 
     // The payment is taken last: every refusal that does not depend on it has
     // been made, and what follows is the dispatch itself.
+    let admitted = match inbound_payment
+        .admit(&state)
+        .await
+    {
+        Ok(admitted) => admitted,
+        Err(response) => {
+            connection_guard
+                .decrement()
+                .await;
+            return Err(response);
+        }
+    };
     match inbound_payment
         .charge(
             &state,
+            &admitted,
             modern_delegation
                 .as_ref()
                 .and_then(|prepared| prepared.payment()),
@@ -13344,6 +13472,7 @@ async fn handle_fabric_request_inner(
     .map_err(|e| {
         crate::proxy::fabric_response_waiter::remove_forward_response_waiter(&forward_request_msg.id);
         gate_receipt.iter().for_each(|receipt| receipt.revoke());
+        admitted.release();
         channel_error!(config_id, "Failed to send ForwardRequest to gateway {} (DID: {}): {:?}", gateway_id, remote_gateway_did, e);
         channel_warn!(config_id, "If the error mentions DID resolution, the remote gateway may be offline or its DID document unreachable");
         channel_warn!(config_id, "Consider checking if a cached DID document exists but is expired");
@@ -13876,7 +14005,7 @@ async fn handle_fabric_request_inner(
                             connection_guard
                                 .decrement()
                                 .await;
-                            return Err(create_error_response(StatusCode::BAD_GATEWAY, refusal.detail()));
+                            return Err(create_error_response(refusal.status(), refusal.detail()));
                         }
                     }
                 } else {
@@ -15815,6 +15944,8 @@ struct McpProxyRequest<'a> {
     policy_input: &'a crate::surface_context::PolicyInput,
     mcp_context: Option<&'a crate::surface_context::McpContext>,
     payment: Option<&'a agent_pay_gate::Intake>,
+    /// The verified MCP identity presentations the request carries.
+    mcp_binding: Option<&'a crate::surface_context::IdentityBindingContext>,
 }
 
 /// Handle MCP request through an MCP proxy backend
@@ -15862,6 +15993,7 @@ async fn handle_mcp_proxy_request_inner(
         policy_input,
         mcp_context,
         payment,
+        mcp_binding,
     } = request;
     use crate::mcp_proxies::filesystem::McpProxyStore;
 
@@ -16137,19 +16269,26 @@ async fn handle_mcp_proxy_request_inner(
     }
     let executed = match prepared {
         Ok(prepared) => {
+            let presented = mcp_binding
+                .map(|binding| binding.presented.clone())
+                .unwrap_or_default();
             let inbound_payment = InboundPayment {
                 intake: payment,
                 identity: authenticated_identity,
                 identity_binding: policy_input
                     .identity_binding
                     .as_ref(),
+                presented: &presented,
                 trace_id: &trace_id,
                 egress_trace_id,
                 source_addr,
                 start_time,
             };
+            let admitted = inbound_payment
+                .admit(state)
+                .await?;
             match inbound_payment
-                .charge(state, None)
+                .charge(state, &admitted, None)
                 .await
             {
                 ControlFlow::Continue(receipt) => *receipt_out = receipt,
@@ -16166,6 +16305,7 @@ async fn handle_mcp_proxy_request_inner(
                 state.policy_manager.as_ref(),
                 channel_name,
                 sent_token.as_ref(),
+                &admitted,
             )
             .await;
             if let Err(error) = &executed
@@ -16174,6 +16314,7 @@ async fn handle_mcp_proxy_request_inner(
                 receipt_out
                     .iter()
                     .for_each(|receipt| receipt.revoke());
+                admitted.release();
             }
             executed
         }

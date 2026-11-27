@@ -44,14 +44,14 @@ pub const PRESENTATION_RECEIVER_REFUSED: &str = "Invalid identity presentation";
 pub struct BindingVpError {
     /// A short diagnostic, never the signed presentation.
     pub detail: String,
-    /// Set when the presentation names no receiver of this gateway, which
-    /// refuses the request rather than leaving it without a binding.
-    pub receiver: Option<crate::identity::VpDomainRefusal>,
+    /// Set when the presentation refuses the request rather than leaving it
+    /// without a binding.
+    pub refusal: Option<crate::identity::ssi::vp_replay::PresentationRefusal>,
 }
 
 impl From<String> for BindingVpError {
     fn from(detail: String) -> Self {
-        Self { detail, receiver: None }
+        Self { detail, refusal: None }
     }
 }
 
@@ -1102,11 +1102,14 @@ async fn resolve_inbound_credential_identity(
         );
         return CredentialResolution::Rejected;
     };
-    match selector
+    let verified = selector
         .get_vc_issuer()
         .verify_agent_presentation_full(vp_jwt, receivers)
-        .await
-    {
+        .await;
+    if let Err(e) = &verified {
+        crate::identity::ssi::vp_replay::track_verify_refusal(crate::identity::ssi::vp_replay::FLOW_ACCESS_POINT, e);
+    }
+    match verified {
         Ok(verified) => {
             let did = verified.holder_did;
             let identity_fields = verified.identity_fields;
@@ -1124,6 +1127,7 @@ async fn resolve_inbound_credential_identity(
                 verification: crate::surface_context::IdentityVerification::VpUnanchored,
                 identity_fields,
                 issuer_did: verified.issuer_did,
+                presented: verified.presented,
             })
         }
         Err(e) if e.is::<crate::identity::VpDomainRefusal>() => {
@@ -1267,8 +1271,12 @@ pub async fn extract_identity_binding_vp(
                 receivers,
             )
             .await?;
-            if primary.is_none() {
-                primary = verified;
+            match (&mut primary, verified) {
+                (None, verified) => primary = verified,
+                (Some(primary), Some(verified)) => primary
+                    .presented
+                    .add(&verified.presented),
+                (Some(_), None) => {}
             }
         }
         return Ok(primary);
@@ -1342,6 +1350,7 @@ async fn verify_identity_binding_presentation(
                 issuer_did,
                 identity_fields,
                 raw_credentials: inbound_credentials,
+                presented,
             } = verified;
 
             if claimed_did.is_some_and(|did| did != agent_did) {
@@ -1415,13 +1424,16 @@ async fn verify_identity_binding_presentation(
                 chained_vcs = inbound_credentials.len(),
                 "Identity binding VP signature verified"
             );
-            Ok(Some(crate::surface_context::IdentityBindingContext::from_verified_parts(
-                agent_did,
-                gateway_did,
-                identity_fields,
-                inbound_credentials,
-                issuer_trusted,
-            )))
+            Ok(Some(crate::surface_context::IdentityBindingContext {
+                presented,
+                ..crate::surface_context::IdentityBindingContext::from_verified_parts(
+                    agent_did,
+                    gateway_did,
+                    identity_fields,
+                    inbound_credentials,
+                    issuer_trusted,
+                )
+            }))
         }
         Err(e) => {
             warn!(
@@ -1429,11 +1441,22 @@ async fn verify_identity_binding_presentation(
                 error = %e,
                 "Identity binding VP verification FAILED"
             );
+            if *receivers != crate::identity::ExpectedReceivers::Unchecked {
+                crate::identity::ssi::vp_replay::track_verify_refusal(
+                    if issuer_anchor.is_some() {
+                        crate::identity::ssi::vp_replay::FLOW_FABRIC_REQUEST
+                    } else {
+                        crate::identity::ssi::vp_replay::FLOW_ACCESS_POINT
+                    },
+                    &e,
+                );
+            }
             Err(BindingVpError {
                 detail: format!("Identity binding VP verification failed: {}", e),
-                receiver: e
+                refusal: e
                     .downcast_ref::<crate::identity::VpDomainRefusal>()
-                    .copied(),
+                    .copied()
+                    .map(Into::into),
             })
         }
     }
@@ -2292,7 +2315,7 @@ mod tests {
             )
             .await
             .expect_err("the binding is refused");
-            assert!(error.receiver.is_some(), "{domain:?}: {error}");
+            assert!(error.refusal.is_some(), "{domain:?}: {error}");
         }
         let signed = crate::identity::test_helpers::signed_agent_presentation_for(Some(ACCESS_POINT_ORIGIN)).await;
         let selector =

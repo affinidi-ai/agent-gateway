@@ -2928,7 +2928,9 @@ impl DispatchSettlement {
     }
 
     fn answered(&mut self) {
-        self.unanswered = None;
+        if let Some(message) = self.unanswered.take() {
+            super::envelope_replay::answered(&message);
+        }
     }
 
     async fn finish(mut self) {

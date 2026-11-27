@@ -33,9 +33,7 @@ pub mod prom {
     pub const PROOF_PURPOSE_MISMATCH_TOTAL: &str = "agent_gateway_proof_purpose_mismatch_total";
 
     // Agent presentations refused for their receiver, lifetime or replay, and the live replay records.
-    #[allow(dead_code)]
     pub const VP_PRESENTATION_REFUSED_TOTAL: &str = "agent_gateway_vp_presentation_refused_total";
-    #[allow(dead_code)]
     pub const VP_PROOF_RECORDS: &str = "agent_gateway_vp_proof_records";
 
     // Managed identity resolution (FromMtls / FromApiKey / Static / PayloadExtraction)

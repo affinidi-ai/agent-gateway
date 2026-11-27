@@ -21,6 +21,7 @@ pub struct ResponsePresentation {
     pub issuer_did: String,
     pub vp_jwt: String,
     pub identity_fields: HashMap<String, JsonValue>,
+    pub presented: crate::identity::ssi::vp_replay::Presented,
 }
 
 /// Whether the connection's issuers vouch for a response presentation.
@@ -41,16 +42,29 @@ pub enum AnswerIdentityRefusal {
     Invalid(String),
     /// No issuer of the connection vouches for the presentation.
     Untrusted,
+    /// The replay record did not admit the presentation.
+    NotAdmitted(crate::identity::ssi::vp_replay::VpRefusal),
 }
 
 impl AnswerIdentityRefusal {
-    /// The detail of the `502` the caller receives: a fixed sentence per
-    /// refusal, never the verifier's diagnostic.
+    /// The detail the caller receives: a fixed sentence per refusal, never the
+    /// verifier's diagnostic.
     pub fn detail(&self) -> &'static str {
+        use crate::identity::ssi::vp_replay::VpRefusal;
         match self {
-            Self::Invalid(_) => "Managed agent identity verification failed",
+            Self::Invalid(_) | Self::NotAdmitted(VpRefusal::Duplicate) => "Managed agent identity verification failed",
             Self::Untrusted => "Managed agent identity verification failed: issuer is not trusted on this connection",
+            Self::NotAdmitted(VpRefusal::HolderLimit) => "Too many agent presentations",
+            Self::NotAdmitted(VpRefusal::Unavailable | VpRefusal::TotalLimit) => {
+                "Agent presentations cannot be recorded"
+            }
         }
+    }
+
+    /// The status the caller receives: always `502`, because the Target has
+    /// already answered and a retry would repeat the request.
+    pub fn status(&self) -> axum::http::StatusCode {
+        axum::http::StatusCode::BAD_GATEWAY
     }
 }
 
@@ -113,6 +127,24 @@ pub async fn check_answer_identity(
     .await
     {
         ResponseAttribution::Verified => {
+            if let Err(refusal) = crate::identity::ssi::vp_replay::admit(
+                crate::identity::ssi::vp_replay::FLOW_FABRIC_ANSWER,
+                &presentation.presented,
+            )
+            .await
+            {
+                warn!(channel = check.facts.channel_name, ?refusal, "✗ Fabric: answer presentation not admitted");
+                crate::audit::request_events::request_rejected(
+                    check.facts,
+                    crate::audit::request_events::RejectionStage::Forward,
+                    crate::audit::request_events::RejectionReason::ExtensionRejected,
+                    AnswerIdentityRefusal::NotAdmitted(refusal)
+                        .status()
+                        .as_u16(),
+                    None,
+                );
+                return Err(AnswerIdentityRefusal::NotAdmitted(refusal));
+            }
             if let Some(vc_issuer) = check.vc_issuer
                 && crate::proxy::backend_identity::slot_reads_response_body(
                     check.surface,
@@ -266,6 +298,10 @@ async fn verify_fabric_credential(
         .await
         .map_err(|e| {
             warn!(channel = channel_name, error = %format!("{e:#}"), "✗ Fabric: VP verification FAILED");
+            crate::identity::ssi::vp_replay::track_verify_refusal(
+                crate::identity::ssi::vp_replay::FLOW_FABRIC_ANSWER,
+                &e,
+            );
             format!("VP verification failed for server agent identity: {e}")
         })?;
     let Some(issuer_did) = verified.issuer_did else {
@@ -283,6 +319,7 @@ async fn verify_fabric_credential(
         issuer_did,
         vp_jwt: vp_jwt.to_string(),
         identity_fields: verified.identity_fields,
+        presented: verified.presented,
     }))
 }
 
@@ -756,6 +793,7 @@ mod tests {
         Result<Option<ResponsePresentation>, AnswerIdentityRefusal>,
         Vec<crate::delegation_vault::audit::DelegationAuditEvent>,
     ) {
+        crate::identity::ssi::vp_replay::install_for_tests();
         let body = response.to_string();
         let facts = facts();
         crate::audit::producer::capture(check_answer_identity(AnswerIdentityCheck {

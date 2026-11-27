@@ -48,7 +48,9 @@ pub enum Namespace {
     FabricEnvelope,
     VoidedEvidence,
     /// Kept in this node's memory only: never journaled or sent to the
-    /// backend, and lost on a restart, a take-over or a step-down.
+    /// backend, and lost on a restart. A disk store also drops them on a
+    /// take-over or a step-down, while the replay record's own count of them
+    /// still refuses them as used.
     VpProof,
 }
 

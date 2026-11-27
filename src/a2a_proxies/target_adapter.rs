@@ -101,7 +101,8 @@ impl A2aProxyTargetAdapter {
         super::runtime::prepare_request(proxy, body_bytes, channel_name)
     }
 
-    /// Sends a request [`Self::prepare_message_send`] accepted to the proxy.
+    /// Sends a request [`Self::prepare_message_send`] accepted, and whose
+    /// presentations were admitted, to the proxy.
     pub async fn dispatch_message_send(
         proxy: &A2aProxy,
         prepared: PreparedSend,
@@ -109,6 +110,7 @@ impl A2aProxyTargetAdapter {
         channel_name: &str,
         caller: crate::proxy::handler::CallerAssertion,
         tenancy: crate::tenancy::SurfaceTenancy<'_>,
+        _admitted: &crate::identity::ssi::vp_replay::Admitted,
     ) -> Response {
         super::runtime::send_prepared(proxy, prepared, secrets_store, channel_name, caller, tenancy).await
     }

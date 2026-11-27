@@ -3126,7 +3126,8 @@ pub async fn surface_circuit_breaker(
 /// retry, circuit breaker, mirroring). This applies all network policies for
 /// feature parity with A2A channels. A tool call that carries the Target
 /// credential drops `sent_token`, the issued service token behind it, when the
-/// backend refuses it as invalid.
+/// backend refuses it as invalid. Only a request whose presentations were
+/// admitted is executed.
 pub async fn execute_mcp_request(
     proxy: &super::types::McpProxy,
     prepared: PreparedMcpRequest,
@@ -3134,6 +3135,7 @@ pub async fn execute_mcp_request(
     policy_manager: Option<&std::sync::Arc<crate::policies::SurfacePolicyManager>>,
     channel_name: &str,
     sent_token: Option<&crate::proxy::handler::SentServiceToken<'_>>,
+    _admitted: &crate::identity::ssi::vp_replay::Admitted,
 ) -> Result<serde_json::Value, McpProxyCallError> {
     let PreparedMcpRequest { server, request, call } = prepared;
     let request_id = request.get("id").cloned();
@@ -3564,7 +3566,13 @@ mod tests {
         sent_token: Option<&crate::proxy::handler::SentServiceToken<'_>>,
     ) -> Result<serde_json::Value, super::McpProxyCallError> {
         let prepared = super::prepare_mcp_request(proxy, request, target_auth_header, channel_name)?;
-        super::execute_mcp_request(proxy, prepared, surface, policy_manager, channel_name, sent_token).await
+        let admitted = crate::identity::ssi::vp_replay::admit(
+            crate::identity::ssi::vp_replay::FLOW_ACCESS_POINT,
+            &Default::default(),
+        )
+        .await
+        .expect("a request with no presentation is admitted");
+        super::execute_mcp_request(proxy, prepared, surface, policy_manager, channel_name, sent_token, &admitted).await
     }
 
     #[test]

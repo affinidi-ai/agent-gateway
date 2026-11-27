@@ -332,6 +332,43 @@ pub fn forget_unanswered(message: &ReceivedMessage) {
             store.forget_in_background(Namespace::FabricEnvelope, &digest(sender, &message.didcomm_message_id));
         }
         crate::metrics::backends::prometheus::set_fabric_envelope_seen_entries(seen().len() as i64);
+        if let Some((_, (admitted, _))) = admissions().remove(&digest(sender, &message.didcomm_message_id)) {
+            admitted.release();
+        }
+    }
+}
+
+type HeldAdmissions = DashMap<[u8; 32], (crate::identity::ssi::vp_replay::Admitted, u64)>;
+
+/// The presentations admitted with each message being answered, until it is
+/// answered or forgotten, and at most as long as their records last.
+fn admissions() -> &'static HeldAdmissions {
+    static ADMISSIONS: OnceLock<HeldAdmissions> = OnceLock::new();
+    ADMISSIONS.get_or_init(DashMap::new)
+}
+
+/// Holds the presentations admitted with `message` so that
+/// [`forget_unanswered`] releases them and the redelivery is admitted again.
+pub fn hold_admission(
+    message: &ReceivedMessage,
+    admitted: &crate::identity::ssi::vp_replay::Admitted,
+) {
+    let Ok(sender) = sender_of(message) else { return };
+    if admitted.is_empty() {
+        return;
+    }
+    let now = now_secs();
+    admissions().retain(|_, (_, until)| *until > now);
+    admissions().insert(
+        digest(sender, &message.didcomm_message_id),
+        (admitted.clone(), now.saturating_add(crate::identity::ssi::vp_replay::RECORD_SECS)),
+    );
+}
+
+/// Lets `message`, now answered, keep its admitted presentations recorded.
+pub fn answered(message: &ReceivedMessage) {
+    if let Ok(sender) = sender_of(message) {
+        admissions().remove(&digest(sender, &message.didcomm_message_id));
     }
 }
 

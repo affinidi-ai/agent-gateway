@@ -40,6 +40,12 @@ pub enum StsError {
     /// Internal failure (signing, storage). Rendered as a generic server error.
     #[error("server_error: {0}")]
     ServerError(String),
+    /// The request cannot be served now; the client may retry later (`503`).
+    #[error("temporarily_unavailable: {0}")]
+    TemporarilyUnavailable(String),
+    /// The client is over a limit; it may retry later (`429`).
+    #[error("temporarily_unavailable: {0}")]
+    TooManyRequests(String),
 }
 
 impl StsError {
@@ -54,15 +60,19 @@ impl StsError {
             Self::UnsupportedGrantType(_) => "unsupported_grant_type",
             Self::InvalidTarget(_) => "invalid_target",
             Self::ServerError(_) => "server_error",
+            Self::TemporarilyUnavailable(_) | Self::TooManyRequests(_) => "temporarily_unavailable",
         }
     }
 
     /// The HTTP status for this error. `invalid_client` is 401 (RFC 6749 §5.2);
-    /// `server_error` is 500; everything else is 400.
+    /// `server_error` is 500; `temporarily_unavailable` is 503, or 429 for a
+    /// client over a limit; everything else is 400.
     pub fn http_status(&self) -> StatusCode {
         match self {
             Self::InvalidClient(_) => StatusCode::UNAUTHORIZED,
             Self::ServerError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::TemporarilyUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             _ => StatusCode::BAD_REQUEST,
         }
     }
@@ -78,7 +88,9 @@ impl StsError {
             | Self::UnsupportedGrantType(m)
             | Self::InvalidTarget(m)
             | Self::UnsupportedTokenType(m)
-            | Self::ServerError(m) => m.clone(),
+            | Self::ServerError(m)
+            | Self::TemporarilyUnavailable(m)
+            | Self::TooManyRequests(m) => m.clone(),
         }
     }
 

@@ -1056,6 +1056,7 @@ pub async fn run_axum_proxy(
             crate::storage::single_use::SingleUseStore::open(config, &dir, dynamodb, now).await?,
         )?;
         info!(path = ?dir, store = ?config, "✓ Single-use store opened");
+        crate::identity::ssi::vp_replay::install();
     }
 
     // Initialize settings store and load settings from disk

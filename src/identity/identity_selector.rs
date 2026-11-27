@@ -34,6 +34,9 @@ pub struct IdentityResult {
     pub identity_fields: std::collections::HashMap<String, JsonValue>,
     /// Issuer DID of the caller from agent-identity-credential VP
     pub issuer_did: Option<String>,
+    /// The proofs of the presentation this identity was verified from, for
+    /// the request's replay claim; empty for any other identity.
+    pub presented: crate::identity::ssi::vp_replay::Presented,
 }
 
 impl IdentitySelector {
@@ -160,6 +163,7 @@ impl IdentitySelector {
             is_new: response.is_new,
             identity_fields,
             issuer_did: None,
+            presented: Default::default(),
         })
     }
 

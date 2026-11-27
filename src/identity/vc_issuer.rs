@@ -2547,6 +2547,7 @@ impl VCIssuer {
             .map(str::to_string);
 
         Ok(VerifiedAgentPresentation {
+            presented: crate::identity::ssi::vp_replay::Presented::new(&result.holder_did, result.replay_keys),
             holder_did: result.holder_did,
             subject_id,
             issuer_did,
@@ -2601,6 +2602,8 @@ pub struct VerifiedAgentPresentation {
     pub identity_fields: std::collections::HashMap<String, serde_json::Value>,
     /// Raw `verifiableCredential` entries for re-chaining.
     pub raw_credentials: Vec<serde_json::Value>,
+    /// The presentation's proofs, for the request's replay claim.
+    pub presented: crate::identity::ssi::vp_replay::Presented,
 }
 
 #[cfg(test)]

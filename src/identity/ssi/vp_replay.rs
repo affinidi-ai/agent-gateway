@@ -6,7 +6,7 @@
 //! this node.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use chrono::Utc;
 use serde_json::Value;
@@ -21,16 +21,67 @@ const HOLDER_WINDOW_SECS: u64 = 420;
 
 /// How long a claim records its proofs: the VP lifetime plus the clock skew on
 /// each side.
-const RECORD_SECS: u64 = (VP_LIFETIME_MINUTES * 60 + 2 * VP_CLOCK_SKEW_SECS).unsigned_abs();
+pub(crate) const RECORD_SECS: u64 = (VP_LIFETIME_MINUTES * 60 + 2 * VP_CLOCK_SKEW_SECS).unsigned_abs();
 
 /// How many expired records and ended windows a claim prunes beyond its own
 /// key count.
 const PRUNE_PER_CLAIM: usize = 64;
 
+/// The `flow` label of a presentation refused at an Access Point.
+pub const FLOW_ACCESS_POINT: &str = "access_point";
+/// The `flow` label of a presentation refused on a Fabric request.
+pub const FLOW_FABRIC_REQUEST: &str = "fabric_request";
+/// The `flow` label of a presentation refused on a Fabric answer.
+pub const FLOW_FABRIC_ANSWER: &str = "fabric_answer";
+/// The `flow` label of a presentation refused at the token exchange.
+pub const FLOW_STS: &str = "sts";
+
 /// The replay key of one presentation proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VpReplayKey {
     digest: [u8; 32],
+}
+
+/// The proofs of the presentations a verify result covers, and the holder
+/// they are counted against: the first holder added.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Presented {
+    holder: Option<String>,
+    keys: Vec<VpReplayKey>,
+}
+
+impl Presented {
+    pub fn new(
+        holder: &str,
+        keys: Vec<VpReplayKey>,
+    ) -> Self {
+        Self {
+            holder: Some(holder.to_string()),
+            keys,
+        }
+    }
+
+    pub fn add(
+        &mut self,
+        other: &Self,
+    ) {
+        if self.holder.is_none() {
+            self.holder
+                .clone_from(&other.holder);
+        }
+        self.keys
+            .extend_from_slice(&other.keys);
+    }
+}
+
+/// Why a presentation refuses the request that carries it, rather than
+/// leaving the request without an identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PresentationRefusal {
+    #[error(transparent)]
+    Receiver(#[from] crate::identity::VpDomainRefusal),
+    #[error("the presentation was already used at this gateway")]
+    Replay,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -113,12 +164,115 @@ impl VpRefusalReason {
     }
 }
 
+impl From<crate::identity::VpDomainRefusal> for VpRefusalReason {
+    fn from(refusal: crate::identity::VpDomainRefusal) -> Self {
+        use crate::identity::VpDomainRefusal;
+        match refusal {
+            VpDomainRefusal::Missing => Self::DomainMissing,
+            VpDomainRefusal::Label => Self::DomainLabel,
+            VpDomainRefusal::Unparseable | VpDomainRefusal::Wrong => Self::DomainWrong,
+        }
+    }
+}
+
+impl VpRefusalReason {
+    /// The reason a verification failed with `error`, when it failed for the
+    /// presentation's receiver or lifetime.
+    pub fn of(error: &anyhow::Error) -> Option<Self> {
+        if let Some(refusal) = error.downcast_ref::<crate::identity::VpDomainRefusal>() {
+            return Some((*refusal).into());
+        }
+        error
+            .is::<super::verifier::VpLifetimeRefusal>()
+            .then_some(Self::Lifetime)
+    }
+}
+
 /// Counts an agent presentation refused on `flow` for `reason`.
 pub fn track_refusal(
     flow: &'static str,
     reason: VpRefusalReason,
 ) {
     crate::metrics::backends::prometheus::track_vp_presentation_refused(flow, reason.as_str());
+}
+
+/// Counts a verification on `flow` that failed with `error`, when it failed
+/// for the presentation's receiver or lifetime.
+pub fn track_verify_refusal(
+    flow: &'static str,
+    error: &anyhow::Error,
+) {
+    if let Some(reason) = VpRefusalReason::of(error) {
+        track_refusal(flow, reason);
+    }
+}
+
+/// A request admitted with the proofs of the presentations it carries. A
+/// request that carries none holds an empty admission, which releases
+/// nothing. Clones share the admission, which is released at most once.
+#[derive(Clone, Debug)]
+pub struct Admitted(Arc<Mutex<Option<VpAdmission>>>);
+
+impl Admitted {
+    /// Forgets the proofs this admission recorded, so the caller can present
+    /// them again.
+    pub fn release(&self) {
+        let admission = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let (Some(admission), Some(replay)) = (admission, global()) {
+            replay.release(admission);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none()
+    }
+}
+
+/// Claims the proofs of `presented` once for the request, counting a refusal
+/// on `flow`. A request that presented nothing is admitted without a claim.
+pub async fn admit(
+    flow: &'static str,
+    presented: &Presented,
+) -> Result<Admitted, VpRefusal> {
+    let Some(holder) = presented
+        .holder
+        .as_deref()
+        .filter(|_| !presented.keys.is_empty())
+    else {
+        return Ok(Admitted(Arc::new(Mutex::new(None))));
+    };
+    let Some(replay) = global() else {
+        tracing::error!("Refusing an agent presentation: the replay record is not open");
+        track_refusal(flow, VpRefusalReason::StoreUnavailable);
+        return Err(VpRefusal::Unavailable);
+    };
+    let admission = replay
+        .claim(flow, &presented.keys, holder)
+        .await?;
+    Ok(Admitted(Arc::new(Mutex::new(Some(admission)))))
+}
+
+static REPLAY: OnceLock<VpReplay> = OnceLock::new();
+
+/// Opens this process's replay record. It is opened once; later calls keep it.
+pub fn install() {
+    REPLAY.get_or_init(|| VpReplay::new(VpReplayLimits::default()));
+}
+
+#[cfg(test)]
+pub(crate) fn install_for_tests() {
+    install();
+}
+
+fn global() -> Option<&'static VpReplay> {
+    REPLAY.get()
 }
 
 /// How many proof records this node holds at once, and how many one holder
@@ -279,19 +433,11 @@ impl VpReplay {
     ) -> Result<(), VpRefusal> {
         let mut budget = self.lock();
         budget.prune(now, PRUNE_PER_CLAIM.saturating_add(keys.len()));
-        let refused = if keys.iter().any(|digest| {
-            budget
-                .expiries
-                .contains_key(digest)
-        }) {
-            Some(VpRefusal::Duplicate)
-        } else if budget.expiries.len() + keys.len() > self.limits.total {
-            Some(VpRefusal::TotalLimit)
-        } else if budget.claims_of(holder) + keys.len() > self.limits.per_holder {
-            Some(VpRefusal::HolderLimit)
-        } else {
-            None
-        };
+        let mut refused = budget.refusal(keys, holder, self.limits);
+        if matches!(refused, Some(VpRefusal::TotalLimit | VpRefusal::HolderLimit)) {
+            budget.prune(now, usize::MAX);
+            refused = budget.refusal(keys, holder, self.limits);
+        }
         if refused.is_none() {
             for digest in keys {
                 budget.insert(digest, expires_at, holder, now);
@@ -343,6 +489,27 @@ struct Budget {
 }
 
 impl Budget {
+    /// Why claiming `keys` for `holder` is refused, if it is.
+    fn refusal(
+        &self,
+        keys: &[[u8; 32]],
+        holder: &[u8; 32],
+        limits: VpReplayLimits,
+    ) -> Option<VpRefusal> {
+        if keys.iter().any(|digest| {
+            self.expiries
+                .contains_key(digest)
+        }) {
+            Some(VpRefusal::Duplicate)
+        } else if self.expiries.len() + keys.len() > limits.total {
+            Some(VpRefusal::TotalLimit)
+        } else if self.claims_of(holder) + keys.len() > limits.per_holder {
+            Some(VpRefusal::HolderLimit)
+        } else {
+            None
+        }
+    }
+
     fn claims_of(
         &self,
         holder: &[u8; 32],

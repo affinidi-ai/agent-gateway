@@ -45,7 +45,14 @@ pub struct VpVerificationResult {
     /// expiring at its `expires`, or at its `created` plus the VP lifetime when it has none.
     #[allow(unused)]
     pub expires_at: DateTime<Utc>,
+    /// The replay key of each holder proof.
+    pub replay_keys: Vec<super::vp_replay::VpReplayKey>,
 }
+
+/// A presentation refused for its proof's `created` or `expires`.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct VpLifetimeRefusal(String);
 
 #[async_trait]
 pub trait Verifier: Send + Sync {
@@ -811,8 +818,13 @@ impl LocalVerifier {
         let proofs = proofs_of(presentation, "VP")?;
         let mut expires_at = DateTime::<Utc>::MAX_UTC;
         for proof in &proofs {
-            expires_at = expires_at.min(verify_vp_proof_lifetime(proof)?);
+            expires_at = expires_at
+                .min(verify_vp_proof_lifetime(proof).map_err(|error| VpLifetimeRefusal(format!("{error:#}")))?);
         }
+        let replay_keys = proofs
+            .iter()
+            .map(super::vp_replay::replay_key)
+            .collect::<Result<Vec<_>, _>>()?;
 
         let resolver = CompositeResolver::new(self.did_cache.clone());
         let cached = resolver.cached_documents();
@@ -910,6 +922,7 @@ impl LocalVerifier {
             domain,
             challenge,
             expires_at,
+            replay_keys,
         })
     }
 }

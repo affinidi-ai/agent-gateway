@@ -72,6 +72,8 @@ pub(crate) enum FabricForwardError {
     GatewayNotConnected(String),
     #[error("DID for remote gateway '{0}' not found")]
     GatewayDidNotFound(String),
+    #[error("Remote gateway '{0}' streams from a DID other than the one its presentation names")]
+    PeerDidMismatch(String),
     /// The send detail is logged where this error is created and is kept out
     /// of `Display`, because callers turn this error into client responses.
     #[error("Failed to send message to remote gateway '{0}'")]
@@ -101,6 +103,7 @@ impl FabricForwardError {
             Self::ListenerManagerUnavailable
                 | Self::GatewayNotConnected(_)
                 | Self::GatewayDidNotFound(_)
+                | Self::PeerDidMismatch(_)
                 | Self::SendFailed(_)
                 | Self::ReplyNotReceived(_)
                 | Self::CapacityReached
@@ -419,7 +422,7 @@ async fn forward_stream_with_runtime(
         .peer_did
         .is_some_and(|signed_for| signed_for != peer_did)
     {
-        return Err(FabricForwardError::GatewayDidNotFound(gateway_id.to_string()));
+        return Err(FabricForwardError::PeerDidMismatch(gateway_id.to_string()));
     }
     let (listener_instance_id, recipient_did) = runtime
         .listener_context(&listener.connection_point_id)
@@ -2386,7 +2389,7 @@ mod tests {
     async fn a_modern_fabric_forward_to_a_peer_its_presentation_does_not_name_is_refused() {
         let refused = modern_forward_signed_for("did:example:elsewhere").await;
 
-        assert!(matches!(refused, FabricForwardError::GatewayDidNotFound(_)), "{refused:?}");
+        assert!(matches!(refused, FabricForwardError::PeerDidMismatch(_)), "{refused:?}");
     }
 
     /// A modern forward whose presentation names the peer's record DID passes

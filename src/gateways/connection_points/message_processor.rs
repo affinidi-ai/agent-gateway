@@ -1840,9 +1840,10 @@ async fn extract_caller_identity_inbound(
     peer_issuers: &crate::gateways::types::PeerIssuers,
     vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
     receivers: &crate::identity::ExpectedReceivers,
+    presented: &mut crate::identity::ssi::vp_replay::Presented,
 ) -> Result<
     (Option<String>, Option<String>, crate::surface_context::IdentityVerification),
-    crate::identity::VpDomainRefusal,
+    crate::identity::ssi::vp_replay::PresentationRefusal,
 > {
     use crate::surface_context::IdentityVerification;
     if surface.channel_protocol() == crate::config::ChannelProtocol::Mcp {
@@ -1923,6 +1924,7 @@ async fn extract_caller_identity_inbound(
                             .and_then(|verified| require_peer_issuer(verified, peer_issuers))
                         {
                             Ok(verified) => {
+                                presented.add(&verified.presented);
                                 let verified_did = verified.holder_did.clone();
                                 let identity_fields = verified
                                     .identity_fields
@@ -1947,7 +1949,7 @@ async fn extract_caller_identity_inbound(
                                 }
                             }
                             Err(e) => {
-                                refuse_presentation_for_another_receiver(config_id, &e)?;
+                                refuse_presentation(config_id, &e)?;
                                 presentation_rejected = true;
                                 channel_warn!(
                                     config_id,
@@ -2014,6 +2016,7 @@ async fn extract_caller_identity_inbound(
                             .and_then(|verified| require_peer_issuer(verified, peer_issuers))
                         {
                             Ok(verified) => {
+                                presented.add(&verified.presented);
                                 let verified_did = verified.holder_did.clone();
                                 let identity_fields = verified
                                     .identity_fields
@@ -2042,7 +2045,7 @@ async fn extract_caller_identity_inbound(
                                 }
                             }
                             Err(e) => {
-                                refuse_presentation_for_another_receiver(config_id, &e)?;
+                                refuse_presentation(config_id, &e)?;
                                 presentation_rejected = true;
                                 channel_warn!(
                                     config_id,
@@ -2205,6 +2208,7 @@ async fn extract_caller_identity_inbound(
                         .and_then(|verified| require_peer_issuer(verified, peer_issuers))
                     {
                         Ok(verified) => {
+                            presented.add(&verified.presented);
                             let verified_did = verified.holder_did.clone();
                             let identity_fields = verified
                                 .identity_fields
@@ -2233,7 +2237,7 @@ async fn extract_caller_identity_inbound(
                             }
                         }
                         Err(e) => {
-                            refuse_presentation_for_another_receiver(config_id, &e)?;
+                            refuse_presentation(config_id, &e)?;
                             presentation_rejected = true;
                             channel_warn!(
                                 config_id,
@@ -2280,14 +2284,15 @@ async fn extract_caller_identity_inbound(
 
 /// `Err` when `error` is a presentation naming no receiver of this gateway,
 /// which refuses the request rather than leaving it without an identity.
-fn refuse_presentation_for_another_receiver(
+fn refuse_presentation(
     config_id: &str,
     error: &anyhow::Error,
-) -> Result<(), crate::identity::VpDomainRefusal> {
+) -> Result<(), crate::identity::ssi::vp_replay::PresentationRefusal> {
+    crate::identity::ssi::vp_replay::track_verify_refusal(crate::identity::ssi::vp_replay::FLOW_FABRIC_REQUEST, error);
     match error.downcast_ref::<crate::identity::VpDomainRefusal>() {
         Some(refusal) => {
             channel_warn!(config_id, "✗ GW2: identity presentation refused: {}", refusal);
-            Err(*refusal)
+            Err((*refusal).into())
         }
         None => Ok(()),
     }
@@ -2555,6 +2560,7 @@ async fn enrich_and_evaluate_surface_policies(
     peer_issuers: &crate::gateways::types::PeerIssuers,
     mcp_context: Option<&crate::surface_context::McpContext>,
     receivers: &crate::identity::ExpectedReceivers,
+    presented: &mut crate::identity::ssi::vp_replay::Presented,
 ) -> Result<bytes::Bytes, ForwardRefusal> {
     // Caller-leg Trust Check stage runs further down (post-identity);
     // gateway OPA on GW2 already ran in `evaluate_gateway_policy_for_fabric`
@@ -2931,7 +2937,7 @@ async fn enrich_and_evaluate_surface_policies(
             };
             crate::observability::identity_binding_audit::audit_extraction(&binding_facts, None, &binding_result);
             if let Err(error) = &binding_result
-                && let Some(refusal) = error.receiver
+                && let Some(refusal) = error.refusal
             {
                 channel_warn!(config_id, "GW2: identity binding VP refused: {}", refusal);
                 crate::audit::request_events::request_rejected(
@@ -2978,7 +2984,12 @@ async fn enrich_and_evaluate_surface_policies(
                 ));
             }
             match binding_result {
-                Ok(binding) => binding,
+                Ok(binding) => {
+                    if let Some(binding) = &binding {
+                        presented.add(&binding.presented);
+                    }
+                    binding
+                }
                 Err(e) => {
                     channel_warn!(config_id, "GW2: Identity binding VP present but invalid: {}", e);
                     None
@@ -4620,18 +4631,89 @@ struct FabricPayment<'a> {
     intake: Option<&'a crate::proxy::handler::agent_pay_gate::Intake>,
     identity: Option<&'a crate::source_auth::AuthenticatedIdentity>,
     binding: Option<&'a crate::surface_context::IdentityBindingContext>,
+    /// The proofs of every presentation the request was verified from.
+    presented: &'a crate::identity::ssi::vp_replay::Presented,
+    /// Whether the mediator redelivers the message when it goes unanswered,
+    /// which a framed stream is not.
+    redeliverable: bool,
     trace_id: Option<&'a str>,
     evidence: Option<&'a crate::mcp::continuations::protected::ContinuationPayment>,
     received_at: std::time::Instant,
 }
 
 impl FabricPayment<'_> {
-    /// Puts the request through the agent-pay payment gate. `Continue(None)`
-    /// when it is free and `Continue(Some(receipt))` when it was paid for.
+    /// Claims the request's presentation proofs once, just before it is
+    /// charged, to be released if the message goes unanswered. `Err` is the
+    /// recorded answer to a request not admitted.
+    async fn admit(&self) -> Result<crate::identity::ssi::vp_replay::Admitted, Box<ProcessingResult>> {
+        use crate::identity::ssi::vp_replay::{PresentationRefusal, VpRefusal};
+        match crate::identity::ssi::vp_replay::admit(
+            crate::identity::ssi::vp_replay::FLOW_FABRIC_REQUEST,
+            self.presented,
+        )
+        .await
+        {
+            Ok(admitted) => {
+                if self.redeliverable {
+                    super::envelope_replay::hold_admission(self.message, &admitted);
+                }
+                Ok(admitted)
+            }
+            Err(refusal) => {
+                let config_id = self
+                    .surface
+                    .config_id()
+                    .unwrap_or("unknown");
+                if refusal == VpRefusal::Duplicate {
+                    channel_warn!(config_id, "✗ GW2: identity presentation refused: {}", PresentationRefusal::Replay);
+                } else {
+                    channel_warn!(config_id, "✗ GW2: identity presentation not admitted: {:?}", refusal);
+                }
+                let (status, message) = match refusal {
+                    VpRefusal::Duplicate
+                        if self
+                            .surface
+                            .channel_protocol()
+                            == crate::config::ChannelProtocol::Mcp =>
+                    {
+                        (axum::http::StatusCode::UNPROCESSABLE_ENTITY, "Invalid MCP identity presentation")
+                    }
+                    VpRefusal::Duplicate => (
+                        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                        crate::protocols::extensions::PRESENTATION_RECEIVER_REFUSED,
+                    ),
+                    VpRefusal::HolderLimit => {
+                        (axum::http::StatusCode::TOO_MANY_REQUESTS, "Too many agent presentations")
+                    }
+                    VpRefusal::Unavailable | VpRefusal::TotalLimit => {
+                        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Agent presentations cannot be recorded")
+                    }
+                };
+                crate::audit::request_events::request_rejected(
+                    &crate::audit::request_events::RequestFacts {
+                        surface_id: config_id,
+                        channel_name: &self.surface.name,
+                        trace_id: self.trace_id,
+                        via_fabric: true,
+                    },
+                    crate::audit::request_events::RejectionStage::Admission,
+                    crate::audit::request_events::RejectionReason::ExtensionRejected,
+                    status.as_u16(),
+                    None,
+                );
+                Err(Box::new(axum_response_to_forward_result(crate::a2a::create_error_response(status, message)).await))
+            }
+        }
+    }
+
+    /// Puts the admitted request through the agent-pay payment gate.
+    /// `Continue(None)` when it is free and `Continue(Some(receipt))` when it
+    /// was paid for; the receipt releases `admitted` when it is revoked.
     /// `Break(answer)` is what the caller is answered instead, already recorded
-    /// in the connection metrics.
+    /// in the connection metrics; a `402`, `429` or `503` releases `admitted`.
     async fn charge(
-        &self
+        &self,
+        admitted: &crate::identity::ssi::vp_replay::Admitted,
     ) -> ControlFlow<
         crate::proxy::handler::agent_pay_gate::Answer,
         Option<crate::proxy::handler::agent_pay_gate::Receipt>,
@@ -4678,8 +4760,12 @@ impl FabricPayment<'_> {
         .await
         {
             agent_pay_gate::GateOutcome::Free => ControlFlow::Continue(None),
-            agent_pay_gate::GateOutcome::Paid(paid) => ControlFlow::Continue(Some(paid.receipt)),
+            agent_pay_gate::GateOutcome::Paid(paid) => ControlFlow::Continue(Some(
+                paid.receipt
+                    .releasing(admitted.clone()),
+            )),
             agent_pay_gate::GateOutcome::Answered(answer) => {
+                answer.release_unpaid(admitted);
                 crate::proxy::handler::record_payment_refusal_metric(
                     GLOBAL_METRICS_STORE
                         .get()
@@ -5723,6 +5809,10 @@ async fn process_charged_forward_request(
         })
         .or(caller_synthesized_ext_rules.as_ref());
     let receivers = fabric_request_receivers(message);
+    let mut presented = mcp_verified_binding
+        .as_ref()
+        .map(|binding| binding.presented.clone())
+        .unwrap_or_default();
     let (caller_identity, caller_issuer_did, caller_identity_verification) =
         match Box::pin(extract_caller_identity_inbound(
             &surface,
@@ -5734,6 +5824,7 @@ async fn process_charged_forward_request(
             &peer_issuers,
             GLOBAL_VC_ISSUER.get(),
             &receivers,
+            &mut presented,
         ))
         .await
         {
@@ -5794,6 +5885,7 @@ async fn process_charged_forward_request(
         &peer_issuers,
         policy_mcp_context.as_ref(),
         &receivers,
+        &mut presented,
     ))
     .await
     {
@@ -5838,6 +5930,8 @@ async fn process_charged_forward_request(
         intake: payment.as_ref(),
         identity: authenticated_identity.as_ref(),
         binding: mcp_verified_binding.as_ref(),
+        presented: &presented,
+        redeliverable: stream_request.is_none(),
         trace_id: audit_trace_id,
         evidence: None,
         received_at,
@@ -5899,8 +5993,14 @@ async fn process_charged_forward_request(
                 modern_delegation = Some(prepared);
             }
             Err(ModernDelegationError::Unpaid) => {
-                match (FabricPayment { evidence: None, ..fabric_payment }).charge().await {
+                let payment = FabricPayment { evidence: None, ..fabric_payment };
+                let admitted = match payment.admit().await {
+                    Ok(admitted) => admitted,
+                    Err(refusal) => return *refusal,
+                };
+                match payment.charge(&admitted).await {
                     ControlFlow::Break(answer) => return axum_response_to_forward_result(answer.into_response()).await,
+                    ControlFlow::Continue(None) => admitted.release(),
                     ControlFlow::Continue(receipt) => {
                         *gate_receipt = receipt.map(|receipt| (receipt, surface.channel_protocol()))
                     }
@@ -6724,14 +6824,19 @@ async fn process_charged_forward_request(
 
     // The payment is taken last: every refusal that does not depend on it has
     // been made, and what follows is the dispatch itself.
-    let charged = (FabricPayment {
+    let payment = FabricPayment {
         evidence: modern_delegation
             .as_ref()
             .and_then(|prepared| prepared.payment()),
         ..fabric_payment
-    })
-    .charge()
-    .await;
+    };
+    let admitted = match payment.admit().await {
+        Ok(admitted) => admitted,
+        Err(refusal) => return *refusal,
+    };
+    let charged = payment
+        .charge(&admitted)
+        .await;
     match charged {
         ControlFlow::Continue(Some(receipt)) => {
             *gate_receipt = Some((receipt.clone(), surface_protocol.clone()));
@@ -8872,7 +8977,14 @@ async fn handle_a2a_proxy_forward(
             match crate::a2a_proxies::A2aProxyTargetAdapter::prepare_message_send(&proxy, &body_bytes, &surface.name) {
                 Err(refusal) => *refusal,
                 Ok(prepared) => {
-                    match payment.charge().await {
+                    let admitted = match payment.admit().await {
+                        Ok(admitted) => admitted,
+                        Err(refusal) => return *refusal,
+                    };
+                    match payment
+                        .charge(&admitted)
+                        .await
+                    {
                         ControlFlow::Continue(receipt) => {
                             *gate_receipt = receipt.map(|receipt| (receipt, surface.channel_protocol()))
                         }
@@ -8891,6 +9003,7 @@ async fn handle_a2a_proxy_forward(
                         &surface.name,
                         caller,
                         crate::tenancy::SurfaceTenancy::configured(surface.tenant_id.as_deref()),
+                        &admitted,
                     )
                     .await
                 }
@@ -9341,7 +9454,14 @@ async fn handle_mcp_proxy_forward(
                 );
                 Err(format!("Circuit breaker open, retry after {:?}", retry_after).into())
             } else {
-                match payment.charge().await {
+                let admitted = match payment.admit().await {
+                    Ok(admitted) => admitted,
+                    Err(refusal) => return *refusal,
+                };
+                match payment
+                    .charge(&admitted)
+                    .await
+                {
                     ControlFlow::Continue(receipt) => {
                         *gate_receipt = receipt.map(|receipt| (receipt, surface.channel_protocol()))
                     }
@@ -9359,6 +9479,7 @@ async fn handle_mcp_proxy_forward(
                     policy_manager,
                     &surface.name,
                     sent_token.as_ref(),
+                    &admitted,
                 )
                 .await;
                 if let Err(error) = &executed
@@ -9367,6 +9488,7 @@ async fn handle_mcp_proxy_forward(
                     gate_receipt
                         .iter()
                         .for_each(|(receipt, _)| receipt.revoke());
+                    admitted.release();
                 }
                 executed
             }
@@ -10149,6 +10271,7 @@ mod tests {
             &peer_issuers,
             None,
             &crate::identity::test_helpers::presentation_receivers(),
+            &mut Default::default(),
         )))
         .await;
         let decisions = events
@@ -10746,7 +10869,10 @@ mod tests {
         metadata: serde_json::Value,
         peer_issuers: &crate::gateways::types::PeerIssuers,
         vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
-    ) -> Result<(Option<String>, Option<String>, IdentityVerification), crate::identity::VpDomainRefusal> {
+    ) -> Result<
+        (Option<String>, Option<String>, IdentityVerification),
+        crate::identity::ssi::vp_replay::PresentationRefusal,
+    > {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": "1",
@@ -10763,6 +10889,7 @@ mod tests {
             peer_issuers,
             vc_issuer,
             receivers,
+            &mut Default::default(),
         )
         .await
     }
@@ -10883,7 +11010,7 @@ mod tests {
                 Some(&signed.issuer),
             )
             .await;
-            assert_eq!(outcome, Err(refusal), "{domain:?} in {extension}");
+            assert_eq!(outcome, Err(refusal.into()), "{domain:?} in {extension}");
         }
     }
 

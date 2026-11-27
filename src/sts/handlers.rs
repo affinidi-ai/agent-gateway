@@ -153,6 +153,9 @@ pub struct VerifiedAssertion {
     /// keys included. The one answer to "did this gateway issue it", shared by
     /// verification and by the exchange's refusal of self-issued tokens.
     pub issued_here: bool,
+    /// The proofs of a verified presentation, claimed once before a token is
+    /// minted; empty for a JWT.
+    pub presented: crate::identity::ssi::vp_replay::Presented,
 }
 
 impl VerifiedAssertion {
@@ -161,6 +164,7 @@ impl VerifiedAssertion {
             claims,
             principal_claim: crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM.to_string(),
             issued_here: false,
+            presented: Default::default(),
         }
     }
 
@@ -194,21 +198,26 @@ pub trait StsSubjectVerifier: Send + Sync {
     }
 }
 
-/// Verifies a Verifiable Presentation subject token and returns a claims object
-/// whose `sub` is the cryptographically-proven subject DID. The presentation
-/// must name `gateway_did`, or another DID of this gateway, as its receiver.
+/// Verifies a Verifiable Presentation subject token and returns claims whose
+/// `sub` is the cryptographically-proven subject DID, with the presentation's
+/// proofs. The presentation must name `gateway_did`, or another DID of this
+/// gateway, as its receiver.
 #[async_trait::async_trait]
 pub trait StsVpVerifier: Send + Sync {
     async fn verify_vp(
         &self,
         vp: &str,
         gateway_did: &str,
-    ) -> Result<Value, StsError>;
+    ) -> Result<VerifiedAssertion, StsError>;
 }
 
 /// The `error_description` of a VP `subject_token` that does not name this
 /// gateway as its receiver.
 const VP_RECEIVER_REFUSED: &str = "VP subject_token does not name this gateway as its receiver";
+
+/// The `error_description` of a VP `subject_token` already used at this
+/// gateway.
+const VP_REPLAY_REFUSED: &str = "VP subject_token was already used";
 
 /// Authenticates a client and loads its managed connection.
 #[async_trait::async_trait]
@@ -503,6 +512,7 @@ async fn verify_with_client_strategies(
                     claims,
                     principal_claim,
                     issued_here: false,
+                    presented: Default::default(),
                 });
             }
             Err(error) => failure = Some(error),
@@ -543,7 +553,7 @@ impl StsVpVerifier for VcIssuerVpVerifier {
         &self,
         vp: &str,
         gateway_did: &str,
-    ) -> Result<Value, StsError> {
+    ) -> Result<VerifiedAssertion, StsError> {
         let mut dids = self
             .vc_issuer
             .gateway_dids()
@@ -554,6 +564,7 @@ impl StsVpVerifier for VcIssuerVpVerifier {
             .verify_agent_presentation_full(vp, &crate::identity::ExpectedReceivers::dids(dids))
             .await
             .map_err(|e| {
+                crate::identity::ssi::vp_replay::track_verify_refusal(crate::identity::ssi::vp_replay::FLOW_STS, &e);
                 if e.is::<crate::identity::VpDomainRefusal>() {
                     tracing::warn!(error = %e, "STS: VP subject_token refused");
                     StsError::InvalidGrant(VP_RECEIVER_REFUSED.to_string())
@@ -570,7 +581,10 @@ impl StsVpVerifier for VcIssuerVpVerifier {
         if let Some(issuer) = verified.issuer_did {
             claims.insert("identity_issuer_did".to_string(), Value::String(issuer));
         }
-        Ok(Value::Object(claims))
+        Ok(VerifiedAssertion {
+            presented: verified.presented,
+            ..VerifiedAssertion::named_by_sub(Value::Object(claims))
+        })
     }
 }
 
@@ -584,7 +598,7 @@ impl StsVpVerifier for DisabledVpVerifier {
         &self,
         _vp: &str,
         _gateway_did: &str,
-    ) -> Result<Value, StsError> {
+    ) -> Result<VerifiedAssertion, StsError> {
         Err(StsError::UnsupportedTokenType(
             "Verifiable Presentation subject tokens are not configured on this gateway".to_string(),
         ))
@@ -1149,6 +1163,7 @@ async fn handle_token_exchange(
         claims: subject_claims,
         principal_claim: subject_claim,
         issued_here: subject_issued_here,
+        mut presented,
     } = verify_assertion(state, req.subject_token_type, &req.subject_token, profile, record.tenant_id.as_deref())
         .await?;
     let mut assertion_expiry = None;
@@ -1201,7 +1216,9 @@ async fn handle_token_exchange(
                 claims: actor_claims,
                 principal_claim: actor_claim,
                 issued_here: actor_issued_here,
+                presented: actor_presented,
             } = verify_assertion(state, actor_type, actor_token, profile, record.tenant_id.as_deref()).await?;
+            presented.add(&actor_presented);
             if actor_type.is_jwt_shaped() {
                 reject_self_issued(
                     state,
@@ -1320,6 +1337,7 @@ async fn handle_token_exchange(
         }
         let aud = audience
             .ok_or_else(|| StsError::InvalidTarget("audience or resource is required for an ID-JAG".to_string()))?;
+        let admitted = admit_presentations(&presented).await?;
         let id_jag_ttl = state
             .config
             .id_jag_ttl_secs
@@ -1346,7 +1364,8 @@ async fn handle_token_exchange(
         let token = state
             .signer
             .sign_id_jag(&claims)
-            .await?;
+            .await
+            .inspect_err(|_| admitted.release())?;
         emit_issuance_audit(
             "token_exchange",
             &client_id,
@@ -1379,16 +1398,19 @@ async fn handle_token_exchange(
         jti: &jti,
     });
     claims[crate::sts::token_origin::CONNECTION_ID_CLAIM] = json!(record.id);
+    let admitted = admit_presentations(&presented).await?;
     let token = if profile.is_some() {
         state
             .signer
             .sign_mcp_access_token(&claims)
-            .await?
+            .await
+            .inspect_err(|_| admitted.release())?
     } else {
         state
             .signer
             .sign(&claims)
-            .await?
+            .await
+            .inspect_err(|_| admitted.release())?
     };
     emit_issuance_audit(
         "token_exchange",
@@ -1657,6 +1679,26 @@ async fn handle_jwt_bearer(
     })
 }
 
+/// Claims the proofs of the presentations an exchange was verified from, once,
+/// before a token is minted.
+async fn admit_presentations(
+    presented: &crate::identity::ssi::vp_replay::Presented
+) -> Result<crate::identity::ssi::vp_replay::Admitted, StsError> {
+    use crate::identity::ssi::vp_replay::VpRefusal;
+    crate::identity::ssi::vp_replay::admit(crate::identity::ssi::vp_replay::FLOW_STS, presented)
+        .await
+        .map_err(|refusal| {
+            tracing::warn!(?refusal, "STS: VP subject_token not admitted");
+            match refusal {
+                VpRefusal::Duplicate => StsError::InvalidGrant(VP_REPLAY_REFUSED.to_string()),
+                VpRefusal::HolderLimit => StsError::TooManyRequests("too many VP subject tokens".to_string()),
+                VpRefusal::Unavailable | VpRefusal::TotalLimit => {
+                    StsError::TemporarilyUnavailable("VP subject tokens cannot be recorded".to_string())
+                }
+            }
+        })
+}
+
 async fn verify_assertion(
     state: &StsState,
     token_type: TokenType,
@@ -1685,7 +1727,6 @@ async fn verify_assertion(
             .vp_verifier
             .verify_vp(token, &gateway_did)
             .await
-            .map(VerifiedAssertion::named_by_sub)
     } else {
         Err(StsError::UnsupportedTokenType(format!("cannot verify token of type {}", token_type.as_urn())))
     }
@@ -2127,10 +2168,11 @@ mod tests {
             &self,
             vp: &str,
             _gateway_did: &str,
-        ) -> Result<Value, StsError> {
+        ) -> Result<VerifiedAssertion, StsError> {
             self.vps
                 .get(vp)
                 .cloned()
+                .map(VerifiedAssertion::named_by_sub)
                 .ok_or_else(|| StsError::InvalidGrant("unknown test vp".to_string()))
         }
     }
@@ -2169,6 +2211,7 @@ mod tests {
             SIGNER_DID,
         )
         .await
+        .map(|verified| verified.claims)
     }
 
     #[tokio::test]
@@ -4330,6 +4373,7 @@ mod tests {
                     claims,
                     principal_claim: "oid".to_string(),
                     issued_here: false,
+                    presented: Default::default(),
                 })
                 .ok_or_else(|| StsError::InvalidGrant("unknown test token".to_string()))
         }

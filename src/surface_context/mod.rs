@@ -805,6 +805,9 @@ pub struct IdentityBindingContext {
     /// Empty for unverified bindings or VPs with no credentials. Never
     /// serialized to OPA.
     pub inbound_credentials: Vec<serde_json::Value>,
+    /// The proofs of the presentations this binding was verified from, for
+    /// the request's replay claim. Never serialized to OPA.
+    pub presented: crate::identity::ssi::vp_replay::Presented,
 }
 
 /// Caller-context sub-shape of a verified identity binding, mirroring the
@@ -893,6 +896,7 @@ impl IdentityBindingContext {
                 target,
                 intent,
                 inbound_credentials,
+                presented: Default::default(),
             }
         } else {
             Self {
@@ -905,6 +909,7 @@ impl IdentityBindingContext {
                 target: None,
                 intent: None,
                 inbound_credentials,
+                presented: Default::default(),
             }
         }
     }

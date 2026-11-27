@@ -1502,6 +1502,8 @@ pub(crate) struct Receipt {
     /// Funds agent-pay holds until the Target delivers, captured or voided by
     /// [`Self::settled`] and voided when the last copy drops unsettled.
     authorization: Option<Arc<Authorization>>,
+    /// The request's admitted presentations, released by [`Self::revoke`].
+    presentations: Option<crate::identity::ssi::vp_replay::Admitted>,
 }
 
 /// Funds agent-pay holds for one request: captured once, when the Target
@@ -1808,6 +1810,20 @@ impl Receipt {
     pub(crate) fn revoke(&self) {
         if let Some(claim) = &self.claim {
             claim.revoke();
+        }
+        if let Some(presentations) = &self.presentations {
+            presentations.release();
+        }
+    }
+
+    /// This receipt, releasing the request's `presentations` when it is revoked.
+    pub(crate) fn releasing(
+        self,
+        presentations: crate::identity::ssi::vp_replay::Admitted,
+    ) -> Self {
+        Self {
+            presentations: Some(presentations),
+            ..self
         }
     }
 
@@ -2183,6 +2199,20 @@ impl Answer {
         }
     }
 
+    /// Releases the request's `presentations` when this answer is a `402`,
+    /// `429` or `503`, which takes no money, so the caller can resend them.
+    pub(crate) fn release_unpaid(
+        &self,
+        presentations: &crate::identity::ssi::vp_replay::Admitted,
+    ) {
+        if matches!(
+            self.status(),
+            StatusCode::PAYMENT_REQUIRED | StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            presentations.release();
+        }
+    }
+
     pub(crate) fn into_response(self) -> Response {
         match self.kind {
             AnswerKind::Decision { decision, retry_after } => {
@@ -2266,6 +2296,7 @@ fn paid_receipt(
         cache_control,
         claim: None,
         authorization: None,
+        presentations: None,
     })
 }
 
@@ -3165,6 +3196,7 @@ async fn evidence_outcome(
                     cache_control: Some("no-store".to_string()),
                     claim: None,
                     authorization: None,
+                    presentations: None,
                 },
             }),
             None => GateOutcome::Answered(continuation_refusal(&intake.shape)),
@@ -4862,6 +4894,7 @@ pub(crate) mod tests {
             cache_control: Some("no-store".into()),
             claim: None,
             authorization: None,
+            presentations: None,
         }
     }
 
@@ -5901,6 +5934,7 @@ pub(crate) mod tests {
                 cache_control: Some("no-store".into()),
                 claim: None,
                 authorization: None,
+                presentations: None,
             }
         );
         let forwarded: Value = serde_json::from_slice(paid.body()).unwrap();

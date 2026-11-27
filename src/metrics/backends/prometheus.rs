@@ -829,7 +829,6 @@ pub fn track_proof_purpose_mismatch(
 }
 
 /// Count an agent presentation refused on `flow` for `reason`.
-#[allow(dead_code)]
 pub fn track_vp_presentation_refused(
     flow: &str,
     reason: &str,
@@ -839,7 +838,6 @@ pub fn track_vp_presentation_refused(
         .inc();
 }
 
-#[allow(dead_code)]
 pub fn set_vp_proof_records(count: i64) {
     VP_PROOF_RECORDS.set(count);
 }

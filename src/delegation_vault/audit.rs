@@ -4618,6 +4618,7 @@ mod tests {
             target: None,
             intent: None,
             inbound_credentials: Vec::new(),
+            presented: Default::default(),
         }
     }
 
