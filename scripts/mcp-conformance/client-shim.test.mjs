@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import http from 'node:http';
-import net from 'node:net';
 import test from 'node:test';
 import { encodeHeaderValue, standardHeaders, startClientShim, withStandardHeaders } from './client-shim.mjs';
+import { unusedPort } from './unused-port.mjs';
 import { accessPointUrl, killChildrenOnSignal, settings } from './client-driver.mjs';
 
 const request = (method, params) => JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
@@ -205,14 +205,6 @@ test('an upstream that dies after its headers closes the client response and lea
     await new Promise((resolve) => upstream.close(resolve));
   }
 });
-
-async function unusedPort() {
-  const listener = net.createServer();
-  await new Promise((resolve) => listener.listen(0, '127.0.0.1', resolve));
-  const { port } = listener.address();
-  await new Promise((resolve) => listener.close(resolve));
-  return port;
-}
 
 test('a completed response leaves the shim quiet and a failed forward still answers 502', async () => {
   const errors = [];

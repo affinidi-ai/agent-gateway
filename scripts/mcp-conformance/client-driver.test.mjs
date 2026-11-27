@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import test from 'node:test';
+import { unusedPort } from './unused-port.mjs';
 import { HARNESS_EXIT_CODE, HARNESS_FAILURE_FILE, hasExited, judgeRequest, recordHarnessFailure, runThroughShim, settings } from './client-driver.mjs';
 
 const DRIVER = path.join(import.meta.dirname, 'client-driver.mjs');
@@ -110,12 +111,14 @@ test('a reply other than 200 is a failed client, and a request that dies is too,
   ]);
 });
 
-test('a scenario that cannot find its token endpoint is a harness failure', () => {
+test('a scenario that cannot find its token endpoint is a harness failure', async () => {
+  const suiteUrl = `http://127.0.0.1:${await unusedPort()}/mcp`;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'client-driver-'));
   try {
     const logDir = path.join(dir, 'logs');
-    const run = spawnSync(process.execPath, [DRIVER, 'http://127.0.0.1:9/mcp'], {
+    const run = spawnSync(process.execPath, [DRIVER, suiteUrl], {
       encoding: 'utf8',
+      timeout: 5_000,
       env: {
         ...process.env,
         ...GATEWAY_ENV,
@@ -126,6 +129,7 @@ test('a scenario that cannot find its token endpoint is a harness failure', () =
         MCP_CONFORMANCE_CONTEXT: '{}',
       },
     });
+    assert.equal(run.error, undefined, 'the driver did not finish within 5 s');
     assert.equal(run.status, HARNESS_EXIT_CODE);
     assert.match(fs.readFileSync(path.join(logDir, HARNESS_FAILURE_FILE), 'utf8'), /^gateway auth\/client-credentials-jwt: .+\n$/);
   } finally {
