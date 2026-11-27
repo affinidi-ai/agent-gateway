@@ -62,6 +62,21 @@ changes:
         /outbound route. The warning was raised only before the save, where warnings are dropped.
         The save toast now reads each saved view against the same view as stored and names the
         path that stopped answering.
+    - timestamp: '2026-11-27T15:00:00Z'
+      title: Judge a variant's copied listen_path on its base Transit Point's listener
+      description: >-
+        The outbound listener registers a variant's routes on its base Transit Point's listener,
+        but a variant copying the base point's listen_path was checked for reachability on the
+        listener its own copy names. A surface whose base point sits on an outbound listener with
+        a hostname of its own, and whose variant names a listener shared with an inbound one, was
+        refused with listen_path_not_served although the route is served. Variant points are now
+        judged on the base point's listener.
+    - timestamp: '2026-11-27T15:10:00Z'
+      title: Name the Transit Point whose listen_path clashes with another route
+      description: >-
+        The listen_path_route_clash refusal and its Warning header named the Transit Point whose
+        route was claimed but not the one whose listen_path had to change, so an operator with
+        several points had to find it by comparing paths. Both now open with that point's alias.
   removed: []
   security: []
   breaking:

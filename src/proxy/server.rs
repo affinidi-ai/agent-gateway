@@ -1080,11 +1080,23 @@ pub(crate) fn listen_path_problems<'a>(
             let path = point.listen_path.as_deref()?;
             let claim = (variant, point.alias.as_str(), path);
             let named = named_transit_point(variant, &point.alias);
-            // Offered for this point's own listener: where an inbound listener
-            // shares its hostname, a plain prefix leads to a path that listener
-            // hides, which is the next refusal, so only the `/outbound` forms
-            // are named here.
-            let shared_hostname = point_listener_shares_an_inbound_hostname(network_config, surface, point);
+            // The router registers a variant's routes on its base point's
+            // listener (`group_outbound_vcs_by_port`), so a variant point the
+            // base defines is judged there, whatever listener the variant names.
+            let listener_point = variant
+                .and_then(|_| {
+                    surface
+                        .transit
+                        .iter()
+                        .flat_map(|transit| transit.points.iter())
+                        .find(|base| base.alias == point.alias)
+                })
+                .unwrap_or(point);
+            // Offered for the listener the point answers on: where an inbound
+            // listener shares its hostname, a plain prefix leads to a path that
+            // listener hides, which is the next refusal, so only the `/outbound`
+            // forms are named here.
+            let shared_hostname = point_listener_shares_an_inbound_hostname(network_config, surface, listener_point);
             let set_a_path = match offered_listen_path_prefixes(&prefixes, shared_hostname) {
                 Some(offered) => format!(
                     "Set a listen_path with a segment of its own under one of {offered}, or add the prefix it \
@@ -1146,12 +1158,12 @@ pub(crate) fn listen_path_problems<'a>(
             if is_under_outbound_prefix(path) {
                 return None;
             }
-            // Reachable where the point's own outbound listener has a hostname
-            // of its own: only an inbound listener answering on that listener's
-            // hostname hides a path outside the prefix, and an appliance can
-            // serve one point on such a listener and another on a listener of
-            // its own.
-            if !point_listener_shares_an_inbound_hostname(network_config, surface, point) {
+            // Reachable where the outbound listener the point answers on has a
+            // hostname of its own: only an inbound listener answering on that
+            // listener's hostname hides a path outside the prefix, and an
+            // appliance can serve one point on such a listener and another on a
+            // listener of its own.
+            if !shared_hostname {
                 return None;
             }
             Some(ListenPathProblem {
@@ -4528,6 +4540,39 @@ mod tests {
         assert_eq!(problems.len(), 1, "only the point on the shared listener is unreachable: {problems:?}");
         assert_eq!(problems[0].claim, (None, "on-shared", "/transit/a"));
         assert_eq!(problems[0].code, LISTEN_PATH_NOT_SERVED);
+    }
+
+    /// The router registers a variant's routes on its base point's listener, so
+    /// a variant copying the base path is judged there, not on the listener the
+    /// variant's copy names.
+    #[test]
+    fn a_variant_copying_its_base_path_is_judged_by_the_base_points_listener() {
+        let network = config_with_one_shared_and_one_separate_outbound_listener();
+        let point = |listen_address: &str| {
+            serde_json::json!([{ "alias": "partner", "target_endpoint": "https://a.example",
+                "listen_path": "/transit/partner", "listen_address": listen_address }])
+        };
+
+        let on_own_base = surface_with_points(
+            point("https://partner.example.com:9100"),
+            point("https://gateway.example.com:9000"),
+        );
+        let problems = listen_path_problems(&on_own_base, &network);
+        assert!(problems.is_empty(), "the base listener has its own hostname: {problems:?}");
+
+        let on_shared_base = surface_with_points(
+            point("https://gateway.example.com:9000"),
+            point("https://partner.example.com:9100"),
+        );
+        let codes: Vec<&str> = listen_path_problems(&on_shared_base, &network)
+            .iter()
+            .map(|problem| problem.code)
+            .collect();
+        assert_eq!(
+            codes,
+            vec![LISTEN_PATH_NOT_SERVED, LISTEN_PATH_NOT_SERVED],
+            "the base point's listener shares the inbound hostname, so neither copy is reached there"
+        );
     }
 
     /// The outbound listener trims every trailing slash before registering a

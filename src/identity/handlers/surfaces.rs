@@ -2638,7 +2638,8 @@ fn listen_path_route_clashes(
                 .to_string(),
         };
         let message = format!(
-            "listen_path '{}' on {} is {reason}; choose a different listener path",
+            "Transit Point '{}' has listen_path '{}' on {}, which is {reason}; choose a different listener path",
+            tp.alias,
             path,
             key.label("outbound")
         );
@@ -10337,7 +10338,10 @@ mod validation_tests {
         // Exempt, and still told: the save answers it with a Warning.
         let warnings = listen_path_route_clash_warnings(&stored, std::slice::from_ref(&other), &no_ports, &|_| true);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("listen_path '/outbound/agents/a/alpha'"), "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("Transit Point 'beta' has listen_path '/outbound/agents/a/alpha'"),
+            "names the point whose path must change: {warnings:?}"
+        );
         assert!(warnings[0].contains("Transit Point 'alpha' of surface 'other'"), "{warnings:?}");
         // A caller that may not read the other surface is told of the clash
         // without its name or its Transit Point's alias.

@@ -160,7 +160,7 @@ export interface ValidateSurfaceOptions {
  */
 export function clearedListenPathWarnings(view: unknown, stored: unknown): string[] {
   const points = (view as { transit?: { points?: unknown } } | null)?.transit?.points;
-  const tps: any[] = Array.isArray(points) ? points : [];
+  const tps: StoredTransitPoint[] = Array.isArray(points) ? points : [];
   const warnings: string[] = [];
   for (const before of storedTransitPoints(stored)) {
     const was = text(before?.listen_path);
