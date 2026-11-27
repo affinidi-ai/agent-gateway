@@ -2686,6 +2686,7 @@ async fn step_extract_protocol_context_with_versions(
             state.vc_issuer.as_ref(),
             &transit_audit_facts(ctx),
             None,
+            &crate::identity::ExpectedReceivers::Unchecked,
         )
         .await
         .map_err(|error| {
@@ -3688,7 +3689,7 @@ async fn step_collect_trust_context(
                     agent_ctx.did = Some(subject_did);
                 } else if let Some(issuer) = state.vc_issuer.as_deref() {
                     match issuer
-                        .verify_agent_presentation_full(vp)
+                        .verify_agent_presentation_full(vp, &crate::identity::ExpectedReceivers::Unchecked)
                         .await
                     {
                         Ok(verified) => {

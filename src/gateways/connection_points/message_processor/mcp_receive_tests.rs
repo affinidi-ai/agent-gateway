@@ -1298,7 +1298,7 @@ async fn fabric_consent_flow() {
             holder_did: Cow::Borrowed(&holder_did),
             verifiable_credentials: Cow::Owned(vec![credential]),
             challenge: None,
-            domain: None,
+            domain: Some(Cow::Borrowed("did:example:receiver")),
             proof_purpose: ssi::verification_methods::ProofPurpose::Assertion,
         }))
         .await
@@ -1421,7 +1421,8 @@ async fn fabric_consent_flow() {
                     .path()
                     .join("surfaces")
             ),
-        );
+        )
+        .with_context(super::CONNECTION_POINT_DID_CONTEXT_KEY, json!("did:example:receiver"));
         (
             message,
             super::FabricStreamRequest {

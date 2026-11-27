@@ -29,7 +29,7 @@ Feature: Identity bindings are audited
     And managed agent "bravo" did not receive a forwarded message
     And the VP Audit Log of gateway 2 records a failed identity binding because "no identity presentation was sent"
 
-  Scenario: A replayed identity presentation is recorded as a failed identity binding
+  Scenario: A replayed identity presentation is recorded as a refused request
     Given a fabric with 3 gateways
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
     And gateway 1 has an A2A surface "charlie" targeting managed agent "delta"
@@ -41,6 +41,6 @@ Feature: Identity bindings are audited
     And managed agent "foxtrot" has obtained the identity presentation that gateway 1 issued for managed agent "delta"
     And the VP Audit Log of gateway 2 keeps every audit event
     When managed agent "foxtrot" sends an A2A message/send request through Transit Point "tr2"
-    Then the response status is 403
+    Then the response status is 422
     And managed agent "bravo" did not receive a forwarded message
-    And the VP Audit Log of gateway 2 records a failed identity binding because "its identity presentation failed verification"
+    And the VP Audit Log of gateway 2 records that a Fabric request to surface "alpha" was refused for its identity presentation

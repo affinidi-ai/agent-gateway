@@ -1839,10 +1839,14 @@ async fn extract_caller_identity_inbound(
     mcp_binding: Option<&crate::surface_context::IdentityBindingContext>,
     peer_issuers: &crate::gateways::types::PeerIssuers,
     vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
-) -> (Option<String>, Option<String>, crate::surface_context::IdentityVerification) {
+    receivers: &crate::identity::ExpectedReceivers,
+) -> Result<
+    (Option<String>, Option<String>, crate::surface_context::IdentityVerification),
+    crate::identity::VpDomainRefusal,
+> {
     use crate::surface_context::IdentityVerification;
     if surface.channel_protocol() == crate::config::ChannelProtocol::Mcp {
-        return mcp_binding
+        return Ok(mcp_binding
             .map(|binding| {
                 let verification = if binding.verified {
                     IdentityVerification::Vp
@@ -1851,7 +1855,7 @@ async fn extract_caller_identity_inbound(
                 };
                 (Some(binding.agent_did.clone()), Some(binding.gateway_did.clone()), verification)
             })
-            .unwrap_or((None, None, IdentityVerification::Unverified));
+            .unwrap_or((None, None, IdentityVerification::Unverified)));
     }
     let mut caller_identity: Option<String> = None;
     // `Vp` only when the DID came from a presentation that verified and whose
@@ -1870,14 +1874,14 @@ async fn extract_caller_identity_inbound(
 
     if body_bytes.is_empty() {
         channel_info!(config_id, "GW2: Body is empty, cannot extract identity");
-        return (None, None, IdentityVerification::Unverified);
+        return Ok((None, None, IdentityVerification::Unverified));
     }
 
     let body_json = match serde_json::from_slice::<serde_json::Value>(body_bytes) {
         Ok(j) => j,
         Err(_) => {
             channel_info!(config_id, "GW2: Failed to parse body as JSON");
-            return (None, None, IdentityVerification::Unverified);
+            return Ok((None, None, IdentityVerification::Unverified));
         }
     };
     info!("GW2: Successfully parsed body as JSON, checking for extensions");
@@ -1914,7 +1918,7 @@ async fn extract_caller_identity_inbound(
                         && let Some(vc_issuer) = vc_issuer
                     {
                         match vc_issuer
-                            .verify_agent_presentation_full(vp_jwt)
+                            .verify_agent_presentation_full(vp_jwt, receivers)
                             .await
                             .and_then(|verified| require_peer_issuer(verified, peer_issuers))
                         {
@@ -1943,6 +1947,7 @@ async fn extract_caller_identity_inbound(
                                 }
                             }
                             Err(e) => {
+                                refuse_presentation_for_another_receiver(config_id, &e)?;
                                 presentation_rejected = true;
                                 channel_warn!(
                                     config_id,
@@ -2004,7 +2009,7 @@ async fn extract_caller_identity_inbound(
                         && let Some(vc_issuer) = vc_issuer
                     {
                         match vc_issuer
-                            .verify_agent_presentation_full(vp_jwt)
+                            .verify_agent_presentation_full(vp_jwt, receivers)
                             .await
                             .and_then(|verified| require_peer_issuer(verified, peer_issuers))
                         {
@@ -2037,6 +2042,7 @@ async fn extract_caller_identity_inbound(
                                 }
                             }
                             Err(e) => {
+                                refuse_presentation_for_another_receiver(config_id, &e)?;
                                 presentation_rejected = true;
                                 channel_warn!(
                                     config_id,
@@ -2194,7 +2200,7 @@ async fn extract_caller_identity_inbound(
                     && let Some(vc_issuer) = vc_issuer
                 {
                     match vc_issuer
-                        .verify_agent_presentation_full(vp_jwt)
+                        .verify_agent_presentation_full(vp_jwt, receivers)
                         .await
                         .and_then(|verified| require_peer_issuer(verified, peer_issuers))
                     {
@@ -2227,6 +2233,7 @@ async fn extract_caller_identity_inbound(
                             }
                         }
                         Err(e) => {
+                            refuse_presentation_for_another_receiver(config_id, &e)?;
                             presentation_rejected = true;
                             channel_warn!(
                                 config_id,
@@ -2268,7 +2275,34 @@ async fn extract_caller_identity_inbound(
         caller_identity_verification,
         presentation_rejected
     );
-    (caller_identity, caller_issuer_did, caller_identity_verification)
+    Ok((caller_identity, caller_issuer_did, caller_identity_verification))
+}
+
+/// `Err` when `error` is a presentation naming no receiver of this gateway,
+/// which refuses the request rather than leaving it without an identity.
+fn refuse_presentation_for_another_receiver(
+    config_id: &str,
+    error: &anyhow::Error,
+) -> Result<(), crate::identity::VpDomainRefusal> {
+    match error.downcast_ref::<crate::identity::VpDomainRefusal>() {
+        Some(refusal) => {
+            channel_warn!(config_id, "✗ GW2: identity presentation refused: {}", refusal);
+            Err(*refusal)
+        }
+        None => Ok(()),
+    }
+}
+
+/// The receivers a Fabric request's presentation must name: the Connection
+/// Point DID the listener received it on, never the envelope's `to`, which
+/// the sender writes. Without that record no receiver is accepted.
+fn fabric_request_receivers(message: &ReceivedMessage) -> crate::identity::ExpectedReceivers {
+    crate::identity::ExpectedReceivers::dids(
+        message
+            .context
+            .get(CONNECTION_POINT_DID_CONTEXT_KEY)
+            .and_then(Value::as_str),
+    )
 }
 
 async fn evaluate_gateway_policy_for_fabric(
@@ -2520,6 +2554,7 @@ async fn enrich_and_evaluate_surface_policies(
     mcp_binding: Option<&crate::surface_context::IdentityBindingContext>,
     peer_issuers: &crate::gateways::types::PeerIssuers,
     mcp_context: Option<&crate::surface_context::McpContext>,
+    receivers: &crate::identity::ExpectedReceivers,
 ) -> Result<bytes::Bytes, ForwardRefusal> {
     // Caller-leg Trust Check stage runs further down (post-identity);
     // gateway OPA on GW2 already ran in `evaluate_gateway_policy_for_fabric`
@@ -2884,19 +2919,30 @@ async fn enrich_and_evaluate_surface_policies(
                 &binding_selector,
                 config_id,
                 Some(peer_issuers),
+                receivers,
             )
             .await;
             let binding_trace_id = crate::observability::policy_audit::current_span_trace_id();
-            crate::observability::identity_binding_audit::audit_extraction(
-                &crate::audit::request_events::RequestFacts {
-                    surface_id: config_id,
-                    channel_name: &surface.name,
-                    trace_id: binding_trace_id.as_deref(),
-                    via_fabric: true,
-                },
-                None,
-                &binding_result,
-            );
+            let binding_facts = crate::audit::request_events::RequestFacts {
+                surface_id: config_id,
+                channel_name: &surface.name,
+                trace_id: binding_trace_id.as_deref(),
+                via_fabric: true,
+            };
+            crate::observability::identity_binding_audit::audit_extraction(&binding_facts, None, &binding_result);
+            if let Err(error) = &binding_result
+                && let Some(refusal) = error.receiver
+            {
+                channel_warn!(config_id, "GW2: identity binding VP refused: {}", refusal);
+                crate::audit::request_events::request_rejected(
+                    &binding_facts,
+                    crate::audit::request_events::RejectionStage::Admission,
+                    crate::audit::request_events::RejectionReason::ExtensionRejected,
+                    422,
+                    None,
+                );
+                return Err(ForwardRefusal::PresentationNotForThisGateway);
+            }
             // When an inbound identity-binding VP verified, also record it in the
             // delegation audit log so the *received* VP (carrying any
             // workloadBinding) surfaces as a `vp_injected` event on the Audit
@@ -5409,7 +5455,7 @@ async fn process_charged_forward_request(
         };
         body_bytes = http_policy.cap_legacy_initialize(body_bytes, &classification, config_id, None);
         mcp_verified_binding = match crate::protocols::extensions::verify_mcp_metadata_identity(
-            &body_bytes, GLOBAL_VC_ISSUER.get(), &audit_facts, Some(&peer_issuers),
+            &body_bytes, GLOBAL_VC_ISSUER.get(), &audit_facts, Some(&peer_issuers), &fabric_request_receivers(message),
         ).await {
             Ok(binding) => binding,
             Err(error) => {
@@ -5676,8 +5722,9 @@ async fn process_charged_forward_request(
             _ => None,
         })
         .or(caller_synthesized_ext_rules.as_ref());
+    let receivers = fabric_request_receivers(message);
     let (caller_identity, caller_issuer_did, caller_identity_verification) =
-        Box::pin(extract_caller_identity_inbound(
+        match Box::pin(extract_caller_identity_inbound(
             &surface,
             channel_id,
             config_id,
@@ -5686,8 +5733,22 @@ async fn process_charged_forward_request(
             mcp_verified_binding.as_ref(),
             &peer_issuers,
             GLOBAL_VC_ISSUER.get(),
+            &receivers,
         ))
-        .await;
+        .await
+        {
+            Ok(identity) => identity,
+            Err(_) => {
+                crate::audit::request_events::request_rejected(
+                    &audit_facts,
+                    crate::audit::request_events::RejectionStage::Admission,
+                    crate::audit::request_events::RejectionReason::ExtensionRejected,
+                    422,
+                    None,
+                );
+                return forward_refusal::presentation_not_for_this_gateway().await;
+            }
+        };
 
     if let Some(result) = evaluate_mcp_tool_policies_for_fabric(
         &surface,
@@ -5732,6 +5793,7 @@ async fn process_charged_forward_request(
         mcp_verified_binding.as_ref(),
         &peer_issuers,
         policy_mcp_context.as_ref(),
+        &receivers,
     ))
     .await
     {
@@ -10086,6 +10148,7 @@ mod tests {
             None,
             &peer_issuers,
             None,
+            &crate::identity::test_helpers::presentation_receivers(),
         )))
         .await;
         let decisions = events
@@ -10666,6 +10729,24 @@ mod tests {
         peer_issuers: &crate::gateways::types::PeerIssuers,
         vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
     ) -> (Option<String>, Option<String>, IdentityVerification) {
+        inbound_caller_identity_at(
+            &crate::identity::test_helpers::presentation_receivers(),
+            extensions,
+            metadata,
+            peer_issuers,
+            vc_issuer,
+        )
+        .await
+        .expect("the presentation names this receiver")
+    }
+
+    async fn inbound_caller_identity_at(
+        receivers: &crate::identity::ExpectedReceivers,
+        extensions: &[&str],
+        metadata: serde_json::Value,
+        peer_issuers: &crate::gateways::types::PeerIssuers,
+        vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
+    ) -> Result<(Option<String>, Option<String>, IdentityVerification), crate::identity::VpDomainRefusal> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": "1",
@@ -10681,6 +10762,7 @@ mod tests {
             None,
             peer_issuers,
             vc_issuer,
+            receivers,
         )
         .await
     }
@@ -10768,6 +10850,82 @@ mod tests {
                 .await
                 .verified
         );
+    }
+
+    const RECEIVING_CONNECTION_POINT: &str = "did:peer:2.receiving-connection-point";
+
+    /// A Fabric request whose credential or binding presentation names any
+    /// receiver but the Connection Point it arrived on is refused, not served
+    /// without an identity.
+    #[tokio::test]
+    async fn a_fabric_presentation_naming_another_receiver_refuses_the_request() {
+        use crate::identity::VpDomainRefusal;
+        const BINDING_EXT: &str = crate::config::AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION;
+        let ours = crate::identity::ExpectedReceivers::dids([RECEIVING_CONNECTION_POINT]);
+        for (domain, extension, refusal) in [
+            (Some("did:peer:2.another-gateway"), CREDENTIAL_EXT, VpDomainRefusal::Wrong),
+            (None, CREDENTIAL_EXT, VpDomainRefusal::Missing),
+            (Some("urn:agent-gateway:label:answer"), CREDENTIAL_EXT, VpDomainRefusal::Label),
+            (Some("did:peer:2.another-gateway"), BINDING_EXT, VpDomainRefusal::Wrong),
+        ] {
+            let signed = crate::identity::test_helpers::signed_agent_presentation_for(domain).await;
+            let connection = crate::gateways::types::PeerIssuers {
+                attested: Some(signed.issuer_did.clone()),
+                trusted: Vec::new(),
+            };
+            let outcome = inbound_caller_identity_at(
+                &ours,
+                &[extension],
+                serde_json::json!({
+                    extension: { "did": signed.holder_did, "verifiablePresentation": signed.presentation.to_string() },
+                }),
+                &connection,
+                Some(&signed.issuer),
+            )
+            .await;
+            assert_eq!(outcome, Err(refusal), "{domain:?} in {extension}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fabric_presentation_naming_the_receiving_connection_point_is_attributed() {
+        let signed =
+            crate::identity::test_helpers::signed_agent_presentation_for(Some(RECEIVING_CONNECTION_POINT)).await;
+        let connection = crate::gateways::types::PeerIssuers {
+            attested: Some(signed.issuer_did.clone()),
+            trusted: Vec::new(),
+        };
+        let outcome = inbound_caller_identity_at(
+            &crate::identity::ExpectedReceivers::dids([RECEIVING_CONNECTION_POINT]),
+            &[CREDENTIAL_EXT],
+            serde_json::json!({
+                CREDENTIAL_EXT: { "did": signed.holder_did, "verifiablePresentation": signed.presentation.to_string() },
+            }),
+            &connection,
+            Some(&signed.issuer),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            Ok((Some(signed.holder_did.clone()), Some(signed.issuer_did.clone()), IdentityVerification::Vp))
+        );
+    }
+
+    /// The receiver is the Connection Point the listener recorded, never the
+    /// envelope's `to`, which the sender writes.
+    #[test]
+    fn a_fabric_request_names_the_connection_point_it_arrived_on_as_its_receiver() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut message = make_forward_request_msg(temp.path(), Some("did:peer:2.sender"), "ch");
+        message.to_dids = vec!["did:peer:2.written-by-the-sender".to_string()];
+        assert_eq!(
+            fabric_request_receivers(&message),
+            crate::identity::ExpectedReceivers::dids(["did:web:receiver.example"])
+        );
+        message
+            .context
+            .remove(CONNECTION_POINT_DID_CONTEXT_KEY);
+        assert_eq!(fabric_request_receivers(&message), crate::identity::ExpectedReceivers::AnyOf(Vec::new()));
     }
 
     #[tokio::test]
@@ -11387,6 +11545,7 @@ mod tests {
             authcrypt_metadata(),
         )
         .with_context("agent_surface_storage_path", storage_context(storage_root))
+        .with_context(CONNECTION_POINT_DID_CONTEXT_KEY, serde_json::json!("did:web:receiver.example"))
     }
 
     /// The presentation in an answer over Fabric names the Connection Point

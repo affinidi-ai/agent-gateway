@@ -37,8 +37,9 @@ pub struct VpVerificationResult {
     /// downstream gateways can flatten this hop's VCs into a chained-provenance
     /// VP they re-issue. Order matches the inbound VP.
     pub raw_credentials: Vec<Value>,
-    #[allow(unused)]
-    pub domain: Option<String>,
+    /// The holder proof's `domain` as presented: a string, an array, or anything else a
+    /// signer put there, for the caller to check against its expected receivers.
+    pub domain: Option<Value>,
     pub challenge: Option<String>,
     /// When the presentation stops being valid: the earliest expiry across its proofs, each proof
     /// expiring at its `expires`, or at its `created` plus the VP lifetime when it has none.
@@ -893,10 +894,7 @@ impl LocalVerifier {
         // it challenged with, so a presentation whose binding does not match is
         // refused there.
         let proof = &proofs[0];
-        let domain = proof
-            .get("domain")
-            .and_then(|d| d.as_str())
-            .map(String::from);
+        let domain = proof.get("domain").cloned();
         let challenge = proof
             .get("challenge")
             .and_then(|c| c.as_str())

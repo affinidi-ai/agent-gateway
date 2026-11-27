@@ -1,7 +1,8 @@
 Feature: Gateway DID validation over Fabric
   A gateway sends fabric envelopes from a per-pairing Connection Point DID but
   signs identity credentials with its gateway DID. The receiving gateway only
-  attributes an identity presentation to the peer that sent the envelope.
+  attributes an identity presentation to the peer that sent the envelope, and
+  refuses a request whose presentation names another Connection Point.
 
   Scenario: A new pairing records the peer issuer DID on both gateways
     Given a fabric with 2 gateways
@@ -49,7 +50,7 @@ Feature: Gateway DID validation over Fabric
     Then the response status is 200
     And managed agent "bravo" received the forwarded request carrying an identity presentation issued by gateway 1
 
-  Scenario: A peer gateway cannot replay an identity presentation issued by another gateway
+  Scenario: A presentation that names another gateway's Connection Point is refused
     Given a fabric with 3 gateways
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
     And gateway 1 has an A2A surface "charlie" targeting managed agent "delta"
@@ -60,7 +61,7 @@ Feature: Gateway DID validation over Fabric
     And surface "alpha" has a policy that requires the caller identity to be issued by gateway 1
     And managed agent "foxtrot" has obtained the identity presentation that gateway 1 issued for managed agent "delta"
     When managed agent "foxtrot" sends an A2A message/send request through Transit Point "tr2"
-    Then the response status is 403
+    Then the response status is 422
     And managed agent "bravo" did not receive a forwarded message
 
   Scenario: An issuer trusted for a connection is attributed when its presentation arrives over that connection
@@ -90,5 +91,5 @@ Feature: Gateway DID validation over Fabric
     And managed agent "foxtrot" has obtained the identity presentation that gateway 1 issued for managed agent "delta"
     And gateway 2 trusts gateway 1's gateway DID as an issuer of its connection with gateway 1
     When managed agent "foxtrot" sends an A2A message/send request through Transit Point "tr2"
-    Then the response status is 403
+    Then the response status is 422
     And managed agent "bravo" did not receive a forwarded message

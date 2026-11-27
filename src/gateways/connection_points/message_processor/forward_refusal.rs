@@ -20,6 +20,8 @@ pub(super) enum ForwardRefusal {
     SurfacePolicyDenied { reason: Option<String> },
     #[error("surface policy could not be evaluated")]
     SurfacePolicyError,
+    #[error("the identity presentation names no receiver of this gateway")]
+    PresentationNotForThisGateway,
     #[error(transparent)]
     TargetBody(#[from] UpstreamBodyError),
 }
@@ -41,6 +43,7 @@ impl ForwardRefusal {
                 build_surface_policy_denied_forward_body(request_body, reason.as_deref())
             }
             Self::SurfacePolicyError => build_surface_policy_denied_forward_body(request_body, None),
+            Self::PresentationNotForThisGateway => return presentation_not_for_this_gateway().await,
             Self::TargetBody(error) => {
                 let (status, message) = error.status_and_message();
                 return axum_response_to_forward_result(crate::a2a::create_error_response(status, message)).await;
@@ -51,6 +54,16 @@ impl ForwardRefusal {
             response_body,
         }
     }
+}
+
+/// The `422` a Fabric request is refused with when an identity presentation
+/// it carries names no receiver of this gateway.
+pub(super) async fn presentation_not_for_this_gateway() -> ProcessingResult {
+    axum_response_to_forward_result(crate::a2a::create_error_response(
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        crate::protocols::extensions::PRESENTATION_RECEIVER_REFUSED,
+    ))
+    .await
 }
 
 fn forbidden(message: &str) -> serde_json::Value {
@@ -126,6 +139,19 @@ mod tests {
         let error = forward_response(ForwardRefusal::SurfacePolicyError, a2a).await;
         assert_eq!(error["status"], 403);
         assert_eq!(error["error"], "Agent trust policy denied the request");
+    }
+
+    #[tokio::test]
+    async fn a_presentation_for_another_receiver_answers_a_fixed_422() {
+        let response = forward_response(ForwardRefusal::PresentationNotForThisGateway, b"").await;
+        assert_eq!(response["status"], 422);
+        assert!(
+            response["body"]
+                .as_str()
+                .unwrap()
+                .contains("Invalid identity presentation"),
+            "{response}"
+        );
     }
 
     #[tokio::test]

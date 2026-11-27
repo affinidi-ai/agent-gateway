@@ -39,16 +39,58 @@ fn message_with_presentation(
     })
 }
 
-/// The receiver a caller names in its presentation: the origin the gateway's inbound listener lists
-/// in `external_urls`. Starts the gateway, so its port is known.
+/// The receiver a caller names in its presentation: the first origin the gateway's inbound listener
+/// lists in `external_urls`. Starts the gateway, so its configuration is written.
 async fn access_point_origin(world: &mut SurfaceWorld) -> String {
     crate::steps::when::ensure_gateway_running(world).await;
-    let port = world
+    let config_path = world
         .infra
         .as_ref()
         .expect("the gateway is running")
-        .gateway_port;
-    format!("http://localhost:{port}")
+        ._temp_dir
+        .path()
+        .join("gateway.json");
+    let gateway: Value =
+        serde_json::from_slice(&std::fs::read(&config_path).expect("read gateway.json")).expect("gateway.json is JSON");
+    gateway["listeners"]
+        .as_array()
+        .expect("gateway.json lists its listeners")
+        .iter()
+        .find(|listener| {
+            listener["listener_type"]
+                .as_str()
+                .unwrap_or("inbound")
+                == "inbound"
+        })
+        .and_then(|listener| listener["external_urls"][0].as_str())
+        .expect("the inbound listener lists an external URL")
+        .to_string()
+}
+
+async fn send_own_presentation_naming(
+    world: &mut SurfaceWorld,
+    receiver: Option<&str>,
+) {
+    crate::steps::when::ensure_gateway_running(world).await;
+    let presentation = presentation_signer(world)
+        .present_own_credential(receiver)
+        .await;
+    send_presentation(world, presentation, vec![]).await;
+}
+
+#[when("the caller sends a request with a presentation that names another gateway")]
+async fn caller_sends_presentation_naming_another_gateway(world: &mut SurfaceWorld) {
+    send_own_presentation_naming(world, Some("https://another-gateway.example")).await;
+}
+
+#[when("the caller sends a request with a presentation that names no receiver")]
+async fn caller_sends_presentation_naming_no_receiver(world: &mut SurfaceWorld) {
+    send_own_presentation_naming(world, None).await;
+}
+
+#[when("the caller sends a request with a presentation that names a label the gateway reserves for its answers")]
+async fn caller_sends_presentation_naming_a_label(world: &mut SurfaceWorld) {
+    send_own_presentation_naming(world, Some("urn:agent-gateway:label:answer")).await;
 }
 
 async fn send_presentation(
@@ -117,10 +159,7 @@ async fn gateway_accepted_presentation_of_credential_from_another_issuer(world: 
 #[when("the caller sends a request with a presentation of a credential it issued itself")]
 async fn caller_sends_presentation_of_own_credential(world: &mut SurfaceWorld) {
     let receiver = access_point_origin(world).await;
-    let presentation = presentation_signer(world)
-        .present_own_credential(&receiver)
-        .await;
-    send_presentation(world, presentation, vec![]).await;
+    send_own_presentation_naming(world, Some(&receiver)).await;
 }
 
 #[given("the caller's DID document lists its key for assertions")]
@@ -135,7 +174,7 @@ async fn caller_with_api_key_sends_presentation_of_own_credential(world: &mut Su
     let receiver = access_point_origin(world).await;
     let header = crate::steps::when::build_valid_api_key_source_auth_header(world);
     let presentation = presentation_signer(world)
-        .present_own_credential(&receiver)
+        .present_own_credential(Some(&receiver))
         .await;
     send_presentation(world, presentation, vec![header]).await;
 }

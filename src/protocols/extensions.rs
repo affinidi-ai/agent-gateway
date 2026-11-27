@@ -31,6 +31,37 @@ pub struct ExtensionInspectionContext<'a> {
     pub source_authenticated: bool,
     pub metrics_store: &'a Option<Arc<crate::metrics::MetricsStore>>,
     pub ws_state: &'a Option<Arc<crate::server::WsState>>,
+    /// The receivers a caller's presentation must name: the Access Point's origins.
+    pub receivers: &'a crate::identity::ExpectedReceivers,
+}
+
+/// The fixed text a request is refused with when its identity presentation
+/// names no receiver of this gateway.
+pub const PRESENTATION_RECEIVER_REFUSED: &str = "Invalid identity presentation";
+
+/// Why an identity binding presentation was not accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingVpError {
+    /// A short diagnostic, never the signed presentation.
+    pub detail: String,
+    /// Set when the presentation names no receiver of this gateway, which
+    /// refuses the request rather than leaving it without a binding.
+    pub receiver: Option<crate::identity::VpDomainRefusal>,
+}
+
+impl From<String> for BindingVpError {
+    fn from(detail: String) -> Self {
+        Self { detail, receiver: None }
+    }
+}
+
+impl std::fmt::Display for BindingVpError {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
 }
 
 /// Context for response extension inspection operations
@@ -815,6 +846,7 @@ pub async fn inspect_message_extensions(
                         extension_payload,
                         ctx.identity_selector,
                         ctx.channel_name,
+                        ctx.receivers,
                     )
                     .await
                     {
@@ -822,6 +854,15 @@ pub async fn inspect_message_extensions(
                         CredentialResolution::Rejected => {
                             presentation_rejected = true;
                             identity_result = None;
+                        }
+                        CredentialResolution::NotForThisReceiver => {
+                            return Err(crate::a2a::create_identity_error_response(
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                crate::a2a::errors::ERR_IDENTITY_VALIDATION_FAILED,
+                                "inbound_identity",
+                                ctx.channel_name,
+                                PRESENTATION_RECEIVER_REFUSED,
+                            ));
                         }
                         CredentialResolution::Absent => {}
                     }
@@ -1026,6 +1067,9 @@ enum CredentialResolution {
     /// verification, or no verifier is available. No payload-derived identity
     /// may be computed for this request.
     Rejected,
+    /// The presentation names no receiver of this Access Point; the request is
+    /// refused.
+    NotForThisReceiver,
     /// The extension carries no presentation.
     Absent,
 }
@@ -1043,6 +1087,7 @@ async fn resolve_inbound_credential_identity(
     credential_ext: &JsonValue,
     identity_selector: &Option<Arc<crate::identity::IdentitySelector>>,
     channel_name: &str,
+    receivers: &crate::identity::ExpectedReceivers,
 ) -> CredentialResolution {
     let Some(vp_jwt) = credential_ext
         .get("verifiablePresentation")
@@ -1059,7 +1104,7 @@ async fn resolve_inbound_credential_identity(
     };
     match selector
         .get_vc_issuer()
-        .verify_agent_presentation_full(vp_jwt)
+        .verify_agent_presentation_full(vp_jwt, receivers)
         .await
     {
         Ok(verified) => {
@@ -1080,6 +1125,10 @@ async fn resolve_inbound_credential_identity(
                 identity_fields,
                 issuer_did: verified.issuer_did,
             })
+        }
+        Err(e) if e.is::<crate::identity::VpDomainRefusal>() => {
+            warn!(channel = channel_name, error = %e, "✗ A2A inbound VP refused: it names no receiver of this Access Point");
+            CredentialResolution::NotForThisReceiver
         }
         Err(e) => {
             warn!(
@@ -1186,7 +1235,8 @@ pub async fn extract_identity_binding_vp(
     identity_selector: &Option<Arc<crate::identity::IdentitySelector>>,
     channel_name: &str,
     issuer_anchor: Option<&crate::gateways::types::PeerIssuers>,
-) -> Result<Option<crate::surface_context::IdentityBindingContext>, String> {
+    receivers: &crate::identity::ExpectedReceivers,
+) -> Result<Option<crate::surface_context::IdentityBindingContext>, BindingVpError> {
     if *protocol == crate::config::ChannelProtocol::Mcp {
         let Ok(body) = serde_json::from_slice::<JsonValue>(body_bytes) else { return Ok(None) };
         let Some(metadata) = crate::mcp::meta::read_metadata(&body).map_err(|error| error.to_string())? else {
@@ -1214,6 +1264,7 @@ pub async fn extract_identity_binding_vp(
                 identity_selector,
                 channel_name,
                 issuer_anchor,
+                receivers,
             )
             .await?;
             if primary.is_none() {
@@ -1225,7 +1276,7 @@ pub async fn extract_identity_binding_vp(
     let Some(vp_jwt) = extract_identity_binding_vp_jwt(body_bytes, protocol) else {
         return Ok(None);
     };
-    verify_identity_binding_presentation(&vp_jwt, None, identity_selector, channel_name, issuer_anchor).await
+    verify_identity_binding_presentation(&vp_jwt, None, identity_selector, channel_name, issuer_anchor, receivers).await
 }
 
 /// Verifies the identity binding VP in an MCP request's metadata and records
@@ -1235,6 +1286,7 @@ pub async fn verify_mcp_metadata_identity(
     issuer: Option<&Arc<crate::identity::VCIssuer>>,
     facts: &crate::audit::request_events::RequestFacts<'_>,
     issuer_anchor: Option<&crate::gateways::types::PeerIssuers>,
+    receivers: &crate::identity::ExpectedReceivers,
 ) -> Result<Option<crate::surface_context::IdentityBindingContext>, String> {
     let selector = issuer
         .map(|issuer| crate::identity::IdentitySelector::new(&serde_json::json!({}), issuer.clone()).map(Arc::new))
@@ -1246,6 +1298,7 @@ pub async fn verify_mcp_metadata_identity(
         &selector,
         facts.surface_id,
         issuer_anchor,
+        receivers,
     )
     .await;
     crate::observability::identity_binding_audit::audit_extraction(
@@ -1253,7 +1306,7 @@ pub async fn verify_mcp_metadata_identity(
         issuer_anchor.and_then(|anchor| anchor.attested.as_deref()),
         &result,
     );
-    result
+    result.map_err(|error| error.detail)
 }
 
 async fn verify_identity_binding_presentation(
@@ -1262,7 +1315,8 @@ async fn verify_identity_binding_presentation(
     identity_selector: &Option<Arc<crate::identity::IdentitySelector>>,
     channel_name: &str,
     issuer_anchor: Option<&crate::gateways::types::PeerIssuers>,
-) -> Result<Option<crate::surface_context::IdentityBindingContext>, String> {
+    receivers: &crate::identity::ExpectedReceivers,
+) -> Result<Option<crate::surface_context::IdentityBindingContext>, BindingVpError> {
     info!(channel = channel_name, "Found identity binding VP in inbound request, verifying...");
 
     // Verify the VP signature
@@ -1270,13 +1324,15 @@ async fn verify_identity_binding_presentation(
         Some(s) => s,
         None => {
             warn!(channel = channel_name, "No identity selector available to verify binding VP");
-            return Err("No identity selector available to verify binding VP".to_string());
+            return Err("No identity selector available to verify binding VP"
+                .to_string()
+                .into());
         }
     };
 
     let vc_issuer = selector.get_vc_issuer();
     match vc_issuer
-        .verify_agent_presentation_full(vp_jwt)
+        .verify_agent_presentation_full(vp_jwt, receivers)
         .await
     {
         Ok(verified) => {
@@ -1289,7 +1345,9 @@ async fn verify_identity_binding_presentation(
             } = verified;
 
             if claimed_did.is_some_and(|did| did != agent_did) {
-                return Err("MCP identity extension DID does not match the verified presentation holder".to_string());
+                return Err("MCP identity extension DID does not match the verified presentation holder"
+                    .to_string()
+                    .into());
             }
 
             // Holder / subject binding: the VP holder must be the same DID as
@@ -1307,7 +1365,8 @@ async fn verify_identity_binding_presentation(
                 return Err(format!(
                     "identity binding VP holder '{}' does not match credential subject '{}'",
                     agent_did, subject
-                ));
+                )
+                .into());
             }
 
             // Issuer trust. The primary VC issuer must be the fabric-authenticated
@@ -1335,7 +1394,7 @@ async fn verify_identity_binding_presentation(
                         issuer = %issuer,
                         "Identity binding VP issuer is not a trusted gateway"
                     );
-                    return Err(format!("identity binding VP issuer '{}' is not a trusted gateway", issuer));
+                    return Err(format!("identity binding VP issuer '{}' is not a trusted gateway", issuer).into());
                 }
             };
 
@@ -1370,7 +1429,12 @@ async fn verify_identity_binding_presentation(
                 error = %e,
                 "Identity binding VP verification FAILED"
             );
-            Err(format!("Identity binding VP verification failed: {}", e))
+            Err(BindingVpError {
+                detail: format!("Identity binding VP verification failed: {}", e),
+                receiver: e
+                    .downcast_ref::<crate::identity::VpDomainRefusal>()
+                    .copied(),
+            })
         }
     }
 }
@@ -1606,7 +1670,7 @@ fn identity_failure(error: &anyhow::Error) -> (StatusCode, &'static str) {
 
 #[cfg(test)]
 mod tests {
-    use crate::identity::test_helpers::{SignedAgentPresentation, signed_agent_presentation};
+    use crate::identity::test_helpers::{SignedAgentPresentation, presentation_receivers, signed_agent_presentation};
 
     #[test]
     fn a_trust_agent_failure_is_503_and_anything_else_stays_422() {
@@ -1758,6 +1822,7 @@ mod tests {
                 Some(&issuer),
                 &test_facts(),
                 Some(&peer_issuers(&issuer_did)),
+                &presentation_receivers(),
             )
             .await
             .unwrap()
@@ -1778,6 +1843,7 @@ mod tests {
                     Some(&issuer),
                     &test_facts(),
                     Some(&peer_issuers("did:example:untrusted")),
+                    &presentation_receivers(),
                 )
                 .await
                 .is_err()
@@ -1789,6 +1855,7 @@ mod tests {
                     Some(&issuer),
                     &test_facts(),
                     Some(&peer_issuers(&issuer_did)),
+                    &presentation_receivers(),
                 )
                 .await
                 .is_err()
@@ -1834,10 +1901,16 @@ mod tests {
                 &None,
                 "test",
                 None,
+                &presentation_receivers(),
             )
             .await
             .unwrap_err();
-            assert!(error.contains("requires a presentation"), "{error}");
+            assert!(
+                error
+                    .detail
+                    .contains("requires a presentation"),
+                "{error}"
+            );
             let body = json!({"method": "tools/call", "params": {"_meta": {key: {"verifiablePresentation": "signed.proof.value"}}}});
             assert_eq!(
                 super::extract_identity_binding_vp_jwt(body.to_string().as_bytes(), &ChannelProtocol::Mcp).as_deref(),
@@ -1849,7 +1922,8 @@ mod tests {
                     &ChannelProtocol::Mcp,
                     &None,
                     "test",
-                    None
+                    None,
+                    &presentation_receivers(),
                 )
                 .await
                 .is_err()
@@ -2095,7 +2169,8 @@ mod tests {
         let body = body.as_bytes();
         let protocol = ChannelProtocol::A2a;
 
-        let unanchored = extract_identity_binding_vp(body, &protocol, &selector, "test", None)
+        let receivers = presentation_receivers();
+        let unanchored = extract_identity_binding_vp(body, &protocol, &selector, "test", None, &receivers)
             .await
             .unwrap()
             .expect("binding is surfaced to OPA");
@@ -2107,7 +2182,7 @@ mod tests {
             attested: Some(issuer_did.clone()),
             trusted: Vec::new(),
         };
-        let anchored = extract_identity_binding_vp(body, &protocol, &selector, "test", Some(&attested))
+        let anchored = extract_identity_binding_vp(body, &protocol, &selector, "test", Some(&attested), &receivers)
             .await
             .unwrap()
             .unwrap();
@@ -2117,7 +2192,7 @@ mod tests {
             attested: None,
             trusted: vec![issuer_did.clone()],
         };
-        let allowlisted = extract_identity_binding_vp(body, &protocol, &selector, "test", Some(&allowed))
+        let allowlisted = extract_identity_binding_vp(body, &protocol, &selector, "test", Some(&allowed), &receivers)
             .await
             .unwrap()
             .unwrap();
@@ -2128,10 +2203,138 @@ mod tests {
             trusted: Vec::new(),
         };
         assert!(
-            extract_identity_binding_vp(body, &protocol, &selector, "test", Some(&other))
+            extract_identity_binding_vp(body, &protocol, &selector, "test", Some(&other), &receivers)
                 .await
                 .is_err()
         );
+    }
+
+    const ACCESS_POINT_ORIGIN: &str = "https://gateway.example";
+
+    /// The receivers of an Access Point whose inbound listener lists `urls`.
+    fn access_point(urls: &[&str]) -> crate::identity::ExpectedReceivers {
+        crate::identity::ExpectedReceivers::origins(urls)
+    }
+
+    /// Each domain a caller can name that this Access Point refuses, with the
+    /// signed presentation naming it.
+    async fn presentations_for_another_receiver() -> Vec<(Option<&'static str>, SignedAgentPresentation)> {
+        let mut presentations = Vec::new();
+        for domain in [
+            Some("https://other.example"),
+            Some(crate::identity::test_helpers::PRESENTATION_RECEIVER),
+            None,
+            Some("urn:agent-gateway:label:answer"),
+        ] {
+            presentations.push((domain, crate::identity::test_helpers::signed_agent_presentation_for(domain).await));
+        }
+        presentations
+    }
+
+    #[tokio::test]
+    async fn a_caller_presentation_naming_another_receiver_refuses_the_request() {
+        for (domain, signed) in presentations_for_another_receiver().await {
+            let selector = Arc::new(
+                crate::identity::IdentitySelector::new(&json!({ "type": "object" }), signed.issuer.clone()).unwrap(),
+            );
+            let ext = json!({ "did": signed.holder_did, "verifiablePresentation": signed.presentation.to_string() });
+            let resolution = resolve_inbound_credential_identity(
+                &ext,
+                &Some(selector),
+                "test-channel",
+                &access_point(&[ACCESS_POINT_ORIGIN]),
+            )
+            .await;
+            assert!(matches!(resolution, CredentialResolution::NotForThisReceiver), "{domain:?}: {resolution:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_caller_presentation_naming_the_access_point_origin_is_verified() {
+        let signed =
+            crate::identity::test_helpers::signed_agent_presentation_for(Some("https://Gateway.Example:443/a2a")).await;
+        let selector = Arc::new(
+            crate::identity::IdentitySelector::new(&json!({ "type": "object" }), signed.issuer.clone()).unwrap(),
+        );
+        let ext = json!({ "did": signed.holder_did, "verifiablePresentation": signed.presentation.to_string() });
+        let receivers = access_point(&["http://localhost:8080", ACCESS_POINT_ORIGIN]);
+
+        match resolve_inbound_credential_identity(&ext, &Some(selector.clone()), "test-channel", &receivers).await {
+            CredentialResolution::Verified(result) => assert_eq!(result.did, signed.holder_did),
+            other => panic!("expected a verified presentation, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                resolve_inbound_credential_identity(&ext, &Some(selector), "test-channel", &access_point(&[])).await,
+                CredentialResolution::NotForThisReceiver
+            ),
+            "an Access Point with no external_urls accepts no presentation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_binding_presentation_naming_another_receiver_is_a_receiver_refusal() {
+        use crate::config::{AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION, ChannelProtocol};
+        for (domain, signed) in presentations_for_another_receiver().await {
+            let selector =
+                Some(Arc::new(crate::identity::IdentitySelector::new(&json!({}), signed.issuer.clone()).unwrap()));
+            let body = json!({"params": {"message": {"metadata": {
+                AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION: {"verifiablePresentation": signed.presentation.to_string()}
+            }}}})
+            .to_string();
+            let error = extract_identity_binding_vp(
+                body.as_bytes(),
+                &ChannelProtocol::A2a,
+                &selector,
+                "test",
+                None,
+                &access_point(&[ACCESS_POINT_ORIGIN]),
+            )
+            .await
+            .expect_err("the binding is refused");
+            assert!(error.receiver.is_some(), "{domain:?}: {error}");
+        }
+        let signed = crate::identity::test_helpers::signed_agent_presentation_for(Some(ACCESS_POINT_ORIGIN)).await;
+        let selector =
+            Some(Arc::new(crate::identity::IdentitySelector::new(&json!({}), signed.issuer.clone()).unwrap()));
+        let body = json!({"params": {"message": {"metadata": {
+            AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION: {"verifiablePresentation": signed.presentation.to_string()}
+        }}}})
+        .to_string();
+        let binding = extract_identity_binding_vp(
+            body.as_bytes(),
+            &ChannelProtocol::A2a,
+            &selector,
+            "test",
+            None,
+            &access_point(&[ACCESS_POINT_ORIGIN]),
+        )
+        .await
+        .unwrap()
+        .expect("a binding naming the Access Point is verified");
+        assert_eq!(binding.agent_did, signed.holder_did);
+    }
+
+    #[tokio::test]
+    async fn an_mcp_presentation_naming_another_receiver_is_invalid() {
+        for (domain, signed) in presentations_for_another_receiver().await {
+            let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"_meta": {
+                crate::config::MCP_AGENT_IDENTITY_CREDENTIAL_KEY:
+                    {"verifiablePresentation": signed.presentation.to_string(), "did": signed.holder_did}
+            }}});
+            assert!(
+                super::verify_mcp_metadata_identity(
+                    body.to_string().as_bytes(),
+                    Some(&signed.issuer),
+                    &test_facts(),
+                    None,
+                    &access_point(&[ACCESS_POINT_ORIGIN]),
+                )
+                .await
+                .is_err(),
+                "{domain:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2139,7 +2342,7 @@ mod tests {
         let ext = json!({ "did": "did:web:agent.example" });
         assert!(
             matches!(
-                resolve_inbound_credential_identity(&ext, &None, "test-channel").await,
+                resolve_inbound_credential_identity(&ext, &None, "test-channel", &presentation_receivers()).await,
                 CredentialResolution::Absent
             ),
             "a bare did claim must not become the caller identity"
@@ -2150,7 +2353,7 @@ mod tests {
     async fn credential_identity_none_when_neither_vp_nor_did() {
         let ext = json!({ "unrelated": "value" });
         assert!(matches!(
-            resolve_inbound_credential_identity(&ext, &None, "test-channel").await,
+            resolve_inbound_credential_identity(&ext, &None, "test-channel", &presentation_receivers()).await,
             CredentialResolution::Absent
         ));
     }
@@ -2163,7 +2366,7 @@ mod tests {
         });
         assert!(
             matches!(
-                resolve_inbound_credential_identity(&ext, &None, "test-channel").await,
+                resolve_inbound_credential_identity(&ext, &None, "test-channel", &presentation_receivers()).await,
                 CredentialResolution::Rejected
             ),
             "an unverifiable presentation must not fall back to the did claim"
@@ -2177,7 +2380,7 @@ mod tests {
             Arc::new(crate::identity::IdentitySelector::new(&json!({ "type": "object" }), Arc::new(issuer)).unwrap());
         let ext = json!({ "verifiablePresentation": "not-a-real-jwt", "did": "did:web:agent.example" });
         assert!(matches!(
-            resolve_inbound_credential_identity(&ext, &Some(selector), "test-channel").await,
+            resolve_inbound_credential_identity(&ext, &Some(selector), "test-channel", &presentation_receivers()).await,
             CredentialResolution::Rejected
         ));
     }
@@ -2191,7 +2394,9 @@ mod tests {
             crate::identity::IdentitySelector::new(&json!({ "type": "object" }), signed.issuer.clone()).unwrap(),
         );
         let ext = json!({ "did": signed.holder_did, "verifiablePresentation": signed.presentation.to_string() });
-        match resolve_inbound_credential_identity(&ext, &Some(selector), "test-channel").await {
+        match resolve_inbound_credential_identity(&ext, &Some(selector), "test-channel", &presentation_receivers())
+            .await
+        {
             CredentialResolution::Verified(result) => {
                 assert_eq!(result.did, signed.holder_did);
                 assert_eq!(result.issuer_did.as_deref(), Some(signed.issuer_did.as_str()));

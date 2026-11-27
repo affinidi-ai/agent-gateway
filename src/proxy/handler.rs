@@ -1936,6 +1936,13 @@ fn routing_facts(
 
 /// Records a request refused by request-extension inspection: an extension
 /// rule, or an inbound identity that is missing or fails validation.
+/// The receivers a caller's presentation must name at an Access Point: the
+/// origins of the inbound listeners' `external_urls`, never the `Host` a
+/// request carries.
+fn access_point_receivers(network: &crate::config::NetworkConfig) -> crate::identity::ExpectedReceivers {
+    crate::identity::ExpectedReceivers::origins(network.get_inbound_external_urls())
+}
+
 fn record_extension_refusal(
     response: &Response,
     facts: &crate::audit::request_events::RequestFacts<'_>,
@@ -2973,6 +2980,7 @@ async fn proxy_charged_request(
                 state.vc_issuer.as_ref(),
                 &audit_facts,
                 None,
+                &access_point_receivers(&state.network_config),
             )
             .await
             .map_err(|error| {
@@ -5212,6 +5220,7 @@ async fn proxy_charged_request(
             surface = %channel_name
         );
 
+        let receivers = access_point_receivers(&state.network_config);
         let inspection_ctx = crate::a2a::ExtensionInspectionContext {
             config: &state.config,
             channel_name: &channel_name,
@@ -5221,6 +5230,7 @@ async fn proxy_charged_request(
             source_authenticated: authenticated_identity.is_some(),
             metrics_store: &state.metrics_store,
             ws_state: &state.ws_state,
+            receivers: &receivers,
         };
 
         let identity_result = match async { inspect_message_extensions(&body_bytes, &inspection_ctx).await }
@@ -5554,6 +5564,7 @@ async fn proxy_charged_request(
             &state.identity_selector,
             &channel_name,
             None,
+            &access_point_receivers(&state.network_config),
         )
         .await;
         crate::observability::identity_binding_audit::audit_extraction(&audit_facts, None, &result);
@@ -5561,6 +5572,18 @@ async fn proxy_charged_request(
     };
     let identity_binding = match binding_result {
         Ok(binding) => binding,
+        Err(e) if e.receiver.is_some() => {
+            warn!(channel = channel_name, error = %e, "Identity binding VP names no receiver of this Access Point");
+            let response = create_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                crate::protocols::extensions::PRESENTATION_RECEIVER_REFUSED,
+            );
+            record_extension_refusal(&response, &audit_facts);
+            connection_guard
+                .decrement()
+                .await;
+            return Err(response);
+        }
         Err(e) => {
             warn!(channel = channel_name, error = %e, "Identity binding VP present but invalid");
             None // Continue without binding context — OPA can decide
@@ -11442,6 +11465,7 @@ async fn handle_fabric_request_inner(
             &state.identity_selector,
             channel_name,
             None,
+            &access_point_receivers(&state.network_config),
         )
         .await;
         crate::observability::identity_binding_audit::audit_extraction(
@@ -11458,6 +11482,26 @@ async fn handle_fabric_request_inner(
     };
     let identity_binding = match binding_result {
         Ok(binding) => binding,
+        Err(e) if e.receiver.is_some() => {
+            channel_warn!(config_id, "Identity binding VP names no receiver of this Access Point error={}", e);
+            let response = create_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                crate::protocols::extensions::PRESENTATION_RECEIVER_REFUSED,
+            );
+            record_extension_refusal(
+                &response,
+                &crate::audit::request_events::RequestFacts {
+                    surface_id: config_id,
+                    channel_name,
+                    trace_id: Some(&trace_id),
+                    via_fabric: false,
+                },
+            );
+            connection_guard
+                .decrement()
+                .await;
+            return Err(response);
+        }
         Err(e) => {
             channel_warn!(config_id, "Identity binding VP present but invalid error={}", e);
             None
@@ -11493,6 +11537,7 @@ async fn handle_fabric_request_inner(
             otel.name = "Extension Inspection",
             channel = channel_name
         );
+        let receivers = access_point_receivers(&state.network_config);
         let inspection_ctx = crate::a2a::ExtensionInspectionContext {
             config: &state.config,
             channel_name,
@@ -11502,6 +11547,7 @@ async fn handle_fabric_request_inner(
             source_authenticated: authenticated_identity.is_some(),
             metrics_store: &state.metrics_store,
             ws_state: &state.ws_state,
+            receivers: &receivers,
         };
         match async { inspect_message_extensions(&body_bytes, &inspection_ctx).await }
             .instrument(inspection_span)
@@ -13456,6 +13502,9 @@ async fn handle_fabric_request_inner(
                 });
             }
         });
+    let answer_receivers = crate::identity::ExpectedReceivers::dids([gateway_listener
+        .gateway_did
+        .as_str()]);
     let is_a2a_surface = matches!(
         state
             .surface
@@ -13801,6 +13850,7 @@ async fn handle_fabric_request_inner(
                             vc_issuer: state.vc_issuer.as_ref(),
                             listener_manager,
                             gateway_id,
+                            receivers: &answer_receivers,
                             facts: &response_audit_facts,
                             caller: authenticated_identity
                                 .as_ref()

@@ -2361,12 +2361,14 @@ fn inbound_api_key_identity_surface(policy_id: &str) -> crate::config::agent_sur
 }
 
 async fn send_api_key_identity_request(policy_id: &'static str) -> (reqwest::StatusCode, usize) {
-    send_api_key_identity_body(policy_id, a2a_request()).await
+    send_api_key_identity_body(policy_id, &async |_: &str| a2a_request()).await
 }
 
+/// Sends the body `body` builds for the origin the harness lists in its inbound
+/// `external_urls`, which a presentation in it must name.
 async fn send_api_key_identity_body(
     policy_id: &'static str,
-    body: serde_json::Value,
+    body: &impl AsyncFn(&str) -> serde_json::Value,
 ) -> (reqwest::StatusCode, usize) {
     let h = GatewayHarness::start(move |temp_dir, gw_config, bootstrap| {
         write_caller_verification_policies(temp_dir);
@@ -2380,6 +2382,11 @@ async fn send_api_key_identity_body(
         gw_config.surfaces = vec![inbound_api_key_identity_surface(policy_id)];
     })
     .await;
+    let port = reqwest::Url::parse(&h.gateway_base)
+        .unwrap()
+        .port()
+        .unwrap();
+    let body = body(&format!("http://localhost:{port}")).await;
     let status = reqwest::Client::new()
         .post(&h.gateway_url)
         .header("x-api-key", INBOUND_CALLER_KEY)
@@ -2457,19 +2464,22 @@ async fn inbound_from_api_key_identity_reaches_policy_as_unverified() {
 /// DID, not the VP holder's `vp_unanchored` one.
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_from_api_key_identity_wins_over_a_body_presentation() {
-    let signed = crate::identity::test_helpers::signed_agent_presentation().await;
-    let credential_uri = crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION;
-    let mut body = a2a_request();
-    body["params"]["message"]["extensions"] = json!([credential_uri]);
-    body["params"]["message"]["metadata"] = json!({
-        credential_uri: { "did": signed.holder_did, "verifiablePresentation": signed.presentation.to_string() }
-    });
+    let body = async |origin: &str| {
+        let signed = crate::identity::test_helpers::signed_agent_presentation_for(Some(origin)).await;
+        let credential_uri = crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION;
+        let mut body = a2a_request();
+        body["params"]["message"]["extensions"] = json!([credential_uri]);
+        body["params"]["message"]["metadata"] = json!({
+            credential_uri: { "did": signed.holder_did, "verifiablePresentation": signed.presentation.to_string() }
+        });
+        body
+    };
 
-    let (status, forwarded) = send_api_key_identity_body(UNVERIFIED_EXTENSION_IDENTITY_POLICY_ID, body.clone()).await;
+    let (status, forwarded) = send_api_key_identity_body(UNVERIFIED_EXTENSION_IDENTITY_POLICY_ID, &body).await;
     assert_eq!(status, 200, "policy must see the key's unverified DID, not the presentation's");
     assert_eq!(forwarded, 1);
 
-    let (status, forwarded) = send_api_key_identity_body(VERIFIED_CALLER_POLICY_ID, body).await;
+    let (status, forwarded) = send_api_key_identity_body(VERIFIED_CALLER_POLICY_ID, &body).await;
     assert_eq!(status, 403, "the verified presentation must not supply the caller identity");
     assert_eq!(forwarded, 0);
 }

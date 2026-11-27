@@ -671,6 +671,37 @@ impl VCIssuer {
         Ok(config.proxy_did.clone())
     }
 
+    /// The gateway DID and the DIDs its stored DID document also names it by:
+    /// the document's `id` (the parallel `did:web` of a `did:webvh` gateway)
+    /// and its `alsoKnownAs` entries.
+    pub async fn gateway_dids(&self) -> Vec<String> {
+        let (did, storage_path) = {
+            let config = self.config.read().await;
+            (config.proxy_did.clone(), config.storage_path.clone())
+        };
+        let mut dids = vec![did];
+        if let Ok(Some(document)) = crate::storage::did_artifacts::read_did_document(&storage_path).await
+            && let Ok(document) = serde_json::from_str::<serde_json::Value>(&document)
+        {
+            dids.extend(
+                document
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            );
+            dids.extend(
+                document
+                    .get("alsoKnownAs")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string),
+            );
+        }
+        dids
+    }
+
     /// The gateway's public JWKS (Ed25519 signing key, private `d` component
     /// stripped). Lets a standard OAuth resource server verify STS-issued tokens
     /// via a `jwks_uri` without resolving the gateway DID document.
@@ -2481,10 +2512,13 @@ impl VCIssuer {
     /// subject id (`credentialSubject.id`), the primary VC issuer DID, the
     /// credential subject fields, and the raw credentials for re-chaining.
     /// Lifetime (`validUntil` / `expirationDate`) is already enforced by
-    /// `verify_vp`, so an expired credential fails here.
+    /// `verify_vp`, so an expired credential fails here. A presentation whose
+    /// proof `domain` names none of `receivers` fails with a
+    /// [`crate::identity::VpDomainRefusal`].
     pub async fn verify_agent_presentation_full(
         &self,
         vp_input: &str,
+        receivers: &crate::identity::ExpectedReceivers,
     ) -> Result<VerifiedAgentPresentation> {
         let vp: serde_json::Value = serde_json::from_str(vp_input).context("Failed to parse VP as JSON")?;
 
@@ -2493,6 +2527,8 @@ impl VCIssuer {
             .verify_vp(&vp)
             .await
             .context("VP verification failed")?;
+
+        receivers.check(result.domain.as_ref())?;
 
         self.validate_vp_challenge(result.challenge.as_ref())
             .await?;
@@ -5451,11 +5487,54 @@ mod tests {
         .to_string();
 
         let result = issuer
-            .verify_agent_presentation_full(&vp)
+            .verify_agent_presentation_full(&vp, &crate::identity::ExpectedReceivers::Unchecked)
             .await;
 
         let err = result.expect_err("an unsigned presentation must never verify, whatever the environment says");
         assert!(format!("{err:#}").contains("VP verification failed"), "unexpected error: {err:#}");
+    }
+
+    /// What verifying a signed presentation for `domain` at a site expecting
+    /// `receivers` gives: `Ok` or the domain refusal.
+    async fn domain_outcome(
+        domain: Option<&str>,
+        receivers: &crate::identity::ExpectedReceivers,
+    ) -> Result<(), Option<crate::identity::VpDomainRefusal>> {
+        let signed = crate::identity::test_helpers::signed_agent_presentation_for(domain).await;
+        signed
+            .issuer
+            .verify_agent_presentation_full(
+                &signed
+                    .presentation
+                    .to_string(),
+                receivers,
+            )
+            .await
+            .map(|verified| assert_eq!(verified.holder_did, signed.holder_did))
+            .map_err(|e| {
+                e.downcast_ref::<crate::identity::VpDomainRefusal>()
+                    .copied()
+            })
+    }
+
+    #[tokio::test]
+    async fn a_presentation_is_verified_only_for_a_receiver_it_names() {
+        use crate::identity::{ExpectedReceivers, VpDomainRefusal};
+        let ours = ExpectedReceivers::dids(["did:web:receiver.example"]);
+        for (domain, outcome) in [
+            (Some("did:web:receiver.example"), Ok(())),
+            (Some("did:web:other.example"), Err(Some(VpDomainRefusal::Wrong))),
+            (None, Err(Some(VpDomainRefusal::Missing))),
+            (Some("urn:agent-gateway:label:answer"), Err(Some(VpDomainRefusal::Label))),
+            (Some("receiver.example"), Err(Some(VpDomainRefusal::Unparseable))),
+        ] {
+            assert_eq!(domain_outcome(domain, &ours).await, outcome, "{domain:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unchecked_site_verifies_a_presentation_without_a_domain() {
+        assert_eq!(domain_outcome(None, &crate::identity::ExpectedReceivers::Unchecked).await, Ok(()));
     }
 
     #[tokio::test]

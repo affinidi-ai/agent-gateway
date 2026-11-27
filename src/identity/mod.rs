@@ -41,4 +41,4 @@ pub use state::IdentityApiState;
 pub use store::IdentityStore;
 pub use vc_issuer::*;
 pub use vp_challenge_store::*;
-pub use vp_domain::{VpDomain, VpLabel};
+pub use vp_domain::{ExpectedReceivers, VpDomain, VpDomainRefusal, VpLabel};

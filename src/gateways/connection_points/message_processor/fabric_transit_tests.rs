@@ -217,6 +217,7 @@ pub(super) fn forward_request(
         },
     )
     .with_context("agent_surface_storage_path", json!(root.join("agent_surfaces")))
+    .with_context(super::CONNECTION_POINT_DID_CONTEXT_KEY, json!("did:web:receiver.example"))
 }
 
 /// The forward-response for `message`, served as the listener serves a

@@ -64,7 +64,7 @@ impl SigningKey {
     async fn sign_presentation(
         &self,
         credentials: Vec<Value>,
-        receiver: &str,
+        receiver: Option<&str>,
     ) -> Value {
         let presentation = json!({
             "@context": [CREDENTIALS_V2],
@@ -82,7 +82,10 @@ impl SigningKey {
                 .parse()
                 .expect("an RFC 3339 time"),
         );
-        options.domains = vec![receiver.to_string()];
+        options.domains = receiver
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         let signed = AnySuite::EdDsaRdfc2022
             .sign_with(SignatureEnvironment::default(), presentation, &methods, signer, options, Default::default())
             .await
@@ -311,11 +314,11 @@ impl PresentationSigner {
             .push(entry);
     }
 
-    /// A presentation signed by this caller for authentication, for `receiver`, of a credential it
-    /// issued to itself.
+    /// A presentation signed by this caller for authentication, for `receiver` or for no
+    /// receiver, of a credential it issued to itself.
     pub async fn present_own_credential(
         &self,
-        receiver: &str,
+        receiver: Option<&str>,
     ) -> Value {
         let credential = self
             .signer
@@ -336,7 +339,7 @@ impl PresentationSigner {
             .sign_credential(&self.signer.did)
             .await;
         self.signer
-            .sign_presentation(vec![credential], receiver)
+            .sign_presentation(vec![credential], Some(receiver))
             .await
     }
 }

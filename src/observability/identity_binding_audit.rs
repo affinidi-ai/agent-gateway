@@ -143,7 +143,10 @@ pub fn record_identity_binding(event: IdentityBindingAuditEvent<'_>) {
 pub fn audit_extraction(
     facts: &crate::audit::request_events::RequestFacts<'_>,
     transit_point: Option<&str>,
-    result: &Result<Option<crate::surface_context::IdentityBindingContext>, String>,
+    result: &Result<
+        Option<crate::surface_context::IdentityBindingContext>,
+        crate::protocols::extensions::BindingVpError,
+    >,
 ) {
     use crate::audit::events::IdentityBindingFailure;
     use crate::audit::request_events::{identity_binding_failed, identity_binding_verified};
@@ -165,7 +168,7 @@ pub fn audit_extraction(
             None,
         ),
         Ok(None) => identity_binding_failed(facts, IdentityBindingFailure::Absent, None, None, None),
-        Err(error) => identity_binding_failed(facts, IdentityBindingFailure::Invalid, None, None, Some(error)),
+        Err(error) => identity_binding_failed(facts, IdentityBindingFailure::Invalid, None, None, Some(&error.detail)),
     }
 
     let surface_id = facts.surface_id;
@@ -225,7 +228,7 @@ pub fn audit_extraction(
             assurance: None,
             delegated: false,
             caller_field_names: &[],
-            error_detail: Some(e.as_str()),
+            error_detail: Some(e.detail.as_str()),
         }),
     }
 }
@@ -263,6 +266,7 @@ mod tests {
     async fn recorded(
         result: Result<Option<crate::surface_context::IdentityBindingContext>, String>
     ) -> Vec<crate::delegation_vault::audit::DelegationAuditEvent> {
+        let result = result.map_err(crate::protocols::extensions::BindingVpError::from);
         let ((), events) = crate::audit::producer::capture(async {
             audit_extraction(&facts(), None, &result);
         })

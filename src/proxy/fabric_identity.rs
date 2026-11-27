@@ -68,6 +68,9 @@ pub struct AnswerIdentityCheck<'a> {
     pub listener_manager: Option<Arc<crate::gateways::ConnectionPointListenerManager>>,
     /// The Remote gateway record the `fabric://` Target names.
     pub gateway_id: &'a str,
+    /// The receivers the answer's presentation must name: the Connection Point
+    /// DID the request was sent from.
+    pub receivers: &'a crate::identity::ExpectedReceivers,
     pub facts: &'a crate::audit::request_events::RequestFacts<'a>,
     /// The request's authenticated caller.
     pub caller: Option<crate::delegation_vault::audit::AuditCallerContext>,
@@ -88,6 +91,7 @@ pub async fn check_answer_identity(
         check.surface,
         check.vc_issuer,
         check.facts.channel_name,
+        check.receivers,
     )
     .await
     {
@@ -160,6 +164,7 @@ async fn extract_fabric_backend_agent_identity(
     surface: &crate::config::agent_surface::AgentSurface,
     vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
     channel_name: &str,
+    receivers: &crate::identity::ExpectedReceivers,
 ) -> Result<Option<ResponsePresentation>, String> {
     info!(channel = channel_name, "Fabric: Checking for backend agent identity in response");
 
@@ -183,7 +188,7 @@ async fn extract_fabric_backend_agent_identity(
     // Dispatch to protocol-specific extractor
     match surface.access_point.protocol {
         crate::config::agent_surface::SurfaceProtocol::A2a | crate::config::agent_surface::SurfaceProtocol::Ap2 => {
-            extract_a2a_fabric_identity(&response_json, vc_issuer, channel_name).await
+            extract_a2a_fabric_identity(&response_json, vc_issuer, channel_name, receivers).await
         }
         crate::config::agent_surface::SurfaceProtocol::Mcp => {
             // MCP not yet implemented for fabric VP verification
@@ -202,6 +207,7 @@ async fn extract_a2a_fabric_identity(
     response_json: &JsonValue,
     vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
     channel_name: &str,
+    receivers: &crate::identity::ExpectedReceivers,
 ) -> Result<Option<ResponsePresentation>, String> {
     use crate::proxy::backend_identity::{
         IdentityExtractionError, extract_a2a_identity_from_response_message_with_uri,
@@ -213,7 +219,7 @@ async fn extract_a2a_fabric_identity(
     ) {
         Ok(credential_ext) => {
             info!(channel = channel_name, "Fabric: Found VP credential extension from GW2");
-            verify_fabric_credential(&credential_ext, vc_issuer, channel_name).await
+            verify_fabric_credential(&credential_ext, vc_issuer, channel_name, receivers).await
         }
         Err(IdentityExtractionError::DeclaredButMissing) => {
             warn!(channel = channel_name, "Fabric: VP credential extension declared but not found in metadata");
@@ -235,6 +241,7 @@ async fn verify_fabric_credential(
     credential_ext: &JsonValue,
     vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
     channel_name: &str,
+    receivers: &crate::identity::ExpectedReceivers,
 ) -> Result<Option<ResponsePresentation>, String> {
     let vp_jwt = match credential_ext.get("verifiablePresentation") {
         Some(JsonValue::String(vp_jwt)) if !vp_jwt.is_empty() => vp_jwt.as_str(),
@@ -255,7 +262,7 @@ async fn verify_fabric_credential(
         return Err("VP verification failed for server agent identity: no VC issuer to verify the presentation".into());
     };
     let verified = vc_issuer
-        .verify_agent_presentation_full(vp_jwt)
+        .verify_agent_presentation_full(vp_jwt, receivers)
         .await
         .map_err(|e| {
             warn!(channel = channel_name, error = %format!("{e:#}"), "✗ Fabric: VP verification FAILED");
@@ -456,7 +463,13 @@ mod tests {
         response: &JsonValue,
         vc_issuer: Option<&Arc<crate::identity::VCIssuer>>,
     ) -> Result<Option<ResponsePresentation>, String> {
-        extract_a2a_fabric_identity(response, vc_issuer, "a-party").await
+        extract_a2a_fabric_identity(
+            response,
+            vc_issuer,
+            "a-party",
+            &crate::identity::test_helpers::presentation_receivers(),
+        )
+        .await
     }
 
     fn caller() -> crate::delegation_vault::audit::AuditCallerContext {
@@ -751,6 +764,7 @@ mod tests {
             vc_issuer,
             listener_manager: None,
             gateway_id: "gw-b",
+            receivers: &crate::identity::test_helpers::presentation_receivers(),
             facts: &facts,
             caller: None,
         }))
@@ -783,6 +797,7 @@ mod tests {
             vc_issuer: Some(&signed.issuer),
             listener_manager: Some(manager),
             gateway_id: &gateway_id,
+            receivers: &crate::identity::test_helpers::presentation_receivers(),
             facts: &facts,
             caller: None,
         }))
@@ -1000,6 +1015,49 @@ mod tests {
         }
     }
 
+    /// An answer's presentation must name the Connection Point DID the request
+    /// was sent from; any other domain refuses the answer with the fixed `502`
+    /// detail.
+    #[tokio::test]
+    async fn an_answer_presentation_naming_another_receiver_is_refused() {
+        let sent_from = crate::identity::ExpectedReceivers::dids(["did:peer:2.sending-connection-point"]);
+        for domain in [
+            Some("did:peer:2.another-gateway"),
+            None,
+            Some("urn:agent-gateway:label:answer"),
+            Some("https://gateway.example"),
+        ] {
+            let signed = crate::identity::test_helpers::signed_agent_presentation_for(domain).await;
+            let body = credential_response(&signed.presentation).to_string();
+            let facts = facts();
+            let (result, _) = crate::audit::producer::capture(check_answer_identity(AnswerIdentityCheck {
+                response_body: &body,
+                surface: &surface(),
+                vc_issuer: Some(&signed.issuer),
+                listener_manager: None,
+                gateway_id: "gw-b",
+                receivers: &sent_from,
+                facts: &facts,
+                caller: None,
+            }))
+            .await;
+            let refusal = result.expect_err("the answer is refused");
+            assert!(matches!(refusal, AnswerIdentityRefusal::Invalid(_)), "{domain:?}: {refusal:?}");
+            assert_eq!(refusal.detail(), "Managed agent identity verification failed");
+        }
+        let signed =
+            crate::identity::test_helpers::signed_agent_presentation_for(Some("did:peer:2.sending-connection-point"))
+                .await;
+        let presented = extract_a2a_fabric_identity(
+            &credential_response(&signed.presentation),
+            Some(&signed.issuer),
+            "a-party",
+            &sent_from,
+        )
+        .await;
+        assert!(matches!(presented, Ok(Some(_))), "{presented:?}");
+    }
+
     #[tokio::test]
     async fn an_mcp_answer_carries_no_checked_presentation() {
         let signed = crate::identity::test_helpers::signed_agent_presentation().await;
@@ -1011,7 +1069,14 @@ mod tests {
         .expect("surface JSON");
         let body = credential_response(&signed.presentation).to_string();
 
-        let presented = extract_fabric_backend_agent_identity(&body, &surface, Some(&signed.issuer), "a-party").await;
+        let presented = extract_fabric_backend_agent_identity(
+            &body,
+            &surface,
+            Some(&signed.issuer),
+            "a-party",
+            &crate::identity::test_helpers::presentation_receivers(),
+        )
+        .await;
 
         assert_eq!(presented, Ok(None));
     }

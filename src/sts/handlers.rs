@@ -195,14 +195,20 @@ pub trait StsSubjectVerifier: Send + Sync {
 }
 
 /// Verifies a Verifiable Presentation subject token and returns a claims object
-/// whose `sub` is the cryptographically-proven subject DID.
+/// whose `sub` is the cryptographically-proven subject DID. The presentation
+/// must name `gateway_did`, or another DID of this gateway, as its receiver.
 #[async_trait::async_trait]
 pub trait StsVpVerifier: Send + Sync {
     async fn verify_vp(
         &self,
         vp: &str,
+        gateway_did: &str,
     ) -> Result<Value, StsError>;
 }
+
+/// The `error_description` of a VP `subject_token` that does not name this
+/// gateway as its receiver.
+const VP_RECEIVER_REFUSED: &str = "VP subject_token does not name this gateway as its receiver";
 
 /// Authenticates a client and loads its managed connection.
 #[async_trait::async_trait]
@@ -536,12 +542,25 @@ impl StsVpVerifier for VcIssuerVpVerifier {
     async fn verify_vp(
         &self,
         vp: &str,
+        gateway_did: &str,
     ) -> Result<Value, StsError> {
+        let mut dids = self
+            .vc_issuer
+            .gateway_dids()
+            .await;
+        dids.push(gateway_did.to_string());
         let verified = self
             .vc_issuer
-            .verify_agent_presentation_full(vp)
+            .verify_agent_presentation_full(vp, &crate::identity::ExpectedReceivers::dids(dids))
             .await
-            .map_err(|e| StsError::InvalidGrant(format!("VP verification failed: {e}")))?;
+            .map_err(|e| {
+                if e.is::<crate::identity::VpDomainRefusal>() {
+                    tracing::warn!(error = %e, "STS: VP subject_token refused");
+                    StsError::InvalidGrant(VP_RECEIVER_REFUSED.to_string())
+                } else {
+                    StsError::InvalidGrant(format!("VP verification failed: {e}"))
+                }
+            })?;
         let sub = verified
             .subject_id
             .clone()
@@ -564,6 +583,7 @@ impl StsVpVerifier for DisabledVpVerifier {
     async fn verify_vp(
         &self,
         _vp: &str,
+        _gateway_did: &str,
     ) -> Result<Value, StsError> {
         Err(StsError::UnsupportedTokenType(
             "Verifiable Presentation subject tokens are not configured on this gateway".to_string(),
@@ -1660,9 +1680,10 @@ async fn verify_assertion(
             }
         }
     } else if token_type == TokenType::Vp {
+        let gateway_did = state.signer.issuer().await?;
         state
             .vp_verifier
-            .verify_vp(token)
+            .verify_vp(token, &gateway_did)
             .await
             .map(VerifiedAssertion::named_by_sub)
     } else {
@@ -2105,11 +2126,75 @@ mod tests {
         async fn verify_vp(
             &self,
             vp: &str,
+            _gateway_did: &str,
         ) -> Result<Value, StsError> {
             self.vps
                 .get(vp)
                 .cloned()
                 .ok_or_else(|| StsError::InvalidGrant("unknown test vp".to_string()))
+        }
+    }
+
+    const SIGNER_DID: &str = "did:webvh:zsigner:sts.example";
+
+    /// What the gateway's VP verifier answers a subject token for `domain`.
+    /// `alias` is added to the `alsoKnownAs` of the stored DID document first.
+    async fn vp_subject_token_for(
+        domain: Option<&str>,
+        alias: &str,
+    ) -> Result<Value, StsError> {
+        let signed = crate::identity::test_helpers::signed_agent_presentation_for(domain).await;
+        let storage = signed
+            .issuer
+            .get_storage_path()
+            .await;
+        let mut document: Value = serde_json::from_str(
+            &crate::storage::did_artifacts::read_did_document(&storage)
+                .await
+                .unwrap()
+                .expect("the gateway stores its DID document"),
+        )
+        .unwrap();
+        document["alsoKnownAs"] = json!([alias]);
+        crate::storage::did_artifacts::write_did_document(&storage, &document.to_string())
+            .await
+            .unwrap();
+        VcIssuerVpVerifier {
+            vc_issuer: signed.issuer.clone(),
+        }
+        .verify_vp(
+            &signed
+                .presentation
+                .to_string(),
+            SIGNER_DID,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_vp_subject_token_is_accepted_for_the_gateway_did_or_an_alias() {
+        for domain in [SIGNER_DID, "did:web:alias.example", "did:web:example.com"] {
+            let claims = vp_subject_token_for(Some(domain), "did:web:alias.example")
+                .await
+                .unwrap_or_else(|e| panic!("{domain}: {e:?}"));
+            assert!(claims["sub"].is_string(), "{domain}: {claims}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_vp_subject_token_naming_no_receiver_of_this_gateway_is_refused_with_fixed_text() {
+        for domain in [
+            Some("did:web:another-gateway.example"),
+            None,
+            Some("urn:agent-gateway:label:answer"),
+            Some("https://sts.example"),
+        ] {
+            match vp_subject_token_for(domain, "did:web:alias.example").await {
+                Err(StsError::InvalidGrant(description)) => {
+                    assert_eq!(description, VP_RECEIVER_REFUSED, "{domain:?}")
+                }
+                other => panic!("{domain:?}: expected invalid_grant, got {other:?}"),
+            }
         }
     }
 
