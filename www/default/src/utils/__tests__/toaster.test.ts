@@ -1,5 +1,13 @@
 import { act } from 'react';
-import { removeToast, showToast, showUndoToast } from '../toaster';
+import {
+  ANNOUNCE_DELAY_MS,
+  closeKeptToast,
+  removeToast,
+  showKeepOpenWarningToast,
+  showSuccessCountdownToast,
+  showToast,
+  showUndoToast,
+} from '../toaster';
 
 const PAYLOAD = '<img src=x onerror="window.__toastXss = true">';
 
@@ -20,8 +28,8 @@ describe('showToast', () => {
     jest.useRealTimers();
   });
 
-  describe('a save with warnings', () => {
-    it('shows the saved message and every warning in the one toast, one per line', () => {
+  describe('a multi-line plain toast', () => {
+    it('shows every line of its message in the one toast', () => {
       showToast('error', 'Saved, with warnings:\nfirst warning\nsecond warning');
       expect(document.querySelectorAll('#app-toast')).toHaveLength(1);
       const toast = getToast();
@@ -33,7 +41,7 @@ describe('showToast', () => {
       );
     });
 
-    it('is replaced by a later toast, which is why a save sends one', () => {
+    it('is replaced by a later toast', () => {
       showToast('success', 'saved');
       showToast('error', 'a warning');
       expect(getToast().textContent).not.toContain('saved');
@@ -90,7 +98,8 @@ describe('showToast', () => {
         const toast = getToast();
         const alert = toast.querySelector('.alert');
         expect(alert).not.toBeNull();
-        expect(alert).toHaveClass(alertClass, 'alert-dismissible', 'fade', 'show');
+        expect(alert).toHaveClass(alertClass, 'fade', 'show');
+        expect(alert).not.toHaveClass('alert-dismissible');
         expect(toast.querySelector('strong')?.textContent).toBe(label);
         expect(toast.querySelector('i.fas')).toHaveClass(icon);
         expect(toast.querySelector('.flex-grow-1 span')?.textContent).toBe('Hello there');
@@ -106,6 +115,14 @@ describe('showToast', () => {
       expect(toast.querySelector('.flex-grow-1 br')).not.toBeNull();
     });
 
+    it('lets a long unbroken message shrink and wrap so the close button stays in the toast', () => {
+      showToast('success', `Surface "${'x'.repeat(200)}" deleted`);
+
+      const body = getToast().querySelector<HTMLElement>('.flex-grow-1');
+      expect(parseFloat(body?.style.minWidth ?? '')).toBe(0);
+      expect(body?.style.overflowWrap).toBe('anywhere');
+    });
+
     it('replaces an existing toast', () => {
       showToast('success', 'first');
       showToast('success', 'second');
@@ -115,12 +132,15 @@ describe('showToast', () => {
       expect(getToast().textContent).not.toContain('first');
     });
 
-    it('removes the toast with the close button', () => {
+    it('removes the toast with the close button, the last item of its row as on the undo toast', () => {
       showToast('error', 'Closable');
 
-      const close = getToast().querySelector<HTMLButtonElement>('button.close');
+      const close = getToast().querySelector<HTMLButtonElement>(
+        '.d-flex.align-items-center > #app-toast-close'
+      );
       expect(close).not.toBeNull();
-      expect(close).toHaveAttribute('title', 'Close notification');
+      expect(close?.parentElement?.lastElementChild).toBe(close);
+      expect(close).toHaveAttribute('title', 'Dismiss');
       expect(close?.textContent?.trim()).toBe('×');
       close?.click();
 
@@ -235,6 +255,302 @@ describe('showUndoToast', () => {
     expect(getToast().textContent).toContain('saved');
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'u' }));
     expect(onUndo).not.toHaveBeenCalled();
+  });
+});
+
+describe('showKeepOpenWarningToast', () => {
+  beforeEach(() => jest.useFakeTimers());
+
+  afterEach(() => {
+    removeToast();
+    jest.useRealTimers();
+  });
+
+  const keepOpenButton = () =>
+    Array.from(getToast().querySelectorAll('button')).find(b => b.textContent === 'Keep open');
+
+  it('counts down 10 seconds by default beside Keep open and the close button, then closes', () => {
+    act(() => {
+      showKeepOpenWarningToast('Saved, with warnings:\nfirst\nsecond');
+    });
+
+    const fill = getToast().querySelector<HTMLElement>('#app-toast-bar-fill');
+    expect(fill?.style.transitionDuration).toBe('10000ms');
+    expect(fill?.style.width).toBe('0%');
+    expect(keepOpenButton()).toBeDefined();
+    expect(getToast().querySelector('#app-toast-close')).not.toBeNull();
+    const message = getToast().querySelector<HTMLElement>('#app-toast-message');
+    expect(message?.textContent).toBe('Saved, with warnings:\nfirst\nsecond');
+    expect(message?.style.maxHeight).toBe('40vh');
+    expect(message?.style.overflowY).toBe('auto');
+
+    act(() => {
+      jest.advanceTimersByTime(9999);
+    });
+    expect(document.getElementById('app-toast')).not.toBeNull();
+    act(() => {
+      jest.advanceTimersByTime(1);
+    });
+    expect(document.getElementById('app-toast')).toBeNull();
+  });
+
+  const kept = () => document.getElementById('app-toast-kept');
+
+  const showAndKeep = (message: string) => {
+    act(() => {
+      showKeepOpenWarningToast(message);
+    });
+    act(() => {
+      keepOpenButton()?.click();
+    });
+  };
+
+  it('stays open after Keep open, with no bar or button, until it is closed', () => {
+    showAndKeep('Saved, with warnings:\nfirst');
+    act(() => {
+      jest.advanceTimersByTime(60000);
+    });
+
+    expect(kept()).not.toBeNull();
+    expect(document.getElementById('app-toast')).toBeNull();
+    expect(kept()?.querySelector('#app-toast-bar-fill')).toBeNull();
+    expect(kept()?.querySelector('[data-testid="app-toast-keep-open-button"]')).toBeNull();
+    expect(document.activeElement).toBe(kept()?.querySelector('#app-toast-kept-close'));
+
+    act(() => {
+      kept()?.querySelector<HTMLButtonElement>('#app-toast-kept-close')?.click();
+    });
+    expect(kept()).toBeNull();
+  });
+
+  const keptHeight = (height: number) => {
+    const box = kept()?.firstElementChild as HTMLElement;
+    jest.spyOn(box, 'getBoundingClientRect').mockReturnValue({ height } as DOMRect);
+  };
+  const activeBox = () => getToast().querySelector<HTMLElement>('.alert');
+
+  it('is not replaced by a later toast once kept: the later toast is shown below it', () => {
+    showAndKeep('Saved, with warnings:\nfirst');
+    keptHeight(80);
+
+    act(() => {
+      showToast('error', 'Save blocked');
+    });
+
+    expect(kept()?.textContent).toContain('first');
+    expect(getToast().textContent).toContain('Save blocked');
+    expect(activeBox()?.style.top).toBe('110px');
+    expect(activeBox()?.style.maxHeight).toBe(`${window.innerHeight - 110 - 20}px`);
+    expect(activeBox()?.style.overflowY).toBe('auto');
+
+    act(() => {
+      kept()?.querySelector<HTMLButtonElement>('#app-toast-kept-close')?.click();
+    });
+    expect(kept()).toBeNull();
+    expect(activeBox()?.style.top).toBe('20px');
+  });
+
+  it('lays the later toast out again when the window is resized', () => {
+    showAndKeep('Saved, with warnings:\nfirst');
+    keptHeight(80);
+    act(() => {
+      showToast('error', 'Save blocked');
+    });
+
+    keptHeight(200);
+    act(() => {
+      window.dispatchEvent(new Event('resize'));
+    });
+
+    expect(activeBox()?.style.top).toBe('230px');
+  });
+
+  it('never shares an inner id with the toast shown below it', () => {
+    showAndKeep('Saved, with warnings:\nfirst');
+    act(() => {
+      showKeepOpenWarningToast('Saved, with warnings:\nsecond');
+    });
+
+    expect(document.querySelectorAll('#app-toast-close')).toHaveLength(1);
+    expect(document.querySelectorAll('#app-toast-message')).toHaveLength(1);
+    expect(kept()?.querySelector('#app-toast-kept-message')?.textContent).toContain('first');
+  });
+
+  it('is replaced by a later toast while it is still counting down', () => {
+    act(() => {
+      showKeepOpenWarningToast('Saved, with warnings:\nfirst');
+    });
+    act(() => {
+      showToast('error', 'Save blocked');
+    });
+
+    expect(kept()).toBeNull();
+    expect(document.querySelectorAll('#app-toast')).toHaveLength(1);
+    expect(getToast().textContent).not.toContain('first');
+  });
+
+  it('closes an earlier kept toast when a newer one is kept, so only the latest stays', () => {
+    showAndKeep('Saved, with warnings:\nfirst');
+    showAndKeep('Saved, with warnings:\nsecond');
+
+    expect(document.querySelectorAll('#app-toast-kept')).toHaveLength(1);
+    expect(kept()?.textContent).toContain('second');
+  });
+
+  it('is closed by closeKeptToast, which leaves the replaceable toast in place', () => {
+    showAndKeep('Saved, with warnings:\nfirst');
+    act(() => {
+      showToast('error', 'Save blocked');
+    });
+
+    act(() => {
+      closeKeptToast();
+    });
+    expect(kept()).toBeNull();
+    expect(getToast().textContent).toContain('Save blocked');
+  });
+
+  it('is removed by removeToast', () => {
+    showAndKeep('Saved, with warnings:\nfirst');
+
+    act(() => {
+      removeToast();
+    });
+    expect(kept()).toBeNull();
+  });
+
+  it('renders markup in the message literally', () => {
+    act(() => {
+      showKeepOpenWarningToast(PAYLOAD);
+    });
+
+    expect(getToast().querySelector('img')).toBeNull();
+    expect(getToast().textContent).toContain(PAYLOAD);
+  });
+
+  it('colours its icon with the text-safe warning token, keeping the brand colour for the border', () => {
+    act(() => {
+      showKeepOpenWarningToast('Saved, with warnings:\nfirst');
+    });
+
+    expect(getToast().querySelector('i.fas')?.getAttribute('style')).toContain(
+      'var(--warning-text)'
+    );
+  });
+
+  it('gives Keep open its test id', () => {
+    act(() => {
+      showKeepOpenWarningToast('Saved, with warnings:\nfirst');
+    });
+
+    expect(
+      getToast().querySelector('[data-testid="app-toast-keep-open-button"]')?.textContent
+    ).toBe('Keep open');
+  });
+
+  it('announces the warning through a live region that outlives the toast, without focus', () => {
+    act(() => {
+      showKeepOpenWarningToast('Saved, with warnings:\nfirst');
+    });
+
+    const region = document.getElementById('app-toast-live-assertive');
+    expect(region).not.toBeNull();
+    expect(region).toHaveAttribute('role', 'alert');
+    expect(region).toHaveAttribute('aria-live', 'assertive');
+    expect(getToast().contains(region)).toBe(false);
+    expect(document.activeElement).toBe(document.body);
+
+    act(() => {
+      jest.advanceTimersByTime(ANNOUNCE_DELAY_MS);
+    });
+    expect(region?.textContent).toBe('Saved, with warnings:\nfirst');
+
+    act(() => {
+      showKeepOpenWarningToast('Saved, with warnings:\nfirst');
+    });
+    expect(region?.textContent).toBe('');
+    act(() => {
+      jest.advanceTimersByTime(ANNOUNCE_DELAY_MS);
+    });
+    expect(region?.textContent).toBe('Saved, with warnings:\nfirst');
+    expect(document.querySelectorAll('#app-toast-live-assertive')).toHaveLength(1);
+  });
+
+  it('does not announce a toast closed before its announcement is read', () => {
+    act(() => {
+      showKeepOpenWarningToast('Saved, with warnings:\nclosed early');
+    });
+    act(() => {
+      getToast().querySelector<HTMLButtonElement>('#app-toast-close')?.click();
+    });
+    act(() => {
+      jest.advanceTimersByTime(ANNOUNCE_DELAY_MS);
+    });
+
+    expect(document.getElementById('app-toast-live-assertive')?.textContent).toBe('');
+  });
+
+  it('announces only the newer of two toasts shown within the delay', () => {
+    act(() => {
+      showKeepOpenWarningToast('Saved, with warnings:\nolder');
+    });
+    act(() => {
+      jest.advanceTimersByTime(ANNOUNCE_DELAY_MS / 2);
+    });
+    act(() => {
+      showKeepOpenWarningToast('Saved, with warnings:\nnewer');
+    });
+    act(() => {
+      jest.advanceTimersByTime(ANNOUNCE_DELAY_MS / 2);
+    });
+    const region = document.getElementById('app-toast-live-assertive');
+    expect(region?.textContent).toBe('');
+
+    act(() => {
+      jest.advanceTimersByTime(ANNOUNCE_DELAY_MS / 2);
+    });
+    expect(region?.textContent).toBe('Saved, with warnings:\nnewer');
+  });
+});
+
+describe('showSuccessCountdownToast', () => {
+  beforeEach(() => jest.useFakeTimers());
+
+  afterEach(() => {
+    removeToast();
+    jest.useRealTimers();
+  });
+
+  it('counts down 3 seconds by default beside the close button alone, then closes', () => {
+    showSuccessCountdownToast('Agent Surface "orders" saved');
+
+    const toast = getToast();
+    expect(toast.querySelector('i.fas')).toHaveClass('fa-check-circle');
+    expect(toast.querySelector('i.fas')?.getAttribute('style')).toContain('var(--success-text)');
+    expect(toast.querySelector<HTMLElement>('#app-toast-bar-fill')?.style.transitionDuration).toBe(
+      '3000ms'
+    );
+    expect(toast.querySelector('#app-toast-button-mount')).toBeNull();
+    expect(toast.querySelectorAll('button')).toHaveLength(1);
+    expect(toast.querySelector('#app-toast-close')).not.toBeNull();
+    expect(toast.querySelector('#app-toast-message')?.textContent).toBe(
+      'Agent Surface "orders" saved'
+    );
+
+    jest.advanceTimersByTime(2999);
+    expect(document.getElementById('app-toast')).not.toBeNull();
+    jest.advanceTimersByTime(1);
+    expect(document.getElementById('app-toast')).toBeNull();
+  });
+
+  it('announces the message politely', () => {
+    showSuccessCountdownToast('Agent Surface "orders" saved');
+
+    const region = document.getElementById('app-toast-live-polite');
+    expect(region).toHaveAttribute('role', 'status');
+    expect(region).toHaveAttribute('aria-live', 'polite');
+    jest.advanceTimersByTime(ANNOUNCE_DELAY_MS);
+    expect(region?.textContent).toBe('Agent Surface "orders" saved');
   });
 });
 

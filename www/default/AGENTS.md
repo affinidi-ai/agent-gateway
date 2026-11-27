@@ -69,13 +69,39 @@ Applies to:
 
 ## Toasts
 
-`showToast` and `showUndoToast` (`utils/toaster.ts`) render the message and the action label as
-text (`textContent`), never as HTML, so a name or a server error message in a toast cannot run
-script. Pass plain text only: markup such as `<b>` shows literally, and callers must not
+`showToast`, `showUndoToast`, `showKeepOpenWarningToast` and `showSuccessCountdownToast`
+(`utils/toaster.ts`) render the message and the action label as text (`textContent`), never as
+HTML, so a name or a server error message in a toast cannot run script. Pass plain text only: markup such as `<b>` shows literally, and callers must not
 escape the text themselves. `showUndoToast` returns a function that dismisses that toast
 without Undo, as its close button does. A new toast replaces the one on screen and stops it:
 the replaced toast's timer and `u` key no longer act, and an Undo toast counts as dismissed
-without Undo (its `onExpire` runs). `removeToast` does the same. This holds on every page.
+without Undo (its `onExpire` runs). `removeToast` does the same and also closes a kept toast.
+This holds on every page.
+
+`showKeepOpenWarningToast` is a warning toast that counts down 10 seconds, and the next toast
+replaces it while it does. Its **Keep open** button stops the countdown, removes the bar and
+the button, moves focus to the close button and keeps the toast (`#app-toast-kept`, its close
+button and message renamed `#app-toast-kept-close` and `#app-toast-kept-message` so no id is on
+screen twice) until it is closed: a later toast no longer replaces it but is shown below it,
+capped at the height left in the viewport and scrolling, laid out again on a window resize and
+moving back to the top when the kept toast closes. Keeping a newer warnings toast closes the
+older kept one. `closeKeptToast` closes a kept toast and leaves the replaceable one; the surface
+page calls it when it leaves its surface, for another surface or another page, and
+`showSurfaceSaveToast` calls it before every save's toast, so kept save warnings last no longer
+than the save and the surface they are about.
+`showSuccessCountdownToast` is a success toast that counts down 3 seconds with no other button.
+Both colour the left border with the brand colour (`UI_COLORS`) and the icon with the text-safe
+token (`--warning-text`, `--success-text`), so the icon keeps 3:1 in both themes.
+
+Every toast closes with the same × button (`closeButtonHtml`, `#app-toast-close`, title
+"Dismiss"), the last item of its row. The message beside it shrinks and wraps (`min-width:0`,
+`overflow-wrap:anywhere`), so a long unbroken name never pushes the button out of the toast. The
+countdown toasts (`showUndoToast`, `showKeepOpenWarningToast`, `showSuccessCountdownToast`) are
+announced to screen readers through two live regions that stay in the page between toasts,
+`#app-toast-live-polite` (`role="status"`) and `#app-toast-live-assertive` (`role="alert"`, for
+the warning toast), without taking focus. A toast closed or replaced before its announcement is
+written is not announced. Plain `showToast` toasts are not announced. **Keep open** carries
+`data-testid="app-toast-keep-open-button"`.
 
 ## Test identifiers
 
@@ -471,11 +497,22 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   The dashboard shows none of these after a save (`shownSaveWarnings` in
   `elements/saveWarnings.ts` drops them, a variant's prefix ignored). Every other `Warning` header is shown.
   `showSurfaceSaveToast` (`elements/saveWarnings.ts`) shows a save in one toast, since a later
-  toast replaces an earlier one: "<saved>" alone as `success`, or "<saved>, with warnings:"
-  and one line per warning as a `warning` toast, the shown `Warning` headers first, then the
-  dashboard's own non-blocking issues (`validateSurfacePayload`), each message once. The same
-  headers fill `SaveWarningsBanner` on the edit page, and a create that drew any opens the new
-  surface's page so the banner lists them.
+  toast replaces an earlier one: "<saved>" alone, or "<saved>, with warnings:" and one line per
+  warning, the shown `Warning` headers first, then the dashboard's own non-blocking issues
+  (`validateSurfacePayload`), each message once, every one in full (no limit, no cutting),
+  the message scrolling past 40% of the viewport height. Both are laid out as the "Changes discarded."
+  undo toast (`showCountdownToast` in `utils/toaster.ts`), with its countdown bar and inline
+  close button. "<saved>" alone is `showSuccessCountdownToast`: the success icon and colour, no
+  other button, closing after 3 seconds. A toast with warnings is `showKeepOpenWarningToast`:
+  **Keep open** where Undo is, closing after 10 seconds unless Keep open is pressed, which
+  keeps it until it is closed, the next save shows its toast, or the page leaves that surface,
+  with other later toasts (a blocked Save's) shown below it rather than replacing it; screen
+  readers announce it assertively. The close button is that of every toast and the live regions
+  are those of the countdown toasts; see _Toasts_. The warnings toast is the only place a save's
+  warnings are listed, with no banner above the canvas. A create that drew gateway warnings opens
+  the new surface's page, carrying them so the Transit Point a warning names shows it in its
+  panel; one with only the dashboard's own warnings returns to the surface list, where a kept
+  toast stays until it is closed or the next save shows its toast.
 - **Transit Settings** has no listener authentication control: the gateway does not support
   `transit.source_auth` and refuses a save that sets it. **Transit Token Mode** is shown, not
   chosen: only the embedded token exists, signed and readable by the agent, not encrypted, so
@@ -764,8 +801,7 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
     target endpoint does, since the gateway checks it as written. The Managed Agent editors learn whether the
     Access Point checks its callers from `accessPointChecksCallers` in `SurfaceMetaContext`,
     which the surface pages set from the draft payload (`hasCallerAuthentication`). After a
-    save in `warn` the header's message shows in the save toast and the surface page's save
-    warnings banner; in `enforce` the gateway's 400 shows in the page's error alert. The
+    save in `warn` the header's message shows in the save toast; in `enforce` the gateway's 400 shows in the page's error alert. The
     whole-surface caller check is a `warning` issue in `validateSurfacePayload`, left out when
     the stored surface already had it on the same leg with the same setting and endpoint.
   - **Advice with no gateway rule.** The same box also shows a passthrough fallback (the

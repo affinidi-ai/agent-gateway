@@ -20,6 +20,68 @@ export interface ToastOptions {
   action?: ToastAction;
 }
 
+/** Every toast's close button: the last item of its row, vertically centred. */
+const closeButtonHtml = (closeColor: string) => `
+        <button id="app-toast-close" type="button" title="Dismiss"
+                style="flex-shrink:0;background:transparent;border:none;
+                       padding:0;cursor:pointer;line-height:1;">
+          <span style="font-size:1.2em;color:${closeColor};">&times;</span>
+        </button>`;
+
+/**
+ * Live regions that stay in the page between toasts, one per politeness, so a screen reader
+ * announces a toast's message without the toast taking focus. A region inserted together with
+ * its text is often not announced, which is why these outlive any one toast.
+ */
+const LIVE_REGION_ID = {
+  polite: 'app-toast-live-polite',
+  assertive: 'app-toast-live-assertive',
+} as const;
+
+/** How long a cleared live region stays empty before it gets the new text, so a repeat is read. */
+export const ANNOUNCE_DELAY_MS = 100;
+
+/** The announcement waiting to be written to each region; a newer one cancels it. */
+const pendingAnnounce: Partial<Record<keyof typeof LIVE_REGION_ID, ReturnType<typeof setTimeout>>> =
+  {};
+
+/** Announces `message` and returns its pending announcement, for `cancelAnnounce`. */
+const announce = (
+  message: string,
+  politeness: keyof typeof LIVE_REGION_ID
+): ReturnType<typeof setTimeout> => {
+  const id = LIVE_REGION_ID[politeness];
+  let region = document.getElementById(id);
+  if (!region) {
+    region = document.createElement('div');
+    region.id = id;
+    region.className = 'visually-hidden';
+    region.setAttribute('role', politeness === 'assertive' ? 'alert' : 'status');
+    region.setAttribute('aria-live', politeness);
+    region.setAttribute('aria-atomic', 'true');
+    document.body.appendChild(region);
+  }
+  const target = region;
+  target.textContent = '';
+  clearTimeout(pendingAnnounce[politeness]);
+  const pending = setTimeout(() => {
+    delete pendingAnnounce[politeness];
+    target.textContent = message;
+  }, ANNOUNCE_DELAY_MS);
+  pendingAnnounce[politeness] = pending;
+  return pending;
+};
+
+/** Cancels `pending` if it is still waiting, so a toast closed before it is read stays quiet. */
+const cancelAnnounce = (
+  politeness: keyof typeof LIVE_REGION_ID,
+  pending: ReturnType<typeof setTimeout>
+) => {
+  if (pendingAnnounce[politeness] !== pending) return;
+  clearTimeout(pending);
+  delete pendingAnnounce[politeness];
+};
+
 // Removes the toast on screen with its timer and key handler; a new toast replaces it through this.
 let dismissActive: (() => void) | null = null;
 
@@ -27,6 +89,35 @@ const replaceActiveToast = () => {
   dismissActive?.();
   document.getElementById('app-toast')?.remove();
 };
+
+/**
+ * A toast its user chose to keep (Keep open) leaves the replaceable slot: it takes this id,
+ * a new toast no longer replaces it, and the toast on screen is laid out below it.
+ */
+const KEPT_TOAST_ID = 'app-toast-kept';
+let dismissKept: (() => void) | null = null;
+
+const TOAST_TOP_PX = 20;
+const TOAST_GAP_PX = 10;
+
+/**
+ * Places the replaceable toast below a kept one, or at the top when none is kept, and caps its
+ * height at the room left in the viewport so it scrolls rather than running off the screen.
+ */
+const layoutToasts = () => {
+  const active = document.getElementById('app-toast')?.firstElementChild as HTMLElement | null;
+  if (!active) return;
+  const kept = document.getElementById(KEPT_TOAST_ID)?.firstElementChild;
+  const top = TOAST_TOP_PX + (kept ? kept.getBoundingClientRect().height + TOAST_GAP_PX : 0);
+  active.style.top = `${top}px`;
+  active.style.maxHeight = `${Math.max(window.innerHeight - top - TOAST_TOP_PX, 0)}px`;
+  active.style.overflowY = 'auto';
+};
+
+if (typeof window !== 'undefined') window.addEventListener('resize', layoutToasts);
+
+/** The ids inside a toast that a kept toast renames, so two toasts on screen never share one. */
+const KEPT_INNER_IDS = ['app-toast-close', 'app-toast-message'] as const;
 
 export const showToast = (
   type: ToastType,
@@ -80,7 +171,7 @@ export const showToast = (
   // `text` and the action label are attached afterwards as text nodes, never parsed as HTML,
   // because toasts carry user-controlled names and server error messages.
   toast.innerHTML = `
-    <div class="alert ${alertClass} alert-dismissible fade show" style="
+    <div class="alert ${alertClass} fade show" style="
       position: fixed; 
       top: 20px; 
       right: 20px; 
@@ -100,13 +191,10 @@ export const showToast = (
         <div class="me-3">
           <i class="fas ${icon}" style="font-size: 1.2em; color: ${borderColor};"></i>
         </div>
-        <div class="flex-grow-1">
+        <div class="flex-grow-1 me-2" style="min-width:0;overflow-wrap:anywhere;">
           <strong>${label}</strong><br/>
-        </div>
+        </div>${closeButtonHtml(closeColor)}
       </div>
-      <button type="button" class="close" title="Close notification" style="position: absolute; top: 10px; right: 15px; z-index: 1000; background: transparent; border: none;">
-        <span style="font-size: 1.2em; color: ${closeColor};">&times;</span>
-      </button>
     </div>
   `;
 
@@ -151,11 +239,12 @@ export const showToast = (
     }
   }
 
-  toast.querySelector('button.close')?.addEventListener('click', close);
+  toast.querySelector('#app-toast-close')?.addEventListener('click', close);
 
   // Add to page
   document.body.appendChild(toast);
   dismissActive = close;
+  layoutToasts();
 
   // Auto-remove with different timers based on type and options
   if (options.autoRemove && type !== 'loading') {
@@ -165,7 +254,16 @@ export const showToast = (
   }
 };
 
-export const removeToast = replaceActiveToast;
+/** Closes the kept toast, if any; the replaceable one stays. */
+export const closeKeptToast = () => {
+  dismissKept?.();
+};
+
+/** Removes every toast on screen, a kept one included. */
+export const removeToast = () => {
+  replaceActiveToast();
+  closeKeptToast();
+};
 
 export interface UndoToastOptions {
   message?: string;
@@ -175,17 +273,56 @@ export interface UndoToastOptions {
   onExpire?: () => void;
 }
 
+/** What the button of a countdown toast can do to its toast. */
+interface CountdownToastControls {
+  /** Removes the toast; `expired` runs its `onExpire`. */
+  remove: (expired: boolean) => void;
+  /**
+   * Stops the countdown and keeps the toast until it is closed: a later toast is shown below it
+   * instead of replacing it, and an earlier kept toast is closed.
+   */
+  keep: () => void;
+}
+
+interface CountdownToastOptions {
+  message: string;
+  duration: number;
+  accent: string;
+  /** Font Awesome icon class shown before the message. */
+  icon?: string;
+  /** The icon's colour; `accent` when unset. */
+  iconColor?: string;
+  /** The button beside the close button; none without a label. */
+  buttonLabel?: string;
+  /** The button's `data-testid`. */
+  buttonTestId?: string;
+  onButton?: (controls: CountdownToastControls) => void;
+  /** How a screen reader announces the message: `assertive` interrupts, `polite` waits. */
+  politeness?: keyof typeof LIVE_REGION_ID;
+  /** Called when the toast expires or is closed without its button removing it. */
+  onExpire?: () => void;
+  /** A key that presses the button while the toast is visible (ignored inside inputs). */
+  shortcut?: string;
+}
+
 /**
- * Toast with an Undo action and a live countdown progress bar.
- * Auto-dismisses after `duration` ms (default 5000). Returns a function that dismisses it
- * without Undo, as its close button does.
+ * Toast with a countdown progress bar and, with `buttonLabel`, one button beside its close
+ * button. Closes after `duration` ms. Returns a function that closes it, as its close button
+ * does.
  */
-export const showUndoToast = ({
-  message = 'Changes discarded.',
-  duration = 5000,
-  onUndo,
+const showCountdownToast = ({
+  message,
+  duration,
+  accent,
+  icon = 'fa-exclamation-triangle',
+  iconColor = accent,
+  buttonLabel,
+  buttonTestId,
+  onButton,
+  politeness = 'polite',
   onExpire,
-}: UndoToastOptions): (() => void) => {
+  shortcut,
+}: CountdownToastOptions): (() => void) => {
   replaceActiveToast();
 
   const isDark = document.body.classList.contains('dark-theme');
@@ -193,7 +330,6 @@ export const showUndoToast = ({
   const borderRing = isDark ? '1px solid rgba(255,255,255,0.08)' : '1px solid rgba(0,0,0,0.06)';
   const textColor = isDark ? '#f1f5f9' : 'inherit';
   const closeColor = isDark ? '#94a3b8' : UI_COLORS.neutralMuted;
-  const accent = UI_COLORS.primary;
   // Progress bar: 2 neutral levels lighter than the toast background
   // light ≈ neutral-50 → neutral-200 (#e5e5e5); dark ≈ neutral-900 → neutral-700 (#404040)
   const barColor = isDark ? '#404040' : '#e5e5e5';
@@ -215,14 +351,9 @@ export const showUndoToast = ({
            style="height:3px;width:100%;background:${barColor};transition:width linear;"></div>
       <div style="height:1.5em;"></div>
       <div style="display:flex;align-items:center;gap:10px;padding:0 12px;font-size:0.9em;">
-        <i class="fas fa-exclamation-triangle" style="color:${accent};flex-shrink:0;"></i>
-        <span id="app-toast-message" style="flex:1;"></span>
-        <span id="app-toast-undo-mount" style="flex-shrink:0;"></span>
-        <button id="app-toast-close" type="button" title="Dismiss"
-                style="flex-shrink:0;background:transparent;border:none;
-                       padding:0;cursor:pointer;line-height:1;">
-          <span style="font-size:1.2em;color:${closeColor};">&times;</span>
-        </button>
+        <i class="fas ${icon}" style="color:${iconColor};flex-shrink:0;"></i>
+        <span id="app-toast-message" style="flex:1;white-space:pre-line;max-height:40vh;overflow-y:auto;overflow-wrap:anywhere;"></span>
+        <span id="app-toast-button-mount" style="flex-shrink:0;"></span>${closeButtonHtml(closeColor)}
       </div>
       <div style="height:1.5em;"></div>
     </div>`;
@@ -230,53 +361,78 @@ export const showUndoToast = ({
   const messageEl = toast.querySelector<HTMLElement>('#app-toast-message');
   if (messageEl) messageEl.textContent = message;
   document.body.appendChild(toast);
+  layoutToasts();
+  const announcement = announce(message, politeness);
 
-  let undoRoot: Root | null = null;
+  let buttonRoot: Root | null = null;
+  const unmountButton = () => {
+    buttonRoot?.unmount();
+    buttonRoot = null;
+  };
 
   let removed = false;
-  const remove = (undone: boolean) => {
+  const remove = (expired: boolean) => {
     if (removed) return;
     removed = true;
     if (dismissActive === dismiss) dismissActive = null;
+    if (dismissKept === dismiss) dismissKept = null;
     document.removeEventListener('keydown', keyHandler);
     clearTimeout(timer);
-    undoRoot?.unmount();
-    undoRoot = null;
+    cancelAnnounce(politeness, announcement);
+    unmountButton();
     toast.remove();
-    if (!undone) onExpire?.();
+    layoutToasts();
+    if (expired) onExpire?.();
   };
-  const dismiss = () => remove(false);
+  const dismiss = () => remove(true);
 
-  const fireUndo = () => {
-    remove(true);
-    onUndo();
+  const fill = toast.querySelector<HTMLElement>('#app-toast-bar-fill');
+  const mountEl = toast.querySelector<HTMLElement>('#app-toast-button-mount');
+  const stopCountdown = () => {
+    clearTimeout(timer);
+    document.removeEventListener('keydown', keyHandler);
+    toast.querySelector<HTMLElement>('#app-toast-close')?.focus();
+    fill?.remove();
+    unmountButton();
+    mountEl?.remove();
   };
+  const keep = () => {
+    stopCountdown();
+    dismissKept?.();
+    if (dismissActive === dismiss) dismissActive = null;
+    toast.id = KEPT_TOAST_ID;
+    for (const id of KEPT_INNER_IDS) {
+      const inner = toast.querySelector(`#${id}`);
+      if (inner) inner.id = id.replace('app-toast-', `${KEPT_TOAST_ID}-`);
+    }
+    dismissKept = dismiss;
+  };
+  const pressButton = () => onButton?.({ remove, keep });
 
-  const mountEl = toast.querySelector<HTMLElement>('#app-toast-undo-mount');
-  if (mountEl) {
-    undoRoot = createRoot(mountEl);
-    undoRoot.render(
-      React.createElement(
-        AppButton,
-        { variant: 'secondary', size: 'sm', onClick: fireUndo },
-        'Undo'
-      )
-    );
+  if (!buttonLabel) {
+    mountEl?.remove();
+  } else if (mountEl) {
+    const buttonProps: React.ComponentProps<typeof AppButton> & { 'data-testid'?: string } = {
+      variant: 'secondary',
+      size: 'sm',
+      onClick: pressButton,
+      'data-testid': buttonTestId,
+    };
+    buttonRoot = createRoot(mountEl);
+    buttonRoot.render(React.createElement(AppButton, buttonProps, buttonLabel));
   }
 
   toast.querySelector('#app-toast-close')?.addEventListener('click', dismiss);
 
-  // 'u' key triggers undo while the toast is visible (ignored inside inputs).
   const keyHandler = (e: KeyboardEvent) => {
-    if (e.key !== 'u' || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (!shortcut || e.key !== shortcut || e.ctrlKey || e.metaKey || e.altKey) return;
     const tag = ((document.activeElement as HTMLElement | null)?.tagName ?? '').toUpperCase();
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-    fireUndo();
+    pressButton();
   };
   document.addEventListener('keydown', keyHandler);
 
   // Progress bar: animate from 100% → 0% over `duration`
-  const fill = toast.querySelector<HTMLElement>('#app-toast-bar-fill');
   if (fill) {
     fill.style.transitionDuration = `${duration}ms`;
     void fill.offsetWidth; // force reflow so transition fires from 100%
@@ -287,3 +443,57 @@ export const showUndoToast = ({
   dismissActive = dismiss;
   return dismiss;
 };
+
+/**
+ * Toast with an Undo action and a live countdown progress bar.
+ * Auto-dismisses after `duration` ms (default 5000). Returns a function that dismisses it
+ * without Undo, as its close button does.
+ */
+export const showUndoToast = ({
+  message = 'Changes discarded.',
+  duration = 5000,
+  onUndo,
+  onExpire,
+}: UndoToastOptions): (() => void) =>
+  showCountdownToast({
+    message,
+    duration,
+    accent: UI_COLORS.primary,
+    buttonLabel: 'Undo',
+    onButton: ({ remove }) => {
+      remove(false);
+      onUndo();
+    },
+    onExpire,
+    shortcut: 'u',
+  });
+
+/**
+ * Warning toast laid out as the undo toast: a countdown progress bar, and a Keep open
+ * button where Undo is, which keeps the toast until it is closed, with later toasts shown below
+ * it. Closes after `duration` ms (default 10000). Screen readers announce it assertively.
+ */
+export const showKeepOpenWarningToast = (message: string, duration = 10000): (() => void) =>
+  showCountdownToast({
+    message,
+    duration,
+    accent: UI_COLORS.warning,
+    iconColor: 'var(--warning-text)',
+    buttonLabel: 'Keep open',
+    buttonTestId: 'app-toast-keep-open-button',
+    onButton: ({ keep }) => keep(),
+    politeness: 'assertive',
+  });
+
+/**
+ * Success toast laid out as the undo toast: a countdown progress bar and the close button,
+ * with no other button. Closes after `duration` ms (default 3000, as a plain success toast).
+ */
+export const showSuccessCountdownToast = (message: string, duration = 3000): (() => void) =>
+  showCountdownToast({
+    message,
+    duration,
+    accent: UI_COLORS.success,
+    iconColor: 'var(--success-text)',
+    icon: 'fa-check-circle',
+  });

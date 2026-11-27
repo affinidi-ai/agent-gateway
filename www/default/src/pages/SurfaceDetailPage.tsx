@@ -1,8 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef, useReducer, useMemo } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { AgentSurface, apiClient } from '../api';
-import { showToast } from '../utils/toaster';
-import SaveWarningsBanner from '../components/surface-builder/SaveWarningsBanner';
+import { closeKeptToast, showToast } from '../utils/toaster';
 import { usePermissions } from '../context/PermissionsContext';
 import { usePageTitle } from '../context/PageTitleContext';
 import { useApp } from '../context/AppContext';
@@ -143,8 +142,8 @@ const SurfaceDetailPage: React.FC = () => {
   const [deleting, setDeleting] = useState(false);
   const [deleteAnchor, setDeleteAnchor] = useState<HTMLElement | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // `Warning` headers of the last save but the Access Point's, shown in the
-  // banner and on the Transit Points they name.
+  // `Warning` headers of the last save but the Access Point's, shown on the
+  // Transit Points they name; the save toast lists them all.
   // A create that drew warnings sends them here in the route state. They are
   // kept with the surface they are about, since this page stays mounted when
   // the route moves to another surface.
@@ -168,6 +167,9 @@ const SurfaceDetailPage: React.FC = () => {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  // A kept save-warnings toast belongs to this surface, so it closes when the
+  // page leaves it, for another surface or another page.
+  useEffect(() => closeKeptToast, [surfaceId]);
   const [hasAttemptedSave, setHasAttemptedSave] = useState(false);
   const surfacePolicyLoadState = useSurfacePolicyDefinitions();
   const surfacePolicyIds =
@@ -1789,7 +1791,7 @@ const SurfaceDetailPage: React.FC = () => {
         canEdit={canEdit}
         builder={builder}
         topBanner={
-          error || refusingRequests || (saveWarnings && saveWarnings.length > 0) ? (
+          error || refusingRequests ? (
             <>
               {refusingRequests && (
                 <div
@@ -1811,7 +1813,6 @@ const SurfaceDetailPage: React.FC = () => {
                   {error}
                 </div>
               )}
-              <SaveWarningsBanner warnings={saveWarnings} />
             </>
           ) : null
         }
