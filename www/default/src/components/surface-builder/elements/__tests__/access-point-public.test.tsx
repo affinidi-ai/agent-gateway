@@ -282,6 +282,20 @@ describe('showSurfaceSaveToast', () => {
     ]);
   });
 
+  it('lists every warning in full, however many and however long', () => {
+    const long = `long ${'x'.repeat(400)}`;
+    const headerWarnings = ['one', 'two', long, 'four', 'five'];
+    showSurfaceSaveToast(
+      'Saved',
+      storedSurface({ public: true, caller_authentication: API_KEY_AUTH }),
+      { headerWarnings }
+    );
+    expect(keepOpenToast.mock.calls).toEqual([
+      [`Saved, with warnings:\n${headerWarnings.join('\n')}`],
+    ]);
+    expect(keepOpenToast.mock.calls[0][0]).not.toContain('more');
+  });
+
   it('adds no public warning of its own', () => {
     showSurfaceSaveToast('Saved', storedSurface({ public: true }));
     expect(successToast.mock.calls).toEqual([['Saved']]);

@@ -446,7 +446,8 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `showSurfaceSaveToast` (`elements/saveWarnings.ts`) shows a save in one toast, since a later
   toast replaces an earlier one: "<saved>" alone, or "<saved>, with warnings:" and one line per
   warning, the shown `Warning` headers first, then the dashboard's own non-blocking issues
-  (`validateSurfacePayload`), each message once. Both are laid out as the "Changes discarded."
+  (`validateSurfacePayload`), each message once, every one in full (no limit, no cutting),
+  the message scrolling past 40% of the viewport height. Both are laid out as the "Changes discarded."
   undo toast (`showCountdownToast` in `utils/toaster.ts`), with its countdown bar and inline
   close button. "<saved>" alone is `showSuccessCountdownToast`: the success icon and colour, no
   other button, closing after 3 seconds. A toast with warnings is `showKeepOpenWarningToast`:

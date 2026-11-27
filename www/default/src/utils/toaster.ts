@@ -247,7 +247,7 @@ const showCountdownToast = ({
       <div style="height:1.5em;"></div>
       <div style="display:flex;align-items:center;gap:10px;padding:0 12px;font-size:0.9em;">
         <i class="fas ${icon}" style="color:${accent};flex-shrink:0;"></i>
-        <span id="app-toast-message" style="flex:1;white-space:pre-line;"></span>
+        <span id="app-toast-message" style="flex:1;white-space:pre-line;max-height:40vh;overflow-y:auto;overflow-wrap:anywhere;"></span>
         <span id="app-toast-button-mount" style="flex-shrink:0;"></span>${closeButtonHtml(closeColor)}
       </div>
       <div style="height:1.5em;"></div>
