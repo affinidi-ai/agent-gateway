@@ -1,0 +1,25 @@
+branch: feat/add-minimal-make-target-for-ci-linting-fmt-etc
+changes:
+  added:
+    - timestamp: '2026-11-27T00:00:00Z'
+      title: Add make ci-happy to run the blocking CI jobs locally, in parallel
+      description: >-
+        `make ci-happy` runs the blocking jobs of the CI workflows with each job's own commands
+        (rustfmt, Clippy, cargo audit and deny, the frontend checks, docs, Gherkin, changelog,
+        toolchain pins, coverage and the BDD and MCP conformance suites), side by side where they
+        do not share a build directory or files, so a branch can be checked before it is pushed.
+        It leaves the unit test job out, since coverage runs the same tests, uses the locally
+        installed tools, and runs the gateway-to-gateway scenarios in parallel, where CI runs
+        them one by one. Each job is also its own `ci-<job>` target to
+        rerun alone, and `PARALLEL=0` runs them one at a time. `make ci-happy-quick` runs only
+        the format, lint and dependency checks, with no tests, in a minute or two; `make
+        ci-happy-full` is `make ci-happy` by its full name. A new CI job, `local-tooling`, tests
+        the parallel runner behind these targets and `make local` with a stand-in `make`:
+        passing, failing, serial, nested and killed groups. `make ci-happy` and `make local`
+        report each group as it ends and, every 30 seconds, what each group still running is
+        doing.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

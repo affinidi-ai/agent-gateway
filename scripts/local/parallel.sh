@@ -12,6 +12,9 @@
 # logs together; tmp/local/latest points at the newest. The oldest folders past
 # the last KEEP_RUNS (20) are removed as a run starts.
 #
+# Each group is reported as it ends, and every PROGRESS_SECS (30; 0: never)
+# each group still running is named with its time and its log's last line.
+#
 # PARALLEL=0 runs the groups one after another (less memory, same logs).
 # ALLOW_FAIL names groups whose failure is only a warning (space-separated).
 # Ctrl-C reaches every group: they share the terminal's process group.
@@ -60,12 +63,18 @@ say() {
     return 0
 }
 
-# One group: its make, its log, then its exit status and seconds.
+# One group: its make, its log, then its exit status and seconds, renamed into
+# place so a reader never sees the status half written.
 run() {
     local name=$1 start=$SECONDS
     shift
     "$make" --no-print-directory "$@" >"$dir/$name.log" 2>&1
-    echo "$? $((SECONDS - start))" >"$dir/$name.status"
+    echo "$? $((SECONDS - start))" >"$dir/$name.status.tmp"
+    mv "$dir/$name.status.tmp" "$dir/$name.status"
+}
+
+took() { # seconds as 1m 2s
+    printf '%dm %ds' "$(($1 / 60))" "$(($1 % 60))"
 }
 
 # The tree: each nesting level is indented one step under its parent, and a
@@ -80,7 +89,30 @@ branch() { # the glyph for item $1 of $2
     if [ "$1" -eq "$2" ]; then printf '└─'; else printf '├─'; fi
 }
 
+# A group as it ends: one line, the full detail waits for the summary.
+report() {
+    local name=$1 rc=1 secs=0
+    [ -f "$dir/$name.status" ] && read -r rc secs <"$dir/$name.status"
+    if [ "$rc" = 0 ]; then
+        say "${pad}${dim}·${off} ${green}✅ $name ($(took "$secs"))${off}"
+    elif [[ " ${ALLOW_FAIL:-} " == *" $name "* ]]; then
+        say "${pad}${dim}·${off} ${yellow}⚠️  $name ($(took "$secs")): failed, allowed - $dir/$name.log${off}"
+    else
+        say "${pad}${dim}·${off} ${red}❌ $name ($(took "$secs")) - $dir/$name.log${off}"
+    fi
+}
+
+# A group still running: its time so far and its log's last line, without
+# colours or any other control character, and cut to fit a line.
+beat() {
+    local name=$1 since=$2 line
+    line=$(tail -n 1 "$dir/$name.log" 2>/dev/null | sed $'s/\033\\[[0-9;]*m//g' | tr -d '\000-\010\013-\037\177')
+    say "${pad}${dim}… $name ($(took $((SECONDS - since)))): ${line:0:100}${off}"
+}
+
 names=()
+starts=()
+pids=()
 started=$SECONDS
 say "${pad}${blue}▶ $title${off}"
 n=0
@@ -88,16 +120,46 @@ for group in "$@"; do
     name=${group%%=*}
     args=${group#*=}
     names+=("$name")
+    starts+=("$SECONDS")
     n=$((n + 1))
-    rm -f "$dir/$name.status"
+    rm -f "$dir/$name.status" "$dir/$name.status.tmp"
     say "${pad}${dim}$(branch "$n" "$#") $name: make $args  (log: $dir/$name.log)${off}"
     # shellcheck disable=SC2086 # a group's make arguments split on spaces
     if [ "${PARALLEL:-1}" = 0 ]; then
         run "$name" $args
+        report "$name"
     else
         run "$name" $args &
+        pids+=("$!")
     fi
 done
+if [ "${PARALLEL:-1}" != 0 ]; then
+    every=${PROGRESS_SECS:-30}
+    last_beat=$SECONDS
+    reported=()
+    while :; do
+        running=0
+        for i in "${!names[@]}"; do
+            [ "${reported[i]:-0}" = 1 ] && continue
+            # A group whose process is gone without a status ended too: it is
+            # reported failed rather than waited for.
+            if [ -f "$dir/${names[i]}.status" ] || ! kill -0 "${pids[i]}" 2>/dev/null; then
+                report "${names[i]}"
+                reported[i]=1
+            else
+                running=1
+            fi
+        done
+        [ "$running" = 0 ] && break
+        if [ "$every" -gt 0 ] && [ $((SECONDS - last_beat)) -ge "$every" ]; then
+            for i in "${!names[@]}"; do
+                [ "${reported[i]:-0}" = 1 ] || beat "${names[i]}" "${starts[i]}"
+            done
+            last_beat=$SECONDS
+        fi
+        sleep 1
+    done
+fi
 wait
 
 failed=0
