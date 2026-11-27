@@ -47,7 +47,7 @@ Only credentials bound to the request itself qualify. See
 | 2 | `src/rbac/mod.rs` | Give the key its default role in `RbacConfig::default()`. A key missing from the map is denied to every role, administrators included. |
 | 3 | `config/examples/rbac.example.json` | Add the key with the same role, so the example shows it. |
 | 4 | `src/identity/handlers/` | Write the handler. |
-| 5 | `src/identity/router.rs` | Register the route with `.layer(require_feature(s.clone(), r.clone(), Feature::YourFeature))`. A route without this layer is unprotected. |
+| 5 | `src/identity/router.rs` | Register the route with `.layer(require_feature(s.clone(), r.clone(), Feature::YourFeature))`. A route without this layer is unprotected. A new route inside the session boundary fails the probes in `src/component_tests/management_route_guard.rs` unless it has a feature guard or an entry in that file's allow-list: a `HandlerChecked` or `RoleOnly` entry names the `Feature` its handler checks, any other entry gives a reason. |
 | 6 | `src/access_tokens/` | If the route touches a tenant-ownable record, check the resource pattern. Enforcement is fail-closed for unknown nested paths. |
 | 7 | `src/auth_manager/permissions.rs` | If the dashboard uses the feature, add its key to `get_permissions`. |
 | 8 | `www/default/src/api.ts` | Add the client call. Do not call `fetch` from a page. |
