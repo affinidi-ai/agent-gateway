@@ -455,6 +455,29 @@ async fn a_fabric_request_past_the_hop_limit_or_with_a_malformed_count_is_refuse
     assert_eq!(response["status"], 200, "the eighth crossing is within the limit: {response}");
 }
 
+/// A Fabric request whose receiving Connection Point DID is unknown is refused
+/// with `403` before the Target is called, since the recipient check on its
+/// identity presentations cannot run without it.
+#[tokio::test]
+async fn a_fabric_request_with_no_known_receiving_connection_point_is_refused() {
+    if ran_in_child("ATG_FABRIC_NO_RECEIVING_DID_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let _receiver = receiver(root.path(), &surface("a2a", &target.url, &["crm"])).await;
+    let headers = json!({ "content-type": "application/json", "x-api-key": CALLER_KEY });
+
+    let mut unaddressed = forward_request(root.path(), headers.clone(), a2a_body());
+    unaddressed.to_dids.clear();
+    let response = forward_response(&unaddressed).await;
+    assert_eq!(response["status"], 403, "{response}");
+    assert!(target.received().is_empty(), "a refused request never reaches the Target");
+
+    let response = forward_response(&forward_request(root.path(), headers, a2a_body())).await;
+    assert_eq!(response["status"], 200, "a request with a receiving Connection Point is served: {response}");
+}
+
 /// The agent of a surface without Transit Points gets no transit token, and
 /// never the one the peer sent.
 #[tokio::test]

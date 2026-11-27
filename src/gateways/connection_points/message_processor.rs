@@ -4891,6 +4891,15 @@ async fn process_charged_forward_request(
             };
         }
     };
+    // Identity presentations over Fabric must name the Connection Point they
+    // arrived on, so without it the recipient check cannot run: refuse.
+    let Some(receiving_did) = receiving_connection_point_did(message) else {
+        warn!("Rejecting forward-request from {:?}: receiving Connection Point DID unknown", message.from_did);
+        return ProcessingResult::RequiresResponse {
+            response_type: MessageType::ForwardResponse.to_string(),
+            response_body: forbidden_forward_response("Receiving Connection Point DID unknown"),
+        };
+    };
 
     // Extract config_id for channel-specific logging
     let config_id = surface.config_id().unwrap_or("unknown");
@@ -5348,7 +5357,7 @@ async fn process_charged_forward_request(
         };
         body_bytes = http_policy.cap_legacy_initialize(body_bytes, &classification, config_id, None);
         mcp_verified_binding = match crate::protocols::extensions::verify_mcp_metadata_identity(
-            &body_bytes, GLOBAL_VC_ISSUER.get(), &audit_facts, Some(&peer_issuers), receiving_connection_point_did(message),
+            &body_bytes, GLOBAL_VC_ISSUER.get(), &audit_facts, Some(&peer_issuers), Some(receiving_did),
         ).await {
             Ok(binding) => binding,
             Err(error) => {
@@ -5625,7 +5634,7 @@ async fn process_charged_forward_request(
             mcp_verified_binding.as_ref(),
             &peer_issuers,
             GLOBAL_VC_ISSUER.get(),
-            receiving_connection_point_did(message),
+            Some(receiving_did),
         ))
         .await;
 
@@ -5672,7 +5681,7 @@ async fn process_charged_forward_request(
         mcp_verified_binding.as_ref(),
         &peer_issuers,
         policy_mcp_context.as_ref(),
-        receiving_connection_point_did(message),
+        Some(receiving_did),
     ))
     .await
     {
