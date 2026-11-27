@@ -2711,18 +2711,22 @@ struct Unwritable(std::path::PathBuf);
 
 #[cfg(unix)]
 impl Unwritable {
-    fn new(file: &std::path::Path) -> Self {
+    /// Makes `dir` read-only, so no record in it can be saved: a save writes a
+    /// new file beside the record and renames it over the record.
+    fn new(dir: &std::path::Path) -> Self {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o400)).unwrap();
-        Self(file.to_path_buf())
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        Self(dir.to_path_buf())
     }
 
     /// Whether writing fails for this user: root writes anyway.
     fn applies(&self) -> bool {
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&self.0)
-            .is_err()
+        let probe = self
+            .0
+            .join(".unwritable-probe");
+        let written = std::fs::write(&probe, b"");
+        let _ = std::fs::remove_file(&probe);
+        written.is_err()
     }
 }
 
@@ -2730,7 +2734,7 @@ impl Unwritable {
 impl Drop for Unwritable {
     fn drop(&mut self) {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
     }
 }
 
@@ -2834,7 +2838,7 @@ async fn a2a_settings_a_reload_could_not_store_are_kept_by_its_storage_event() {
     )
     .unwrap();
 
-    let unwritable = Unwritable::new(&stored_path);
+    let unwritable = Unwritable::new(&surfaces_dir);
     if !unwritable.applies() {
         return;
     }

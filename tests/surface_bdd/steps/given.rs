@@ -3073,6 +3073,14 @@ fn surface_has_deny_all_request_policy(world: &mut SurfaceWorld) {
         .request_policy = Some(RequestPolicyFixture::new("bdd-deny-all", "BDD deny-all surface policy", rego));
 }
 
+#[given("the surface has a request policy that allows all requests")]
+fn surface_has_allow_all_request_policy(world: &mut SurfaceWorld) {
+    let rego = "package surface.policy\n\ndefault allow := true\n".to_string();
+    world
+        .surface_config
+        .request_policy = Some(RequestPolicyFixture::new("bdd-allow-all", "BDD allow-all surface policy", rego));
+}
+
 #[given(expr = "the MCP surface has a request policy that allows all requests")]
 fn mcp_surface_has_allow_all_request_policy(world: &mut SurfaceWorld) {
     let rego = "package surface.policy\n\ndefault allow := true\n".to_string();
@@ -3439,6 +3447,23 @@ fn surface_derives_inbound_identity_from_jwt_claim(world: &mut SurfaceWorld) {
     world
         .surface_config
         .jwt_claim_inbound_identity = true;
+}
+
+#[given(expr = "the surface maps caller header {string} into the identity binding presentation")]
+fn surface_maps_caller_header_into_the_identity_binding_presentation(
+    world: &mut SurfaceWorld,
+    header: String,
+) {
+    world
+        .surface_config
+        .identity_binding_header = Some(header);
+}
+
+#[given("the surface derives the inbound identity from the API key the caller presents")]
+fn surface_derives_inbound_identity_from_presented_api_key(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .api_key_inbound_identity = true;
 }
 
 #[given(expr = "the surface injects custom metadata key {string} value {string} into {string}")]

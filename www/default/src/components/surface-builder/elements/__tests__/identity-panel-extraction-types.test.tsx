@@ -74,6 +74,20 @@ describe('IdentityPanel From API Key placement', () => {
     }
   );
 
+  it.each([
+    'request:identity-inbound',
+    'response:identity-protected',
+    'response:identity-external',
+  ])('keeps From mTLS certificate disabled on %s', slotId => {
+    showPanel(slotId);
+
+    expect(
+      within(screen.getByLabelText('Identity Extraction Type')).getByRole('option', {
+        name: 'From mTLS certificate',
+      })
+    ).toBeDisabled();
+  });
+
   it('keeps the key selector for a protected identity already set to From API Key', () => {
     showPanel('response:identity-protected', { type: 'from_api_key', api_key_id: 'key-1' });
 

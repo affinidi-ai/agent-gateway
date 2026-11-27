@@ -34,9 +34,9 @@ const INPUT_FIELDS: [string, string][] = [
   ],
   [
     'input.extension_identity.did',
-    'The caller DID the gateway resolved; trust it only when input.extension_identity.verified is true',
+    'The caller DID the gateway resolved, or on a Transit Point the managed agent DID; trust it only when input.extension_identity.verified is true',
   ],
-  ['input.extension_identity.verified', 'true when the gateway verified the caller DID'],
+  ['input.extension_identity.verified', 'true when the gateway verified that DID'],
 ];
 
 const TOOL_INPUT_FIELDS: [string, string][] = [

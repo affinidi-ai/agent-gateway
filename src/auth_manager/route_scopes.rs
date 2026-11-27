@@ -156,6 +156,8 @@ pub(crate) const ROUTE_SCOPES: &[RouteScope] = &[
     ("PUT", "/v1/gateways/{id}/exposed-surfaces", &[GatewaysEdit]),
     ("POST", "/v1/gateways/refresh-surfaces", &[GatewaysEdit]),
     ("POST", "/v1/gateways/{id}/approve", &[GatewaysEdit]),
+    ("POST", "/v1/gateways/{id}/continue", &[GatewaysEdit]),
+    ("GET", "/v1/gateways/{id}/mediator-access", &[GatewaysView]),
     ("GET", "/v1/gateways/{gateway_id}/connection-points", &[GatewaysView]),
     ("GET", "/v1/gateways/payment-logos/{sha256}", &[PaymentGatewaysView]),
     ("GET", "/v1/gateways/payment-providers", &[PaymentGatewaysView]),
@@ -184,6 +186,8 @@ pub(crate) const ROUTE_SCOPES: &[RouteScope] = &[
     ("GET", "/v1/connection-points/{id}/messages/unread-count", &[GatewaysView]),
     ("GET", "/v1/connection-points/{id}/metrics", &[GatewaysView]),
     ("POST", "/v1/connection-points/{id}/reconnect", &[GatewaysEdit]),
+    ("POST", "/v1/connection-points/{id}/continue", &[GatewaysEdit]),
+    ("GET", "/v1/connection-points/{id}/mediator-access", &[GatewaysView]),
 
     // Mediators
     ("GET", "/v1/mediators", &[MediatorsView]),
@@ -207,6 +211,24 @@ pub(crate) const ROUTE_SCOPES: &[RouteScope] = &[
     (ANY, "/v1/departments/{id}", &[IssuersView, IssuersEdit, IssuersDelete]),
     (ANY, "/v1/departments/{id}/register-trust-registry", &[IssuersEdit]),
     (ANY, "/v1/admin/departments/migrate-to-webvh", &[IssuersEdit]),
+
+    // Verifiable Trust Agent connections and key management
+    ("POST", "/v1/vta/connections", &[VtaConnectionsEdit]),
+    ("GET", "/v1/vta/connections", &[VtaConnectionsView]),
+    ("GET", "/v1/vta/connections/{id}", &[VtaConnectionsView]),
+    ("PUT", "/v1/vta/connections/{id}", &[VtaConnectionsEdit]),
+    ("DELETE", "/v1/vta/connections/{id}", &[VtaConnectionsDelete]),
+    ("POST", "/v1/vta/connections/{id}/pair", &[VtaConnectionsEdit]),
+    ("POST", "/v1/vta/connections/{id}/verify", &[VtaConnectionsEdit]),
+    ("POST", "/v1/vta/connections/{id}/revoke", &[VtaConnectionsDelete]),
+    ("GET", "/v1/vta/connections/{id}/status", &[VtaConnectionsView]),
+    ("POST", "/v1/vta/connections/{id}/rotate", &[KeyManagementEdit]),
+    ("POST", "/v1/vta/connections/{id}/control-key/rotate", &[KeyManagementEdit]),
+    ("POST", "/v1/vta/connections/{id}/control-key/rotate/cancel", &[KeyManagementEdit]),
+    ("POST", "/v1/vta/connections/{id}/keys", &[KeyManagementEdit]),
+    ("GET", "/v1/vta/status", &[VtaConnectionsView]),
+    ("POST", "/v1/vta/control-key/rotate", &[KeyManagementEdit]),
+    ("GET", "/v1/key-management/inventory", &[KeyManagementView]),
 
     // Authorities
     ("GET", "/v1/authorities", &[AuthoritiesView]),

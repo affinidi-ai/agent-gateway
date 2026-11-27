@@ -123,6 +123,11 @@ export function PermissionsProvider({ children }: { children: ReactNode }) {
   return <PermissionsContext.Provider value={value}>{children}</PermissionsContext.Provider>;
 }
 
+/** The permissions, or `undefined` outside a `PermissionsProvider`. */
+export function useOptionalPermissions(): PermissionsContextType | undefined {
+  return useContext(PermissionsContext);
+}
+
 export function usePermissions(): PermissionsContextType {
   const context = useContext(PermissionsContext);
   if (context === undefined) {

@@ -124,14 +124,6 @@ const AuthoritiesPage: React.FC<AuthoritiesPageProps> = ({
           <div className="card-header py-3 d-flex justify-content-between align-items-center">
             <h6 className="m-0 font-weight-bold text-primary">
               <i className="fas fa-landmark"></i> Authorities
-              <Badge
-                value={filteredAuthorities.length}
-                suffix={(externalSearchTerm ?? '').trim() ? ` of ${authorities.length}` : undefined}
-                className="ms-2"
-                ariaLabel={`${filteredAuthorities.length}${
-                  (externalSearchTerm ?? '').trim() ? ` of ${authorities.length}` : ''
-                } authorities`}
-              />
             </h6>
             {!hideAddButton && (
               <AppButton

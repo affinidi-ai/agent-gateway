@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::gateways::connection_points::types::GatewayConnectionPoint;
+use crate::gateways::connection_points::types::{GatewayConnectionPoint, ReservedPermanent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
@@ -65,6 +65,23 @@ impl ConnectionPointPayload {
             did_method: did_method(did),
             created_at: None,
         }
+    }
+
+    /// The permanent Connection Point `record` reserved for its pairing, which is
+    /// stored only when the pairing completes.
+    pub fn reserved(
+        record: &GatewayConnectionPoint,
+        reserved: &ReservedPermanent,
+    ) -> Self {
+        Self::minted(
+            &reserved.cp_id,
+            &record.name,
+            &record.description,
+            &record.gateway_id,
+            &reserved.mediator_id,
+            &reserved.mediator_did,
+            &reserved.did,
+        )
     }
 
     /// `mediator_did` is the DID the Connection Point's listener uses; a stored

@@ -91,7 +91,7 @@ const VARIABLES: &[VariableSpec] = &[
     var(
         "FAILURE_REASON",
         "Failure Reason",
-        "Why the sign-in failed: invalid_credential, not_approved, unknown_user or saml_rejected",
+        "Why the sign-in failed: invalid_credential, not_approved, unknown_user, saml_rejected, role_not_mapped or ambiguous_attribute",
     ),
     var("CP_ID", "Connection Point ID", "ID of the connection point"),
     var("CP_NAME", "Connection Point Name", "Name of the connection point"),

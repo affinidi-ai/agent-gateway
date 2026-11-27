@@ -34,6 +34,12 @@ pub struct SurfaceConfigBuilder {
     pub mcp_inbound_identity_strip_raw: bool,
     /// The inbound identity is the `sub` claim of the caller's JWT (`from_jwt_claim`).
     pub jwt_claim_inbound_identity: bool,
+    /// The inbound identity is the DID of the API key the caller presents
+    /// (`from_api_key`), presented to the Target in an identity presentation.
+    pub api_key_inbound_identity: bool,
+    /// The Access Point maps this caller header into the identity binding
+    /// extension's `verifiablePresentation`.
+    pub identity_binding_header: Option<String>,
     pub target_auth: Option<SurfaceTargetAuthConfig>,
     pub target_auth_provider: Option<SurfaceTargetAuthProviderConfig>,
     pub mcp_tool_policy: Option<McpToolPolicyFixture>,
@@ -84,6 +90,9 @@ pub struct SurfaceConfigBuilder {
     pub transit_token_lifetime_secs: Option<u64>,
     /// The appliance's `transit_token_max_lifetime_secs` in `gateway.json`.
     pub transit_token_max_lifetime_secs: Option<u64>,
+    /// `sts.id_jag_max_lifetime_secs` in `gateway.json`: the longest remaining lifetime an
+    /// ID-JAG presented for redemption may have.
+    pub sts_id_jag_max_lifetime_secs: Option<u64>,
     pub didwebvh_identity: Option<DidWebVhIdentityFixture>,
     pub caller_trust_check_list: Vec<serde_json::Value>,
     pub trust_recorder_entries: Vec<serde_json::Value>,
@@ -96,6 +105,8 @@ pub struct SurfaceConfigBuilder {
     /// The outbound listener is also published at [`PROTECTED_RESOURCE_PUBLIC_ORIGIN`], the
     /// https origin a Transit Point's `mcp_http.authorization` resource must use.
     pub outbound_public_origin: bool,
+    /// The outbound listener serves https and asks each caller for a client certificate.
+    pub outbound_client_certificates: Option<OutboundClientCertificatesFixture>,
     pub a2a_settings: Option<serde_json::Value>,
     /// The stored `access_point.public`; `None` stores what the admin API
     /// writes (see [`AccessPointFixture::public`](crate::bdd_support::config::agent_surface::AccessPointFixture)).
@@ -131,6 +142,15 @@ pub struct SurfaceConfigBuilder {
     pub stored_consent_age_secs: Option<i64>,
     /// The gateway writes its log files to `_storage/logs`, the directory the log routes act on.
     pub writes_log_directory: bool,
+    /// The gateway starts with a `[vta]` block that points at a mock trust agent.
+    pub control_key_trust_agent: Option<ControlKeyTrustAgentSetup>,
+    /// `[vta] control_key_rotation_days` of that block.
+    pub control_key_rotation_days: Option<u32>,
+    /// `[vta] connection_key_switch_timeout_secs`, so a rotation the trust agent refuses rolls back quickly.
+    pub connection_key_switch_timeout_secs: Option<u64>,
+    /// `[vta] context_did_method = "did_webvh"` with this `context_did_hosting`: `vta_server`
+    /// (the trust agent's webvh server `host-1`) or `gateway`.
+    pub context_did_webvh_hosting: Option<&'static str>,
     /// The gateway serves a dashboard build from `www/` at `/`, falling back to its
     /// `index.html` for every path no other route takes, as a deployed dashboard does.
     pub serves_dashboard: bool,
@@ -144,6 +164,14 @@ pub struct SurfaceConfigBuilder {
     pub stored_surfaces_on_routes: Vec<StoredSurfaceFixture>,
     /// The key id the seeded surface's protected Identity takes its DID from.
     pub protected_identity_api_key_id: Option<String>,
+    /// The seeded surface's identity slot (`inbound` or `protected`) that is `from_mtls`
+    /// naming no stored certificate.
+    pub unnamed_certificate_identity_slot: Option<String>,
+    /// The seeded surface's inbound Identity gives every caller this static DID.
+    pub inbound_static_did: Option<String>,
+    /// An enabled variant, by alias, whose Transit Points are the surface's but with the one
+    /// named taking the managed agent's identity from its caller's API key.
+    pub variant_caller_key_transit_point: Option<(String, String)>,
     /// When the API Key Provider's key was created; when the gateway starts if absent.
     pub api_key_provider_key_created_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The gateway starts in Standby mode.
@@ -250,6 +278,14 @@ impl SurfaceConfigBuilder {
     }
 }
 
+/// The trust agent a gateway is configured against, and where it keeps its control key.
+#[derive(Debug, Clone)]
+pub struct ControlKeyTrustAgentSetup {
+    pub base_url: String,
+    pub key_path: std::path::PathBuf,
+    pub control_did_method: &'static str,
+}
+
 impl Default for SurfaceConfigBuilder {
     fn default() -> Self {
         Self {
@@ -268,6 +304,8 @@ impl Default for SurfaceConfigBuilder {
             mcp_inbound_identity: false,
             mcp_inbound_identity_strip_raw: false,
             jwt_claim_inbound_identity: false,
+            api_key_inbound_identity: false,
+            identity_binding_header: None,
             target_auth: None,
             target_auth_provider: None,
             mcp_tool_policy: None,
@@ -284,6 +322,7 @@ impl Default for SurfaceConfigBuilder {
             a2a_proxy_target: None,
             protected_resource: None,
             outbound_public_origin: false,
+            outbound_client_certificates: None,
             custom_metadata: None,
             credential_delegation: None,
             oauth_provider_base_url: None,
@@ -308,6 +347,7 @@ impl Default for SurfaceConfigBuilder {
             transit_source_auth: false,
             transit_token_lifetime_secs: None,
             transit_token_max_lifetime_secs: None,
+            sts_id_jag_max_lifetime_secs: None,
             didwebvh_identity: None,
             caller_trust_check_list: Vec::new(),
             trust_recorder_entries: Vec::new(),
@@ -328,12 +368,19 @@ impl Default for SurfaceConfigBuilder {
             logs_no_delegation_events: false,
             stored_consent_age_secs: None,
             writes_log_directory: false,
+            control_key_trust_agent: None,
+            control_key_rotation_days: None,
+            context_did_webvh_hosting: None,
+            connection_key_switch_timeout_secs: None,
             serves_dashboard: false,
             gateway_prefixes: Vec::new(),
             stored_api_keys: Vec::new(),
             other_stored_surfaces: Vec::new(),
             stored_surfaces_on_routes: Vec::new(),
             protected_identity_api_key_id: None,
+            unnamed_certificate_identity_slot: None,
+            inbound_static_did: None,
+            variant_caller_key_transit_point: None,
             api_key_provider_key_created_at: None,
             starts_standby: false,
             sign_in_event_stream: None,
@@ -481,6 +528,26 @@ pub struct SurfaceTransitPointConfig {
     /// The Transit Point presents the surface's managed agent identity to its
     /// destination (`identity_injection.inject_vp`) without an identity of its own.
     pub inject_vp: bool,
+    /// The managed agent's identity is the DID of the API key the Transit
+    /// Point's caller presented (`from_api_key` with no `api_key_id`).
+    pub identity_from_caller_api_key: bool,
+    /// The managed agent's identity is the DID of this claim of the JWT the
+    /// Transit Point's caller presented (`from_jwt_claim`).
+    pub identity_from_jwt_claim: Option<String>,
+    /// The managed agent's identity is the DID of the client certificate the
+    /// Transit Point's caller presented (`from_mtls` with no `certificate_id`).
+    pub identity_from_caller_certificate: bool,
+}
+
+/// The outbound listener serves https with `server_certificate_pem` and asks each caller for a
+/// client certificate (`[tls.client_auth] direct`), checked against the CA the certificate store
+/// holds as `ca_id`.
+#[derive(Debug, Clone)]
+pub struct OutboundClientCertificatesFixture {
+    pub ca_id: String,
+    pub ca_certificate_pem: String,
+    pub server_certificate_pem: String,
+    pub server_private_key_pem: String,
 }
 
 impl SurfaceTransitPointConfig {
@@ -506,6 +573,9 @@ impl SurfaceTransitPointConfig {
             target_base_path: None,
             per_caller_rate_limit_per_minute: None,
             inject_vp: false,
+            identity_from_caller_api_key: false,
+            identity_from_jwt_claim: None,
+            identity_from_caller_certificate: false,
         }
     }
 }

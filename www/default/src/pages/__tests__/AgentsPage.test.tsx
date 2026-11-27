@@ -77,7 +77,6 @@ describe('AgentsPage', () => {
     renderPage();
 
     const first = await screen.findByTestId('agents-row-a1');
-    expect(screen.getByTestId('agents-count')).toHaveTextContent('2');
     expect(within(first).getByText('TimeAsker')).toBeInTheDocument();
     expect(within(first).getByText('Direct')).toBeInTheDocument();
     expect(within(first).getByTestId('agents-protocol-badge')).toHaveTextContent('A2A');
@@ -298,7 +297,6 @@ describe('AgentsPage', () => {
     fireEvent.change(screen.getByTestId('agents-filter-input'), { target: { value: 'treas' } });
     expect(screen.queryByTestId('agents-row-a1')).not.toBeInTheDocument();
     expect(screen.getByTestId('agents-row-a2')).toBeInTheDocument();
-    expect(screen.getByTestId('agents-count')).toHaveTextContent('1 of 2');
 
     fireEvent.change(screen.getByTestId('agents-filter-input'), { target: { value: 'nothing' } });
     expect(screen.getByTestId('agents-no-match')).toBeInTheDocument();
@@ -352,46 +350,62 @@ describe('AgentsPage', () => {
   it('shows the empty state', async () => {
     mockedListAgents.mockResolvedValue(list());
     renderPage();
-    expect(await screen.findByText('No managed agents yet')).toBeInTheDocument();
+    expect(await screen.findByText('Get started with Agents')).toBeInTheDocument();
   });
 
-  it('opens the surface creation flow from the empty state link', async () => {
+  it('opens the surface creation flow from the button in the header', async () => {
     mockedListAgents.mockResolvedValue(list());
     renderPage();
 
-    const add = await screen.findByTestId('agents-add-surface-link');
-    expect(add.tagName).toBe('A');
-    expect(add).toHaveTextContent('Create a surface');
-    expect(add).toHaveAttribute('href', '/surfaces/new');
+    const add = await screen.findByTestId('agents-add-surface-button');
+    expect(add.tagName).toBe('BUTTON');
+    expect(add).toHaveTextContent('Add Surface');
     fireEvent.click(add);
     expect(await screen.findByTestId('new-surface-route')).toBeInTheDocument();
   });
 
-  it('links to the surfaces docs from the empty state', async () => {
+  it('shows the create surface button in the header when user can edit surfaces', async () => {
+    mockedListAgents.mockResolvedValue(list(agent()));
+    renderPage();
+
+    const button = await screen.findByTestId('agents-add-surface-button');
+    expect(button).toBeInTheDocument();
+    expect(button).toHaveTextContent('Add Surface');
+  });
+
+  it('hides the create surface button in the header when user cannot edit surfaces', async () => {
+    grant('surfaces.view');
+    mockedListAgents.mockResolvedValue(list(agent()));
+    renderPage();
+
+    expect(await screen.findByTestId('agents-row-a1')).toBeInTheDocument();
+    expect(screen.queryByTestId('agents-add-surface-button')).not.toBeInTheDocument();
+  });
+
+  it('links to the create first agent docs from the empty state', async () => {
     mockedListAgents.mockResolvedValue(list());
     renderPage();
 
-    const docs = await screen.findByRole('link', { name: /What’s a surface\?/ });
-    expect(docs).toHaveAttribute('href', DOCS_URL.surfaces);
+    const docs = await screen.findByRole('link', { name: /View Docs/ });
+    expect(docs).toHaveAttribute('href', DOCS_URL.createFirstSurface);
     expect(docs).toHaveAttribute('target', '_blank');
   });
 
-  it('offers no surface creation in the empty state to a user who cannot edit surfaces', async () => {
+  it('offers no surface creation button in the header to a user who cannot edit surfaces', async () => {
     grant('surfaces.view');
     mockedListAgents.mockResolvedValue(list());
     renderPage();
 
-    expect(await screen.findByText('No managed agents yet')).toBeInTheDocument();
-    expect(screen.queryByTestId('agents-add-surface-link')).not.toBeInTheDocument();
-    expect(screen.getByRole('link', { name: /What’s a surface\?/ })).toBeInTheDocument();
+    expect(await screen.findByText('Get started with Agents')).toBeInTheDocument();
+    expect(screen.queryByTestId('agents-add-surface-button')).not.toBeInTheDocument();
   });
 
-  it('offers no surface creation in the empty state while the list failed to load', async () => {
+  it('offers no surface creation button in the header while the list failed to load', async () => {
     mockedListAgents.mockRejectedValue(new Error('Internal Server Error'));
     renderPage();
 
     expect(await screen.findByTestId('agents-load-error')).toBeInTheDocument();
-    expect(screen.queryByTestId('agents-add-surface-link')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('agents-add-surface-button')).not.toBeInTheDocument();
   });
 
   it('shows the error state and retries', async () => {

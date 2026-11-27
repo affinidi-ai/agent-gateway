@@ -1,0 +1,16 @@
+branch: fix/trust-registry-timeout-log-redaction
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-26T13:30:00Z'
+      title: Show the trust registry wait time in logs instead of REDACTED-PHONE
+      description: >-
+        The log line printed after a trust registry query is forwarded through the mediator, and
+        the timeout error that follows it, showed the remaining wait with nanosecond precision, for
+        example 9.999827541s. The Phone numbers redaction rule of the example configuration masks
+        that digit run, so the line read "timeout: [REDACTED-PHONE]s". Both now show whole
+        milliseconds, such as 9999ms, which redaction leaves alone.
+  removed: []
+  security: []
+  breaking: []

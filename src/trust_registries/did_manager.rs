@@ -190,6 +190,7 @@ pub async fn generate_trust_registry_identity(
             metadata.insert("trust_registry_id".to_string(), serde_json::Value::String(trust_registry_id.to_string()));
 
             let identity = DidWebVhIdentity {
+                pending_key_pair: None,
                 id,
                 did: final_did.clone(),
                 key_pair: Some(key_pair.clone()),

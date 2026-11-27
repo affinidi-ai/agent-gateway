@@ -120,6 +120,7 @@ sha256 = "1.6"
 hmac = "0.12"
 hex = "0.4"
 zeroize = { version = "1.8", features = ["derive"] }
+vta-signing = "0.1"
 affinidi-did-resolver-cache-sdk = { version = "0.8.57", features = [
     "agent-names",
 ] }
@@ -128,13 +129,22 @@ affinidi-messaging-sdk = "0.47.2"
 affinidi-messaging-didcomm = "0.15.16"
 affinidi-tdk-common = "0.7.3"
 affinidi-did-common = "0.4.10"
+# Verifies `eddsa-jcs-2022` Data-Integrity proofs, which `ssi` does not implement
+# at any released version (and does not implement upstream either). `ssi` keeps
+# every other suite — see `src/identity/ssi/di_jcs.rs`. Already in the tree via
+# `affinidi-tdk-common` and `didwebvh-rs`, so this pins nothing new.
+affinidi-data-integrity = "0.9.0"
+# Supplies the `KeyType` that `affinidi-data-integrity`'s resolver trait returns.
+# Must track the version *that* crate uses (0.6.x) — `did-peer` pulls an older
+# 0.4 in parallel, and the two `KeyType`s are different types.
+affinidi-secrets-resolver = "0.6.0"
 ssi = "0.16.0"
 ssi-json-ld = "0.3.3"
 ssi-claims-core = "0.2.0"
 did-peer = "0.7.5"
 uuid = { version = "1.18.1", features = ["v4", "v7"] }
 chrono = { version = "0.4.42", features = ["serde"] }
-cookie = { version = "0.18.1", features = ["percent-encode"] }
+cookie = { version = "0.18.3", features = ["percent-encode"] }
 base64 = "0.22.1"
 bcrypt = "0.17"
 bs58 = "0.5.1"
@@ -149,8 +159,12 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 jsonschema = "0.41.0"
 
 # did:webvh support
+#
+# JCS canonicalisation for did:webvh deliberately uses the workspace's
+# `serde_json_canonicalizer` rather than `serde_jcs`: this binary builds
+# `serde_json` with `arbitrary_precision` (the alloy stack enables it), under
+# which `serde_jcs` panics on any number it is asked to serialise.
 didwebvh-rs = { version = "0.8.2", optional = true }
-serde_jcs = { version = "0.1", optional = true }
 
 # WebAuthn for passkey authentication
 webauthn-rs = "0.5"
@@ -187,22 +201,6 @@ ring = "0.17"
 
 # RAII scope guard for cleanup
 scopeguard = "1.2"
-
-# x402 protocol implementation
-x402-types = "1.1"
-x402-facilitator-local = { version = "1.1.2", features = ["telemetry"] }
-x402-chain-eip155 = { version = "1.1.1", features = [
-    "facilitator",
-    "telemetry",
-] }
-x402-chain-solana = { version = "1.1.3", features = [
-    "facilitator",
-    "telemetry",
-] }
-
-# x402 settlement: payment amounts and the Solana facilitator key
-alloy = "2.5"
-solana-sdk = "3.0.0"
 
 # Model types and the server side only. The gateway serves MCP through rmcp-openapi and
 # calls MCP endpoints with its own Streamable HTTP client (eventsource-stream, below), so
@@ -275,6 +273,8 @@ webpki = { package = "rustls-webpki", version = "0.103", default-features = fals
 rustls-pki-types = "1"
 
 [dev-dependencies]
+# Builds the exact authentication error a mediator returns for a DID it does not admit.
+affinidi-did-authentication = "0.3.13"
 tempfile = "3.24.0"
 ts-rs = "11.0"
 cucumber = { version = "0.23", features = ["macros"] }
@@ -294,7 +294,7 @@ harness = false
 
 [features]
 default = ["didwebvh"]
-didwebvh = ["didwebvh-rs", "serde_jcs"]
+didwebvh = ["didwebvh-rs"]
 
 [profile.dev]
 # Skip dsymutil pass on macOS - major time saver

@@ -1,0 +1,23 @@
+branch: UX-fixes---badges-and-empty-states
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-25T10:00:00Z'
+      title: Remove count badges from dashboard pages
+      description: Removed count badges from Credentials (STS Clients tab), Policies (Gateway and Surface Policies tabs), JWT Verification Strategies, Access Tokens (PAT), Payments, Proxies page, and Payment Gateway detail surfaces section. These count badges appeared next to page titles and were displaying the number of items in each section.
+    - timestamp: '2026-11-25T10:15:00Z'
+      title: Remove duplicate CTA from STS Clients empty state
+      description: Removed the duplicate "Add your first STS client" button from the STS Clients empty state. The "Add STS Client" button in the header is now the only CTA, following the design pattern used in other empty states like Agents and Surfaces.
+    - timestamp: '2026-11-25T10:30:00Z'
+      title: Move surface creation action to Agents page header
+      description: Relocated the "Add Surface" button from the empty-state text to the Agents page header, following the design pattern used in other empty states. Updated the empty-state documentation link to point to the first-surface creation guide for new users.
+    - timestamp: '2026-11-25T10:45:00Z'
+      title: Keep indication when payment list is capped at 500 rows
+      description: Added a truncation notice on the Payments page when the ledger response contains more than 500 matching payments. The notice informs operators that only the newest 500 payments are shown and that older matching payments were not searched, preventing silent failures when searching for older payments.
+  fixed:
+    - timestamp: '2026-11-25T11:00:00Z'
+      title: Fix navigation from API key and certificate detail pages to Secrets tab
+      description: API key and certificate detail pages now return to their respective tabs (API Keys or Certificates) on the Secrets page instead of always returning to the generic Secrets tab, improving navigation flow for resource management.
+  removed: []
+  security: []
+  breaking: []

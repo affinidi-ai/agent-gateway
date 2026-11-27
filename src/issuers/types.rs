@@ -47,6 +47,12 @@ pub struct Issuer {
     /// For did:webvh issuers this is the parallel did:web document.
     pub did_document: serde_json::Value,
 
+    /// Which backend signs for the surfaces this issuer owns, unless a surface or a variant sets its
+    /// own. Absent follows the appliance default. The same block a surface carries, resolved by the
+    /// key directory between the surface and the appliance default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing: Option<crate::config::agent_surface::SurfaceSigningConfig>,
+
     /// Trust registry DID used when this issuer was registered (stored for deregistration on delete).
     /// Never returned in API responses.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,6 +102,7 @@ impl Issuer {
             secrets,
             #[cfg(feature = "didwebvh")]
             key_pair: None,
+            signing: None,
             did_document,
             trust_registry_did: None,
             authority_did: None,
@@ -123,6 +130,7 @@ impl Issuer {
             did,
             secrets: serde_json::Value::Array(vec![]),
             key_pair: Some(key_pair),
+            signing: None,
             did_document,
             trust_registry_did: None,
             authority_did: None,
@@ -149,6 +157,8 @@ pub struct IssuerResponse {
     pub authority_did: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tr_registered: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing: Option<crate::config::agent_surface::SurfaceSigningConfig>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -164,6 +174,7 @@ impl From<Issuer> for IssuerResponse {
             trust_registry_did: i.trust_registry_did,
             authority_did: i.authority_did,
             tr_registered: i.tr_registered,
+            signing: i.signing,
             created_at: i.created_at,
             updated_at: i.updated_at,
         }

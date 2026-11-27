@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use openssl::pkey::PKey;
 use openssl::x509::X509;
-use samael::schema::{Assertion, Conditions, Response};
+use samael::schema::{Assertion, AttributeStatement, Conditions, Response};
 use std::collections::HashMap;
 use std::fs;
 use tracing::{info, warn};
@@ -32,6 +32,14 @@ impl std::fmt::Display for TooManyPendingAuthnRequests {
 }
 
 impl std::error::Error for TooManyPendingAuthnRequests {}
+
+/// The attributes of an assertion: every value of each attribute, in the order the identity provider sent them.
+pub type SamlAttributes = HashMap<String, Vec<String>>;
+
+/// The key under which the role values of every attribute statement are kept, apart from the
+/// first-statement attributes. It holds a NUL, which no XML attribute name can, so it never
+/// collides with an attribute of the assertion.
+pub const ROLE_VALUES_KEY: &str = "\u{0}role-values";
 
 /// SAML Service Provider implementation
 pub struct SamlService {
@@ -431,34 +439,30 @@ impl SamlService {
         check_assertion_conditions(conditions, Utc::now(), &self.config.sp_entity_id)
     }
 
-    /// Extract user attributes from assertion
+    /// Extract user attributes from assertion, every value of each attribute in the order sent
     pub fn extract_attributes(
         &self,
         assertion: &Assertion,
-    ) -> Result<HashMap<String, String>> {
-        let mut attributes = HashMap::new();
-
-        // attribute_statements is Option<Vec<AttributeStatement>>
-        if let Some(statements) = &assertion.attribute_statements
-            && let Some(attribute_statement) = statements.first()
-        {
-            for attr in &attribute_statement.attributes {
-                // Use 'values' instead of 'attribute_values' per samael API
-                if let Some(attr_value) = attr.values.first() {
-                    // AttributeValue has a 'value: Option<String>' field
-                    // attr.name is also Option<String>
-                    if let (Some(name), Some(text)) = (&attr.name, &attr_value.value) {
-                        attributes.insert(name.clone(), text.clone());
-                    }
-                }
-            }
-        }
+    ) -> Result<SamlAttributes> {
+        let mut attributes = assertion
+            .attribute_statements
+            .as_deref()
+            .map(|statements| {
+                collect_attributes_with_roles_from_all_statements(
+                    statements,
+                    &self
+                        .config
+                        .attribute_mapping
+                        .role,
+                )
+            })
+            .unwrap_or_default();
 
         // Also extract NameID if present
         if let Some(subject) = &assertion.subject
             && let Some(name_id) = &subject.name_id
         {
-            attributes.insert("NameID".to_string(), name_id.value.clone());
+            attributes.insert("NameID".to_string(), vec![name_id.value.clone()]);
         }
 
         Ok(attributes)
@@ -468,6 +472,49 @@ impl SamlService {
     pub fn config(&self) -> &SamlConfig {
         &self.config
     }
+}
+
+/// The attributes the gateway reads: those of the first attribute statement, plus the values of
+/// the role attribute from every statement under [`ROLE_VALUES_KEY`], so a role is never missed for
+/// the statement it sits in and never leaks into an identity or profile attribute.
+fn collect_attributes_with_roles_from_all_statements(
+    statements: &[AttributeStatement],
+    role_attribute: &str,
+) -> SamlAttributes {
+    let mut attributes = statements
+        .first()
+        .map(|first| collect_attributes(std::slice::from_ref(first)))
+        .unwrap_or_default();
+    if let Some(roles) = collect_attributes(statements).remove(role_attribute) {
+        attributes.insert(ROLE_VALUES_KEY.to_string(), roles);
+    }
+    attributes
+}
+
+/// Gather every value of every attribute across all attribute statements, appending the values of
+/// an attribute that appears more than once, in document order.
+fn collect_attributes(statements: &[AttributeStatement]) -> SamlAttributes {
+    let mut attributes = SamlAttributes::new();
+    for attribute in statements
+        .iter()
+        .flat_map(|statement| &statement.attributes)
+    {
+        let Some(name) = &attribute.name else {
+            continue;
+        };
+        let values = attribute
+            .values
+            .iter()
+            .filter_map(|value| value.value.clone());
+        let collected = attributes
+            .entry(name.clone())
+            .or_default();
+        collected.extend(values);
+        if collected.is_empty() {
+            attributes.remove(name);
+        }
+    }
+    attributes
 }
 
 /// Reject a SAML response that carries an `EncryptedAssertion` element or
@@ -706,6 +753,111 @@ mod tests {
             one_time_use: None,
             proxy_restriction: None,
         }
+    }
+
+    fn attribute(
+        name: &str,
+        values: &[&str],
+    ) -> samael::attribute::Attribute {
+        samael::attribute::Attribute {
+            friendly_name: None,
+            name: Some(name.to_string()),
+            name_format: None,
+            values: values
+                .iter()
+                .map(|value| samael::attribute::AttributeValue {
+                    attribute_type: None,
+                    value: Some(value.to_string()),
+                })
+                .collect(),
+        }
+    }
+
+    fn statement(attributes: Vec<samael::attribute::Attribute>) -> AttributeStatement {
+        AttributeStatement { attributes }
+    }
+
+    #[test]
+    fn a_repeated_attribute_keeps_the_values_of_every_occurrence_in_order() {
+        let collected = collect_attributes(&[statement(vec![
+            attribute("role", &["gw-admins"]),
+            attribute("role", &["contractors"]),
+        ])]);
+        assert_eq!(collected["role"], vec!["gw-admins", "contractors"]);
+    }
+
+    #[test]
+    fn attributes_of_a_later_statement_are_collected() {
+        let collected = collect_attributes(&[
+            statement(vec![attribute("email", &["a@example.test"])]),
+            statement(vec![attribute("role", &["gw-admins"])]),
+        ]);
+        assert_eq!(collected["email"], vec!["a@example.test"]);
+        assert_eq!(collected["role"], vec!["gw-admins"]);
+    }
+
+    #[test]
+    fn the_same_attribute_across_statements_is_joined_whatever_the_statement_order() {
+        let first = statement(vec![attribute("role", &["gw-admins"])]);
+        let second = statement(vec![attribute("role", &["contractors"])]);
+        let forward = collect_attributes(&[first.clone(), second.clone()]);
+        let reversed = collect_attributes(&[second, first]);
+        assert_eq!(forward["role"], vec!["gw-admins", "contractors"]);
+        assert_eq!(reversed["role"], vec!["contractors", "gw-admins"]);
+    }
+
+    #[test]
+    fn only_the_first_statement_gives_the_attributes_but_the_role_comes_from_every_statement() {
+        let collected = collect_attributes_with_roles_from_all_statements(
+            &[
+                statement(vec![attribute("uid", &["first"]), attribute("role", &["gw-all"])]),
+                statement(vec![
+                    attribute("uid", &["later"]),
+                    attribute("name", &["later-name"]),
+                    attribute("role", &["gw-admins"]),
+                ]),
+            ],
+            "role",
+        );
+        assert_eq!(collected["uid"], vec!["first"]);
+        assert!(!collected.contains_key("name"));
+        assert_eq!(collected[ROLE_VALUES_KEY], vec!["gw-all", "gw-admins"]);
+    }
+
+    #[test]
+    fn a_role_only_in_a_later_statement_is_collected() {
+        let collected = collect_attributes_with_roles_from_all_statements(
+            &[statement(vec![attribute("uid", &["first"])]), statement(vec![attribute("role", &["gw-admins"])])],
+            "role",
+        );
+        assert_eq!(collected[ROLE_VALUES_KEY], vec!["gw-admins"]);
+        assert_eq!(collected["uid"], vec!["first"]);
+    }
+
+    #[test]
+    fn a_claim_that_is_both_the_role_and_another_attribute_keeps_its_first_statement_value_for_the_attribute() {
+        let collected = collect_attributes_with_roles_from_all_statements(
+            &[statement(vec![attribute("claim", &["first"])]), statement(vec![attribute("claim", &["later"])])],
+            "claim",
+        );
+        assert_eq!(collected["claim"], vec!["first"]);
+        assert_eq!(collected[ROLE_VALUES_KEY], vec!["first", "later"]);
+    }
+
+    #[test]
+    fn a_role_claim_absent_from_the_first_statement_does_not_appear_as_an_attribute() {
+        let collected = collect_attributes_with_roles_from_all_statements(
+            &[statement(vec![attribute("uid", &["first"])]), statement(vec![attribute("claim", &["later"])])],
+            "claim",
+        );
+        assert!(!collected.contains_key("claim"));
+        assert_eq!(collected[ROLE_VALUES_KEY], vec!["later"]);
+    }
+
+    #[test]
+    fn an_attribute_with_no_values_is_left_out() {
+        let collected = collect_attributes(&[statement(vec![attribute("role", &[])])]);
+        assert!(!collected.contains_key("role"));
     }
 
     #[test]

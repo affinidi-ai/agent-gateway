@@ -118,9 +118,10 @@ fields; and `variable_pattern`, the placeholder syntax in use (see _Templates_)
 | Payment | `payment.challenge_issued`, `paid`, `held`, `rejected`, `unconfirmed`, `unavailable`, `authorized`, `voided`, `capture_failed`, `reconcile_failed`: the outcomes of payments delegated to a connected agent-pay gateway |
 | Audit | `audit.<event>` for every event of the audit catalog ([`src/audit/catalog.rs`](../src/audit/catalog.rs)) |
 
-This gateway verifies no x402 or MPP payment itself, so `x402.verification.failed` and the three
-`mpp.*` events stay in the catalog, where existing integrations name them, but are never raised.
-The other x402 events come from settling and pruning x402 payments recorded before.
+This gateway verifies and settles no x402 or MPP payment itself, so `x402.verification.failed`,
+`x402.settlement.failed`, `x402.transaction.completed` and the three `mpp.*` events stay in the
+catalog, where existing integrations name them, but are never raised. Only
+`x402.cleanup.completed` still fires, when the daily cleanup prunes x402 payments recorded before.
 
 A passkey registration that creates an account raises `user.created` (registering a username that
 already has an account creates nothing and raises nothing), and an administrator's approval `user.approved`. A
@@ -135,9 +136,12 @@ A console sign-in raises `user.login`, with `LOGIN_METHOD` set to `passkey` or `
 raises `user.login_failed` ([`user_integration_triggers.rs`](../src/integrations/user_integration_triggers.rs)):
 a passkey sign-in whose credential does not verify, and a SAML response the gateway rejects at the
 Assertion Consumer Service (bad or missing signature, untrusted certificate, wrong destination or
-audience, an unknown, used or expired AuthnRequest, expired conditions). A passkey sign-in whose
-challenge is unknown or expired has nothing to verify and raises nothing, and neither does a
-failure after verification, such as provisioning a SAML user or opening the session.
+audience, an unknown, used or expired AuthnRequest, expired conditions), and a verified SAML
+sign-in refused because its identity-provider role maps to no gateway role or its user ID or username
+attribute carries conflicting values. A passkey sign-in whose
+challenge is unknown or expired has nothing to verify and raises nothing, and neither does any other
+failure after verification, such as reaching the user limit, a provisioning error or opening the
+session.
 
 `user.login_failed` carries the user variables of `user.login`, `LOGIN_METHOD`, and
 `FAILURE_REASON`:
@@ -148,9 +152,11 @@ failure after verification, such as provisioning a SAML user or opening the sess
 | `not_approved` | The account exists but is not approved. A browser rarely sends this sign-in: the challenge for such an account names decoy credentials, not its passkeys, so the browser finds no passkey to use |
 | `unknown_user` | No account has the username the sign-in named, or the account was deleted before the sign-in finished |
 | `saml_rejected` | The SAML response was rejected |
+| `role_not_mapped` | The SAML response was valid, but none of the identity-provider role values has a `role_mapping` entry and `saml.json` sets no `default_role` |
+| `ambiguous_attribute` | The SAML response was valid, but its user ID or username attribute carried more than one distinct value, so it named no single user |
 
 `USER_ID`, `USERNAME`, `USER_EMAIL`, `USER_ROLE`, `USER_STATUS` and `NEW_STATE` are set only when the
-account exists, from the account as stored. For `unknown_user` and `saml_rejected` they are absent:
+account exists, from the account as stored. For `unknown_user`, `saml_rejected`, `role_not_mapped` and `ambiguous_attribute` they are absent:
 a template placeholder for them is empty and `EVENT_DATA` leaves them out, so neither the username a
 caller typed nor anything in a rejected SAML response leaves the appliance. With the default
 `webhook` or `stream` template, `data` holds `login_method`, `failure_reason` and, for an existing
@@ -408,6 +414,7 @@ addresses are blocked, the resolved address is pinned and redirects are not foll
 - a Connection Point created through the management API;
 - the temporary DID an acceptor uses for the pairing handshake, which is the `id` of its temporary Connection Point, and the permanent Connection Point it stores when the pairing completes;
 - the permanent Connection Point the inviter stores when it approves a pairing;
+- with a [pause for mediator access](FABRIC.md#pausing-for-mediator-access), every DID at the pause: the Connection Point and the permanent DID it reserves, or an acceptor's temporary and permanent DIDs. The reserved permanent DID gets `creation_started` at the pause and its `created` when the pairing stores it; when the record that reserved it is deleted before the pairing, it gets `creation_failed` (never after its `created`). The dashboard always asks for the pause, so every Connection Point it creates reserves and announces its permanent DID at creation, whatever the mediator's mode;
 - the DID the gateway generates for a stored Trust Registry, with `id` the Trust Registry id and empty `gateway_id` and `mediator_id`. It is announced when the registry is added and `deleted` when the registry is deleted.
 
 Each is announced before the gateway first contacts the mediator and followed by `created` or `creation_failed`; a Trust Registry deleted before its record naming the DID is saved reports `creation_failed`. Reconnecting a Trust Registry rebuilds its connection from its stored keys and keeps its DID, so it sends nothing; only a registry that never finished connecting accepts its OOB invitation again, and its new DID is announced as on creation. The first-call repeat for these DIDs needs the directory to list the mediator already: while it has not answered yet, a refused first call fails at once, unlike a Connection Point on a provided mediator. The deletion of a Connection Point record, whether the pairing is deleted, the temporary Connection Point is cleaned up or it expires, sends `deleted`. Not announced are Connection Points stored before `mediator_did` was recorded (there is no backfill, so deleting one sends nothing), the ephemeral DID the gateway makes to query a public Trust Registry it has no stored entry for, and any DID after a restart that interrupts its creation or deletion.
@@ -648,7 +655,7 @@ of its own and never hides the entry. A stored provided record cannot be changed
 offered by the directory or used by a connection point or a pending pairing, until the directory
 has answered successfully without its DID (or no directory is configured) and nothing uses it: no stored Connection Point names it
 (a pending pairing's temporary Connection Point, until its recorded expiry, names its acceptor mediator in
-`oob_message.secure_mediator_id`), and no unexpired pending pairing names it as its acceptor mediator record (a pairing expires after `oob_connection.pending_expiry_hours`, and one that has expired can no longer be finalized). Then `DELETE` removes it, and
+`oob_message.secure_mediator_id`), and no unexpired pending pairing names it as its acceptor mediator record (a pairing expires with its invitation: its `expires_time`, capped at seven days, or seven days without one, and one that has expired can no longer be finalized). Then `DELETE` removes it, and
 the list marks such a record `"deletable": true` (a directory answer that omits its DID sets it, and so does having no directory
 configured, since nothing then offers the record; a directory that has not answered yet, or still
 lists the DID, does not. The dashboard offers Delete only for such records, and the in-use check still
@@ -670,14 +677,19 @@ mediator.** These are current behaviour, not guarantees:
   provided one. A missing one refuses the finalization and writes nothing, where earlier versions
   recreated it with no tenant, which could attach a gateway with no tenant to a tenant's mediator
   or pick up another acceptance's gateway by the shared DID.
-- An invitation accepted just before the gateway restarts does not complete. At start the gateway
-  removes the pending gateways, and their pairings, that an earlier run left behind; one created
-  since the process started belongs to a pairing in flight and is kept. The interrupted invitation
-  has to be accepted again.
-- A rejected acceptance, or one whose finalization fails, leaves its pairing, temporary Connection
-  Point, listener and pending gateway until the pairing expires or the gateway restarts. They hold the
-  provided mediator (`409` on `DELETE`) until then. A failure while the invitation is being
-  accepted removes all of them at once.
+- A pending acceptance survives a restart while its temporary Connection Point is unexpired (the
+  invitation's `expires_time`, capped at seven days): its listener is started again and it keeps
+  waiting for approval. At start the gateway removes the pending gateways, and their pairings, that
+  an earlier run left behind with no unexpired temporary Connection Point; one created since the
+  process started belongs to a pairing in flight and is kept. Such an invitation has to be accepted
+  again.
+- A `connection-rejected` from the inviter removes the acceptance's pairing, temporary Connection
+  Point and listener at once, which releases the provided mediator; the gateway stays `failed` until
+  it is deleted.
+- An acceptance whose finalization fails leaves its pairing, temporary Connection Point, listener and
+  pending gateway until the pairing expires or the gateway restarts. They hold the provided mediator
+  (`409` on `DELETE`) until then. A failure while the invitation is being accepted removes all of
+  them at once.
 - A request cancelled by the client while the invitation is being accepted is cleaned up the same way
   as a failed one, on a task of its own: the pairing, the temporary Connection Point, the pending
   gateway and the generated keys are removed and the DIDComm client is shut down. A cancellation

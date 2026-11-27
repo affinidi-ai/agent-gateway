@@ -164,7 +164,7 @@ const EditCertificatePage: React.FC = () => {
       } else {
         await apiClient.post('/certificates', payload);
         showToast('success', 'Certificate created successfully');
-        navigate('/secrets');
+        navigate('/secrets?tab=certificates');
       }
     } catch (err: any) {
       console.error('Failed to save certificate:', err);
@@ -197,7 +197,7 @@ const EditCertificatePage: React.FC = () => {
     try {
       await apiClient.delete(`/certificates/${id}`);
       showToast('success', 'Certificate deleted successfully');
-      navigate('/secrets');
+      navigate('/secrets?tab=certificates');
     } catch (err: any) {
       console.error('Failed to delete certificate:', err);
       const errorMessage = getErrorMessage(err, 'Failed to delete certificate');
@@ -365,7 +365,7 @@ const EditCertificatePage: React.FC = () => {
         <button
           className="btn btn-sm btn-secondary"
           data-testid="certificate-editor-back-button"
-          onClick={() => navigate('/secrets')}
+          onClick={() => navigate('/secrets?tab=certificates')}
           disabled={isSaving}
         >
           <i className="fas fa-arrow-left"></i>

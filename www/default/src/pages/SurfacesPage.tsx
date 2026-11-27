@@ -235,12 +235,6 @@ const SurfaceList: React.FC<SurfaceListProps> = ({
           <span>
             <i className="fas fa-layer-group me-2" />
             Agent Surfaces
-            <Badge
-              value={visibleSurfaces.length}
-              suffix={searchTerm || recentOnly ? ` of ${allSurfaces.length}` : undefined}
-              className="ms-2"
-              ariaLabel={`${visibleSurfaces.length}${searchTerm || recentOnly ? ` of ${allSurfaces.length}` : ''} surfaces`}
-            />
           </span>
           <span className="d-flex align-items-center" style={{ gap: '1.75rem' }}>
             <i

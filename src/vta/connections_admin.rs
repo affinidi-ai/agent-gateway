@@ -1,0 +1,4388 @@
+//! VTA connection CRUD HTTP handlers.
+//!
+//! Administrator-gated (`vta_connections.*`); non-admin callers receive `403`.
+//! A response never contains key material — only the `control_key_ref` into the
+//! secrets store is stored and returned.
+//!
+//! Every write **invalidates** the connection's cached connector, which is what
+//! makes an edit or a disable take effect without a restart.
+
+use std::sync::Arc;
+
+use axum::{
+    Extension, Json, Router,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{delete, get, post, put},
+};
+use serde::{Deserialize, Serialize};
+use tracing::{error, info, warn};
+
+use crate::audit::trust_agent_changes as security_records;
+use crate::auth::storage::PasskeyStorage;
+use crate::auth_manager::pat::{PatContext, PatResourceScope};
+use crate::rbac::{Feature, RbacConfig};
+use crate::secrets::SecretsStore;
+use crate::tenancy::{
+    PatTenantContext, ResourceKind, can_access, can_mutate, can_reference, scope_allows_resource, tenant_for_create,
+};
+use crate::vta::connections::{VtaConnection, VtaConnectionStatus, VtaConnectionStorage, VtaConnectionTransport};
+use crate::vta::registry::VtaConnectionRegistry;
+
+/// Axum state: the record store plus the live registry whose cache a write
+/// must invalidate.
+#[derive(Clone)]
+pub struct VtaConnectionAdminState {
+    pub store: Arc<dyn VtaConnectionStorage>,
+    pub registry: Option<Arc<VtaConnectionRegistry>>,
+    /// The bootstrap `[vta]` block, for the deployment-tier report. Read-only
+    /// here: it is startup config, not a managed record.
+    pub vta_config: Arc<crate::config::vta::VtaConfig>,
+    /// Context provisioner, for reporting which contexts exist and which no
+    /// surface claims any more.
+    pub provisioner: Option<Arc<crate::vta::provisioning::ContextProvisioner>>,
+    /// What this appliance signs with when nobody has said, and why.
+    /// Resolved once at startup — it is a property of the install, not of a
+    /// request.
+    pub default_resolution: Arc<crate::vta::onboarding_default::DefaultResolution>,
+    /// Agent identities, so a connection that holds agents' keys cannot be
+    /// disconnected without the caller acknowledging they will be stranded.
+    pub identity_store: Option<Arc<dyn crate::identity::store::IdentityStore>>,
+    /// Publishes a new connection's `did:webvh`. `None` when the gateway has no
+    /// domain to publish under, so connections authenticate as their `did:key`.
+    pub auth_did_publisher: Option<Arc<crate::vta::auth_did::ConnectionDidPublisher>>,
+    /// Rotates the control key of a connection the operator added. Absent when
+    /// the gateway has no domain to publish a connection's DID under.
+    pub key_rotator: Option<Arc<crate::vta::connection_key_rotation::ConnectionKeyRotator>>,
+}
+
+/// Query for the actions that stop a connection signing.
+#[derive(Debug, Default, Deserialize)]
+pub struct DisconnectQuery {
+    /// Proceed although agents whose keys live in this connection will stop
+    /// being able to sign.
+    #[serde(default)]
+    pub acknowledge_stranded_agents: bool,
+    /// Proceed although the gateway default, surfaces, variants or issuers
+    /// sign through this connection and will stop signing.
+    #[serde(default)]
+    pub acknowledge_signing_users: bool,
+}
+
+/// How many agents hold their key in `connection_id`. A record written before
+/// the connection was tracked can only have used the bootstrap one.
+async fn agents_holding_keys(
+    state: &VtaConnectionAdminState,
+    connection_id: &str,
+) -> anyhow::Result<usize> {
+    let Some(store) = state.identity_store.as_ref() else {
+        return Ok(0);
+    };
+    Ok(store
+        .list_all()
+        .await?
+        .iter()
+        .filter(|record| {
+            record
+                .vta_context_id
+                .is_some()
+                && record
+                    .vta_connection_id
+                    .as_deref()
+                    .unwrap_or(crate::vta::connections::BOOTSTRAP_CONNECTION_ID)
+                    == connection_id
+        })
+        .count())
+}
+
+/// Whether `signing` signs through `connection_id`. A block that names no
+/// connection, or the `default` one, signs through the bootstrap connection.
+fn signs_through(
+    signing: Option<&crate::config::agent_surface::SurfaceSigningConfig>,
+    connection_id: &str,
+) -> bool {
+    use crate::config::agent_surface::SigningBackendKind;
+    let Some(signing) = signing.filter(|s| s.backend != Some(SigningBackendKind::Local)) else {
+        return false;
+    };
+    match signing
+        .connection_id
+        .as_deref()
+    {
+        Some(id) if id != crate::vta::key_directory::DEFAULT_CONNECTION_ID => id == connection_id,
+        Some(_) => connection_id == crate::vta::connections::BOOTSTRAP_CONNECTION_ID,
+        None => {
+            signing.backend == Some(SigningBackendKind::Vta)
+                && connection_id == crate::vta::connections::BOOTSTRAP_CONNECTION_ID
+        }
+    }
+}
+
+/// What signs through a connection: the users the caller may view, by name,
+/// and how many others there are.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SigningUsers {
+    named: Vec<String>,
+    hidden: usize,
+}
+
+impl SigningUsers {
+    fn is_empty(&self) -> bool {
+        self.named.is_empty() && self.hidden == 0
+    }
+
+    fn add(
+        &mut self,
+        visible: bool,
+        name: impl FnOnce() -> String,
+    ) {
+        if visible {
+            self.named.push(name());
+        } else {
+            self.hidden += 1;
+        }
+    }
+}
+
+fn signing_users(
+    connection_id: &str,
+    default_signing: Option<&crate::config::agent_surface::SurfaceSigningConfig>,
+    surfaces: &[crate::config::agent_surface::AgentSurface],
+    issuers: &[crate::issuers::types::Issuer],
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
+) -> SigningUsers {
+    let mut users = SigningUsers::default();
+    if signs_through(default_signing, connection_id) {
+        users.add(true, || "the gateway default (Audit signing)".to_string());
+    }
+    for surface in surfaces {
+        let visible = can_access(surface.tenant_id.as_deref(), context)
+            && scope_allows_resource(scope, context, ResourceKind::Surfaces, &surface.surface_id);
+        if signs_through(surface.signing.as_ref(), connection_id) {
+            users.add(visible, || format!("surface \"{}\"", surface.name));
+        }
+    }
+    for issuer in issuers {
+        if signs_through(issuer.signing.as_ref(), connection_id) {
+            let visible = can_access(issuer.tenant_id.as_deref(), context)
+                && scope_allows_resource(scope, context, ResourceKind::Issuers, &issuer.id);
+            users.add(visible, || format!("issuer \"{}\"", issuer.name));
+        }
+    }
+    users
+}
+
+/// Stores the disconnect check reads, from the router's extensions.
+struct SigningUserStores<'a> {
+    surfaces: Option<&'a Arc<dyn crate::surfaces::AgentSurfaceStore>>,
+    issuers: Option<&'a Arc<dyn crate::issuers::IssuerStore>>,
+}
+
+async fn find_signing_users(
+    connection_id: &str,
+    stores: &SigningUserStores<'_>,
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
+) -> anyhow::Result<SigningUsers> {
+    let surfaces = match stores.surfaces {
+        Some(store) => store.list_all().await?,
+        None => Vec::new(),
+    };
+    let issuers = match stores.issuers {
+        Some(store) => store.list_all().await?,
+        None => Vec::new(),
+    };
+    let default_signing = crate::storage::settings_store::global_settings().and_then(|s| s.default_signing);
+    Ok(signing_users(connection_id, default_signing.as_ref(), &surfaces, &issuers, context, scope))
+}
+
+/// The refusal to stop a connection signing while something still signs through
+/// it, unless the caller acknowledged the consequence. Agents whose keys live
+/// in the trust agent cannot be moved: they would have to be re-onboarded
+/// under a new DID. A check that cannot be made refuses too, and the same
+/// acknowledgement proceeds without it.
+async fn guard_disconnect(
+    state: &VtaConnectionAdminState,
+    connection_id: &str,
+    query: &DisconnectQuery,
+    stores: &SigningUserStores<'_>,
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
+) -> Option<axum::response::Response> {
+    let mut reasons = Vec::new();
+    let mut users = SigningUsers::default();
+    if !query.acknowledge_signing_users {
+        match find_signing_users(connection_id, stores, context, scope).await {
+            Ok(found) if !found.is_empty() => {
+                let mut named = found.named.join(", ");
+                if found.hidden > 0 {
+                    if !named.is_empty() {
+                        named.push_str(" and ");
+                    }
+                    named.push_str(&format!("{} you cannot view", found.hidden));
+                }
+                reasons.push(format!("This trust agent still signs for {named}; they will stop signing."));
+                users = found;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error!(error = %e, "Failed to list what signs through a VTA connection before disconnecting it");
+                reasons.push("Could not check what signs through this trust agent.".to_string());
+            }
+        }
+    }
+    let mut stranded = 0;
+    if !query.acknowledge_stranded_agents {
+        match agents_holding_keys(state, connection_id).await {
+            Ok(0) => {}
+            Ok(held) => {
+                stranded = held;
+                reasons.push(format!(
+                    "{held} agent(s) keep their key in this trust agent and cannot sign without it. They cannot be \
+                     moved; they would have to be re-onboarded with a new DID."
+                ));
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to list agent identities before disconnecting a VTA connection");
+                reasons.push("Could not check which agents keep their key in this trust agent.".to_string());
+            }
+        }
+    }
+    if reasons.is_empty() {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": reasons.join(" "),
+                "signing_users": users.named,
+                "hidden_signing_users": users.hidden,
+                "stranded_agents": stranded,
+            })),
+        )
+            .into_response(),
+    )
+}
+
+/// The identifier a new connection authenticates to its VTA as.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlIdentity {
+    /// A `did:webvh` the gateway publishes, so the control key can be replaced
+    /// without a new grant. The VTA must be able to reach the gateway's
+    /// `/vta-auth/{id}/did.jsonl`.
+    #[default]
+    Webvh,
+    /// The `did:key` of the control key itself. Needs nothing published, and
+    /// replacing the key means a new identifier and a new grant.
+    DidKey,
+}
+
+/// Body for create / update.
+#[derive(Debug, Default, Deserialize)]
+pub struct VtaConnectionRequest {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub transport: VtaConnectionTransport,
+    pub endpoint: String,
+    pub vta_did: String,
+    #[serde(default)]
+    pub default_context_id: Option<String>,
+    #[serde(default)]
+    pub control_key_ref: Option<String>,
+    /// Applies when the gateway mints the control key (no `control_key_ref`).
+    #[serde(default)]
+    pub control_identity: ControlIdentity,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorBody {
+    error: String,
+}
+
+impl ErrorBody {
+    fn json(msg: impl Into<String>) -> Json<Self> {
+        Json(Self { error: msg.into() })
+    }
+}
+
+fn unauthorized() -> (StatusCode, Json<ErrorBody>) {
+    (StatusCode::UNAUTHORIZED, ErrorBody::json("Unauthorized"))
+}
+
+fn forbidden() -> (StatusCode, Json<ErrorBody>) {
+    (StatusCode::FORBIDDEN, ErrorBody::json("Forbidden"))
+}
+
+fn not_found() -> (StatusCode, Json<ErrorBody>) {
+    (StatusCode::NOT_FOUND, ErrorBody::json("connection not found"))
+}
+
+/// The `404` for a connection outside what the caller may see, marked so the refusal is
+/// recorded.
+fn hidden() -> axum::response::Response {
+    let mut response = not_found().into_response();
+    response
+        .extensions_mut()
+        .insert(security_records::HiddenConnection);
+    response
+}
+
+fn acknowledged(query: &DisconnectQuery) -> security_records::Acknowledged {
+    security_records::Acknowledged {
+        signing_users: query.acknowledge_signing_users,
+        stranded_agents: query.acknowledge_stranded_agents,
+    }
+}
+
+async fn require_permission(
+    user_id: &str,
+    storage: &PasskeyStorage,
+    rbac_config: &RbacConfig,
+    feature: &Feature,
+    pat: Option<&PatContext>,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let user = storage
+        .load_user_by_id(user_id)
+        .await
+        .map_err(|e| {
+            error!("Failed to load user {} for RBAC check: {}", user_id, e);
+            unauthorized()
+        })?
+        .ok_or_else(|| {
+            warn!(user_id = %user_id, "VTA connection CRUD rejected — user not found");
+            unauthorized()
+        })?;
+    if !rbac_config.has_permission(&user.role, feature) {
+        warn!(user_id = %user_id, feature = %feature.as_str(), "VTA connection CRUD rejected — insufficient permissions");
+        return Err(forbidden());
+    }
+    if let Some(PatContext(Some(scopes))) = pat
+        && !scopes
+            .iter()
+            .any(|scope| scope == feature.as_str())
+    {
+        warn!(user_id = %user_id, feature = %feature.as_str(), "VTA connection CRUD rejected — access-token scope excludes permission");
+        return Err(forbidden());
+    }
+    Ok(())
+}
+
+fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
+    context
+        .as_ref()
+        .map(|Extension(context)| context)
+}
+
+fn resource_scope(scope: &Option<Extension<PatResourceScope>>) -> Option<&PatResourceScope> {
+    scope
+        .as_ref()
+        .map(|Extension(scope)| scope)
+}
+
+fn connection_allowed(
+    connection: &VtaConnection,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> bool {
+    can_access(
+        connection
+            .tenant_id
+            .as_deref(),
+        tenant_context(context),
+    ) && scope_allows_resource(
+        resource_scope(scope),
+        tenant_context(context),
+        ResourceKind::VtaConnections,
+        &connection.id,
+    )
+}
+
+/// May this caller change, pair, revoke or delete the connection? A tenant
+/// token may see an appliance-wide connection but not act on it.
+fn connection_writable(
+    connection: &VtaConnection,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> bool {
+    can_mutate(
+        connection
+            .tenant_id
+            .as_deref(),
+        tenant_context(context),
+    ) && scope_allows_resource(
+        resource_scope(scope),
+        tenant_context(context),
+        ResourceKind::VtaConnections,
+        &connection.id,
+    )
+}
+
+fn outside_scope() -> (StatusCode, Json<ErrorBody>) {
+    (StatusCode::FORBIDDEN, ErrorBody::json("VTA connection is outside this token's permitted scope"))
+}
+
+/// The control key is the credential this gateway authenticates to the VTA
+/// with, so the reference must point at a secret the caller may actually use —
+/// otherwise a tenant could borrow another tenant's VTA identity.
+async fn validate_control_key_reference(
+    owner_tenant_id: Option<&str>,
+    secret_ref: Option<&str>,
+    secrets_store: Option<&Arc<dyn SecretsStore>>,
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let Some(secret_ref) = secret_ref.filter(|r| !r.trim().is_empty()) else {
+        return Ok(());
+    };
+    let store = secrets_store
+        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Secrets store is not configured")))?;
+    let secret = store
+        .get_by_secret_id(secret_ref)
+        .await
+        .map_err(|e| {
+            error!(secret_ref = %secret_ref, error = %e, "Failed to validate VTA control key reference");
+            (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Internal server error"))
+        })?
+        .ok_or_else(|| {
+            (StatusCode::BAD_REQUEST, ErrorBody::json("control_key_ref does not reference an accessible secret"))
+        })?;
+    if !can_reference(owner_tenant_id, secret.tenant_id.as_deref())
+        || !scope_allows_resource(scope, context, ResourceKind::Secrets, &secret.secret_id)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ErrorBody::json("control_key_ref does not reference an accessible secret"),
+        ));
+    }
+    Ok(())
+}
+
+fn to_connection(
+    id: String,
+    body: VtaConnectionRequest,
+    status: VtaConnectionStatus,
+) -> VtaConnection {
+    let now = chrono::Utc::now();
+    VtaConnection {
+        id,
+        tenant_id: body.tenant_id,
+        name: body.name,
+        description: body.description,
+        enabled: body.enabled,
+        transport: body.transport,
+        endpoint: body.endpoint,
+        vta_did: body.vta_did,
+        default_context_id: body.default_context_id,
+        control_key_ref: body.control_key_ref,
+        control_did: None,
+        control_key_state: Default::default(),
+        status,
+        keys: Default::default(),
+        pairing: Default::default(),
+        created_at: now,
+        updated_at: now,
+        retired_at: None,
+    }
+}
+
+/// Makes `next` the active key of the connection as stored now, retiring the
+/// one it replaces, so a key change saved meanwhile is kept rather than
+/// overwritten. Returns the saved connection and the retired key id, or why
+/// the switch was refused.
+type SurfaceStoreExt = Option<Extension<Arc<dyn crate::surfaces::AgentSurfaceStore>>>;
+type IssuerStoreExt = Option<Extension<Arc<dyn crate::issuers::IssuerStore>>>;
+
+/// Moves every saved signing choice that names key `previous` of connection
+/// `connection_id` (a surface's, an issuer's, Gateway signing) to `next`, so
+/// what is shown and stored is the key that signs. Best effort: one that
+/// cannot be saved is logged and still signs with `next`, since a retired key
+/// signs with the connection's active one.
+async fn follow_key_rotation(
+    surfaces: &SurfaceStoreExt,
+    issuers: &IssuerStoreExt,
+    connection_id: &str,
+    previous: &str,
+    next: &str,
+) {
+    let names_previous = |signing: Option<&crate::config::agent_surface::SurfaceSigningConfig>| {
+        signs_through(signing, connection_id) && signing.and_then(|signing| signing.key_id.as_deref()) == Some(previous)
+    };
+    let moved = |signing: &mut Option<crate::config::agent_surface::SurfaceSigningConfig>| {
+        if let Some(signing) = signing.as_mut() {
+            signing.key_id = Some(next.to_string());
+        }
+    };
+    if let Some(Extension(store)) = surfaces {
+        for mut surface in store
+            .list_all()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|surface| names_previous(surface.signing.as_ref()))
+        {
+            moved(&mut surface.signing);
+            if let Err(e) = store.save(&surface).await {
+                warn!(surface_id = %surface.surface_id, error = %e, "a surface's signing choice still names a rotated key");
+            }
+        }
+    }
+    if let Some(Extension(store)) = issuers {
+        for mut issuer in store
+            .list_all()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|issuer| names_previous(issuer.signing.as_ref()))
+        {
+            moved(&mut issuer.signing);
+            if let Err(e) = store.update(&issuer).await {
+                warn!(issuer_id = %issuer.id, error = %e, "an issuer's signing choice still names a rotated key");
+            }
+        }
+    }
+    if let Some(settings) = crate::storage::settings_store::global_settings_store() {
+        let mut current = settings.get();
+        if names_previous(
+            current
+                .default_signing
+                .as_ref(),
+        ) {
+            moved(&mut current.default_signing);
+            let saved = match settings.update(current) {
+                Ok(()) => settings.save().await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = saved {
+                warn!(error = %e, "Gateway signing still names a rotated key");
+            }
+        }
+    }
+}
+
+/// Whether `stored` is still the agent `basis` was read as: the same endpoint,
+/// agent DID and carrier, and not retired since (disabled, revoked or pointed
+/// elsewhere, even if it was restored after).
+fn same_agent(
+    stored: &VtaConnection,
+    basis: &VtaConnection,
+) -> bool {
+    stored.endpoint == basis.endpoint
+        && stored.vta_did == basis.vta_did
+        && stored.transport == basis.transport
+        && stored.retired_at == basis.retired_at
+}
+
+/// Why a key was not recorded.
+enum KeySwitchRefusal {
+    /// The key cannot become the active one.
+    Invalid(String),
+    /// The connection now names another agent than the one the key is in.
+    Changed,
+}
+
+impl KeySwitchRefusal {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Invalid(message) => (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response(),
+            Self::Changed => (
+                StatusCode::CONFLICT,
+                ErrorBody::json(
+                    "the connection was changed, disabled or revoked meanwhile, so the key was not recorded; try again",
+                ),
+            )
+                .into_response(),
+        }
+    }
+}
+
+/// Makes `next` the active key of connection `id`, as long as it is still the
+/// agent `basis` was read as, which is where the key is.
+async fn switch_active_key(
+    state: &VtaConnectionAdminState,
+    id: &str,
+    basis: &VtaConnection,
+    next: crate::vta::connections::SigningKey,
+) -> anyhow::Result<Result<(VtaConnection, Option<String>), KeySwitchRefusal>> {
+    let mut outcome = Ok(None);
+    let updated = crate::vta::connections::modify(state.store.as_ref(), id, |stored| {
+        if !same_agent(stored, basis) {
+            outcome = Err(KeySwitchRefusal::Changed);
+            return;
+        }
+        let previous = stored
+            .keys
+            .active
+            .as_ref()
+            .map(|key| key.key_id.clone());
+        outcome = stored
+            .keys
+            .rotate_to(next, chrono::Utc::now())
+            .map(|()| previous)
+            .map_err(KeySwitchRefusal::Invalid);
+    })
+    .await?;
+    Ok(outcome.map(|previous| (updated, previous)))
+}
+
+/// The connection as edited: each editable field the edit sends, and the stored
+/// value of each it leaves out. A field sent as `null` is cleared.
+fn edited_request(
+    existing: &VtaConnection,
+    edit: serde_json::Value,
+) -> Result<VtaConnectionRequest, String> {
+    let serde_json::Value::Object(sent) = edit else {
+        return Err("the edit must be a JSON object".to_string());
+    };
+    let mut merged = serde_json::json!({
+        "name": existing.name,
+        "description": existing.description,
+        "enabled": existing.enabled,
+        "transport": existing.transport,
+        "endpoint": existing.endpoint,
+        "vta_did": existing.vta_did,
+        "default_context_id": existing.default_context_id,
+        "control_key_ref": existing.control_key_ref,
+    });
+    if let Some(fields) = merged.as_object_mut() {
+        for (field, value) in sent {
+            if fields.contains_key(&field) {
+                fields.insert(field, value);
+            }
+        }
+    }
+    serde_json::from_value(merged).map_err(|e| format!("invalid edit: {e}"))
+}
+
+/// Whether an edit points the connection at another trust agent: a different
+/// endpoint, agent DID or transport.
+fn points_elsewhere(
+    existing: &VtaConnection,
+    body: &VtaConnectionRequest,
+) -> bool {
+    existing.endpoint != body.endpoint || existing.vta_did != body.vta_did || existing.transport != body.transport
+}
+
+/// The published DID survives an edit, because the grant names it. It belongs
+/// to the control key, so a connection pointed at a different key loses it.
+fn kept_control_did(
+    existing: &VtaConnection,
+    updated: &VtaConnection,
+) -> Option<String> {
+    (existing.control_key_ref == updated.control_key_ref)
+        .then(|| existing.control_did.clone())
+        .flatten()
+}
+
+async fn invalidate(
+    state: &VtaConnectionAdminState,
+    id: &str,
+) {
+    if let Some(registry) = &state.registry {
+        registry.invalidate(id).await;
+    }
+}
+
+/// Bring the data-plane reservations in line with the stored connections
+/// after a write: see [`crate::vta::isolation`].
+async fn sync_reservations(state: &VtaConnectionAdminState) {
+    crate::vta::isolation::sync_connection_reservations(state.store.as_ref()).await;
+}
+
+/// `POST /v1/vta/connections` — create a connection.
+pub async fn create_connection(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    State(state): State<VtaConnectionAdminState>,
+    secrets_store: Option<Extension<Arc<dyn SecretsStore>>>,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+    Json(mut body): Json<VtaConnectionRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_permission(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &Feature::VtaConnectionsEdit,
+        pat.as_ref()
+            .map(|Extension(pat)| pat),
+    )
+    .await
+    {
+        return e.into_response();
+    }
+    body.tenant_id = match tenant_for_create(body.tenant_id.take(), pat.is_some(), tenant_context(&context)) {
+        Ok(tenant_id) => tenant_id,
+        Err(message) => return (StatusCode::FORBIDDEN, ErrorBody::json(message)).into_response(),
+    };
+    if let Err(response) = validate_control_key_reference(
+        body.tenant_id.as_deref(),
+        body.control_key_ref
+            .as_deref(),
+        secrets_store
+            .as_ref()
+            .map(|Extension(store)| store),
+        tenant_context(&context),
+        resource_scope(&scope),
+    )
+    .await
+    {
+        return response.into_response();
+    }
+    let control_identity = body.control_identity;
+    let mut connection = to_connection(uuid::Uuid::new_v4().to_string(), body, VtaConnectionStatus::Unpaired);
+
+    // Every connection gets its **own** control key: revoking one
+    // must not strand the others, and a leaked seed must not authenticate the
+    // gateway to every VTA it knows. The seed is written to the secrets store
+    // and only its reference lands on the record, so no key material is ever
+    // persisted in connection JSON.
+    if connection
+        .control_key_ref
+        .as_deref()
+        .map(|r| r.trim().is_empty())
+        .unwrap_or(true)
+        && let Some(Extension(secrets)) = secrets_store.as_ref()
+        && let Err(response) =
+            give_connection_a_control_identity(&state, secrets, &mut connection, control_identity).await
+    {
+        return response.into_response();
+    }
+
+    if let Err(message) = connection.validate() {
+        return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response();
+    }
+    if !connection_writable(&connection, &context, &scope) {
+        return outside_scope().into_response();
+    }
+    match state
+        .store
+        .create(connection)
+        .await
+    {
+        Ok(created) => {
+            info!(id = %created.id, name = %created.name, "VTA connection created");
+            security_records::connection_created(&created);
+            invalidate(&state, &created.id).await;
+            (StatusCode::CREATED, Json(created)).into_response()
+        }
+        Err(e) => {
+            error!("Failed to create VTA connection: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Failed to create connection")).into_response()
+        }
+    }
+}
+
+/// A stored connection as the API shows it.
+fn present(mut connection: VtaConnection) -> VtaConnection {
+    // A rotation under way names the secrets-store entries of both keys; what
+    // the page needs is the phase and the times.
+    if let Some(rotation) = connection
+        .control_key_state
+        .rotation
+        .as_mut()
+    {
+        rotation.next_key_ref.clear();
+        rotation
+            .previous_key_ref
+            .clear();
+    }
+    connection
+}
+
+/// `GET /v1/vta/connections` — list connections.
+pub async fn list_connections(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    State(state): State<VtaConnectionAdminState>,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_permission(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &Feature::VtaConnectionsView,
+        pat.as_ref()
+            .map(|Extension(pat)| pat),
+    )
+    .await
+    {
+        return e.into_response();
+    }
+    match state.store.list().await {
+        Ok(mut connections) => {
+            connections.retain(|connection| connection_allowed(connection, &context, &scope));
+            let connections: Vec<VtaConnection> = connections
+                .into_iter()
+                .map(present)
+                .collect();
+            (StatusCode::OK, Json(connections)).into_response()
+        }
+        Err(e) => {
+            error!("Failed to list VTA connections: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Failed to list connections")).into_response()
+        }
+    }
+}
+
+/// `GET /v1/vta/connections/{id}` — fetch one connection.
+pub async fn get_connection(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    State(state): State<VtaConnectionAdminState>,
+    Path(id): Path<String>,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_permission(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &Feature::VtaConnectionsView,
+        pat.as_ref()
+            .map(|Extension(pat)| pat),
+    )
+    .await
+    {
+        return e.into_response();
+    }
+    match state.store.get(&id).await {
+        Ok(Some(connection)) if connection_allowed(&connection, &context, &scope) => {
+            (StatusCode::OK, Json(present(connection))).into_response()
+        }
+        Ok(_) => not_found().into_response(),
+        Err(e) => {
+            error!("Failed to get VTA connection {}: {}", id, e);
+            (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Failed to get connection")).into_response()
+        }
+    }
+}
+
+/// `PUT /v1/vta/connections/{id}` — update a connection.
+pub async fn update_connection(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    State(state): State<VtaConnectionAdminState>,
+    Path(id): Path<String>,
+    Query(query): Query<DisconnectQuery>,
+    secrets_store: Option<Extension<Arc<dyn SecretsStore>>>,
+    surfaces: Option<Extension<Arc<dyn crate::surfaces::AgentSurfaceStore>>>,
+    issuers: Option<Extension<Arc<dyn crate::issuers::IssuerStore>>>,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+    Json(edit): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_permission(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &Feature::VtaConnectionsEdit,
+        pat.as_ref()
+            .map(|Extension(pat)| pat),
+    )
+    .await
+    {
+        return e.into_response();
+    }
+    let existing = match state.store.get(&id).await {
+        Ok(Some(existing)) => existing,
+        Ok(None) => return not_found().into_response(),
+        Err(e) => {
+            error!(id = %id, error = %e, "Failed to load VTA connection before update");
+            return (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Internal server error")).into_response();
+        }
+    };
+    if !connection_allowed(&existing, &context, &scope) {
+        return hidden();
+    }
+    if !connection_writable(&existing, &context, &scope) {
+        return outside_scope().into_response();
+    }
+    // The bootstrap record mirrors the `[vta]` TOML block, which is re-applied
+    // on every boot. Allowing an edit here would make "which one wins after a
+    // restart" unanswerable, so the block stays the only way to change it.
+    if existing.is_bootstrap() {
+        return (
+            StatusCode::CONFLICT,
+            ErrorBody::json("the bootstrap connection is managed by the [vta] configuration block"),
+        )
+            .into_response();
+    }
+    let sent: Vec<String> = edit
+        .as_object()
+        .map(|fields| {
+            fields
+                .keys()
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut body = match edited_request(&existing, edit) {
+        Ok(body) => body,
+        Err(message) => return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response(),
+    };
+    let repointed = points_elsewhere(&existing, &body);
+    if (existing.enabled && !body.enabled
+        || repointed
+            && existing
+                .pairing
+                .state
+                .is_usable())
+        && let Some(response) = guard_disconnect(
+            &state,
+            &id,
+            &query,
+            &SigningUserStores {
+                surfaces: surfaces
+                    .as_ref()
+                    .map(|Extension(store)| store),
+                issuers: issuers
+                    .as_ref()
+                    .map(|Extension(store)| store),
+            },
+            tenant_context(&context),
+            resource_scope(&scope),
+        )
+        .await
+    {
+        return response;
+    }
+    // Ownership is not reassignable here (see the tenancy section of AGENTS.md).
+    body.tenant_id = existing.tenant_id.clone();
+    if let Err(response) = validate_control_key_reference(
+        body.tenant_id.as_deref(),
+        body.control_key_ref
+            .as_deref(),
+        secrets_store
+            .as_ref()
+            .map(|Extension(store)| store),
+        tenant_context(&context),
+        resource_scope(&scope),
+    )
+    .await
+    {
+        return response.into_response();
+    }
+    if existing
+        .control_key_state
+        .rotation
+        .is_some()
+    {
+        return (
+            StatusCode::CONFLICT,
+            ErrorBody::json("a control-key rotation is under way on this connection; finish or cancel it first"),
+        )
+            .into_response();
+    }
+    let mut updated = to_connection(id.clone(), body, existing.status);
+    updated.control_did = kept_control_did(&existing, &updated);
+    if let Err(message) = updated.validate() {
+        return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response();
+    }
+    // An edit changes only what the operator edits. The keys stay published so
+    // tokens they signed keep verifying, and the pairing stays unless the edit
+    // points the connection at another agent, whose grant has to be approved
+    // and verified again. Which key of the DID the gateway signs in with is the
+    // gateway's to change, never the request's.
+    let mut changed_meanwhile = false;
+    match crate::vta::connections::modify(state.store.as_ref(), &id, |stored| {
+        changed_meanwhile = apply_edit(stored, &existing, updated, &sent, repointed).is_err();
+    })
+    .await
+    {
+        Ok(_) if changed_meanwhile => (
+            StatusCode::CONFLICT,
+            ErrorBody::json("the connection changed while it was being edited; reload it and try again"),
+        )
+            .into_response(),
+        Ok(updated) => {
+            info!(id = %id, enabled = updated.enabled, "VTA connection updated");
+            security_records::connection_updated(&existing, &updated, acknowledged(&query));
+            sync_reservations(&state).await;
+            // Take effect now: the next signing call rebuilds, or fails closed
+            // if the connection was just disabled.
+            invalidate(&state, &id).await;
+            (StatusCode::OK, Json(updated)).into_response()
+        }
+        Err(e) => {
+            error!("Failed to update VTA connection {}: {}", id, e);
+            not_found().into_response()
+        }
+    }
+}
+
+/// What an edit's checks were made against: the fields that decide whether it
+/// disconnects or repoints the connection, and whether a rotation is under way.
+fn edit_basis(connection: &VtaConnection) -> impl PartialEq + '_ {
+    (
+        connection.enabled,
+        &connection.transport,
+        &connection.endpoint,
+        &connection.vta_did,
+        connection.pairing.state,
+        &connection.control_key_ref,
+        connection
+            .control_key_state
+            .rotation
+            .is_some(),
+    )
+}
+
+/// Writes the fields an edit sent onto the record read under the write lock.
+/// Refuses, changing nothing, when what the edit was checked against changed
+/// since it was read, such as a disable or a control-key change made meanwhile.
+fn apply_edit(
+    stored: &mut VtaConnection,
+    read: &VtaConnection,
+    updated: VtaConnection,
+    sent: &[String],
+    repointed: bool,
+) -> Result<(), ()> {
+    if edit_basis(stored) != edit_basis(read) {
+        return Err(());
+    }
+    if repointed {
+        stored.pairing = Default::default();
+        stored.status = stored.pairing.state.into();
+    }
+    let was_sent = |field: &str| {
+        sent.iter()
+            .any(|sent| sent == field)
+    };
+    if was_sent("name") {
+        stored.name = updated.name;
+    }
+    if was_sent("description") {
+        stored.description = updated.description;
+    }
+    if was_sent("enabled") {
+        stored.enabled = updated.enabled;
+    }
+    if was_sent("transport") {
+        stored.transport = updated.transport;
+    }
+    if was_sent("endpoint") {
+        stored.endpoint = updated.endpoint;
+    }
+    if was_sent("vta_did") {
+        stored.vta_did = updated.vta_did;
+    }
+    if was_sent("default_context_id") {
+        stored.default_context_id = updated.default_context_id;
+    }
+    if was_sent("control_key_ref") {
+        stored.control_key_ref = updated.control_key_ref;
+        stored.control_did = updated.control_did;
+    }
+    Ok(())
+}
+
+/// `DELETE /v1/vta/connections/{id}` — remove a connection.
+pub async fn delete_connection(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    State(state): State<VtaConnectionAdminState>,
+    Path(id): Path<String>,
+    Query(query): Query<DisconnectQuery>,
+    surfaces: Option<Extension<Arc<dyn crate::surfaces::AgentSurfaceStore>>>,
+    issuers: Option<Extension<Arc<dyn crate::issuers::IssuerStore>>>,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> axum::response::Response {
+    let connection = match load_for_pairing(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &state,
+        &id,
+        &Feature::VtaConnectionsDelete,
+        Access::Write,
+        pat.as_ref(),
+        &context,
+        &scope,
+    )
+    .await
+    {
+        Ok(connection) => connection,
+        Err(e) => return e.into_response(),
+    };
+    if connection.is_bootstrap() {
+        return (
+            StatusCode::CONFLICT,
+            ErrorBody::json("the bootstrap connection is managed by the [vta] configuration block"),
+        )
+            .into_response();
+    }
+    if let Some(response) = guard_disconnect(
+        &state,
+        &id,
+        &query,
+        &SigningUserStores {
+            surfaces: surfaces
+                .as_ref()
+                .map(|Extension(store)| store),
+            issuers: issuers
+                .as_ref()
+                .map(|Extension(store)| store),
+        },
+        tenant_context(&context),
+        resource_scope(&scope),
+    )
+    .await
+    {
+        return response;
+    }
+    match state.store.delete(&id).await {
+        Ok(()) => {
+            info!(id = %id, "VTA connection deleted");
+            security_records::connection_deleted(&connection, acknowledged(&query));
+            sync_reservations(&state).await;
+            invalidate(&state, &id).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => {
+            error!("Failed to delete VTA connection {}: {}", id, e);
+            (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Failed to delete connection")).into_response()
+        }
+    }
+}
+
+/// A VTA failure as an API response or a stored record may show it: what the
+/// trust agent sent back, or how reaching it failed, only in summary; the
+/// gateway's own configuration and signing errors in full.
+fn operator_message(error: &crate::vta::VtaError) -> String {
+    use crate::vta::VtaError as E;
+    match error {
+        E::Http { .. } | E::Transport(_) | E::Protocol(_) => error.to_string(),
+        E::Signing(_) | E::Config(_) | E::QuotaExceeded(_) => error.log_detail().to_string(),
+    }
+}
+
+/// What a route does with the connection it loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Read,
+    Write,
+}
+
+/// Load a connection for a pairing operation, applying the same RBAC, tenancy
+/// and PAT-scope gates the CRUD routes use. A connection the caller may see
+/// but not change is refused with `403` for [`Access::Write`].
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+async fn load_for_pairing(
+    user_id: &str,
+    passkey_storage: &PasskeyStorage,
+    rbac_config: &RbacConfig,
+    state: &VtaConnectionAdminState,
+    id: &str,
+    feature: &Feature,
+    access: Access,
+    pat: Option<&Extension<PatContext>>,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<VtaConnection, axum::response::Response> {
+    require_permission(user_id, passkey_storage, rbac_config, feature, pat.map(|Extension(pat)| pat))
+        .await
+        .map_err(IntoResponse::into_response)?;
+    let connection = state
+        .store
+        .get(id)
+        .await
+        .map_err(|e| {
+            error!(id = %id, error = %e, "Failed to load VTA connection for pairing");
+            (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Internal server error")).into_response()
+        })?
+        .ok_or_else(|| not_found().into_response())?;
+    if !connection_allowed(&connection, context, scope) {
+        // Indistinguishable from "does not exist", so a scoped token cannot
+        // probe for connections it may not see.
+        return Err(hidden());
+    }
+    if access == Access::Write && !connection_writable(&connection, context, scope) {
+        return Err(outside_scope().into_response());
+    }
+    Ok(connection)
+}
+
+async fn persist_pairing(
+    state: &VtaConnectionAdminState,
+    connection: VtaConnection,
+    pairing: crate::vta::pairing::PairingRecord,
+) -> Result<VtaConnection, (StatusCode, Json<ErrorBody>)> {
+    save_pairing(state, connection, pairing, false).await
+}
+
+/// Saves a Verify result, unless the connection was revoked since it was read:
+/// only pairing again brings a revoked connection back.
+async fn persist_verification(
+    state: &VtaConnectionAdminState,
+    connection: VtaConnection,
+    pairing: crate::vta::pairing::PairingRecord,
+) -> Result<VtaConnection, (StatusCode, Json<ErrorBody>)> {
+    save_pairing(state, connection, pairing, true).await
+}
+
+/// The answer to a Verify of a revoked connection.
+fn revoked_connection() -> (StatusCode, Json<ErrorBody>) {
+    (StatusCode::CONFLICT, ErrorBody::json("this connection was revoked; pair it again first"))
+}
+
+async fn save_pairing(
+    state: &VtaConnectionAdminState,
+    connection: VtaConnection,
+    pairing: crate::vta::pairing::PairingRecord,
+    unless_revoked: bool,
+) -> Result<VtaConnection, (StatusCode, Json<ErrorBody>)> {
+    let id = connection.id.clone();
+    let mut revoked = false;
+    let mut changed = false;
+    let updated = crate::vta::connections::modify(state.store.as_ref(), &id, |stored| {
+        if unless_revoked && stored.pairing.state == crate::vta::pairing::PairingState::Revoked {
+            revoked = true;
+            return;
+        }
+        // A Verify judged the agent the record named when it was read; one
+        // pointed elsewhere, or revoked and paired again, since is not that.
+        if unless_revoked && !same_agent(stored, &connection) {
+            changed = true;
+            return;
+        }
+        stored.status = pairing.state.into();
+        stored.pairing = pairing;
+    })
+    .await
+    .map_err(|e| {
+        error!(id = %id, error = %e, "Failed to persist VTA pairing state");
+        (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Internal server error"))
+    })?;
+    if revoked {
+        return Err(revoked_connection());
+    }
+    if changed {
+        return Err((
+            StatusCode::CONFLICT,
+            ErrorBody::json("the connection was changed while it was being verified; verify it again"),
+        ));
+    }
+    // Pairing changes whether the connection may sign, so the cached connector
+    // must go: a revoke has to take effect on the very next request.
+    invalidate(state, &id).await;
+    sync_reservations(state).await;
+    Ok(updated)
+}
+
+/// `POST /v1/vta/connections/{id}/pair` — begin pairing and return the artifact
+/// the customer approves on their own VTA.
+///
+/// Minting the per-connection control key is the caller's responsibility once a
+/// secrets store is wired; until then an existing `control_key_ref` is required,
+/// so a pairing artifact always names a key the gateway actually holds.
+pub async fn pair_connection(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    State(state): State<VtaConnectionAdminState>,
+    Path(id): Path<String>,
+    secrets_store: Option<Extension<Arc<dyn SecretsStore>>>,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> impl IntoResponse {
+    let connection = match load_for_pairing(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &state,
+        &id,
+        &Feature::VtaConnectionsEdit,
+        Access::Write,
+        pat.as_ref(),
+        &context,
+        &scope,
+    )
+    .await
+    {
+        Ok(connection) => connection,
+        Err(e) => return e.into_response(),
+    };
+
+    let control_did = match resolve_control_did(
+        &connection,
+        secrets_store
+            .as_ref()
+            .map(|Extension(store)| store),
+        &state.vta_config,
+    )
+    .await
+    {
+        Ok(did) => did,
+        Err(e) => return e.into_response(),
+    };
+
+    let (payload, pairing) = match crate::vta::pairing::begin_pairing(&connection, &control_did, chrono::Utc::now()) {
+        Ok(result) => result,
+        Err(e) => return (StatusCode::BAD_REQUEST, ErrorBody::json(e.log_detail())).into_response(),
+    };
+    info!(
+        target: "vta_audit",
+        connection_id = %id,
+        control_did = %control_did,
+        "VTA pairing started",
+    );
+    // A re-pair must not take a working connection out of service, so the
+    // record is only advanced when the connection is not already connected.
+    let previous = connection.clone();
+    let current = if previous
+        .pairing
+        .state
+        .is_usable()
+    {
+        connection
+    } else {
+        match persist_pairing(&state, connection, pairing).await {
+            Ok(updated) => updated,
+            Err(e) => return e.into_response(),
+        }
+    };
+    security_records::pairing_started(&previous, &current);
+    (StatusCode::OK, Json(payload)).into_response()
+}
+
+/// `POST /v1/vta/connections/{id}/verify` — check the grant and pin the VTA.
+pub async fn verify_connection(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    State(state): State<VtaConnectionAdminState>,
+    Path(id): Path<String>,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> impl IntoResponse {
+    let connection = match load_for_pairing(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &state,
+        &id,
+        &Feature::VtaConnectionsEdit,
+        Access::Write,
+        pat.as_ref(),
+        &context,
+        &scope,
+    )
+    .await
+    {
+        Ok(connection) => connection,
+        Err(e) => return e.into_response(),
+    };
+
+    // The bootstrap record has no control key of its own (it authenticates as
+    // the `[vta]` block's), and a second login as the same DID would make the
+    // VTA supersede the session that signs. Its state is the bootstrap's.
+    if connection.is_bootstrap() {
+        return (
+            StatusCode::CONFLICT,
+            ErrorBody::json("the bootstrap connection is managed by the [vta] configuration block"),
+        )
+            .into_response();
+    }
+
+    if connection.pairing.state == crate::vta::pairing::PairingState::Revoked {
+        return revoked_connection().into_response();
+    }
+
+    let Some(registry) = state.registry.clone() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, ErrorBody::json("VTA connections are not active on this gateway"))
+            .into_response();
+    };
+
+    // Reaching the VTA at all is the verification: the registry builds the
+    // connector, which authenticates with this connection's control key.
+    let previous = connection.pairing.clone();
+    let previous_state = previous.state.as_str();
+    let verified = registry
+        .verify(&connection)
+        .await;
+    // Verify signs in with a client of its own, which the agent may answer by superseding the
+    // cached client's session, so the cached client is dropped whatever the answer.
+    registry.invalidate(&id).await;
+    let outcome = match verified {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            warn!(
+                target: "vta_audit",
+                connection_id = %id,
+                error = %e.log_detail(),
+                "VTA pairing verification failed",
+            );
+            // An agent that cannot answer for now says nothing about the grant,
+            // so a working connection keeps signing.
+            if e.is_unavailable() {
+                return (StatusCode::BAD_GATEWAY, ErrorBody::json(operator_message(&e))).into_response();
+            }
+            // Never a fallback to local signing — the connection stays
+            // unusable and the operator is told why.
+            let pairing = crate::vta::pairing::apply_failure(&previous, operator_message(&e));
+            return match persist_verification(&state, connection, pairing).await {
+                Ok(updated) => {
+                    security_records::connection_verified(previous_state, &updated);
+                    (StatusCode::BAD_GATEWAY, Json(updated)).into_response()
+                }
+                Err(e) => e.into_response(),
+            };
+        }
+    };
+
+    let pairing = crate::vta::pairing::apply_verification(&connection, &previous, &outcome, chrono::Utc::now());
+    info!(
+        target: "vta_audit",
+        connection_id = %id,
+        pairing_state = %pairing.state.as_str(),
+        "VTA pairing verified",
+    );
+    let connected = pairing.state.is_usable();
+    match persist_verification(&state, connection, pairing).await {
+        Ok(updated) => {
+            security_records::connection_verified(previous_state, &updated);
+            if connected {
+                return (StatusCode::OK, Json(updated)).into_response();
+            }
+            // Reached the VTA, but the grant or the identity is wrong: the
+            // operator has to act, so this is not a success.
+            let mut response = (StatusCode::CONFLICT, Json(updated)).into_response();
+            response
+                .extensions_mut()
+                .insert(security_records::OutcomeRecorded);
+            response
+        }
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /v1/vta/connections/{id}/revoke` — stop using this connection now.
+pub async fn revoke_connection(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    State(state): State<VtaConnectionAdminState>,
+    Path(id): Path<String>,
+    Query(query): Query<DisconnectQuery>,
+    surfaces: Option<Extension<Arc<dyn crate::surfaces::AgentSurfaceStore>>>,
+    issuers: Option<Extension<Arc<dyn crate::issuers::IssuerStore>>>,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> axum::response::Response {
+    let connection = match load_for_pairing(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &state,
+        &id,
+        &Feature::VtaConnectionsDelete,
+        Access::Write,
+        pat.as_ref(),
+        &context,
+        &scope,
+    )
+    .await
+    {
+        Ok(connection) => connection,
+        Err(e) => return e.into_response(),
+    };
+
+    // The bootstrap record signs through the `[vta]` block whatever its pairing
+    // says, so recording it as revoked would claim something that is not true.
+    if connection.is_bootstrap() {
+        return (
+            StatusCode::CONFLICT,
+            ErrorBody::json("the bootstrap connection is managed by the [vta] configuration block"),
+        )
+            .into_response();
+    }
+
+    if let Some(response) = guard_disconnect(
+        &state,
+        &id,
+        &query,
+        &SigningUserStores {
+            surfaces: surfaces
+                .as_ref()
+                .map(|Extension(store)| store),
+            issuers: issuers
+                .as_ref()
+                .map(|Extension(store)| store),
+        },
+        tenant_context(&context),
+        resource_scope(&scope),
+    )
+    .await
+    {
+        return response;
+    }
+    let pairing = crate::vta::pairing::revoke(&connection.pairing);
+    let previous_state = connection
+        .pairing
+        .state
+        .as_str();
+    info!(target: "vta_audit", connection_id = %id, "VTA connection revoked");
+    match persist_pairing(&state, connection, pairing).await {
+        Ok(updated) => {
+            security_records::connection_revoked(previous_state, &updated, acknowledged(&query));
+            (StatusCode::OK, Json(updated)).into_response()
+        }
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `GET /v1/vta/connections/{id}/status` — live pairing state for the UI.
+pub async fn connection_status(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    State(state): State<VtaConnectionAdminState>,
+    Path(id): Path<String>,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> impl IntoResponse {
+    let connection = match load_for_pairing(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &state,
+        &id,
+        &Feature::VtaConnectionsView,
+        Access::Read,
+        pat.as_ref(),
+        &context,
+        &scope,
+    )
+    .await
+    {
+        Ok(connection) => connection,
+        Err(e) => return e.into_response(),
+    };
+    let usable = crate::vta::pairing::assert_usable(&connection, &connection.pairing).is_ok();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "id": connection.id,
+            "enabled": connection.enabled,
+            "status": connection.status,
+            "pairing": connection.pairing,
+            "usable": usable,
+        })),
+    )
+        .into_response()
+}
+
+/// Mint `connection`'s own control key, store it, and — when asked and the
+/// gateway has a domain to publish under — publish the `did:webvh` that
+/// declares it. Records the secret reference and the DID on the connection.
+///
+/// Without a publisher the connection authenticates as the `did:key` of its
+/// key. A publisher that fails is an error, not a fallback: the identifier the
+/// operator is about to grant would otherwise silently differ from the one
+/// they asked for.
+async fn give_connection_a_control_identity(
+    state: &VtaConnectionAdminState,
+    secrets: &Arc<dyn SecretsStore>,
+    connection: &mut VtaConnection,
+    identity: ControlIdentity,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let key = crate::vta::control_key::ControlKey::generate();
+    connection.control_key_ref =
+        Some(store_connection_control_key(secrets, &connection.id, connection.tenant_id.clone(), &key).await?);
+    if identity == ControlIdentity::Webvh
+        && let Some(publisher) = &state.auth_did_publisher
+    {
+        let did = publisher
+            .publish(&connection.id, &key)
+            .await
+            .map_err(|e| {
+                error!(connection_id = %connection.id, error = %e.log_detail(), "Failed to publish the connection's auth DID");
+                (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Failed to publish the control DID"))
+            })?;
+        connection.control_did = Some(did);
+    }
+    Ok(())
+}
+
+/// Store this connection's own Ed25519 control key: the seed goes in the
+/// secrets store, returning the reference to record.
+///
+/// The seed never touches the connection record, so a leaked record file
+/// cannot authenticate to the VTA; and the key is per connection, so revoking
+/// one cannot strand the others.
+async fn store_connection_control_key(
+    secrets: &Arc<dyn SecretsStore>,
+    connection_id: &str,
+    tenant_id: Option<String>,
+    key: &crate::vta::control_key::ControlKey,
+) -> Result<String, (StatusCode, Json<ErrorBody>)> {
+    let control_did = crate::vta::control_key::SignerKeyProvider::did(key).to_string();
+    let seed = key.seed_hex();
+    let secret_id = format!("vta-control-key-{connection_id}");
+    secrets
+        .create(crate::secrets::CreateSecretRequest {
+            tenant_id,
+            name: format!("VTA control key ({connection_id})"),
+            secret_id: secret_id.clone(),
+            description: Some(format!(
+                "Ed25519 control-key seed the gateway authenticates to this VTA with ({control_did})."
+            )),
+            value: seed,
+            secret_type: "General".to_string(),
+            tags: vec!["vta".to_string()],
+        })
+        .await
+        .map_err(|e| {
+            error!(connection_id = %connection_id, error = %e, "Failed to store the VTA control key");
+            (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Failed to store the control key"))
+        })?;
+    info!(
+        target: "vta_audit",
+        connection_id = %connection_id,
+        control_did = %control_did,
+        "minted a per-connection VTA control key",
+    );
+    Ok(secret_id)
+}
+
+/// The control DID the customer is asked to grant, resolved from the
+/// connection's secrets-store reference.
+///
+/// Derived from the stored seed rather than recorded on the record, so the DID
+/// and the key the gateway will actually authenticate with cannot drift apart.
+async fn resolve_control_did(
+    connection: &VtaConnection,
+    secrets_store: Option<&Arc<dyn SecretsStore>>,
+    vta_config: &crate::config::vta::VtaConfig,
+) -> Result<String, (StatusCode, Json<ErrorBody>)> {
+    if let Some(did) = connection
+        .control_did
+        .as_deref()
+    {
+        return Ok(did.to_string());
+    }
+    let secret_ref = match connection
+        .control_key_ref
+        .as_deref()
+        .filter(|r| !r.trim().is_empty())
+    {
+        Some(secret_ref) => secret_ref,
+        // The bootstrap record carries no `control_key_ref` by design — its key
+        // comes from `[vta] auth_key_source`, not the secrets store. Without
+        // this branch the operator could not pair it, and the DID they must
+        // grant appears nowhere they can read: it is redacted in the logs and
+        // the key itself is encrypted at rest. An operator cannot grant what
+        // they cannot see, so derive it from the same source the connector used.
+        None if connection.is_bootstrap() => return bootstrap_control_did(vta_config).await,
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                ErrorBody::json("this connection has no control_key_ref; set one before pairing"),
+            ));
+        }
+    };
+    let store = secrets_store
+        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Secrets store is not configured")))?;
+    let secret = store
+        .get_by_secret_id(secret_ref)
+        .await
+        .map_err(|e| {
+            error!(secret_ref = %secret_ref, error = %e, "Failed to read the VTA control key");
+            (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Internal server error"))
+        })?
+        .ok_or_else(|| {
+            (StatusCode::BAD_REQUEST, ErrorBody::json("control_key_ref does not reference an accessible secret"))
+        })?;
+    crate::vta::control_key_did(secret.value.trim())
+        .map_err(|e| (StatusCode::BAD_REQUEST, ErrorBody::json(e.log_detail())))
+}
+
+/// The control DID the `[vta]` block authenticates with, for the pairing view.
+///
+/// Requires `auth_key_source` to be set, and says so rather than falling back.
+/// With no source the gateway generates a **fresh key on every boot**, so a DID
+/// derived here would neither match the running connector nor survive a
+/// restart — showing it would send the operator to grant something that stops
+/// being true as soon as the gateway restarts.
+async fn bootstrap_control_did(
+    vta_config: &crate::config::vta::VtaConfig
+) -> Result<String, (StatusCode, Json<ErrorBody>)> {
+    if vta_config
+        .auth_key_source
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .is_none()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ErrorBody::json(
+                "the [vta] block has no auth_key_source, so its control key is regenerated on every \
+                 restart and cannot be granted; set auth_key_source (env:// or file://) and restart",
+            ),
+        ));
+    }
+    if let Some(did) = vta_config.auth_did.as_deref() {
+        return Ok(did.to_string());
+    }
+    let key = crate::vta::build_control_key_material(vta_config)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, ErrorBody::json(e.log_detail())))?;
+    crate::vta::control_key_did(&key.seed_hex()).map_err(|e| (StatusCode::BAD_REQUEST, ErrorBody::json(e.log_detail())))
+}
+
+/// `GET /v1/vta/status` — the appliance's signing-deployment tier.
+///
+/// The dashboard renders this verbatim. `custody_claim` is deliberately part
+/// of the payload rather than inferred client-side: local signing keeps the
+/// keys on the gateway's own host, so "the keys are held by a separate agent"
+/// is not a property that deployment has, and the backend says so explicitly
+/// rather than leaving the UI to guess.
+pub async fn vta_status(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    State(state): State<VtaConnectionAdminState>,
+    surfaces: Option<Extension<Arc<dyn crate::surfaces::AgentSurfaceStore>>>,
+    issuers: Option<Extension<Arc<dyn crate::issuers::IssuerStore>>>,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_permission(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &Feature::VtaConnectionsView,
+        pat.as_ref()
+            .map(|Extension(pat)| pat),
+    )
+    .await
+    {
+        return e.into_response();
+    }
+    let config = &state.vta_config;
+    // A tenant, or a token limited to some connections, sees the addresses of
+    // the connections it may see, and the appliance's own trust agent only
+    // when it may see the `[vta]` connection.
+    let tenant_view = tenant_context(&context).is_some();
+    let restricted = tenant_view || scope.is_some();
+    let reserved_origins = if restricted {
+        visible_connection_origins(&state, &context, &scope).await
+    } else {
+        crate::vta::isolation::reserved_origins()
+    };
+    let sees_bootstrap = !tenant_view
+        && scope_allows_resource(
+            resource_scope(&scope),
+            None,
+            ResourceKind::VtaConnections,
+            crate::vta::connections::BOOTSTRAP_CONNECTION_ID,
+        );
+    // The identity an operator grants on their trust agent. Exposed here
+    // because it is redacted in logs and encrypted on disk, so this authorised
+    // response is the only place it can be read — and an operator cannot grant
+    // what they cannot see. `None` when no stable key is configured, which is
+    // the case where showing one would be worse than showing nothing.
+    let control_did = if !sees_bootstrap {
+        None
+    } else {
+        bootstrap_control_did(config)
+            .await
+            .ok()
+    };
+    let dashboard_default =
+        crate::storage::settings_store::global_settings().and_then(|settings| settings.default_signing);
+    let through_trust_agent = crate::vta::inventory::signs_through_trust_agent(config, dashboard_default.as_ref());
+    let surface_list = match surfaces.as_ref() {
+        Some(Extension(store)) => store
+            .list_all()
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let issuer_list = match issuers.as_ref() {
+        Some(Extension(store)) => store
+            .list_all()
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let custody_claim = crate::vta::inventory::custody_claim(
+        through_trust_agent,
+        &surface_list,
+        &issuer_list,
+        crate::vta::key_directory::local_key_in_use(),
+    );
+    let default_resolution =
+        crate::vta::onboarding_default::effective(&state.default_resolution, dashboard_default.as_ref());
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "enabled": config.enabled,
+            "tier": crate::vta::inventory::tier(through_trust_agent),
+            // False while anything signs with the gateway's own key. Nothing in
+            // product copy may claim custody when this is false.
+            "custody_claim": custody_claim,
+            "auto_provision_contexts": config.auto_provision_contexts,
+            "control_did": control_did,
+            "control_did_method": config.effective_control_did_method().as_str(),
+            // Which DID the contexts this gateway creates sign as, and where a
+            // did:webvh's log is hosted.
+            "context_did_method": config.context_did_method.as_str(),
+            "context_did_hosting": config.context_did_hosting.as_str(),
+            // The control key this gateway rotates with `acl/swap-key`: absent
+            // unless it holds a `did:key` control key in a file.
+            "control_key": if sees_bootstrap { crate::vta::control_key_live::status() } else { None },
+            // What this appliance signs with when nobody has said, and why
+            //. Reported so "why is it signing with this?" never
+            // requires reading config or code.
+            "default_resolution": default_resolution,
+            // Addresses that are off-limits as proxy targets, so an operator
+            // can see why a surface pointing at one was refused.
+            "reserved_origins": reserved_origins,
+        })),
+    )
+        .into_response()
+}
+
+/// The reserved origins of the verified connections this caller may see.
+async fn visible_connection_origins(
+    state: &VtaConnectionAdminState,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Vec<String> {
+    let connections = match state.store.list().await {
+        Ok(connections) => connections,
+        Err(e) => {
+            error!(error = %e, "Failed to list VTA connections for the status of a tenant");
+            return Vec::new();
+        }
+    };
+    connections
+        .iter()
+        .filter(|connection| crate::vta::isolation::reserves_endpoint(connection))
+        .filter(|connection| connection_allowed(connection, context, scope))
+        .filter_map(|connection| crate::vta::isolation::origin_key(&connection.endpoint))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// How a refused rotation is answered: the status, the seconds to wait (for a
+/// `429`), and a message that names the next step without naming VTA internals.
+fn rotation_refusal(error: &crate::vta::control_key_live::RotateNowError) -> (StatusCode, Option<u64>, String) {
+    use crate::vta::control_key_live::RotateNowError as E;
+    match error {
+        E::NotConfigured => {
+            (StatusCode::NOT_FOUND, None, "this gateway holds no did:key control key it can rotate".to_string())
+        }
+        E::InProgress => (StatusCode::CONFLICT, None, "a rotation is already running".to_string()),
+        E::Standby => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+            "this gateway is on standby; the active gateway rotates the key".to_string(),
+        ),
+        E::TooSoon(seconds) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(*seconds),
+            format!("the control key was rotated moments ago; try again in {seconds} seconds"),
+        ),
+        E::Failed(_) => (
+            StatusCode::BAD_GATEWAY,
+            None,
+            "the trust agent did not accept the rotation; the current control key still works".to_string(),
+        ),
+    }
+}
+
+/// `POST /v1/vta/control-key/rotate` — move the gateway's access entry on its
+/// trust agent to a new control `did:key`, now.
+///
+/// Signing keys and issuer identities are untouched; only the key the gateway
+/// authenticates with changes. Needs key management edit rights.
+pub async fn rotate_control_key(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+) -> axum::response::Response {
+    if let Err(e) = require_permission(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &Feature::KeyManagementEdit,
+        pat.as_ref()
+            .map(|Extension(pat)| pat),
+    )
+    .await
+    {
+        return e.into_response();
+    }
+    if context.is_some() {
+        return (
+            StatusCode::FORBIDDEN,
+            ErrorBody::json("the gateway's own control key is appliance-wide; a tenant token cannot rotate it"),
+        )
+            .into_response();
+    }
+    let result =
+        crate::vta::control_key_live::rotate_now(crate::vta::control_key_live::Trigger::Api, Some(&user_id)).await;
+    match &result {
+        Ok(report) => security_records::control_key_rotated(
+            security_records::actor(),
+            None,
+            crate::audit::events::ControlKeyRotationOutcome::Rotated,
+            security_records::ControlDids {
+                previous: Some(
+                    report
+                        .previous_control_did
+                        .clone(),
+                ),
+                current: Some(report.control_did.clone()),
+            },
+        ),
+        Err(crate::vta::control_key_live::RotateNowError::Failed(_)) => security_records::control_key_rotated(
+            security_records::actor(),
+            None,
+            crate::audit::events::ControlKeyRotationOutcome::RolledBack,
+            security_records::ControlDids::default(),
+        ),
+        Err(_) => {}
+    }
+    match result {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "previous_control_did": report.previous_control_did,
+                "control_did": report.control_did,
+                "rotated_at": report.rotated_at,
+                "next_rotation_at": report.next_rotation_at,
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, retry_after, message) = rotation_refusal(&error);
+            let mut response = (status, ErrorBody::json(message)).into_response();
+            if let Some(seconds) = retry_after
+                && let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string())
+            {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+            response
+        }
+    }
+}
+
+/// How long a rotation request waits for the rotation to finish before it
+/// answers `202` and lets it carry on in the background.
+const ROTATION_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn rotation_start_refusal(error: crate::vta::connection_key_rotation::StartError) -> axum::response::Response {
+    use crate::vta::connection_key_rotation::StartError as E;
+    let (status, message) = match error {
+        E::NotFound => return not_found().into_response(),
+        E::ConfiguredBlock => (
+            StatusCode::CONFLICT,
+            "the connection configured in [vta] rotates its control key through POST /v1/vta/control-key/rotate"
+                .to_string(),
+        ),
+        E::NotUsable(reason) => (StatusCode::CONFLICT, format!("{reason}; connect it before rotating its key")),
+        E::NotWebvh => (
+            StatusCode::CONFLICT,
+            "this connection authenticates as a did:key, whose identifier is its key; rotating it needs a new grant on the trust agent"
+                .to_string(),
+        ),
+        E::InProgress(view) => return (StatusCode::CONFLICT, Json(*view)).into_response(),
+        E::Busy => (StatusCode::CONFLICT, "this connection is being worked on right now".to_string()),
+        E::Failed(e) => {
+            error!(error = %e.log_detail(), "Failed to start a control-key rotation");
+            (StatusCode::INTERNAL_SERVER_ERROR, "the rotation could not be started".to_string())
+        }
+    };
+    (status, ErrorBody::json(message)).into_response()
+}
+
+/// `POST /v1/vta/connections/{id}/control-key/rotate` — replace the key the
+/// gateway signs in to a connection with, keeping the connection's `did:webvh`,
+/// so nothing changes on the trust agent.
+///
+/// Answers `200` with the finished rotation, `202` while it is still under way
+/// (it carries on in the background), and `502` when the trust agent refused
+/// the new key and the old one was put back.
+pub async fn rotate_connection_control_key(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    State(state): State<VtaConnectionAdminState>,
+    Path(id): Path<String>,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> axum::response::Response {
+    let loaded = match load_for_pairing(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &state,
+        &id,
+        &Feature::KeyManagementEdit,
+        Access::Write,
+        pat.as_ref(),
+        &context,
+        &scope,
+    )
+    .await
+    {
+        Ok(connection) => connection,
+        Err(e) => return e,
+    };
+    if crate::server::mode::is_standby() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorBody::json("this gateway is on standby; the active gateway rotates the key"),
+        )
+            .into_response();
+    }
+    let Some(rotator) = state.key_rotator.clone() else {
+        return (
+            StatusCode::CONFLICT,
+            ErrorBody::json(
+                "this gateway has no domain to publish a connection's DID under, so there is no key to rotate",
+            ),
+        )
+            .into_response();
+    };
+    if let Err(e) = rotator
+        .start(&id, Some(&user_id))
+        .await
+    {
+        if matches!(e, crate::vta::connection_key_rotation::StartError::InProgress(_)) {
+            let driver = Arc::clone(&rotator);
+            let driven_id = id.clone();
+            tokio::spawn(async move { driver.drive(&driven_id).await });
+        }
+        return rotation_start_refusal(e);
+    }
+    let driver = Arc::clone(&rotator);
+    let driven_id = id.clone();
+    let actor = security_records::actor();
+    let tenant_id = loaded.tenant_id.clone();
+    let dids = security_records::ControlDids {
+        previous: None,
+        current: loaded.control_did,
+    };
+    let recorded = (actor.clone(), tenant_id.clone(), dids.clone());
+    let mut task = tokio::spawn(async move {
+        let driven = driver.drive(&driven_id).await;
+        let outcome = match &driven {
+            Ok(crate::vta::connection_key_rotation::Outcome::Finished) => {
+                Some(crate::audit::events::ControlKeyRotationOutcome::Rotated)
+            }
+            Ok(crate::vta::connection_key_rotation::Outcome::RolledBack) => {
+                Some(crate::audit::events::ControlKeyRotationOutcome::RolledBack)
+            }
+            _ => None,
+        };
+        if let Some(outcome) = outcome {
+            let (actor, tenant_id, dids) = recorded;
+            security_records::control_key_rotated(actor, Some((&driven_id, tenant_id.as_deref())), outcome, dids);
+        }
+        driven
+    });
+    let finished = tokio::time::timeout(ROTATION_WAIT, &mut task).await;
+    if finished.is_err() {
+        security_records::control_key_rotated(
+            actor,
+            Some((&id, tenant_id.as_deref())),
+            crate::audit::events::ControlKeyRotationOutcome::Started,
+            dids,
+        );
+    }
+    let connection = match state.store.get(&id).await {
+        Ok(Some(connection)) => connection,
+        _ => return not_found().into_response(),
+    };
+    let view = crate::vta::connection_key_rotation::view_of(&connection);
+    use crate::vta::connection_key_rotation::Outcome;
+    match finished {
+        Ok(Ok(Ok(Outcome::Finished))) => (StatusCode::OK, Json(view)).into_response(),
+        Ok(Ok(Ok(Outcome::RolledBack))) => (
+            StatusCode::BAD_GATEWAY,
+            ErrorBody::json(
+                "the trust agent did not accept the new key; the rotation was rolled back and the current key still works",
+            ),
+        )
+            .into_response(),
+        _ => (StatusCode::ACCEPTED, Json(view)).into_response(),
+    }
+}
+
+/// `POST /v1/vta/connections/{id}/control-key/rotate/cancel` — stop a rotation
+/// that has not switched yet and put the old key back.
+pub async fn cancel_connection_control_key_rotation(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    State(state): State<VtaConnectionAdminState>,
+    Path(id): Path<String>,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> axum::response::Response {
+    let loaded = match load_for_pairing(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &state,
+        &id,
+        &Feature::KeyManagementEdit,
+        Access::Write,
+        pat.as_ref(),
+        &context,
+        &scope,
+    )
+    .await
+    {
+        Ok(connection) => connection,
+        Err(e) => return e,
+    };
+    let Some(rotator) = state.key_rotator.clone() else {
+        return (StatusCode::CONFLICT, ErrorBody::json("there is no rotation to cancel")).into_response();
+    };
+    use crate::vta::connection_key_rotation::CancelError;
+    match rotator.cancel(&id).await {
+        Ok(view) => {
+            security_records::control_key_rotated(
+                security_records::actor(),
+                Some((&id, loaded.tenant_id.as_deref())),
+                crate::audit::events::ControlKeyRotationOutcome::Cancelled,
+                security_records::ControlDids {
+                    previous: None,
+                    current: loaded.control_did,
+                },
+            );
+            (StatusCode::OK, Json(view)).into_response()
+        }
+        Err(CancelError::NotFound) => not_found().into_response(),
+        Err(CancelError::NothingToCancel) => {
+            (StatusCode::CONFLICT, ErrorBody::json("there is no rotation to cancel")).into_response()
+        }
+        Err(CancelError::Busy) => (
+            StatusCode::CONFLICT,
+            ErrorBody::json("a rotation step is talking to the trust agent right now; try again in a moment"),
+        )
+            .into_response(),
+        Err(CancelError::TooLate) => (
+            StatusCode::CONFLICT,
+            ErrorBody::json("the gateway already signs in with the new key; the rotation can no longer be cancelled"),
+        )
+            .into_response(),
+        Err(CancelError::Failed(e)) => {
+            error!(error = %e.log_detail(), "Failed to cancel a control-key rotation");
+            (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("the rotation could not be cancelled")).into_response()
+        }
+    }
+}
+
+/// `GET /v1/key-management/inventory` — every key this appliance signs with,
+/// which surface maps to what, and which contexts no surface claims.
+///
+/// Derived on every read from the live records rather than cached: a second
+/// source of truth for "which key signs this" is one more thing that can drift
+/// from the thing that actually signs.
+pub async fn key_inventory(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    State(state): State<VtaConnectionAdminState>,
+    surfaces: Option<Extension<Arc<dyn crate::surfaces::AgentSurfaceStore>>>,
+    issuers: Option<Extension<Arc<dyn crate::issuers::IssuerStore>>>,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_permission(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &Feature::KeyManagementView,
+        pat.as_ref()
+            .map(|Extension(pat)| pat),
+    )
+    .await
+    {
+        return e.into_response();
+    }
+
+    let connections = match state.store.list().await {
+        Ok(mut connections) => {
+            // Same tenancy and PAT-scope filter as the connections list: the
+            // inventory must not become a way to enumerate connections the
+            // caller cannot otherwise see.
+            connections.retain(|connection| connection_allowed(connection, &context, &scope));
+            connections
+                .into_iter()
+                .map(present)
+                .collect::<Vec<_>>()
+        }
+        Err(e) => {
+            error!("Failed to list VTA connections for the key inventory: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Failed to build the key inventory"))
+                .into_response();
+        }
+    };
+
+    let surface_list = match surfaces.as_ref() {
+        Some(Extension(store)) => match store.list_all().await {
+            Ok(list) => list,
+            Err(e) => {
+                error!("Failed to list surfaces for the key inventory: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Failed to build the key inventory"))
+                    .into_response();
+            }
+        },
+        None => Vec::new(),
+    };
+
+    let issuer_list = match issuers.as_ref() {
+        Some(Extension(store)) => match store.list_all().await {
+            Ok(list) => list,
+            Err(e) => {
+                error!("Failed to list issuers for the key inventory: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Failed to build the key inventory"))
+                    .into_response();
+            }
+        },
+        None => Vec::new(),
+    };
+
+    let known_contexts: Vec<String> = match &state.provisioner {
+        Some(provisioner) => {
+            provisioner
+                .known_names()
+                .await
+        }
+        None => Vec::new(),
+    };
+
+    (
+        StatusCode::OK,
+        Json(inventory_for_caller(
+            &state.vta_config,
+            crate::storage::settings_store::global_settings()
+                .and_then(|settings| settings.default_signing)
+                .as_ref(),
+            &connections,
+            &surface_list,
+            issuer_list,
+            &known_contexts,
+            tenant_context(&context),
+            resource_scope(&scope),
+        )),
+    )
+        .into_response()
+}
+
+/// The key inventory limited to what the caller may see: the surfaces and
+/// issuers their list routes would show them, and for a tenant token only the
+/// orphaned contexts of its own tenant. Liveness is judged against every
+/// surface, so another tenant's live context is never reported as orphaned.
+fn inventory_for_caller(
+    config: &crate::config::vta::VtaConfig,
+    default_signing: Option<&crate::config::agent_surface::SurfaceSigningConfig>,
+    connections: &[VtaConnection],
+    surfaces: &[crate::config::agent_surface::AgentSurface],
+    mut issuers: Vec<crate::issuers::types::Issuer>,
+    known_contexts: &[String],
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
+) -> crate::vta::inventory::KeyInventory {
+    let custody_claim = crate::vta::inventory::custody_claim(
+        crate::vta::inventory::signs_through_trust_agent(config, default_signing),
+        surfaces,
+        &issuers,
+        crate::vta::key_directory::local_key_in_use(),
+    );
+    issuers.retain(|issuer| {
+        can_access(issuer.tenant_id.as_deref(), context)
+            && scope_allows_resource(scope, context, ResourceKind::Issuers, &issuer.id)
+    });
+    let visible: std::collections::HashSet<&str> = surfaces
+        .iter()
+        .filter(|surface| {
+            can_access(surface.tenant_id.as_deref(), context)
+                && scope_allows_resource(scope, context, ResourceKind::Surfaces, &surface.surface_id)
+        })
+        .map(|surface| surface.surface_id.as_str())
+        .collect();
+    let mut inventory =
+        crate::vta::inventory::build(config, default_signing, connections, surfaces, &issuers, known_contexts);
+    inventory.custody_claim = custody_claim;
+    inventory
+        .mappings
+        .retain(|mapping| visible.contains(mapping.surface_id.as_str()));
+    if let Some(context) = context {
+        let own = crate::config::agent_surface::derived_context_name(Some(&context.tenant_id), "", None);
+        inventory
+            .orphaned_contexts
+            .retain(|name| name.starts_with(&own));
+    }
+    inventory
+}
+
+/// Body for `POST /v1/vta/connections/{id}/rotate`.
+#[derive(Debug, Deserialize)]
+pub struct RotateKeyRequest {
+    /// The VTA key record id to start signing with — also its published `kid`.
+    pub key_id: String,
+    /// Multibase public half. Required in practice for an internal
+    /// (non-exportable) key, whose record the VTA will not return.
+    #[serde(default)]
+    pub public_key: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// `POST /v1/vta/connections/{id}/rotate` — start signing with a new key.
+///
+/// The previous key is **retired, never deleted**: a verifier selects between
+/// keys by `kid`, so dropping the old public half would invalidate every token
+/// it signed that is still in flight. Both keys keep being published.
+pub async fn rotate_connection_key(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    State(state): State<VtaConnectionAdminState>,
+    Path(id): Path<String>,
+    surfaces: SurfaceStoreExt,
+    issuers: IssuerStoreExt,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+    Json(body): Json<RotateKeyRequest>,
+) -> impl IntoResponse {
+    let connection = match load_for_pairing(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &state,
+        &id,
+        &Feature::KeyManagementEdit,
+        Access::Write,
+        pat.as_ref(),
+        &context,
+        &scope,
+    )
+    .await
+    {
+        Ok(connection) => connection,
+        Err(e) => return e.into_response(),
+    };
+
+    let next = crate::vta::connections::SigningKey {
+        key_id: body.key_id.trim().to_string(),
+        public_key: body.public_key,
+        label: body.label,
+        added_at: chrono::Utc::now(),
+        retired_at: None,
+    };
+    if let Err(message) = connection
+        .keys
+        .clone()
+        .rotate_to(next.clone(), chrono::Utc::now())
+    {
+        return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response();
+    }
+    // A public key the request supplies is published as the key's and becomes
+    // its issuer `did:key`, so the agent first proves it signs with that key.
+    if let Some(public_key) = next.public_key.as_deref() {
+        let Some(registry) = state.registry.as_ref() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorBody::json("Trust agent connections are not available on this gateway"),
+            )
+                .into_response();
+        };
+        let proved = match registry.client(&id).await {
+            Ok(client) => crate::vta::authority::prove_key_possession(&client, &next.key_id, public_key).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = proved {
+            error!(target: "vta_audit", connection_id = %id, error = %e.log_detail(), "the trust agent did not prove it holds the key");
+            let status = if e.is_unavailable() {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return (
+                status,
+                ErrorBody::json(format!(
+                    "the trust agent did not sign with key `{}` under the public key supplied, so it was not recorded",
+                    next.key_id
+                )),
+            )
+                .into_response();
+        }
+    }
+
+    match switch_active_key(&state, &id, &connection, next).await {
+        Ok(Err(refusal)) => refusal.into_response(),
+        Ok(Ok((updated, previous))) => {
+            info!(
+                target: "vta_audit",
+                connection_id = %id,
+                new_key_id = %body.key_id,
+                retired_key_id = previous.as_deref().unwrap_or("none"),
+                "VTA signing key rotated",
+            );
+            if let Some(previous) = previous.as_deref() {
+                follow_key_rotation(&surfaces, &issuers, &id, previous, body.key_id.trim()).await;
+            }
+            security_records::signing_key_rotated(&updated, previous, body.key_id.trim());
+            // Rebuild on next use so the new key signs immediately.
+            invalidate(&state, &id).await;
+            (StatusCode::OK, Json(updated)).into_response()
+        }
+        Err(e) => {
+            error!("Failed to rotate the VTA signing key for {}: {}", id, e);
+            (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Failed to rotate the key")).into_response()
+        }
+    }
+}
+
+/// `POST /v1/vta/connections/{id}/keys` — mint a signing key **inside the
+/// trust agent** and start signing with it.
+///
+/// Distinct from `/rotate`, which only records a `key_id` the caller already
+/// knows: nothing could create that key. The VTA CLI has no `keys create`, and
+/// the gateway is the only party holding a session scoped to the granted
+/// context, so without this a connection could be paired and verified and
+/// still never sign — the appliance and surface pickers both require an active
+/// key.
+///
+/// The private half is generated by the agent and never leaves it. `internal`
+/// mints a **non-exportable** key: not by an operator, not by a super-admin,
+/// not through a backup. That is the custody property the integration exists
+/// to provide, and the trade — it cannot be recovered if the agent is lost —
+/// is the one the runbook's seed-backup owner covers.
+///
+/// Mint one Ed25519 signing key inside the agent.
+///
+/// `internal: true` keeps the private half non-exportable — the reason to use
+/// a trust agent at all. The public half is captured **here** because the
+/// agent will not return an internal key's record to any caller at any role
+/// afterwards, so this is the only moment it can be recorded for publication.
+///
+/// A fresh id per key so provisioning twice never collides with a key the
+/// agent already holds, and so the `kid` in a token points at exactly one.
+async fn mint_signing_key(
+    client: &Arc<crate::vta::client::VtaRestClient>
+) -> Result<crate::vta::connections::SigningKey, crate::vta::VtaError> {
+    const LABEL: &str = "agent-gateway signing key";
+    let key_id = format!("gateway-jwt-{}", uuid::Uuid::new_v4());
+    let created: serde_json::Value = client
+        .dispatch_signed(
+            "https://trusttasks.org/spec/keys/create/0.1",
+            serde_json::json!({
+                "keyType": "ed25519",
+                "keyId": key_id,
+                "label": LABEL,
+                "internal": true,
+            }),
+        )
+        .await?;
+
+    // The agent answers with a `#response` Trust-Task envelope; a flat `{ key }`
+    // is tolerated for the same reason the rest of the client tolerates it.
+    let key = created
+        .get("payload")
+        .and_then(|p| p.get("key"))
+        .or_else(|| created.get("key"))
+        .unwrap_or(&created);
+    let public_key = key
+        .get("publicKeyMultibase")
+        .or_else(|| key.get("publicKey"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    Ok(crate::vta::connections::SigningKey {
+        key_id,
+        public_key,
+        label: Some(LABEL.to_string()),
+        added_at: chrono::Utc::now(),
+        retired_at: None,
+    })
+}
+
+/// Requires the grant to carry `key-mint`, which the `initiator` role derives
+/// and `application` does not; a connection granted the narrower role fails
+/// here with the agent's own refusal rather than a gateway-invented one.
+pub async fn provision_connection_key(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    State(state): State<VtaConnectionAdminState>,
+    Path(id): Path<String>,
+    surfaces: SurfaceStoreExt,
+    issuers: IssuerStoreExt,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> impl IntoResponse {
+    let connection = match load_for_pairing(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &state,
+        &id,
+        &Feature::KeyManagementEdit,
+        Access::Write,
+        pat.as_ref(),
+        &context,
+        &scope,
+    )
+    .await
+    {
+        Ok(connection) => connection,
+        Err(e) => return e.into_response(),
+    };
+
+    let Some(registry) = state.registry.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorBody::json("Trust agent connections are not available on this gateway"),
+        )
+            .into_response();
+    };
+    let client = match registry.client(&id).await {
+        Ok(client) => client,
+        Err(e) => {
+            // Already operator-facing and redacted of agent internals.
+            return (StatusCode::BAD_REQUEST, ErrorBody::json(e.log_detail())).into_response();
+        }
+    };
+
+    let created = match mint_signing_key(&client).await {
+        Ok(created) => created,
+        Err(e) => {
+            error!(target: "vta_audit", connection_id = %id, error = %e.log_detail(), "could not mint a signing key");
+            return (StatusCode::BAD_GATEWAY, ErrorBody::json(operator_message(&e))).into_response();
+        }
+    };
+    let key_id = created.key_id.clone();
+
+    match switch_active_key(&state, &id, &connection, created).await {
+        Ok(Err(refusal)) => refusal.into_response(),
+        Ok(Ok((updated, previous_key_id))) => {
+            info!(
+                target: "vta_audit",
+                connection_id = %id,
+                key_id = %key_id,
+                "minted a signing key in the trust agent",
+            );
+            if let Some(previous) = previous_key_id.as_deref() {
+                follow_key_rotation(&surfaces, &issuers, &id, previous, &key_id).await;
+            }
+            security_records::signing_key_provisioned(&updated, previous_key_id, &key_id);
+            invalidate(&state, &id).await;
+            (StatusCode::CREATED, Json(updated)).into_response()
+        }
+        Err(e) => {
+            // The key exists in the agent but is unrecorded here. Say so: the
+            // operator can provision again (ids are unique) and the orphan is
+            // inert, but silently reporting failure would hide a real artifact.
+            error!(
+                target: "vta_audit",
+                connection_id = %id,
+                key_id = %key_id,
+                error = %e,
+                "minted a signing key but could not record it on the connection",
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorBody::json("The key was created in the trust agent but could not be recorded; provision again"),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Build the VTA connection admin router. The caller layers the session-auth
+/// middleware and the `Extension<Arc<PasskeyStorage>>` /
+/// `Extension<Arc<RbacConfig>>` extensions before merging, mirroring the STS
+/// client router.
+pub fn create_vta_connection_router(
+    state: VtaConnectionAdminState,
+    secrets_store: Option<Arc<dyn SecretsStore>>,
+) -> Router {
+    let router = Router::new()
+        .route("/v1/vta/connections", post(create_connection))
+        .route("/v1/vta/connections", get(list_connections))
+        .route("/v1/vta/connections/{id}", get(get_connection))
+        .route("/v1/vta/connections/{id}", put(update_connection))
+        .route("/v1/vta/connections/{id}", delete(delete_connection))
+        .route("/v1/vta/connections/{id}/pair", post(pair_connection))
+        .route("/v1/vta/connections/{id}/verify", post(verify_connection))
+        .route("/v1/vta/connections/{id}/revoke", post(revoke_connection))
+        .route("/v1/vta/connections/{id}/status", get(connection_status))
+        .route("/v1/vta/connections/{id}/rotate", post(rotate_connection_key))
+        .route("/v1/vta/connections/{id}/control-key/rotate", post(rotate_connection_control_key))
+        .route("/v1/vta/connections/{id}/control-key/rotate/cancel", post(cancel_connection_control_key_rotation))
+        .route("/v1/vta/connections/{id}/keys", post(provision_connection_key))
+        .route("/v1/vta/status", get(vta_status))
+        .route("/v1/vta/control-key/rotate", post(rotate_control_key))
+        .route("/v1/key-management/inventory", get(key_inventory))
+        .route_layer(axum::middleware::from_fn(security_records::record_refusals))
+        .with_state(state);
+    if let Some(secrets_store) = secrets_store {
+        router.layer(Extension(secrets_store))
+    } else {
+        router
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::vta::VtaConfig;
+
+    fn bootstrap_config(auth_key_source: Option<&str>) -> VtaConfig {
+        VtaConfig {
+            enabled: true,
+            base_url: Some("https://vta.example.com".to_string()),
+            vta_did: Some("did:webvh:QmScid:vta.example.com".to_string()),
+            context_id: Some("ctx".to_string()),
+            auth_key_source: auth_key_source.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    async fn admin_state(
+        identity_store: Option<Arc<dyn crate::identity::store::IdentityStore>>
+    ) -> (VtaConnectionAdminState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::vta::connections::FileSystemVtaConnectionStore::new(dir.path().to_path_buf())
+            .await
+            .expect("connection store");
+        let state = VtaConnectionAdminState {
+            store: Arc::new(store),
+            registry: None,
+            vta_config: Arc::new(VtaConfig::default()),
+            provisioner: None,
+            default_resolution: Arc::new(crate::vta::onboarding_default::resolve(&VtaConfig::default())),
+            identity_store,
+            auth_did_publisher: None,
+            key_rotator: None,
+        };
+        (state, dir)
+    }
+
+    fn agent(
+        did: &str,
+        context: Option<&str>,
+        connection: Option<&str>,
+    ) -> crate::identity::AgentIdentityRecord {
+        crate::identity::AgentIdentityRecord {
+            did: did.to_string(),
+            identity_hash: format!("hash-{did}"),
+            created_at: chrono::Utc::now(),
+            identity_fields: std::collections::HashMap::new(),
+            usage_count: 0,
+            last_used_at: None,
+            channel_usage: vec![],
+            private_key: None,
+            vta_context_id: context.map(str::to_string),
+            vta_connection_id: connection.map(str::to_string),
+            channel_config_id: None,
+            is_local: true,
+            verified: true,
+            origin: None,
+            slot: None,
+            credential_updated_at: None,
+            rotations: Vec::new(),
+            rotation_count: 0,
+        }
+    }
+
+    #[test]
+    fn a_connection_shown_to_a_client_names_no_secret_of_a_rotation_under_way() {
+        use crate::vta::connections::{ControlKeyRotation, RotationPhase};
+        let mut connection = crate::vta::connections::VtaConnection {
+            id: "c".to_string(),
+            tenant_id: None,
+            name: "n".to_string(),
+            description: None,
+            enabled: true,
+            transport: Default::default(),
+            endpoint: "http://x".to_string(),
+            vta_did: "did:webvh:v".to_string(),
+            default_context_id: None,
+            control_key_ref: None,
+            control_did: None,
+            control_key_state: Default::default(),
+            status: Default::default(),
+            keys: Default::default(),
+            pairing: Default::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            retired_at: None,
+        };
+        connection
+            .control_key_state
+            .rotation = Some(ControlKeyRotation {
+            phase: RotationPhase::Introduced,
+            next_key_ref: "vta-control-key-c-key-2".to_string(),
+            next_verification_method: "#key-2".to_string(),
+            previous_key_ref: "vta-control-key-c".to_string(),
+            previous_verification_method: "#key-1".to_string(),
+            started_at: chrono::Utc::now(),
+            give_up_at: chrono::Utc::now(),
+            attempts: 0,
+        });
+
+        let shown = serde_json::to_string(&present(connection)).unwrap();
+
+        assert!(!shown.contains("vta-control-key"), "{shown}");
+        assert!(shown.contains("#key-2"), "{shown}");
+    }
+
+    #[test]
+    fn every_refused_rotation_is_answered_with_its_own_status_and_no_agent_internals() {
+        use crate::vta::control_key_live::RotateNowError as E;
+        let cases = [
+            (E::NotConfigured, StatusCode::NOT_FOUND, None),
+            (E::InProgress, StatusCode::CONFLICT, None),
+            (E::Standby, StatusCode::SERVICE_UNAVAILABLE, None),
+            (E::TooSoon(420), StatusCode::TOO_MANY_REQUESTS, Some(420)),
+            (
+                E::Failed(crate::vta::error::VtaError::Http {
+                    status: 403,
+                    body: "secret-internal-detail".to_string(),
+                }),
+                StatusCode::BAD_GATEWAY,
+                None,
+            ),
+        ];
+        for (error, status, retry) in cases {
+            let (got_status, got_retry, message) = rotation_refusal(&error);
+            assert_eq!(got_status, status, "{error:?}");
+            assert_eq!(got_retry, retry, "{error:?}");
+            assert!(!message.contains("secret-internal-detail"), "{message}");
+        }
+        let (_, _, message) = rotation_refusal(&E::NotConfigured);
+        assert!(message.contains("did:key control key"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn disconnecting_is_refused_while_agents_keep_their_key_in_the_connection() {
+        let store = Arc::new(crate::identity::test_helpers::MockIdentityStore::new());
+        for record in [
+            agent("did:key:a", Some("ctx-a"), Some("other")),
+            agent("did:key:b", Some("ctx-b"), Some("other")),
+            agent("did:key:c", Some("ctx-c"), None),
+            agent("did:key:d", None, Some("other")),
+        ] {
+            crate::identity::store::IdentityStore::create(&*store, record)
+                .await
+                .expect("store");
+        }
+        let (state, _dir) = admin_state(Some(store)).await;
+
+        let refused = disconnect_refusal(&state, "other", DisconnectQuery::default(), None)
+            .await
+            .expect("two agents hold keys in `other`");
+        assert_eq!(refused["stranded_agents"], 2);
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("2 agent(s)"),
+            "{refused}"
+        );
+
+        assert_eq!(
+            agents_holding_keys(&state, "other")
+                .await
+                .unwrap(),
+            2,
+            "a record with no context holds nothing"
+        );
+        assert_eq!(
+            agents_holding_keys(&state, crate::vta::connections::BOOTSTRAP_CONNECTION_ID)
+                .await
+                .unwrap(),
+            1,
+            "a record from before connections were tracked belongs to the bootstrap one"
+        );
+        let acknowledged = DisconnectQuery {
+            acknowledge_stranded_agents: true,
+            ..Default::default()
+        };
+        assert!(
+            disconnect_refusal(&state, "other", acknowledged, None)
+                .await
+                .is_none(),
+            "acknowledging proceeds"
+        );
+        assert!(
+            disconnect_refusal(&state, "unused", DisconnectQuery::default(), None)
+                .await
+                .is_none(),
+            "an empty connection is free to go"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_an_identity_store_nothing_blocks_a_disconnect() {
+        let (state, _dir) = admin_state(None).await;
+        assert!(
+            disconnect_refusal(&state, "any", DisconnectQuery::default(), None)
+                .await
+                .is_none()
+        );
+    }
+
+    async fn admin_user() -> (Arc<PasskeyStorage>, tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let users_dir = dir.path().join("users");
+        let avatars_dir = dir.path().join("avatars");
+        std::fs::create_dir_all(&users_dir).unwrap();
+        std::fs::create_dir_all(&avatars_dir).unwrap();
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let user = crate::auth::storage::UserData {
+            user_id: user_id.clone(),
+            username: "admin".to_string(),
+            passkeys: vec![],
+            role: crate::auth::types::UserRole::Administrator,
+            status: crate::auth::types::UserStatus::Approved,
+            is_primary: false,
+            first_name: None,
+            last_name: None,
+            email: None,
+            department: None,
+            job_title: None,
+            avatar_path: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_logged_in: None,
+            saml_id: None,
+        };
+        std::fs::write(users_dir.join(format!("{user_id}.json")), serde_json::to_string(&user).unwrap()).unwrap();
+        let storage = PasskeyStorage::new(
+            users_dir
+                .to_string_lossy()
+                .into_owned(),
+            avatars_dir
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .unwrap();
+        (Arc::new(storage), dir, user_id)
+    }
+
+    /// The admin router as an administrator calls it, through a tenant token
+    /// when `tenant_id` is set.
+    async fn admin_router(
+        state: VtaConnectionAdminState,
+        tenant_id: Option<&str>,
+    ) -> (Router, tempfile::TempDir) {
+        let (storage, dir, user_id) = admin_user().await;
+        let rbac = Arc::new(RbacConfig::default());
+        let mut router = create_vta_connection_router(state, None).layer(axum::middleware::from_fn(
+            move |mut request: axum::extract::Request, next: axum::middleware::Next| {
+                let user_id = user_id.clone();
+                let storage = storage.clone();
+                let rbac = rbac.clone();
+                async move {
+                    request
+                        .extensions_mut()
+                        .insert(user_id);
+                    request
+                        .extensions_mut()
+                        .insert(storage);
+                    request
+                        .extensions_mut()
+                        .insert(rbac);
+                    next.run(request).await
+                }
+            },
+        ));
+        if let Some(tenant_id) = tenant_id {
+            router = router.layer(Extension(tenant(tenant_id)));
+        }
+        (router, dir)
+    }
+
+    async fn stored(
+        state: &VtaConnectionAdminState,
+        id: &str,
+        tenant_id: Option<&str>,
+    ) {
+        let mut connection = new_connection();
+        connection.id = id.to_string();
+        connection.tenant_id = tenant_id.map(str::to_string);
+        state
+            .store
+            .create(connection)
+            .await
+            .unwrap();
+    }
+
+    async fn call(
+        router: &Router,
+        method: &str,
+        uri: &str,
+    ) -> StatusCode {
+        use tower::ServiceExt;
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri);
+        let body = if method == "PUT" {
+            request = request.header("content-type", "application/json");
+            axum::body::Body::from(
+                serde_json::json!({
+                    "name": "Renamed",
+                    "endpoint": "https://vta.example",
+                    "vta_did": "did:webvh:QmVta:vta.example",
+                })
+                .to_string(),
+            )
+        } else {
+            axum::body::Body::empty()
+        };
+        router
+            .clone()
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn send(
+        router: &Router,
+        method: &str,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// A connected connection with a description, a default context and an
+    /// active key, so an edit that drops any of them shows.
+    async fn stored_connected(state: &VtaConnectionAdminState) -> VtaConnection {
+        let mut connection = new_connection();
+        connection.id = "conn".to_string();
+        connection.description = Some("the customer's agent".to_string());
+        connection.enabled = true;
+        connection.default_context_id = Some("ctx-1".to_string());
+        connection.control_key_ref = Some(CONTROL_KEY_REF.to_string());
+        connection.pairing.state = crate::vta::pairing::PairingState::Connected;
+        connection.status = connection
+            .pairing
+            .state
+            .into();
+        connection
+            .keys
+            .rotate_to(
+                crate::vta::connections::SigningKey {
+                    key_id: "key-1".to_string(),
+                    public_key: None,
+                    label: None,
+                    added_at: chrono::Utc::now(),
+                    retired_at: None,
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        state
+            .store
+            .create(connection)
+            .await
+            .unwrap()
+    }
+
+    const CONTROL_KEY_REF: &str = "vta-control-key-3f2c9a1e-7d4b-4c1a-9e55-0a1b2c3d4e5f";
+
+    /// The admin router with the secrets store holding the control key that
+    /// [`stored_connected`] names.
+    async fn edit_router(state: &VtaConnectionAdminState) -> (Router, tempfile::TempDir) {
+        let (router, users) = admin_router(state.clone(), None).await;
+        (router.layer(Extension(store_holding(&"2a".repeat(32)))), users)
+    }
+
+    async fn reread(state: &VtaConnectionAdminState) -> VtaConnection {
+        state
+            .store
+            .get("conn")
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn an_edit_changes_only_the_fields_it_sends() {
+        let _guard = crate::vta::isolation::TEST_LOCK
+            .lock()
+            .unwrap();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async {
+                let (state, _dir) = admin_state(None).await;
+                let before = stored_connected(&state).await;
+                let (router, _users) = edit_router(&state).await;
+
+                let (status, body) =
+                    send(&router, "PUT", "/v1/vta/connections/conn", serde_json::json!({ "name": "Renamed" })).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let after = reread(&state).await;
+                assert_eq!(after.name, "Renamed");
+                assert_eq!(after.description, before.description);
+                assert!(after.enabled, "an edit that leaves out enabled keeps it");
+                assert_eq!(after.transport, before.transport);
+                assert_eq!(after.endpoint, before.endpoint);
+                assert_eq!(after.vta_did, before.vta_did);
+                assert_eq!(after.default_context_id, before.default_context_id);
+                assert_eq!(after.pairing.state, crate::vta::pairing::PairingState::Connected);
+                assert_eq!(after.keys, before.keys);
+
+                let (status, _) =
+                    send(&router, "PUT", "/v1/vta/connections/conn", serde_json::json!({ "description": null })).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(
+                    reread(&state)
+                        .await
+                        .description,
+                    None,
+                    "a field sent as null is cleared"
+                );
+
+                let (status, _) =
+                    send(&router, "PUT", "/v1/vta/connections/conn", serde_json::json!({ "enabled": "yes" })).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                let (status, _) = send(&router, "PUT", "/v1/vta/connections/conn", serde_json::json!(["name"])).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(reread(&state).await.enabled, "a refused edit changes nothing");
+                crate::vta::isolation::clear_reservations();
+            });
+    }
+
+    #[test]
+    fn an_edit_points_elsewhere_when_it_changes_the_endpoint_agent_did_or_transport() {
+        let existing = new_connection();
+        let edit = |change: serde_json::Value| edited_request(&existing, change).unwrap();
+        assert!(!points_elsewhere(&existing, &edit(serde_json::json!({ "name": "Renamed", "enabled": false }))));
+        assert!(points_elsewhere(&existing, &edit(serde_json::json!({ "endpoint": "https://other.example" }))));
+        assert!(points_elsewhere(
+            &existing,
+            &edit(serde_json::json!({ "vta_did": "did:webvh:QmOther:other.example" }))
+        ));
+        assert!(points_elsewhere(&existing, &edit(serde_json::json!({ "transport": "didcomm" }))));
+    }
+
+    /// Repointing a connection is a disconnect from the agent it was granted
+    /// by: refused while a surface signs through it, unless acknowledged, and
+    /// once done the new agent has to grant and be verified again.
+    #[test]
+    fn repointing_resets_the_pairing_and_is_refused_while_something_signs_through_the_connection() {
+        let _guard = crate::vta::isolation::TEST_LOCK
+            .lock()
+            .unwrap();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async {
+                let (state, _dir) = admin_state(None).await;
+                let before = stored_connected(&state).await;
+                let surfaces_dir = tempfile::tempdir().unwrap();
+                let surfaces = crate::surfaces::FileSystemAgentSurfaceStore::new(
+                    surfaces_dir
+                        .path()
+                        .to_path_buf(),
+                )
+                .await
+                .unwrap();
+                crate::surfaces::AgentSurfaceStore::save(
+                    &surfaces,
+                    &signing_surface("s1", None, vta_signing(Some("conn"))),
+                )
+                .await
+                .unwrap();
+                let surfaces: Arc<dyn crate::surfaces::AgentSurfaceStore> = Arc::new(surfaces);
+                let (router, _users) = edit_router(&state).await;
+                let router = router.layer(Extension(surfaces));
+                let repoint = serde_json::json!({ "endpoint": "https://other.example" });
+
+                let (status, body) = send(&router, "PUT", "/v1/vta/connections/conn", repoint.clone()).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{body}");
+                assert_eq!(body["signing_users"], serde_json::json!(["surface \"surface s1\""]));
+                let unchanged = reread(&state).await;
+                assert_eq!(unchanged.endpoint, before.endpoint);
+                assert_eq!(unchanged.pairing.state, crate::vta::pairing::PairingState::Connected);
+
+                let (status, _) =
+                    send(&router, "PUT", "/v1/vta/connections/conn", serde_json::json!({ "name": "Renamed" })).await;
+                assert_eq!(status, StatusCode::OK, "a rename points nowhere else and is not refused");
+
+                let (status, _) =
+                    send(&router, "PUT", "/v1/vta/connections/conn?acknowledge_signing_users=true", repoint).await;
+                assert_eq!(status, StatusCode::OK);
+                let repointed = reread(&state).await;
+                assert_eq!(repointed.endpoint, "https://other.example");
+                assert_eq!(repointed.pairing.state, crate::vta::pairing::PairingState::Draft);
+                assert_eq!(repointed.status, VtaConnectionStatus::Unpaired);
+                assert_eq!(repointed.name, "Renamed");
+                crate::vta::isolation::clear_reservations();
+            });
+    }
+
+    async fn status_body(router: &Router) -> serde_json::Value {
+        use tower::ServiceExt;
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/vta/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn a_tenant_token_sees_only_the_trust_agent_addresses_of_connections_it_may_see() {
+        let _guard = crate::vta::isolation::TEST_LOCK
+            .lock()
+            .unwrap();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tenant_status_scenario());
+    }
+
+    async fn tenant_status_scenario() {
+        crate::vta::isolation::clear_reservations();
+        let (state, _dir) = admin_state(None).await;
+        for (id, tenant_id, endpoint) in [
+            ("appliance", None, "https://shared.example"),
+            ("own", Some("tenant-a"), "https://own.example:8443"),
+            ("other", Some("tenant-b"), "https://other.example"),
+        ] {
+            let mut connection = new_connection();
+            connection.id = id.to_string();
+            connection.tenant_id = tenant_id.map(str::to_string);
+            connection.endpoint = endpoint.to_string();
+            connection.pairing.state = crate::vta::pairing::PairingState::Connected;
+            state
+                .store
+                .create(connection)
+                .await
+                .unwrap();
+        }
+        crate::vta::isolation::reserve("https://vta-block.example");
+        crate::vta::isolation::sync_connection_reservations(state.store.as_ref()).await;
+
+        let (tenant, _users) = admin_router(state.clone(), Some("tenant-a")).await;
+        let seen = status_body(&tenant).await;
+        assert_eq!(seen["reserved_origins"], serde_json::json!(["own.example:8443", "shared.example:443"]));
+        assert!(seen["control_did"].is_null(), "{seen}");
+        assert!(seen["control_key"].is_null(), "{seen}");
+
+        let (limited, _limited_users) = admin_router(state.clone(), None).await;
+        let limited = limited.layer(Extension(crate::auth_manager::pat::PatResourceScope(Arc::new(
+            regex::Regex::new("^own$").unwrap(),
+        ))));
+        let seen = status_body(&limited).await;
+        assert_eq!(
+            seen["reserved_origins"],
+            serde_json::json!(["own.example:8443"]),
+            "an appliance token limited to some connections sees only theirs"
+        );
+        assert!(seen["control_did"].is_null(), "{seen}");
+        assert!(seen["control_key"].is_null(), "{seen}");
+
+        let (admin, _admin_users) = admin_router(state, None).await;
+        assert_eq!(
+            status_body(&admin).await["reserved_origins"],
+            serde_json::json!(["other.example:443", "own.example:8443", "shared.example:443", "vta-block.example:443"]),
+            "an appliance administrator sees every reserved address"
+        );
+        crate::vta::isolation::clear_reservations();
+    }
+
+    #[test]
+    fn a_tenant_token_can_see_an_appliance_connection_but_not_act_on_it() {
+        let _guard = crate::vta::isolation::TEST_LOCK
+            .lock()
+            .unwrap();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tenant_token_scenario());
+    }
+
+    async fn tenant_token_scenario() {
+        let (state, _dir) = admin_state(None).await;
+        stored(&state, "appliance", None).await;
+        stored(&state, "own", Some("tenant-a")).await;
+        stored(&state, "other", Some("tenant-b")).await;
+        let (router, _users) = admin_router(state.clone(), Some("tenant-a")).await;
+
+        assert_eq!(call(&router, "GET", "/v1/vta/connections/appliance").await, StatusCode::OK);
+        let refusals = [
+            ("PUT", "/v1/vta/connections/appliance", "update_connection"),
+            ("DELETE", "/v1/vta/connections/appliance", "delete_connection"),
+            ("POST", "/v1/vta/connections/appliance/pair", "pair_connection"),
+            ("POST", "/v1/vta/connections/appliance/verify", "verify_connection"),
+            ("POST", "/v1/vta/connections/appliance/revoke", "revoke_connection"),
+            ("POST", "/v1/vta/connections/appliance/keys", "provision_signing_key"),
+            ("POST", "/v1/vta/connections/appliance/control-key/rotate", "rotate_control_key"),
+            ("POST", "/v1/vta/connections/appliance/control-key/rotate/cancel", "cancel_control_key_rotation"),
+            ("POST", "/v1/vta/control-key/rotate", "rotate_control_key"),
+        ];
+        let ((), records) = crate::audit::producer::capture(crate::audit::context::in_management_request(
+            crate::audit::events::Actor::pat("tenant-token", "admin"),
+            async {
+                for (method, uri, _) in refusals {
+                    assert_eq!(call(&router, method, uri).await, StatusCode::FORBIDDEN, "{method} {uri}");
+                }
+                assert_eq!(call(&router, "POST", "/v1/vta/connections/other/revoke").await, StatusCode::NOT_FOUND);
+                assert_eq!(call(&router, "POST", "/v1/vta/connections/missing/revoke").await, StatusCode::NOT_FOUND);
+            },
+        ))
+        .await;
+        let refused: Vec<serde_json::Value> = records
+            .iter()
+            .map(|record| serde_json::to_value(&record.event).unwrap()["trust_agent_change_refused"].clone())
+            .collect();
+        assert_eq!(refused.len(), refusals.len() + 1, "{records:?}");
+        for ((_, uri, action), record) in refusals.iter().zip(&refused) {
+            assert_eq!(record["action"], *action, "{uri}");
+            assert_eq!(record["status"], 403, "{uri}");
+            assert_eq!(record["reason"], "forbidden", "{uri}");
+            assert_eq!(record["actor"]["id"], "tenant-token", "{uri}");
+            assert!(record["record_hash"].is_string(), "{uri}");
+        }
+        assert_eq!(refused[1]["connection_id"], "appliance");
+        assert_eq!(refused[refusals.len()]["connection_id"], "other");
+        assert_eq!(refused[refusals.len()]["reason"], "not_visible");
+        assert!(
+            state
+                .store
+                .get("appliance")
+                .await
+                .unwrap()
+                .is_some(),
+            "the appliance connection survived"
+        );
+
+        let ((), records) = crate::audit::producer::capture(crate::audit::context::in_management_request(
+            crate::audit::events::Actor::pat("tenant-token", "admin"),
+            async {
+                assert_eq!(call(&router, "POST", "/v1/vta/connections/own/revoke").await, StatusCode::OK);
+                assert_eq!(call(&router, "DELETE", "/v1/vta/connections/own").await, StatusCode::NO_CONTENT);
+            },
+        ))
+        .await;
+        let changes: Vec<(&str, serde_json::Value)> = records
+            .iter()
+            .map(|record| {
+                let category = crate::delegation_vault::audit::action_category(&record.event);
+                (category, serde_json::to_value(&record.event).unwrap()[category].clone())
+            })
+            .collect();
+        assert_eq!(
+            changes
+                .iter()
+                .map(|(category, _)| *category)
+                .collect::<Vec<_>>(),
+            ["trust_agent_connection_revoked", "trust_agent_connection_deleted"]
+        );
+        for (category, change) in &changes {
+            assert_eq!(change["connection_id"], "own", "{category}");
+            assert_eq!(change["tenant_id"], "tenant-a", "{category}");
+            assert_eq!(change["acknowledge_signing_users"], false, "{category}");
+        }
+        assert_eq!(changes[0].1["state"], "revoked");
+    }
+
+    #[test]
+    fn an_appliance_token_acts_on_any_connection_and_reaches_the_control_key_rotation() {
+        let _guard = crate::vta::isolation::TEST_LOCK
+            .lock()
+            .unwrap();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(appliance_token_scenario());
+    }
+
+    async fn appliance_token_scenario() {
+        let (state, _dir) = admin_state(None).await;
+        stored(&state, "appliance", None).await;
+        stored(&state, "tenant", Some("tenant-a")).await;
+        let (router, _users) = admin_router(state.clone(), None).await;
+
+        assert_eq!(call(&router, "POST", "/v1/vta/connections/tenant/revoke").await, StatusCode::OK);
+        assert_eq!(call(&router, "DELETE", "/v1/vta/connections/appliance").await, StatusCode::NO_CONTENT);
+        assert_ne!(call(&router, "POST", "/v1/vta/control-key/rotate").await, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn the_key_inventory_shows_a_tenant_only_what_its_list_routes_would() {
+        let config = bootstrap_config(None);
+        let surfaces = vec![
+            signing_surface("a1", Some("tenant-a"), vta_signing(Some("conn"))),
+            signing_surface("b1", Some("tenant-b"), vta_signing(Some("conn"))),
+            signing_surface("g1", None, None),
+        ];
+        let mut issuer_b = crate::issuers::types::Issuer::new(
+            "ib".to_string(),
+            "Tenant B issuer".to_string(),
+            "did:web:ib".to_string(),
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        );
+        issuer_b.tenant_id = Some("tenant-b".to_string());
+        let known = vec![
+            "ctx:tenant-a/a1".to_string(),
+            "ctx:tenant-a/gone".to_string(),
+            "ctx:tenant-b/b1".to_string(),
+            "ctx:tenant-b/gone".to_string(),
+        ];
+        let tenant_a = tenant("tenant-a");
+
+        let inventory =
+            inventory_for_caller(&config, None, &[], &surfaces, vec![issuer_b.clone()], &known, Some(&tenant_a), None);
+
+        let shown: Vec<&str> = inventory
+            .mappings
+            .iter()
+            .map(|m| m.surface_id.as_str())
+            .collect();
+        assert_eq!(shown, vec!["a1", "g1"]);
+        assert_eq!(inventory.orphaned_contexts, vec!["ctx:tenant-a/gone".to_string()]);
+        let body = serde_json::to_string(&inventory).unwrap();
+        assert!(!body.contains("tenant-b"), "{body}");
+        assert!(!body.contains("Tenant B issuer"), "{body}");
+
+        let appliance = inventory_for_caller(&config, None, &[], &surfaces, vec![issuer_b], &known, None, None);
+        assert_eq!(appliance.mappings.len(), 3);
+        assert_eq!(appliance.orphaned_contexts, vec!["ctx:tenant-a/gone".to_string(), "ctx:tenant-b/gone".to_string()]);
+    }
+
+    #[test]
+    fn a_failure_is_shown_without_what_the_trust_agent_sent_back() {
+        use crate::vta::VtaError;
+        let http = VtaError::Http {
+            status: 403,
+            body: r#"{"code":"keys:forbidden","message":"internal detail /var/lib/vta"}"#.to_string(),
+        };
+        let shown = operator_message(&http);
+        assert!(shown.contains("403") && shown.contains("keys:forbidden"), "{shown}");
+        assert!(!shown.contains("internal detail"), "{shown}");
+        assert_eq!(
+            operator_message(&VtaError::Transport("connect to 10.0.0.5:8100 timed out".to_string())),
+            "VTA transport error"
+        );
+        assert_eq!(
+            operator_message(&VtaError::Config("VTA connection `c` is disabled".to_string())),
+            "VTA connection `c` is disabled",
+            "the gateway's own explanation is kept"
+        );
+    }
+
+    /// The 409 body of a refused disconnect, or `None` when it may proceed.
+    async fn disconnect_refusal(
+        state: &VtaConnectionAdminState,
+        connection_id: &str,
+        query: DisconnectQuery,
+        surfaces: Option<&Arc<dyn crate::surfaces::AgentSurfaceStore>>,
+    ) -> Option<serde_json::Value> {
+        let stores = SigningUserStores { surfaces, issuers: None };
+        let response = guard_disconnect(state, connection_id, &query, &stores, None, None).await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        Some(serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn vta_signing(connection_id: Option<&str>) -> Option<crate::config::agent_surface::SurfaceSigningConfig> {
+        Some(crate::config::agent_surface::SurfaceSigningConfig {
+            backend: Some(crate::config::agent_surface::SigningBackendKind::Vta),
+            connection_id: connection_id.map(str::to_string),
+            ..Default::default()
+        })
+    }
+
+    fn signing_surface(
+        id: &str,
+        tenant_id: Option<&str>,
+        signing: Option<crate::config::agent_surface::SurfaceSigningConfig>,
+    ) -> crate::config::agent_surface::AgentSurface {
+        crate::config::agent_surface::AgentSurface {
+            surface_id: id.to_string(),
+            tenant_id: tenant_id.map(str::to_string),
+            name: format!("surface {id}"),
+            signing,
+            ..Default::default()
+        }
+    }
+
+    fn tenant(id: &str) -> PatTenantContext {
+        PatTenantContext {
+            token_id: format!("token-{id}"),
+            tenant_id: id.to_string(),
+        }
+    }
+
+    #[test]
+    fn what_signs_through_a_connection_is_named_and_what_the_caller_cannot_see_is_counted() {
+        let mut issuer = crate::issuers::types::Issuer::new(
+            "i1".to_string(),
+            "Issuer one".to_string(),
+            "did:web:i1".to_string(),
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        );
+        issuer.signing = vta_signing(Some("conn"));
+        let mut with_variant = signing_surface("s2", Some("tenant-a"), None);
+        let mut variant = crate::config::agent_surface_variants::SurfaceVariant {
+            id: "v1".to_string(),
+            alias: "beta".to_string(),
+            name: "Beta".to_string(),
+            description: String::new(),
+            enabled: true,
+            overrides: Default::default(),
+        };
+        variant.overrides.signing = vta_signing(Some("conn"));
+        with_variant
+            .variants
+            .push(variant);
+        let surfaces = vec![
+            signing_surface("s1", Some("tenant-a"), vta_signing(Some("conn"))),
+            with_variant,
+            signing_surface("s3", Some("tenant-b"), vta_signing(Some("conn"))),
+            signing_surface("s4", None, vta_signing(Some("elsewhere"))),
+            signing_surface("s5", None, None),
+        ];
+
+        let appliance =
+            signing_users("conn", vta_signing(Some("conn")).as_ref(), &surfaces, &[issuer.clone()], None, None);
+        assert_eq!(
+            appliance.named,
+            vec![
+                "the gateway default (Audit signing)".to_string(),
+                "surface \"surface s1\"".to_string(),
+                "surface \"surface s3\"".to_string(),
+                "issuer \"Issuer one\"".to_string(),
+            ]
+        );
+        assert_eq!(appliance.hidden, 0);
+
+        let tenant_a = tenant("tenant-a");
+        let scoped = signing_users("conn", None, &surfaces, &[issuer], Some(&tenant_a), None);
+        assert_eq!(scoped.hidden, 1, "tenant-b's surface is counted, not named");
+        assert!(
+            scoped
+                .named
+                .iter()
+                .all(|name| !name.contains("s3")),
+            "{scoped:?}"
+        );
+
+        assert!(signing_users("unused", None, &surfaces, &[], None, None).is_empty());
+    }
+
+    /// An edit writes only the fields it sent onto the record read under the
+    /// lock, and refuses when what it was checked against changed meanwhile.
+    #[test]
+    fn an_edit_writes_only_what_it_sent_and_refuses_a_record_changed_meanwhile() {
+        let mut read = new_connection();
+        read.enabled = true;
+        let mut updated = read.clone();
+        updated.name = "Renamed".to_string();
+        updated.enabled = !read.enabled;
+        updated.default_context_id = Some("other".to_string());
+
+        let mut stored = read.clone();
+        stored.description = Some("written meanwhile".to_string());
+        apply_edit(&mut stored, &read, updated.clone(), &["name".to_string()], false).expect("applied");
+        assert_eq!(stored.name, "Renamed");
+        assert_eq!(stored.enabled, read.enabled, "not sent, so not written");
+        assert_eq!(stored.default_context_id, read.default_context_id);
+        assert_eq!(stored.description.as_deref(), Some("written meanwhile"), "a field it did not send is kept");
+
+        let mut disabled = read.clone();
+        disabled.enabled = false;
+        let mut stored = disabled.clone();
+        assert!(apply_edit(&mut stored, &read, updated.clone(), &["name".to_string()], false).is_err());
+        assert_eq!(
+            serde_json::to_value(&stored).unwrap(),
+            serde_json::to_value(&disabled).unwrap(),
+            "nothing is written over a disable made meanwhile"
+        );
+
+        let mut rekeyed = read.clone();
+        rekeyed.control_key_ref = Some("vta-control-key-next".to_string());
+        let mut stored = rekeyed.clone();
+        assert!(apply_edit(&mut stored, &read, updated, &["control_key_ref".to_string()], false).is_err());
+        assert_eq!(
+            serde_json::to_value(&stored).unwrap(),
+            serde_json::to_value(&rekeyed).unwrap(),
+            "a control-key change made meanwhile is kept"
+        );
+    }
+
+    /// Revoking the `[vta]` connection would record it revoked while it keeps
+    /// signing through the block, so it is refused like delete and Verify.
+    #[tokio::test]
+    async fn revoking_the_bootstrap_connection_is_refused() {
+        let (state, _dir) = admin_state(None).await;
+        let bootstrap = crate::vta::connections::BOOTSTRAP_CONNECTION_ID;
+        stored(&state, bootstrap, None).await;
+        let (router, _users) = admin_router(state.clone(), None).await;
+
+        assert_eq!(
+            call(&router, "POST", &format!("/v1/vta/connections/{bootstrap}/revoke")).await,
+            StatusCode::CONFLICT
+        );
+        let kept = state
+            .store
+            .get(bootstrap)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(kept.pairing.state, crate::vta::pairing::PairingState::Revoked);
+    }
+
+    /// Only pairing again brings a revoked connection back; Verify does not.
+    #[tokio::test]
+    async fn verifying_a_revoked_connection_is_refused_and_it_stays_revoked() {
+        let (state, _dir) = admin_state(None).await;
+        stored(&state, "conn", None).await;
+        crate::vta::connections::modify(state.store.as_ref(), "conn", |c| {
+            c.pairing = crate::vta::pairing::revoke(&c.pairing);
+        })
+        .await
+        .unwrap();
+        let (router, _users) = admin_router(state.clone(), None).await;
+
+        assert_eq!(call(&router, "POST", "/v1/vta/connections/conn/verify").await, StatusCode::CONFLICT);
+        let kept = state
+            .store
+            .get("conn")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.pairing.state, crate::vta::pairing::PairingState::Revoked);
+    }
+
+    /// A revoke that lands while Verify is talking to the agent is kept.
+    #[tokio::test]
+    async fn a_revoke_during_verify_is_kept() {
+        let (state, _dir) = admin_state(None).await;
+        stored(&state, "conn", None).await;
+        let read = state
+            .store
+            .get("conn")
+            .await
+            .unwrap()
+            .unwrap();
+        crate::vta::connections::modify(state.store.as_ref(), "conn", |c| {
+            c.pairing = crate::vta::pairing::revoke(&c.pairing);
+        })
+        .await
+        .unwrap();
+        let connected = crate::vta::pairing::PairingRecord {
+            state: crate::vta::pairing::PairingState::Connected,
+            ..read.pairing.clone()
+        };
+
+        let refused = persist_verification(&state, read, connected)
+            .await
+            .expect_err("the revoke wins");
+        assert_eq!(refused.0, StatusCode::CONFLICT);
+        let kept = state
+            .store
+            .get("conn")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.pairing.state, crate::vta::pairing::PairingState::Revoked);
+    }
+
+    /// A Verify judged the agent the record named when it was read: one
+    /// pointed at another agent meanwhile, or revoked and paired again, keeps
+    /// its own pairing instead of the old agent's Connected and pin.
+    #[tokio::test]
+    async fn a_verify_of_a_connection_changed_meanwhile_is_not_saved() {
+        for change in ["repoint", "revoke and pair again"] {
+            let (state, _dir) = admin_state(None).await;
+            stored(&state, "conn", None).await;
+            let read = state
+                .store
+                .get("conn")
+                .await
+                .unwrap()
+                .unwrap();
+            crate::vta::connections::modify(state.store.as_ref(), "conn", |c| {
+                if change == "repoint" {
+                    c.endpoint = "https://elsewhere.example".to_string();
+                    c.pairing = Default::default();
+                } else {
+                    c.pairing = crate::vta::pairing::revoke(&c.pairing);
+                }
+            })
+            .await
+            .unwrap();
+            if change != "repoint" {
+                crate::vta::connections::modify(state.store.as_ref(), "conn", |c| {
+                    c.pairing = Default::default();
+                })
+                .await
+                .unwrap();
+            }
+            let connected = crate::vta::pairing::PairingRecord {
+                state: crate::vta::pairing::PairingState::Connected,
+                pinned_vta_did: Some("did:webvh:old.example".to_string()),
+                ..read.pairing.clone()
+            };
+
+            let refused = persist_verification(&state, read, connected)
+                .await
+                .expect_err(change);
+
+            assert_eq!(refused.0, StatusCode::CONFLICT, "{change}");
+            let kept = state
+                .store
+                .get("conn")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(kept.pairing.state, crate::vta::pairing::PairingState::Connected, "{change}");
+            assert_eq!(kept.pairing.pinned_vta_did, None, "{change}");
+        }
+    }
+
+    #[test]
+    fn a_block_naming_no_connection_signs_through_the_bootstrap_one() {
+        let bootstrap = crate::vta::connections::BOOTSTRAP_CONNECTION_ID;
+        assert!(signs_through(vta_signing(None).as_ref(), bootstrap));
+        assert!(signs_through(vta_signing(Some("default")).as_ref(), bootstrap));
+        assert!(!signs_through(vta_signing(None).as_ref(), "conn"));
+        let local = crate::config::agent_surface::SurfaceSigningConfig {
+            backend: Some(crate::config::agent_surface::SigningBackendKind::Local),
+            ..Default::default()
+        };
+        assert!(!signs_through(Some(&local), bootstrap));
+        assert!(!signs_through(None, bootstrap));
+    }
+
+    /// After a rotation the saved choices that named the old key name the new
+    /// one, so what the dashboard shows is the key that signs; a choice naming
+    /// another key or connection is left as it is.
+    #[tokio::test]
+    async fn a_rotation_moves_the_choices_that_named_the_old_key() {
+        let keyed = |connection: &str, key: &str| {
+            let mut signing = vta_signing(Some(connection));
+            if let Some(signing) = signing.as_mut() {
+                signing.key_id = Some(key.to_string());
+            }
+            signing
+        };
+        let surfaces_dir = tempfile::tempdir().unwrap();
+        let surface_store = crate::surfaces::FileSystemAgentSurfaceStore::new(
+            surfaces_dir
+                .path()
+                .to_path_buf(),
+        )
+        .await
+        .unwrap();
+        for (id, signing) in [
+            ("s-old", keyed("conn", "key-1")),
+            ("s-other", keyed("conn", "key-9")),
+            ("s-elsewhere", keyed("other", "key-1")),
+        ] {
+            crate::surfaces::AgentSurfaceStore::save(&surface_store, &signing_surface(id, None, signing))
+                .await
+                .unwrap();
+        }
+        let surface_store: Arc<dyn crate::surfaces::AgentSurfaceStore> = Arc::new(surface_store);
+        let issuers_dir = tempfile::tempdir().unwrap();
+        let issuer_store = crate::issuers::FileSystemIssuerStore::new(
+            issuers_dir
+                .path()
+                .to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let mut issuer = crate::issuers::types::Issuer::new(
+            "issuer-a".into(),
+            "Research".into(),
+            "did:example:issuer".into(),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        );
+        issuer.signing = keyed("conn", "key-1");
+        crate::issuers::IssuerStore::create(&issuer_store, &issuer)
+            .await
+            .unwrap();
+        let issuer_store: Arc<dyn crate::issuers::IssuerStore> = Arc::new(issuer_store);
+
+        follow_key_rotation(
+            &Some(Extension(Arc::clone(&surface_store))),
+            &Some(Extension(Arc::clone(&issuer_store))),
+            "conn",
+            "key-1",
+            "key-2",
+        )
+        .await;
+
+        let key_of = |signing: Option<crate::config::agent_surface::SurfaceSigningConfig>| {
+            signing.and_then(|signing| signing.key_id)
+        };
+        let surface_key = |id: &'static str| {
+            let store = Arc::clone(&surface_store);
+            async move {
+                key_of(
+                    store
+                        .get(id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .signing,
+                )
+            }
+        };
+        assert_eq!(
+            surface_key("s-old")
+                .await
+                .as_deref(),
+            Some("key-2")
+        );
+        assert_eq!(
+            surface_key("s-other")
+                .await
+                .as_deref(),
+            Some("key-9")
+        );
+        assert_eq!(
+            surface_key("s-elsewhere")
+                .await
+                .as_deref(),
+            Some("key-1")
+        );
+        assert_eq!(
+            key_of(
+                issuer_store
+                    .get("issuer-a")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .signing
+            )
+            .as_deref(),
+            Some("key-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_is_refused_while_a_surface_signs_through_the_connection_unless_acknowledged() {
+        let (state, _dir) = admin_state(None).await;
+        let surfaces_dir = tempfile::tempdir().unwrap();
+        let store = crate::surfaces::FileSystemAgentSurfaceStore::new(
+            surfaces_dir
+                .path()
+                .to_path_buf(),
+        )
+        .await
+        .unwrap();
+        crate::surfaces::AgentSurfaceStore::save(&store, &signing_surface("s1", None, vta_signing(Some("conn"))))
+            .await
+            .unwrap();
+        let store: Arc<dyn crate::surfaces::AgentSurfaceStore> = Arc::new(store);
+
+        let refused = disconnect_refusal(&state, "conn", DisconnectQuery::default(), Some(&store))
+            .await
+            .expect("a surface signs through `conn`");
+        assert_eq!(refused["signing_users"], serde_json::json!(["surface \"surface s1\""]));
+
+        let acknowledged = DisconnectQuery {
+            acknowledge_signing_users: true,
+            ..Default::default()
+        };
+        assert!(
+            disconnect_refusal(&state, "conn", acknowledged, Some(&store))
+                .await
+                .is_none()
+        );
+        assert!(
+            disconnect_refusal(&state, "other", DisconnectQuery::default(), Some(&store))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_is_refused_when_what_signs_through_the_connection_cannot_be_listed() {
+        let (state, _dir) = admin_state(None).await;
+        let store: Arc<dyn crate::surfaces::AgentSurfaceStore> =
+            Arc::new(crate::delegation_vault::test_support::UnreadableSurfaces);
+
+        let refused = disconnect_refusal(&state, "conn", DisconnectQuery::default(), Some(&store))
+            .await
+            .expect("an unchecked disconnect is refused");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("Could not check"),
+            "{refused}"
+        );
+        let acknowledged = DisconnectQuery {
+            acknowledge_signing_users: true,
+            ..Default::default()
+        };
+        assert!(
+            disconnect_refusal(&state, "conn", acknowledged, Some(&store))
+                .await
+                .is_none()
+        );
+    }
+
+    // ---- the identity a new connection authenticates as ------------------
+
+    /// Records what is stored so the test can read the seed back, as the
+    /// registry will.
+    struct RecordingSecrets(std::sync::Mutex<Vec<crate::secrets::CreateSecretRequest>>);
+
+    #[async_trait::async_trait]
+    impl SecretsStore for RecordingSecrets {
+        async fn create(
+            &self,
+            request: crate::secrets::CreateSecretRequest,
+        ) -> anyhow::Result<crate::secrets::Secret> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(request.clone());
+            let now = chrono::Utc::now();
+            Ok(crate::secrets::Secret {
+                id: format!("internal-{}", request.secret_id),
+                tenant_id: request.tenant_id,
+                name: request.name,
+                secret_id: request.secret_id,
+                description: request.description,
+                value: request.value,
+                secret_type: request.secret_type,
+                tags: request.tags,
+                created_at: now,
+                updated_at: now,
+            })
+        }
+
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<Option<crate::secrets::Secret>> {
+            unimplemented!()
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::secrets::SecretListItem>> {
+            unimplemented!()
+        }
+
+        async fn update(
+            &self,
+            _id: &str,
+            _request: crate::secrets::UpdateSecretRequest,
+        ) -> anyhow::Result<crate::secrets::Secret> {
+            unimplemented!()
+        }
+
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+
+        async fn find_by_tag(
+            &self,
+            _tag: &str,
+        ) -> anyhow::Result<Vec<crate::secrets::SecretListItem>> {
+            unimplemented!()
+        }
+    }
+
+    /// A store that returns `seed` for the reference [`give_connection_a_control_identity`] recorded.
+    fn store_holding(seed: &str) -> Arc<dyn SecretsStore> {
+        let seed: &'static str = Box::leak(
+            seed.to_string()
+                .into_boxed_str(),
+        );
+        Arc::new(crate::integrations::definitions::test_secrets::Secrets(vec![(
+            "vta-control-key-3f2c9a1e-7d4b-4c1a-9e55-0a1b2c3d4e5f",
+            None,
+            seed,
+        )]))
+    }
+
+    fn new_connection() -> VtaConnection {
+        to_connection(
+            "3f2c9a1e-7d4b-4c1a-9e55-0a1b2c3d4e5f".to_string(),
+            VtaConnectionRequest {
+                name: "Customer VTA".to_string(),
+                endpoint: "https://vta.example".to_string(),
+                vta_did: "did:webvh:QmVta:vta.example".to_string(),
+                ..Default::default()
+            },
+            VtaConnectionStatus::Unpaired,
+        )
+    }
+
+    async fn state_publishing_under(storage: &std::path::Path) -> (VtaConnectionAdminState, tempfile::TempDir) {
+        let (mut state, dir) = admin_state(None).await;
+        state.auth_did_publisher = Some(Arc::new(crate::vta::auth_did::ConnectionDidPublisher::new(
+            storage.to_path_buf(),
+            "gw.example.com".to_string(),
+        )));
+        (state, dir)
+    }
+
+    /// The identifier the operator is asked to grant is the published
+    /// `did:webvh`, it names the connection, and the key it declares is the one
+    /// the seed in the secrets store derives.
+    #[tokio::test]
+    async fn a_new_connection_authenticates_as_a_published_did_webvh() {
+        let storage = tempfile::tempdir().expect("storage");
+        let (state, _dir) = state_publishing_under(storage.path()).await;
+        let secrets = Arc::new(RecordingSecrets(Default::default()));
+        let store: Arc<dyn SecretsStore> = secrets.clone();
+        let mut connection = new_connection();
+
+        give_connection_a_control_identity(&state, &store, &mut connection, ControlIdentity::Webvh)
+            .await
+            .expect("provisioned");
+
+        let did = connection
+            .control_did
+            .clone()
+            .expect("a published DID is recorded");
+        assert!(did.starts_with("did:webvh:"), "{did}");
+        assert!(did.ends_with(&format!(":gw.example.com:vta-auth:{}", connection.id)), "{did}");
+
+        let stored = secrets
+            .0
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            connection
+                .control_key_ref
+                .as_deref(),
+            Some(stored[0].secret_id.as_str())
+        );
+        assert!(
+            stored[0]
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("did:key:"),
+            "the secret's description names the key's own did:key"
+        );
+
+        let seed = crate::vta::decode_hex_seed(&stored[0].value).expect("seed");
+        let key = crate::vta::control_key::ControlKey::from_seed(seed);
+        let log_dir = crate::vta::auth_did::connection_auth_did_dir(storage.path(), &connection.id).expect("dir");
+        let raw = crate::storage::did_artifacts::read_did_log_raw(&log_dir)
+            .await
+            .expect("read")
+            .expect("a log was published");
+        let entry: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(entry["state"]["id"], serde_json::json!(did));
+        assert_eq!(
+            entry["state"]["verificationMethod"][0]["publicKeyMultibase"],
+            serde_json::json!(key.public_key_multibase())
+        );
+
+        let shown = resolve_control_did(&connection, None, &VtaConfig::default())
+            .await
+            .expect("resolves");
+        assert_eq!(shown, did, "pairing shows the DID the gateway really authenticates as");
+    }
+
+    #[tokio::test]
+    async fn asking_for_a_did_key_publishes_nothing() {
+        let storage = tempfile::tempdir().expect("storage");
+        let (state, _dir) = state_publishing_under(storage.path()).await;
+        let secrets = Arc::new(RecordingSecrets(Default::default()));
+        let store: Arc<dyn SecretsStore> = secrets.clone();
+        let mut connection = new_connection();
+
+        give_connection_a_control_identity(&state, &store, &mut connection, ControlIdentity::DidKey)
+            .await
+            .expect("provisioned");
+
+        assert!(
+            connection
+                .control_did
+                .is_none()
+        );
+        let seed = secrets.0.lock().unwrap()[0]
+            .value
+            .clone();
+        let shown = resolve_control_did(&connection, Some(&store_holding(&seed)), &VtaConfig::default())
+            .await
+            .expect("resolves");
+        assert_eq!(shown, crate::vta::control_key_did(&seed).expect("derive"));
+        assert!(shown.starts_with("did:key:"));
+        assert!(
+            !crate::vta::auth_did::auth_did_dir(storage.path()).exists(),
+            "nothing may be published for a did:key connection"
+        );
+    }
+
+    /// A gateway with no domain to publish under cannot give a resolvable
+    /// `did:webvh`, so the connection works as a `did:key` rather than not at all.
+    #[tokio::test]
+    async fn without_a_domain_a_connection_falls_back_to_its_did_key() {
+        let (state, _dir) = admin_state(None).await;
+        let store: Arc<dyn SecretsStore> = Arc::new(RecordingSecrets(Default::default()));
+        let mut connection = new_connection();
+
+        give_connection_a_control_identity(&state, &store, &mut connection, ControlIdentity::Webvh)
+            .await
+            .expect("provisioned");
+
+        assert!(
+            connection
+                .control_did
+                .is_none()
+        );
+        assert!(
+            connection
+                .control_key_ref
+                .is_some()
+        );
+    }
+
+    /// A publisher that cannot write is an error: granting a different
+    /// identifier than the one asked for would be worse than failing.
+    #[tokio::test]
+    async fn a_publisher_that_fails_fails_the_create() {
+        let blocker = tempfile::NamedTempFile::new().expect("a file where the directory should go");
+        let (state, _dir) = state_publishing_under(blocker.path()).await;
+        let store: Arc<dyn SecretsStore> = Arc::new(RecordingSecrets(Default::default()));
+        let mut connection = new_connection();
+
+        let (status, _) = give_connection_a_control_identity(&state, &store, &mut connection, ControlIdentity::Webvh)
+            .await
+            .expect_err("publishing cannot succeed");
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            connection
+                .control_did
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_edit_keeps_the_published_did_unless_the_key_changes() {
+        let mut existing = new_connection();
+        existing.control_key_ref = Some("k1".to_string());
+        existing.control_did = Some("did:webvh:QmScid:gw.example.com:vta-auth:c".to_string());
+        let mut same = new_connection();
+        same.control_key_ref = Some("k1".to_string());
+        let mut other = new_connection();
+        other.control_key_ref = Some("k2".to_string());
+
+        assert_eq!(kept_control_did(&existing, &same), existing.control_did);
+        assert_eq!(kept_control_did(&existing, &other), None);
+    }
+
+    /// The `[vta]` block's own configured DID is what is offered for granting.
+    #[tokio::test]
+    async fn the_bootstrap_block_offers_its_configured_auth_did() {
+        let var = "TG_TEST_VTA_BOOTSTRAP_DID_KEY";
+        let mut config = bootstrap_config(Some(&format!("env://{var}")));
+        config.auth_did = Some("did:webvh:QmScid:gw.example.com:vta-auth".to_string());
+        let connection = VtaConnection::from_bootstrap(&config).expect("a bootstrap record");
+
+        let did = resolve_control_did(&connection, None, &config)
+            .await
+            .expect("resolves");
+
+        assert_eq!(did, "did:webvh:QmScid:gw.example.com:vta-auth");
+    }
+
+    /// The whole point of the fallback: an operator pairing the `[vta]` block
+    /// must be shown the DID to grant. Before this it was a 400, and the DID
+    /// appeared nowhere readable — redacted in logs, encrypted on disk.
+    #[tokio::test]
+    async fn pairing_the_bootstrap_connection_resolves_the_did_from_the_block() {
+        let var = "TG_TEST_VTA_BOOTSTRAP_DID_KEY";
+        let seed = std::env::var(var).expect("`.cargo/config.toml` [env] provides the test seed");
+        let config = bootstrap_config(Some(&format!("env://{var}")));
+        let connection = VtaConnection::from_bootstrap(&config).expect("a bootstrap record");
+        assert!(
+            connection
+                .control_key_ref
+                .is_none(),
+            "the bootstrap record carries no secrets-store reference, which is why the fallback exists"
+        );
+
+        let did = resolve_control_did(&connection, None, &config)
+            .await
+            .expect("the bootstrap DID must resolve without a secrets-store reference");
+
+        assert_eq!(
+            did,
+            crate::vta::control_key_did(&seed).expect("derive"),
+            "the DID shown must be the one the connector actually authenticates with"
+        );
+    }
+
+    /// With no key source the gateway mints a fresh key every boot, so any DID
+    /// shown here would stop being true at the next restart. Say that, rather
+    /// than send the operator to grant something transient.
+    #[tokio::test]
+    async fn a_bootstrap_block_without_a_key_source_explains_itself_instead_of_showing_a_did() {
+        let config = bootstrap_config(None);
+        let connection = VtaConnection::from_bootstrap(&config).expect("a bootstrap record");
+
+        let (status, body) = resolve_control_did(&connection, None, &config)
+            .await
+            .expect_err("a regenerated-every-boot key must not be offered for granting");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let rendered = serde_json::to_string(&body.0).expect("serialise");
+        assert!(rendered.contains("auth_key_source"), "the error must name the setting that fixes it: {rendered}");
+    }
+
+    /// The fallback is scoped to the bootstrap record. An ordinary connection
+    /// without a key must keep failing, or pairing one would silently hand back
+    /// the appliance-wide block's DID.
+    #[tokio::test]
+    async fn an_ordinary_connection_without_a_key_still_refuses_to_pair() {
+        let config = bootstrap_config(None);
+        let mut connection = VtaConnection::from_bootstrap(&config).expect("a bootstrap record");
+        connection.id = "some-other-connection".to_string();
+        assert!(!connection.is_bootstrap());
+
+        let (status, body) = resolve_control_did(&connection, None, &config)
+            .await
+            .expect_err("a non-bootstrap connection has no block key to fall back to");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let rendered = serde_json::to_string(&body.0).expect("serialise");
+        assert!(rendered.contains("control_key_ref"), "it must still point at the missing reference: {rendered}");
+    }
+}
+
+/// End-to-end coverage of the key the connect wizard mints, against a **real**
+/// agent.
+///
+/// The wizard's final step calls `POST /v1/vta/connections/{id}/keys` and then
+/// expects every picker to accept the connection. Nothing proved that the key
+/// it creates can actually sign — the unit tests stop at the HTTP boundary,
+/// and the surface-mapping suites start from a key that was already there.
+///
+/// Run with a live agent:
+/// ```text
+/// VTA_LIVE_URL=http://127.0.0.1:3000 \
+/// VTA_LIVE_DID='did:webvh:...' \
+/// VTA_LIVE_PARENT_CONTEXT=gwtest \
+///   cargo test --bin agent-trust-gateway connections_admin::live_key_tests \
+///     -- --ignored --test-threads=1
+/// ```
+/// The agent rate-limits authentication, so keep `--test-threads=1`.
+#[cfg(test)]
+mod live_key_tests {
+    use super::*;
+    use crate::vta::connections::SigningKeys;
+
+    /// The seed the other live suites authenticate with, so one ACL grant
+    /// covers them all.
+    const LIVE_SEED: [u8; 32] = [0x2a; 32];
+
+    fn env(name: &str) -> String {
+        std::env::var(name).unwrap_or_else(|_| panic!("set {name}; see the module docs"))
+    }
+
+    async fn live_client() -> Arc<crate::vta::client::VtaRestClient> {
+        let url = std::env::var("VTA_LIVE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+        let vta_did = env("VTA_LIVE_DID");
+        let control = Arc::new(crate::vta::control_key::ControlKey::from_seed(LIVE_SEED));
+        Arc::new(
+            crate::vta::client::VtaRestClient::new(
+                &url,
+                &vta_did,
+                control,
+                std::time::Duration::from_secs(15),
+                8,
+                None,
+            )
+            .expect("build a live client"),
+        )
+    }
+
+    /// The key the wizard mints is real, non-exportable, and can sign.
+    ///
+    /// Asserts the whole contract the dashboard relies on: an id is returned,
+    /// the public half is captured at creation (the agent will never hand it
+    /// back later), and a JWT signed with it carries that id as `kid` — which
+    /// is how an operator correlates a token to the key that produced it.
+    #[tokio::test]
+    #[ignore = "requires a running VTA; see the module docs"]
+    async fn a_minted_key_can_sign_and_names_itself_as_kid() {
+        let client = live_client().await;
+        let context = env("VTA_LIVE_PARENT_CONTEXT");
+
+        let key = mint_signing_key(&client)
+            .await
+            .expect("mint a signing key against the live agent");
+
+        assert!(
+            key.key_id
+                .starts_with("gateway-jwt-"),
+            "the dashboard shows this id as the kid: {}",
+            key.key_id
+        );
+        assert!(
+            key.public_key.is_some(),
+            "the public half must be captured at creation — the agent will not \
+             return an internal key's record afterwards, so missing it here \
+             means it can never be published for verification"
+        );
+
+        // Sign with exactly that key, the way the registry does for a surface.
+        use crate::identity::authority::CredentialAuthority;
+        let authority =
+            crate::vta::authority::VtaCredentialAuthority::new(Arc::clone(&client), key.key_id.clone(), None);
+        let jwt = authority
+            .sign_token(&serde_json::json!({ "sub": "wizard-live-test", "ctx": context }))
+            .await
+            .expect("the minted key must be able to sign");
+
+        use base64::Engine;
+        let header: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(
+                    jwt.split('.')
+                        .next()
+                        .expect("a JWT has three parts"),
+                )
+                .expect("base64url header"),
+        )
+        .expect("JSON header");
+
+        assert_eq!(
+            header
+                .get("kid")
+                .and_then(|v| v.as_str()),
+            Some(key.key_id.as_str()),
+            "the token must name the key that signed it: {header}"
+        );
+        assert_eq!(
+            header
+                .get("alg")
+                .and_then(|v| v.as_str()),
+            Some("EdDSA")
+        );
+    }
+
+    /// Provisioning a second time retires the first key rather than dropping
+    /// it — the reason the wizard only mints when there is no active key.
+    ///
+    /// A verifier selects by `kid`, so a retired key must keep being published
+    /// or every token it signed that is still in flight stops verifying.
+    #[tokio::test]
+    #[ignore = "requires a running VTA; see the module docs"]
+    async fn provisioning_again_retires_the_previous_key() {
+        let client = live_client().await;
+        let mut keys = SigningKeys::default();
+
+        let first = mint_signing_key(&client)
+            .await
+            .expect("mint the first key");
+        keys.rotate_to(first.clone(), chrono::Utc::now())
+            .expect("adopt the first key");
+        let second = mint_signing_key(&client)
+            .await
+            .expect("mint a second key");
+        keys.rotate_to(second.clone(), chrono::Utc::now())
+            .expect("adopt the second key");
+
+        assert_eq!(
+            keys.active
+                .as_ref()
+                .map(|k| k.key_id.as_str()),
+            Some(second.key_id.as_str()),
+            "the newest key signs"
+        );
+        assert!(
+            keys.retiring
+                .iter()
+                .any(|k| k.key_id == first.key_id),
+            "the previous key must still be published, not dropped: {:?}",
+            keys.retiring
+                .iter()
+                .map(|k| &k.key_id)
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(first.key_id, second.key_id, "each provisioning must create a distinct key");
+    }
+}

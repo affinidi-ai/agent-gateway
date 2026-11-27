@@ -259,6 +259,29 @@ pub async fn a2a_request_sent_to_surface(
     send_rpc(world, gw_index, &surface_name, build_a2a_request_body(), &[]).await;
 }
 
+/// An A2A message with an invalid API key, carrying an identity binding VP and
+/// an identity credential of the caller's own making.
+#[when(
+    expr = "the caller sends a Fabric A2A request with an invalid API key and an identity proof of its own through gateway {int} surface {string}"
+)]
+pub async fn a2a_request_with_invalid_api_key_and_own_identity_proof(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    surface_name: String,
+) {
+    use crate::bdd_support::json_rpc::{AGENT_IDENTITY_BINDING_EXTENSION_URI, AGENT_IDENTITY_CREDENTIAL_EXTENSION_URI};
+    world.start().await;
+    let mut body = build_a2a_request_body();
+    body["params"]["message"]["extensions"] =
+        serde_json::json!([AGENT_IDENTITY_BINDING_EXTENSION_URI, AGENT_IDENTITY_CREDENTIAL_EXTENSION_URI]);
+    body["params"]["message"]["metadata"] = serde_json::json!({
+        AGENT_IDENTITY_BINDING_EXTENSION_URI: {"verifiablePresentation": "caller-made-presentation"},
+        AGENT_IDENTITY_CREDENTIAL_EXTENSION_URI: {"did": "did:web:asserted.example", "verifiablePresentation": "caller-made-presentation"}
+    });
+    send_rpc(world, gw_index, &surface_name, body, &[("x-api-key".to_string(), "bdd-invalid-api-key".to_string())])
+        .await;
+}
+
 #[when(expr = "the caller fetches the agent card from gateway {int} surface {string}")]
 pub async fn agent_card_fetched_from_surface(
     world: &mut G2gWorld,
@@ -637,7 +660,7 @@ pub async fn gateway_pings_gateway(
         .insert((from_gw, to_gw), success);
 }
 
-async fn accept_pending_oob(
+pub(crate) async fn accept_pending_oob(
     world: &mut G2gWorld,
     gateway: usize,
     acceptor_mediator_id: Option<&str>,
@@ -667,8 +690,52 @@ async fn accept_pending_oob(
         )
         .await
         .expect("connect-via-oob request should complete at the transport layer");
+    world.accepted_gateway_id = response
+        .body
+        .pointer("/gateway/id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     world.response_status = Some(response.status);
     world.response_body = Some(response.body);
+}
+
+#[when(regex = r"^the gateways pair$")]
+pub async fn the_gateways_pair(world: &mut G2gWorld) {
+    world.start().await;
+}
+
+#[when(regex = r"^gateway (\d+) deletes the gateway it accepted last$")]
+pub async fn gateway_deletes_the_gateway_it_accepted_last(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let gateway_id = world
+        .accepted_gateway_id
+        .clone()
+        .expect("a step must accept an invitation before this one");
+    let deleted = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .delete_gateway_recorded(&gateway_id)
+        .await
+        .expect("delete request completes at the transport layer");
+    world.response_status = Some(deleted.status);
+    world.response_body = Some(deleted.body);
+}
+
+#[when(regex = r"^gateway (\d+) accepts the invitation again$")]
+pub async fn gateway_accepts_the_invitation_again(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    accept_pending_oob(world, gateway, None).await;
+    assert_eq!(
+        world.response_status,
+        Some(200),
+        "the acceptor sends its connection-setup whatever the invitation's state: {:?}",
+        world.response_body
+    );
 }
 
 #[when(regex = r#"^gateway (\d+) accepts the invitation using mediator "([^"]+)"$"#)]

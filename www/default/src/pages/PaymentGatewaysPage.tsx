@@ -3,7 +3,6 @@ import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import { usePermissions } from '../context/PermissionsContext';
 import { AppButton } from '../components/shared/AppButton';
-import { Badge } from '../components/shared/Badge';
 import { EmptyState } from '../components/shared/EmptyState';
 import SearchInput from '../components/shared/SearchInput';
 import { pingPaymentGateway } from '../components/payment-gateways/pingPaymentGateway';
@@ -151,10 +150,6 @@ const PaymentGatewaysPage: React.FC<PaymentGatewaysPageProps> = ({
               icon="fa-credit-card"
               title="Connect a payment gateway"
               body="A payment gateway is an agent-pay gateway that takes payments for your surfaces: it issues the payment challenge, verifies and settles the payment and returns the receipt. Connect with the Connection Point Link and secret its administrator shares; agent-pay's administrator then approves the connection."
-              ctaLabel={canEdit ? 'Connect Payment Gateway' : undefined}
-              ctaIcon="fa-plus"
-              onCtaClick={canEdit ? connect : undefined}
-              ctaTestId="payment-gateways-empty-connect-button"
               docsHref={DOCS_URL.payments}
             />
           </div>
@@ -165,12 +160,6 @@ const PaymentGatewaysPage: React.FC<PaymentGatewaysPageProps> = ({
             <div className="d-flex justify-content-between align-items-center">
               <h6 className="m-0 font-weight-bold text-primary">
                 <i className="fas fa-credit-card"></i> Payment Gateways
-                <Badge
-                  value={filtered.length}
-                  suffix={effectiveSearchTerm ? ` of ${gateways.length}` : undefined}
-                  className="ms-2"
-                  ariaLabel={`${filtered.length}${effectiveSearchTerm ? ` of ${gateways.length}` : ''} payment gateways`}
-                />
               </h6>
               {!actionsContainer && connectButton}
             </div>

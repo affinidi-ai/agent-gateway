@@ -1,0 +1,221 @@
+branch: fix/state-audit-high-findings
+changes:
+  added:
+    - timestamp: '2026-11-19T00:00:00Z'
+      title: Add single_use_store to keep single-use records on disk or in DynamoDB
+      description: >-
+        gateway.json `single_use_store` selects where single-use records are kept:
+        `{"backend":"disk"}` (the default) or `{"backend":"dynamodb","table":"..."}` shared
+        by every node. The disk backend keeps one owner-only journal per kind in `single_use/` of
+        the `_storage` folder that holds the stored surfaces, synced before a record is accepted and
+        compacted at startup. Instances sharing one `_storage` volume take turns with it through a
+        lock: the Active node holds the journals, and a node that does not hold them refuses every
+        single-use check. Nodes with their own `_storage` need DynamoDB, and the gateway refuses to
+        start when MCP continuations are kept in DynamoDB while this store is on disk.
+  changed:
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Refuse channel_config_source "file" when the gateway starts
+      description: >-
+        The bootstrap configuration accepted channel_config_source = "file", although the gateway
+        could neither start nor reload with it. Validation now names the two sources it supports,
+        local and dynamodb.
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Refuse to start on a settings.json that cannot be read
+      description: >-
+        A settings.json that could not be read or parsed, for example after a crash mid-write,
+        was overwritten with defaults, which turned off metrics authentication and audit logging
+        and cleared every feature flag. The gateway now leaves the file as it is and refuses to
+        start until it is fixed or removed, and settings are written atomically.
+    - timestamp: '2026-11-19T00:00:00Z'
+      title: Refuse ID-JAGs whose remaining lifetime exceeds the configured cap
+      description: >-
+        jwt-bearer redemption, including the embedded MCP issuer profile, now refuses with
+        invalid_grant an ID-JAG whose exp is more than `sts.id_jag_max_lifetime_secs` (default
+        900, 1 to 3600) after now, so a long-lived grant cannot be held for later use. A value
+        outside the range stops the gateway at startup.
+    - timestamp: '2026-11-19T00:00:00Z'
+      title: Stop using sts.replay_protection.backend
+      description: >-
+        Redeemed ID-JAGs are now recorded in the single-use store. The setting is still
+        accepted so existing configurations load, and any value other than in_process
+        logs a startup warning. The embedded `sts.mcp_replay` capacity is still validated
+        but no longer bounds anything.
+  fixed:
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Stop Connection Point listeners that are still connecting
+      description: >-
+        A Connection Point listener still waiting for its mediator after its start returned is
+        now cancelled by a stop or by stepping down to Standby, so it can no longer register later
+        on a Standby node and hold a second socket for the same DID. A second start for the same
+        Connection Point waits at most 30 seconds for the first instead of blocking every later
+        listener start, and approving a gateway no longer reports a listener as authenticated
+        while it is still connecting.
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Handle Fabric requests again when redelivered after a reconnect
+      description: >-
+        A forward request still being handled when a listener's mediator connection dropped was
+        aborted but stayed marked as seen, so the mediator's redelivery was dropped as a
+        duplicate and the caller timed out. The aborted request is now forgotten, so the
+        redelivery is handled, and the in-flight dispatch gauge drops for aborted requests too.
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Never serve a surface stored as deleted
+      description: >-
+        A surface stored with status deleted, by a hand edit or a restore, was given its route at
+        startup, served until the next full reload, and could take a live surface's route and get
+        that surface disabled. Only an active surface now serves traffic or claims a route,
+        everywhere the gateway decides it, and the admin API refuses to save a surface as deleted.
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Keep serving every surface when a configuration reload fails to load
+      description: >-
+        A reload whose configuration or surface records could not be loaded, such as on a
+        DynamoDB read error, rebuilt every port from a cached configuration that holds no
+        surfaces, taking every surface offline. It now changes nothing and reports the failure.
+        A single-surface reload whose engines or variants fail to build, or whose port has no
+        listener, is refused before the running configuration changes, and the configuration
+        cache is written atomically.
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Keep a closed payment ledger row's outcome
+      description: >-
+        Every change to a payment ledger row now checks the row as it is at that moment. A row
+        closed as paid, voided, capture_failed or rejected, or superseded by a later row, is no
+        longer reopened as unconfirmed by a settle that timed out, moved from voided to
+        capture_failed by a late capture, or sent to agent-pay again. A row the disk did not take
+        is queued only in its newest version, so a reload never brings back an older one.
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Keep unsettled x402 transactions past their retention period
+      description: >-
+        The daily x402 transaction cleanup deleted records whose settlement was still pending,
+        processing or awaiting a remote or external facilitator, which the admin API refuses to
+        delete. Cleanup now deletes only records that are final.
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Never lose a did:webvh identity's key during rotation
+      description: >-
+        Key rotation wrote the new log entry before saving the new private key, so a failed save
+        or a crash in between left the DID unable to be updated again. The new key is now saved
+        before the log entry is written, and the next change finishes or drops a rotation that
+        stopped part way. Changes to one identity run one at a time, so two concurrent updates
+        can no longer fork its log, and each log line is synced to the disk.
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Stop a backup restore from repeating or restoring a stale archive
+      description: >-
+        After a startup restore, a staged archive that could not be removed was restored again
+        on every start, and an older legacy .tgwbak staged beside it could be restored over the
+        fresh data on the next one. Both staged archives are now removed, and the restore records
+        the digest of every archive staged when it ran, so neither is applied again when its
+        removal fails.
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Keep changes saved while encryption at rest was off
+      description: >-
+        A record saved with encryption off left its older encrypted copy in place, and turning
+        encryption back on loaded that copy and deleted the newer plaintext. Saving a record now
+        removes its superseded encrypted copy.
+    - timestamp: '2026-11-19T00:00:00Z'
+      title: Keep a did:webvh log valid when it changes twice in one second
+      description: >-
+        A change to a did:webvh identity made in the same second as its previous log version,
+        such as a key rotation right after the identity was created, wrote a version dated the
+        same second, which the log then refused, failing every later change. The change now
+        waits until it can be dated later than the previous version.
+    - timestamp: '2026-11-19T00:00:00Z'
+      title: Never leave a stored record half written after a crash
+      description: >-
+        A record was saved by overwriting its file in place, so a crash mid-write left a torn file
+        that the next load skipped, losing the record. A save now writes a temporary file and
+        renames it over the record, so a crash leaves the previous version whole.
+    - timestamp: '2026-11-20T00:00:00Z'
+      title: Remove temporary files left by interrupted saves
+      description: >-
+        A crash between writing a record's temporary file and renaming it over the record left
+        the temporary file behind for good. Opening a storage directory now removes such files
+        once they are ten minutes old, keeping newer ones that may belong to a save still
+        running on another instance sharing the volume.
+  removed:
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Remove x402 settlement and keep recorded x402 transactions as they are
+      description: >-
+        The x402 settlement worker, settlement sync worker, startup recovery, embedded and remote
+        facilitators, the Fabric facilitator service and the facilitator address script are
+        removed, along with the x402, alloy and Solana crates only they used; their x402.json
+        settings still load and are ignored. Startup recovery could mark a failed settlement
+        completed with both a rejection and a receipt attached, and the sync worker could tell a
+        peer a payment completed before it settled. Nothing writes a new x402 transaction, and a
+        recorded one changes only when its own facilitator gateway reports it completed while its
+        settlement is in progress. The admin API reads them and now deletes one at any stage, the
+        only way to remove one left unsettled. A Fabric settle-response is dropped.
+    - timestamp: '2026-11-20T00:00:00Z'
+      title: Remove the facilitator blocks from the example x402.json and gateway.json
+      description: >-
+        The example x402.json no longer has `facilitator_private_keys`, `settlement_storage`,
+        `facilitator` or the facilitator defaults, which nothing reads, so operators are no
+        longer invited to place chain signing keys on the host. The payment policy API no
+        longer returns `defaults.facilitator_timeout_secs`, and `facilitator_private_keys` in an
+        existing x402.json is dropped when it loads, with a warning to remove it, instead of
+        being kept in memory. The example gateway.json drops
+        `facilitator_mode` and `sts.replay_protection` and shows `single_use_store` and
+        `sts.id_jag_max_lifetime_secs`.
+  security:
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Accept trust registry status changes only from that registry
+      description: >-
+        A trust registry connection's setup and rejection messages are now honoured only when
+        they come from that registry's DID (or, for a rejection, its mediator), so another
+        sender can no longer mark a registry Connected or Failed. Setup messages only move a
+        connection forward, so a late setup/received no longer downgrades a Connected registry
+        and a Failed registry stays Failed until an operator reconnects it. Only the registry
+        can answer a pending registry query, and only the registry or its mediator a pending
+        problem report, and peer-chosen fields in the logged rejection are capped and escaped.
+    - timestamp: '2026-11-18T00:00:00Z'
+      title: Accept x402 settlement-complete only from the transaction's facilitator
+      description: >-
+        A settlement-complete message now completes a recorded x402 transaction only when it
+        comes from the active peer gateway recorded as that transaction's facilitator and
+        explicitly reports completed, and only while its settlement is in progress, so a repeated
+        message issues no second receipt or audit event and a failed or refunded settlement is
+        not reopened. Previously any Fabric peer could complete any transaction and issue its
+        receipt, and a message without a status counted as completed.
+    - timestamp: '2026-11-19T00:00:00Z'
+      title: Refuse replayed ID-JAGs after a restart or on another node
+      description: >-
+        ID-JAG redemption, including the embedded MCP issuer profile, records the digest
+        of the grant's issuer and jti in the durable single-use store instead of process
+        memory, so a gateway restart (or, with DynamoDB, another node) can no longer
+        accept a replay. The same jti from two issuers is two grants. A store failure
+        fails closed with server_error and no token is issued.
+    - timestamp: '2026-11-19T00:00:00Z'
+      title: Refuse replayed Fabric envelopes after a restart
+      description: >-
+        Admitted forward-request, capability query and pairing envelopes are recorded in
+        the single-use store until they expire, so a restart no longer reopens a replay
+        window. An envelope the store cannot record is refused (a forward-request is
+        answered 503). A dispatch aborted by a reconnect still forgets its envelope, in
+        memory and in the store, so the mediator's redelivery is processed.
+    - timestamp: '2026-11-19T00:00:00Z'
+      title: Keep voided payment evidence voided across restarts and nodes
+      description: >-
+        The receipt of a voided agent-pay authorization is recorded in the single-use
+        store for the longest a continuation lives, so continuation evidence recorded
+        before the void pays for no later round after a restart or on another node.
+        Evidence the store cannot check is refused, and evidence of a void is refused on
+        the node from the moment the void is decided, before the record is written, also
+        when a request is abandoned or its record cannot be written.
+  breaking:
+    - timestamp: '2026-11-20T00:00:00Z'
+      title: Set single_use_store to dynamodb when MCP continuations are in DynamoDB
+      description: >-
+        A gateway that keeps MCP continuations in DynamoDB now refuses to start while
+        `single_use_store` is on disk, which is the default when the key is absent. Before
+        upgrading such a deployment, add `"single_use_store": {"backend": "dynamodb",
+        "table": "..."}` to gateway.json.
+    - timestamp: '2026-11-20T00:00:00Z'
+      title: Stop settling x402 payments already verified
+      description: >-
+        x402 transactions recorded before the upgrade with a settlement pending are no longer
+        settled, retried or synced. Settle any you still need through the payment rail they were
+        made on, then delete them with `DELETE /api/admin/x402/transactions/{id}`.
+    - timestamp: '2026-11-20T00:00:00Z'
+      title: Answer a configuration reload that could not load with 500
+      description: >-
+        `POST /v1/config/reload` whose configuration or surface records cannot be loaded now
+        answers `500` with the failure in `details`, instead of `200` with `is_fallback: true`.
+        The running configuration is still kept, and a successful reload no longer returns
+        `is_fallback`.

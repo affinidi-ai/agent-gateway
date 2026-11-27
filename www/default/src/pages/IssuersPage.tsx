@@ -9,6 +9,7 @@ import { DeleteButton } from '../components/shared/DeleteButton';
 import { CopyButton } from '../components/shared/CopyButton';
 import { topAndTail } from '../utils/stringUtils';
 import { DOCS_URL } from '../config/docs';
+import { isSigningEmpty, type SurfaceSigning } from '../components/surface-builder/elements/types';
 
 interface Issuer {
   id: string;
@@ -18,9 +19,23 @@ interface Issuer {
   trust_registry_did?: string;
   authority_did?: string;
   tr_registered?: boolean | null;
+  signing?: SurfaceSigning;
   created_at: string;
   updated_at: string;
 }
+
+/** What an issuer's `signing` says in the list: its own choice, or that it follows the default. */
+const signingLabel = (
+  signing: SurfaceSigning | undefined,
+  agentNames: Record<string, string>
+): React.ReactNode => {
+  if (isSigningEmpty(signing)) return <span className="text-muted">Default</span>;
+  if (signing?.backend === 'local') return 'Gateway secret';
+  const name = signing?.connection_id
+    ? (agentNames[signing.connection_id] ?? signing.connection_id)
+    : null;
+  return name ? `VTA · ${name}` : 'VTA';
+};
 
 interface IssuersPageProps {
   onEdit?: (id: string) => void;
@@ -43,6 +58,7 @@ const IssuersPage: React.FC<IssuersPageProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [retryingTr, setRetryingTr] = useState<Set<string>>(new Set());
+  const [agentNames, setAgentNames] = useState<Record<string, string>>({});
 
   const fetchIssuers = async () => {
     try {
@@ -56,6 +72,18 @@ const IssuersPage: React.FC<IssuersPageProps> = ({
       setLoading(false);
     }
   };
+
+  // Names for the trust agents the issuers sign through. Best effort: without them the list
+  // shows the connection id, and a caller who cannot list connections sees no change.
+  useEffect(() => {
+    apiClient
+      .fetch('/api/v1/vta/connections')
+      .then(response => (response.ok ? response.json() : []))
+      .then((list: { id: string; name: string }[]) =>
+        setAgentNames(Object.fromEntries(list.map(c => [c.id, c.name])))
+      )
+      .catch(() => undefined);
+  }, []);
 
   const handleRetryTr = useCallback(async (issuerId: string) => {
     setRetryingTr(prev => new Set(prev).add(issuerId));
@@ -153,12 +181,6 @@ const IssuersPage: React.FC<IssuersPageProps> = ({
           <div className="card-header py-3 d-flex justify-content-between align-items-center">
             <h6 className="m-0 font-weight-bold text-primary">
               <i className="fas fa-sitemap"></i> Issuers
-              <Badge
-                value={filteredIssuers.length}
-                suffix={(externalSearchTerm ?? '').trim() ? ` of ${issuers.length}` : undefined}
-                className="ms-2"
-                ariaLabel={`${filteredIssuers.length}${(externalSearchTerm ?? '').trim() ? ` of ${issuers.length}` : ''} issuers`}
-              />
             </h6>
             {!hideAddButton && (
               <AppButton
@@ -193,6 +215,7 @@ const IssuersPage: React.FC<IssuersPageProps> = ({
                     <tr>
                       <th>Name</th>
                       <th style={{ width: '35%' }}>DID</th>
+                      <th>Signing key source</th>
                       <th>Trust Registry Status</th>
                       <th>Actions</th>
                     </tr>
@@ -219,6 +242,9 @@ const IssuersPage: React.FC<IssuersPageProps> = ({
                             </code>
                             <CopyButton text={issuer.did} title="Copy DID" />
                           </div>
+                        </td>
+                        <td data-testid={`issuers-signing-${issuer.id}`}>
+                          {signingLabel(issuer.signing, agentNames)}
                         </td>
                         <td>
                           {!issuer.trust_registry_did ? (

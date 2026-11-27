@@ -9,6 +9,7 @@ use crate::bdd_support::admin_client::{AdminApiClient, recorded_response};
 use crate::bdd_support::gateway_process::SURFACE_TEST_AUTH_TOKEN;
 use crate::bdd_support::passkey::SoftPasskey;
 use crate::bdd_support::redis_stream::RedisStreamStandIn;
+use crate::bdd_support::saml_idp::AssertionLayout;
 use crate::bdd_support::sign_in_events::{
     ACCOUNT_DATA_FIELDS, APPLIANCE_ID, ENVELOPE_FIELDS, EVENT_TOPIC, NO_ACCOUNT_DATA_FIELDS, RECORD_FIELDS,
     RECORD_TOPIC, STATE_FIELDS, golden, golden_path, keys, names, normalise, updates_golden, write_golden,
@@ -136,6 +137,21 @@ fn saml_json_sets(
         .surface_config
         .saml_settings
         .insert(key, value);
+    world
+        .surface_config
+        .keeps_gateway_log = true;
+}
+
+#[given(expr = "saml.json maps the identity provider role {string} to {string}")]
+fn saml_json_maps_role(
+    world: &mut SurfaceWorld,
+    idp_role: String,
+    gateway_role: String,
+) {
+    world
+        .surface_config
+        .saml_settings
+        .insert("role_mapping".to_string(), json!({ idp_role: gateway_role }));
     world
         .surface_config
         .keeps_gateway_log = true;
@@ -323,6 +339,146 @@ async fn post_unsigned_saml_response(world: &mut SurfaceWorld) {
     );
 }
 
+#[given(expr = "{string} has signed in with SAML as the first user and that event was received")]
+async fn first_user_has_signed_in_with_saml(
+    world: &mut SurfaceWorld,
+    subject: String,
+) {
+    sign_in_with_saml_roles(world, subject, String::new()).await;
+    let status = world
+        .caller_response
+        .as_ref()
+        .expect("the first user's answer")
+        .status;
+    assert_eq!(status, 200, "the first SAML user signs in as the primary administrator: {:?}", world.caller_response);
+    receive_sign_in_payload(world, EVENT_TOPIC, "data", "user.login", &[("login_method", "saml")]).await;
+}
+
+#[given(
+    expr = "{string} has signed in with SAML carrying the identity provider roles {string} and that event was received"
+)]
+async fn a_user_has_signed_in_with_saml_roles(
+    world: &mut SurfaceWorld,
+    subject: String,
+    roles: String,
+) {
+    sign_in_with_saml_roles(world, subject.clone(), roles).await;
+    let status = world
+        .caller_response
+        .as_ref()
+        .expect("the user's answer")
+        .status;
+    assert_eq!(status, 200, "the SAML sign-in succeeds: {:?}", world.caller_response);
+    receive_sign_in_payload(
+        world,
+        EVENT_TOPIC,
+        "data",
+        "user.login",
+        &[("login_method", "saml"), ("username", subject.as_str())],
+    )
+    .await;
+}
+
+#[when(expr = "{string} signs in with SAML carrying the identity provider roles {string}")]
+async fn sign_in_with_saml_roles(
+    world: &mut SurfaceWorld,
+    subject: String,
+    roles: String,
+) {
+    sign_in_with_saml_layout(world, subject, roles, AssertionLayout::SameStatement).await;
+}
+
+#[when(
+    expr = "{string} signs in with SAML carrying the identity provider roles {string} in a second attribute statement"
+)]
+async fn sign_in_with_saml_roles_in_a_second_statement(
+    world: &mut SurfaceWorld,
+    subject: String,
+    roles: String,
+) {
+    sign_in_with_saml_layout(world, subject, roles, AssertionLayout::SecondStatement).await;
+}
+
+#[when(expr = "{string} signs in with SAML carrying the identity provider roles {string} as repeated attributes")]
+async fn sign_in_with_saml_roles_as_repeated_attributes(
+    world: &mut SurfaceWorld,
+    subject: String,
+    roles: String,
+) {
+    sign_in_with_saml_layout(world, subject, roles, AssertionLayout::RepeatedAttribute).await;
+}
+
+#[when(expr = "{string} signs in with SAML carrying two different user IDs as repeated attributes")]
+async fn sign_in_with_saml_repeated_user_ids(
+    world: &mut SurfaceWorld,
+    subject: String,
+) {
+    sign_in_with_saml_layout(world, subject, "gw-all".to_string(), AssertionLayout::RepeatedUserId).await;
+}
+
+#[when(expr = "{string} signs in with SAML carrying two different user IDs in separate attribute statements")]
+async fn sign_in_with_saml_user_ids_in_two_statements(
+    world: &mut SurfaceWorld,
+    subject: String,
+) {
+    sign_in_with_saml_layout(world, subject, "gw-all".to_string(), AssertionLayout::UserIdInSecondStatement).await;
+}
+
+#[when(expr = "{string} signs in with SAML carrying two different usernames as repeated attributes")]
+async fn sign_in_with_saml_repeated_usernames(
+    world: &mut SurfaceWorld,
+    subject: String,
+) {
+    sign_in_with_saml_layout(world, subject, "gw-all".to_string(), AssertionLayout::RepeatedUsername).await;
+}
+
+#[when(expr = "{string} signs in with SAML carrying two different email addresses as repeated attributes")]
+async fn sign_in_with_saml_repeated_emails(
+    world: &mut SurfaceWorld,
+    subject: String,
+) {
+    sign_in_with_saml_layout(world, subject, "gw-all".to_string(), AssertionLayout::RepeatedEmail).await;
+}
+
+#[when(expr = "{string} signs in with SAML carrying the user ID only in a second attribute statement")]
+async fn sign_in_with_saml_user_id_only_in_a_second_statement(
+    world: &mut SurfaceWorld,
+    subject: String,
+) {
+    sign_in_with_saml_layout(world, subject, "gw-all".to_string(), AssertionLayout::UserIdOnlyInSecondStatement).await;
+}
+
+async fn sign_in_with_saml_layout(
+    world: &mut SurfaceWorld,
+    subject: String,
+    roles: String,
+    layout: AssertionLayout,
+) {
+    ensure_gateway_running(world).await;
+    let roles: Vec<String> = roles
+        .split(',')
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
+        .map(str::to_string)
+        .collect();
+    let infra = world
+        .infra
+        .as_ref()
+        .expect("the gateway runs");
+    let answer =
+        crate::bdd_support::saml_idp::sign_in(infra._temp_dir.path(), infra.gateway_port, &subject, &roles, layout)
+            .await;
+    world.caller_response = Some(crate::bdd_support::admin_client::RecordedResponse {
+        status: answer.status,
+        headers: if answer.set_cookies.is_empty() {
+            Default::default()
+        } else {
+            [("set-cookie".to_string(), answer.set_cookies.join("\n"))].into()
+        },
+        body: serde_json::from_str(&answer.body).unwrap_or(Value::String(answer.body)),
+    });
+}
+
 #[when("a passkey sign-in is completed without a sign-in the gateway started")]
 async fn finish_with_unissued_challenge(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
@@ -401,6 +557,17 @@ async fn stream_receives_sign_in(
 ) {
     world.sign_in_event =
         Some(receive_sign_in_payload(world, EVENT_TOPIC, "data", &event_type, &[("login_method", &method)]).await);
+}
+
+#[then(expr = "the integration receives a {string} event with login method {string} for user {string}")]
+async fn stream_receives_sign_in_of_user(
+    world: &mut SurfaceWorld,
+    event_type: String,
+    method: String,
+    username: String,
+) {
+    let data = [("login_method", method.as_str()), ("username", username.as_str())];
+    world.sign_in_event = Some(receive_sign_in_payload(world, EVENT_TOPIC, "data", &event_type, &data).await);
 }
 
 #[then(expr = "the integration receives a {string} event with login method {string} and failure reason {string}")]
@@ -492,6 +659,81 @@ fn event_has_the_fields_naming_no_account(world: &mut SurfaceWorld) {
     assert_exact_fields(sign_in_event(world), false);
 }
 
+#[then("the gateway issues no session cookie")]
+fn the_gateway_issues_no_session_cookie(world: &mut SurfaceWorld) {
+    let response = world
+        .caller_response
+        .as_ref()
+        .expect("the sign-in answer");
+    assert!(
+        !response
+            .headers
+            .contains_key("set-cookie"),
+        "the refused sign-in set a cookie: {:?}",
+        response.headers
+    );
+}
+
+fn stored_users(world: &SurfaceWorld) -> Vec<Value> {
+    let base = world
+        .infra
+        .as_ref()
+        .expect("the gateway runs")
+        ._temp_dir
+        .path()
+        .to_path_buf();
+    let users_dir = ["_storage/passkeys"]
+        .iter()
+        .map(|relative| base.join(relative))
+        .find(|dir| dir.is_dir())
+        .unwrap_or_else(|| panic!("no stored users directory under {base:?}"));
+    let stored: Vec<Value> = std::fs::read_dir(&users_dir)
+        .expect("read the users directory")
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .filter_map(|text| serde_json::from_str(&text).ok())
+        .collect();
+    assert!(!stored.is_empty(), "the first user's account is stored in {users_dir:?}");
+    stored
+}
+
+#[then("only the first human user is stored")]
+fn only_the_first_console_user_is_stored(world: &mut SurfaceWorld) {
+    let stored = stored_users(world);
+    let names: Vec<&Value> = stored
+        .iter()
+        .map(|user| &user["username"])
+        .collect();
+    assert_eq!(stored.len(), 1, "the refused sign-in left another account: {names:?}");
+}
+
+#[then(expr = "human user {string} is stored once")]
+fn console_user_is_stored_once(
+    world: &mut SurfaceWorld,
+    username: String,
+) {
+    let stored = stored_users(world);
+    let matching = stored
+        .iter()
+        .filter(|user| user["username"] == username)
+        .count();
+    assert_eq!(matching, 1, "{username:?} is stored {matching} times: {stored:?}");
+}
+
+#[then(expr = "human user {string} keeps the stored role {string}")]
+fn console_user_keeps_the_stored_role(
+    world: &mut SurfaceWorld,
+    username: String,
+    role: String,
+) {
+    let stored = stored_users(world);
+    let user = stored
+        .iter()
+        .find(|user| user["username"] == username)
+        .unwrap_or_else(|| panic!("no stored user {username:?}: {stored:?}"));
+    assert_eq!(user["role"], role.as_str(), "{username:?}'s stored role: {user}");
+}
+
 #[then(expr = "that event names human user {string}")]
 async fn event_names_console_user(
     world: &mut SurfaceWorld,
@@ -523,6 +765,15 @@ async fn event_names_console_user(
         .as_str()
         .unwrap_or_default();
     assert!(chrono::DateTime::parse_from_rfc3339(updated_at).is_ok(), "new_state updated_at {updated_at:?}");
+}
+
+#[then(expr = "that event reports the user role {string}")]
+fn event_reports_the_user_role(
+    world: &mut SurfaceWorld,
+    role: String,
+) {
+    let data = &sign_in_event(world)["data"];
+    assert_eq!(data["user_role"], role, "the event data is {data}");
 }
 
 #[then("that event names no failure reason")]
@@ -571,6 +822,13 @@ async fn event_is_the_only_one(world: &mut SurfaceWorld) {
     tokio::time::sleep(EXACTLY_ONCE_WAIT).await;
     let received = payloads(world, EVENT_TOPIC);
     assert_eq!(received.len(), 1, "expected one sign-in event; the stream received {received:?}");
+}
+
+#[then("the integration receives no other sign-in event besides the first user's")]
+async fn event_is_the_only_one_besides_the_first_users(world: &mut SurfaceWorld) {
+    tokio::time::sleep(EXACTLY_ONCE_WAIT).await;
+    let received = payloads(world, EVENT_TOPIC);
+    assert_eq!(received.len(), 2, "expected the first user's event and one more; the stream received {received:?}");
 }
 
 #[then("the integration receives no sign-in event")]

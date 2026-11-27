@@ -7,8 +7,8 @@
   "oob_connection": {
     "pending_expiry_hours": 24
   },
-  "facilitator_mode": {
-    "enable_test_endpoints": false
+  "single_use_store": {
+    "backend": "disk"
   },
   "integration": {
     "variable_pattern": "\\$\\{([A-Za-z0-9_]+)(?::([^}]*))?\\}",
@@ -150,9 +150,7 @@
     ]
   },
   "sts": {
-    "replay_protection": {
-      "backend": "in_process"
-    },
+    "id_jag_max_lifetime_secs": 900,
     "token_endpoint_throttle": {
       "enabled": true,
       "failed_attempts_only": true,

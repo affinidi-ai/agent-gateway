@@ -65,7 +65,41 @@ impl FileSystemConnectionPointStore {
     /// Clean up orphaned connection point key directories — a `{id}/` folder with no
     /// `{id}.json` or `{id}.json.enc` config sibling at the base level. These are leftover
     /// DID secret folders from failed or incomplete connection attempts.
+    ///
+    /// A permanent connection point an acceptance or a paused pairing minted ahead of
+    /// the pairing has keys but no record of its own until the pairing completes; its
+    /// directory is kept while a stored connection point still names it, as its
+    /// `reserved_permanent` or as the `secure_cp_id` an acceptance keeps in its
+    /// `oob_message`.
     pub async fn cleanup_orphaned_directories(&self) -> Result<usize> {
+        // Keys are removed only after every stored record was read: an unreadable one may
+        // name the directory as its reservation.
+        let reserved: std::collections::HashSet<String> = self
+            .list_all_checked()
+            .await?
+            .into_iter()
+            .flat_map(|point| {
+                let acceptance = point
+                    .oob_message
+                    .get("secure_cp_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                point
+                    .reserved_permanent
+                    .map(|reserved| reserved.cp_id)
+                    .into_iter()
+                    .chain(acceptance)
+            })
+            .collect();
+        self.remove_orphaned_directories(&reserved)
+            .await
+    }
+
+    /// Removes the key directories with no config sibling that no name in `reserved` keeps.
+    async fn remove_orphaned_directories(
+        &self,
+        reserved: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
         use tracing::{info, warn};
 
         let mut cleaned = 0;
@@ -101,7 +135,7 @@ impl FileSystemConnectionPointStore {
                     .base_path
                     .join(format!("{}.json.enc", dir_name_str));
 
-                if !config_json.exists() && !config_json_enc.exists() {
+                if !config_json.exists() && !config_json_enc.exists() && !reserved.contains(dir_name_str.as_ref()) {
                     info!("Cleaning up orphaned connection point directory: {:?}", dir_name);
 
                     match tokio::fs::remove_dir_all(&path).await {
@@ -292,6 +326,50 @@ impl ConnectionPointStore for FileSystemConnectionPointStore {
         self.storage
             .delete(id)
             .await?;
+        // A reservation never paired leaves keys with no record of their own: remove them,
+        // and report its DID failed unless the pairing consumed it. A permanent record that
+        // is stored but cannot be read keeps its keys, as the orphaned-key cleanup does.
+        if let Ok(Some(record)) = &previous
+            && let Some(reserved) = &record.reserved_permanent
+            && match self
+                .storage
+                .get_checked(&reserved.cp_id)
+                .await
+            {
+                Ok(permanent) => permanent.is_none(),
+                Err(error) => {
+                    tracing::warn!(
+                        connection_point_id = %reserved.cp_id,
+                        %error,
+                        "Keeping the keys of a reserved permanent DID whose record cannot be read"
+                    );
+                    false
+                }
+            }
+        {
+            match tokio::fs::remove_dir_all(
+                self.base_path
+                    .join(&reserved.cp_id),
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(
+                    connection_point_id = %reserved.cp_id,
+                    %e,
+                    "Could not remove the keys of a reservation that was never paired"
+                ),
+            }
+            if !reserved.consumed
+                && let Some(hook) = self.event_hook.get()
+            {
+                hook.emit(
+                    crate::event_hook::EventKind::CreationFailed,
+                    crate::event_hook::ConnectionPointPayload::reserved(record, reserved),
+                );
+            }
+        }
         if let Some(hook) = self.event_hook.get() {
             match &previous {
                 Ok(Some(record)) if record.is_announced() => hook.emit(
@@ -309,6 +387,66 @@ impl ConnectionPointStore for FileSystemConnectionPointStore {
         self.revoke_change(previous, None)
             .await;
         Ok(())
+    }
+
+    async fn create_reserved(
+        &self,
+        connection_point: &GatewayConnectionPoint,
+        reserving_id: &str,
+    ) -> Result<()> {
+        // `delete` holds this lock while it checks for the permanent record and removes
+        // the reservation's keys, so the two cannot interleave.
+        let _reserving = self
+            .lock_id(reserving_id)
+            .await;
+        if self
+            .storage
+            .get(reserving_id)
+            .await?
+            .is_none()
+        {
+            anyhow::bail!("connection point {reserving_id} that reserved this permanent DID was deleted");
+        }
+        self.create(connection_point)
+            .await
+    }
+
+    async fn list_all_checked(&self) -> Result<Vec<GatewayConnectionPoint>> {
+        let points = self.list_all().await?;
+        let listed: std::collections::HashSet<&str> = points
+            .iter()
+            .map(|point| point.id.as_str())
+            .collect();
+        // A record file the cache left out is either unreadable, which is an error
+        // here, or was deleted or added since the list was read.
+        let mut dir = tokio::fs::read_dir(&self.base_path).await?;
+        while let Some(entry) = dir.next_entry().await? {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(id) = name
+                .strip_suffix(".json.enc")
+                .or_else(|| name.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            if !listed.contains(id) {
+                self.storage
+                    .get_checked(id)
+                    .await?;
+            }
+        }
+        Ok(points)
+    }
+
+    async fn list_by_gateway_checked(
+        &self,
+        gateway_id: &str,
+    ) -> Result<Vec<GatewayConnectionPoint>> {
+        let mut points = self
+            .list_all_checked()
+            .await?;
+        points.retain(|point| point.gateway_id == gateway_id);
+        Ok(points)
     }
 }
 
@@ -437,8 +575,10 @@ mod tests {
             .await
             .unwrap();
 
+        // The configs above are placeholders the store cannot read, so the full cleanup
+        // would refuse to run; this checks which directories count as orphans.
         let cleaned = store
-            .cleanup_orphaned_directories()
+            .remove_orphaned_directories(&std::collections::HashSet::new())
             .await
             .unwrap();
 
@@ -446,6 +586,56 @@ mod tests {
         assert!(live_keys.exists(), "key dir with an encrypted config must be kept");
         assert!(plain_keys.exists(), "key dir with a plaintext config must be kept");
         assert!(!orphan_keys.exists(), "key dir with no config sibling must be removed");
+    }
+
+    #[tokio::test]
+    async fn cleanup_after_a_restart_keeps_the_keys_a_paused_pairing_reserved() {
+        let dir = TempDir::new().unwrap();
+        let store = FileSystemConnectionPointStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut paused = sample_cp();
+        paused.awaiting_mediator_access = true;
+        paused.reserved_permanent = Some(super::super::types::ReservedPermanent {
+            cp_id: "reserved-cp".to_string(),
+            did: "did:peer:2.reserved".to_string(),
+            mediator_id: "med-1".to_string(),
+            mediator_did: "did:example:mediator".to_string(),
+            consumed: false,
+        });
+        store
+            .create(&paused)
+            .await
+            .unwrap();
+        let reserved_keys = dir.path().join("reserved-cp");
+        tokio::fs::create_dir_all(&reserved_keys)
+            .await
+            .unwrap();
+        tokio::fs::write(reserved_keys.join("key_0.json"), b"{}")
+            .await
+            .unwrap();
+        let orphan_keys = dir.path().join("orphan-cp");
+        tokio::fs::create_dir_all(&orphan_keys)
+            .await
+            .unwrap();
+        drop(store);
+
+        let restarted = FileSystemConnectionPointStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let cleaned = restarted
+            .cleanup_orphaned_directories()
+            .await
+            .unwrap();
+
+        assert_eq!(cleaned, 1, "only the true orphan should be removed");
+        assert!(
+            reserved_keys
+                .join("key_0.json")
+                .exists(),
+            "the reserved permanent keys must survive a restart"
+        );
+        assert!(!orphan_keys.exists());
     }
 
     #[tokio::test]
@@ -831,6 +1021,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_after_a_restart_keeps_the_permanent_keys_of_an_unpaused_acceptance() {
+        let dir = TempDir::new().unwrap();
+        let store = FileSystemConnectionPointStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut temporary = sample_cp();
+        temporary.oob_message = serde_json::json!({ "secure_cp_id": "acceptance-permanent" });
+        store
+            .create(&temporary)
+            .await
+            .unwrap();
+        let permanent_keys = dir
+            .path()
+            .join("acceptance-permanent");
+        tokio::fs::create_dir_all(&permanent_keys)
+            .await
+            .unwrap();
+        tokio::fs::write(permanent_keys.join("key_0.json"), b"{}")
+            .await
+            .unwrap();
+        drop(store);
+
+        let restarted = FileSystemConnectionPointStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let cleaned = restarted
+            .cleanup_orphaned_directories()
+            .await
+            .unwrap();
+
+        assert_eq!(cleaned, 0);
+        assert!(
+            permanent_keys
+                .join("key_0.json")
+                .exists(),
+            "the permanent keys a pending acceptance named must survive a restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_paused_record_reports_creation_failed_for_the_dids_it_reserved() {
+        let (url, captured) = crate::event_hook::tests_support::serve(204, "").await;
+        let dir = TempDir::new().unwrap();
+        let store = FileSystemConnectionPointStore::new(dir.path().join("cps"))
+            .await
+            .unwrap();
+        store.set_event_hook(hook_for(url));
+        let mut paused = sample_cp();
+        paused.awaiting_mediator_access = true;
+        paused.reserved_permanent = Some(super::super::types::ReservedPermanent {
+            cp_id: "reserved-cp".to_string(),
+            did: "did:peer:2.reserved".to_string(),
+            mediator_id: "med-1".to_string(),
+            mediator_did: "did:example:mediator".to_string(),
+            consumed: false,
+        });
+        store
+            .create(&paused)
+            .await
+            .unwrap();
+        store
+            .delete(&paused.id)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let failed: Vec<serde_json::Value> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| serde_json::from_str::<serde_json::Value>(&event.body).unwrap())
+            .filter(|event| event["event"] == "connection_point.creation_failed")
+            .collect();
+        assert_eq!(failed.len(), 1, "one creation_failed for the reserved DID");
+        assert_eq!(failed[0]["connection_point"]["did"], "did:peer:2.reserved");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_record_whose_reservation_was_consumed_reports_nothing_for_it() {
+        let (url, captured) = crate::event_hook::tests_support::serve(204, "").await;
+        let dir = TempDir::new().unwrap();
+        let store = FileSystemConnectionPointStore::new(dir.path().join("cps"))
+            .await
+            .unwrap();
+        store.set_event_hook(hook_for(url));
+        let mut used = sample_cp();
+        used.reserved_permanent = Some(super::super::types::ReservedPermanent {
+            cp_id: "paired-then-deleted".to_string(),
+            did: "did:peer:2.reserved".to_string(),
+            mediator_id: "med-1".to_string(),
+            mediator_did: "did:example:mediator".to_string(),
+            consumed: false,
+        });
+        store
+            .create(&used)
+            .await
+            .unwrap();
+        crate::gateways::mediator_access::mark_reservation_consumed(&store, &used.id).await;
+        assert!(
+            store
+                .get(&used.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .reserved_permanent
+                .unwrap()
+                .consumed
+        );
+
+        store
+            .delete(&used.id)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let failed = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event
+                    .body
+                    .contains("connection_point.creation_failed")
+            })
+            .count();
+        assert_eq!(failed, 0, "a consumed reservation is owned by its paired record");
+    }
+
+    #[tokio::test]
+    async fn deleting_an_unpaired_paused_record_removes_its_reserved_keys() {
+        let dir = TempDir::new().unwrap();
+        let store = FileSystemConnectionPointStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut paused = sample_cp();
+        paused.awaiting_mediator_access = true;
+        paused.reserved_permanent = Some(super::super::types::ReservedPermanent {
+            cp_id: "never-paired".to_string(),
+            did: "did:peer:2.reserved".to_string(),
+            mediator_id: "med-1".to_string(),
+            mediator_did: "did:example:mediator".to_string(),
+            consumed: false,
+        });
+        store
+            .create(&paused)
+            .await
+            .unwrap();
+        let keys = dir
+            .path()
+            .join("never-paired");
+        tokio::fs::create_dir_all(&keys)
+            .await
+            .unwrap();
+        tokio::fs::write(keys.join("key_0.json"), b"{}")
+            .await
+            .unwrap();
+
+        store
+            .delete(&paused.id)
+            .await
+            .unwrap();
+
+        assert!(!keys.exists(), "the reserved keys go with the reservation");
+    }
+
+    #[tokio::test]
     async fn deleting_a_record_the_management_api_did_not_create_reports_nothing() {
         let (url, captured) = crate::event_hook::tests_support::serve(204, "").await;
         let dir = TempDir::new().unwrap();
@@ -908,6 +1264,157 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reserved_point_is_stored_only_while_its_reserving_point_is() {
+        let dir = TempDir::new().unwrap();
+        let store = FileSystemConnectionPointStore::new(dir.path().join("cps"))
+            .await
+            .unwrap();
+        let mut paused = sample_cp();
+        paused.awaiting_mediator_access = true;
+        paused.reserved_permanent = Some(super::super::types::ReservedPermanent {
+            cp_id: "reserved-cp".to_string(),
+            did: "did:peer:2.reserved".to_string(),
+            mediator_id: "med-1".to_string(),
+            mediator_did: "did:example:mediator".to_string(),
+            consumed: false,
+        });
+        store
+            .create(&paused)
+            .await
+            .unwrap();
+        let mut permanent = sample_cp();
+        permanent.id = "reserved-cp".to_string();
+
+        store
+            .create_reserved(&permanent, &paused.id)
+            .await
+            .expect("stored while the reserving point is");
+        store
+            .delete(&permanent.id)
+            .await
+            .unwrap();
+        store
+            .delete(&paused.id)
+            .await
+            .unwrap();
+
+        store
+            .create_reserved(&permanent, &paused.id)
+            .await
+            .expect_err("its reserving point, and with it the keys, are gone");
+        assert!(
+            store
+                .get(&permanent.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_are_kept_while_a_stored_connection_point_cannot_be_read() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("cps");
+        let store = FileSystemConnectionPointStore::new(base.clone())
+            .await
+            .unwrap();
+        store
+            .create(&sample_cp())
+            .await
+            .unwrap();
+        // An unreadable record may name these keys as its reservation.
+        tokio::fs::write(base.join("unreadable.json"), b"not json")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(base.join("reserved-cp"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .list_all()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .list_all_checked()
+            .await
+            .expect_err("a stored record could not be read");
+        store
+            .list_by_gateway_checked("gw-1")
+            .await
+            .expect_err("the unreadable record may be this gateway's");
+        store
+            .cleanup_orphaned_directories()
+            .await
+            .expect_err("no cleanup without a complete read");
+        assert!(
+            base.join("reserved-cp")
+                .is_dir()
+        );
+
+        tokio::fs::remove_file(base.join("unreadable.json"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .list_all_checked()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .cleanup_orphaned_directories()
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_reserving_point_keeps_the_keys_of_an_unreadable_permanent_record() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("cps");
+        let store = FileSystemConnectionPointStore::new(base.clone())
+            .await
+            .unwrap();
+        let mut reserving = sample_cp();
+        reserving.reserved_permanent = Some(super::super::types::ReservedPermanent {
+            cp_id: "paired-cp".to_string(),
+            did: "did:peer:2.reserved".to_string(),
+            mediator_id: "med-1".to_string(),
+            mediator_did: "did:example:mediator".to_string(),
+            consumed: true,
+        });
+        store
+            .create(&reserving)
+            .await
+            .unwrap();
+        // The paired permanent record is stored, but cannot be read right now.
+        tokio::fs::write(base.join("paired-cp.json"), b"not json")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(base.join("paired-cp"))
+            .await
+            .unwrap();
+
+        store
+            .delete(&reserving.id)
+            .await
+            .unwrap();
+
+        assert!(
+            base.join("paired-cp")
+                .is_dir(),
+            "the paired DID's keys must survive until its record can be read"
         );
     }
 }

@@ -205,7 +205,7 @@ describe('Delegated Access tab', () => {
 
     await waitFor(() => expect(rowIds()).toEqual(['t1']), WAIT);
     expect(screen.queryByTestId('delegated-access-read-error')).toBeNull();
-    expect(screen.getByLabelText('1 active delegation')).toBeInTheDocument();
+    expect(rowIds().length).toBe(1);
     expect(reads()).toHaveLength(2);
   });
 
@@ -235,7 +235,7 @@ describe('Delegated Access tab', () => {
     expect(screen.queryByTestId('delegated-access-history-button')).not.toBeInTheDocument();
     expect(screen.getByText('Active access only.')).toBeInTheDocument();
     expect(screen.queryByText(/in the history/)).toBeNull();
-    expect(screen.getByLabelText('2 active delegations')).toBeInTheDocument();
+    expect(rowIds().length).toBe(2);
   });
 
   it('points at the history beside its button', async () => {

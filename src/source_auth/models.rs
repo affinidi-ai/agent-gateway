@@ -740,7 +740,8 @@ pub enum ManagedIdentityConfig {
     #[serde(alias = "from_payload")]
     PayloadExtraction(PayloadExtractionConfig),
 
-    /// Derive the agent identity from a stored API key.
+    /// Derive the agent identity from a stored API key, or, on the inbound slot
+    /// and on a Transit Point without `api_key_id`, from the key the caller presented.
     FromApiKey {
         /// Stored key identifier: a secret id or an `atgk_` provider key id.
         /// The stored-credential resolver refuses `FromApiKey` without one.
@@ -748,10 +749,14 @@ pub enum ManagedIdentityConfig {
         api_key_id: Option<String>,
     },
 
-    /// Take the upstream agent identity from the TLS client certificate.
+    /// Derive the agent identity from a stored client certificate, or, on a
+    /// Transit Point without `certificate_id`, from the client certificate its
+    /// caller presented.
     FromMtls {
-        /// Stored certificate identifier.
-        certificate_id: String,
+        /// Stored certificate identifier. The stored-credential resolver
+        /// refuses `FromMtls` without one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        certificate_id: Option<String>,
     },
 
     /// Always present a fixed DID as the upstream agent identity (test
@@ -796,6 +801,60 @@ impl ManagedIdentityConfig {
             Self::PayloadExtraction(_) | Self::FromApiKey { .. } | Self::FromMtls { .. } | Self::Static { .. } => {
                 crate::surface_context::IdentityVerification::Unverified
             }
+        }
+    }
+
+    /// The caller credential a Transit Point with this identity of its own
+    /// takes the DID from: the API key of a `from_api_key` that names no stored
+    /// key, the JWT of `from_jwt_claim`, and the client certificate of a
+    /// `from_mtls` that names no stored certificate. `None` for a mode that
+    /// reads the payload, a stored credential or a static DID.
+    pub fn caller_credential(&self) -> Option<CallerCredential> {
+        let unnamed = |id: &Option<String>| {
+            id.as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+        };
+        match self {
+            Self::FromApiKey { api_key_id } if unnamed(api_key_id) => Some(CallerCredential::ApiKey),
+            Self::FromJwtClaim { .. } => Some(CallerCredential::JwtBearer),
+            Self::FromMtls { certificate_id } if unnamed(certificate_id) => Some(CallerCredential::Mtls),
+            _ => None,
+        }
+    }
+}
+
+/// The credential a caller presented that a request-bound identity takes its
+/// DID from. See [`ManagedIdentityConfig::caller_credential`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallerCredential {
+    /// An API key, verified by `api_key` or `api_key_provider`.
+    ApiKey,
+    /// A JWT, verified by `jwt_bearer`.
+    JwtBearer,
+    /// A client certificate, verified by `mtls`.
+    Mtls,
+}
+
+impl CallerCredential {
+    /// Whether `source_auth` verifies this credential.
+    pub fn verified_by(
+        self,
+        source_auth: Option<&SourceAuthConfig>,
+    ) -> bool {
+        matches!(
+            (self, source_auth),
+            (Self::ApiKey, Some(SourceAuthConfig::ApiKey(_) | SourceAuthConfig::ApiKeyProvider(_)))
+                | (Self::JwtBearer, Some(SourceAuthConfig::JwtBearer(_)))
+                | (Self::Mtls, Some(SourceAuthConfig::Mtls(_)))
+        )
+    }
+
+    /// The `managed_identity` mode that takes this credential.
+    pub fn identity_mode(self) -> &'static str {
+        match self {
+            Self::ApiKey => "from_api_key",
+            Self::JwtBearer => "from_jwt_claim",
+            Self::Mtls => "from_mtls",
         }
     }
 }
@@ -888,7 +947,7 @@ mod tests {
                 did: "did:web:agent.example".to_string(),
             },
             ManagedIdentityConfig::FromMtls {
-                certificate_id: "cert-1".to_string(),
+                certificate_id: Some("cert-1".to_string()),
             },
             ManagedIdentityConfig::FromApiKey {
                 api_key_id: Some("key-1".to_string()),
@@ -1535,13 +1594,68 @@ mod tests {
 
     #[test]
     fn managed_identity_from_mtls_roundtrip() {
-        let config = ManagedIdentityConfig::FromMtls {
-            certificate_id: "cert-1".to_string(),
-        };
-        let json = serde_json::to_string(&config).unwrap();
-        assert!(json.contains("\"type\":\"from_mtls\""));
-        let back: ManagedIdentityConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, config);
+        let wire = serde_json::json!({ "type": "from_mtls", "certificate_id": "cert-1" });
+        let config: ManagedIdentityConfig = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            config,
+            ManagedIdentityConfig::FromMtls {
+                certificate_id: Some("cert-1".to_string()),
+            }
+        );
+        assert_eq!(config.caller_credential(), None);
+        assert_eq!(serde_json::to_value(&config).unwrap(), wire);
+    }
+
+    #[test]
+    fn managed_identity_from_mtls_without_certificate_id_omits_it_on_the_wire() {
+        let wire = serde_json::json!({ "type": "from_mtls" });
+        let config: ManagedIdentityConfig = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(config, ManagedIdentityConfig::FromMtls { certificate_id: None });
+        assert_eq!(config.caller_credential(), Some(CallerCredential::Mtls));
+        assert_eq!(serde_json::to_value(&config).unwrap(), wire);
+    }
+
+    #[test]
+    fn caller_credential_names_the_credential_a_request_bound_identity_reads() {
+        let identity = |wire: serde_json::Value| serde_json::from_value::<ManagedIdentityConfig>(wire).unwrap();
+        for (wire, expected) in [
+            (serde_json::json!({ "type": "from_api_key" }), Some(CallerCredential::ApiKey)),
+            (serde_json::json!({ "type": "from_api_key", "api_key_id": " " }), Some(CallerCredential::ApiKey)),
+            (serde_json::json!({ "type": "from_api_key", "api_key_id": "key-1" }), None),
+            (serde_json::json!({ "type": "from_jwt_claim" }), Some(CallerCredential::JwtBearer)),
+            (serde_json::json!({ "type": "from_mtls" }), Some(CallerCredential::Mtls)),
+            (serde_json::json!({ "type": "from_mtls", "certificate_id": "" }), Some(CallerCredential::Mtls)),
+            (serde_json::json!({ "type": "from_mtls", "certificate_id": "cert-1" }), None),
+            (serde_json::json!({ "type": "static", "did": "did:example:42" }), None),
+        ] {
+            assert_eq!(identity(wire.clone()).caller_credential(), expected, "{wire}");
+        }
+    }
+
+    #[test]
+    fn caller_credential_is_verified_only_by_its_own_method() {
+        let source_auth = |wire: serde_json::Value| serde_json::from_value::<SourceAuthConfig>(wire).unwrap();
+        let api_key = source_auth(serde_json::json!({
+            "type": "api_key", "secret_id": "keys",
+            "extraction": { "source": "http_header", "field": "X-API-Key" }
+        }));
+        let mtls = source_auth(serde_json::json!({
+            "type": "mtls",
+            "trust": { "type": "ca", "ca_certificate_ids": ["agents-ca"] },
+            "identity_binding": { "type": "subject_cn" }
+        }));
+
+        assert!(CallerCredential::ApiKey.verified_by(Some(&api_key)));
+        assert!(!CallerCredential::ApiKey.verified_by(Some(&mtls)));
+        assert!(CallerCredential::Mtls.verified_by(Some(&mtls)));
+        assert!(!CallerCredential::Mtls.verified_by(Some(&api_key)));
+        assert!(!CallerCredential::JwtBearer.verified_by(Some(&api_key)));
+        for credential in [CallerCredential::ApiKey, CallerCredential::JwtBearer, CallerCredential::Mtls] {
+            assert!(!credential.verified_by(None), "{credential:?}");
+        }
+        assert_eq!(CallerCredential::ApiKey.identity_mode(), "from_api_key");
+        assert_eq!(CallerCredential::JwtBearer.identity_mode(), "from_jwt_claim");
+        assert_eq!(CallerCredential::Mtls.identity_mode(), "from_mtls");
     }
 
     #[test]

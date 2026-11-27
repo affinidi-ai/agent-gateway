@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useLimitGuard } from '../../hooks/useLimitGuard';
 import { AppButton } from '../../components/shared/AppButton';
-import { Badge } from '../../components/shared/Badge';
 import SearchInput from '../../components/shared/SearchInput';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { DOCS_URL } from '../../config/docs';
@@ -190,12 +189,6 @@ const PolicyListTab: React.FC<PolicyListTabProps> = ({
       <div className="card-header py-3 d-flex justify-content-between align-items-center">
         <h6 className="m-0 font-weight-bold text-primary">
           <i className={`fas ${icon}`}></i> {label} Policies
-          <Badge
-            value={filtered.length}
-            tone="primary"
-            className="ms-2"
-            ariaLabel={`${filtered.length} ${label.toLowerCase()} policies`}
-          />
         </h6>
         <div className="d-flex align-items-center gap-2">
           {!externalProvided && (

@@ -564,7 +564,7 @@ impl McpResourceServerConfig {
         reach: Option<crate::sts::token_origin::TokenReach<'_>>,
     ) -> Result<crate::source_auth::AuthenticatedIdentity, ResourceTokenError> {
         let jwks = issuer
-            .signing_public_jwks()
+            .token_signing_jwks()
             .await
             .map_err(|_| ResourceTokenError::Unavailable)?;
         self.verify_token(headers, profile, &jwks, keys, reach)
@@ -1206,5 +1206,92 @@ mod tests {
                 .iter()
                 .all(|declaration| !declaration.served)
         );
+    }
+
+    /// The installed token-signing authority, standing in for a trust agent:
+    /// its key is not the gateway's local one.
+    struct AgentAuthority {
+        jwks: Value,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::identity::authority::CredentialAuthority for AgentAuthority {
+        async fn issuer_did(&self) -> anyhow::Result<String> {
+            Ok("did:key:zAgentContext".into())
+        }
+
+        async fn issuer_jwks(&self) -> anyhow::Result<Value> {
+            Ok(self.jwks.clone())
+        }
+
+        async fn sign_token(
+            &self,
+            _claims: &Value,
+        ) -> anyhow::Result<String> {
+            unimplemented!("tokens are signed by the test")
+        }
+
+        async fn sign_token_typ(
+            &self,
+            _claims: &Value,
+            _typ: &str,
+        ) -> anyhow::Result<String> {
+            unimplemented!("tokens are signed by the test")
+        }
+    }
+
+    /// An MCP access token the gateway signed through a trust agent carries
+    /// that agent's key, so the gateway's own Resource Server verifies it
+    /// against the signing authority's JWKS rather than the local key alone.
+    #[tokio::test]
+    async fn a_resource_token_signed_through_a_trust_agent_is_accepted_by_the_gateways_own_resource_server() {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+
+        let agent_key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let encoding = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let config = McpResourceServerConfig {
+            resource: "https://gateway.example/mcp/".into(),
+            scopes: vec!["read".into()],
+        };
+        let profile = McpIssuerProfile {
+            issuer: "https://gateway.example/oauth2/mcp".into(),
+        };
+        let claims = json!({"iss": profile.issuer, "sub": "user", "aud": config.resource, "exp": chrono::Utc::now().timestamp() + 60, "scope": "read"});
+        let header =
+            encoding.encode(serde_json::to_vec(&json!({"alg": "EdDSA", "typ": "at+jwt", "kid": "agent-key"})).unwrap());
+        let content = format!("{header}.{}", encoding.encode(serde_json::to_vec(&claims).unwrap()));
+        let token = format!(
+            "{content}.{}",
+            encoding.encode(
+                agent_key
+                    .sign(content.as_bytes())
+                    .to_bytes()
+            )
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}")).unwrap());
+        let keys = std::sync::Arc::new(crate::jwt_bearer::JwksClient::new());
+        let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer().await;
+
+        assert_eq!(
+            config
+                .authenticate(&headers, &profile, &issuer, keys.clone(), None)
+                .await
+                .err(),
+            Some(ResourceTokenError::Invalid),
+            "the local key did not sign it"
+        );
+
+        issuer
+            .set_signing_authority(std::sync::Arc::new(AgentAuthority {
+                jwks: json!({"keys": [{"kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "use": "sig", "kid": "agent-key", "x": encoding.encode(agent_key.verifying_key().as_bytes())}]}),
+            }))
+            .await;
+        let identity = config
+            .authenticate(&headers, &profile, &issuer, keys, None)
+            .await
+            .expect("a token from the signing authority is the gateway's own");
+        assert_eq!(identity.jwt_claims().unwrap()["sub"], "user");
     }
 }
