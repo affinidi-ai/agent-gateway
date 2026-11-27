@@ -296,6 +296,10 @@ harness = false
 default = ["didwebvh"]
 didwebvh = ["didwebvh-rs"]
 
+[lints.rust]
+# cargo llvm-cov builds the Coverage job with `--cfg coverage`.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
+
 [profile.dev]
 # Skip dsymutil pass on macOS - major time saver
 split-debuginfo = "unpacked"
