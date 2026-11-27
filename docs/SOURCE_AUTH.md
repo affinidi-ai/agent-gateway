@@ -310,7 +310,9 @@ keys lack fetches the keys again, at most once a minute for each strategy, count
 such fetch: a rotated key is found by the first token that names it, but tokens with made-up
 `kid` values cannot make every request fetch from the key server, even when they arrive together
 or the fetch fails. A token naming a key published within that minute is refused as an invalid
-credential until the minute has passed. A fetch that fails is not tried again for a minute:
+credential until the minute has passed. One fetch runs at a time for each strategy, so tokens
+that arrive together while its keys are missing or expired share it. A fetch that fails is not
+tried again for a minute:
 meanwhile every token checked against that strategy gets the same failure at once, except that
 keys that expired and could not be fetched again are still used for that minute, once, so one
 failed fetch when they expire does not refuse every caller. These rules hold for every check

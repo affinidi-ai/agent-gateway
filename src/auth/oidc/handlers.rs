@@ -37,10 +37,14 @@ use crate::delegation_vault::oauth::{generate_pkce_challenge, generate_pkce_veri
 use crate::integrations::{LoginFailure, LoginMethod};
 use crate::jwt_bearer::JwksClient;
 use crate::metrics::MetricsStore;
+use crate::observability::loggable;
 use crate::source_auth::client_ip::ClientIp;
 
 /// The largest token endpoint response accepted.
 const MAX_TOKEN_RESPONSE_BYTES: usize = 256 * 1024;
+
+/// What a browser says a request will be used for (Fetch Metadata).
+const SEC_FETCH_DEST: &str = "sec-fetch-dest";
 
 /// Everything OIDC sign-in needs.
 pub struct OidcState {
@@ -108,6 +112,7 @@ impl OidcState {
 /// Why a sign-in was refused. The reason code goes to the log; the browser gets a generic page.
 #[derive(Debug)]
 pub(super) enum Refusal {
+    NotNavigation,
     IssuerMismatch,
     StateUnknown,
     BindingMismatch,
@@ -127,6 +132,7 @@ pub(super) enum Refusal {
 impl Refusal {
     fn code(&self) -> &'static str {
         match self {
+            Self::NotNavigation => "not_navigation",
             Self::IssuerMismatch => "issuer_mismatch",
             Self::StateUnknown => "state_unknown",
             Self::BindingMismatch => "binding_mismatch",
@@ -145,15 +151,18 @@ impl Refusal {
     }
 
     /// `401` for a code the provider refused (`invalid_grant`): the code is the one thing a
-    /// caller sends that could be a guess. `400` for a sign-in link naming another provider, an
-    /// unknown or unbound `state` or a callback without a code; `502` for an ID token that did not
+    /// caller sends that could be a guess. `400` for a sign-in start that is not a page the browser
+    /// opens, a sign-in link naming another provider, an unknown or unbound `state` or a callback
+    /// without a code; `502` for an ID token that did not
     /// verify, which comes from the provider and never from the caller; `403` for an account the
     /// settings refuse or whose every username another user holds.
     fn status(&self) -> StatusCode {
         match self {
-            Self::IssuerMismatch | Self::StateUnknown | Self::BindingMismatch | Self::CodeMissing => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::NotNavigation
+            | Self::IssuerMismatch
+            | Self::StateUnknown
+            | Self::BindingMismatch
+            | Self::CodeMissing => StatusCode::BAD_REQUEST,
             Self::ExchangeFailed => StatusCode::UNAUTHORIZED,
             Self::IdTokenInvalid => StatusCode::BAD_GATEWAY,
             Self::AccessDenied
@@ -181,6 +190,7 @@ impl Refusal {
 
     fn message(&self) -> String {
         match self {
+            Self::NotNavigation => "Open the sign-in page to sign in.".to_string(),
             Self::IssuerMismatch => "This sign-in link is not for this dashboard.".to_string(),
             Self::StateUnknown | Self::BindingMismatch => {
                 "This sign-in has expired or was started in another browser. Start again from the sign-in page."
@@ -204,8 +214,8 @@ impl IntoResponse for Refusal {
         let mut response = sign_in_error_page(self.status(), self.title(), &self.message());
         let headers = response.headers_mut();
         // On a mismatch the cookie belongs to a newer sign-in in this browser, which must still
-        // be able to finish.
-        if !matches!(self, Self::BindingMismatch)
+        // be able to finish, and a start that is not a navigation may come from another site.
+        if !matches!(self, Self::BindingMismatch | Self::NotNavigation)
             && let Ok(clear) = HeaderValue::from_str(&clear_oidc_state_cookie())
         {
             headers.append(SET_COOKIE, clear);
@@ -231,13 +241,24 @@ pub struct OidcLoginQuery {
 }
 
 /// Start an OIDC sign-in. `next` is kept as the return target only when the return-target
-/// allowlist admits it; otherwise the browser lands on `/`.
+/// allowlist admits it; otherwise the browser lands on `/`. A request the browser says is not a
+/// page it opens (`Sec-Fetch-Dest` other than `document`), such as an image or frame another site
+/// embeds, is refused before it counts against the sign-in budget.
 /// GET /oidc/login
 pub async fn oidc_login(
     State(oidc): State<Arc<OidcState>>,
     client_ip: Option<Extension<ClientIp>>,
+    headers: HeaderMap,
     Query(query): Query<OidcLoginQuery>,
 ) -> Response {
+    if let Some(destination) = headers
+        .get(SEC_FETCH_DEST)
+        .filter(|destination| destination.as_bytes() != b"document")
+    {
+        let destination = String::from_utf8_lossy(destination.as_bytes());
+        let detail = format!("Sec-Fetch-Dest is {}", loggable::untrusted(&destination));
+        return refused(Refusal::NotNavigation, None, detail).into_response();
+    }
     if let Some(throttled) = throttled(&oidc, client_ip.map(|Extension(ClientIp(ip))| ip)) {
         return throttled;
     }

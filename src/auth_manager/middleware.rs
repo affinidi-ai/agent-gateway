@@ -248,14 +248,10 @@ pub async fn require_session_auth(
                     .insert(storage);
             }
             let mut response = next.run(request).await;
-            if let Ok(value) = session_cookie::build_session_cookie(
-                &session_token,
-                state
-                    .session_manager
-                    .timeout_seconds(),
-            )
-            .parse()
-            {
+            let max_age = state
+                .session_manager
+                .cookie_max_age_seconds(&session, chrono::Utc::now());
+            if let Ok(value) = session_cookie::build_session_cookie(&session_token, max_age).parse() {
                 response
                     .headers_mut()
                     .append(SET_COOKIE, value);
@@ -1229,6 +1225,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 401, "a cookie without the __Host- prefix is not a session");
+    }
+
+    /// The `Max-Age` of the session cookie the gate sends back on a request carrying `token`.
+    async fn refreshed_cookie_max_age(
+        app: &Router,
+        token: &str,
+    ) -> i64 {
+        let req = axum::http::Request::builder()
+            .uri("/v1/settings")
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        resp.headers()
+            .get(SET_COOKIE)
+            .expect("the gate re-sends the session cookie")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .find_map(|attribute| {
+                attribute
+                    .trim()
+                    .strip_prefix("Max-Age=")
+            })
+            .expect("the session cookie carries a Max-Age")
+            .parse()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn refreshed_session_cookie_never_outlives_the_session_lifetime() {
+        let dir = tempdir().unwrap();
+        let sessions = Arc::new(
+            SessionManager::with_storage(20, 60, dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let now = chrono::Utc::now();
+        sessions
+            .store_for_test(&crate::auth::session::Session {
+                token_hash: crate::storage::filesystem::token_storage_id("near-the-end"),
+                username: "alice".to_string(),
+                user_id: "user-1".to_string(),
+                created_at: now - chrono::Duration::minutes(50),
+                expires_at: now + chrono::Duration::minutes(5),
+                terms_gate: TermsSessionGate::AllowedAtLogin,
+                oidc: None,
+            })
+            .await;
+
+        let max_age = refreshed_cookie_max_age(&test_app(sessions), "near-the-end").await;
+
+        assert!((1..=600).contains(&max_age), "Max-Age {max_age} must end by the lifetime end");
+    }
+
+    #[tokio::test]
+    async fn refreshed_session_cookie_lasts_the_timeout_inside_the_lifetime() {
+        let sessions = Arc::new(SessionManager::new());
+        let token = sessions
+            .create_session("alice".into(), "user-1".into())
+            .await;
+
+        let max_age = refreshed_cookie_max_age(&test_app(sessions), &token).await;
+
+        assert!((1190..=1200).contains(&max_age), "Max-Age {max_age} must be the 20-minute timeout");
     }
 
     // ── Session token via Authorization Bearer header should work ──

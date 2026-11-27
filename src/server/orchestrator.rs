@@ -5210,6 +5210,7 @@ async fn initialize_auth_state(
         storage_path,
         avatars_path,
         session_timeout_minutes,
+        bootstrap_config.session_max_lifetime_minutes,
         sessions_path,
         terms_manager,
         decoy_credentials,
@@ -5245,6 +5246,7 @@ async fn initialize_sso_user_stores(
     let session_manager = Arc::new(
         crate::auth::SessionManager::with_storage(
             bootstrap_config.session_timeout_minutes,
+            bootstrap_config.session_max_lifetime_minutes,
             std::path::PathBuf::from(
                 &bootstrap_config
                     .storage_paths

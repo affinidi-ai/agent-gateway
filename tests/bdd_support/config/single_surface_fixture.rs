@@ -194,6 +194,8 @@ pub struct SurfaceConfigBuilder {
     pub oidc_settings: serde_json::Map<String, serde_json::Value>,
     /// The appliance limit on human users, when the scenario sets one.
     pub human_user_limit: Option<u64>,
+    /// `session_max_lifetime_minutes` in `config.toml`, when the scenario sets one.
+    pub session_max_lifetime_minutes: Option<u64>,
     /// The gateway is expected to exit at startup, so the harness waits for it to exit
     /// instead of waiting for it to serve.
     pub refuses_to_start: bool,
@@ -402,6 +404,7 @@ impl Default for SurfaceConfigBuilder {
             signs_in_with_oidc: None,
             oidc_settings: serde_json::Map::new(),
             human_user_limit: None,
+            session_max_lifetime_minutes: None,
             refuses_to_start: false,
             rbac_permissions: Vec::new(),
             caller_key: None,

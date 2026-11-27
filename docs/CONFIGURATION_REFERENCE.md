@@ -298,7 +298,7 @@ The bootstrap file. Startup only; changes need a restart.
 
 | Section | Controls |
 | --- | --- |
-| top level | `channel_config_source` (`local` or `dynamodb`), AWS region and profile, `secrets_backend`, `backup_encryption_key`, `auth_mode`, session timeout, WebSocket auth and buffer, metrics retention and cache, `server_mode` |
+| top level | `channel_config_source` (`local` or `dynamodb`), AWS region and profile, `secrets_backend`, `backup_encryption_key`, `auth_mode`, dashboard session timeout and lifetime, WebSocket auth and buffer, metrics retention and cache, `server_mode` |
 | `[tenancy.trusted_tenant_header]` | Declares that an authenticated edge writes the tenant header. Enables broad header-derived PAT selectors. |
 | `[credential_policy]` | How strictly credential providers and Target credentials are held to four rules. `token_endpoint_https`, `tenant_credential_isolation`, `target_https` and `target_source_auth` are each `"warn"` (default) or `"enforce"`; any other value fails startup. In `"enforce"`, `target_https` and `target_source_auth` also refuse a new or changed Target authentication that breaks them on save (for `target_source_auth`, also a new `a2a-proxy://` Target whose A2A proxy would send its Direct Line credential for unchecked callers); in `"warn"` such a save succeeds with a warning. `insecure_token_endpoints` lists exact token endpoint URLs that may use http deliberately (default empty), relaxing only the https rule, never the refusal of a token endpoint that resolves to loopback or cloud metadata; an entry that is not a valid http URL without a user name or password fails startup. `token_request_timeout_secs` is how long a token request to a credential provider may take, from 1 to 120 seconds (default 30); `0` or a larger value fails startup. `default_max_consent_age_secs` and `max_consent_age_ceiling_secs` limit how long a person's consent may be used, each from 60 to 31,536,000 seconds and unset by default: the default applies to a credential provider that sets no `max_consent_age_secs`, the ceiling applies to such a provider while no default is set, and no provider's or binding's limit reaches past the ceiling. Both reach the consents already stored: setting either ends the stored consents it limits that are older than it, at the latest at the next hourly pass (the first runs ten minutes after startup), and revokes the grants by binding among them at the vendor; a node logs at `WARN`, when it starts active or becomes active, how many consents the two keys end. A value out of range, or a default above the ceiling, fails startup (see [Consent time limit](CREDENTIAL_DELEGATION.md#consent-time-limit)). Absent section means every rule is `warn` and no consent is limited. The report also names a stored JWT Bearer provider without a subject under a fifth rule, `jwt_subject`, which only warns and has no setting. See [Credential policy](CONFIGURATION_RELOAD.md#credential-policy). |
 | `[encryption]` | Encryption at rest: on or off, key source, KMS settings |
@@ -327,6 +327,8 @@ description that exists today.
 | `cache_refresh_interval_secs` | Above 0, DashMap-backed stores reconcile with disk on that interval, so manual `_storage/` edits are picked up without a reload. Policy definitions and global policies do not participate. |
 | `auth_mode` | `passkey` uses WebAuthn. `saml` requires `saml.json` and a configured identity provider; it reads `saml.json` and fails startup if it cannot be read or any of its settings is refused ([`saml.json`](#samljson)). `oidc` signs human users in at one OpenID provider; it reads `oidc.json` and fails startup if it cannot be read or any of its settings is refused ([`oidc.json`](#oidcjson)). |
 | `secrets_backend` | `filesystem` keeps secrets under `_storage/`. `aws` uses AWS. |
+| `session_timeout_minutes` | How long a dashboard session lasts after its last use, for passkey, SAML and OIDC sign-in alike (default `20`). Each request the session makes pushes its end out again, up to `session_max_lifetime_minutes`, so a larger value than that has no further effect. |
+| `session_max_lifetime_minutes` | The longest a dashboard session lasts after sign-in, however active it stays, for passkey, SAML and OIDC sign-in alike (default `720`, twelve hours). The session cookie's `Max-Age` never runs past it: the sign-in cookie lasts the smaller of the timeout and this lifetime, and a refreshed cookie the time left on the session. Must be 1 to 1440; `0` or a larger value fails startup. Sessions already stored are held to it from their sign-in time, so at the first start those older than it are removed and their users sign in again. |
 | `encryption.enabled` | Writes whole storage files as `.json.enc`. Losing the master key loses the data. |
 | `metrics_retention_minutes` | Parsed but not used. Retention is the value in `_storage/settings/settings.json`, set from the dashboard, which defaults to 360 minutes whatever this field says. |
 | `websocket_require_auth` | Off means an unauthenticated client can open the dashboard event stream. |
@@ -662,10 +664,11 @@ awaiting approval) is refused at the ACS with a `403` page that does not say why
 opens and the record is left as it was; the refusal raises `user.login_failed` with failure
 reason `not_approved`. Deleting a SAML user keeps a disabled record under their SAML user ID,
 as [Deleting an OIDC or SAML user](#deleting-an-oidc-or-saml-user) describes. When the username
-the identity provider asserts is held by another user, the user gets their SAML user ID as
-username instead, and only when that is held too is the sign-in refused with the same page,
-with nothing created or changed. A user whose stored username already is the asserted one signs
-in as before, so users who already share a username keep signing in. To clear such a refusal,
+the identity provider asserts is held by another user, or is a user's id, the user's own
+included, the user gets their SAML user ID as username instead, and only when that is held too
+is the sign-in refused with the same page, with nothing created or changed. A user whose stored
+username already is the asserted one, and not their user id, signs in as before, so users who
+already share a username keep signing in. To clear such a refusal,
 change the asserted attribute at the identity provider, or delete the other user if they are not
 an administrator. Users created by SAML are approved at once and count toward the `users` limit;
 the kept record of a deleted user does not.
@@ -763,7 +766,7 @@ for it after the person has left the organisation.
 
 | Route | Purpose |
 | --- | --- |
-| `GET /oidc/login?next=` | Public. Sends the browser to the provider to sign in. `next` is kept only when it is a return target a sign-in may send the browser to (the dashboard root, the CLI authorize path or the new access token form; see [`CAPABILITIES.md`](CAPABILITIES.md#managing-the-gateway)); otherwise the browser lands on `/` |
+| `GET /oidc/login?next=` | Public. Sends the browser to the provider to sign in. `next` is kept only when it is a return target a sign-in may send the browser to (the dashboard root, the CLI authorize path or the new access token form; see [`CAPABILITIES.md`](CAPABILITIES.md#managing-the-gateway)); otherwise the browser lands on `/`. A request whose `Sec-Fetch-Dest` header is present and not `document`, such as an image or frame another site embeds, gets a readable `400` page (`not_navigation`) before it counts against the sign-in budget, and leaves the binding cookie as it is; a browser that sends no such header is served |
 | `GET`, `POST /oidc/initiate` | Public. The provider's sign-in link (third-party-initiated login): starts a sign-in as `/oidc/login` does |
 | `GET /oidc/callback` | Public. The `redirect_uri`: verifies the sign-in and opens a session |
 | `POST /oidc/backchannel-logout` | Public, carrying a logout token the provider signed. Ends the sessions of a sign-out at the provider. Served unless `logout.backchannel` is `false` |
@@ -778,7 +781,9 @@ for it after the person has left the organisation.
   the others wait, and a failed fetch is not tried again for a minute. Once a document has been
   fetched, a refresh that fails keeps the cached one and is retried after a minute. A token
   endpoint or key set that cannot be reached, or a token endpoint that answers `404` or fails
-  with a `5xx`, has the document fetched again at the next sign-in. The document must name the configured
+  with a `5xx`, has the document fetched again at the next sign-in, and a key set that a
+  back-channel logout cannot fetch has it fetched again at the next sign-in or logout. The
+  document must name the configured
   `issuer` exactly and every endpoint in it, `end_session_endpoint` included, must be `https`; when
   it lists `code_challenge_methods_supported` the list must include `S256`, and when it lists
   `token_endpoint_auth_methods_supported` the list must include `token_endpoint_auth_method`.
@@ -805,15 +810,17 @@ for it after the person has left the organisation.
   one), then `iss` equals the issuer, `aud` includes `client_id` (`azp` must equal it when there
   are several audiences), `exp` has not passed, `nbf`, when present, has been reached, and
   `iat` is not more than 60 seconds ahead (60 seconds of leeway each), `nonce` is this
-  sign-in's, `sub` is 1 to 255 characters, and `sid`, when present, is 1 to 255 characters. The session remembers the provider sign-in it came
-  from: the issuer, `sub`, `sid` and the ID token, which is used only as the hint of a sign-out at
-  the provider and never appears in the log.
+  sign-in's, `sub` is 1 to 255 characters, and `sid`, when present, is 1 to 255 characters. The
+  gateway does not check `acr`, `amr` or `max_age`, so requiring multi-factor sign-in is the
+  provider's job. The session remembers the provider sign-in it came from: the issuer, `sub`,
+  `sid` and the ID token, which is used only as the hint of a sign-out at the provider and never
+  appears in the log.
 - **Users.** A user is identified by the provider account, the issuer and `sub` together,
   never by email or username. The first sign-in creates the user, approved at once and never
-  the primary administrator, within the appliance user limit. The username is the
-  `claims.username` claim, else the email, else `sub` (a claim over 255 characters is skipped);
-  when another user has it, the username is `sub`, and when another user has that too the
-  sign-in is refused with `403` (`username_taken`) and no user is created. Every sign-in sets
+  the primary administrator, within the appliance user limit. The username is the first of the
+  `claims.username` claim, the email and `sub` that no other user has and that is no user's id,
+  the user's own included (a claim over 255 characters is skipped); when every one of them is
+  held, the sign-in is refused with `403` (`username_taken`) and no user is created. Every sign-in sets
   the username, email, first and last name, and role again from the ID token. A user who is not approved is refused even with a valid ID token.
   Deleting an OIDC user keeps a disabled record under their provider account, so their next
   sign-in is refused rather than creating a new user; see
@@ -825,8 +832,9 @@ for it after the person has left the organisation.
   Personal access tokens are not touched: a user the provider no longer admits keeps their
   tokens, with the role last stored, until an administrator disables or deletes the user;
   deleting the user ends their sessions and revokes their tokens. The role is set again only at
-  a sign-in, so a role change at the provider reaches the gateway at the user's next sign-in; a
-  sign-out at the provider ends their sessions at once through back-channel logout.
+  a sign-in, so a role change at the provider reaches the gateway at the user's next sign-in, and
+  so within `session_max_lifetime_minutes` (twelve hours by default) at most, since no session
+  outlasts it; a sign-out at the provider ends their sessions at once through back-channel logout.
 - **Sign-in links.** `/oidc/initiate` takes `iss`, `login_hint` and `target_link_uri` from the
   query (`GET`) or a form (`POST`, which the provider's page may submit from another site, so it
   passes no same-origin check and never reads or changes a session), as OpenID Connect Core 1.0
@@ -844,13 +852,14 @@ for it after the person has left the organisation.
   `/oidc/callback` share a budget of 10 requests per minute, and 10 callbacks whose code the
   provider refused (`401`) lock the client out of all three for 15 minutes; a completed sign-in
   clears the count. An unknown `state`, a missing binding cookie or a refused account does not
-  count. A client over either limit gets a `429` page with `Retry-After`. Back-channel logout and
+  count, nor does a `/oidc/login` refused as `not_navigation`. A client over either limit gets a
+  `429` page with `Retry-After`. Back-channel logout and
   sign-out are not throttled. Behind a load balancer, set `client_ip.trusted_proxies` in
   `gateway.json`, or every caller shares the balancer's budget; startup warns while it is empty.
 - **The answer.** On success the callback sets the session cookie and returns the same hand-off
   page as SAML sign-in, with `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. A
   refused sign-in shows a page that does not say why, and the log records a reason code:
-  `issuer_mismatch`, `state_unknown`, `binding_mismatch`, `code_missing`, `access_denied`, `exchange_failed`,
+  `not_navigation`, `issuer_mismatch`, `state_unknown`, `binding_mismatch`, `code_missing`, `access_denied`, `exchange_failed`,
   `id_token_invalid`, `claim_not_allowed`, `role_unmapped`, `user_disabled`, `username_taken`,
   `user_limit`, `op_unavailable`, `server_error` or `throttled`. No token, code, secret or claim value is
   logged, and the provider's `error_description` is never shown.
@@ -975,8 +984,10 @@ demoted before they can be deleted.
   administrator's update of a kept record sets its role and status but not its profile fields,
   unless the same update approves it again.
 - No action removes a kept record, because removing it lets the account sign in again as a new
-  user. To answer an erasure request, disable the account at the provider first, then delete the
-  record's file from `_storage/` and restart the gateway or reload its configuration.
+  user. A deleted SAML user's kept record holds their SAML user ID, often an email address, with
+  no end date, which an erasure request must account for. To answer an erasure request, disable
+  the account at the provider first, then delete the record's file from `_storage/` and restart
+  the gateway or reload its configuration.
 - **Upgrading:** before this release, deleting a SAML user removed the record, so the user was
   created again, approved, at their next sign-in, and the personal access tokens they created
   were not revoked. Delete such users again and review their access tokens.

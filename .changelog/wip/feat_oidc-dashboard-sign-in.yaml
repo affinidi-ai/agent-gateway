@@ -9,8 +9,9 @@ changes:
         nonce and a browser-binding cookie. The ID token is fully verified, its signature and nbf
         included, against the provider's published keys. Users are created at their first
         sign-in, approved and never the primary administrator, and identified by the provider
-        account (issuer and sub), never by email; an account whose every candidate username
-        other users hold is refused with a 403 page. role_mapping maps a string or array claim
+        account (issuer and sub), never by email; the username is the first of the username
+        claim, the email and sub that no other user holds and that is no user's id, and an
+        account for which none is free is refused with a 403 page. role_mapping maps a string or array claim
         to a gateway role at every sign-in, raising or lowering it and ending the user's other
         sessions when it changes, and refuses unmapped accounts by default. required_claims
         binds the deployment to one tenant at the provider and is required unless
@@ -19,7 +20,9 @@ changes:
         not define stops startup. The provider's endpoints are reached under the Configured
         egress policy, discovery is fetched once and cached, and a provider that cannot be
         reached neither stops nor delays startup. Sign-in is always throttled per client, with a
-        lockout after repeated refused codes. Sign-ins raise the user.login and user.login_failed
+        lockout after repeated refused codes, and /oidc/login answers a request the browser says
+        is not a page it opens (Sec-Fetch-Dest other than document), such as an image another
+        site embeds, with a 400 page before it counts. Sign-ins raise the user.login and user.login_failed
         events with login method oidc, and the login page shows one "Sign in with {label}"
         button. A gateway in OIDC mode refuses dashboard sessions that did not come from a
         sign-in at its provider, such as passkey or SAML sessions from before the switch.
@@ -47,7 +50,8 @@ changes:
         is never accepted in its place, and is accepted once. The route answers 200 also when
         nothing matched; 400 invalid_request for a token that does not verify; 400 logout_failed
         when a session could not be ended, which leaves the token usable for a retry; and 503
-        while the provider or its keys cannot be reached, while the token names a key published
+        while the provider or its keys cannot be reached (keys that cannot be fetched have the
+        discovery document fetched again at the next logout), while the token names a key published
         since the keys were last fetched for an unknown key id (within a minute), and on a
         Standby instance or one that is not yet ready. Sessions are ended even when the provider
         drops the connection first. It has a 16 KiB body limit, spends no sign-in budget, and is
@@ -106,7 +110,8 @@ changes:
         not refuse every caller. A token naming a key published within the minute is refused as
         an invalid credential, or answered as keys unavailable by consent confirmation and the
         OIDC sign-in and back-channel logout, until it has passed. The key id of such a token is
-        logged escaped.
+        logged escaped. Requests that find a key set missing or expired at the same time now
+        share one fetch of it.
     - timestamp: '2026-11-27T14:00:00Z'
       title: ⭐ Keep a deleted SAML user out and refuse SAML users who are not approved
       description: >-
@@ -117,7 +122,8 @@ changes:
         user under their provider account, so the next sign-in is refused with a 403 page
         until an administrator approves the record again; that record does not count toward
         the users limit, and approving it is checked against the limit. A SAML user whose
-        asserted username another user holds gets their SAML user ID as username instead.
+        asserted username another user holds, or is a user's id, gets their SAML user ID as
+        username instead.
         Every delete now also revokes the user's access tokens, including those whose secret
         they created or rotated for others, ends their sessions and removes their uploaded
         avatar files. Administrator updates and deletes now write by user id under the same
@@ -127,6 +133,18 @@ changes:
         deleted before this release were created again, approved, at their next sign-in, and
         personal access tokens they created were not revoked. Delete such users again and
         review their access tokens.
+    - timestamp: '2026-11-27T16:00:00Z'
+      title: End dashboard sessions 12 hours after sign-in, however active they stay
+      description: >-
+        Dashboard sessions now end session_max_lifetime_minutes in config.toml after sign-in
+        (default 720, at most 1440), however often they are used, for passkey, SAML and OIDC
+        sign-in alike, so an open dashboard signs in again at least every 12 hours by default.
+        Session checks, the startup sweep and the periodic cleanup all apply the limit; a refresh
+        never extends a session past it, the refreshed session cookie's Max-Age is the time left
+        on the session, and the sign-in cookie lasts the smaller of session_timeout_minutes and the
+        lifetime. Sessions stored before the upgrade are held to it from their sign-in time, so
+        those older than the lifetime end at the first start. A value of 0 or above 1440 stops
+        startup with an error.
   breaking:
     - timestamp: '2026-11-27T14:00:00Z'
       title: Answer a user delete with 200 and its outcome instead of 204

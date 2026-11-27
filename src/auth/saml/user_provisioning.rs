@@ -179,7 +179,7 @@ pub async fn provision_user_from_saml(
 
     let (user, change) = if let Some(mut user) = existing_user {
         let previous = user.clone();
-        if user.username != username {
+        if user.username != username || username == user.user_id {
             user.username = resolve_username(storage, &username, user_id_attr, Some(&user.user_id)).await?;
         }
         user.email = email.clone();
@@ -303,8 +303,8 @@ pub async fn provision_user_from_saml(
 }
 
 /// The username a SAML user gets: the asserted one, or the SAML user ID when another user holds
-/// it. A user whose stored username already is the asserted one keeps it without this check, so
-/// users that already share a username keep signing in.
+/// it or it is a user id. A user whose stored username already is the asserted one, and not their
+/// user id, keeps it without this check, so users that already share a username keep signing in.
 async fn resolve_username(
     storage: &PasskeyStorage,
     asserted: &str,
@@ -1339,5 +1339,47 @@ mod tests {
         assert_eq!(again.username, "bob");
         assert_eq!(again.status, UserStatus::Approved);
         assert!(again.deleted_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_asserted_username_equal_to_the_users_own_id_gives_them_their_saml_user_id() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let (_, bob) = alice_and_bob(&storage, &avatars).await;
+
+        let signed_in = sign_in(&storage, &avatars, "bob", &bob.user_id)
+            .await
+            .unwrap()
+            .user;
+        assert_eq!((signed_in.user_id.as_str(), signed_in.username.as_str()), (bob.user_id.as_str(), "bob"));
+
+        storage
+            .delete_user(&bob.user_id)
+            .await
+            .unwrap();
+        storage
+            .update_user(&bob.user_id, None, Some(UserStatus::Approved), &crate::config::LimitsConfig::default())
+            .await
+            .unwrap();
+        let approved_again = sign_in(&storage, &avatars, "bob", &bob.user_id)
+            .await
+            .unwrap()
+            .user;
+        assert_eq!(approved_again.username, "bob", "a kept record approved again never keeps its user id as username");
+    }
+
+    #[tokio::test]
+    async fn an_asserted_username_equal_to_another_users_id_gives_the_saml_user_id() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let (alice, _) = alice_and_bob(&storage, &avatars).await;
+
+        let newcomer = sign_in(&storage, &avatars, "carol", &alice.user_id)
+            .await
+            .unwrap()
+            .user;
+
+        assert_ne!(newcomer.user_id, alice.user_id);
+        assert_eq!(newcomer.username, "carol");
     }
 }

@@ -198,6 +198,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_sign_in_cookie_lasts_no_longer_than_a_shorter_session_lifetime() {
+        let directory = tempfile::tempdir().unwrap();
+        let finalizer = SessionManagerFinalizer::new(
+            Arc::new(
+                SessionManager::with_storage(30, 10, directory.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            ),
+            std::sync::Arc::new(crate::terms::TermsManager::disabled()),
+        );
+
+        let finalized = finalizer
+            .finalize_session(AuthenticatedPrincipal::new("alice".to_string(), "user-123".to_string()))
+            .await
+            .unwrap();
+
+        let cookie = finalized
+            .headers
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.contains("Max-Age=600"), "{cookie}");
+    }
+
+    #[tokio::test]
     async fn finalized_session_debug_hides_the_token_and_the_cookie() {
         let finalizer = SessionManagerFinalizer::new(
             Arc::new(SessionManager::with_timeout(7)),

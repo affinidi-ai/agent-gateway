@@ -203,6 +203,8 @@ pub struct JwksClient {
     cache: Arc<RwLock<HashMap<String, CacheEntry>>>,
     /// strategy_id → its last fetch, when that failed
     failed_fetches: Arc<RwLock<HashMap<String, FailedFetch>>>,
+    /// strategy_id → the lock held while its keys are fetched, so one fetch runs at a time
+    fetching: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl Default for JwksClient {
@@ -221,6 +223,7 @@ impl JwksClient {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
             failed_fetches: Arc::new(RwLock::new(HashMap::new())),
+            fetching: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -270,10 +273,11 @@ impl JwksClient {
     /// Retrieve the JWK for the given `kid` from `strategy_id`'s JWKS.
     ///
     /// 1. If the cache is present and fresh, look up `kid` there.
-    /// 2. If missing or expired, or if `kid` is not found, re-fetch once. A `kid` that fresh
-    ///    keys lack re-fetches only when the entry was not itself re-fetched for an unknown
-    ///    `kid` within [`REFETCH_COOLDOWN`]. A fetch that failed within it is not tried again:
-    ///    its error is returned at once.
+    /// 2. If missing or expired, or if `kid` is not found, re-fetch once. One fetch runs at a
+    ///    time for each `strategy_id`; a request that waited for it looks in the cache again
+    ///    first. A `kid` that fresh keys lack re-fetches only when the entry was not itself
+    ///    re-fetched for an unknown `kid` within [`REFETCH_COOLDOWN`]. A fetch that failed
+    ///    within it is not tried again: its error is returned at once.
     /// 3. If `kid` is still absent after a re-fetch, return [`JwtBearerError::KeyNotFound`];
     ///    when the cooldown prevents the re-fetch, return
     ///    [`JwtBearerError::KeyNotFoundDuringCooldown`].
@@ -283,29 +287,19 @@ impl JwksClient {
         jwks_uri: &str,
         kid: &str,
     ) -> JwtBearerResult<Jwk> {
-        // Fast path — read lock only
-        let mut unknown_kid = false;
+        if let Some(answer) = self
+            .cached_answer(strategy_id, kid)
+            .await
         {
-            let cache = self.cache.read().await;
-            if let Some(entry) = cache.get(strategy_id) {
-                if entry.is_usable() {
-                    if let Some(jwk) = entry.keys.get(kid) {
-                        debug!("JWKS cache hit for strategy {} kid {}", strategy_id, kid);
-                        return Ok(jwk.clone());
-                    }
-                    if entry.refetched_for_unknown_kid_recently() {
-                        debug!(
-                            "kid {} not found for strategy {}; re-fetched recently, not again",
-                            loggable::untrusted(kid),
-                            strategy_id
-                        );
-                        return Err(JwtBearerError::KeyNotFoundDuringCooldown(kid.to_string()));
-                    }
-                    unknown_kid = true;
-                } else {
-                    debug!("JWKS cache expired for strategy {}, re-fetching", strategy_id);
-                }
-            }
+            return answer;
+        }
+        let fetch_lock = self.fetch_lock(strategy_id);
+        let _fetching = fetch_lock.lock().await;
+        if let Some(answer) = self
+            .cached_answer(strategy_id, kid)
+            .await
+        {
+            return answer;
         }
 
         if let Some(failed) = self
@@ -319,30 +313,24 @@ impl JwksClient {
             return Err(failed.error.clone());
         }
 
-        // Claim the unknown-kid re-fetch under the write lock before fetching, so concurrent
-        // requests make one fetch between them and a failed fetch still starts the cooldown.
+        // Mark an unknown-kid re-fetch on the entry before fetching, so a failed fetch still
+        // starts the cooldown.
         let mut unknown_kid_refetch_at = None;
-        if unknown_kid {
-            let mut cache = self.cache.write().await;
-            if let Some(entry) = cache
-                .get_mut(strategy_id)
-                .filter(|entry| !entry.is_expired())
-            {
-                if let Some(jwk) = entry.keys.get(kid) {
-                    return Ok(jwk.clone());
-                }
-                if entry.refetched_for_unknown_kid_recently() {
-                    return Err(JwtBearerError::KeyNotFoundDuringCooldown(kid.to_string()));
-                }
-                debug!(
-                    "kid {} not found in fresh cache for strategy {}, re-fetching",
-                    loggable::untrusted(kid),
-                    strategy_id
-                );
-                let now = Instant::now();
-                entry.unknown_kid_refetch_at = Some(now);
-                unknown_kid_refetch_at = Some(now);
-            }
+        if let Some(entry) = self
+            .cache
+            .write()
+            .await
+            .get_mut(strategy_id)
+            .filter(|entry| !entry.is_expired())
+        {
+            debug!(
+                "kid {} not found in fresh cache for strategy {}, re-fetching",
+                loggable::untrusted(kid),
+                strategy_id
+            );
+            let now = Instant::now();
+            entry.unknown_kid_refetch_at = Some(now);
+            unknown_kid_refetch_at = Some(now);
         }
 
         // Slow path — re-fetch and write
@@ -398,6 +386,49 @@ impl JwksClient {
     }
 
     // ── private ───────────────────────────────────────────────────────────────
+
+    /// What the cache answers for `kid` without a fetch: the key, or
+    /// [`JwtBearerError::KeyNotFoundDuringCooldown`] for a `kid` that usable keys lack while
+    /// the entry was re-fetched for an unknown `kid` within [`REFETCH_COOLDOWN`]. `None` when a
+    /// fetch is needed.
+    async fn cached_answer(
+        &self,
+        strategy_id: &str,
+        kid: &str,
+    ) -> Option<JwtBearerResult<Jwk>> {
+        let cache = self.cache.read().await;
+        let entry = cache.get(strategy_id)?;
+        if !entry.is_usable() {
+            debug!("JWKS cache expired for strategy {}, re-fetching", strategy_id);
+            return None;
+        }
+        if let Some(jwk) = entry.keys.get(kid) {
+            debug!("JWKS cache hit for strategy {} kid {}", strategy_id, kid);
+            return Some(Ok(jwk.clone()));
+        }
+        if entry.refetched_for_unknown_kid_recently() {
+            debug!(
+                "kid {} not found for strategy {}; re-fetched recently, not again",
+                loggable::untrusted(kid),
+                strategy_id
+            );
+            return Some(Err(JwtBearerError::KeyNotFoundDuringCooldown(kid.to_string())));
+        }
+        None
+    }
+
+    /// The lock held while `strategy_id`'s keys are fetched.
+    fn fetch_lock(
+        &self,
+        strategy_id: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        self.fetching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(strategy_id.to_string())
+            .or_default()
+            .clone()
+    }
 
     async fn fetch_and_build_entry(
         &self,
@@ -729,6 +760,85 @@ mod tests {
             ));
         }
         assert_eq!(fetched(&fetches), 2);
+    }
+
+    /// Looks `kid` up `count` times at once for `strategy_id`, and returns the answers.
+    async fn concurrent_lookups(
+        client: &JwksClient,
+        strategy_id: &str,
+        jwks_uri: &str,
+        kid: &str,
+        count: usize,
+    ) -> Vec<JwtBearerResult<Jwk>> {
+        let lookups = (0..count).map(|_| {
+            let (client, strategy_id, jwks_uri, kid) =
+                (client.clone(), strategy_id.to_string(), jwks_uri.to_string(), kid.to_string());
+            tokio::spawn(async move {
+                client
+                    .get_key(&strategy_id, &jwks_uri, &kid)
+                    .await
+            })
+        });
+        futures::future::join_all(lookups)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn concurrent_lookups_on_an_empty_cache_make_one_fetch_between_them() {
+        let (jwks_uri, _served, fetches, _server) =
+            counting_jwks_server(&rsa_jwks_body("key-1", DUMMY_N, DUMMY_E)).await;
+        let client = JwksClient::new();
+
+        for found in concurrent_lookups(&client, "provider-empty", &jwks_uri, "key-1", 20).await {
+            assert_eq!(found.unwrap().kid.as_deref(), Some("key-1"));
+        }
+        assert_eq!(fetched(&fetches), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_lookups_on_expired_keys_make_one_fetch_between_them() {
+        let (jwks_uri, _served, fetches, _server) =
+            counting_jwks_server(&rsa_jwks_body("key-1", DUMMY_N, DUMMY_E)).await;
+        let client = JwksClient::new();
+        client
+            .get_key("provider-expired", &jwks_uri, "key-1")
+            .await
+            .unwrap();
+        client
+            .cache
+            .write()
+            .await
+            .get_mut("provider-expired")
+            .unwrap()
+            .fetched_at = Instant::now() - Duration::from_secs(90_000);
+
+        for found in concurrent_lookups(&client, "provider-expired", &jwks_uri, "key-1", 20).await {
+            assert_eq!(found.unwrap().kid.as_deref(), Some("key-1"));
+        }
+        assert_eq!(fetched(&fetches), 2);
+        assert!(
+            !client
+                .cache
+                .read()
+                .await
+                .get("provider-expired")
+                .unwrap()
+                .is_expired()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_lookups_waiting_on_a_failed_fetch_get_its_error_without_fetching() {
+        let (jwks_uri, _served, fetches, _server) = counting_jwks_server("not a key set").await;
+        let client = JwksClient::new();
+
+        for failed in concurrent_lookups(&client, "provider-failing", &jwks_uri, "key-1", 20).await {
+            assert!(matches!(failed, Err(JwtBearerError::JwksFetchFailed(_))), "{failed:?}");
+        }
+        assert_eq!(fetched(&fetches), 1);
     }
 
     #[tokio::test]

@@ -324,9 +324,10 @@ impl PasskeyStorage {
         Ok(true)
     }
 
-    /// Whether another user already holds `username`. Call it while holding
-    /// [`Self::user_write_guard`], as the creators of users do, so the answer still holds when the
-    /// record is written.
+    /// Whether another user already holds `username`. Every user id, the user's own included,
+    /// counts as held: a username equal to a user id marks a deleted user's kept record. Call it
+    /// while holding [`Self::user_write_guard`], as the creators of users do, so the answer still
+    /// holds when the record is written.
     pub async fn username_held_by_other(
         &self,
         username: &str,
@@ -337,7 +338,10 @@ impl PasskeyStorage {
             .list_all()
             .await?
             .iter()
-            .any(|holder| holder.username == username && Some(holder.user_id.as_str()) != own_user_id))
+            .any(|holder| {
+                holder.user_id == username
+                    || (holder.username == username && Some(holder.user_id.as_str()) != own_user_id)
+            }))
     }
 
     /// The first of `candidates` that no other user has as their username, so no two users share
@@ -1511,6 +1515,36 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_user_id_is_never_a_free_username_even_for_its_own_user() {
+        let dir = tempdir().unwrap();
+        let storage = storage(dir.path()).await;
+        let mut data = user("first", None);
+        data.username = "bob".to_string();
+        storage
+            .save_user(&data)
+            .await
+            .unwrap();
+
+        for own_user_id in [None, Some("first"), Some("second")] {
+            assert!(
+                storage
+                    .username_held_by_other("first", own_user_id)
+                    .await
+                    .unwrap(),
+                "{own_user_id:?}"
+            );
+        }
+        assert_eq!(
+            storage
+                .free_username(&["first", "alice"], Some("first"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("alice")
         );
     }
 

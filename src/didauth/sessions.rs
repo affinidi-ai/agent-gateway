@@ -688,9 +688,13 @@ mod tests {
         let store = DidAuthSessionStore::with_storage(sessions_path.to_path_buf())
             .await
             .unwrap();
-        let dashboard_sessions = crate::auth::SessionManager::with_storage(20, sessions_path.to_path_buf())
-            .await
-            .unwrap();
+        let dashboard_sessions = crate::auth::SessionManager::with_storage(
+            20,
+            crate::auth::session::DEFAULT_SESSION_LIFETIME_MINUTES,
+            sessions_path.to_path_buf(),
+        )
+        .await
+        .unwrap();
 
         assert!(
             store

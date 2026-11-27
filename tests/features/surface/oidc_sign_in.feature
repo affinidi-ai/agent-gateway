@@ -5,9 +5,10 @@ Feature: OpenID Connect sign-in
   again at every sign-in. An account becomes a human user at its first sign-in, approved and never
   the primary administrator, within the appliance's user limit. A refused sign-in hands the
   dashboard no session and stores no user. Deleting such a user keeps a disabled record under the
-  provider account, so the account stays refused until an administrator approves it again. An
-  oidc.json that writes the client secret into the file, misspells a setting or has no tenant
-  binding stops startup.
+  provider account, so the account stays refused until an administrator approves it again. The
+  sign-in address answers only as a page the browser opens: another site that loads it as an image
+  is refused and spends none of the sign-in budget. An oidc.json that writes the client secret into
+  the file, misspells a setting or has no tenant binding stops startup.
 
   Background:
     Given human users sign in with OpenID Connect
@@ -46,6 +47,15 @@ Feature: OpenID Connect sign-in
     Then the response status is 400
     And the dashboard is handed no session
     And no human user is stored
+
+  Scenario: Another site that loads the sign-in address as an image is refused
+    When another site loads the sign-in address as an image
+    Then the response status is 400
+
+  Scenario: Loading the sign-in address as an image spends none of the sign-in budget
+    Given another site has loaded the sign-in address as an image 10 times
+    When the browser starts a sign-in from the login button
+    Then the browser is sent to the provider
 
   Scenario: A new account past the appliance's user limit is refused with a page naming the limit
     Given the appliance allows 1 human user

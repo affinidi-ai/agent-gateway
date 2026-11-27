@@ -157,6 +157,16 @@ fn saml_json_maps_role(
         .keeps_gateway_log = true;
 }
 
+#[given(expr = "config.toml sets the dashboard session lifetime to {int} minutes")]
+fn config_sets_session_lifetime(
+    world: &mut SurfaceWorld,
+    minutes: u64,
+) {
+    world
+        .surface_config
+        .session_max_lifetime_minutes = Some(minutes);
+}
+
 #[when("the gateway tries to start")]
 async fn gateway_tries_to_start(world: &mut SurfaceWorld) {
     world

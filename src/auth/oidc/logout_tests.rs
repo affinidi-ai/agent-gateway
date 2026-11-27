@@ -612,12 +612,10 @@ async fn a_logout_signed_with_a_key_published_during_the_unknown_key_cooldown_an
 
     flow.provider
         .rotate_to_key_b();
+    let signed_with_key_b =
+        sign_logout_with(KEY_B_PEM, Some(KEY_B_KID), &logout_claims(&flow.provider.issuer, "op-session-1"));
     let response = flow
-        .backchannel_logout(&sign_logout_with(
-            KEY_B_PEM,
-            Some(KEY_B_KID),
-            &logout_claims(&flow.provider.issuer, "op-session-1"),
-        ))
+        .backchannel_logout(&signed_with_key_b)
         .await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "the provider retries after the cooldown");
@@ -625,6 +623,49 @@ async fn a_logout_signed_with_a_key_published_during_the_unknown_key_cooldown_an
     assert!(
         flow.session_is_live(&session)
             .await
+    );
+    flow.backchannel_logout(&signed_with_key_b)
+        .await;
+    assert_eq!(
+        flow.provider
+            .discovery_fetches(),
+        1,
+        "a key the cooldown keeps unknown leaves the discovery document as it is"
+    );
+}
+
+#[tokio::test]
+async fn a_logout_whose_keys_cannot_be_fetched_has_the_discovery_document_fetched_again() {
+    let _ready = mode::ready_for_test().await;
+    let flow = Flow::new().await;
+    flow.signed_in_with_sid("op-session-1")
+        .await;
+    flow.provider
+        .set_jwks(json!("not a key set"));
+    let signed_with_a_new_key =
+        sign_logout_with(KEY_B_PEM, Some(KEY_B_KID), &logout_claims(&flow.provider.issuer, "op-session-1"));
+    assert_eq!(
+        flow.backchannel_logout(&signed_with_a_new_key)
+            .await
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        flow.provider
+            .discovery_fetches(),
+        1
+    );
+
+    let response = flow
+        .backchannel_logout(&signed_with_a_new_key)
+        .await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        flow.provider
+            .discovery_fetches(),
+        2,
+        "a key set that could not be fetched may have moved"
     );
 }
 

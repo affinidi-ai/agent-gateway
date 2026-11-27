@@ -3298,6 +3298,11 @@ pub struct BootstrapConfig {
     #[serde(default = "default_session_timeout_minutes")]
     pub session_timeout_minutes: u64,
 
+    /// Longest a dashboard session lasts after sign-in, in minutes, however active it stays
+    /// (1 to 1440, default 720)
+    #[serde(default = "default_session_max_lifetime_minutes")]
+    pub session_max_lifetime_minutes: u64,
+
     /// WebSocket broadcast channel buffer size (default: 500)
     #[serde(default = "default_websocket_broadcast_buffer")]
     pub websocket_broadcast_buffer: usize,
@@ -3600,6 +3605,10 @@ fn default_x402_proxy_config_path() -> String {
 #[allow(dead_code)]
 fn default_session_timeout_minutes() -> u64 {
     20 // 20 minutes
+}
+
+fn default_session_max_lifetime_minutes() -> u64 {
+    crate::auth::session::DEFAULT_SESSION_LIFETIME_MINUTES
 }
 
 fn default_websocket_broadcast_buffer() -> usize {

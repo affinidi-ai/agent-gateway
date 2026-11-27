@@ -1510,6 +1510,7 @@ fn render_default_bootstrap_toml(
         metrics_cache_ttl_seconds: 1,
         websocket_require_auth: true,
         session_timeout_minutes: 20,
+        session_max_lifetime_minutes: crate::auth::session::DEFAULT_SESSION_LIFETIME_MINUTES,
         websocket_broadcast_buffer: 500,
         metrics_retention_minutes: 360,
         metrics_cache_ttl_seconds_legacy: 1,

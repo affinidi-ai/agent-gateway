@@ -635,6 +635,35 @@ async fn browser_starts_sign_in_from_login_button(world: &mut SurfaceWorld) {
     record_sign_in_link_answer(world, response).await;
 }
 
+/// The sign-in address, loaded as an image another site's page embeds.
+async fn load_sign_in_address_as_an_image(world: &mut SurfaceWorld) -> reqwest::Response {
+    ensure_gateway_running(world).await;
+    browser()
+        .get(gateway_url(world, "/api/oidc/login"))
+        .header("sec-fetch-dest", "image")
+        .header("sec-fetch-site", "cross-site")
+        .send()
+        .await
+        .expect("the sign-in address")
+}
+
+#[when("another site loads the sign-in address as an image")]
+async fn another_site_loads_sign_in_address_as_image(world: &mut SurfaceWorld) {
+    let response = load_sign_in_address_as_an_image(world).await;
+    record_sign_in_link_answer(world, response).await;
+}
+
+#[given(expr = "another site has loaded the sign-in address as an image {int} times")]
+async fn another_site_has_loaded_sign_in_address_as_image(
+    world: &mut SurfaceWorld,
+    times: u32,
+) {
+    for attempt in 1..=times {
+        let response = load_sign_in_address_as_an_image(world).await;
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST, "load {attempt} is refused");
+    }
+}
+
 #[when("a browser follows a sign-in link that names another provider")]
 async fn browser_follows_link_for_another_provider(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
@@ -647,11 +676,8 @@ async fn browser_follows_link_for_another_provider(world: &mut SurfaceWorld) {
     record_sign_in_link_answer(world, response).await;
 }
 
-#[then(expr = "the browser is sent to the provider with the login hint {string}")]
-fn browser_is_sent_to_provider_with_login_hint(
-    world: &mut SurfaceWorld,
-    hint: String,
-) {
+/// Where the recorded answer sends the browser, checked to be the provider's sign-in address.
+fn sent_to_provider(world: &SurfaceWorld) -> url::Url {
     let answer = recorded(world);
     assert_eq!(answer.status, 303, "{answer:?}");
     let location = answer
@@ -665,6 +691,20 @@ fn browser_is_sent_to_provider_with_login_hint(
             .starts_with(&format!("{}/authorize?", provider(world).issuer())),
         "{location}"
     );
+    location
+}
+
+#[then("the browser is sent to the provider")]
+fn browser_is_sent_to_provider(world: &mut SurfaceWorld) {
+    sent_to_provider(world);
+}
+
+#[then(expr = "the browser is sent to the provider with the login hint {string}")]
+fn browser_is_sent_to_provider_with_login_hint(
+    world: &mut SurfaceWorld,
+    hint: String,
+) {
+    let location = sent_to_provider(world);
     let login_hint = location
         .query_pairs()
         .find(|(name, _)| name == "login_hint")
@@ -839,6 +879,30 @@ fn dashboard_is_handed_a_session(world: &mut SurfaceWorld) {
         .as_str()
         .unwrap_or_default();
     assert!(page.contains("sessionStorage.setItem('session_token'"), "the page hands no session over: {page}");
+}
+
+#[then(expr = "the session cookie the dashboard is handed lasts {int} seconds")]
+fn handed_session_cookie_lasts(
+    world: &mut SurfaceWorld,
+    seconds: u64,
+) {
+    let answer = recorded(world);
+    let cookies = answer
+        .headers
+        .get("set-cookie")
+        .cloned()
+        .unwrap_or_default();
+    let session_cookie = cookies
+        .lines()
+        .find(|cookie| cookie.starts_with(SESSION_COOKIE))
+        .unwrap_or_else(|| panic!("no session cookie was set: {cookies}"));
+    let max_age = format!("Max-Age={seconds}");
+    assert!(
+        session_cookie
+            .split(';')
+            .any(|attribute| attribute.trim() == max_age),
+        "{session_cookie}"
+    );
 }
 
 #[then("the dashboard is handed no session")]

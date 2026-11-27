@@ -97,6 +97,9 @@ pub async fn oidc_backchannel_logout(
                     detail = %loggable::untrusted(&detail),
                     "OIDC back-channel logout could not be checked: the provider's keys are unavailable"
                 );
+                oidc.discovery
+                    .mark_stale()
+                    .await;
                 return unavailable();
             }
             Err(TokenFailure::KeyNotFoundDuringCooldown(detail)) => {

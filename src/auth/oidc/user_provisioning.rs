@@ -58,11 +58,7 @@ pub async fn provision_user_from_oidc(
     let email = claim_string(claims, &names.email);
     let first_name = claim_string(claims, &names.first_name);
     let last_name = claim_string(claims, &names.last_name);
-    let preferred_username = [claim_string(claims, &names.username), email.clone()]
-        .into_iter()
-        .flatten()
-        .find(|username| username.len() <= MAX_USERNAME_LEN)
-        .unwrap_or_else(|| identity.subject.clone());
+    let username_claim = claim_string(claims, &names.username);
 
     let _user_write_guard = storage
         .user_write_guard()
@@ -78,8 +74,14 @@ pub async fn provision_user_from_oidc(
     let own_user_id = existing
         .as_ref()
         .map(|user| user.user_id.as_str());
+    let candidates: Vec<&str> = [username_claim.as_deref(), email.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|username| username.len() <= MAX_USERNAME_LEN)
+        .chain([identity.subject.as_str()])
+        .collect();
     let username = storage
-        .free_username(&[preferred_username.as_str(), identity.subject.as_str()], own_user_id)
+        .free_username(&candidates, own_user_id)
         .await?
         .ok_or(ProvisionRefusal::UsernameTaken)?;
     let now = chrono::Utc::now();
@@ -301,6 +303,88 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(refused, ProvisionRefusal::UsernameTaken), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn a_taken_username_claim_falls_back_to_a_free_email() {
+        let (_dir, storage) = storage().await;
+        provision(&storage, "sub-0", json!({ "preferred_username": "alice" }), UserRole::User)
+            .await
+            .unwrap();
+
+        let user = provision(
+            &storage,
+            "sub-1",
+            json!({ "preferred_username": "alice", "email": "alice@example.com" }),
+            UserRole::User,
+        )
+        .await
+        .unwrap()
+        .user;
+
+        assert_eq!(user.username, "alice@example.com");
+    }
+
+    #[tokio::test]
+    async fn a_taken_username_claim_and_email_fall_back_to_the_subject() {
+        let (_dir, storage) = storage().await;
+        provision(&storage, "sub-0", json!({ "preferred_username": "alice" }), UserRole::User)
+            .await
+            .unwrap();
+        provision(&storage, "sub-9", json!({ "preferred_username": "alice@example.com" }), UserRole::User)
+            .await
+            .unwrap();
+
+        let user = provision(
+            &storage,
+            "sub-1",
+            json!({ "preferred_username": "alice", "email": "alice@example.com" }),
+            UserRole::User,
+        )
+        .await
+        .unwrap()
+        .user;
+
+        assert_eq!(user.username, "sub-1");
+    }
+
+    #[tokio::test]
+    async fn a_username_claim_equal_to_the_users_own_id_falls_back_to_the_next_candidate() {
+        let (_dir, storage) = storage().await;
+        let user = provision(&storage, "sub-1", json!({ "preferred_username": "alice" }), UserRole::User)
+            .await
+            .unwrap()
+            .user;
+
+        let again = provision(
+            &storage,
+            "sub-1",
+            json!({ "preferred_username": user.user_id, "email": "alice@example.com" }),
+            UserRole::User,
+        )
+        .await
+        .unwrap()
+        .user;
+
+        assert_eq!(again.user_id, user.user_id);
+        assert_eq!(again.username, "alice@example.com");
+    }
+
+    #[tokio::test]
+    async fn a_username_claim_equal_to_another_users_id_falls_back_to_the_next_candidate() {
+        let (_dir, storage) = storage().await;
+        let holder = provision(&storage, "sub-1", json!({ "preferred_username": "alice" }), UserRole::User)
+            .await
+            .unwrap()
+            .user;
+
+        let newcomer = provision(&storage, "sub-2", json!({ "preferred_username": holder.user_id }), UserRole::User)
+            .await
+            .unwrap()
+            .user;
+
+        assert_ne!(newcomer.user_id, holder.user_id);
+        assert_eq!(newcomer.username, "sub-2");
     }
 
     #[tokio::test]

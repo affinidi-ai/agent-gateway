@@ -189,6 +189,19 @@ pub fn limit_human_users(
     std::fs::write(&config_path, config).expect("write config.toml");
 }
 
+/// Sets `session_max_lifetime_minutes` of the gateway written under `base_dir` to `minutes`.
+pub fn limit_session_lifetime(
+    base_dir: &Path,
+    minutes: u64,
+) {
+    let config_path = base_dir.join("config.toml");
+    let config = std::fs::read_to_string(&config_path).expect("read config.toml");
+    let timeout = "session_timeout_minutes = 20\n";
+    assert!(config.contains(timeout), "the gateway config must set the session timeout");
+    let config = config.replacen(timeout, &format!("{timeout}session_max_lifetime_minutes = {minutes}\n"), 1);
+    std::fs::write(&config_path, config).expect("write config.toml");
+}
+
 fn write(
     path: &Path,
     value: serde_json::Value,

@@ -981,7 +981,7 @@ async fn a_deleted_user_signs_in_as_the_same_user_once_an_administrator_approves
 #[tokio::test]
 async fn an_account_whose_every_username_other_users_hold_is_refused_and_no_user_is_created() {
     let flow = Flow::new().await;
-    for (user_id, username) in [("holder-1", "alice"), ("holder-2", "user-1")] {
+    for (user_id, username) in [("holder-1", "alice"), ("holder-2", "alice@example.com"), ("holder-3", "user-1")] {
         flow.oidc
             .storage
             .save_user(&passkey_user(user_id, username))
@@ -999,7 +999,7 @@ async fn an_account_whose_every_username_other_users_hold_is_refused_and_no_user
             .contains("not allowed to use this dashboard")
     );
     assert!(flow.user().await.is_none(), "no user was created");
-    assert_eq!(flow.stored_user_count().await, 2);
+    assert_eq!(flow.stored_user_count().await, 3);
     assert!(
         logs.text()
             .contains("username_taken"),
@@ -1104,6 +1104,74 @@ async fn a_client_over_its_sign_in_budget_is_told_when_to_retry() {
         StatusCode::SEE_OTHER,
         "another client has its own budget"
     );
+}
+
+/// `GET /oidc/login` from the browser, which says the answer is for `destination`.
+async fn login_for(
+    flow: &Flow,
+    destination: &str,
+) -> Response<Body> {
+    flow.send_from(
+        BROWSER,
+        Request::builder()
+            .uri("/oidc/login")
+            .header("sec-fetch-dest", destination)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_sign_in_start_that_is_not_a_page_is_refused_and_spends_no_budget() {
+    let flow = Flow::new().await;
+    for _ in 0..=SIGN_IN_REQUESTS_PER_WINDOW {
+        let refused = login_for(&flow, "image").await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(header_value(&refused, header::CACHE_CONTROL), "no-store");
+        assert!(
+            refused
+                .headers()
+                .get(header::SET_COOKIE)
+                .is_none(),
+            "the binding cookie of a sign-in under way is left as it is"
+        );
+    }
+    let page = body(login_for(&flow, "iframe").await).await;
+    assert!(page.contains("Open the sign-in page to sign in."), "{page}");
+    assert_eq!(
+        flow.provider
+            .discovery_fetches(),
+        0,
+        "a refused start reaches nothing"
+    );
+
+    assert_eq!(
+        login_for(&flow, "document")
+            .await
+            .status(),
+        StatusCode::SEE_OTHER,
+        "the refused starts did not count against the budget"
+    );
+}
+
+#[tokio::test]
+async fn a_sign_in_start_as_a_page_or_without_fetch_metadata_goes_to_the_provider() {
+    let flow = Flow::new().await;
+
+    for response in [
+        login_for(&flow, "document").await,
+        flow.get("/oidc/login", None)
+            .await,
+    ] {
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(
+            header_value(&response, header::LOCATION).starts_with(&flow.provider.issuer),
+            "{:?}",
+            response.headers()
+        );
+        assert!(header_value(&response, header::SET_COOKIE).starts_with("__Host-oidc_state="));
+    }
 }
 
 #[tokio::test]

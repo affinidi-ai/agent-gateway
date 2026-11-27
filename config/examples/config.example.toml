@@ -42,6 +42,9 @@ auth_mode = "passkey"
 # Session timeout in minutes (applies to every authentication mode)
 session_timeout_minutes = 20
 
+# Longest a session lasts after sign-in, in minutes, however active it stays (1 to 1440)
+session_max_lifetime_minutes = 720
+
 # Require authentication for WebSocket connections (default: true)
 # When enabled, users must authenticate with a valid passkey session before connecting to WebSocket
 websocket_require_auth = true
