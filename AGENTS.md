@@ -546,6 +546,14 @@ _Policy templates_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#policy-tem
 The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see
 _Maintenance actions_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#maintenance-actions).
 
+A surface save's warnings are listed once, in full, in the save toast, laid out as the "Changes
+discarded." undo toast with a countdown bar and closing after 8 seconds unless **Keep Opened**
+is pressed; there is no save-warnings banner, and a save without warnings shows the same layout
+for 3 seconds. Every toast closes with the same × button at the end of its row, its message
+wrapping so the button stays reachable, and the countdown toasts are announced to screen readers
+through live regions that stay in the page; see _Toasts_ and _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#toasts).
+
 Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI patterns evolve. Instruction drift is a blocker.
 
 ## Architecture

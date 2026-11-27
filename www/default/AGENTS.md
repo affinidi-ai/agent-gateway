@@ -77,6 +77,15 @@ without Undo, as its close button does. A new toast replaces the one on screen a
 the replaced toast's timer and `u` key no longer act, and an Undo toast counts as dismissed
 without Undo (its `onExpire` runs). `removeToast` does the same. This holds on every page.
 
+Every toast closes with the same × button (`closeButtonHtml`, `#app-toast-close`, title
+"Dismiss"), the last item of its row. The message beside it shrinks and wraps (`min-width:0`,
+`overflow-wrap:anywhere`), so a long unbroken name never pushes the button out of the toast. The
+countdown toasts (`showUndoToast`, `showKeepOpenWarningToast`, `showSuccessCountdownToast`) are
+announced to screen readers through two live regions that stay in the page between toasts,
+`#app-toast-live-polite` (`role="status"`) and `#app-toast-live-assertive` (`role="alert"`, for
+the warning toast), without taking focus. **Keep Opened** carries
+`data-testid="app-toast-keep-open-button"`.
+
 ## Test identifiers
 
 Every new interactive element ships with a `data-testid`. Tests under `ui-tests/specs/`
@@ -452,10 +461,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   close button. "<saved>" alone is `showSuccessCountdownToast`: the success icon and colour, no
   other button, closing after 3 seconds. A toast with warnings is `showKeepOpenWarningToast`:
   **Keep Opened** where Undo is, closing after 8 seconds unless Keep Opened is pressed, which
-  stops the countdown and removes the bar and the button until the toast is closed. Every
-  toast (`showToast` and the countdown toasts) closes with the same × button
-  (`closeButtonHtml`, `#app-toast-close`, title "Dismiss"), the last item of its row, never
-  pinned to a corner. The warnings toast is the only place a save's warnings are listed, with
+  stops the countdown and removes the bar and the button until the toast is closed; screen
+  readers announce it assertively. The close button and live regions are those of every toast;
+  see _Toasts_. The warnings toast is the only place a save's warnings are listed, with
   no banner above the canvas. A create that drew any opens the new surface's page, carrying
   them so the Transit Point a warning names shows it in its panel.
 - **Transit Settings** has no listener authentication control: the gateway does not support

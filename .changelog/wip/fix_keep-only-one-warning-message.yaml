@@ -8,6 +8,7 @@ changes:
         Success, warning, error and loading notifications now close with the same ×
         button as the "Changes discarded." notification, at the end of the message row,
         instead of one pinned to the top-right corner, so all notifications look alike.
+        A long message wraps beside it, so the button stays inside the notification.
     - timestamp: '2026-11-26T14:00:00Z'
       title: Show a countdown bar on the notification after a surface save
       description: >-
@@ -22,8 +23,8 @@ changes:
         "The last save drew a warning" banner above the canvas and in the save toast.
         The banner is gone, and the save toast is the one place they are listed. It is
         laid out like the "Changes discarded." toast, with a countdown bar, and closes
-        after 8 seconds unless Keep Opened is pressed. A Transit Point a warning names still shows it in its own
-        panel.
+        after 8 seconds unless Keep Opened is pressed. Screen readers announce it, as they
+        did the banner. A Transit Point a warning names still shows it in its own panel.
   removed: []
   security: []
   breaking: []

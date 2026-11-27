@@ -28,6 +28,38 @@ const closeButtonHtml = (closeColor: string) => `
           <span style="font-size:1.2em;color:${closeColor};">&times;</span>
         </button>`;
 
+/**
+ * Live regions that stay in the page between toasts, one per politeness, so a screen reader
+ * announces a toast's message without the toast taking focus. A region inserted together with
+ * its text is often not announced, which is why these outlive any one toast.
+ */
+const LIVE_REGION_ID = {
+  polite: 'app-toast-live-polite',
+  assertive: 'app-toast-live-assertive',
+} as const;
+
+/** How long a cleared live region stays empty before it gets the new text, so a repeat is read. */
+export const ANNOUNCE_DELAY_MS = 100;
+
+const announce = (message: string, politeness: keyof typeof LIVE_REGION_ID) => {
+  const id = LIVE_REGION_ID[politeness];
+  let region = document.getElementById(id);
+  if (!region) {
+    region = document.createElement('div');
+    region.id = id;
+    region.className = 'visually-hidden';
+    region.setAttribute('role', politeness === 'assertive' ? 'alert' : 'status');
+    region.setAttribute('aria-live', politeness);
+    region.setAttribute('aria-atomic', 'true');
+    document.body.appendChild(region);
+  }
+  const target = region;
+  target.textContent = '';
+  setTimeout(() => {
+    target.textContent = message;
+  }, ANNOUNCE_DELAY_MS);
+};
+
 // Removes the toast on screen with its timer and key handler; a new toast replaces it through this.
 let dismissActive: (() => void) | null = null;
 
@@ -108,7 +140,7 @@ export const showToast = (
         <div class="me-3">
           <i class="fas ${icon}" style="font-size: 1.2em; color: ${borderColor};"></i>
         </div>
-        <div class="flex-grow-1 me-2">
+        <div class="flex-grow-1 me-2" style="min-width:0;overflow-wrap:anywhere;">
           <strong>${label}</strong><br/>
         </div>${closeButtonHtml(closeColor)}
       </div>
@@ -196,7 +228,11 @@ interface CountdownToastOptions {
   icon?: string;
   /** The button beside the close button; none without a label. */
   buttonLabel?: string;
+  /** The button's `data-testid`. */
+  buttonTestId?: string;
   onButton?: (controls: CountdownToastControls) => void;
+  /** How a screen reader announces the message: `assertive` interrupts, `polite` waits. */
+  politeness?: keyof typeof LIVE_REGION_ID;
   /** Called when the toast expires or is closed without its button removing it. */
   onExpire?: () => void;
   /** A key that presses the button while the toast is visible (ignored inside inputs). */
@@ -214,7 +250,9 @@ const showCountdownToast = ({
   accent,
   icon = 'fa-exclamation-triangle',
   buttonLabel,
+  buttonTestId,
   onButton,
+  politeness = 'polite',
   onExpire,
   shortcut,
 }: CountdownToastOptions): (() => void) => {
@@ -256,6 +294,7 @@ const showCountdownToast = ({
   const messageEl = toast.querySelector<HTMLElement>('#app-toast-message');
   if (messageEl) messageEl.textContent = message;
   document.body.appendChild(toast);
+  announce(message, politeness);
 
   let buttonRoot: Root | null = null;
   const unmountButton = () => {
@@ -290,14 +329,14 @@ const showCountdownToast = ({
   if (!buttonLabel) {
     mountEl?.remove();
   } else if (mountEl) {
+    const buttonProps: React.ComponentProps<typeof AppButton> & { 'data-testid'?: string } = {
+      variant: 'secondary',
+      size: 'sm',
+      onClick: pressButton,
+      'data-testid': buttonTestId,
+    };
     buttonRoot = createRoot(mountEl);
-    buttonRoot.render(
-      React.createElement(
-        AppButton,
-        { variant: 'secondary', size: 'sm', onClick: pressButton },
-        buttonLabel
-      )
-    );
+    buttonRoot.render(React.createElement(AppButton, buttonProps, buttonLabel));
   }
 
   toast.querySelector('#app-toast-close')?.addEventListener('click', dismiss);
@@ -349,7 +388,7 @@ export const showUndoToast = ({
 /**
  * Warning toast laid out as the undo toast: a countdown progress bar, and a Keep Opened
  * button where Undo is, which stops the countdown so the toast stays until it is closed.
- * Closes after `duration` ms (default 8000).
+ * Closes after `duration` ms (default 8000). Screen readers announce it assertively.
  */
 export const showKeepOpenWarningToast = (message: string, duration = 8000): (() => void) =>
   showCountdownToast({
@@ -357,7 +396,9 @@ export const showKeepOpenWarningToast = (message: string, duration = 8000): (() 
     duration,
     accent: UI_COLORS.warning,
     buttonLabel: 'Keep Opened',
+    buttonTestId: 'app-toast-keep-open-button',
     onButton: ({ stopCountdown }) => stopCountdown(),
+    politeness: 'assertive',
   });
 
 /**

@@ -1,5 +1,6 @@
 import { act } from 'react';
 import {
+  ANNOUNCE_DELAY_MS,
   removeToast,
   showKeepOpenWarningToast,
   showSuccessCountdownToast,
@@ -111,6 +112,14 @@ describe('showToast', () => {
       expect(toast.querySelector('.d-flex.align-items-center > .me-3')).not.toBeNull();
       expect(toast.querySelector('.d-flex.align-items-center > .flex-grow-1')).not.toBeNull();
       expect(toast.querySelector('.flex-grow-1 br')).not.toBeNull();
+    });
+
+    it('lets a long unbroken message shrink and wrap so the close button stays in the toast', () => {
+      showToast('success', `Surface "${'x'.repeat(200)}" deleted`);
+
+      const body = getToast().querySelector<HTMLElement>('.flex-grow-1');
+      expect(body?.style.minWidth).toBe('0px');
+      expect(body?.style.overflowWrap).toBe('anywhere');
     });
 
     it('replaces an existing toast', () => {
@@ -313,6 +322,44 @@ describe('showKeepOpenWarningToast', () => {
     expect(getToast().querySelector('img')).toBeNull();
     expect(getToast().textContent).toContain(PAYLOAD);
   });
+
+  it('gives Keep Opened its test id', () => {
+    act(() => {
+      showKeepOpenWarningToast('Saved, with warnings:\nfirst');
+    });
+
+    expect(
+      getToast().querySelector('[data-testid="app-toast-keep-open-button"]')?.textContent
+    ).toBe('Keep Opened');
+  });
+
+  it('announces the warning through a live region that outlives the toast, without focus', () => {
+    act(() => {
+      showKeepOpenWarningToast('Saved, with warnings:\nfirst');
+    });
+
+    const region = document.getElementById('app-toast-live-assertive');
+    expect(region).not.toBeNull();
+    expect(region).toHaveAttribute('role', 'alert');
+    expect(region).toHaveAttribute('aria-live', 'assertive');
+    expect(getToast().contains(region)).toBe(false);
+    expect(document.activeElement).toBe(document.body);
+
+    act(() => {
+      jest.advanceTimersByTime(ANNOUNCE_DELAY_MS);
+    });
+    expect(region?.textContent).toBe('Saved, with warnings:\nfirst');
+
+    act(() => {
+      showKeepOpenWarningToast('Saved, with warnings:\nfirst');
+    });
+    expect(region?.textContent).toBe('');
+    act(() => {
+      jest.advanceTimersByTime(ANNOUNCE_DELAY_MS);
+    });
+    expect(region?.textContent).toBe('Saved, with warnings:\nfirst');
+    expect(document.querySelectorAll('#app-toast-live-assertive')).toHaveLength(1);
+  });
 });
 
 describe('showSuccessCountdownToast', () => {
@@ -340,6 +387,16 @@ describe('showSuccessCountdownToast', () => {
 
     jest.advanceTimersByTime(3000);
     expect(document.getElementById('app-toast')).toBeNull();
+  });
+
+  it('announces the message politely', () => {
+    showSuccessCountdownToast('Agent Surface "orders" saved');
+
+    const region = document.getElementById('app-toast-live-polite');
+    expect(region).toHaveAttribute('role', 'status');
+    expect(region).toHaveAttribute('aria-live', 'polite');
+    jest.advanceTimersByTime(ANNOUNCE_DELAY_MS);
+    expect(region?.textContent).toBe('Agent Surface "orders" saved');
   });
 });
 
