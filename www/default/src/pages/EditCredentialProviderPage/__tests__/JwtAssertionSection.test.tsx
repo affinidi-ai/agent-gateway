@@ -1,5 +1,6 @@
 import React from 'react';
 import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
 import JwtAssertionSection from '../JwtAssertionSection';
@@ -37,6 +38,18 @@ describe('JwtAssertionSection', () => {
     expect(algorithms()).toEqual(['RS256', 'ES256']);
   });
 
+  it.each(['oauth2_jwt_bearer', 'oauth2_client_credentials_jwt_auth'] as const)(
+    'tells a %s provider when the Audience should be the issuer',
+    async providerType => {
+      renderSection(providerType);
+      await userEvent.hover(screen.getByTestId('field-help-jwt-audience'));
+      const help = await screen.findByRole('tooltip');
+      expect(help).toHaveTextContent('Leave empty to use the token endpoint');
+      expect(help).toHaveTextContent('RFC 7523bis');
+      expect(help).toHaveTextContent('issuer identifier');
+    }
+  );
+
   it('marks the Subject of a JWT Bearer provider as required', () => {
     renderSection('oauth2_jwt_bearer');
     expect(screen.getByText(/^Subject/, { selector: 'label' })).toHaveTextContent('*');
@@ -48,13 +61,13 @@ describe('JwtAssertionSection', () => {
     expect(screen.queryByTestId('credential-provider-jwt-subject-input')).not.toBeInTheDocument();
   });
 
-  it('asks a Client Credentials JWT provider for its certificate, offering PS256 first', () => {
+  it('asks a Client Credentials JWT provider for its certificate, offering PS256 first and ES256', () => {
     renderSection('oauth2_client_credentials_jwt_auth');
     expect(
       screen.getByTestId('credential-provider-jwt_certificate_secret_ref-select')
     ).toBeInTheDocument();
     expect(screen.queryByTestId('credential-provider-jwt-issuer-input')).not.toBeInTheDocument();
-    expect(algorithms()).toEqual(['PS256', 'RS256']);
+    expect(algorithms()).toEqual(['PS256', 'RS256', 'ES256']);
   });
 
   it('offers the certificate as optional with the key ID right under it', () => {

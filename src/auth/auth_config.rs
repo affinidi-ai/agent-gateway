@@ -44,6 +44,11 @@ pub struct SamlConfig {
     #[serde(default)]
     pub role_mapping: HashMap<String, String>,
 
+    /// Role for a sign-in whose identity-provider role has no `role_mapping` entry.
+    /// Unset: such a sign-in is refused.
+    #[serde(default)]
+    pub default_role: Option<String>,
+
     /// Must be false or absent: encrypted assertions are not supported.
     #[serde(default)]
     pub require_encrypted_assertions: bool,
@@ -211,6 +216,8 @@ impl SamlConfig {
                 .to_string());
         }
 
+        config.validate()?;
+
         if config.idp_slo_url.is_some() {
             return Err("idp_slo_url must be null or absent: SAML single logout is not supported, and signing out \
                  ends only the dashboard session. Remove it. See docs/CONFIGURATION_REFERENCE.md#samljson"
@@ -227,6 +234,53 @@ impl SamlConfig {
         }
 
         Ok(config)
+    }
+
+    /// Refuse a `role_mapping` or `default_role` that names a role the gateway does not have.
+    pub fn validate(&self) -> Result<(), String> {
+        for (idp_role, gateway_role) in &self.role_mapping {
+            if crate::auth::types::UserRole::from_config_name(gateway_role).is_none() {
+                return Err(format!(
+                    "SAML role_mapping entry '{idp_role}' names unknown role '{gateway_role}' (expected administrator, poweruser or user)"
+                ));
+            }
+        }
+        if let Some(default_role) = &self.default_role
+            && crate::auth::types::UserRole::from_config_name(default_role).is_none()
+        {
+            return Err(format!(
+                "SAML default_role names unknown role '{default_role}' (expected administrator, poweruser or user)"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Warnings about a role setup that is valid but admits more or fewer sign-ins than intended.
+    pub fn role_warnings(&self) -> Vec<&'static str> {
+        let mut warnings = Vec::new();
+        if self.default_role.as_deref() == Some("administrator") {
+            warnings.push(
+                "SAML default_role is administrator: every sign-in whose role has no role_mapping entry becomes an administrator",
+            );
+        }
+        if self.role_mapping.is_empty() && self.default_role.is_none() {
+            warnings.push(
+                "SAML role_mapping is empty and default_role is unset: every sign-in except the first user's is refused",
+            );
+        }
+        if !self.role_mapping.is_empty()
+            && self
+                .role_mapping
+                .keys()
+                .all(|key| key.starts_with('<') && key.ends_with('>'))
+        {
+            warnings.push(if self.default_role.is_none() {
+                "SAML role_mapping still holds only the <...> placeholder names of the example: every sign-in except the first user's is refused"
+            } else {
+                "SAML role_mapping still holds only the <...> placeholder names of the example: no identity-provider role is mapped, so every sign-in gets default_role"
+            });
+        }
+        warnings
     }
 }
 
@@ -301,6 +355,131 @@ fn collect_unread_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_with(
+        role_mapping: serde_json::Value,
+        default_role: serde_json::Value,
+    ) -> SamlConfig {
+        serde_json::from_value(serde_json::json!({
+            "idp_entity_id": "idp",
+            "idp_sso_url": "https://idp.example/sso",
+            "sp_entity_id": "sp",
+            "sp_acs_url": "https://sp.example/acs",
+            "idp_cert_path": "idp.crt",
+            "sp_key_path": null,
+            "sp_cert_path": null,
+            "role_mapping": role_mapping,
+            "default_role": default_role,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_role_mapping_to_an_unknown_role_is_refused_naming_the_entry() {
+        let err = config_with(serde_json::json!({ "gw-admins": "Administrator" }), serde_json::Value::Null)
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("gw-admins") && err.contains("Administrator"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_default_role_is_refused() {
+        let err = config_with(serde_json::json!({}), serde_json::json!("root"))
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("default_role") && err.contains("root"), "{err}");
+    }
+
+    #[test]
+    fn a_default_role_of_administrator_and_an_empty_setup_each_warn() {
+        let admin_default = config_with(serde_json::json!({}), serde_json::json!("administrator"));
+        assert_eq!(
+            admin_default
+                .role_warnings()
+                .len(),
+            1
+        );
+        assert!(admin_default.role_warnings()[0].contains("administrator"));
+
+        let nothing = config_with(serde_json::json!({}), serde_json::Value::Null);
+        assert_eq!(nothing.role_warnings().len(), 1);
+        assert!(nothing.role_warnings()[0].contains("refused"));
+
+        let mapped = config_with(serde_json::json!({ "gw-all": "user" }), serde_json::Value::Null);
+        assert!(
+            mapped
+                .role_warnings()
+                .is_empty()
+        );
+        let user_default = config_with(serde_json::json!({}), serde_json::json!("user"));
+        assert!(
+            user_default
+                .role_warnings()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_role_mapping_made_only_of_example_placeholders_warns() {
+        let placeholders = config_with(
+            serde_json::json!({ "<idp-admin-group>": "administrator", "<idp-user-group>": "user" }),
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            placeholders
+                .role_warnings()
+                .len(),
+            1
+        );
+        assert!(placeholders.role_warnings()[0].contains("placeholder"));
+
+        let edited = config_with(
+            serde_json::json!({ "<idp-admin-group>": "administrator", "gw-all": "user" }),
+            serde_json::Value::Null,
+        );
+        assert!(
+            edited
+                .role_warnings()
+                .is_empty()
+        );
+        let with_default = config_with(serde_json::json!({ "<idp-user-group>": "user" }), serde_json::json!("user"));
+        assert_eq!(
+            with_default
+                .role_warnings()
+                .len(),
+            1
+        );
+        assert!(with_default.role_warnings()[0].contains("default_role"));
+    }
+
+    fn saml_json_with_roles(role_mapping: &str) -> String {
+        format!(
+            r#"{{"idp_entity_id":"idp","idp_sso_url":"https://idp.example/sso","sp_entity_id":"sp","sp_acs_url":"https://sp.example/acs","idp_cert_path":"idp.crt","sp_key_path":null,"sp_cert_path":null,"role_mapping":{role_mapping}}}"#
+        )
+    }
+
+    #[test]
+    fn loading_saml_json_refuses_an_unknown_role_name_and_accepts_a_known_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("saml.json");
+
+        std::fs::write(&path, saml_json_with_roles(r#"{"x":"Administrator"}"#)).unwrap();
+        let err = SamlConfig::load_from_file(&path).unwrap_err();
+        assert!(err.contains("'x'") && err.contains("Administrator"), "{err}");
+
+        std::fs::write(&path, saml_json_with_roles(r#"{"x":"administrator"}"#)).unwrap();
+        let config = SamlConfig::load_from_file(&path).unwrap();
+        assert_eq!(config.role_mapping["x"], "administrator");
+    }
+
+    #[test]
+    fn known_roles_in_the_mapping_and_default_role_are_accepted() {
+        let config = config_with(
+            serde_json::json!({ "gw-admins": "administrator", "gw-power": "poweruser", "gw-all": "user" }),
+            serde_json::json!("user"),
+        );
+        assert!(config.validate().is_ok());
+    }
 
     #[test]
     fn the_saml_login_throttle_is_off_unless_saml_json_enables_it() {

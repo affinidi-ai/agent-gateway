@@ -177,6 +177,8 @@ and policies. Set new gating on the surface's Transit Point.
   condition can read `input.transit.caller` (the end user the transit token
   names) and `input.transit.client` (the principal the TP authenticated); see
   [Caller in Transit Point policy input](POLICY.md#caller-in-transit-point-policy-input).
+  It also gets the managed agent in `input.extension_identity`, absent while the
+  managed agent has no identity; see the same section.
   Without a transit token the caller is `anonymous`, so gate on
   `input.transit.caller.verified` rather than its negation, as in a gate that
   hides `admin_*` unless the caller is verified (condition `default allow :=

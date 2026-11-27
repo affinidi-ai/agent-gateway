@@ -718,7 +718,7 @@ async fn cached_token(
             .all(|scope| token.scopes.contains(scope));
     Ok(match token.expires_at {
         Some(expires) if matches && usable_at(&token, now) => {
-            if now < expires - renewal_margin(expires - token.created_at) {
+            if now < expires - renewal_margin(expires - token.consent_granted_at) {
                 CachedToken::Fresh(token)
             } else {
                 CachedToken::RenewalDue(token)
@@ -1316,7 +1316,7 @@ mod tests {
         fixture
             .only_stored()
             .await
-            .created_at
+            .consent_granted_at
     }
 
     fn seconds(
@@ -1337,31 +1337,119 @@ mod tests {
         }
     }
 
+    const LIFETIMES_AND_MARGINS: [(i64, i64); 3] = [(120, 60), (400, 200), (3600, 300)];
+
+    /// Asserts that the stored token `value`, issued for `lifetime` seconds, is served from the
+    /// cache until `margin` seconds before it expires and renewed from then on.
+    async fn assert_renewed_margin_before_expiry(
+        fixture: &Fixture,
+        provider: &CredentialProvider,
+        value: &str,
+        lifetime: i64,
+        margin: i64,
+    ) {
+        let renew_at = seconds(
+            fixture
+                .only_stored()
+                .await
+                .expires_at
+                .unwrap(),
+            -margin,
+        );
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(provider, &[], seconds(renew_at, -1))
+                    .await
+            ),
+            (value.into(), Freshness::Cached),
+            "a {lifetime} s token one second before its renewal"
+        );
+        fixture.respond(json!({"access_token": "renewed", "token_type": "Bearer", "expires_in": lifetime}));
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(provider, &[], renew_at)
+                    .await
+            ),
+            ("renewed".into(), Freshness::Fresh),
+            "a {lifetime} s token at its renewal"
+        );
+    }
+
+    /// Moves every time on the only stored token's row back by `age`, as if the row had been
+    /// written that long ago.
+    async fn age_the_row(
+        fixture: &Fixture,
+        age: chrono::Duration,
+    ) -> DelegationToken {
+        let mut row = fixture.only_stored().await;
+        assert!(
+            fixture
+                .vault
+                .delete(&row.id)
+                .await
+                .unwrap()
+        );
+        row.created_at -= age;
+        row.updated_at -= age;
+        row.consent_granted_at -= age;
+        row.last_used_at = row
+            .last_used_at
+            .map(|at| at - age);
+        row.expires_at = row
+            .expires_at
+            .map(|at| at - age);
+        fixture
+            .vault
+            .store(row)
+            .await
+            .unwrap()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_cached_token_is_renewed_five_minutes_before_it_expires() {
-        let fixture = Fixture::new().await;
-        let provider = fixture
-            .provider(client_credentials())
-            .await;
-        let created = cache_a_token(&fixture, &provider).await;
-        assert_eq!(
-            issued(
-                fixture
-                    .acquire(&provider, &[], seconds(created, 3299))
-                    .await
-            ),
-            ("issued".into(), Freshness::Cached)
-        );
-        fixture.respond(json!({"access_token": "renewed", "token_type": "Bearer", "expires_in": 3600}));
-        assert_eq!(
-            issued(
-                fixture
-                    .acquire(&provider, &[], seconds(created, 3300))
-                    .await
-            ),
-            ("renewed".into(), Freshness::Fresh)
-        );
-        assert_eq!(fixture.requests().len(), 2);
+    async fn a_first_token_is_renewed_half_its_lifetime_before_it_expires() {
+        for (lifetime, margin) in LIFETIMES_AND_MARGINS {
+            let fixture = Fixture::new().await;
+            let provider = fixture
+                .provider(client_credentials())
+                .await;
+            fixture.respond(json!({"access_token": "first", "token_type": "Bearer", "expires_in": lifetime}));
+            cache_a_token(&fixture, &provider).await;
+            assert_renewed_margin_before_expiry(&fixture, &provider, "first", lifetime, margin).await;
+            assert_eq!(fixture.requests().len(), 2, "{lifetime}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_stored_in_an_older_row_is_renewed_half_its_own_lifetime_before_it_expires() {
+        for (lifetime, margin) in LIFETIMES_AND_MARGINS {
+            let fixture = Fixture::new().await;
+            let provider = fixture
+                .provider(client_credentials())
+                .await;
+            fixture.respond(json!({"access_token": "first", "token_type": "Bearer", "expires_in": lifetime}));
+            cache_a_token(&fixture, &provider).await;
+            let row = age_the_row(&fixture, chrono::Duration::hours(1)).await;
+            fixture.respond(json!({"access_token": "second", "token_type": "Bearer", "expires_in": lifetime}));
+            assert_eq!(
+                issued(
+                    fixture
+                        .acquire(&provider, &[], Utc::now())
+                        .await
+                ),
+                ("second".into(), Freshness::Fresh),
+                "{lifetime}"
+            );
+            let stored = fixture.only_stored().await;
+            assert_eq!(
+                (stored.id, stored.created_at),
+                (row.id, row.created_at),
+                "a {lifetime} s token's row keeps its id and its date"
+            );
+            assert_renewed_margin_before_expiry(&fixture, &provider, "second", lifetime, margin).await;
+            assert_eq!(fixture.requests().len(), 3, "{lifetime}");
+        }
     }
 
     #[test]

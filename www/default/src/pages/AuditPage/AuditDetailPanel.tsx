@@ -11,7 +11,7 @@ interface AuditDetailPanelProps {
   filteredEntries: AuditEntry[];
   onTitleClick: () => void;
   onQuickFilter: (term: string, cat?: string) => void;
-  /** Names the users policy changes were made by. */
+  /** Names the users changes were made by. */
   userName?: UserNameResolver;
 }
 

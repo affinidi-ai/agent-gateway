@@ -72,25 +72,148 @@ fn format_did_domain(base_url: &str) -> String {
     domain.replace(':', "%3A")
 }
 
-/// Build a didwebvh-rs `Secret` suitable for signing from a JWK private key.
+/// Build the log signer for a JWK private key.
 ///
-/// The library requires the `Secret.id` to be a `did:key:` URI matching one of the
-/// DID log's `update_keys`.  We derive the multibase public key from the JWK,
-/// construct the canonical `did:key:<mb>#<mb>` identifier, and build the secret.
+/// The library requires the signer's verification method to be a `did:key:` URI
+/// matching one of the DID log's `update_keys`; the signer derives the canonical
+/// `did:key:<mb>#<mb>` identifier from the key itself.
 pub(crate) fn build_signing_secret(
     private_key_jwk: &serde_json::Value
-) -> Result<didwebvh_rs::prelude::Secret, String> {
-    let temp_id = "did:key:temp#temp";
-    let raw = didwebvh_rs::prelude::Secret::from_jwk_value(temp_id, private_key_jwk)
-        .map_err(|e| format!("Failed to build key Secret: {e}"))?;
-    let mb = raw
-        .get_public_keymultibase()
-        .map_err(|e| format!("Failed to get key multibase: {e}"))?;
-    let key_id = format!("did:key:{0}#{0}", mb);
-    let mut secret = didwebvh_rs::prelude::Secret::from_jwk_value(&key_id, private_key_jwk)
-        .map_err(|e| format!("Failed to build signing Secret: {e}"))?;
-    secret.id = key_id;
-    Ok(secret)
+) -> Result<crate::vta::local::VtaDiSigner, String> {
+    crate::vta::local::VtaDiSigner::from_jwk(private_key_jwk)
+        .map_err(|e| format!("Failed to build signing key: {}", e.log_detail()))
+}
+
+type HandlerError = (StatusCode, Json<ErrorResponse>);
+
+/// One lock per identity, held across reading the log, signing, appending and
+/// saving the record, so two changes never sign from the same log entry and
+/// fork the log.
+static IDENTITY_CHANGE_LOCKS: std::sync::LazyLock<dashmap::DashMap<Uuid, Arc<tokio::sync::Mutex<()>>>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// Holds an identity's change lock, and removes the lock once no change holds
+/// or waits for it.
+struct IdentityChange {
+    id: Uuid,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for IdentityChange {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        IDENTITY_CHANGE_LOCKS.remove_if(&self.id, |_, lock| Arc::strong_count(lock) == 1);
+    }
+}
+
+/// Takes identity `id`'s change lock and loads it, finishing a key rotation
+/// that stopped after saving its new key. Hold the guard until the change is
+/// saved.
+async fn identity_for_change(
+    state: &DidWebVhApiState,
+    id: &Uuid,
+) -> Result<(DidWebVhIdentity, IdentityChange), HandlerError> {
+    let lock = IDENTITY_CHANGE_LOCKS
+        .entry(*id)
+        .or_default()
+        .clone();
+    let guard = IdentityChange {
+        id: *id,
+        guard: Some(lock.lock_owned().await),
+    };
+    let mut identity = state
+        .identity_store
+        .get(id)
+        .await
+        .map_err(|e| {
+            error!("Failed to retrieve identity: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::with_details("Failed to retrieve identity", e.to_string())),
+            )
+        })?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(ErrorResponse::new("Identity not found"))))?;
+    if identity
+        .pending_key_pair
+        .is_some()
+    {
+        finish_pending_rotation(state, &mut identity).await?;
+    }
+    Ok((identity, guard))
+}
+
+/// Settles a rotation whose new key was saved but whose record was not
+/// updated after: the new key becomes the signing key when the newest log
+/// entry names it as update key, and is dropped when it does not.
+async fn finish_pending_rotation(
+    state: &DidWebVhApiState,
+    identity: &mut DidWebVhIdentity,
+) -> Result<(), HandlerError> {
+    let Some(pending) = identity
+        .pending_key_pair
+        .take()
+    else {
+        return Ok(());
+    };
+    let internal = |message: &str, details: String| {
+        error!("{message}: {details}");
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::with_details(message, details)))
+    };
+    let raw_entries = state
+        .log_storage
+        .load_all_raw(&identity.did)
+        .await
+        .map_err(|e| internal("Failed to load DID log", e.to_string()))?;
+    let newest: Option<super::types::LogEntry> = raw_entries
+        .last()
+        .map(|raw| serde_json::from_str(raw))
+        .transpose()
+        .map_err(|e| internal("Failed to parse last log entry", e.to_string()))?;
+    let pending_key = build_signing_secret(&pending.private_key)
+        .map(|signer| {
+            signer
+                .public_multibase()
+                .to_string()
+        })
+        .map_err(|e| internal("Failed to read the pending key", e))?;
+    if newest.is_some_and(|entry| {
+        entry
+            .parameters
+            .update_keys
+            .contains(&pending_key)
+    }) {
+        info!("Finishing the key rotation of DID:webvh identity {} that its log already holds", identity.id);
+        identity.key_pair = Some(pending);
+        identity.version += 1;
+        identity.updated_at = chrono::Utc::now();
+    } else {
+        warn!("Dropping the pending key of DID:webvh identity {}: its log never took it", identity.id);
+    }
+    state
+        .identity_store
+        .update(identity.clone())
+        .await
+        .map_err(|e| internal("Failed to update identity", e.to_string()))
+}
+
+/// Waits until a new log version can be dated later than the newest of
+/// `raw_entries`: a version's `versionTime`, in whole seconds, must be later
+/// than the previous one's, or the log refuses it and every later change.
+async fn wait_for_next_version_time(raw_entries: &[String]) -> Result<(), String> {
+    let Some(newest) = raw_entries.last() else {
+        return Ok(());
+    };
+    let newest: super::types::LogEntry =
+        serde_json::from_str(newest).map_err(|e| format!("Failed to parse last log entry: {e}"))?;
+    let previous = chrono::DateTime::parse_from_rfc3339(&newest.version_time)
+        .map_err(|e| format!("The last log entry has an invalid versionTime: {e}"))?;
+    if let Some(wait) =
+        crate::identity::didwebvh::signing_key_repair::wait_before_next_version(previous.to_utc(), chrono::Utc::now())
+            .map_err(|e| e.to_string())?
+    {
+        tokio::time::sleep(wait).await;
+    }
+    Ok(())
 }
 
 /// Load raw log entries and build a validated `DIDWebVHState`.
@@ -105,6 +228,7 @@ async fn load_raw_and_build_state(
         .load_all_raw(did)
         .await
         .map_err(|e| format!("Failed to load DID log: {e}"))?;
+    wait_for_next_version_time(&raw_entries).await?;
     let webvh_state = build_webvh_state(did, &raw_entries).await?;
     Ok((raw_entries, webvh_state))
 }
@@ -261,6 +385,7 @@ pub async fn create_identity(
     // Create identity record with the final SCID-based DID
     let now = chrono::Utc::now();
     let identity = DidWebVhIdentity {
+        pending_key_pair: None,
         id,
         did: final_did.clone(),
         key_pair: Some(key_pair),
@@ -603,19 +728,7 @@ pub async fn delete_identity(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     info!("Deactivating DID:webvh identity {}", id);
 
-    // Get existing identity
-    let mut identity = state
-        .identity_store
-        .get(&id)
-        .await
-        .map_err(|e| {
-            error!("Failed to retrieve identity: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::with_details("Failed to retrieve identity", e.to_string())),
-            )
-        })?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(ErrorResponse::new("Identity not found"))))?;
+    let (mut identity, _change) = identity_for_change(&state, &id).await?;
 
     if !identity.active {
         return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse::new("Identity already deactivated"))));
@@ -644,7 +757,7 @@ pub async fn delete_identity(
 
     // Deactivate via library — handles pre-rotation teardown automatically
     let update_result = didwebvh_rs::prelude::update_did(
-        didwebvh_rs::prelude::UpdateDIDConfig::builder()
+        didwebvh_rs::prelude::UpdateDIDConfig::<crate::vta::local::VtaDiSigner, crate::vta::local::VtaDiSigner>::builder_generic()
             .state(webvh_state)
             .signing_key(signing_secret)
             .deactivate(true)
@@ -852,19 +965,7 @@ pub async fn update_identity(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     info!("Updating DID:webvh identity {}", id);
 
-    // Get existing identity
-    let mut identity = state
-        .identity_store
-        .get(&id)
-        .await
-        .map_err(|e| {
-            error!("Failed to retrieve identity: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::with_details("Failed to retrieve identity", e.to_string())),
-            )
-        })?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(ErrorResponse::new("Identity not found"))))?;
+    let (mut identity, _change) = identity_for_change(&state, &id).await?;
 
     if !identity.active {
         return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse::new("Cannot update inactive identity"))));
@@ -901,10 +1002,13 @@ pub async fn update_identity(
     })?;
 
     // Build update config with optional parameter changes
-    let mut builder = didwebvh_rs::prelude::UpdateDIDConfig::builder()
-        .state(webvh_state)
-        .signing_key(signing_secret)
-        .document(new_doc_json);
+    let mut builder = didwebvh_rs::prelude::UpdateDIDConfig::<
+        crate::vta::local::VtaDiSigner,
+        crate::vta::local::VtaDiSigner,
+    >::builder_generic()
+    .state(webvh_state)
+    .signing_key(signing_secret)
+    .document(new_doc_json);
 
     if let Some(ttl) = request.ttl {
         builder = builder.ttl(ttl);
@@ -1006,19 +1110,7 @@ pub async fn rotate_keys(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     info!("Rotating keys for DID:webvh identity {}", id);
 
-    // Get existing identity
-    let mut identity = state
-        .identity_store
-        .get(&id)
-        .await
-        .map_err(|e| {
-            error!("Failed to retrieve identity: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::with_details("Failed to retrieve identity", e.to_string())),
-            )
-        })?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(ErrorResponse::new("Identity not found"))))?;
+    let (mut identity, _change) = identity_for_change(&state, &id).await?;
 
     if !identity.active {
         return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse::new("Cannot rotate keys for inactive identity"))));
@@ -1137,14 +1229,8 @@ pub async fn rotate_keys(
         (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::with_details("Failed to build new key", e)))
     })?;
     let new_mb = new_secret
-        .get_public_keymultibase()
-        .map_err(|e| {
-            error!("Failed to get new key multibase: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::with_details("Failed to get new key multibase", e.to_string())),
-            )
-        })?;
+        .public_multibase()
+        .to_string();
 
     // Build DIDWebVHState from raw log entries (preserves original bytes for validation)
     let (_, webvh_state) = load_raw_and_build_state(state.log_storage.as_ref(), &did)
@@ -1156,7 +1242,7 @@ pub async fn rotate_keys(
 
     // Call update_did() — library computes entry hash, verifies auth, signs
     let update_result = didwebvh_rs::prelude::update_did(
-        didwebvh_rs::prelude::UpdateDIDConfig::builder()
+        didwebvh_rs::prelude::UpdateDIDConfig::<crate::vta::local::VtaDiSigner, crate::vta::local::VtaDiSigner>::builder_generic()
             .state(webvh_state)
             .signing_key(old_secret)
             .update_keys(vec![didwebvh_rs::Multibase::new(new_mb)])
@@ -1192,6 +1278,19 @@ pub async fn rotate_keys(
         )
     })?;
 
+    identity.pending_key_pair = Some(new_key_pair.clone());
+    state
+        .identity_store
+        .update(identity.clone())
+        .await
+        .map_err(|e| {
+            error!("Failed to save the new key before rotating: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::with_details("Failed to save the new key", e.to_string())),
+            )
+        })?;
+
     state
         .log_storage
         .append_raw(&did, &new_entry_json)
@@ -1206,8 +1305,8 @@ pub async fn rotate_keys(
 
     let now = chrono::Utc::now();
 
-    // Update identity record with new key pair
     identity.key_pair = Some(new_key_pair.clone());
+    identity.pending_key_pair = None;
     identity.version += 1;
     identity.updated_at = now;
 
@@ -1524,19 +1623,7 @@ pub async fn transfer_ownership(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     info!("Transferring ownership for identity {}", id);
 
-    // Get existing identity
-    let mut identity = state
-        .identity_store
-        .get(&id)
-        .await
-        .map_err(|e| {
-            error!("Failed to retrieve identity: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::with_details("Failed to retrieve identity", e.to_string())),
-            )
-        })?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(ErrorResponse::new("Identity not found"))))?;
+    let (mut identity, _change) = identity_for_change(&state, &id).await?;
 
     if !identity.active {
         return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse::new("Cannot transfer inactive identity"))));
@@ -1583,6 +1670,13 @@ pub async fn transfer_ownership(
         (StatusCode::UNAUTHORIZED, Json(ErrorResponse::with_details("Current owner authorization rejected", e)))
     })?;
 
+    wait_for_next_version_time(&raw_entries)
+        .await
+        .map_err(|e| {
+            error!("Cannot date the next DID log version: {}", e);
+            (StatusCode::CONFLICT, Json(ErrorResponse::with_details("Cannot date the next DID log version", e)))
+        })?;
+
     // Build DIDWebVHState from raw log (preserves signatures)
     let webvh_state = build_webvh_state(&did, &raw_entries)
         .await
@@ -1621,7 +1715,7 @@ pub async fn transfer_ownership(
 
     // Use update_did() with no document change — just creates a signed log entry
     let update_result = didwebvh_rs::prelude::update_did(
-        didwebvh_rs::prelude::UpdateDIDConfig::builder()
+        didwebvh_rs::prelude::UpdateDIDConfig::<crate::vta::local::VtaDiSigner, crate::vta::local::VtaDiSigner>::builder_generic()
             .state(webvh_state)
             .signing_key(signing_secret)
             .build()
@@ -1932,7 +2026,7 @@ fn compute_key_hash(public_key_jwk: &serde_json::Value) -> anyhow::Result<String
     use sha2::{Digest, Sha256};
 
     // Canonicalize the public key JWK using JCS (RFC 8785)
-    let canonical = serde_jcs::to_string(public_key_jwk).context("Failed to canonicalize public key")?;
+    let canonical = serde_json_canonicalizer::to_string(public_key_jwk).context("Failed to canonicalize public key")?;
 
     // Compute SHA-256 hash
     let mut hasher = Sha256::new();
@@ -2522,6 +2616,7 @@ mod tests {
 
         let id = Uuid::new_v4();
         let identity = DidWebVhIdentity {
+            pending_key_pair: None,
             id,
             did: "did:webvh:example.com:alice".to_string(),
             key_pair: None,
@@ -2565,6 +2660,7 @@ mod tests {
 
         for i in 0..2 {
             let identity = DidWebVhIdentity {
+                pending_key_pair: None,
                 id: Uuid::new_v4(),
                 did: format!("did:webvh:example.com:user{}", i),
                 key_pair: None,
@@ -2605,6 +2701,7 @@ mod tests {
 
         let id = Uuid::new_v4();
         let identity = DidWebVhIdentity {
+            pending_key_pair: None,
             id,
             did: "did:webvh:example.com:dave".to_string(),
             key_pair: None,
@@ -3225,6 +3322,199 @@ mod tests {
         (state, id, key_pair)
     }
 
+    async fn rotate(
+        state: &DidWebVhApiState,
+        id: Uuid,
+        new_key_pair: &KeyPair,
+    ) -> Result<(), StatusCode> {
+        rotate_keys(
+            State(state.clone()),
+            Path(id),
+            Json(RotateKeysRequest {
+                new_key_pair: Some(new_key_pair.clone()),
+            }),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|(status, _)| status)
+    }
+
+    async fn stored(
+        state: &DidWebVhApiState,
+        id: Uuid,
+    ) -> DidWebVhIdentity {
+        state
+            .identity_store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    fn log_versions(entries: &[super::super::types::LogEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .version_id
+                    .split('-')
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_rotation_leaves_the_new_key_as_the_signing_key_and_nothing_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, id, _) = api_state_with_identity(tmp.path()).await;
+        let new_key = generate_ed25519_keypair().unwrap();
+
+        rotate(&state, id, &new_key)
+            .await
+            .unwrap();
+
+        let identity = stored(&state, id).await;
+        assert_eq!(
+            identity
+                .key_pair
+                .unwrap()
+                .private_key,
+            new_key.private_key
+        );
+        assert!(
+            identity
+                .pending_key_pair
+                .is_none()
+        );
+        rotate(&state, id, &generate_ed25519_keypair().unwrap())
+            .await
+            .expect("the new key signs the next change");
+    }
+
+    #[tokio::test]
+    async fn a_rotation_stopped_after_its_log_entry_is_finished_by_the_next_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, id, old_key) = api_state_with_identity(tmp.path()).await;
+        let new_key = generate_ed25519_keypair().unwrap();
+        rotate(&state, id, &new_key)
+            .await
+            .unwrap();
+        let mut interrupted = stored(&state, id).await;
+        interrupted.key_pair = Some(old_key);
+        interrupted.pending_key_pair = Some(new_key.clone());
+        interrupted.version -= 1;
+        state
+            .identity_store
+            .update(interrupted.clone())
+            .await
+            .unwrap();
+
+        rotate(&state, id, &generate_ed25519_keypair().unwrap())
+            .await
+            .expect("the change signs with the key the log already holds");
+
+        let identity = stored(&state, id).await;
+        assert!(
+            identity
+                .pending_key_pair
+                .is_none()
+        );
+        assert_eq!(identity.version, interrupted.version + 2);
+    }
+
+    #[tokio::test]
+    async fn an_identity_change_lock_is_removed_once_nothing_holds_or_awaits_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, id, _) = api_state_with_identity(tmp.path()).await;
+
+        let (_, change) = identity_for_change(&state, &id)
+            .await
+            .unwrap();
+        let waiter = IDENTITY_CHANGE_LOCKS
+            .get(&id)
+            .map(|lock| Arc::clone(&lock))
+            .expect("held while the change runs");
+        drop(change);
+        assert!(IDENTITY_CHANGE_LOCKS.contains_key(&id), "kept while another change awaits it");
+
+        let (_, next) = identity_for_change(&state, &id)
+            .await
+            .unwrap();
+        drop(waiter);
+        drop(next);
+        assert!(!IDENTITY_CHANGE_LOCKS.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn a_pending_key_the_log_never_took_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, id, old_key) = api_state_with_identity(tmp.path()).await;
+        let mut interrupted = stored(&state, id).await;
+        interrupted.pending_key_pair = Some(generate_ed25519_keypair().unwrap());
+        state
+            .identity_store
+            .update(interrupted)
+            .await
+            .unwrap();
+
+        let (identity, _change) = identity_for_change(&state, &id)
+            .await
+            .unwrap();
+
+        assert!(
+            identity
+                .pending_key_pair
+                .is_none()
+        );
+        assert_eq!(
+            identity
+                .key_pair
+                .unwrap()
+                .private_key,
+            old_key.private_key
+        );
+        assert!(
+            stored(&state, id)
+                .await
+                .pending_key_pair
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_rotations_each_append_their_own_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, id, _) = api_state_with_identity(tmp.path()).await;
+        let (first, second) = (generate_ed25519_keypair().unwrap(), generate_ed25519_keypair().unwrap());
+
+        let (a, b) = tokio::join!(rotate(&state, id, &first), rotate(&state, id, &second));
+
+        assert_eq!((a, b), (Ok(()), Ok(())));
+        let did = stored(&state, id).await.did;
+        let entries = state
+            .log_storage
+            .load_all(&did)
+            .await
+            .unwrap();
+        assert_eq!(log_versions(&entries), vec!["1", "2", "3"], "each change appended its own next version");
+        load_raw_and_build_state(state.log_storage.as_ref(), &did)
+            .await
+            .expect("the log still validates");
+        let identity = stored(&state, id).await;
+        let signing = identity
+            .key_pair
+            .unwrap()
+            .private_key;
+        assert!(signing == first.private_key || signing == second.private_key);
+        assert!(
+            identity
+                .pending_key_pair
+                .is_none()
+        );
+    }
+
     fn transfer_request(
         new_controller: &str,
         authorization: &str,
@@ -3278,6 +3568,7 @@ mod tests {
             .unwrap()
             .to_string();
         let identity = DidWebVhIdentity {
+            pending_key_pair: None,
             id: Uuid::new_v4(),
             did: "did:webvh:example.com:alice".to_string(),
             key_pair: Some(KeyPair {

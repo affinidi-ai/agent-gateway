@@ -166,6 +166,7 @@ async fn inject_vp_into_mcp(
     strip_raw_meta: bool,
     target: McpMetaTarget,
     context: McpMetadataContext,
+    scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<(bytes::Bytes, Option<String>)> {
     let mut message_json: JsonValue = serde_json::from_slice(message_bytes)?;
     super::meta::normalize_metadata(&mut message_json, context)?;
@@ -202,6 +203,7 @@ async fn inject_vp_into_mcp(
             None,
             None,
             inbound_chained_vcs,
+            scope,
         )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create identity presentation: {}", e))?;
@@ -246,6 +248,7 @@ pub async fn inject_vp_into_mcp_response(
     meta_field: &str,
     strip_raw_meta: bool,
     context: McpMetadataContext,
+    scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<(bytes::Bytes, Option<String>)> {
     inject_vp_into_mcp(
         response_bytes,
@@ -259,6 +262,7 @@ pub async fn inject_vp_into_mcp_response(
         strip_raw_meta,
         McpMetaTarget::Result,
         context,
+        scope,
     )
     .await
 }
@@ -274,6 +278,7 @@ pub async fn inject_vp_into_mcp_request(
     meta_field: &str,
     strip_raw_meta: bool,
     context: McpMetadataContext,
+    scope: &crate::vta::key_directory::KeyScope,
 ) -> anyhow::Result<(bytes::Bytes, Option<String>)> {
     inject_vp_into_mcp(
         request_bytes,
@@ -287,6 +292,7 @@ pub async fn inject_vp_into_mcp_request(
         strip_raw_meta,
         McpMetaTarget::TopLevel,
         context,
+        scope,
     )
     .await
 }
@@ -311,6 +317,7 @@ mod tests {
             "agentIdentity",
             true,
             context,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -379,6 +386,7 @@ mod tests {
             "agentIdentity",
             true,
             modern_context(&request),
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -417,6 +425,7 @@ mod tests {
             "serverIdentity",
             false,
             modern_context(&modern_tools_call()),
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -451,6 +460,7 @@ mod tests {
                 "serverIdentity",
                 false,
                 McpMetadataContext::default(),
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -488,6 +498,70 @@ mod tests {
         (Arc::new(issuer), tmp, did)
     }
 
+    /// The credential an MCP message carries is issued under the key of the
+    /// surface serving it: a surface whose trust agent cannot issue gets no
+    /// credential, never one from the gateway's key.
+    #[tokio::test]
+    async fn injection_follows_the_signing_of_the_surface_it_serves() {
+        let (issuer, tmp, did) = issuer_with_did().await;
+        crate::identity::test_helpers::map_surface_to_unusable_trust_agent(&issuer, tmp.path(), "surface-mapped").await;
+        let request = bytes::Bytes::from(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "echo"}})
+                .to_string(),
+        );
+        let response =
+            bytes::Bytes::from(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"content": []}}).to_string());
+        let context = McpMetadataContext::legacy(Some(crate::config::McpLegacyMetadataOutput::Canonical));
+        let inject_request = |scope: crate::vta::key_directory::KeyScope| {
+            let (request, issuer, did) = (request.clone(), Arc::clone(&issuer), did.clone());
+            async move {
+                inject_vp_into_mcp_request(
+                    &request,
+                    &did,
+                    &identity_fields(),
+                    None,
+                    &issuer,
+                    "test",
+                    vec![],
+                    "agentIdentity",
+                    true,
+                    context,
+                    &scope,
+                )
+                .await
+            }
+        };
+
+        let err = inject_request(crate::vta::key_directory::KeyScope::surface("surface-mapped"))
+            .await
+            .expect_err("the request's surface cannot issue");
+        assert!(
+            err.to_string()
+                .contains("vta-gone"),
+            "{err}"
+        );
+        let (_, proof) = inject_request(crate::vta::key_directory::KeyScope::surface("surface-unmapped"))
+            .await
+            .expect("an unmapped surface issues as before");
+        assert!(proof.is_some());
+
+        inject_vp_into_mcp_response(
+            &response,
+            &did,
+            &identity_fields(),
+            None,
+            &issuer,
+            "test",
+            vec![],
+            "serverIdentity",
+            false,
+            context,
+            &crate::vta::key_directory::KeyScope::surface("surface-mapped"),
+        )
+        .await
+        .expect_err("the response's surface cannot issue");
+    }
+
     #[tokio::test]
     async fn request_injection_targets_top_level_meta_on_params_only_body() {
         let (issuer, _tmp, did) = issuer_with_did().await;
@@ -512,6 +586,7 @@ mod tests {
             "agentIdentity",
             false,
             McpMetadataContext::default(),
+            &Default::default(),
         )
         .await
         .expect("request injection must succeed on a params-only body");
@@ -570,6 +645,7 @@ mod tests {
             "serverIdentity",
             false,
             McpMetadataContext::default(),
+            &Default::default(),
         )
         .await
         .expect_err("response injection must fail without a result object");
@@ -602,6 +678,7 @@ mod tests {
             "serverIdentity",
             false,
             McpMetadataContext::default(),
+            &Default::default(),
         )
         .await
         .expect("response injection must succeed with a result object");

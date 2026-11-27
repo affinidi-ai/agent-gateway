@@ -15,8 +15,8 @@ use crate::config::types::X402Config;
 use crate::identity::handlers::config::X402ConfigResponse;
 
 lazy_static::lazy_static! {
-    /// Global cache for x402 configuration
-    /// Contains the full X402Config including facilitator_private_keys
+    /// Global cache for x402 configuration, without the ignored
+    /// `facilitator_private_keys` the loader drops
     static ref X402_CONFIG_CACHE: Arc<RwLock<Option<Arc<X402Config>>>> =
         Arc::new(RwLock::new(None));
 

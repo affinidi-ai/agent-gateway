@@ -239,7 +239,7 @@ async fn record_refusals(
 
 /// An id read from a request path, kept to the characters ids use and to a
 /// bounded length, as the path is untrusted.
-fn untrusted_id(id: &str) -> String {
+pub(crate) fn untrusted_id(id: &str) -> String {
     id.chars()
         .take(MAX_ID_CHARS)
         .map(|c| {

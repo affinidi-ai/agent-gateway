@@ -888,168 +888,127 @@ pub async fn resolve_delegation_credentials(
                     "Delegation token expired — attempting refresh"
                 );
 
-                // Load provider to get token endpoint
-                match provider_store
-                    .get(&binding.credential_provider_id)
-                    .await
+                match oauth::refresh_access_token(
+                    &provider,
+                    token
+                        .refresh_token
+                        .as_deref()
+                        .unwrap_or_default(),
+                    secrets_store,
+                )
+                .await
                 {
-                    Ok(Some(provider)) => {
-                        match oauth::refresh_access_token(
-                            &provider,
-                            token
-                                .refresh_token
-                                .as_deref()
-                                .unwrap_or_default(),
-                            secrets_store,
-                        )
-                        .await
-                        {
-                            Ok(oauth::RefreshedToken {
-                                response: refreshed,
-                                insecure_endpoint,
-                            }) => {
-                                token.access_token = refreshed.access_token.clone();
-                                if let Some(rt) = &refreshed.refresh_token {
-                                    token.refresh_token = Some(rt.clone());
-                                }
-                                if let Some(exp) = refreshed.expires_in {
-                                    token.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(exp));
-                                }
-                                token = match vault_store
-                                    .update(token)
-                                    .await
-                                {
-                                    Ok(stored) => stored,
-                                    Err(error) => {
-                                        results.push(refreshed_token_rejected(
-                                            binding,
-                                            &provider,
-                                            &error,
-                                            surface_variant,
-                                        ));
-                                        continue;
-                                    }
-                                };
-                                if let Err(e) = vault_store
-                                    .mark_used(&token.id)
-                                    .await
-                                {
-                                    warn!(
-                                        target: "credential_delegation",
-                                        surface_variant,
-                                        token_id = %token.id,
-                                        error = %e,
-                                        "Failed to mark refreshed token as used"
-                                    );
-                                }
-
-                                info!(
-                                    target: "credential_delegation",
-                                    surface_variant,
-                                    surface_id = %channel_id,
-                                    provider_id = %binding.credential_provider_id,
-                                    "Token refreshed successfully"
-                                );
-
-                                let refresh_detail = if insecure_endpoint {
-                                    INSECURE_TOKEN_ENDPOINT_DETAIL
-                                } else {
-                                    ""
-                                };
-
-                                // Logged: token refreshed
-                                audit::emit("token_refreshed", || {
-                                    let mut evt = audit::audit_event(
-                                        DelegationAuditAction::TokenRefreshed,
-                                        Some(agent_did),
-                                        Some(user_identity_hash),
-                                        Some(&binding.credential_provider_id),
-                                        Some(channel_id),
-                                    );
-                                    evt.token_id = Some(token.id.clone());
-                                    evt.via_fabric = via_fabric;
-                                    enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
-                                    evt
-                                });
-
-                                audit::emit("token_injected", || {
-                                    let mut evt = audit::audit_event(
-                                        DelegationAuditAction::TokenInjected,
-                                        Some(agent_did),
-                                        Some(user_identity_hash),
-                                        Some(&binding.credential_provider_id),
-                                        Some(channel_id),
-                                    );
-                                    evt.token_id = Some(token.id.clone());
-                                    evt.via_fabric = via_fabric;
-                                    evt.detail = Some(format!("after_refresh{refresh_detail}"));
-                                    enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
-                                    evt
-                                });
-
-                                let headers = build_injection_headers(&binding.inject_as, &token.access_token);
-                                results.push(DelegationResolution::new(
-                                    binding,
-                                    Some(&provider.name),
-                                    DelegationActionOutcome::TokenRefreshed,
-                                    None,
-                                    DelegationLookupResult::Inject(headers),
-                                ));
-                            }
-                            Err(e) => {
-                                warn!(
-                                    target: "credential_delegation",
-                                    surface_variant,
-                                    surface_id = %channel_id,
-                                    provider_id = %binding.credential_provider_id,
-                                    error = %e,
-                                    "Token refresh failed — requesting new consent"
-                                );
-                                // Logged: refresh failed
-                                audit::emit("refresh_failed", || {
-                                    let mut evt = audit::audit_event(
-                                        DelegationAuditAction::RefreshFailed,
-                                        Some(agent_did),
-                                        Some(user_identity_hash),
-                                        Some(&binding.credential_provider_id),
-                                        Some(channel_id),
-                                    );
-                                    evt.via_fabric = via_fabric;
-                                    evt.detail = Some(e.to_string());
-                                    enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
-                                    evt
-                                });
-                                // Fall through to consent_required
-                                let cr = build_consent_required(
-                                    binding,
-                                    user_identity_hash,
-                                    agent_did,
-                                    channel_id,
-                                    consent_caller,
-                                    provider_store,
-                                    secrets_store,
-                                    gateway_base_url,
-                                    surface_variant,
-                                    ask,
-                                )
-                                .await;
-                                results.push(DelegationResolution::new(
-                                    binding,
-                                    Some(&provider.name),
-                                    DelegationActionOutcome::RefreshFailed,
-                                    Some(e.to_string()),
-                                    cr,
-                                ));
-                            }
+                    Ok(oauth::RefreshedToken {
+                        response: refreshed,
+                        insecure_endpoint,
+                    }) => {
+                        token.access_token = refreshed.access_token.clone();
+                        if let Some(rt) = &refreshed.refresh_token {
+                            token.refresh_token = Some(rt.clone());
                         }
+                        if let Some(exp) = refreshed.expires_in {
+                            token.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(exp));
+                        }
+                        token = match vault_store
+                            .update(token)
+                            .await
+                        {
+                            Ok(stored) => stored,
+                            Err(error) => {
+                                results.push(refreshed_token_rejected(binding, &provider, &error, surface_variant));
+                                continue;
+                            }
+                        };
+                        if let Err(e) = vault_store
+                            .mark_used(&token.id)
+                            .await
+                        {
+                            warn!(
+                                target: "credential_delegation",
+                                surface_variant,
+                                token_id = %token.id,
+                                error = %e,
+                                "Failed to mark refreshed token as used"
+                            );
+                        }
+
+                        info!(
+                            target: "credential_delegation",
+                            surface_variant,
+                            surface_id = %channel_id,
+                            provider_id = %binding.credential_provider_id,
+                            "Token refreshed successfully"
+                        );
+
+                        let refresh_detail = if insecure_endpoint {
+                            INSECURE_TOKEN_ENDPOINT_DETAIL
+                        } else {
+                            ""
+                        };
+
+                        // Logged: token refreshed
+                        audit::emit("token_refreshed", || {
+                            let mut evt = audit::audit_event(
+                                DelegationAuditAction::TokenRefreshed,
+                                Some(agent_did),
+                                Some(user_identity_hash),
+                                Some(&binding.credential_provider_id),
+                                Some(channel_id),
+                            );
+                            evt.token_id = Some(token.id.clone());
+                            evt.via_fabric = via_fabric;
+                            enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
+                            evt
+                        });
+
+                        audit::emit("token_injected", || {
+                            let mut evt = audit::audit_event(
+                                DelegationAuditAction::TokenInjected,
+                                Some(agent_did),
+                                Some(user_identity_hash),
+                                Some(&binding.credential_provider_id),
+                                Some(channel_id),
+                            );
+                            evt.token_id = Some(token.id.clone());
+                            evt.via_fabric = via_fabric;
+                            evt.detail = Some(format!("after_refresh{refresh_detail}"));
+                            enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
+                            evt
+                        });
+
+                        let headers = build_injection_headers(&binding.inject_as, &token.access_token);
+                        results.push(DelegationResolution::new(
+                            binding,
+                            Some(&provider.name),
+                            DelegationActionOutcome::TokenRefreshed,
+                            None,
+                            DelegationLookupResult::Inject(headers),
+                        ));
                     }
-                    _ => {
+                    Err(e) => {
                         warn!(
                             target: "credential_delegation",
                             surface_variant,
+                            surface_id = %channel_id,
                             provider_id = %binding.credential_provider_id,
-                            "Cannot refresh — credential provider not found"
+                            error = %e,
+                            "Token refresh failed — requesting new consent"
                         );
+                        // Logged: refresh failed
+                        audit::emit("refresh_failed", || {
+                            let mut evt = audit::audit_event(
+                                DelegationAuditAction::RefreshFailed,
+                                Some(agent_did),
+                                Some(user_identity_hash),
+                                Some(&binding.credential_provider_id),
+                                Some(channel_id),
+                            );
+                            evt.via_fabric = via_fabric;
+                            evt.detail = Some(e.to_string());
+                            enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
+                            evt
+                        });
+                        // Fall through to consent_required
                         let cr = build_consent_required(
                             binding,
                             user_identity_hash,
@@ -1067,7 +1026,7 @@ pub async fn resolve_delegation_credentials(
                             binding,
                             Some(&provider.name),
                             DelegationActionOutcome::RefreshFailed,
-                            Some("provider_missing_for_refresh".to_string()),
+                            Some(e.to_string()),
                             cr,
                         ));
                     }
@@ -2835,6 +2794,7 @@ mod tests {
         token.user_identity_hash = "__client_credentials__".to_string();
         token.access_token = "cached-service-token".to_string();
         token.created_at = now - Duration::seconds(3400);
+        token.consent_granted_at = token.created_at;
         token.expires_at = Some(now + Duration::seconds(200));
         let vault: Arc<dyn DelegationVaultStorage> = MockVaultStore::new(VaultLookupResult::Found(token));
         let directory = tempfile::tempdir().unwrap();
@@ -3100,10 +3060,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_refused_refresh_logs_only_the_oauth_error_code_and_audits_nothing() {
-        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
-        let directory = tempfile::tempdir().unwrap();
+    /// A secrets store in `directory` holding the `CLIENT_ID` and `CLIENT_SECRET` of
+    /// `make_credential_provider`.
+    async fn client_secrets(directory: &tempfile::TempDir) -> Arc<dyn SecretsStore> {
         let secrets: Arc<dyn SecretsStore> = Arc::new(
             crate::secrets::FilesystemSecretsStore::new_async(
                 directory
@@ -3128,15 +3087,21 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let app = axum::Router::new().fallback(axum::routing::post(|| async {
-            (
-                axum::http::StatusCode::BAD_REQUEST,
-                axum::Json(serde_json::json!({
-                    "error": "invalid_grant",
-                    "error_description": "description-marker",
-                    "error_uri": "https://idp.example/uri-marker"
-                })),
-            )
+        secrets
+    }
+
+    /// A loopback http token endpoint that answers every request with `status` and `body`,
+    /// with the number of requests it received. It serves until the returned set is dropped.
+    async fn loopback_token_endpoint(
+        status: axum::http::StatusCode,
+        body: serde_json::Value,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>, tokio::task::JoinSet<()>) {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = requests.clone();
+        let app = axum::Router::new().fallback(axum::routing::post(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = body.clone();
+            async move { (status, axum::Json(body)) }
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3148,6 +3113,148 @@ mod tests {
                 .await
                 .unwrap();
         });
+        (token_endpoint, requests, server)
+    }
+
+    /// A provider store that answers the first read with `checked` and every later one with
+    /// `retyped`: what a request sees when its provider is retyped while it is resolved.
+    struct RetypedAfterFirstRead {
+        checked: CredentialProvider,
+        retyped: CredentialProvider,
+        read: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl CredentialProviderStorage for RetypedAfterFirstRead {
+        async fn get_checked(
+            &self,
+            id: &str,
+        ) -> Result<Option<CredentialProvider>> {
+            self.get(id).await
+        }
+        async fn create(
+            &self,
+            provider: CredentialProvider,
+        ) -> Result<CredentialProvider> {
+            Ok(provider)
+        }
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> Result<Option<CredentialProvider>> {
+            let read_before = self
+                .read
+                .swap(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(if read_before {
+                self.retyped.clone()
+            } else {
+                self.checked.clone()
+            }))
+        }
+        async fn list(&self) -> Result<Vec<CredentialProvider>> {
+            Ok(vec![self.retyped.clone()])
+        }
+        async fn update(
+            &self,
+            provider: CredentialProvider,
+        ) -> Result<CredentialProvider> {
+            Ok(provider)
+        }
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+        async fn find_by_provider_id(
+            &self,
+            _tenant_id: Option<&str>,
+            _provider_id: &str,
+        ) -> Result<Option<CredentialProvider>> {
+            Ok(None)
+        }
+    }
+
+    /// A provider retyped to `api_key` while a request refreshes its expired grant, with an http
+    /// token endpoint and the client references still stored: the refresh goes to the token
+    /// endpoint of the authorization code provider the request checked, and the retyped
+    /// provider's endpoint receives neither the client secret nor the refresh token.
+    #[tokio::test]
+    async fn a_provider_retyped_during_a_refresh_never_receives_the_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = client_secrets(&directory).await;
+        let issued =
+            serde_json::json!({"access_token": "refreshed-access", "token_type": "Bearer", "expires_in": 3600});
+        let (checked_endpoint, checked_requests, _checked_server) =
+            loopback_token_endpoint(axum::http::StatusCode::OK, issued.clone()).await;
+        let (retyped_endpoint, retyped_requests, _retyped_server) =
+            loopback_token_endpoint(axum::http::StatusCode::OK, issued).await;
+        let mut checked = make_credential_provider("cp-1", CredentialProviderType::OAuth2AuthorizationCode);
+        checked.token_endpoint = Some(checked_endpoint.clone());
+        let mut retyped = checked.clone();
+        retyped.provider_type = CredentialProviderType::ApiKey;
+        retyped.api_key_secret_ref = Some("CLIENT_SECRET".into());
+        retyped.token_endpoint = Some(retyped_endpoint.clone());
+        let providers: Arc<dyn CredentialProviderStorage> = Arc::new(RetypedAfterFirstRead {
+            checked,
+            retyped,
+            read: std::sync::atomic::AtomicBool::new(false),
+        });
+        let vault: Arc<dyn DelegationVaultStorage> =
+            MockVaultStore::new(VaultLookupResult::ExpiredRefreshable(make_token(true, true)));
+        let egress = oauth::TokenEgress {
+            timeout: std::time::Duration::from_secs(5),
+            exact_allowlist: Some(format!("{checked_endpoint},{retyped_endpoint}")),
+            policy: Default::default(),
+        };
+
+        let results = egress
+            .scope(resolve_delegation_credentials(
+                &[make_binding("cp-1")],
+                "sha256:user1",
+                "did:web:agent.example",
+                "ch-1",
+                crate::tenancy::SurfaceTenancy::configured(None),
+                None,
+                &vault,
+                &providers,
+                &secrets,
+                "https://gw.example.com",
+                false,
+                access_point(None, None),
+                None,
+                None,
+            ))
+            .await;
+
+        assert_eq!(
+            retyped_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the retyped provider's token endpoint received the refresh"
+        );
+        assert_eq!(checked_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].action.outcome, DelegationActionOutcome::TokenRefreshed);
+        let DelegationLookupResult::Inject(headers) = &results[0].result else {
+            panic!("the refreshed token is injected: {:?}", results[0].action);
+        };
+        assert_eq!(headers, &build_injection_headers(&CredentialInjection::BearerHeader, "refreshed-access"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_refresh_logs_only_the_oauth_error_code_and_audits_nothing() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = client_secrets(&directory).await;
+        let (token_endpoint, _, _server) = loopback_token_endpoint(
+            axum::http::StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "description-marker",
+                "error_uri": "https://idp.example/uri-marker"
+            }),
+        )
+        .await;
         let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2AuthorizationCode);
         provider.token_endpoint = Some(token_endpoint.clone());
         let providers: Arc<dyn CredentialProviderStorage> = MockProviderStore::with_stored(provider);

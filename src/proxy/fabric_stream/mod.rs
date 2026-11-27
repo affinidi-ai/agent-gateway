@@ -443,12 +443,12 @@ impl StreamRuntime {
         }
     }
 
-    pub fn process(
+    pub async fn process(
         &self,
         message: &ReceivedMessage,
         message_type: &MessageType,
     ) -> ProcessingResult {
-        let result = (|| {
+        let result: Result<ProcessingResult, String> = async {
             let instance_id = self.validate_message(message)?;
             match message_type {
                 MessageType::ForwardStreamFrame => {
@@ -505,6 +505,7 @@ impl StreamRuntime {
                             self.peers
                                 .offer(message, binding, capabilities, tenant_id, Instant::now())?;
                         crate::gateways::connection_points::envelope_replay::admit_capability_query(message)
+                            .await
                             .map_err(|rejection| rejection.to_string())?;
                         Ok(ProcessingResult::RequiresResponse {
                             response_type: MessageType::ForwardStreamDisclose.to_string(),
@@ -514,7 +515,8 @@ impl StreamRuntime {
                 }
                 _ => Err("Unexpected Fabric stream message type".to_string()),
             }
-        })();
+        }
+        .await;
         result.unwrap_or_else(|reason| ProcessingResult::Failed { reason })
     }
 }
@@ -1131,7 +1133,9 @@ mod tests {
         );
         listener.stamp(&mut offer);
         assert!(matches!(
-            runtime.process(&offer, &MessageType::ForwardStreamQuery),
+            runtime
+                .process(&offer, &MessageType::ForwardStreamQuery)
+                .await,
             ProcessingResult::RequiresResponse { .. }
         ));
         let stream_id = Uuid::new_v4();
@@ -1709,7 +1713,9 @@ mod tests {
                 })
                 .unwrap();
                 assert!(matches!(
-                    runtime.process(&data, &MessageType::ForwardStreamFrame),
+                    runtime
+                        .process(&data, &MessageType::ForwardStreamFrame)
+                        .await,
                     ProcessingResult::ProcessedNoResponse
                 ));
                 sequence += 1;
@@ -1725,7 +1731,9 @@ mod tests {
             })
             .unwrap();
             assert!(matches!(
-                runtime.process(&end, &MessageType::ForwardStreamFrame),
+                runtime
+                    .process(&end, &MessageType::ForwardStreamFrame)
+                    .await,
                 ProcessingResult::ProcessedNoResponse
             ));
             let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(16);
@@ -1781,7 +1789,9 @@ mod tests {
                         acknowledged.message_body =
                             serde_json::to_value(wire::StreamFrame { stream_id: id, payload }).unwrap();
                         assert!(matches!(
-                            runtime.process(&acknowledged, &MessageType::ForwardStreamFrame),
+                            runtime
+                                .process(&acknowledged, &MessageType::ForwardStreamFrame)
+                                .await,
                             ProcessingResult::ProcessedNoResponse
                         ));
                     }
@@ -1934,7 +1944,9 @@ mod tests {
                 let mut frame = upload.clone();
                 frame.message_body = serde_json::to_value(wire::StreamFrame { stream_id: id, payload }).unwrap();
                 assert!(matches!(
-                    runtime.process(&frame, &MessageType::ForwardStreamFrame),
+                    runtime
+                        .process(&frame, &MessageType::ForwardStreamFrame)
+                        .await,
                     ProcessingResult::ProcessedNoResponse
                 ));
             }
@@ -2018,7 +2030,9 @@ mod tests {
                         frame.message_body =
                             serde_json::to_value(wire::StreamFrame { stream_id: id, payload }).unwrap();
                         assert!(matches!(
-                            runtime.process(&frame, &MessageType::ForwardStreamFrame),
+                            runtime
+                                .process(&frame, &MessageType::ForwardStreamFrame)
+                                .await,
                             ProcessingResult::ProcessedNoResponse
                         ));
                     }
@@ -2638,10 +2652,16 @@ mod tests {
                 extra: serde_json::Value::Null,
             },
         );
-        assert!(matches!(runtime.process(&message, &MessageType::ForwardStreamQuery), ProcessingResult::Failed { .. }));
+        assert!(matches!(
+            runtime
+                .process(&message, &MessageType::ForwardStreamQuery)
+                .await,
+            ProcessingResult::Failed { .. }
+        ));
         listener.stamp(&mut message);
-        let ProcessingResult::RequiresResponse { response_type, response_body } =
-            runtime.process(&message, &MessageType::ForwardStreamQuery)
+        let ProcessingResult::RequiresResponse { response_type, response_body } = runtime
+            .process(&message, &MessageType::ForwardStreamQuery)
+            .await
         else {
             panic!("expected correlated capability response");
         };
@@ -2652,11 +2672,21 @@ mod tests {
         let replacement = runtime
             .listener("cp".into(), "did:example:local".into())
             .unwrap();
-        assert!(matches!(runtime.process(&message, &MessageType::ForwardStreamQuery), ProcessingResult::Failed { .. }));
+        assert!(matches!(
+            runtime
+                .process(&message, &MessageType::ForwardStreamQuery)
+                .await,
+            ProcessingResult::Failed { .. }
+        ));
         drop(listener);
         replacement.stamp(&mut message);
         assert!(
-            matches!(runtime.process(&message, &MessageType::ForwardStreamQuery), ProcessingResult::Failed { .. }),
+            matches!(
+                runtime
+                    .process(&message, &MessageType::ForwardStreamQuery)
+                    .await,
+                ProcessingResult::Failed { .. }
+            ),
             "an answered query is not answered again, even on a replacement listener"
         );
         let nonce = Uuid::new_v4();
@@ -2664,7 +2694,9 @@ mod tests {
         message.didcomm_thid = Some(nonce.to_string());
         message.message_body["nonce"] = serde_json::json!(nonce.to_string());
         assert!(matches!(
-            runtime.process(&message, &MessageType::ForwardStreamQuery),
+            runtime
+                .process(&message, &MessageType::ForwardStreamQuery)
+                .await,
             ProcessingResult::RequiresResponse { .. }
         ));
         drop(replacement);
@@ -2689,7 +2721,8 @@ mod tests {
         assert!(matches!(
             fixture
                 .runtime
-                .process(&query, &MessageType::ForwardStreamQuery),
+                .process(&query, &MessageType::ForwardStreamQuery)
+                .await,
             ProcessingResult::RequiresResponse { .. }
         ));
         assert!(fixture.offered(&query, nonce, Instant::now()));
@@ -2726,7 +2759,8 @@ mod tests {
             matches!(
                 fixture
                     .runtime
-                    .process(&query, &MessageType::ForwardStreamQuery),
+                    .process(&query, &MessageType::ForwardStreamQuery)
+                    .await,
                 ProcessingResult::Failed { .. }
             ),
             "a replayed capability query is refused while its envelope is live"

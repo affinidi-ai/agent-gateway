@@ -480,12 +480,10 @@ pub async fn resolve_agent_identity_for_slot(
     // the same surface), not from a stored credential. The store-based
     // resolver has no token in scope, so this mode is handled here before the
     // credential-derived path below.
-    if let Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim { claim, namespace_claims }) =
-        slot_config.as_ref()
-    {
+    if let Some(slot_identity @ crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. }) = slot_config.as_ref() {
         let mode_label = "from_jwt_claim";
         let started = std::time::Instant::now();
-        let Some(claims) = source_identity.and_then(|i| i.jwt_claims()) else {
+        let Some(caller) = source_identity.filter(|i| i.jwt_claims().is_some()) else {
             // No validated token in scope. A public agent card has no inbound
             // caller, so treat it as anonymous; otherwise the surface is
             // misconfigured (FromJwtClaim without jwt_bearer source auth).
@@ -504,11 +502,12 @@ pub async fn resolve_agent_identity_for_slot(
                 crate::identity::credential_identity::CredentialIdentityError::JwtClaimsUnavailable.to_string(),
             ));
         };
-        match crate::identity::credential_identity::resolve_jwt_claim_identity(claim, namespace_claims, claims) {
-            Ok(crate::identity::credential_identity::CredentialIdentity::Derived {
-                identity_fields,
-                identity_hash,
-                credential_updated_at,
+        match crate::identity::credential_identity::global_resolver()
+            .resolve_verified_caller(slot_identity, caller, None, None)
+            .await
+        {
+            Ok(crate::identity::credential_identity::VerifiedCallerIdentity {
+                identity_fields, identity_hash, ..
             }) => {
                 let Some(selector) = identity_selector else {
                     crate::metrics::backends::prometheus::track_managed_identity_resolve(
@@ -529,7 +528,7 @@ pub async fn resolve_agent_identity_for_slot(
                     slot,
                     identity_fields.clone(),
                     identity_hash.clone(),
-                    credential_updated_at,
+                    None,
                     surface,
                 )
                 .await
@@ -573,9 +572,6 @@ pub async fn resolve_agent_identity_for_slot(
                         return Err(IdentityResolutionError::IdentityBackendUnavailable(e.to_string()));
                     }
                 }
-            }
-            Ok(crate::identity::credential_identity::CredentialIdentity::Bound { .. }) => {
-                unreachable!("resolve_jwt_claim_identity only returns Derived")
             }
             Err(e) => {
                 crate::metrics::backends::prometheus::track_managed_identity_resolve(

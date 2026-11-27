@@ -3,6 +3,7 @@
 // This module provides HTTP endpoints for clients to submit their agent identity
 // and receive a verifiable credential and DID.
 
+pub mod authority;
 pub mod credential_identity;
 pub mod did_keys;
 pub mod display_name;

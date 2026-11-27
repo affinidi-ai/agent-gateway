@@ -358,6 +358,27 @@ async fn operator_changes_provider_type(
     change_stored_provider(world, json!({ "provider_type": provider_type }), None).await;
 }
 
+#[when(expr = "the operator changes the credential provider to an API key provider using the secret {string}")]
+async fn operator_changes_provider_to_api_key(
+    world: &mut SurfaceWorld,
+    secret_id: String,
+) {
+    change_stored_provider(world, json!({ "provider_type": "api_key", "api_key_secret_ref": secret_id }), None).await;
+}
+
+#[then("the stored credential provider has no token endpoint and no client references")]
+async fn stored_provider_has_no_token_endpoint_or_client(world: &mut SurfaceWorld) {
+    let stored = stored_target_auth_provider(world).await;
+    for field in ["token_endpoint", "client_id_secret_ref", "client_secret_secret_ref"] {
+        assert!(
+            stored
+                .get(field)
+                .is_none_or(Value::is_null),
+            "{field} of the stored provider: {stored}"
+        );
+    }
+}
+
 #[then("the stored credential provider is still a JWT Bearer provider")]
 async fn stored_provider_is_still_a_jwt_bearer_provider(world: &mut SurfaceWorld) {
     let stored = stored_target_auth_provider(world).await;
@@ -563,18 +584,26 @@ async fn latest_token_request_carries_basic_credentials(
     client_id: String,
     secret: String,
 ) {
-    use base64::Engine;
-    // RFC 6749 section 2.3.1: the client ID and secret are form-urlencoded before the Basic encoding.
-    let encode = |value: &str| url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>();
-    let expected = format!(
-        "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", encode(&client_id), encode(&secret)))
-    );
+    let expected = http_basic_client_credentials(&client_id, &secret);
     let authorization = latest_token_request_authorization(world).await;
     assert!(
         authorization.as_deref() == Some(expected.as_str()),
         "the latest token request carried HTTP Basic credentials other than those of client {client_id}"
     );
+}
+
+/// The `Authorization` value of a token request that authenticates `client_id` by HTTP Basic.
+pub(crate) fn http_basic_client_credentials(
+    client_id: &str,
+    secret: &str,
+) -> String {
+    use base64::Engine;
+    // RFC 6749 section 2.3.1: the client ID and secret are form-urlencoded before the Basic encoding.
+    let encode = |value: &str| url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>();
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", encode(client_id), encode(secret)))
+    )
 }
 
 #[then("the credential provider's latest token request carries no HTTP Basic credentials")]

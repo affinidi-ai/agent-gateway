@@ -83,7 +83,7 @@ describe('ApiKeyDetailPage delete', () => {
 
     await userEvent.click(confirm);
 
-    await waitFor(() => expect(mockNavigate).toHaveBeenCalledWith('/secrets'));
+    await waitFor(() => expect(mockNavigate).toHaveBeenCalledWith('/secrets?tab=api-keys'));
     expect(apiClient.deleteApiKey).toHaveBeenCalledTimes(1);
     expect(apiClient.deleteApiKey).toHaveBeenCalledWith('owner-a', 'atgk_named');
     expect(showToast).toHaveBeenCalledWith('success', 'API key deleted');

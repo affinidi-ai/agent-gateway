@@ -289,6 +289,14 @@ impl BootstrapConfig {
                 .clone(),
         );
 
+        // Fail fast on a misconfigured [vta] block: an enabled-but-incomplete
+        // block is a startup error rather than a silent fallback to local
+        // signing (fail closed — see src/config/vta.rs).
+        config
+            .vta
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid [vta] configuration: {e}"))?;
+
         Ok(config)
     }
 
@@ -303,14 +311,11 @@ impl BootstrapConfig {
                     anyhow::bail!("dynamodb_table must be specified when channel_config_source is 'dynamodb'");
                 }
             }
-            "file" => {
-                // File-based config doesn't need additional validation here
-            }
             "local" => {
                 // Local config doesn't need additional validation here
             }
             other => {
-                anyhow::bail!("Invalid channel_config_source '{}'. Must be 'dynamodb', 'file', or 'local'", other);
+                anyhow::bail!("Invalid channel_config_source '{}'. Must be 'dynamodb' or 'local'", other);
             }
         }
 
@@ -598,6 +603,46 @@ fn copy_directory_recursive(
 #[cfg(test)]
 mod migration_tests {
     use super::*;
+
+    fn bootstrap_with_source(
+        directory: &Path,
+        source: &str,
+    ) -> BootstrapConfig {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_path = directory.join("cert.pem");
+        let key_path = directory.join("key.pem");
+        std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+        std::fs::write(
+            &key_path,
+            certified
+                .signing_key
+                .serialize_pem(),
+        )
+        .unwrap();
+        toml::from_str(&format!(
+            "channel_config_source = {source:?}\nbackup_encryption_key = \"env://UNUSED_BACKUP_KEY\"\n[tls]\ncert_path = {:?}\nkey_path = {:?}\n",
+            cert_path.display().to_string(),
+            key_path.display().to_string()
+        ))
+        .expect("bootstrap config parses")
+    }
+
+    #[test]
+    fn only_local_and_dynamodb_configuration_sources_are_accepted() {
+        let directory = tempfile::tempdir().unwrap();
+        bootstrap_with_source(directory.path(), "local")
+            .validate()
+            .expect("local is accepted");
+        let error = bootstrap_with_source(directory.path(), "file")
+            .validate()
+            .expect_err("file is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("Must be 'dynamodb' or 'local'"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn terms_storage_path_resolves_relative_to_the_config_directory() {

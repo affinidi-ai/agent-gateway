@@ -259,6 +259,29 @@ pub async fn a2a_request_sent_to_surface(
     send_rpc(world, gw_index, &surface_name, build_a2a_request_body(), &[]).await;
 }
 
+/// An A2A message with an invalid API key, carrying an identity binding VP and
+/// an identity credential of the caller's own making.
+#[when(
+    expr = "the caller sends a Fabric A2A request with an invalid API key and an identity proof of its own through gateway {int} surface {string}"
+)]
+pub async fn a2a_request_with_invalid_api_key_and_own_identity_proof(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    surface_name: String,
+) {
+    use crate::bdd_support::json_rpc::{AGENT_IDENTITY_BINDING_EXTENSION_URI, AGENT_IDENTITY_CREDENTIAL_EXTENSION_URI};
+    world.start().await;
+    let mut body = build_a2a_request_body();
+    body["params"]["message"]["extensions"] =
+        serde_json::json!([AGENT_IDENTITY_BINDING_EXTENSION_URI, AGENT_IDENTITY_CREDENTIAL_EXTENSION_URI]);
+    body["params"]["message"]["metadata"] = serde_json::json!({
+        AGENT_IDENTITY_BINDING_EXTENSION_URI: {"verifiablePresentation": "caller-made-presentation"},
+        AGENT_IDENTITY_CREDENTIAL_EXTENSION_URI: {"did": "did:web:asserted.example", "verifiablePresentation": "caller-made-presentation"}
+    });
+    send_rpc(world, gw_index, &surface_name, body, &[("x-api-key".to_string(), "bdd-invalid-api-key".to_string())])
+        .await;
+}
+
 #[when(expr = "the caller fetches the agent card from gateway {int} surface {string}")]
 pub async fn agent_card_fetched_from_surface(
     world: &mut G2gWorld,
@@ -666,7 +689,7 @@ pub async fn gateway_pings_gateway(
         .insert((from_gw, to_gw), success);
 }
 
-async fn accept_pending_oob(
+pub(crate) async fn accept_pending_oob(
     world: &mut G2gWorld,
     gateway: usize,
     acceptor_mediator_id: Option<&str>,
@@ -696,8 +719,52 @@ async fn accept_pending_oob(
         )
         .await
         .expect("connect-via-oob request should complete at the transport layer");
+    world.accepted_gateway_id = response
+        .body
+        .pointer("/gateway/id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     world.response_status = Some(response.status);
     world.response_body = Some(response.body);
+}
+
+#[when(regex = r"^the gateways pair$")]
+pub async fn the_gateways_pair(world: &mut G2gWorld) {
+    world.start().await;
+}
+
+#[when(regex = r"^gateway (\d+) deletes the gateway it accepted last$")]
+pub async fn gateway_deletes_the_gateway_it_accepted_last(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let gateway_id = world
+        .accepted_gateway_id
+        .clone()
+        .expect("a step must accept an invitation before this one");
+    let deleted = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .delete_gateway_recorded(&gateway_id)
+        .await
+        .expect("delete request completes at the transport layer");
+    world.response_status = Some(deleted.status);
+    world.response_body = Some(deleted.body);
+}
+
+#[when(regex = r"^gateway (\d+) accepts the invitation again$")]
+pub async fn gateway_accepts_the_invitation_again(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    accept_pending_oob(world, gateway, None).await;
+    assert_eq!(
+        world.response_status,
+        Some(200),
+        "the acceptor sends its connection-setup whatever the invitation's state: {:?}",
+        world.response_body
+    );
 }
 
 #[when(regex = r#"^gateway (\d+) accepts the invitation using mediator "([^"]+)"$"#)]
@@ -767,7 +834,6 @@ pub async fn mcp_list_tools_accepting_an_event_stream(
 
 /// Two `tools/list` calls, with distinct ids, over one session of the deprecated HTTP+SSE
 /// transport (`GET {route}/sse`, then POSTs to the announced session URL).
-/// Each request is recorded with the SSE `message` event reply it got, if any.
 #[when(
     expr = "the caller asks gateway {int} MCP surface {string} for available tools twice over one Legacy SSE session"
 )]
@@ -776,11 +842,42 @@ pub async fn mcp_list_tools_twice_over_legacy_sse(
     gw_index: usize,
     surface_name: String,
 ) {
+    // Distinct ids, as a real client sends, so the target sees two requests.
+    let bodies = ["legacy-sse-1", "legacy-sse-2"].map(|id| {
+        let mut body = build_mcp_list_tools_body();
+        body["id"] = Value::from(id);
+        body
+    });
+    send_over_one_legacy_sse_session(world, gw_index, &surface_name, bodies.to_vec()).await;
+}
+
+/// A notification, then a `tools/list` call, over one Legacy SSE session. The reply read
+/// after the call is the first `message` event of the session.
+#[when(
+    expr = "the caller sends an MCP notification and then asks gateway {int} MCP surface {string} for available tools over one Legacy SSE session"
+)]
+pub async fn mcp_notification_then_list_tools_over_legacy_sse(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    surface_name: String,
+) {
+    let bodies = vec![build_mcp_initialized_notification_body(), build_mcp_list_tools_body()];
+    send_over_one_legacy_sse_session(world, gw_index, &surface_name, bodies).await;
+}
+
+/// Sends `bodies` in order over one Legacy SSE session and records each with the SSE
+/// `message` event reply it got, if any; a notification gets none.
+async fn send_over_one_legacy_sse_session(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    surface_name: &str,
+    bodies: Vec<Value>,
+) {
     world.start().await;
     world
         .remember_fabric_forward_baseline()
         .await;
-    let (_, surface_id) = world.surface(&surface_name);
+    let (_, surface_id) = world.surface(surface_name);
     let route = world
         .surface_spec(gw_index, &surface_id)
         .route
@@ -789,12 +886,6 @@ pub async fn mcp_list_tools_twice_over_legacy_sse(
         .harness()
         .gw(gw_index)
         .port;
-    // Distinct ids, as a real client sends, so the target sees two requests.
-    let bodies = ["legacy-sse-1", "legacy-sse-2"].map(|id| {
-        let mut body = build_mcp_list_tools_body();
-        body["id"] = Value::from(id);
-        body
-    });
     world.sent_body = bodies.last().cloned();
     let exchange =
         crate::bdd_support::sse_client::legacy_sse_session(&format!("http://127.0.0.1:{port}"), &route, &bodies)
@@ -819,7 +910,12 @@ pub async fn mcp_list_tools_twice_over_legacy_sse(
     let mut replies = exchange.replies.into_iter();
     world.legacy_sse_exchange = bodies
         .into_iter()
-        .map(|request| (request, replies.next()))
+        .map(|request| {
+            let reply = request
+                .get("id")
+                .and_then(|_| replies.next());
+            (request, reply)
+        })
         .collect();
 }
 

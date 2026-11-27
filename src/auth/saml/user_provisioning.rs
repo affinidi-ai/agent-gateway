@@ -4,6 +4,7 @@ use tracing::{info, warn};
 
 use crate::auth::auth_config::SamlConfig;
 use crate::auth::saml::graph_api::GraphApiClient;
+use crate::auth::saml::service::{ROLE_VALUES_KEY, SamlAttributes};
 use crate::auth::storage::{PasskeyStorage, UserData};
 use crate::auth::types::{UserRole, UserStatus};
 
@@ -56,13 +57,79 @@ fn changes_reported_state(
     old.role != new.role || old.status != new.status || old.is_primary != new.is_primary
 }
 
+/// Whether `attribute` carries more than one distinct value.
+fn carries_several_values(
+    all_attributes: &SamlAttributes,
+    attribute: &str,
+) -> bool {
+    all_attributes
+        .get(attribute)
+        .into_iter()
+        .flatten()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        > 1
+}
+
+/// An assertion whose user-id or username attribute carries more than one distinct value, so
+/// which one names the user would depend on the identity provider's ordering.
+#[derive(Debug, thiserror::Error)]
+#[error("The SAML {attribute} attribute carries more than one value")]
+pub struct AmbiguousAttribute {
+    pub attribute: &'static str,
+}
+
+fn ensure_single_valued_identity(
+    all_attributes: &SamlAttributes,
+    config: &SamlConfig,
+) -> Result<(), AmbiguousAttribute> {
+    let mapping = &config.attribute_mapping;
+    if carries_several_values(all_attributes, &mapping.user_id) {
+        return Err(AmbiguousAttribute { attribute: "user ID" });
+    }
+    if mapping.username != mapping.email && carries_several_values(all_attributes, &mapping.username) {
+        return Err(AmbiguousAttribute { attribute: "username" });
+    }
+    Ok(())
+}
+
+/// The value a profile attribute gives the user: the stored one when the identity provider still
+/// sends it, else the first sent. Several distinct values are logged by attribute name only.
+fn profile_value(
+    all_attributes: &SamlAttributes,
+    attribute: &str,
+    stored: Option<&String>,
+) -> Option<String> {
+    let values = all_attributes.get(attribute)?;
+    if values
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        > 1
+    {
+        warn!(%attribute, "The SAML attribute carries several values; keeping the stored one if sent, else the first");
+    }
+    stored
+        .filter(|stored| values.contains(stored))
+        .or_else(|| values.first())
+        .cloned()
+}
+
 /// Provision or update a user from SAML attributes
 pub async fn provision_user_from_saml(
     storage: &PasskeyStorage,
-    attributes: &HashMap<String, String>,
+    all_attributes: &SamlAttributes,
     config: &SamlConfig,
     avatars_storage_path: &str,
 ) -> Result<Provisioned> {
+    let attributes: HashMap<String, String> = all_attributes
+        .iter()
+        .filter_map(|(name, values)| {
+            values
+                .first()
+                .map(|value| (name.clone(), value.clone()))
+        })
+        .collect();
     // Extract user attributes using configured mappings
     let user_id_attr = attributes
         .get(
@@ -72,54 +139,16 @@ pub async fn provision_user_from_saml(
         )
         .or_else(|| attributes.get("NameID"))
         .context("User ID not found in SAML attributes")?;
-
-    let username = attributes
-        .get(
-            &config
-                .attribute_mapping
-                .username,
-        )
-        .or_else(|| attributes.get(&config.attribute_mapping.email))
-        .context("Username not found in SAML attributes")?;
-
-    let email = attributes
-        .get(&config.attribute_mapping.email)
-        .map(|s| s.to_string());
-
-    let first_name = attributes
-        .get(
-            &config
-                .attribute_mapping
-                .first_name,
-        )
-        .map(|s| s.to_string());
-
-    let last_name = attributes
-        .get(
-            &config
-                .attribute_mapping
-                .last_name,
-        )
-        .map(|s| s.to_string());
-
-    let department = attributes
-        .get(
-            &config
-                .attribute_mapping
-                .department,
-        )
-        .map(|s| s.to_string());
-
-    let job_title = attributes
-        .get(
-            &config
-                .attribute_mapping
-                .job_title,
-        )
-        .map(|s| s.to_string());
+    ensure_single_valued_identity(all_attributes, config)?;
 
     // Determine role from SAML attributes
-    let role = determine_role(attributes, config);
+    let role = determine_role(all_attributes, config).map_err(|refused| {
+        refused.for_subject(
+            attributes
+                .get("NameID")
+                .map(String::as_str),
+        )
+    });
 
     let user_write_guard = storage
         .user_write_guard()
@@ -129,6 +158,51 @@ pub async fn provision_user_from_saml(
     let existing_user = storage
         .load_user_by_saml_id(user_id_attr)
         .await?;
+    let mapping = &config.attribute_mapping;
+    let email = profile_value(
+        all_attributes,
+        &mapping.email,
+        existing_user
+            .as_ref()
+            .and_then(|user| user.email.as_ref()),
+    );
+    let username = (mapping.username != mapping.email)
+        .then(|| {
+            attributes
+                .get(&mapping.username)
+                .cloned()
+        })
+        .flatten()
+        .or_else(|| email.clone())
+        .context("Username not found in SAML attributes")?;
+    let first_name = profile_value(
+        all_attributes,
+        &mapping.first_name,
+        existing_user
+            .as_ref()
+            .and_then(|user| user.first_name.as_ref()),
+    );
+    let last_name = profile_value(
+        all_attributes,
+        &mapping.last_name,
+        existing_user
+            .as_ref()
+            .and_then(|user| user.last_name.as_ref()),
+    );
+    let department = profile_value(
+        all_attributes,
+        &mapping.department,
+        existing_user
+            .as_ref()
+            .and_then(|user| user.department.as_ref()),
+    );
+    let job_title = profile_value(
+        all_attributes,
+        &mapping.job_title,
+        existing_user
+            .as_ref()
+            .and_then(|user| user.job_title.as_ref()),
+    );
 
     let (user, change) = if let Some(mut user) = existing_user {
         let previous = user.clone();
@@ -139,9 +213,17 @@ pub async fn provision_user_from_saml(
         user.department = department;
         user.job_title = job_title;
         if !user.is_primary {
-            user.role = role;
-        } else if role != UserRole::Administrator {
-            warn!(user_id = %user.user_id, idp_role = %role, "Kept the primary administrator's role over the IdP role");
+            user.role = role?;
+        } else {
+            match &role {
+                Ok(role) if *role != UserRole::Administrator => {
+                    warn!(user_id = %user.user_id, idp_role = %role, "Kept the primary administrator's role over the IdP role");
+                }
+                Ok(_) => {}
+                Err(refused) => {
+                    warn!(user_id = %user.user_id, idp_role = ?refused.idp_role, "Kept the primary administrator's role; the IdP role maps to no gateway role");
+                }
+            }
         }
         user.updated_at = chrono::Utc::now();
         user.last_logged_in = Some(chrono::Utc::now());
@@ -155,6 +237,15 @@ pub async fn provision_user_from_saml(
             .await?
             .is_empty();
 
+        let final_role = if is_first_user {
+            if let Err(refused) = &role {
+                warn!(idp_role = ?refused.idp_role, "Created the first user as administrator; the IdP role maps to no gateway role");
+            }
+            UserRole::Administrator
+        } else {
+            role?
+        };
+
         // Enforce the appliance user limit for JIT-provisioned users. The first
         // user always bootstraps admin access regardless of the configured cap.
         if !is_first_user {
@@ -167,12 +258,6 @@ pub async fn provision_user_from_saml(
                 return Err(anyhow::Error::new(e));
             }
         }
-
-        let final_role = if is_first_user {
-            UserRole::Administrator
-        } else {
-            role
-        };
         let status = UserStatus::Approved; // SAML users auto-approved (including first user)
 
         let now = chrono::Utc::now();
@@ -240,62 +325,70 @@ pub async fn provision_user_from_saml(
     Ok(Provisioned { user, change })
 }
 
-/// Determine user role from SAML attributes and role mapping
-fn determine_role(
-    attributes: &HashMap<String, String>,
-    config: &SamlConfig,
-) -> UserRole {
-    let role_attr = &config.attribute_mapping.role;
-    info!(
-        "determine_role: role attribute key='{}', role_mapping keys={:?}, available SAML attributes={:?}",
-        role_attr,
-        config
-            .role_mapping
-            .keys()
-            .collect::<Vec<_>>(),
-        attributes
-            .keys()
-            .collect::<Vec<_>>()
-    );
+/// The longest identity-provider role value kept for a refusal's log line.
+const MAX_LOGGED_ROLE_CHARS: usize = 200;
 
-    // Get role attribute value
-    if let Some(saml_role) = attributes.get(role_attr) {
-        info!("determine_role: SAML role value received = '{}'", saml_role);
+/// A sign-in whose identity-provider role values map to no gateway role while no `default_role`
+/// is set. `idp_role` is the values received, joined, capped and `None` when the claim was absent;
+/// it is identity-provider input, so log it only with `?`.
+#[derive(Debug, thiserror::Error)]
+#[error("identity-provider role is not mapped to a gateway role")]
+pub struct RoleRefused {
+    pub subject: Option<String>,
+    pub idp_role: Option<String>,
+}
 
-        // Check role mapping
-        if let Some(mapped_role) = config
-            .role_mapping
-            .get(saml_role)
-        {
-            let resolved = match mapped_role.as_str() {
-                "administrator" => UserRole::Administrator,
-                "poweruser" => UserRole::PowerUser,
-                "user" => UserRole::User,
-                _ => UserRole::User,
-            };
-            info!(
-                "determine_role: matched explicit role_mapping '{}' -> '{}' -> {:?}",
-                saml_role, mapped_role, resolved
-            );
-            return resolved;
+impl RoleRefused {
+    fn for_subject(
+        self,
+        subject: Option<&str>,
+    ) -> Self {
+        Self {
+            subject: subject.map(str::to_string),
+            ..self
         }
-
-        // If no explicit mapping, try direct match
-        let resolved = match saml_role
-            .to_lowercase()
-            .as_str()
-        {
-            "administrator" | "admin" => UserRole::Administrator,
-            "poweruser" | "power_user" | "power-user" => UserRole::PowerUser,
-            _ => UserRole::User,
-        };
-        info!("determine_role: no role_mapping hit for '{}', fallback direct-match -> {:?}", saml_role, resolved);
-        return resolved;
     }
+}
 
-    info!("determine_role: role attribute '{}' not present in SAML attributes, defaulting to User", role_attr);
-    // Default to User role
-    UserRole::User
+fn privilege(role: &UserRole) -> u8 {
+    match role {
+        UserRole::Administrator => 2,
+        UserRole::PowerUser => 1,
+        UserRole::User => 0,
+    }
+}
+
+/// Resolve the gateway role from the identity provider's role values: the highest role an
+/// explicit `role_mapping` entry gives any value, else `default_role`, else refused.
+fn determine_role(
+    attributes: &SamlAttributes,
+    config: &SamlConfig,
+) -> Result<UserRole, RoleRefused> {
+    let values = attributes
+        .get(ROLE_VALUES_KEY)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mapped = values
+        .iter()
+        .filter_map(|value| config.role_mapping.get(value))
+        .filter_map(|name| UserRole::from_config_name(name))
+        .max_by_key(privilege);
+    let role = mapped.or_else(|| {
+        config
+            .default_role
+            .as_deref()
+            .and_then(UserRole::from_config_name)
+    });
+    role.ok_or_else(|| RoleRefused {
+        subject: None,
+        idp_role: (!values.is_empty()).then(|| {
+            values
+                .join(",")
+                .chars()
+                .take(MAX_LOGGED_ROLE_CHARS)
+                .collect()
+        }),
+    })
 }
 
 /// Fetch avatar from Microsoft Graph API and save to disk
@@ -351,6 +444,7 @@ mod tests {
             idp_cert_path: "idp.crt".to_string(),
             attribute_mapping: SamlAttributeMapping::default(),
             role_mapping: HashMap::new(),
+            default_role: None,
             require_encrypted_assertions: false,
             sign_requests: false,
             sp_key_path: None,
@@ -363,12 +457,12 @@ mod tests {
     fn saml_attributes(
         user_id: &str,
         username: &str,
-    ) -> HashMap<String, String> {
+    ) -> SamlAttributes {
         let mapping = SamlAttributeMapping::default();
         HashMap::from([
-            (mapping.user_id, user_id.to_string()),
-            (mapping.username, username.to_string()),
-            (mapping.email, format!("{username}@example.test")),
+            (mapping.user_id, vec![user_id.to_string()]),
+            (mapping.username, vec![username.to_string()]),
+            (mapping.email, vec![format!("{username}@example.test")]),
         ])
     }
 
@@ -389,7 +483,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let config = test_saml_config();
+        let mut config = test_saml_config();
+        config.default_role = Some("user".to_string());
         let first_attributes = saml_attributes("saml-user-1", "first-user");
         let second_attributes = saml_attributes("saml-user-2", "second-user");
         let avatars_storage_path = avatars_path
@@ -454,10 +549,10 @@ mod tests {
     }
 
     fn with_role(
-        mut attributes: HashMap<String, String>,
+        mut attributes: SamlAttributes,
         role: &str,
-    ) -> HashMap<String, String> {
-        attributes.insert(SamlAttributeMapping::default().role, role.to_string());
+    ) -> SamlAttributes {
+        attributes.insert(ROLE_VALUES_KEY.to_string(), vec![role.to_string()]);
         attributes
     }
 
@@ -500,7 +595,11 @@ mod tests {
     async fn a_later_sign_in_reports_the_user_as_it_was_before() {
         let dir = tempdir().unwrap();
         let (storage, avatars) = user_storage(&dir).await;
-        let config = test_saml_config();
+        let mut config = test_saml_config();
+        config.default_role = Some("user".to_string());
+        config
+            .role_mapping
+            .insert("gw-power".to_string(), "poweruser".to_string());
         provision_user_from_saml(&storage, &saml_attributes("saml-admin", "admin"), &config, &avatars)
             .await
             .unwrap();
@@ -510,7 +609,7 @@ mod tests {
 
         let second = provision_user_from_saml(
             &storage,
-            &with_role(saml_attributes("saml-1", "jane"), "poweruser"),
+            &with_role(saml_attributes("saml-1", "jane"), "gw-power"),
             &config,
             &avatars,
         )
@@ -581,7 +680,10 @@ mod tests {
     async fn the_primary_administrator_keeps_the_role_whatever_the_idp_sends() {
         let dir = tempdir().unwrap();
         let (storage, avatars) = user_storage(&dir).await;
-        let config = test_saml_config();
+        let mut config = test_saml_config();
+        config
+            .role_mapping
+            .insert("gw-all".to_string(), "user".to_string());
         let first = provision_user_from_saml(&storage, &saml_attributes("saml-admin", "admin"), &config, &avatars)
             .await
             .unwrap();
@@ -589,7 +691,7 @@ mod tests {
         assert_eq!(first.user.role, UserRole::Administrator);
 
         for attributes in
-            [saml_attributes("saml-admin", "admin"), with_role(saml_attributes("saml-admin", "admin"), "user")]
+            [saml_attributes("saml-admin", "admin"), with_role(saml_attributes("saml-admin", "admin"), "gw-all")]
         {
             let again = provision_user_from_saml(&storage, &attributes, &config, &avatars)
                 .await
@@ -598,5 +700,532 @@ mod tests {
             assert_eq!(again.user.role, UserRole::Administrator);
             assert!(again.user.is_primary);
         }
+    }
+
+    #[tokio::test]
+    async fn a_profile_attribute_with_two_values_takes_the_first_for_a_new_user() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mapping = SamlAttributeMapping::default();
+        let mut attributes = saml_attributes("saml-1", "jane");
+        attributes.insert(mapping.email, vec!["first@example.test".to_string(), "second@example.test".to_string()]);
+        attributes.insert(mapping.department, vec!["Platform".to_string(), "Sales".to_string()]);
+        attributes.insert(mapping.job_title, vec!["Engineer".to_string(), "Manager".to_string()]);
+
+        let user = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap()
+            .user;
+
+        assert_eq!(user.email.as_deref(), Some("first@example.test"));
+        assert_eq!(user.department.as_deref(), Some("Platform"));
+        assert_eq!(user.job_title.as_deref(), Some("Engineer"));
+    }
+
+    #[tokio::test]
+    async fn a_profile_attribute_keeps_the_stored_value_while_the_idp_still_sends_it() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mapping = SamlAttributeMapping::default();
+        let mut attributes = saml_attributes("saml-1", "jane");
+        attributes.insert(mapping.department.clone(), vec!["Sales".to_string()]);
+        let first = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap();
+        assert!(first.user.is_primary);
+
+        attributes.insert(mapping.department.clone(), vec!["Platform".to_string(), "Sales".to_string()]);
+        let kept = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap();
+        assert_eq!(
+            kept.user
+                .department
+                .as_deref(),
+            Some("Sales")
+        );
+        assert_eq!(kept.user.user_id, first.user.user_id);
+
+        attributes.insert(mapping.department, vec!["Platform".to_string(), "Legal".to_string()]);
+        let replaced = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap();
+        assert_eq!(
+            replaced
+                .user
+                .department
+                .as_deref(),
+            Some("Platform")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_primary_administrator_signs_in_whatever_profile_values_are_sent() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mapping = SamlAttributeMapping::default();
+        let mut attributes = saml_attributes("saml-admin", "admin");
+        attributes.insert(mapping.email, vec!["a@example.test".to_string(), "b@example.test".to_string()]);
+
+        let provisioned = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap();
+
+        assert!(provisioned.user.is_primary);
+        assert_eq!(
+            provisioned
+                .user
+                .email
+                .as_deref(),
+            Some("a@example.test")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_id_equal_to_another_users_stored_key_does_not_land_on_that_account() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let config = mapped_config();
+        let owner = provision_user_from_saml(&storage, &saml_attributes("shared-key", "owner"), &config, &avatars)
+            .await
+            .unwrap();
+        let mut attributes = with_role(saml_attributes("newcomer-id", "newcomer"), "gw-admins");
+        attributes.insert("NameID".to_string(), vec!["shared-key".to_string()]);
+
+        let newcomer = provision_user_from_saml(&storage, &attributes, &config, &avatars)
+            .await
+            .unwrap();
+
+        assert!(matches!(newcomer.change, SignInChange::Created));
+        assert_ne!(newcomer.user.user_id, owner.user.user_id);
+        assert_eq!(
+            newcomer
+                .user
+                .saml_id
+                .as_deref(),
+            Some("newcomer-id")
+        );
+        let owner_now = storage
+            .load_user_by_saml_id("shared-key")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner_now.user_id, owner.user.user_id);
+        assert_eq!(owner_now.username, "owner");
+    }
+
+    #[tokio::test]
+    async fn two_emails_with_no_username_attribute_sign_in_and_the_username_follows_the_stored_email() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mapping = SamlAttributeMapping::default();
+        let mut attributes = saml_attributes("saml-1", "jane");
+        attributes.remove(&mapping.username);
+        attributes.insert(mapping.email.clone(), vec!["old@example.test".to_string()]);
+        let first = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap();
+        assert_eq!(first.user.username, "old@example.test");
+
+        attributes.insert(mapping.email, vec!["new@example.test".to_string(), "old@example.test".to_string()]);
+        let again = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap();
+
+        assert_eq!(again.user.email.as_deref(), Some("old@example.test"));
+        assert_eq!(again.user.username, "old@example.test");
+    }
+
+    #[tokio::test]
+    async fn a_username_mapped_to_the_email_claim_follows_the_kept_email_whatever_addresses_are_sent() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mut config = test_saml_config();
+        config
+            .attribute_mapping
+            .username = config
+            .attribute_mapping
+            .email
+            .clone();
+        let email = config
+            .attribute_mapping
+            .email
+            .clone();
+        let mut attributes = saml_attributes("saml-1", "jane");
+        attributes.insert(email.clone(), vec!["primary@example.test".to_string()]);
+        let first = provision_user_from_saml(&storage, &attributes, &config, &avatars)
+            .await
+            .unwrap();
+        assert_eq!(first.user.username, "primary@example.test");
+
+        attributes.insert(email, vec!["alias@example.test".to_string(), "primary@example.test".to_string()]);
+        let again = provision_user_from_saml(&storage, &attributes, &config, &avatars)
+            .await
+            .unwrap();
+
+        assert_eq!(again.user.username, "primary@example.test");
+        assert_eq!(again.user.email.as_deref(), Some("primary@example.test"));
+    }
+
+    #[tokio::test]
+    async fn an_assertion_with_neither_a_username_nor_an_email_is_refused() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mapping = SamlAttributeMapping::default();
+        let mut attributes = saml_attributes("saml-1", "jane");
+        attributes.remove(&mapping.username);
+        attributes.remove(&mapping.email);
+
+        let err = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Username not found")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_whose_name_id_matches_nobody_creates_a_new_user() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let config = mapped_config();
+        provision_user_from_saml(&storage, &saml_attributes("saml-first", "first"), &config, &avatars)
+            .await
+            .unwrap();
+        let mut attributes = with_role(saml_attributes("attribute-id-2", "second"), "gw-admins");
+        attributes.insert("NameID".to_string(), vec!["unknown-name-id".to_string()]);
+
+        let provisioned = provision_user_from_saml(&storage, &attributes, &config, &avatars)
+            .await
+            .unwrap();
+
+        assert!(matches!(provisioned.change, SignInChange::Created));
+        assert_eq!(
+            storage
+                .list_users()
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn a_profile_attribute_repeating_one_value_is_accepted() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mapping = SamlAttributeMapping::default();
+        let mut attributes = saml_attributes("saml-1", "jane");
+        attributes.insert(mapping.email, vec!["jane@example.test".to_string(); 2]);
+        attributes.insert(mapping.department, vec!["Platform".to_string(); 2]);
+
+        let provisioned = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            provisioned
+                .user
+                .email
+                .as_deref(),
+            Some("jane@example.test")
+        );
+        assert_eq!(
+            provisioned
+                .user
+                .department
+                .as_deref(),
+            Some("Platform")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_assertion_whose_user_id_attribute_has_two_distinct_values_is_refused() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mut attributes = saml_attributes("saml-1", "jane");
+        attributes
+            .get_mut(&SamlAttributeMapping::default().user_id)
+            .unwrap()
+            .push("saml-2".to_string());
+
+        let err = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("more than one value")
+        );
+        assert!(
+            storage
+                .list_users()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_assertion_whose_username_attribute_has_two_distinct_values_is_refused() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mut attributes = saml_attributes("saml-1", "jane");
+        attributes
+            .get_mut(&SamlAttributeMapping::default().username)
+            .unwrap()
+            .push("sam".to_string());
+
+        let err = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.downcast_ref::<AmbiguousAttribute>()
+                .map(|ambiguous| ambiguous.attribute),
+            Some("username")
+        );
+        assert!(
+            storage
+                .list_users()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_names_the_assertion_subject_not_the_mapped_user_id() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let config = mapped_config();
+        provision_user_from_saml(&storage, &saml_attributes("saml-first", "first"), &config, &avatars)
+            .await
+            .unwrap();
+        let mut attributes = with_role(saml_attributes("mapped-id", "mallory"), "admin");
+        attributes.insert("NameID".to_string(), vec!["name-id-subject".to_string()]);
+
+        let err = provision_user_from_saml(&storage, &attributes, &config, &avatars)
+            .await
+            .unwrap_err();
+
+        let refused = err
+            .downcast_ref::<RoleRefused>()
+            .unwrap();
+        assert_eq!(refused.subject.as_deref(), Some("name-id-subject"));
+    }
+
+    #[tokio::test]
+    async fn a_user_id_attribute_repeating_one_value_is_accepted() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let mut attributes = saml_attributes("saml-1", "jane");
+        attributes
+            .get_mut(&SamlAttributeMapping::default().user_id)
+            .unwrap()
+            .push("saml-1".to_string());
+
+        let provisioned = provision_user_from_saml(&storage, &attributes, &test_saml_config(), &avatars)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            provisioned
+                .user
+                .saml_id
+                .as_deref(),
+            Some("saml-1")
+        );
+    }
+
+    fn mapped_config() -> SamlConfig {
+        let mut config = test_saml_config();
+        config
+            .role_mapping
+            .insert("gw-admins".to_string(), "administrator".to_string());
+        config
+    }
+
+    #[test]
+    fn an_unmapped_role_named_like_a_gateway_role_is_refused() {
+        let config = mapped_config();
+        for name in ["admin", "administrator", "Administrator", "ADMIN", "poweruser", "power_user", "power-user"] {
+            let attributes = with_role(HashMap::new(), name);
+            assert!(determine_role(&attributes, &config).is_err(), "{name} must not grant a role");
+        }
+    }
+
+    #[test]
+    fn an_explicit_mapping_grants_its_role() {
+        let attributes = with_role(HashMap::new(), "gw-admins");
+        assert_eq!(determine_role(&attributes, &mapped_config()).unwrap(), UserRole::Administrator);
+    }
+
+    #[test]
+    fn an_unmapped_role_gets_the_default_role_never_a_name_match() {
+        let mut config = mapped_config();
+        config.default_role = Some("user".to_string());
+        let attributes = with_role(HashMap::new(), "admin");
+        assert_eq!(determine_role(&attributes, &config).unwrap(), UserRole::User);
+    }
+
+    #[test]
+    fn a_missing_role_attribute_is_refused_without_a_default_role_and_defaulted_with_one() {
+        let mut config = mapped_config();
+        assert!(determine_role(&HashMap::new(), &config).is_err());
+        config.default_role = Some("poweruser".to_string());
+        assert_eq!(determine_role(&HashMap::new(), &config).unwrap(), UserRole::PowerUser);
+    }
+
+    #[tokio::test]
+    async fn an_unmapped_role_refuses_a_new_user_and_stores_nothing() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let config = mapped_config();
+        provision_user_from_saml(&storage, &saml_attributes("saml-first", "first"), &config, &avatars)
+            .await
+            .unwrap();
+
+        let err = provision_user_from_saml(
+            &storage,
+            &with_role(saml_attributes("saml-2", "mallory"), "admin"),
+            &config,
+            &avatars,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.downcast_ref::<RoleRefused>()
+                .is_some()
+        );
+        assert_eq!(
+            storage
+                .list_users()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_existing_user_whose_role_becomes_unmapped_is_refused_and_keeps_the_stored_role() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let config = mapped_config();
+        provision_user_from_saml(&storage, &saml_attributes("saml-first", "first"), &config, &avatars)
+            .await
+            .unwrap();
+        let second = provision_user_from_saml(
+            &storage,
+            &with_role(saml_attributes("saml-2", "jane"), "gw-admins"),
+            &config,
+            &avatars,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.user.role, UserRole::Administrator);
+
+        let err = provision_user_from_saml(
+            &storage,
+            &with_role(saml_attributes("saml-2", "jane"), "contractors"),
+            &config,
+            &avatars,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.downcast_ref::<RoleRefused>()
+                .is_some()
+        );
+        let stored = storage
+            .load_user_by_saml_id("saml-2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.role, UserRole::Administrator);
+    }
+
+    fn with_roles(
+        mut attributes: SamlAttributes,
+        roles: &[&str],
+    ) -> SamlAttributes {
+        attributes.insert(
+            ROLE_VALUES_KEY.to_string(),
+            roles
+                .iter()
+                .map(|role| role.to_string())
+                .collect(),
+        );
+        attributes
+    }
+
+    #[test]
+    fn the_highest_mapped_role_among_several_values_wins_whatever_their_order() {
+        let mut config = mapped_config();
+        config
+            .role_mapping
+            .insert("gw-all".to_string(), "user".to_string());
+        config
+            .role_mapping
+            .insert("gw-power".to_string(), "poweruser".to_string());
+        for roles in [["contractors", "gw-admins"], ["gw-admins", "contractors"]] {
+            let resolved = determine_role(&with_roles(HashMap::new(), &roles), &config).unwrap();
+            assert_eq!(resolved, UserRole::Administrator, "{roles:?}");
+        }
+        let resolved = determine_role(&with_roles(HashMap::new(), &["gw-all", "gw-power"]), &config).unwrap();
+        assert_eq!(resolved, UserRole::PowerUser);
+    }
+
+    #[test]
+    fn several_unmapped_values_are_refused_and_an_unmapped_admin_name_among_them_grants_nothing() {
+        let config = mapped_config();
+        let refused = determine_role(&with_roles(HashMap::new(), &["contractors", "admin"]), &config).unwrap_err();
+        assert_eq!(refused.idp_role.as_deref(), Some("contractors,admin"));
+    }
+
+    #[test]
+    fn a_refusal_names_the_values_received_or_none_for_an_absent_claim_and_caps_them() {
+        let config = mapped_config();
+        let absent = determine_role(&HashMap::new(), &config).unwrap_err();
+        assert_eq!(absent.idp_role, None);
+
+        let long = "x".repeat(MAX_LOGGED_ROLE_CHARS + 50);
+        let capped = determine_role(&with_role(HashMap::new(), &long), &config).unwrap_err();
+        assert_eq!(
+            capped
+                .idp_role
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_LOGGED_ROLE_CHARS
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_new_user_is_named_by_the_saml_subject() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let config = mapped_config();
+        provision_user_from_saml(&storage, &saml_attributes("saml-first", "first"), &config, &avatars)
+            .await
+            .unwrap();
+
+        let mut attributes = with_role(saml_attributes("saml-2", "jane"), "contractors");
+        attributes.insert("NameID".to_string(), vec!["saml-2".to_string()]);
+
+        let err = provision_user_from_saml(&storage, &attributes, &config, &avatars)
+            .await
+            .unwrap_err();
+
+        let refused = err
+            .downcast_ref::<RoleRefused>()
+            .unwrap();
+        assert_eq!(refused.subject.as_deref(), Some("saml-2"));
+        assert_eq!(refused.idp_role.as_deref(), Some("contractors"));
     }
 }

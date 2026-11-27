@@ -149,6 +149,9 @@ pub async fn legacy_sse_session(
         if post_status != reqwest::StatusCode::ACCEPTED {
             break;
         }
+        if body.get("id").is_none() {
+            continue;
+        }
         let message_data = match read_named_event(&mut stream, &mut buf, "message").await {
             Ok(data) => data,
             Err(error) => {

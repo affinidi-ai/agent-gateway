@@ -257,6 +257,86 @@ impl MockTls {
     }
 }
 
+/// A certificate authority that issues client certificates to callers.
+#[derive(Debug)]
+pub struct TestCertificateAuthority {
+    params: rcgen::CertificateParams,
+    key: rcgen::KeyPair,
+    pub certificate_pem: String,
+}
+
+impl TestCertificateAuthority {
+    pub fn generate(name: &str) -> Self {
+        let key = rcgen::KeyPair::generate().expect("generate a CA key pair");
+        let mut params = rcgen::CertificateParams::default();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign, rcgen::KeyUsagePurpose::DigitalSignature];
+        let certificate = params
+            .self_signed(&key)
+            .expect("self-sign the CA certificate");
+        Self {
+            params,
+            key,
+            certificate_pem: certificate.pem(),
+        }
+    }
+
+    /// A client certificate for `principal`, its subject common name, signed by this CA.
+    pub fn issue_client_certificate(
+        &self,
+        principal: &str,
+    ) -> MockTls {
+        let key = rcgen::KeyPair::generate().expect("generate a client key pair");
+        let mut params = rcgen::CertificateParams::default();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, principal);
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let issuer = rcgen::Issuer::from_params(&self.params, &self.key);
+        let certificate = params
+            .signed_by(&key, &issuer)
+            .expect("sign the client certificate");
+        MockTls {
+            certificate_pem: certificate.pem(),
+            private_key_pem: key.serialize_pem(),
+            der: certificate.der().to_vec(),
+        }
+    }
+}
+
+/// A client that trusts only `server` and presents `client` as its certificate.
+pub fn client_presenting_certificate(
+    server: &MockTls,
+    client: &MockTls,
+) -> reqwest::Client {
+    use rustls::pki_types::CertificateDer;
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(server.der.clone()))
+        .expect("trust the server certificate");
+    let key = rustls_pemfile::private_key(
+        &mut client
+            .private_key_pem
+            .as_bytes(),
+    )
+    .expect("read the client key")
+    .expect("a client key");
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
+        .with_root_certificates(roots)
+        .with_client_auth_cert(vec![CertificateDer::from(client.der.clone())], key)
+        .expect("client TLS configuration");
+    reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
+        .build()
+        .expect("a client presenting a certificate")
+}
+
 /// Takes any client certificate, or none, so the mock can record what a client presented.
 #[derive(Debug)]
 struct AnyClientCertificate(Arc<rustls::crypto::CryptoProvider>);

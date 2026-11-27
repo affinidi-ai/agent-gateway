@@ -708,6 +708,12 @@ pub struct ExtensionIdentityContext {
 }
 
 impl ExtensionIdentityContext {
+    /// The `identity_hash` of a resolved identity: absent for a DID used as
+    /// given (static, or a certificate with a pinned DID), which has no hash.
+    pub fn hash_field(hash: &str) -> Option<String> {
+        (!hash.is_empty()).then(|| hash.to_string())
+    }
+
     pub fn verified(&self) -> bool {
         self.verification
             .is_verified()
@@ -1765,6 +1771,21 @@ allow if {
     }
 
     // ── Identity verification markers ────────────────────────────────────────
+
+    #[test]
+    fn a_did_used_as_given_has_no_identity_hash_in_policy_input() {
+        assert_eq!(ExtensionIdentityContext::hash_field(""), None);
+        assert_eq!(ExtensionIdentityContext::hash_field("abc"), Some("abc".to_string()));
+        let bound = ExtensionIdentityContext {
+            did: Some("did:web:static.example".into()),
+            identity_hash: ExtensionIdentityContext::hash_field(""),
+            verification: IdentityVerification::Unverified,
+        };
+        assert_eq!(
+            serde_json::to_value(&bound).unwrap(),
+            serde_json::json!({ "did": "did:web:static.example", "verified": false, "verification": "unverified" })
+        );
+    }
 
     fn extension_identity(verified: bool) -> ExtensionIdentityContext {
         ExtensionIdentityContext {

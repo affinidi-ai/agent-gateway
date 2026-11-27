@@ -115,15 +115,6 @@ Feature: JWT Bearer client authentication
     And the admin API error response mentions "client_secret_secret_ref is not allowed"
     And no credential provider "public-with-secret" is stored
 
-  Scenario: A client authentication is refused on a provider of another type and not stored
-    Given the operator can use the admin API and no surface is configured for route "/example"
-    And the appliance holds the secret "bdd-client-id"
-    And the appliance holds the secret "bdd-client-secret"
-    When the operator creates the credential provider "m2m" with token endpoint "https://192.0.2.1/token" using secrets "bdd-client-id" and "bdd-client-secret", authenticating its client with "HTTP Basic"
-    Then the admin API response status is 400
-    And the admin API error response mentions "only for oauth2_jwt_bearer"
-    And no credential provider "m2m" is stored
-
   Scenario: Clearing the client authentication of a stored provider sends a client-less grant
     Given an A2A surface targeting managed agent "bravo"
     And the gateway authenticates to the managed agent with a JWT Bearer provider

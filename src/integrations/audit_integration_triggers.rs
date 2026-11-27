@@ -576,6 +576,17 @@ mod tests {
             | DelegationAuditAction::AuthorityForceDeleted(_)
             | DelegationAuditAction::McpProxyPinChanged(_)
             | DelegationAuditAction::BrowserOriginsChanged(_)
+            | DelegationAuditAction::TrustAgentConnectionCreated(_)
+            | DelegationAuditAction::TrustAgentConnectionUpdated(_)
+            | DelegationAuditAction::TrustAgentConnectionDeleted(_)
+            | DelegationAuditAction::TrustAgentPairingStarted(_)
+            | DelegationAuditAction::TrustAgentConnectionVerified(_)
+            | DelegationAuditAction::TrustAgentConnectionRevoked(_)
+            | DelegationAuditAction::TrustAgentSigningKeyProvisioned(_)
+            | DelegationAuditAction::TrustAgentSigningKeyRotated(_)
+            | DelegationAuditAction::TrustAgentControlKeyRotated(_)
+            | DelegationAuditAction::TrustAgentChangeRefused(_)
+            | DelegationAuditAction::SigningChangeRefused(_)
             | DelegationAuditAction::PolicyInputCaptureStarted(_)
             | DelegationAuditAction::PolicyInputCaptureStopped(_) => {}
         }
@@ -732,6 +743,26 @@ mod tests {
                 previous_origins: Vec::new(),
                 origins: vec!["https://chat.example.com".to_string()],
             })),
+            DelegationAuditAction::TrustAgentConnectionCreated(trust_agent_change()),
+            DelegationAuditAction::TrustAgentConnectionUpdated(trust_agent_change()),
+            DelegationAuditAction::TrustAgentConnectionDeleted(trust_agent_change()),
+            DelegationAuditAction::TrustAgentPairingStarted(trust_agent_change()),
+            DelegationAuditAction::TrustAgentConnectionVerified(trust_agent_change()),
+            DelegationAuditAction::TrustAgentConnectionRevoked(trust_agent_change()),
+            DelegationAuditAction::TrustAgentSigningKeyProvisioned(trust_agent_change()),
+            DelegationAuditAction::TrustAgentSigningKeyRotated(trust_agent_change()),
+            DelegationAuditAction::TrustAgentControlKeyRotated(trust_agent_change()),
+            DelegationAuditAction::TrustAgentChangeRefused(trust_agent_change()),
+            DelegationAuditAction::SigningChangeRefused(Box::new(
+                crate::delegation_vault::audit::SigningChangeRefusalDetails {
+                    actor: Actor::user("u-1"),
+                    recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                    owner: crate::audit::events::SigningOwnerKind::Surface,
+                    owner_id: Some("s-1".to_string()),
+                    status: 403,
+                    chain: None,
+                },
+            )),
             DelegationAuditAction::PolicyInputCaptureStarted(Box::new(PolicyInputCaptureDetails {
                 actor: Actor::user("u-1"),
                 reason: None,
@@ -741,6 +772,10 @@ mod tests {
                 reason: Some(PolicyInputCaptureStop::Stopped),
             })),
         ]
+    }
+
+    fn trust_agent_change() -> Box<crate::delegation_vault::audit::TrustAgentChangeDetails> {
+        Box::new(crate::audit::trust_agent_changes::details(Actor::user("u-1")))
     }
 
     fn policy_change() -> Box<PolicyChangeDetails> {

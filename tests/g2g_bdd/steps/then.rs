@@ -543,6 +543,60 @@ pub async fn managed_agent_received_forwarded_request_with_identity_field(
     );
 }
 
+#[then(
+    expr = "managed agent {string} received the forwarded request with a VP proving only the API key Transit Point {string} verified"
+)]
+async fn managed_agent_received_only_the_verified_api_key_identity(
+    world: &mut G2gWorld,
+    target_name: String,
+    transit_point: String,
+) {
+    world
+        .topology
+        .actors
+        .expect_target_kind(&target_name, TargetActorKind::ManagedAgent);
+    let secret_id = world
+        .topology
+        .plans
+        .values()
+        .flat_map(|plan| &plan.surfaces)
+        .flat_map(|surface| &surface.transit_points)
+        .find(|point| point.alias == transit_point)
+        .and_then(|point| point.source_auth.as_ref())
+        .map(|crate::bdd_support::config::fabric_surface_fixture::SourceAuthSpec::ApiKey { secret_id, .. }| {
+            secret_id.clone()
+        })
+        .unwrap_or_else(|| panic!("Transit Point '{transit_point}' must authenticate its callers with an API key"));
+    let body = last_request_for(world, &target_name)
+        .await
+        .json_body();
+    let proof = body
+        .pointer(&format!("/params/message/metadata/{}", AGENT_IDENTITY_BINDING_URI.replace('/', "~1")))
+        .or_else(|| {
+            body.pointer(&format!("/params/message/metadata/{}", AGENT_IDENTITY_CREDENTIAL_URI.replace('/', "~1")))
+        })
+        .unwrap_or_else(|| panic!("managed agent '{target_name}' should receive an identity proof, got body: {body}"));
+    let subject = first_credential_subject_from_identity_proof(proof);
+    for (field, expected) in [("credential_type", "api_key"), ("api_key_id", secret_id.as_str())] {
+        assert_eq!(
+            identity_field_value_from_subject(&subject, field).and_then(Value::as_str),
+            Some(expected),
+            "managed agent '{target_name}' should receive the identity of the API key Transit Point '{transit_point}' verified, got credentialSubject: {subject}"
+        );
+    }
+    let text = body.to_string();
+    for copied in world
+        .obtained_identity_proofs
+        .values()
+    {
+        let presentation = copied.proof["verifiablePresentation"].to_string();
+        assert!(
+            !text.contains(presentation.trim_matches('"')),
+            "managed agent '{target_name}' should receive no identity presentation the caller copied, got body: {body}"
+        );
+    }
+}
+
 #[then(expr = "the VP Audit Log of gateway {int} records a verified identity binding issued by gateway {int}")]
 async fn vp_audit_log_of_gateway_records_verified_identity_binding(
     world: &mut G2gWorld,
@@ -1261,6 +1315,25 @@ pub async fn managed_agent_served_its_agent_card_once(
     );
 }
 
+#[then(expr = "managed agent {string} received the forwarded message with no caller identity")]
+pub async fn actor_received_the_forwarded_message_with_no_caller_identity(
+    world: &mut G2gWorld,
+    target_name: String,
+) {
+    use crate::bdd_support::json_rpc::{AGENT_IDENTITY_BINDING_EXTENSION_URI, AGENT_IDENTITY_CREDENTIAL_EXTENSION_URI};
+    let messages = forwarded_messages_for(world, &target_name).await;
+    assert_eq!(messages.len(), 1, "managed agent '{target_name}' should receive one forwarded message: {messages:?}");
+    let body = messages[0].json_body();
+    for uri in [AGENT_IDENTITY_BINDING_EXTENSION_URI, AGENT_IDENTITY_CREDENTIAL_EXTENSION_URI] {
+        let pointer = format!("/params/message/metadata/{}", uri.replace('/', "~1"));
+        assert!(
+            body.pointer(&pointer)
+                .is_none(),
+            "managed agent '{target_name}' should receive no caller identity proof '{uri}', got body: {body}"
+        );
+    }
+}
+
 #[then(expr = "managed agent {string} received one forwarded message")]
 pub async fn actor_received_one_forwarded_message(
     world: &mut G2gWorld,
@@ -1303,6 +1376,24 @@ pub async fn ping_succeeds(
         .copied()
         .unwrap_or_else(|| panic!("no ping recorded from gateway {from_gw} to gateway {to_gw}"));
     assert!(success, "ping from gateway {from_gw} to gateway {to_gw} did not succeed");
+}
+
+#[then(regex = r#"^gateway (\d+) waited for the mediator to admit its DIDs "([^"]+)"$"#)]
+pub async fn gateway_waited_for_mediator_access(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    roles: String,
+) {
+    let expected: Vec<String> = roles
+        .split(',')
+        .map(|role| role.trim().to_string())
+        .collect();
+    let waited = world
+        .harness()
+        .mediator_access_pauses
+        .get(&gw_index)
+        .unwrap_or_else(|| panic!("gateway {gw_index} did not pause for mediator access"));
+    assert_eq!(waited, &expected, "the DIDs gateway {gw_index} waited for");
 }
 
 /// How long a Remote record may take to gain an issuer DID after a restart:
@@ -1525,6 +1616,58 @@ pub async fn agent_card_points_callers_at_surface(
             .and_then(Value::as_str),
         Some(format!("http://localhost:{port}/{surface_id}").as_str()),
         "agent card should point at gateway {gw_index} surface '{surface_name}': {body}"
+    );
+}
+
+#[then(regex = r#"^gateway (\d+) shows the gateway it accepted last as failed with "([^"]+)"$"#)]
+pub async fn accepted_gateway_failed_with(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    description: String,
+) {
+    let gateway_id = world
+        .accepted_gateway_id
+        .clone()
+        .expect("a When must accept an invitation before this Then");
+    let gateway = world
+        .harness()
+        .gw(gw_index)
+        .admin
+        .wait_for_gateway_status(
+            &gateway_id,
+            crate::bdd_support::admin_client::GatewayStatus::Failed,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("gateway {gw_index} never marked {gateway_id} failed: {error:#}"));
+    assert_eq!(gateway.description, description);
+}
+
+#[then(regex = r"^gateway (\d+) no longer lists the gateway it accepted last$")]
+pub async fn accepted_gateway_is_no_longer_listed(
+    world: &mut G2gWorld,
+    gw_index: usize,
+) {
+    let gateway_id = world
+        .accepted_gateway_id
+        .clone()
+        .expect("a When must accept an invitation before this Then");
+    let status = world
+        .response_status
+        .expect("a When must delete the gateway before this Then");
+    assert!((200..300).contains(&status), "delete refused: {status} {:?}", world.response_body);
+    let remaining = world
+        .harness()
+        .gw(gw_index)
+        .admin
+        .list_gateways()
+        .await
+        .expect("list gateways");
+    assert!(
+        remaining
+            .iter()
+            .all(|gateway| gateway.id != gateway_id),
+        "gateway {gateway_id} is still listed"
     );
 }
 

@@ -5,8 +5,8 @@ source revision. If Affinidi hosts the appliance for you, use the hosted
 [Agent Gateway documentation](https://docs.affinidi.com/products/affinidi-trust-fabric/agent-gateway/)
 instead.
 
-Agent Gateway is a single process, `agent-gateway`. It needs no database and no sidecar:
-it keeps its state in memory and saves it as JSON files on disk. The web dashboard is a
+Agent Gateway is a single process, `agent-gateway`. It needs no database and no sidecar: it keeps its state in
+memory and saves it as JSON files on disk. The web dashboard is a
 folder of static files that the process serves.
 
 ## At a glance
@@ -119,9 +119,14 @@ host; the gateway warns about it and starts.
 
 Instances that share one `_storage` volume, such as an Active node and its Standby nodes, take
 turns through advisory file locks on that volume: the gateway DID lock (`.gateway_did.lock` in
-`vc_keys`) and the delegation vault's mutation lock (see
-[Credential delegation](CREDENTIAL_DELEGATION.md)). The file server must grant each lock to one
-host at a time:
+`vc_keys`), the delegation vault's mutation lock (see
+[Credential delegation](CREDENTIAL_DELEGATION.md)), and, with the default `single_use_store`
+disk backend, the single-use journal lock (`single_use/single-use.lock`), which the Active node
+holds and a node stepping down to Standby releases (see
+[Single-use store](CONFIGURATION_REFERENCE.md#single-use-store)). Instances that each have their
+own `_storage` and serve at the same time need `single_use_store` set to the `dynamodb` backend,
+or a replayed ID-JAG, Fabric envelope or voided payment receipt is accepted by the node that has
+not seen it. The file server must grant each lock to one host at a time:
 
 | Volume | Locks hold across hosts |
 | --- | --- |
@@ -143,7 +148,8 @@ Back up with full `.agbak` archives from the dashboard or the management API; se
 volume snapshots and archives as sensitive. A restore exits the gateway after staging the
 archive, and again after applying it on the next start. Run the gateway under a
 supervisor or restart policy (for example, `restart: on-failure`), or start it twice by
-hand.
+hand. Once applied, the staged archive and any older staged archive beside it are removed; one
+that cannot be removed is recognised on the next start and not applied again.
 
 ## Network
 

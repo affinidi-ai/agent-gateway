@@ -1033,6 +1033,7 @@ async fn load_storage_dir<T: StorableEntity>(
     fs::create_dir_all(storage_dir)
         .await
         .context("Failed to create storage directory")?;
+    remove_stale_temporaries(storage_dir).await;
 
     // Load existing entities from disk
     let entities = load_all_entities_from_disk(storage_dir, entity_name, config, cache, strict).await?;
@@ -1258,7 +1259,7 @@ async fn save_entity_to_disk<T: StorableEntity>(
         let encrypted_content = encryption_service
             .encrypt_file(&logged_path, &json_content)
             .context("Failed to encrypt entity")?;
-        fs::write(&encrypted_path, encrypted_content)
+        replace_file_unsynced(&encrypted_path, encrypted_content.as_bytes())
             .await
             .context("Failed to write encrypted entity to disk")?;
         debug!("Saved encrypted {} {} to {:?}", entity_name, loggable_id::<T>(id), logged_path);
@@ -1268,10 +1269,11 @@ async fn save_entity_to_disk<T: StorableEntity>(
     } else {
         // Plain storage
         let raw_path = get_raw_path(storage_dir, id);
-        fs::write(&raw_path, json_content.as_bytes())
+        replace_file_unsynced(&raw_path, json_content.as_bytes())
             .await
             .context("Failed to write entity to disk")?;
         debug!("Saved {} {} to {:?}", entity_name, loggable_id::<T>(id), loggable_path::<T>(&raw_path, id));
+        remove_encrypted_sibling::<T>(storage_dir, entity_name, id).await;
     }
 
     Ok(())
@@ -1309,9 +1311,77 @@ async fn save_entity_to_disk_atomic<T: StorableEntity>(
             .await
             .context("Failed to write entity to disk")?;
         debug!("Atomically saved {} {} to {:?}", entity_name, loggable_id::<T>(id), loggable_path::<T>(&raw_path, id));
+        remove_encrypted_sibling::<T>(storage_dir, entity_name, id).await;
     }
 
     Ok(())
+}
+
+/// A temporary file older than this was left by a write that never renamed it.
+const STALE_TEMPORARY_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Removes the `.<name>.<uuid>.tmp` files a crash between writing and renaming
+/// left in `dir`. A temporary file younger than [`STALE_TEMPORARY_AGE`] may
+/// belong to a write still running on another instance sharing the directory,
+/// so it is kept.
+async fn remove_stale_temporaries(dir: &Path) {
+    let Ok(mut entries) = fs::read_dir(dir).await else {
+        return;
+    };
+    let mut removed = 0usize;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with('.') && name.ends_with(".tmp")) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .await
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= STALE_TEMPORARY_AGE);
+        if stale
+            && fs::remove_file(entry.path())
+                .await
+                .is_ok()
+        {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        info!("Removed {} temporary file(s) left by interrupted writes in {}", removed, dir.display());
+    }
+}
+
+/// Writes `content` beside `target_path` and renames it over the target, so a
+/// crash mid-write leaves the previous file whole rather than a torn one the
+/// loader would skip. Unlike [`atomic_write_file`] it does not sync, so the new
+/// content may not survive a power loss; it keeps saves that run on every
+/// request free of a disk sync.
+async fn replace_file_unsynced(
+    target_path: &Path,
+    content: &[u8],
+) -> Result<()> {
+    let parent = target_path
+        .parent()
+        .context("Target path has no parent directory")?;
+    let file_name = target_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Target path has invalid file name")?;
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    let replaced = async {
+        fs::write(&temporary, content).await?;
+        fs::rename(&temporary, target_path).await
+    }
+    .await;
+    if replaced.is_err() {
+        let _ = fs::remove_file(&temporary).await;
+    }
+    Ok(replaced?)
 }
 
 async fn atomic_write_file(
@@ -1491,6 +1561,30 @@ async fn remove_plaintext_sibling<T: StorableEntity>(
                 );
             }
         }
+    }
+}
+
+/// Remove an `id.json.enc` left beside an `id.json` just saved with encryption
+/// off. The plaintext is now the newer record, and a later load with encryption
+/// on keeps the ciphertext and drops the plaintext, so the stale ciphertext would
+/// otherwise replace every change made while encryption was off.
+async fn remove_encrypted_sibling<T: StorableEntity>(
+    storage_dir: &Path,
+    entity_name: &str,
+    id: &str,
+) {
+    let encrypted_path = get_encrypted_path(storage_dir, id);
+    if !encrypted_path.exists() {
+        return;
+    }
+    let logged_path = loggable_path::<T>(&encrypted_path, id);
+    match fs::remove_file(&encrypted_path).await {
+        Ok(()) => info!("Removed {} file {:?} superseded by a plaintext save", entity_name, logged_path),
+        Err(e) => error!(
+            "Failed to remove {} file {:?} superseded by a plaintext save; enabling encryption again would \
+             load it in place of the newer plaintext: {}",
+            entity_name, logged_path, e
+        ),
     }
 }
 
@@ -2238,6 +2332,7 @@ impl<T: StorableEntity> UncachedFilesystemStorage<T> {
         fs::create_dir_all(&storage_dir)
             .await
             .context("Failed to create storage directory")?;
+        remove_stale_temporaries(&storage_dir).await;
 
         Ok(Self {
             storage_dir,
@@ -5153,6 +5248,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opening_a_storage_directory_removes_only_stale_temporary_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let stale = temp_dir
+            .path()
+            .join(".stale-1.json.0b6c3a52-7f0e-4e43-9d3c-1d2f6d1f5c11.tmp");
+        let fresh = temp_dir
+            .path()
+            .join(".fresh-1.json.5a1e9c8d-2b7f-4f0a-8c3d-6e4b2a9f1d07.tmp");
+        let unrelated = temp_dir
+            .path()
+            .join("notes.tmp");
+        for path in [&stale, &fresh, &unrelated] {
+            std::fs::write(path, b"partial").unwrap();
+        }
+        let old = std::time::SystemTime::now() - STALE_TEMPORARY_AGE - std::time::Duration::from_secs(1);
+        for path in [&stale, &unrelated] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+
+        let _storage = cached_storage::<TestEntity>(temp_dir.path().to_path_buf(), "test_entity")
+            .await
+            .unwrap();
+
+        assert!(!stale.exists(), "a temporary file older than any running write is removed");
+        assert!(fresh.exists(), "a recent one may belong to a write still running");
+        assert!(unrelated.exists(), "only hidden temporary files are touched");
+    }
+
+    #[tokio::test]
     async fn test_cached_trait_object_save_atomic_persists_and_leaves_no_temp() {
         let temp_dir = TempDir::new().unwrap();
         let storage: Box<dyn StorageBackend<TestEntity>> = cached_storage(temp_dir.path().to_path_buf(), "test_entity")
@@ -5931,6 +6060,115 @@ mod tests {
         assert!(!raw_path.exists(), "save must remove the stale plaintext sibling");
         assert!(get_encrypted_path(temp_dir.path(), id).exists());
         assert_eq!(storage.get(id).await.unwrap(), Some(entity));
+    }
+
+    #[tokio::test]
+    async fn a_save_replaces_the_record_whole_and_leaves_no_temporary_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = CachedFilesystemStorage::<TestEntity>::new(temp_dir.path().to_path_buf(), "test_entity")
+            .await
+            .unwrap();
+        for value in 1..=3 {
+            storage
+                .save(&TestEntity {
+                    id: "whole-1".to_string(),
+                    name: "Whole".to_string(),
+                    value,
+                })
+                .await
+                .unwrap();
+        }
+
+        let names: Vec<String> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(names, vec!["whole-1.json".to_string()]);
+        let stored: TestEntity =
+            serde_json::from_str(&std::fs::read_to_string(get_raw_path(temp_dir.path(), "whole-1")).unwrap()).unwrap();
+        assert_eq!(stored.value, 3);
+    }
+
+    #[tokio::test]
+    async fn a_failed_replace_keeps_the_previous_file_and_no_temporary_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let target = temp_dir
+            .path()
+            .join("kept.json");
+        std::fs::write(&target, b"previous").unwrap();
+        let blocked = temp_dir
+            .path()
+            .join("missing-dir/kept.json");
+
+        assert!(
+            replace_file_unsynced(&blocked, b"new")
+                .await
+                .is_err()
+        );
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"previous");
+        assert_eq!(
+            std::fs::read_dir(temp_dir.path())
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn changes_saved_with_encryption_off_survive_turning_it_back_on() {
+        let temp_dir = TempDir::new().unwrap();
+        let key = rand::random::<[u8; 32]>();
+        let id = "toggle-1";
+        let encrypted = || {
+            CachedFilesystemStorage::<TestEntity>::new_with_encryption(
+                temp_dir.path().to_path_buf(),
+                "test_entity",
+                EncryptionService::new(KeySource::Raw { key }).unwrap(),
+            )
+        };
+        let before = TestEntity {
+            id: id.to_string(),
+            name: "Before".to_string(),
+            value: 1,
+        };
+        encrypted()
+            .await
+            .unwrap()
+            .save(&before)
+            .await
+            .unwrap();
+
+        let plaintext = CachedFilesystemStorage::<TestEntity>::new(temp_dir.path().to_path_buf(), "test_entity")
+            .await
+            .unwrap();
+        let changed = TestEntity {
+            id: id.to_string(),
+            name: "Changed while encryption was off".to_string(),
+            value: 2,
+        };
+        plaintext
+            .save(&changed)
+            .await
+            .unwrap();
+        assert!(!get_encrypted_path(temp_dir.path(), id).exists(), "the older ciphertext is removed");
+
+        let reopened = encrypted().await.unwrap();
+        assert_eq!(
+            reopened
+                .get(id)
+                .await
+                .unwrap(),
+            Some(changed)
+        );
+        assert!(get_encrypted_path(temp_dir.path(), id).exists());
+        assert!(!get_raw_path(temp_dir.path(), id).exists());
     }
 
     #[test]

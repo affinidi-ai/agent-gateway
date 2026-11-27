@@ -356,7 +356,7 @@ impl TrustRegistryConnection {
     }
 
     /// Whether this connection is addressed to `did`, by its canonical or transport DID.
-    fn serves(
+    pub(super) fn serves(
         &self,
         did: &str,
     ) -> bool {
@@ -2510,8 +2510,8 @@ impl TrustRegistryListenerManager {
         }
 
         info!(
-            "Message forwarded via mediator, waiting for response (timeout: {:?})",
-            deadline.saturating_duration_since(Instant::now())
+            "Message forwarded via mediator, waiting for response (timeout: {})",
+            wait_label(deadline.saturating_duration_since(Instant::now()))
         );
 
         match tokio::time::timeout_at(deadline, rx).await {
@@ -2531,9 +2531,11 @@ impl TrustRegistryListenerManager {
                 // waiters. Treat as stale so `send_with_reconnect` reconnects.
                 Err(TrustRegistryError::StaleConnection("stream reader closed before a response arrived".to_string()))
             }
-            Err(_elapsed) => {
-                Err(TrustRegistryError::Timeout(format!("No response within {:?} for thread {}", remaining, thread_id)))
-            }
+            Err(_elapsed) => Err(TrustRegistryError::Timeout(format!(
+                "No response within {} for thread {}",
+                wait_label(remaining),
+                thread_id
+            ))),
         }
     }
 }
@@ -3046,12 +3048,41 @@ async fn create_tr_client(
     Ok(client)
 }
 
+/// Whole milliseconds with an `ms` unit, for a wait shown in a log line.
+///
+/// The `Debug` form of a `Duration` carries nanoseconds (`9.999827541s`), a digit run that
+/// the phone number redaction rule masks.
+fn wait_label(wait: Duration) -> String {
+    format!("{}ms", wait.as_millis())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn parse(url: &str) -> url::Url {
         url::Url::parse(url).expect("test URL must be syntactically valid")
+    }
+
+    #[test]
+    fn test_wait_label_survives_example_redaction() {
+        let redactor = crate::observability::log_redact::example_redactor();
+        for wait in [Duration::new(9, 999_827_541), Duration::from_millis(29_999), Duration::from_secs(30)] {
+            let line = format!("waiting for response (timeout: {})", wait_label(wait));
+            assert_eq!(
+                redactor
+                    .redact(&line)
+                    .as_ref(),
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn test_wait_label_formats_whole_milliseconds() {
+        assert_eq!(wait_label(Duration::new(9, 999_827_541)), "9999ms");
+        assert_eq!(wait_label(Duration::from_secs(30)), "30000ms");
+        assert_eq!(wait_label(Duration::ZERO), "0ms");
     }
 
     // --- Active/Standby gate ---

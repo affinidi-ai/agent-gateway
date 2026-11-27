@@ -404,15 +404,21 @@ mod tests {
         assert_eq!(dns.kind(), "DNS resolution failed");
     }
 
-    #[tokio::test]
-    async fn send_failure_names_a_connection_refused_kind_without_the_url() {
+    /// A loopback address nothing listens on. Not a fixed port: tests of trust agent connections
+    /// reserve fixed unreachable addresses such as `127.0.0.1:1`, and the egress guard refuses a
+    /// reserved address before connecting, so a fixed port's outcome would depend on test order.
+    async fn closed_port() -> std::net::SocketAddr {
         let closed = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
-        let addr = closed
+        closed
             .local_addr()
-            .expect("addr");
-        drop(closed);
+            .expect("addr")
+    }
+
+    #[tokio::test]
+    async fn send_failure_names_a_connection_refused_kind_without_the_url() {
+        let addr = closed_port().await;
         let err = send(request(&format!("http://{addr}/secret-path")))
             .await
             .expect_err("nothing listens");
@@ -437,7 +443,7 @@ mod tests {
             MirrorError::Internal("egress task failed".into()).caller_message(),
             "Traffic mirroring failed (internal error): the mirror request did not complete"
         );
-        let refused_connection = send(request("http://127.0.0.1:1/secret-path"))
+        let refused_connection = send(request(&format!("http://{}/secret-path", closed_port().await)))
             .await
             .expect_err("nothing listens");
         assert_eq!(
@@ -472,8 +478,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_stored_timeout_above_the_ceiling_is_cut_to_it_and_does_not_overflow_the_deadline() {
+        let endpoint = format!("http://{}/", closed_port().await);
         let config: MirrorConfig =
-            serde_json::from_value(serde_json::json!({ "endpoint": "http://127.0.0.1:1/", "timeout_secs": u64::MAX }))
+            serde_json::from_value(serde_json::json!({ "endpoint": endpoint, "timeout_secs": u64::MAX }))
                 .expect("mirror config");
         let request = MirrorRequest::new(&config, Method::POST, Bytes::new());
         assert_eq!(request.timeout, Duration::from_secs(MAX_TIMEOUT_SECS));

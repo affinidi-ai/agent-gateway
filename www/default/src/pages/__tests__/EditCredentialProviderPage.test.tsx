@@ -1282,8 +1282,46 @@ describe('EditCredentialProviderPage JWT Bearer client authentication', () => {
     );
   });
 
-  it('does not offer client authentication on a Client Credentials provider', async () => {
-    renderJwt({ ...jwtBearer(), provider_type: 'oauth2_client_credentials' });
+  it('offers HTTP Basic beside the default form body on a Client Credentials provider and saves it', async () => {
+    renderJwt({
+      ...jwtBearer(),
+      provider_type: 'oauth2_client_credentials',
+      client_id_secret_ref: 'HYDRA_ID',
+      client_secret_secret_ref: 'HYDRA_SECRET',
+    });
+    await screen.findByDisplayValue('https://hydra.example/oauth2/token');
+    expect(select().value).toBe('');
+    expect(Array.from(select().options).map(o => [o.value, o.textContent])).toEqual([
+      ['', 'Form body (default)'],
+      ['client_secret_basic', 'HTTP Basic'],
+    ]);
+    fireEvent.change(select(), { target: { value: 'client_secret_basic' } });
+
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(savedBody().client_authentication).toBe('client_secret_basic'));
+    expect(savedBody()).toMatchObject({
+      client_id_secret_ref: 'HYDRA_ID',
+      client_secret_secret_ref: 'HYDRA_SECRET',
+    });
+  });
+
+  it('shows a stored client_secret_post as the default form body and keeps it on save', async () => {
+    renderJwt({
+      ...jwtBearer(),
+      provider_type: 'oauth2_client_credentials',
+      client_authentication: 'client_secret_post',
+      client_id_secret_ref: 'HYDRA_ID',
+      client_secret_secret_ref: 'HYDRA_SECRET',
+    });
+    await screen.findByDisplayValue('https://hydra.example/oauth2/token');
+    expect(select().value).toBe('');
+
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(savedBody().client_authentication).toBe('client_secret_post'));
+  });
+
+  it('does not offer client authentication on a Client Credentials JWT provider', async () => {
+    renderJwt({ ...jwtBearer(), provider_type: 'oauth2_client_credentials_jwt_auth' });
     await screen.findByDisplayValue('https://hydra.example/oauth2/token');
     expect(
       screen.queryByTestId('credential-provider-client-authentication-select')
@@ -1387,7 +1425,7 @@ describe('EditCredentialProviderPage client authentication requests', () => {
     });
   });
 
-  it('sends an empty client authentication when a JWT Bearer provider becomes Client Credentials', async () => {
+  it('keeps HTTP Basic when a JWT Bearer provider becomes Client Credentials', async () => {
     setup(
       '/credential-providers/p1',
       stored({
@@ -1400,17 +1438,40 @@ describe('EditCredentialProviderPage client authentication requests', () => {
     fireEvent.change(screen.getByTestId('credential-provider-type-select'), {
       target: { value: 'oauth2_client_credentials' },
     });
+    expect(
+      (screen.getByTestId('credential-provider-client-authentication-select') as HTMLSelectElement)
+        .value
+    ).toBe('client_secret_basic');
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
     await waitFor(() =>
       expect(mockFetch.mock.calls.some(([, i]) => i?.method === 'PUT')).toBe(true)
     );
     const { body } = savedRequest('PUT');
     expect(body.provider_type).toBe('oauth2_client_credentials');
-    expect(body.client_authentication).toBe('');
+    expect(body.client_authentication).toBe('client_secret_basic');
     expect(body).toMatchObject({
       client_id_secret_ref: 'HYDRA_ID',
       client_secret_secret_ref: 'HYDRA_SECRET',
     });
+  });
+
+  it('sends an empty client authentication when a public JWT Bearer client becomes Client Credentials', async () => {
+    setup(
+      '/credential-providers/p1',
+      stored({ client_authentication: 'none', client_id_secret_ref: 'HYDRA_ID' })
+    );
+    await screen.findByDisplayValue('https://hydra.example/oauth2/token');
+    fireEvent.change(screen.getByTestId('credential-provider-type-select'), {
+      target: { value: 'oauth2_client_credentials' },
+    });
+    fireEvent.change(screen.getByRole('combobox', { name: /^Client Secret/ }), {
+      target: { value: 'HYDRA_SECRET' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() =>
+      expect(mockFetch.mock.calls.some(([, i]) => i?.method === 'PUT')).toBe(true)
+    );
+    expect(savedRequest('PUT').body.client_authentication).toBe('');
   });
 
   it('clears stale client references of a JWT Bearer provider with no method', async () => {

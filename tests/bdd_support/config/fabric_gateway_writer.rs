@@ -251,6 +251,9 @@ fn build_surface_fixture(
     if let Some(did) = &surface.fixed_managed_identity {
         fixture = fixture.with_identity_slot("protected", serde_json::json!({ "type": "static", "did": did }));
     }
+    if surface.inbound_identity_from_api_key {
+        fixture = fixture.with_identity_slot("inbound", serde_json::json!({ "type": "from_api_key" }));
+    }
     if let Some(proxy) = &surface.mcp_proxy {
         fixture = fixture.with_mcp_proxy_id(proxy.proxy_id.clone());
     }
@@ -371,6 +374,10 @@ fn build_surface_fixture(
                     point["identity_injection"] = serde_json::json!({
                         "inject_vp": true,
                     });
+                }
+                if tp.identity_from_caller_api_key {
+                    point["managed_identity"] = serde_json::json!({ "type": "from_api_key" });
+                    point["identity_injection"] = serde_json::json!({ "inject_vp": true });
                 }
                 point
             })

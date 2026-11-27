@@ -2,16 +2,16 @@
 //! sink has passed.
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::audit::journal::{JournalEntry, OWNER_ONLY_FILE, create_owner_only_dir, segment_first_seq, segment_paths};
+use crate::audit::journal::{
+    JournalEntry, create_owner_only_dir, segment_first_seq, segment_paths, write_owner_only_atomically,
+};
 use crate::audit::registry::SinkId;
 
 /// What one read of the journal found after a sink's cursor.
@@ -597,25 +597,7 @@ impl CursorStore {
             })
             .collect();
         let bytes = serde_json::to_vec(&stored).map_err(io::Error::other)?;
-        let temp = self
-            .path
-            .with_extension("json.tmp");
-        {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(OWNER_ONLY_FILE)
-                .open(&temp)?;
-            file.set_permissions(fs::Permissions::from_mode(OWNER_ONLY_FILE))?;
-            io::Write::write_all(&mut file, &bytes)?;
-            file.sync_all()?;
-        }
-        fs::rename(&temp, &self.path)?;
-        if let Some(dir) = self.path.parent() {
-            File::open(dir)?.sync_all()?;
-        }
-        Ok(())
+        write_owner_only_atomically(&self.path, &bytes)
     }
 }
 
@@ -652,6 +634,7 @@ mod tests {
     use super::*;
     use crate::audit::journal::{JournalWriter, Pending};
     use crate::delegation_vault::audit::{DelegationAuditAction, audit_event};
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     fn pending() -> Pending {

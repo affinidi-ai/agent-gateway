@@ -75,6 +75,7 @@ mod trust_registries;
 mod trust_registry_verification; // Trust Registry client and validation
 mod url_validation; // SSRF protection for user-supplied URLs
 mod vault_identity; // Vault identity generation for API keys and certificates
+mod vta; // Verifiable Trust Agent (VTA) signing connector — thin REST/Trust-Task client
 mod x402; // x402 protocol (HTTP Native Payments Protocol)
 
 #[cfg(test)]
@@ -125,6 +126,12 @@ struct Args {
     /// Decrypt a previously exported storage archive
     #[arg(long, value_name = "INPUT_FILE")]
     decrypt_export: Option<PathBuf>,
+
+    /// Print the did:key of the control key stored for the trust agent
+    /// connection configured in `[vta]`, for granting it on the trust agent or
+    /// again after a backup restore. Prints public data only.
+    #[arg(long)]
+    vta_print_control_did: bool,
 
     /// Output path (used with --decrypt-export, defaults to export.zip)
     #[arg(long, value_name = "OUTPUT_FILE", default_value = "export.zip")]
@@ -309,6 +316,19 @@ async fn async_main() -> Result<()> {
     storage::filesystem::init_global_encryption(encryption.clone())
         .context("Failed to initialize storage encryption")?;
 
+    if args.vta_print_control_did {
+        let key_path = vta::rotatable_control_key_path(&bootstrap_config.vta)
+            .ok_or_else(|| anyhow::anyhow!("[vta] holds no did:key control key in a file"))?;
+        match vta::control_rotation::stored_control_did(&key_path)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.log_detail().to_string()))?
+        {
+            Some(did) => println!("{did}"),
+            None => anyhow::bail!("no control key is stored at {}", key_path.display()),
+        }
+        return Ok(());
+    }
+
     // Boot migration: decrypt any residual field-level ENC[...] values left by an
     // earlier build to plaintext, before any store is loaded into a model. Whole-file
     // encryption re-wraps them on the next save.
@@ -461,10 +481,6 @@ async fn async_main() -> Result<()> {
             warn!("Token symbols and decimals will not be available");
         }
     }
-
-    // Initialize gateway facilitator service for DIDComm-based settlement of stored x402 payments
-    x402::init_gateway_facilitator_service().await;
-    info!("Gateway facilitator service initialized - ready for ATM infrastructure");
 
     // Load local surfaces after logging is initialized so errors are logged;
     // other sources loaded theirs with the configuration, before logging, so
@@ -905,16 +921,17 @@ fn log_startup_summary(
     let surfaces = &gateway_config.surfaces;
     let active_count = surfaces
         .iter()
-        .filter(|s| s.status == crate::config::agent_surface::SurfaceStatus::Active)
+        .filter(|s| s.status.is_live())
         .count();
-    let disabled_count = surfaces
-        .iter()
-        .filter(|s| s.status == crate::config::agent_surface::SurfaceStatus::Disabled)
-        .count();
-    info!("Configured {} channel(s) ({} active, {} disabled)", surfaces.len(), active_count, disabled_count);
+    info!(
+        "Configured {} channel(s) ({} active, {} inactive)",
+        surfaces.len(),
+        active_count,
+        surfaces.len() - active_count
+    );
     for surface in surfaces
         .iter()
-        .filter(|s| s.status == crate::config::agent_surface::SurfaceStatus::Active)
+        .filter(|s| s.status.is_live())
     {
         info!(
             "  Channel '{}': {} -> {}",
@@ -1031,7 +1048,7 @@ async fn disable_duplicate_route_surfaces(
     let combos: Vec<Option<String>> = channels
         .iter()
         .map(|surface| {
-            (surface.status != crate::config::agent_surface::SurfaceStatus::Disabled).then(|| {
+            (surface.status.is_live()).then(|| {
                 let listen_address = surface.listen_address();
                 let listener = match network_config.map_url_to_port(listen_address) {
                     Some(port) => format!("port {}", port),
@@ -1502,6 +1519,7 @@ fn render_default_bootstrap_toml(
         legacy_backup_encryption_keys: None,
         trust_registry: Default::default(),
         tenancy: Default::default(),
+        vta: Default::default(),
         credential_policy: Default::default(),
         config_dir: None,
         server_mode: crate::server::mode::ServerMode::default(),
@@ -1670,6 +1688,22 @@ mod duplicate_route_surface_tests {
         assert_eq!(channels[0].status, SurfaceStatus::Disabled);
         assert_eq!(channels[1].status, SurfaceStatus::Active, "an already-disabled surface must not claim the route");
     }
+
+    #[tokio::test]
+    async fn test_disable_duplicate_route_surfaces_deleted_surface_claims_no_route() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let mut deleted = surface("s-a", "/api");
+        deleted.status = SurfaceStatus::Deleted;
+        let mut channels = vec![deleted, surface("s-b", "/api")];
+
+        disable_duplicate_route_surfaces(&store, &mut channels, &network_config())
+            .await
+            .expect("dedup should succeed");
+
+        assert_eq!(channels[0].status, SurfaceStatus::Deleted);
+        assert_eq!(channels[1].status, SurfaceStatus::Active, "a deleted surface must not take a live one's route");
+    }
 }
 
 #[cfg(test)]
@@ -1788,7 +1822,7 @@ mod startup_logging_tests {
             ),
             "{text}"
         );
-        assert!(text.contains("Configured 2 channel(s) (2 active, 0 disabled)"), "{text}");
+        assert!(text.contains("Configured 2 channel(s) (2 active, 0 inactive)"), "{text}");
         assert!(
             text.contains("Channel 'mpp-surface': 0.0.0.0:8443 -> https://upstream.example.com/v1?api_key=<redacted>"),
             "{text}"

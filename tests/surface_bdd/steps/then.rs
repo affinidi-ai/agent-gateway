@@ -29,7 +29,7 @@ fn get_sent_body(world: &SurfaceWorld) -> &serde_json::Value {
         .expect("sent_body must be set")
 }
 
-fn get_observed_target_requests<'a>(
+pub(crate) fn get_observed_target_requests<'a>(
     target: &'a ObservedTarget,
     context: &str,
 ) -> &'a [crate::bdd_support::mock_server::ReceivedRequest] {
@@ -48,7 +48,7 @@ fn get_observed_target_request<'a>(
     assert_called_exactly_once(get_observed_target_requests(target, context), context)
 }
 
-fn get_observed_target_for_actor<'a>(
+pub(crate) fn get_observed_target_for_actor<'a>(
     world: &'a SurfaceWorld,
     actor_name: &str,
     expected_kind: TargetActorKind,
@@ -62,7 +62,7 @@ fn get_observed_target_for_actor<'a>(
     world.collaborator_target(collaborator_key)
 }
 
-fn get_observed_request_for_actor<'a>(
+pub(crate) fn get_observed_request_for_actor<'a>(
     world: &'a SurfaceWorld,
     actor_name: &str,
     expected_kind: TargetActorKind,
@@ -180,7 +180,7 @@ fn get_caller_response(world: &SurfaceWorld) -> &crate::world::RecordedResponse 
         .expect("caller_response must be set")
 }
 
-fn get_admin_response(world: &SurfaceWorld) -> &crate::world::RecordedResponse {
+pub(crate) fn get_admin_response(world: &SurfaceWorld) -> &crate::world::RecordedResponse {
     world
         .admin_response
         .as_ref()
@@ -224,7 +224,7 @@ fn get_response_headers_value(world: &SurfaceWorld) -> &HashMap<String, String> 
     &get_caller_response(world).headers
 }
 
-fn get_response_body_value(world: &SurfaceWorld) -> &serde_json::Value {
+pub(crate) fn get_response_body_value(world: &SurfaceWorld) -> &serde_json::Value {
     &get_caller_response(world).body
 }
 
@@ -1848,7 +1848,7 @@ const AGENT_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent-id
 const AGENT_IDENTITY_CREDENTIAL_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity-credential/v1";
 const TRUST_REGISTRY_EXTENSION_URI: &str = "https://fabric.affinidi.io/extensions/trust-registry";
 
-fn is_valid_vp(v: &serde_json::Value) -> bool {
+pub(crate) fn is_valid_vp(v: &serde_json::Value) -> bool {
     match v {
         serde_json::Value::String(s) => {
             let parts: Vec<&str> = s.split('.').collect();
@@ -2211,7 +2211,7 @@ fn both_responses_same_did(world: &mut SurfaceWorld) {
     );
 }
 
-fn get_mcp_request_for_actor<'a>(
+pub(crate) fn get_mcp_request_for_actor<'a>(
     world: &'a SurfaceWorld,
     server_name: &str,
 ) -> &'a crate::bdd_support::mock_server::ReceivedRequest {
@@ -2853,7 +2853,7 @@ fn first_vp_credential(presentation: &serde_json::Value) -> Option<&serde_json::
     }
 }
 
-fn get_holder_did_from_vp(vp: &serde_json::Value) -> String {
+pub(crate) fn get_holder_did_from_vp(vp: &serde_json::Value) -> String {
     let decoded = decode_vp(vp);
     decoded
         .get("holder")
@@ -3017,7 +3017,7 @@ fn mcp_response_tool_catalog_tool_has_no_output_schema(
     assert_eq!(tool.get("outputSchema"), None, "tool '{name}' must advertise no output schema. Tool: {tool}");
 }
 
-fn get_a2a_binding_extension(
+pub(crate) fn get_a2a_binding_extension(
     request: &crate::bdd_support::mock_server::ReceivedRequest,
     context: &str,
 ) -> serde_json::Value {
@@ -3036,7 +3036,7 @@ fn get_a2a_binding_extension(
         })
 }
 
-fn get_did_from_a2a_binding_request(
+pub(crate) fn get_did_from_a2a_binding_request(
     request: &crate::bdd_support::mock_server::ReceivedRequest,
     context: &str,
 ) -> String {
@@ -3066,7 +3066,7 @@ fn decode_json_or_jwt(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn first_credential_subject_from_vp(vp: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn first_credential_subject_from_vp(vp: &serde_json::Value) -> serde_json::Value {
     let decoded = decode_vp(vp);
     let presentation = presentation_from_decoded_vp(&decoded);
     let credential = first_vp_credential(presentation)
@@ -3154,6 +3154,85 @@ fn named_managed_agent_received_two_binding_vps_for_different_dids(
     let first = get_did_from_a2a_binding_request(&observations.requests[0], "first managed agent request");
     let second = get_did_from_a2a_binding_request(&observations.requests[1], "second managed agent request");
     assert_ne!(first, second, "identity-binding VP holder DIDs should differ");
+}
+
+fn assert_managed_agent_vp_identifies(
+    world: &SurfaceWorld,
+    agent_name: &str,
+    expected: &[(&str, &str)],
+) {
+    let request = get_observed_request_for_actor(world, agent_name, TargetActorKind::ManagedAgent);
+    let context = format!("managed agent '{agent_name}'");
+    let binding = get_a2a_binding_extension(request, &context);
+    let vp = &binding["verifiablePresentation"];
+    assert!(is_valid_vp(vp), "{context} identity-binding VP should be valid, got: {vp}");
+    let subject = first_credential_subject_from_vp(vp);
+    for (field, value) in expected {
+        assert_eq!(
+            identity_field_value_from_subject(&subject, field).and_then(serde_json::Value::as_str),
+            Some(*value),
+            "{context} identity-binding VP should identify the caller by '{field}' = '{value}', got credentialSubject: {subject}"
+        );
+    }
+}
+
+#[then(
+    expr = "managed agent {string} received the forwarded request with a VP proving the Agent DID of the token's subject"
+)]
+fn named_managed_agent_received_a_binding_vp_for_the_token_subject(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    assert_managed_agent_vp_identifies(
+        world,
+        &agent_name,
+        &[("credential_type", "jwt_claim"), ("claim", "sub"), ("value", "test-user")],
+    );
+}
+
+#[then(
+    expr = "managed agent {string} received the forwarded request with a VP proving the Agent DID of the presented API key"
+)]
+fn named_managed_agent_received_a_binding_vp_for_the_presented_api_key(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    let secret_id = world
+        .surface_config
+        .source_auth
+        .iter()
+        .chain(
+            &world
+                .surface_config
+                .additional_source_auth,
+        )
+        .find_map(|auth| match auth {
+            crate::world::SurfaceSourceAuthConfig::ApiKey(config) => Some(config.secret_id.clone()),
+            _ => None,
+        })
+        .expect("an API Key source authentication method must be configured");
+    assert_managed_agent_vp_identifies(
+        world,
+        &agent_name,
+        &[("credential_type", "api_key"), ("secret_id", secret_id.as_str())],
+    );
+}
+
+#[then(expr = "managed agent {string} received the forwarded request with no caller identity")]
+fn named_managed_agent_received_no_caller_identity(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    let request = get_observed_request_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
+    let body = request.json_body();
+    for uri in [AGENT_IDENTITY_BINDING_URI, AGENT_IDENTITY_CREDENTIAL_URI] {
+        let pointer = format!("/params/message/metadata/{}", uri.replace('/', "~1"));
+        assert!(
+            body.pointer(&pointer)
+                .is_none(),
+            "managed agent '{agent_name}' should receive no caller identity proof '{uri}', got body: {body}"
+        );
+    }
 }
 
 #[then(expr = "managed agent {string} received two forwarded requests with VPs proving the same caller Agent DID")]
@@ -4043,6 +4122,51 @@ fn oauth_provider_received_refresh_request(
         "expected OAuth refresh request not to include authorization code, got body {:?}",
         request.raw_body
     );
+}
+
+fn latest_oauth_provider_token_request(world: &SurfaceWorld) -> crate::bdd_support::mock_server::ReceivedRequest {
+    oauth_provider_requests(world)
+        .into_iter()
+        .rfind(|request| {
+            request
+                .path_and_query
+                .starts_with("/token")
+        })
+        .expect("the OAuth provider received a token request")
+}
+
+#[then(
+    expr = "OAuth provider {string}'s latest token request carries HTTP Basic credentials for client {string} and secret {string}"
+)]
+fn oauth_provider_token_request_carries_basic_credentials(
+    world: &mut SurfaceWorld,
+    _provider: String,
+    client_id: String,
+    secret: String,
+) {
+    let expected = crate::steps::provider_token::http_basic_client_credentials(&client_id, &secret);
+    let request = latest_oauth_provider_token_request(world);
+    assert!(
+        request
+            .headers
+            .get("authorization")
+            .is_some_and(|authorization| *authorization == expected),
+        "the latest token request carried HTTP Basic credentials other than those of client {client_id}"
+    );
+}
+
+#[then(expr = "OAuth provider {string}'s latest token request has no client ID or secret in its form body")]
+fn oauth_provider_token_request_has_no_client_identity_in_its_form(
+    world: &mut SurfaceWorld,
+    _provider: String,
+) {
+    let request = latest_oauth_provider_token_request(world);
+    let form = url::form_urlencoded::parse(request.raw_body.as_bytes())
+        .into_owned()
+        .collect::<HashMap<String, String>>();
+    for field in ["client_id", "client_secret"] {
+        assert!(!form.contains_key(field), "the latest token request carries {field}");
+    }
 }
 
 /// Delegation audit records name a provider by its record id, which is not

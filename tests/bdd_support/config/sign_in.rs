@@ -89,6 +89,7 @@ pub fn sign_in_with_saml(
         .expect("an identity provider certificate");
     let cert_path = base_dir.join("idp.crt");
     std::fs::write(&cert_path, cert.pem()).expect("write the identity provider certificate");
+    std::fs::write(base_dir.join("idp.key"), key.serialize_pem()).expect("write the identity provider key");
     let saml_path = base_dir.join("saml.json");
     let mut saml = json!({
         "idp_entity_id": "https://idp.example.test",
@@ -97,6 +98,11 @@ pub fn sign_in_with_saml(
         "sp_acs_url": format!("http://localhost:{gateway_port}/api/saml/acs"),
         "idp_cert_path": cert_path.display().to_string(),
         "sign_requests": false,
+        "role_mapping": {
+            "gw-admins": "administrator",
+            "gw-power": "poweruser",
+            "gw-all": "user",
+        },
     });
     for (key, value) in settings {
         saml[key] = value.clone();

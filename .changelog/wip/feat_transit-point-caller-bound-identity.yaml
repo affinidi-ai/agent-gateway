@@ -1,0 +1,149 @@
+branch: feat/transit-point-caller-bound-identity
+changes:
+  added:
+    - timestamp: '2026-11-25T16:00:00Z'
+      title: Offer caller credential identities on a Transit Point in the Surface Builder
+      description: >-
+        The Surface Builder's Transit Point identity offers From API Key, with no key picker,
+        while the Transit Point's caller authentication is API Key or API Key Provider, From JWT
+        Claims while it is JWT Bearer, and From mTLS certificate, with no certificate picker,
+        while it is mTLS, so the managed agent's DID is taken from the credential the Transit
+        Point's caller presented. Save is blocked while a Transit Point's identity needs a caller
+        authentication the Transit Point does not use, as the gateway refuses such a save. A
+        blank or whitespace-only api_key_id or certificate_id counts as none, as on the gateway.
+  changed:
+    - timestamp: '2026-11-26T10:00:00Z'
+      title: List every caller-bound Transit Point DID as its own identity in GET /v1/agents
+      description: >-
+        GET /v1/agents and the Agents page list each DID a Transit Point took from its callers'
+        credentials (slot caller_bound) among the agent's identities, rather than only the most
+        recently used one as a version of the managed agent, since each belongs to another
+        caller.
+  fixed:
+    - timestamp: '2026-11-24T16:45:00Z'
+      title: Read requests through an MCP Transit Point on an A2A surface as MCP
+      description: >-
+        An MCP Transit Point on an A2A surface whose Transit Point had its own managed identity
+        refused every request with 500, because the gateway read the request as A2A, the
+        surface's protocol. The gateway now reads a Transit Point request in the Transit Point's
+        own protocol, so the managed agent's identity is read from and injected into MCP _meta,
+        an identity the request copied is removed from _meta when no DID is issued, and Transit
+        Point policies get input.mcp instead of input.a2a. An http Transit Point still uses the
+        surface's protocol.
+    - timestamp: '2026-11-25T14:00:00Z'
+      title: Refuse a stored from_mtls identity without a certificate_id with a fixed 500
+      description: >-
+        An Access Point identity slot stored with from_mtls and no certificate_id answered 502
+        with internal error text and counted nothing. It now answers 500 with the body "Caller
+        identity could not be resolved", counts certificate_id_missing under mode from_mtls,
+        and the gateway logs a startup warning naming the surface, also for a blank
+        certificate_id, for the external slot, and for an enabled variant's slot, naming the
+        variant.
+    - timestamp: '2026-11-25T14:01:00Z'
+      title: Answer an inherited Transit Point identity failure with a fixed error body
+      description: >-
+        A Transit Point that inherits a stored key or certificate identity (with inject_vp) it
+        cannot derive the DID from answered with internal error text. It now answers with the
+        fixed body "Identity resolution failed: Caller identity could not be resolved": 500
+        when misconfigured, 502 when the DID cannot be issued, and 503 when a store is
+        unavailable; why is logged.
+    - timestamp: '2026-11-25T18:00:00Z'
+      title: Forward A2A task requests through a Transit Point with a managed identity
+      description: >-
+        A2A task operations (tasks/get, tasks/cancel, tasks/resubscribe and their A2A 1.0 names)
+        through a Transit Point with a managed agent identity answered 500, because the gateway
+        tried to inject the identity presentation into a message these requests do not carry.
+        They are now forwarded unchanged, with no identity presentation, as the Access Point
+        already does, through a Transit Point whose identity is taken from its caller's
+        credential, stored (a key or certificate it names) or static. A From Payload Transit
+        Point still answers 422 for them. On any Transit Point that injects an identity, an A2A
+        body that is JSON but not one object, such as a JSON-RPC batch, is refused with 400 and
+        JSON-RPC error -32600 rather than forwarded without the gateway's presentation.
+  removed: []
+  security:
+    - timestamp: '2026-11-24T11:10:20Z'
+      title: Take a Transit Point's agent DID from the credential its caller presented
+      description: >-
+        A Transit Point whose managed_identity is from_api_key without an api_key_id now takes
+        the managed agent's DID from the API key its caller presented to the Transit Point's own
+        source_auth, one whose managed_identity is from_jwt_claim, which was skipped before,
+        takes it from the claim of the JWT the Transit Point verified, and one whose
+        managed_identity is from_mtls without a certificate_id, now optional, takes it from the
+        trusted CA, the identity_binding and the principal it derives from the client certificate
+        the Transit Point verified. Each DID is the one the Access Point gives the same key or
+        claim value, and a DID the Transit Point issues first is recorded as its managed agent
+        (origin managed, slot transit_point with caller_bound true), with the managed agent's
+        display name on its credential, and the Identities page lists each such DID as its own
+        row rather than as a version of the managed agent; a DID first issued to an Access Point caller stays an external caller
+        record, a DID that is another surface's Managed Agent is recorded as a caller use so
+        that agent keeps its name, and the Managed Agent's own stored key later replaces the
+        caller_bound slot. The DID replaces any identity the request body asserts for policy, Trust Check,
+        the identity presentation to the destination and the VP Audit Log, and every identity
+        the body asserts (agent-identity, agent-identity-credential and agent-identity-binding,
+        and agentIdentity and didwebvhIdentity in MCP _meta, including the 2026-07-28 request
+        policy reads, and in A2A at every message location: params.message, message, the bare
+        body, result.status.message, result.message and result) is removed before the request
+        is forwarded, so a caller with a copied identity extension
+        gets the DID of its own credential and the destination receives only the gateway's. An
+        A2A body that is not exactly one JSON object, such as a batch, is refused with 400 and
+        JSON-RPC error -32600.
+        When no DID can be issued (no VC issuer, or issuance fails), an API key or client
+        certificate caller goes on to policy without an identity, while a JWT caller is refused
+        as on the Access Point: 500 without a VC issuer, 502 when issuance fails. A From Payload
+        Transit Point still takes the DID from the body, as unverified. Every Transit Point
+        policy, response policy and MCP tool gating condition now gets the
+        managed agent in input.extension_identity (did, identity_hash, verification, verified),
+        with the Access Point's verification values: source_auth for an API Key Provider key, a
+        JWT claim or a client certificate, and unverified for a plain API key, a payload, static
+        or stored-credential identity; it is absent when the managed agent has no identity.
+        input.agent still describes the destination. Built-in policy templates that read
+        input.extension_identity now decide on the managed agent on a Transit Point instead of
+        always denying there. A
+        save refuses from_api_key unless the Transit Point's source_auth is API Key or API Key
+        Provider, from_jwt_claim unless it is JWT Bearer, and from_mtls without a certificate_id
+        unless it is mTLS; every other slot still needs a certificate_id. A release without this
+        change refuses a from_api_key Transit Point without an api_key_id, and skips the whole
+        surface at load when a Transit Point's from_mtls has no certificate_id; name a stored key
+        or certificate, or choose another mode, before rolling back. It also skips a Transit
+        Point's own from_jwt_claim and does not remove the identity the body asserts, so after a
+        rollback such a Transit Point forwards the identity the body asserts, and it ignores
+        caller_bound, so caller-bound DIDs read back as versions of the Managed Agent; first
+        switch each such Transit Point to another identity mode or turn its identity injection
+        off.
+    - timestamp: '2026-11-25T14:05:00Z'
+      title: Warn when a Transit Point's JWT claim DID is not namespaced by issuer
+      description: >-
+        A save answers with a Warning header for each Transit Point, on the surface or an enabled
+        variant, whose own from_jwt_claim leaves iss out of namespace_claims while its
+        source_auth verifies tokens through a JWT verification strategy the Access Point does not
+        accept, since a token from another identity provider with the same claim value would get
+        the same DID. Add iss to namespace_claims to keep them apart.
+  breaking:
+    - timestamp: '2026-11-24T12:49:23Z'
+      title: Refuse requests through a Transit Point whose from_jwt_claim has no JWT Bearer
+      description: >-
+        A stored Transit Point with its own from_jwt_claim identity and no JWT Bearer caller
+        authentication used to forward its requests with no managed agent identity. It now
+        refuses requests other than discovery reads with 500 until it is given JWT Bearer caller
+        authentication or another identity mode, since its DID comes from the JWT the Transit
+        Point verified. At startup the gateway logs "Channel '<name>': Transit Point '<alias>'
+        takes its managed identity from_jwt_claim but its source_auth is not jwt_bearer; requests
+        other than discovery reads are refused until the surface is fixed", with "Channel
+        '<name>' variant '<variant>'" for an enabled variant's Transit Point.
+    - timestamp: '2026-11-24T15:30:00Z'
+      title: Give gateway and surface policies the managed agent on Transit Point calls
+      description: >-
+        Gateway and surface policies also run on Transit Point calls, and there they now see
+        the managed agent in input.extension_identity. A rule such as
+        input.extension_identity.verified == false, which never matched on a Transit Point
+        before, now matches a managed agent identity read from the payload, a static DID or a
+        stored key or certificate, all unverified, and can deny Transit Point traffic it used to
+        allow. Scope such a rule to inbound requests by testing that input.transit is absent.
+    - timestamp: '2026-11-25T10:00:00Z'
+      title: Leave identity_hash out of policy input for a DID used as given
+      description: >-
+        A static DID or a certificate with a pinned DID has no identity hash, yet policy input
+        reported identity_hash as an empty string, which every such DID shared. On the Access
+        Point and the Transit Point input.extension_identity now leaves identity_hash out for
+        such a DID, so a rule testing input.extension_identity.identity_hash == "" no longer
+        matches it and changes its result; match such a DID by did.

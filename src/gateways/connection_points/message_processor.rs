@@ -571,7 +571,11 @@ pub async fn process_message_internal(
         MessageType::ForwardResponse => process_forward_response(message).await,
         MessageType::ForwardStreamFrame | MessageType::ForwardStreamQuery | MessageType::ForwardStreamDisclose => {
             match crate::proxy::fabric_stream::global() {
-                Ok(runtime) => runtime.process(message, message_type),
+                Ok(runtime) => {
+                    runtime
+                        .process(message, message_type)
+                        .await
+                }
                 Err(reason) => ProcessingResult::Failed { reason },
             }
         }
@@ -580,7 +584,7 @@ pub async fn process_message_internal(
         MessageType::X402VerifyRequest => refuse_x402_verify_request(message),
         MessageType::X402VerifyResponse => ignore_x402_verify_response(message),
         MessageType::X402SettleRequest => refuse_x402_settle_request(message),
-        MessageType::X402SettleResponse => process_x402_settle_response(message).await,
+        MessageType::X402SettleResponse => ignore_x402_settle_response(message),
         MessageType::X402SettlementComplete => process_x402_settlement_complete(message).await,
 
         // Message pickup protocol
@@ -658,6 +662,12 @@ pub enum ProcessingResult {
     OOBConnectionAccepted(Box<OobConnectionAccepted>),
     /// OOB connection-setup received - needs to send connection-accepted
     OOBConnectionSetup(Box<OobConnectionSetup>),
+    /// OOB connection-setup on an invitation that can't be used - the acceptor is told so with
+    /// `INVITATION_UNUSABLE_REASON`; `reason` is the detail kept for the log
+    OOBInvitationUnusable {
+        acceptor_temporary_did: String,
+        reason: String,
+    },
     /// OOB connection-rejected received - connection failed
     OOBConnectionRejected {
         reason: String,
@@ -847,7 +857,12 @@ async fn process_connection_setup(message: &ReceivedMessage) -> ProcessingResult
 
     let connection_point = match load_invited_connection_point(message).await {
         Ok(connection_point) => connection_point,
-        Err(reason) => {
+        Err(InvitationRefusal::Unusable(reason)) => {
+            warn!("connection-setup on connection point {} refused: {}", message.connection_point_id, reason);
+            return ProcessingResult::OOBInvitationUnusable { acceptor_temporary_did, reason };
+        }
+        Err(refusal) => {
+            let reason = refusal.detail();
             warn!("connection-setup on connection point {} refused: {}", message.connection_point_id, reason);
             return ProcessingResult::Failed { reason };
         }
@@ -876,7 +891,7 @@ async fn process_connection_setup(message: &ReceivedMessage) -> ProcessingResult
 
     // Only a sender that proved control of its channel_did on a live
     // invitation may add to the seen set.
-    if let Err(rejection) = super::envelope_replay::admit_pairing_message(message) {
+    if let Err(rejection) = super::envelope_replay::admit_pairing_message(message).await {
         return pairing_envelope_refusal(message, rejection);
     }
 
@@ -995,50 +1010,82 @@ async fn verify_channel_did_proof(
 /// running keeps accepting on its socket after the invitation expires.
 async fn load_invited_connection_point(
     message: &ReceivedMessage
-) -> Result<crate::gateways::connection_points::types::GatewayConnectionPoint, String> {
+) -> Result<crate::gateways::connection_points::types::GatewayConnectionPoint, InvitationRefusal> {
+    let unavailable = |reason: &str| InvitationRefusal::Unavailable(reason.to_string());
+    let unusable = |reason: &str| InvitationRefusal::Unusable(reason.to_string());
     let storage_root =
-        storage_root_from_context(message).ok_or_else(|| "storage path not found in message context".to_string())?;
+        storage_root_from_context(message).ok_or_else(|| unavailable("storage path not found in message context"))?;
     let store =
         crate::gateways::connection_points::FileSystemConnectionPointStore::new(storage_root.join("connection_points"))
             .await
-            .map_err(|e| format!("failed to open connection point store: {}", e))?;
+            .map_err(|e| InvitationRefusal::Unavailable(format!("failed to open connection point store: {}", e)))?;
     let connection_point = store
         .get(&message.connection_point_id)
         .await
-        .map_err(|e| format!("failed to load connection point: {}", e))?
-        .ok_or_else(|| "connection point not found".to_string())?;
+        .map_err(|e| InvitationRefusal::Unavailable(format!("failed to load connection point: {}", e)))?
+        .ok_or_else(|| unusable("connection point not found"))?;
     if connection_point.cp_type != crate::gateways::connection_points::types::ConnectionPointType::User {
-        return Err("connection point is not an invitation".to_string());
+        return Err(unavailable("connection point is not an invitation"));
     }
     if connection_point
         .secret
         .is_empty()
     {
-        return Err("invitation has no secret".to_string());
+        return Err(unavailable("invitation has no secret"));
     }
     if !connection_point.enabled {
-        return Err("connection point is disabled".to_string());
+        return Err(unusable("connection point is disabled"));
     }
     if connection_point
         .expires_at
         .is_some_and(|expires_at| expires_at < chrono::Utc::now())
     {
-        return Err("invitation has expired".to_string());
+        return Err(unusable("invitation has expired"));
     }
     if connection_point.use_count > 0 {
-        return Err("invitation has already been used".to_string());
+        return Err(unusable("invitation has already been used"));
     }
     match (connection_point.invitation_message_id(), message.pthid.as_deref()) {
         (Some(invitation_id), Some(pthid)) if invitation_id == pthid => Ok(connection_point),
-        _ => Err("connection-setup does not reference this invitation".to_string()),
+        _ => Err(unavailable("connection-setup does not reference this invitation")),
     }
 }
+
+/// What a refused acceptor is told when its invitation is missing, disabled, expired or already
+/// used. It never says which, so it reveals nothing about the invitation.
+pub(crate) const INVITATION_UNUSABLE_REASON: &str = "This invitation can't be used any more. Ask for a new one.";
+
+/// What a refused acceptor is told when the connection secret is wrong.
+pub(crate) const INVALID_SECRET_REASON: &str = "Invalid connection secret";
 
 /// Why an invitation was not redeemed for a connection-setup.
 #[derive(Debug, PartialEq)]
 pub(crate) enum InvitationRefusal {
     InvalidSecret,
+    /// The invitation is missing, disabled, expired or already used; the detail is for the log.
+    Unusable(String),
+    /// Anything else, such as a storage failure or a setup that is not for an invitation; the
+    /// acceptor is not answered.
     Unavailable(String),
+}
+
+impl InvitationRefusal {
+    /// The reason logged and returned for the refusal.
+    pub(crate) fn detail(&self) -> String {
+        match self {
+            Self::InvalidSecret => INVALID_SECRET_REASON.to_string(),
+            Self::Unusable(reason) | Self::Unavailable(reason) => reason.clone(),
+        }
+    }
+
+    /// The reason sent to the acceptor in a `connection-rejected`, when it is told at all.
+    pub(crate) fn rejection_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::InvalidSecret => Some(INVALID_SECRET_REASON),
+            Self::Unusable(_) => Some(INVITATION_UNUSABLE_REASON),
+            Self::Unavailable(_) => None,
+        }
+    }
 }
 
 /// Redeem the invitation whose DID a connection-setup was addressed to, returning the redeemed record.
@@ -1055,21 +1102,22 @@ pub(crate) async fn redeem_invitation<CS: ConnectionPointStore + ?Sized>(
     use subtle::ConstantTimeEq;
 
     let unavailable = |reason: &str| InvitationRefusal::Unavailable(reason.to_string());
+    let unusable = |reason: &str| InvitationRefusal::Unusable(reason.to_string());
     let mut invitation = store
         .list_all()
         .await
         .map_err(|e| InvitationRefusal::Unavailable(format!("failed to list connection points: {}", e)))?
         .into_iter()
         .find(|cp| cp.connection_point_did == connection_point_did)
-        .ok_or_else(|| unavailable("connection point not found"))?;
+        .ok_or_else(|| unusable("connection point not found"))?;
     if invitation.cp_type != crate::gateways::connection_points::types::ConnectionPointType::User {
         return Err(unavailable("connection point is not an invitation"));
     }
     if !invitation.enabled {
-        return Err(unavailable("connection point is disabled"));
+        return Err(unusable("connection point is disabled"));
     }
     if invitation.use_count > 0 {
-        return Err(unavailable("invitation has already been used"));
+        return Err(unusable("invitation has already been used"));
     }
     let secret_matches: bool = invitation
         .secret
@@ -1086,7 +1134,7 @@ pub(crate) async fn redeem_invitation<CS: ConnectionPointStore + ?Sized>(
         .await
         .map_err(|e| InvitationRefusal::Unavailable(format!("failed to mark invitation as used: {}", e)))?;
     if !written {
-        return Err(unavailable("connection point not found"));
+        return Err(unusable("connection point not found"));
     }
     Ok(invitation)
 }
@@ -1153,7 +1201,7 @@ async fn process_connection_accepted(message: &ReceivedMessage) -> ProcessingRes
         }
     };
 
-    if let Err(rejection) = super::envelope_replay::admit_pairing_message(message) {
+    if let Err(rejection) = super::envelope_replay::admit_pairing_message(message).await {
         return pairing_envelope_refusal(message, rejection);
     }
 
@@ -1681,6 +1729,7 @@ fn forward_request_envelope_refusal(
     let (status, error) = match rejection {
         EnvelopeRejection::Duplicate { .. } => return ProcessingResult::ProcessedNoResponse,
         EnvelopeRejection::Expired { .. } => (504, "Gateway Timeout"),
+        EnvelopeRejection::Unrecorded => (503, "Service Unavailable"),
         _ => (403, "Forbidden"),
     };
     ProcessingResult::RequiresResponse {
@@ -1765,8 +1814,17 @@ fn require_peer_issuer(
     if issuer_matches_peer(verified.issuer_did.as_deref(), peer_issuers) {
         Ok(verified)
     } else {
+        // Name the remedy, not just the mismatch. The overwhelmingly common
+        // cause is a peer that moved its issuer DID — to a trust agent, say —
+        // after this connection recorded the old one. The attested issuer is
+        // deliberately not settable through the API, so an operator who does
+        // not know about re-attestation sees every request from that peer fail
+        // with nothing pointing at the cure.
         anyhow::bail!(
-            "identity presentation issuer {:?} is not an issuer of the sending connection {peer_issuers}",
+            "identity presentation issuer {:?} is not an issuer of the sending connection \
+             {peer_issuers}; if the peer has moved its issuer DID, re-attest the connection \
+             (DELETE then POST /v1/gateways/{{id}}/issuer), or add the new issuer with \
+             POST /v1/gateways/{{id}}/trusted-issuers",
             verified.issuer_did
         )
     }
@@ -4795,7 +4853,7 @@ async fn process_charged_forward_request(
                 .await;
         }
     };
-    if let Err(rejection) = super::envelope_replay::admit_forward_request(message) {
+    if let Err(rejection) = super::envelope_replay::admit_forward_request(message).await {
         return forward_request_envelope_refusal(message, rejection);
     }
 
@@ -7166,7 +7224,13 @@ async fn process_charged_forward_request(
                         && let Some(vc_issuer) = GLOBAL_VC_ISSUER.get()
                     {
                         card_changed |=
-                            crate::a2a::inject_credential_into_agent_card(&mut agent_card, &resolved_identity, vc_issuer, channel_id)
+                            crate::a2a::inject_credential_into_agent_card(
+                                &mut agent_card,
+                                &resolved_identity,
+                                vc_issuer,
+                                channel_id,
+                                &crate::vta::key_directory::KeyScope::serving(&resolved_surface, active_variant_id.as_deref()),
+                            )
                                 .await
                                 .inspect_err(|e| {
                                     channel_warn!(config_id, "GW2: Failed to inject identity credential into agent card: {}", e)
@@ -7833,6 +7897,10 @@ async fn process_charged_forward_request(
                                     None
                                 };
 
+                                let key_scope = crate::vta::key_directory::KeyScope::serving(
+                                    &resolved_surface,
+                                    active_variant_id.as_deref(),
+                                );
                                 // Use protocol-specific injection (RESPONSE functions, not request functions!)
                                 let inject_result = if surface_protocol == crate::config::ChannelProtocol::Mcp {
                                     let (gw2_meta_field, gw2_strip_raw) = resolved_surface
@@ -7857,6 +7925,7 @@ async fn process_charged_forward_request(
                                         &gw2_meta_field,
                                         gw2_strip_raw,
                                         mcp_metadata_context,
+                                        &key_scope,
                                     )
                                     .await
                                 } else {
@@ -7869,6 +7938,7 @@ async fn process_charged_forward_request(
                                         vc_issuer,
                                         channel_id,
                                         Vec::new(),
+                                        &key_scope,
                                     )
                                     .await
                                     .map(|injected| {
@@ -9616,78 +9686,10 @@ fn ignore_x402_verify_response(message: &ReceivedMessage) -> ProcessingResult {
     ProcessingResult::ProcessedNoResponse
 }
 
-#[instrument(skip(message), fields(message_id = %message.id))]
-async fn process_x402_settle_response(message: &ReceivedMessage) -> ProcessingResult {
-    info!("Processing settlement response");
-
-    let body = &message.message_body;
-    let settled = body
-        .get("settled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let transaction_id = body
-        .get("transaction_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let error_msg = body
-        .get("error")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Settlement failed");
-    let network = body
-        .get("network")
-        .and_then(|v| v.as_str());
-    let facilitator = body
-        .get("facilitator")
-        .and_then(|v| v.as_str());
-
-    // Get correlation_id from DIDComm thid field
-    // The response should have thid matching our original request message ID
-    let correlation_id = match &message.didcomm_thid {
-        Some(id) => id.clone(),
-        None => {
-            warn!("Settlement response missing thid - cannot match to request");
-            return ProcessingResult::Failed {
-                reason: "Missing thid (thread ID) in settlement response".to_string(),
-            };
-        }
-    };
-
-    if settled {
-        info!(
-            "✅ Settlement successful - txn: {} network: {} facilitator: {} correlation_id: {}",
-            transaction_id,
-            network.unwrap_or("unknown"),
-            facilitator.unwrap_or("unknown"),
-            correlation_id
-        );
-    } else {
-        warn!(
-            "❌ Settlement failed - error: {} network: {} facilitator: {} correlation_id: {}",
-            error_msg,
-            network.unwrap_or("unknown"),
-            facilitator.unwrap_or("unknown"),
-            correlation_id
-        );
-    }
-
-    // Create settlement response
-    let response = crate::x402::gateway_facilitator_service::SettlementResponse {
-        settled,
-        tx_hash: transaction_id.to_string(),
-        error: error_msg.to_string(),
-    };
-
-    // Try to signal any waiting immediate mode request (event-driven, NO POLLING!)
-    let signaled =
-        crate::x402::gateway_facilitator_service::signal_settlement_response(&correlation_id, response.clone()).await;
-
-    if signaled {
-        info!("✅ Signaled waiting immediate mode settlement request: {}", correlation_id);
-    } else {
-        // No immediate request waiting - this is deferred mode, update payment record
-        info!("No immediate request waiting, updating payment record for deferred settlement: {}", correlation_id);
-    }
-
+/// This gateway sends no x402 settle-request, so a settle-response answers
+/// nothing it asked and is dropped without touching the transaction store.
+fn ignore_x402_settle_response(message: &ReceivedMessage) -> ProcessingResult {
+    debug!(from = ?message.from_did, "Ignoring x402 settle-response: this gateway sends no settle-request");
     ProcessingResult::ProcessedNoResponse
 }
 
@@ -9697,61 +9699,75 @@ async fn process_x402_settle_response(message: &ReceivedMessage) -> ProcessingRe
 async fn process_x402_settlement_complete(message: &ReceivedMessage) -> ProcessingResult {
     info!("📥 Processing x402 settlement-complete");
 
-    let body = &message.message_body;
+    let Some(txn_store) = get_transaction_store() else {
+        warn!("Transaction store not available - cannot update settlement completion");
+        return ProcessingResult::ProcessedNoResponse;
+    };
+    let gateways = match message_gateway_store(message).await {
+        Ok(gateways) => gateways,
+        Err(e) => {
+            warn!("Ignoring settlement-complete: {}", e);
+            return ProcessingResult::ProcessedNoResponse;
+        }
+    };
+    if let Err(reason) = apply_settlement_complete(message, &txn_store, &gateways).await {
+        warn!("Ignoring settlement-complete from {:?}: {}", message.from_did, reason);
+    }
 
-    // Extract settlement completion details
+    ProcessingResult::ProcessedNoResponse
+}
+
+/// Complete the named transaction's settlement, but only when the message comes
+/// from the active peer gateway recorded as that transaction's facilitator,
+/// explicitly reports `completed`, and the settlement is still in progress.
+async fn apply_settlement_complete(
+    message: &ReceivedMessage,
+    txn_store: &crate::x402::TransactionStore,
+    gateways: &crate::gateways::FileSystemGatewayStore,
+) -> Result<(), String> {
+    let body = &message.message_body;
     let correlation_id = body
         .get("correlation_id")
         .and_then(|v| v.as_str())
-        .unwrap_or(&message.didcomm_message_id)
-        .to_string();
+        .unwrap_or(&message.didcomm_message_id);
+    if body
+        .get("status")
+        .and_then(|v| v.as_str())
+        != Some("completed")
+    {
+        return Err(format!("transaction {correlation_id:?} is not reported as completed"));
+    }
+    let from_did = message
+        .from_did
+        .as_deref()
+        .ok_or("the message has no sender DID")?;
+    let transaction = txn_store
+        .get(correlation_id)
+        .await
+        .ok_or_else(|| format!("no transaction {correlation_id:?}"))?;
+    let facilitator = transaction
+        .verification
+        .facilitator_gateway_id
+        .as_deref()
+        .ok_or_else(|| format!("transaction {correlation_id:?} has no facilitator gateway"))?;
+    let sender = gateways
+        .get_by_did(from_did)
+        .await
+        .map_err(|e| format!("gateway lookup failed: {e}"))?;
+    if !sender.is_some_and(|gateway| gateway.is_active() && gateway.id == facilitator) {
+        return Err(format!("the sender is not the active facilitator gateway of transaction {correlation_id:?}"));
+    }
 
     let tx_hash = body
         .get("tx_hash")
         .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-
-    let status = body
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("completed");
-
-    info!(
-        "✅ Settlement completion notification received: correlation_id={} tx_hash={} status={}",
-        correlation_id, tx_hash, status
-    );
-
-    // Update local transaction record with settlement completion from remote gateway
-    if let Some(txn_store) = get_transaction_store() {
-        // First set the transaction hash
-        if !tx_hash.is_empty() {
-            if let Err(e) = txn_store
-                .set_settlement_tx_hash(&correlation_id, tx_hash.clone())
-                .await
-            {
-                warn!("Failed to set settlement tx_hash for {}: {}", correlation_id, e);
-            } else {
-                info!("✅ Updated transaction {} with tx_hash: {}", correlation_id, tx_hash);
-            }
-        }
-
-        // Then mark settlement as complete
-        if status == "completed" {
-            if let Err(e) = txn_store
-                .complete_settlement(&correlation_id)
-                .await
-            {
-                warn!("Failed to complete settlement for {}: {}", correlation_id, e);
-            } else {
-                info!("✅ Marked settlement as complete for: {}", correlation_id);
-            }
-        }
-    } else {
-        warn!("Transaction store not available - cannot update settlement completion");
-    }
-
-    ProcessingResult::ProcessedNoResponse
+        .filter(|tx_hash| !tx_hash.is_empty())
+        .map(str::to_string);
+    txn_store
+        .complete_settlement(correlation_id, tx_hash)
+        .await?;
+    info!("✅ Marked settlement as complete for: {}", correlation_id);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -9777,6 +9793,9 @@ mod target_grant_tests;
 
 #[cfg(test)]
 mod fabric_partner_grant_tests;
+
+#[cfg(test)]
+mod settlement_complete_tests;
 
 #[cfg(test)]
 mod fabric_response_auth_tests;
@@ -11428,15 +11447,21 @@ mod tests {
         .with_context("agent_surface_storage_path", storage_context(storage_root))
     }
 
-    #[test]
-    fn redelivered_forward_request_is_dropped_without_a_response() {
+    #[tokio::test]
+    async fn redelivered_forward_request_is_dropped_without_a_response() {
         let temp = tempfile::tempdir().unwrap();
         let msg = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "surface-1");
 
         use crate::gateways::connection_points::envelope_replay::{EnvelopeRejection, admit_forward_request};
 
-        assert!(admit_forward_request(&msg).is_ok());
-        let duplicate = admit_forward_request(&msg).unwrap_err();
+        assert!(
+            admit_forward_request(&msg)
+                .await
+                .is_ok()
+        );
+        let duplicate = admit_forward_request(&msg)
+            .await
+            .unwrap_err();
         assert!(matches!(duplicate, EnvelopeRejection::Duplicate { .. }), "{duplicate}");
         assert!(
             matches!(forward_request_envelope_refusal(&msg, duplicate), ProcessingResult::ProcessedNoResponse),
@@ -11445,7 +11470,9 @@ mod tests {
 
         let mut expired = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "surface-1");
         expired.expires_time = Some(crate::gateways::connection_points::envelope_replay::now_secs() - 1);
-        let rejection = admit_forward_request(&expired).unwrap_err();
+        let rejection = admit_forward_request(&expired)
+            .await
+            .unwrap_err();
         assert!(matches!(rejection, EnvelopeRejection::Expired { .. }), "{rejection}");
         match forward_request_envelope_refusal(&expired, rejection) {
             ProcessingResult::RequiresResponse { response_body, .. } => {
@@ -11669,7 +11696,11 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert!(crate::gateways::connection_points::envelope_replay::admit_forward_request(&fresh).is_ok());
+        assert!(
+            crate::gateways::connection_points::envelope_replay::admit_forward_request(&fresh)
+                .await
+                .is_ok()
+        );
         // A redelivery of an admitted request gets no reply at all.
         assert!(matches!(refusal(fresh).await, Some(ProcessingResult::ProcessedNoResponse)));
 
@@ -12358,6 +12389,18 @@ mod tests {
         }
     }
 
+    /// The logged detail of a setup refused on an unusable invitation, checking the acceptor
+    /// it would tell is the setup's sender.
+    fn unusable_reason(result: &ProcessingResult) -> &str {
+        match result {
+            ProcessingResult::OOBInvitationUnusable { acceptor_temporary_did, reason } => {
+                assert_eq!(acceptor_temporary_did, ACCEPTOR_TMP_DID);
+                reason
+            }
+            other => panic!("expected OOBInvitationUnusable, got {other:?}"),
+        }
+    }
+
     #[test]
     fn channel_did_proof_verifies_against_the_signing_key_document() {
         let (did, key) = did_key_identity();
@@ -12483,7 +12526,7 @@ mod tests {
 
         let result = process_connection_setup(&msg).await;
 
-        assert_eq!(failure_reason(&result), "invitation has expired");
+        assert_eq!(unusable_reason(&result), "invitation has expired");
     }
 
     #[tokio::test]
@@ -12497,7 +12540,7 @@ mod tests {
 
         let result = process_connection_setup(&msg).await;
 
-        assert_eq!(failure_reason(&result), "connection point not found");
+        assert_eq!(unusable_reason(&result), "connection point not found");
     }
 
     #[tokio::test]
@@ -12570,12 +12613,12 @@ mod tests {
             1
         );
         let later = process_connection_setup(&proven_setup_msg(temp.path(), &connection_point.id).await).await;
-        assert_eq!(failure_reason(&later), "invitation has already been used");
+        assert_eq!(unusable_reason(&later), "invitation has already been used");
         assert_eq!(
             redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
                 .await
                 .unwrap_err(),
-            InvitationRefusal::Unavailable("invitation has already been used".to_string())
+            InvitationRefusal::Unusable("invitation has already been used".to_string())
         );
     }
 
@@ -12714,8 +12757,8 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(disabled, InvitationRefusal::Unavailable("connection point is disabled".to_string()));
-        assert_eq!(deleted, InvitationRefusal::Unavailable("connection point not found".to_string()));
+        assert_eq!(disabled, InvitationRefusal::Unusable("connection point is disabled".to_string()));
+        assert_eq!(deleted, InvitationRefusal::Unusable("connection point not found".to_string()));
         assert!(
             store
                 .get(&connection_point.id)
@@ -12804,7 +12847,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(refused, InvitationRefusal::Unavailable("connection point not found".to_string()));
+        assert_eq!(refused, InvitationRefusal::Unusable("connection point not found".to_string()));
         assert!(
             store
                 .inner
@@ -12866,6 +12909,75 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(refused, InvitationRefusal::Unavailable("connection point is not an invitation".to_string()));
+    }
+
+    #[tokio::test]
+    async fn connection_setup_on_a_disabled_invitation_tells_the_acceptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut connection_point = invitation(None);
+        connection_point.enabled = false;
+        save_connection_point(temp.path(), &connection_point).await;
+
+        let result = process_connection_setup(&proven_setup_msg(temp.path(), &connection_point.id).await).await;
+
+        assert_eq!(unusable_reason(&result), "connection point is disabled");
+    }
+
+    #[tokio::test]
+    async fn redeeming_a_used_disabled_or_deleted_invitation_tells_the_acceptor_it_cant_be_used() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut connection_point = store_invitation(temp.path(), None).await;
+        let store = invitation_store(temp.path()).await;
+        redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap();
+        let used = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap_err();
+        connection_point.enabled = false;
+        store
+            .update(&connection_point)
+            .await
+            .unwrap();
+        let disabled = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap_err();
+        store
+            .delete(&connection_point.id)
+            .await
+            .unwrap();
+        let deleted = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap_err();
+
+        for refusal in [used, disabled, deleted] {
+            assert_eq!(refusal.rejection_reason(), Some(INVITATION_UNUSABLE_REASON), "{refusal:?}");
+        }
+    }
+
+    #[test]
+    fn every_unusable_invitation_gets_the_same_rejection_reason() {
+        for detail in [
+            "invitation has already been used",
+            "invitation has expired",
+            "connection point is disabled",
+            "connection point not found",
+        ] {
+            let refusal = InvitationRefusal::Unusable(detail.to_string());
+            assert_eq!(refusal.rejection_reason(), Some("This invitation can't be used any more. Ask for a new one."));
+            assert_eq!(refusal.detail(), detail);
+        }
+        assert_eq!(InvitationRefusal::InvalidSecret.rejection_reason(), Some("Invalid connection secret"));
+        assert_eq!(InvitationRefusal::InvalidSecret.detail(), "Invalid connection secret");
+    }
+
+    #[test]
+    fn a_refusal_that_is_not_about_the_invitation_is_not_answered() {
+        for detail in ["connection point is not an invitation", "failed to list connection points: disk"] {
+            let refusal = InvitationRefusal::Unavailable(detail.to_string());
+            assert_eq!(refusal.rejection_reason(), None);
+            assert_eq!(refusal.detail(), detail);
+        }
     }
 
     const NOT_THIS_INVITATION: &str = "connection-setup does not reference this invitation";
@@ -12955,7 +13067,7 @@ mod tests {
 
         let result = process_connection_setup(&msg).await;
 
-        assert_eq!(failure_reason(&result), "invitation has already been used");
+        assert_eq!(unusable_reason(&result), "invitation has already been used");
     }
 
     fn x402_requirement(pay_to: &str) -> crate::config::types::X402PaymentRequirement {
@@ -13075,34 +13187,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_settle_response_completes_our_outstanding_settle_request() {
-        let correlation_id = format!("settle-{}", uuid::Uuid::new_v4());
-        let pending = crate::x402::gateway_facilitator_service::register_pending_settlement(&correlation_id).await;
+    async fn an_unsolicited_settle_response_is_dropped() {
         let message = make_handshake_msg(
             MessageType::X402SettleResponse.as_str(),
-            Some(&correlation_id),
+            Some("settle-unasked"),
             serde_json::json!({"settled": true, "transaction_id": "0xabc", "network": "eip155:1"}),
         );
 
         let result = process_message_internal(&message, &MessageType::X402SettleResponse).await;
-        let response = pending.await.unwrap();
 
         assert!(matches!(result, ProcessingResult::ProcessedNoResponse), "a settle response got a reply");
-        assert!(response.settled);
-        assert_eq!(response.tx_hash, "0xabc");
-    }
-
-    #[tokio::test]
-    async fn a_settle_response_without_a_thread_id_is_not_matched() {
-        let message = make_handshake_msg(
-            MessageType::X402SettleResponse.as_str(),
-            None,
-            serde_json::json!({"settled": true, "transaction_id": "0xabc"}),
-        );
-
-        let result = process_message_internal(&message, &MessageType::X402SettleResponse).await;
-
-        assert_eq!(failure_reason(&result), "Missing thid (thread ID) in settlement response");
     }
 
     #[test]
