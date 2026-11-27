@@ -1,0 +1,20 @@
+branch: fix/unidentified-caller-identity-data
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-27T09:00:00Z'
+      title: Keep an unidentified caller's identity data out of policy input and the Target
+      description: >-
+        A caller that gets no inbound identity, such as an API key caller on a surface whose
+        inbound identity is From JWT Claims, could still get its own identity data through in
+        three ways. A body with duplicate or case-variant keys, such as two metadata members,
+        could forward a proof the gateway had removed from the other, so such a body is now
+        refused with 400 and a JSON-RPC invalid request error. The identity proofs and
+        trust-registry claims in input.mcp.params._meta of an MCP request, including tool
+        gating and tool policy input, and in input.a2a.message.metadata of an A2A request are
+        now removed from policy input. The Target still receives the unsigned trust-registry
+        metadata. Callers the inbound identity reads are unchanged.
+  breaking: []

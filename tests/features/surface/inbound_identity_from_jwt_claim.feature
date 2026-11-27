@@ -129,3 +129,44 @@ Feature: Inbound identity derived from a JWT claim
     When the caller asks the MCP surface for available tools with a valid API key and an identity proof of its own
     Then the response status is 200
     And MCP server "bravo" did not receive MCP _meta key "https://fabric.affinidi.io/extensions/agent-identity-binding/v1"
+
+  Scenario: A surface deriving the inbound identity from a JWT claim refuses an API key caller's body with a duplicate metadata member
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface accepts "JWT Bearer" and "API Key" source authentication
+    And the surface derives the inbound identity from a JWT claim
+    And the surface accepts JWT audience "bdd-test-audience"
+    And the surface's A2A validation is "off"
+    When the caller sends a request to the surface with a valid API key and an identity proof of its own beside a duplicate metadata member
+    Then the response status is 400
+    And managed agent "bravo" was not called
+
+  Scenario: A surface deriving the inbound identity from a JWT claim shows policy no identity proof or trust-registry claim of an API key caller
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface accepts "JWT Bearer" and "API Key" source authentication
+    And the surface derives the inbound identity from a JWT claim
+    And the surface accepts JWT audience "bdd-test-audience"
+    And the surface has a request policy that denies a message carrying an identity proof or trust-registry claim
+    When the caller sends a request to the surface with a valid API key and an identity proof of its own
+    Then the response status is 200
+    And managed agent "bravo" received the forwarded request with no caller identity
+
+  Scenario: An MCP surface deriving the inbound identity from a JWT claim shows policy no identity proof or trust-registry claim of an API key caller
+    Given MCP surface "alpha" targets MCP server "bravo"
+    And the surface accepts "JWT Bearer" and "API Key" source authentication
+    And the surface derives the inbound identity from a JWT claim
+    And the surface accepts JWT audience "bdd-test-audience"
+    And MCP server "bravo" supports modern tool invocation with "application/json" responses
+    And the MCP surface has a request policy that denies a request carrying an identity proof or trust-registry claim
+    When the caller invokes MCP tool "echo" using protocol version "2026-07-28" with a valid API key and an identity proof of its own
+    Then the response status is 200
+    And MCP server "bravo" received the forwarded MCP request
+
+  Scenario: An MCP surface deriving the inbound identity from a JWT claim shows a tool policy no identity proof or trust-registry claim of an API key caller
+    Given MCP surface "alpha" targets MCP server "bravo"
+    And the surface accepts "JWT Bearer" and "API Key" source authentication
+    And the surface derives the inbound identity from a JWT claim
+    And the surface accepts JWT audience "bdd-test-audience"
+    And the MCP surface enforces a wildcard default tool policy that denies a call carrying an identity proof or trust-registry claim
+    When the caller invokes MCP tool "get_news" with a valid API key and an identity proof of its own
+    Then the response status is 200
+    And MCP server "bravo" received the forwarded MCP request

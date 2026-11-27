@@ -3323,10 +3323,11 @@ async fn proxy_charged_request(
         .channel_protocol()
         == crate::config::ChannelProtocol::Mcp
     {
-        match mcp_classification.as_ref() {
+        let context = match mcp_classification.as_ref() {
             Some(classification) => crate::mcp::build_validated_mcp_context(&body_bytes, classification),
             None => crate::mcp::build_mcp_context(&body_bytes),
-        }
+        };
+        without_unidentified_caller_claims_mcp(context, caller_identified)
     } else {
         None
     };
@@ -3395,10 +3396,11 @@ async fn proxy_charged_request(
             payment.strip_modern(message);
         }
         if mcp_context.is_some() {
-            mcp_context = match mcp_classification.as_ref() {
+            let context = match mcp_classification.as_ref() {
                 Some(classification) => crate::mcp::build_validated_mcp_context(&body_bytes, classification),
                 None => crate::mcp::build_mcp_context(&body_bytes),
             };
+            mcp_context = without_unidentified_caller_claims_mcp(context, caller_identified);
         }
     }
 
@@ -3414,7 +3416,7 @@ async fn proxy_charged_request(
             .channel_protocol(),
         crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2
     ) {
-        serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        let context = serde_json::from_slice::<serde_json::Value>(&body_bytes)
             .ok()
             .map(|body| {
                 // `method` reaches policy exactly as the caller sent it (v0.3
@@ -3430,7 +3432,8 @@ async fn proxy_charged_request(
                     .or_else(|| body.get("message"))
                     .cloned();
                 crate::surface_context::A2aContext::new(method, message)
-            })
+            });
+        without_unidentified_caller_claims_a2a(context, caller_identified)
     } else {
         None
     };
@@ -8986,9 +8989,12 @@ async fn proxy_charged_request(
                             &state.surface.name,
                         );
                         template.source_auth = source_auth_context.clone();
-                        template.mcp = mcp_classification
-                            .as_ref()
-                            .and_then(crate::mcp::modern_mcp_context);
+                        template.mcp = without_unidentified_caller_claims_mcp(
+                            mcp_classification
+                                .as_ref()
+                                .and_then(crate::mcp::modern_mcp_context),
+                            caller_identified,
+                        );
                         template.agent = agent_context.clone();
                         template.a2a = a2a_context.clone();
                         template.extension_identity = extension_identity.clone();
@@ -9041,19 +9047,22 @@ async fn proxy_charged_request(
                         {
                             let gating_input_value = if gating.has_policy_conditions() {
                                 let mut gating_input = template.clone();
-                                gating_input.mcp = mcp_classification
-                                    .as_ref()
-                                    .and_then(crate::mcp::modern_mcp_context)
-                                    .or_else(|| {
-                                        Some(crate::surface_context::McpContext {
-                                            method: "tools/list".to_string(),
-                                            tool_name: None,
-                                            resource_uri: None,
-                                            prompt_name: None,
-                                            params: None,
-                                            ..Default::default()
-                                        })
-                                    });
+                                gating_input.mcp = without_unidentified_caller_claims_mcp(
+                                    mcp_classification
+                                        .as_ref()
+                                        .and_then(crate::mcp::modern_mcp_context),
+                                    caller_identified,
+                                )
+                                .or_else(|| {
+                                    Some(crate::surface_context::McpContext {
+                                        method: "tools/list".to_string(),
+                                        tool_name: None,
+                                        resource_uri: None,
+                                        prompt_name: None,
+                                        params: None,
+                                        ..Default::default()
+                                    })
+                                });
                                 serde_json::to_value(&gating_input).unwrap_or_default()
                             } else {
                                 serde_json::Value::Null
@@ -11348,7 +11357,10 @@ async fn handle_fabric_request_inner(
             }
         }
     };
-    let modern_mcp_context = mcp_classification.and_then(crate::mcp::modern_mcp_context);
+    let modern_mcp_context = without_unidentified_caller_claims_mcp(
+        mcp_classification.and_then(crate::mcp::modern_mcp_context),
+        caller_identified,
+    );
     let mut modern_request = match mcp_classification {
         Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) => Some((**request).clone()),
         _ => None,
@@ -11791,7 +11803,12 @@ async fn handle_fabric_request_inner(
         {
             modern_mcp_context
                 .clone()
-                .or_else(|| crate::mcp::build_mcp_context(&body_bytes))
+                .or_else(|| {
+                    without_unidentified_caller_claims_mcp(
+                        crate::mcp::build_mcp_context(&body_bytes),
+                        caller_identified,
+                    )
+                })
         } else {
             None
         };
@@ -11802,7 +11819,7 @@ async fn handle_fabric_request_inner(
                 .channel_protocol(),
             crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2
         ) {
-            body_ref.map(|body| {
+            let context = body_ref.map(|body| {
                 let a2a_method = body
                     .get("method")
                     .and_then(|m| m.as_str())
@@ -11813,7 +11830,8 @@ async fn handle_fabric_request_inner(
                     .or_else(|| body.get("message"))
                     .cloned();
                 crate::surface_context::A2aContext::new(a2a_method, message)
-            })
+            });
+            without_unidentified_caller_claims_a2a(context, caller_identified)
         } else {
             None
         };
@@ -12092,7 +12110,10 @@ async fn handle_fabric_request_inner(
                 .and_then(|p| p.get("message"))
                 .or_else(|| body.get("message"))
                 .cloned();
-            policy_input.a2a = Some(crate::surface_context::A2aContext::new(method, message));
+            policy_input.a2a = without_unidentified_caller_claims_a2a(
+                Some(crate::surface_context::A2aContext::new(method, message)),
+                caller_identified,
+            );
         }
         // ── Trust Check stage (target leg, fabric send) ──────────────────────
         {
@@ -12292,14 +12313,20 @@ async fn handle_fabric_request_inner(
                 payment_context.as_ref(),
                 modern_mcp_context
                     .clone()
-                    .unwrap_or_else(|| crate::surface_context::McpContext {
-                        method: tool_request.method.clone(),
-                        tool_name: Some(tool_name.to_string()),
-                        resource_uri: None,
-                        prompt_name: None,
-                        params: tool_request.params.clone(),
-                        ..Default::default()
-                    }),
+                    .or_else(|| {
+                        without_unidentified_caller_claims_mcp(
+                            Some(crate::surface_context::McpContext {
+                                method: tool_request.method.clone(),
+                                tool_name: Some(tool_name.to_string()),
+                                resource_uri: None,
+                                prompt_name: None,
+                                params: tool_request.params.clone(),
+                                ..Default::default()
+                            }),
+                            caller_identified,
+                        )
+                    })
+                    .unwrap_or_default(),
                 identity_binding.as_ref(),
             )
         } else {
@@ -15071,7 +15098,9 @@ async fn evaluate_mcp_tool_policies(
     // Build policy context
     let context = crate::mcp::McpPolicyContext::new(
         tool_request.method.clone(),
-        tool_request.params.clone(),
+        mcp_context
+            .and_then(|context| context.params.clone())
+            .or_else(|| tool_request.params.clone()),
         jwt_claims,
         channel_name.to_string(),
         Some(
@@ -16891,7 +16920,9 @@ const CALLER_IDENTITY_PROOFS: [&str; 2] = [
 /// also ask for the responding agent's credential. A body with no proof, an
 /// empty one, or one of another protocol is returned byte for byte. A body the
 /// gateway cannot read (not JSON, or nested past what the parser reads) is
-/// refused with a JSON-RPC parse error, since its proofs cannot be removed.
+/// refused with a JSON-RPC parse error, and one with duplicate or case-variant
+/// keys with an invalid request error, since its proofs cannot be removed for
+/// every parser.
 fn strip_caller_identity_proofs(
     body_bytes: &bytes::Bytes,
     protocol: &crate::config::ChannelProtocol,
@@ -16906,6 +16937,13 @@ fn strip_caller_identity_proofs(
     }
     let unreadable = || create_jsonrpc_error_response(StatusCode::BAD_REQUEST, -32700, "Parse error: invalid JSON");
     let mut body = serde_json::from_slice::<serde_json::Value>(body_bytes).map_err(|_| unreadable())?;
+    if crate::mcp::tool_analyzer::has_ambiguous_keys(body_bytes) {
+        return Err(create_jsonrpc_error_response(
+            StatusCode::BAD_REQUEST,
+            -32600,
+            "Invalid Request: duplicate or case-variant JSON keys",
+        ));
+    }
     let removed = match &mut body {
         serde_json::Value::Array(requests) => requests
             .iter_mut()
@@ -16918,6 +16956,53 @@ fn strip_caller_identity_proofs(
     serde_json::to_vec(&body)
         .map(bytes::Bytes::from)
         .map_err(|_| unreadable())
+}
+
+/// The keys of a caller's own identity data: the identity proofs and the
+/// trust-registry claims. Policy input of a caller that gets no inbound identity
+/// has none of them, while the Target still receives the unsigned claims.
+const CALLER_IDENTITY_CLAIMS: [&str; 3] = [
+    crate::config::AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION,
+    crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION,
+    crate::config::TRUST_REGISTRY_EXTENSION,
+];
+
+/// `context` for policy input without the identity proofs and trust-registry
+/// claims in `params._meta`, when the caller gets no inbound identity.
+fn without_unidentified_caller_claims_mcp(
+    mut context: Option<crate::surface_context::McpContext>,
+    caller_identified: bool,
+) -> Option<crate::surface_context::McpContext> {
+    if !caller_identified
+        && let Some(params) = context
+            .as_mut()
+            .and_then(|context| context.params.as_mut())
+    {
+        for key in CALLER_IDENTITY_CLAIMS {
+            crate::mcp::meta::remove_metadata_key(params, key);
+        }
+    }
+    context
+}
+
+/// `context` for policy input without the identity proofs and trust-registry
+/// claims in `message.metadata`, when the caller gets no inbound identity.
+fn without_unidentified_caller_claims_a2a(
+    mut context: Option<crate::surface_context::A2aContext>,
+    caller_identified: bool,
+) -> Option<crate::surface_context::A2aContext> {
+    if !caller_identified
+        && let Some(metadata) = context
+            .as_mut()
+            .and_then(|context| context.message.as_mut())
+            .and_then(|message| message.get_mut("metadata"))
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        for key in CALLER_IDENTITY_CLAIMS {
+            metadata.remove(key);
+        }
+    }
+    context
 }
 
 /// Remove the caller identity proofs from an MCP request's `_meta`; whether any was there.
@@ -24453,6 +24538,91 @@ allow if {
                     assert_eq!(refused.status(), axum::http::StatusCode::BAD_REQUEST);
                 }
             }
+        }
+
+        #[test]
+        fn a_body_with_duplicate_keys_is_refused_so_no_parser_reads_a_proof_the_gateway_did_not() {
+            let binding = crate::config::AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION;
+            let a2a = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"message/send","params":{{"message":{{"metadata":{{"{binding}":{{"verifiablePresentation":"caller-made"}}}},"metadata":{{}}}}}}}}"#
+            );
+            let mcp = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{{"_meta":{{"{binding}":{{"verifiablePresentation":"caller-made"}}}},"_meta":{{}}}}}}"#
+            );
+            let unrelated = r#"{"jsonrpc":"2.0","id":1,"method":"message/send","id":2,"params":{}}"#;
+            for (body, protocol) in [
+                (a2a.as_str(), crate::config::ChannelProtocol::A2a),
+                (a2a.as_str(), crate::config::ChannelProtocol::Ap2),
+                (mcp.as_str(), crate::config::ChannelProtocol::Mcp),
+                (unrelated, crate::config::ChannelProtocol::A2a),
+            ] {
+                let refused = super::super::strip_caller_identity_proofs(
+                    &axum::body::Bytes::copy_from_slice(body.as_bytes()),
+                    &protocol,
+                )
+                .expect_err("a duplicated key cannot be stripped for every parser");
+                assert_eq!(refused.status(), axum::http::StatusCode::BAD_REQUEST, "{body}");
+            }
+        }
+
+        #[test]
+        fn duplicate_keys_in_a_body_of_another_protocol_are_not_this_functions_business() {
+            let body = axum::body::Bytes::from_static(br#"{"a":1,"a":2}"#);
+            assert_eq!(strip_readable(&body, &crate::config::ChannelProtocol::DIDComm), body);
+        }
+
+        fn claims_of_an_unidentified_caller() -> serde_json::Value {
+            serde_json::json!({
+                crate::config::AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION: {"verifiablePresentation": "caller-made"},
+                crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION: {"verifiableCredential": "caller-made"},
+                crate::config::TRUST_REGISTRY_EXTENSION: {"agent_did": "did:web:asserted.example"},
+                crate::config::MCP_TRUST_REGISTRY_KEY: {"agent_did": "did:web:asserted.example"},
+                crate::config::MCP_AGENT_IDENTITY_BINDING_KEY: {"verifiablePresentation": "caller-made"},
+                "progressToken": 7
+            })
+        }
+
+        #[test]
+        fn mcp_policy_input_of_an_unidentified_caller_has_no_proof_or_trust_registry_claim() {
+            let context = || crate::surface_context::McpContext {
+                method: "tools/call".into(),
+                params: Some(serde_json::json!({"name": "echo", "_meta": claims_of_an_unidentified_caller()})),
+                ..Default::default()
+            };
+            let scrubbed = super::super::without_unidentified_caller_claims_mcp(Some(context()), false).unwrap();
+            assert_eq!(scrubbed.params, Some(serde_json::json!({"name": "echo", "_meta": {"progressToken": 7}})));
+            assert_eq!(scrubbed.method, "tools/call");
+
+            let identified = super::super::without_unidentified_caller_claims_mcp(Some(context()), true).unwrap();
+            assert_eq!(identified.params, context().params, "an identified caller is unchanged");
+            assert!(super::super::without_unidentified_caller_claims_mcp(None, false).is_none());
+        }
+
+        #[test]
+        fn a2a_policy_input_of_an_unidentified_caller_has_no_proof_or_trust_registry_claim() {
+            let message = || serde_json::json!({"role": "user", "metadata": claims_of_an_unidentified_caller()});
+            let context = || crate::surface_context::A2aContext::new(Some("message/send".into()), Some(message()));
+            let scrubbed = super::super::without_unidentified_caller_claims_a2a(Some(context()), false).unwrap();
+            let keep = |key: &str| {
+                scrubbed
+                    .message
+                    .as_ref()
+                    .unwrap()["metadata"]
+                    .get(key)
+                    .cloned()
+            };
+            assert_eq!(keep("progressToken"), Some(serde_json::json!(7)));
+            for gone in [
+                crate::config::AFFINIDI_AGENT_IDENTITY_BINDING_EXTENSION,
+                crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION,
+                crate::config::TRUST_REGISTRY_EXTENSION,
+            ] {
+                assert_eq!(keep(gone), None, "{gone}");
+            }
+            assert_eq!(scrubbed.method.as_deref(), Some("message/send"));
+
+            let identified = super::super::without_unidentified_caller_claims_a2a(Some(context()), true).unwrap();
+            assert_eq!(identified.message, Some(message()), "an identified caller is unchanged");
         }
 
         #[test]
