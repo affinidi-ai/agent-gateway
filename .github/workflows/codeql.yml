@@ -1,8 +1,9 @@
 name: CodeQL
 
-# Weekly-only CodeQL scan of main. PR and push scans are intentionally off:
-# the Rust codebase made per-PR scans too slow. Repo-level CodeQL "default
-# setup" must stay disabled, or GitHub rejects results from this workflow.
+# Weekly-only CodeQL scan of main through pipeline-rust's reusable workflow.
+# PR and push scans are intentionally off: the Rust analysis is too slow to
+# gate PRs. Repo-level CodeQL "default setup" must stay disabled, or GitHub
+# rejects results from this workflow.
 on:
   schedule:
     # Mondays 02:00 UTC. Scheduled runs always use the default branch (main).
@@ -12,7 +13,6 @@ on:
 
 permissions:
   contents: read
-  security-events: write
 
 concurrency:
   group: codeql-${{ github.ref }}
@@ -21,37 +21,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  analyze:
-    name: Analyze (${{ matrix.language }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # GitHub Actions workflows under .github/workflows.
-          - language: actions
-            build-mode: none
-          - language: javascript-typescript
-            build-mode: none
-          - language: python
-            build-mode: none
-          # Rust analysis is the slow part; acceptable because this runs weekly.
-          - language: rust
-            build-mode: none
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
-        with:
-          languages: ${{ matrix.language }}
-          build-mode: ${{ matrix.build-mode }}
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
-        with:
-          category: /language:${{ matrix.language }}
+  codeql:
+    uses: affinidi/pipeline-rust/.github/workflows/codeql.yaml@0fb584f5fa8e4b5b96dd37613f25804e3b1623db # feat/codeql-workflow 2026-11-19
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    with:
+      languages: '["actions", "javascript-typescript", "python", "rust"]'
