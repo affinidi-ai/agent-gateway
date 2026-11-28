@@ -1,0 +1,18 @@
+# Tests whose outcome, or the suite's message for it, through an A2A Access Point with `validation: full` differs from the direct run
+# (target "access-point-full", A2A 0.3 suite). The run fails on an entry that is missing here, on a
+# listed test with another outcome, and on a listed test that no longer applies.
+
+[[expected]]
+tests = [
+    "tests.mandatory.jsonrpc.test_json_rpc_compliance::test_rejects_invalid_json_rpc_requests[invalid_request0--32600]",
+    "tests.mandatory.jsonrpc.test_json_rpc_compliance::test_rejects_invalid_json_rpc_requests[invalid_request1--32600]",
+    "tests.mandatory.jsonrpc.test_json_rpc_compliance::test_rejects_invalid_json_rpc_requests[invalid_request3--32600]",
+    "tests.mandatory.jsonrpc.test_json_rpc_compliance::test_rejects_invalid_json_rpc_requests[invalid_request4--32602]",
+    "tests.mandatory.jsonrpc.test_json_rpc_compliance::test_rejects_invalid_params",
+    "tests.mandatory.jsonrpc.test_protocol_violations::test_invalid_jsonrpc_version",
+    "tests.mandatory.jsonrpc.test_protocol_violations::test_missing_method_field",
+    "tests.mandatory.protocol.test_message_send_method::test_message_send_invalid_params",
+    "tests.optional.capabilities.test_a2a_v030_method_enhancements.TestA2AV030MethodEnhancements::test_method_parameter_validation_enhancements",
+]
+outcome = "fail"
+reason = "The gateway answers a JSON-RPC request it refuses itself with HTTP 400 and the JSON-RPC error in the body (docs/PROTOCOLS.md, Error mapping); the agent answers the same request with HTTP 200, which this suite requires for a JSON-RPC error. The suite fails on the HTTP 400: an assertion on the status, a raised HTTPError, or a -32603 from its transport client."

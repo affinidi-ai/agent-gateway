@@ -1,0 +1,28 @@
+# Tests whose outcome, or the suite's message for it, through an A2A Transit Point differs from the direct run
+# (target "transit"). The run fails on a difference not listed here, on a
+# listed difference with another outcome, and on a listed test that no longer
+# differs.
+#
+# The suite reaches the Transit Point without the trailing slash it normally
+# adds (plugins/tck_plugin.py), so the first entry is the only one the slash causes.
+
+[[expected]]
+test = "harness.entry_point::accepts_trailing_slash"
+outcome = "fail"
+reason = "A Transit Point serves its path and any path below it, but a bare trailing slash matches neither route, so the request gets 404 with an empty body. The Access Point matches on the channel prefix and picks the surface afterwards, so it accepts both spellings, as the agent does."
+
+[[expected]]
+test = "harness.agent_card::interfaces_are_served"
+outcome = "fail"
+reason = "The rewritten card keeps the agent's HTTP+JSON and GRPC interfaces and points them at the gateway's JSON-RPC endpoint, which serves neither binding (docs/PROTOCOLS.md, Current limitations: Per-interface routing)."
+
+[[expected]]
+tests = [
+    "core_operations.test_multi_stream.TestMultiStreamOrdering::test_closing_one_stream_does_not_affect_others[jsonrpc]",
+    "core_operations.test_multi_stream.TestMultiStreamOrdering::test_events_broadcast_to_all_streams[jsonrpc]",
+    "core_operations.test_multi_stream.TestMultiStreamOrdering::test_streams_receive_same_events_in_order[jsonrpc]",
+    "core_operations.test_task_lifecycle.TestSubscribeLifecycle::test_subscribe_terminates_at_terminal_state[jsonrpc]",
+    "jsonrpc.test_sse_streaming.TestSseSubscribeToTask::test_subscribe_first_event_is_task",
+]
+outcome = ["skip", "fail"]
+reason = "A Transit Point buffers an A2A event stream until the agent closes it (docs/PROTOCOLS.md, Current limitations: Streaming over Fabric and on Transit Points), so SubscribeToTask on a running task delivers no event within the suite's stream timeout. The suite usually skips the test then; timing decides whether it fails it instead."

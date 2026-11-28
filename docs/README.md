@@ -38,7 +38,7 @@ adds procedures for deploying and operating an appliance, operator guides, and F
 | [Policy planes and egress](POLICY.md)                                 | OPA packages, versioned policy definitions, appliance-wide enforcement, and SSRF/egress controls                            |
 | [Fabric internals](FABRIC.md)                                         | DIDComm listener lifecycle, legacy wire names, and receive pipeline                                                         |
 | [Per-gateway mediators](PER_GATEWAY_MEDIATOR_FEDERATION.md)           | Choosing the acceptor's own mediator on OOB connect, how sends are routed, and mediator relay setup                         |
-| [Protocol behavior](PROTOCOLS.md)                                     | Active revisions, validation boundaries, compatibility, and limitations                                                     |
+| [Protocol behavior](PROTOCOLS.md)                                     | Active revisions, validation boundaries, compatibility, limitations, and the A2A conformance harness                        |
 | [MCP tool gating](MCP_TOOL_GATING.md)                                 | MCP metadata contract, request-boundary invariant, and the tool-gating firewall                                             |
 | [Source auth and managed identity](SOURCE_AUTH.md)                    | Inbound authentication methods, agent-DID derivation, and the Trust Recorder                                                |
 | [Credential delegation](CREDENTIAL_DELEGATION.md)                     | Credential providers, surface bindings, consent modes, the OAuth flow, and the delegation vault                             |

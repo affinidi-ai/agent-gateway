@@ -1,0 +1,14 @@
+# Tests whose outcome, or the suite's message for it, through an A2A Access Point differs from the direct run
+# (target "access-point"). The run fails on a difference not listed here, on a
+# listed difference with another outcome, and on a listed test that no longer
+# differs.
+
+[[expected]]
+test = "agent_card.test_agent_card_caching.TestAgentCardETag::test_etag_present"
+outcome = "fail"
+reason = "CARD-CACHE-002: the Access Point builds the card response itself from the rewritten JSON and copies no header of the agent's response; it sets Content-Type and Vary and sends no ETag."
+
+[[expected]]
+test = "harness.agent_card::interfaces_are_served"
+outcome = "fail"
+reason = "The rewritten card keeps the agent's HTTP+JSON and GRPC interfaces and points them at the gateway's JSON-RPC endpoint, which serves neither binding (docs/PROTOCOLS.md, Current limitations: Per-interface routing)."

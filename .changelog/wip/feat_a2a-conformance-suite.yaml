@@ -1,0 +1,30 @@
+branch: feat/a2a-conformance-suite
+changes:
+  added:
+    - timestamp: '2026-11-25T00:26:00Z'
+      title: Add an A2A conformance harness that tests the gateway with the A2A TCK
+      description: >-
+        make a2a-conformance runs the A2A project's conformance suite (the A2A TCK) on the JSON-RPC
+        binding against the suite's own test agent, once directly and once through an A2A Access
+        Point (with envelope and with full validation) and an A2A Transit Point, and against the
+        gateway's A2A proxy over a Direct Line stand-in. A forwarding entry point is scored on the
+        tests whose outcome, or the suite's message for it, differs from the direct run, so a
+        failure of the test agent never counts against the gateway, and each known difference is
+        listed in a baseline with its cause. make a2a-conformance-legacy
+        runs the A2A 0.3 suite the same way. A run fails on a difference no baseline lists and on
+        a listed one that no longer applies; ARGS=--report writes every difference to a file
+        instead. The suite and its packages are pinned and installed under target/, and the
+        gateway itself is unchanged. CI runs both suites on every push to main and on pull
+        requests that change the harness or the A2A code its path filter lists.
+  changed: []
+  fixed:
+    - timestamp: '2026-11-27T12:54:26Z'
+      title: Record an MCP conformance run ended by a hangup as failed
+      description: >-
+        A run of make mcp-conformance whose terminal closed could write RESULT PASS and exit 0
+        to its summary, although the run had stopped part way. A hangup now ends the run with exit 129
+        and a FAIL summary, as an interrupt already did, and a second signal during the cleanup
+        no longer leaves the processes the run started behind.
+  removed: []
+  security: []
+  breaking: []

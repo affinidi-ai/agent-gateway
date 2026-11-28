@@ -5,7 +5,7 @@
 # legacy compatibility checks. See scripts/mcp-conformance/README.md.
 #
 # Exit codes: 0 pass, 1 failure, 2 invalid options or precondition not met,
-# 3 dependency fetch failed, 130 SIGINT, 143 SIGTERM.
+# 3 dependency fetch failed, 129 SIGHUP, 130 SIGINT, 143 SIGTERM.
 
 set -euo pipefail
 unset CDPATH
@@ -289,6 +289,10 @@ write_summary() {
 cleanup() {
     local code=$?
     local pid
+    # A second signal must not cut the cleanup short and leave processes on the
+    # ports, and neither may a failed write: after a hangup the terminal is gone.
+    trap '' HUP INT TERM
+    set +e
     for pid in "${STARTED_PIDS[@]+"${STARTED_PIDS[@]}"}"; do
         stop_pid "${pid}"
     done
@@ -308,6 +312,7 @@ cleanup() {
     exit "${code}"
 }
 trap cleanup EXIT
+trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 

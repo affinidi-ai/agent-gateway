@@ -1,0 +1,17 @@
+# Tests whose outcome, or the suite's message for it, through an A2A Transit Point differs from the direct run
+# (target "transit", A2A 0.3 suite). The run fails on an entry that is missing here, on a
+# listed test with another outcome, and on a listed test that no longer applies.
+
+[[expected]]
+tests = [
+    "harness.entry_point::accepts_trailing_slash",
+]
+outcome = "fail"
+reason = "A Transit Point serves its path and any path below it, but a bare trailing slash matches neither route, so the request gets 404 with an empty body. The Access Point matches on the channel prefix and picks the surface afterwards, so it accepts both spellings, as the agent does."
+
+[[expected]]
+tests = [
+    "tests.optional.capabilities.test_streaming_methods::test_tasks_resubscribe",
+]
+outcome = ["skip", "fail"]
+reason = "A Transit Point buffers an A2A event stream until the agent closes it (docs/PROTOCOLS.md, Current limitations: Streaming over Fabric and on Transit Points), so the task has finished before the suite can resubscribe to it. Timing decides whether the suite then skips the test or fails it."

@@ -2271,7 +2271,7 @@ runs the full binary test suite, `ARGS=--report` makes the report-only run, and
 `make mcp-conformance-legacy` runs only the legacy-phase compatibility checks.
 Run outputs stay under the ignored `target/mcp-conformance/`. Exit codes are `0`
 pass, `1` failure, `2` invalid options or precondition not met, `3` dependency
-fetch failure, `130` interrupted (SIGINT) and `143` terminated (SIGTERM).
+fetch failure, `129` hung up (SIGHUP), `130` interrupted (SIGINT) and `143` terminated (SIGTERM).
 
 **CI.** The `mcp-conformance` job in `.github/workflows/ci.yml` runs
 `make mcp-conformance` with every target, `fabric` and `client` included, on
